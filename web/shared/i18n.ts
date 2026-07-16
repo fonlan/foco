@@ -574,6 +574,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Context compression": "上下文压缩",
     Compressing: "压缩中",
     Compressed: "已压缩",
+    "Context compression in progress": "上下文压缩进行中",
+    "Context compression completed": "上下文压缩已完成",
     Rule: "规则",
     "Runtime tool state": "运行期工具状态",
     "Saved {count} tokens": "节省 {count} Token",

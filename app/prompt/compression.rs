@@ -9,6 +9,7 @@ use foco_store::workspace::{
     ContextCompressionSnapshotRecord, NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
 };
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 
 use crate::http::chat::{ContextUsageResponse, ContextUsageSegments};
 use crate::*;
@@ -114,8 +115,13 @@ fn validate_prompt_context_lengths(
 /// local tool-state path remains an optional independent optimization that still preserves the
 /// recent two tool batches. Tool-round-cap recovery via `compress_all_runtime_tool_state` is not
 /// gated by this switch.
+///
+/// When `event_tx` is provided, compression events (especially LLM `start` before the summary
+/// provider request and `completed` after snapshot persistence) are also pushed immediately so
+/// the chat SSE loop can yield them while the compression future is still running.
 pub(crate) async fn ensure_context_compression(
     context: &mut PreparedChatContext,
+    event_tx: Option<mpsc::UnboundedSender<ContextCompressionEventDetail>>,
 ) -> Result<ContextCompressionResult, ApiError> {
     // Runtime tool-state and LLM compression can themselves issue an LLM request. Resolve
     // the model's active provider at that boundary instead of reusing a queued run snapshot.
@@ -127,8 +133,12 @@ pub(crate) async fn ensure_context_compression(
     )?;
 
     let mut events = Vec::new();
-    let mut runtime_tool_state_compressed =
-        compress_runtime_tool_state_with_events_if_needed(context, false, &mut events)?;
+    let mut runtime_tool_state_compressed = compress_runtime_tool_state_with_events_if_needed(
+        context,
+        false,
+        &mut events,
+        event_tx.as_ref(),
+    )?;
 
     let mut message_groups = context_message_groups(
         &context.provider_request.messages,
@@ -146,6 +156,7 @@ pub(crate) async fn ensure_context_compression(
         context,
         &message_groups,
         &mut events,
+        event_tx.as_ref(),
         LlmContextCompressionMode::Normal,
         total_used_context_tokens,
     )
@@ -164,8 +175,12 @@ pub(crate) async fn ensure_context_compression(
         // call is a no-op so overflow goes straight to RequiredOverflow LLM without a tool-state
         // prefix rewrite (avoids stacked prompt-cache invalidation).
         if !runtime_tool_state_compressed {
-            runtime_tool_state_compressed |=
-                compress_runtime_tool_state_with_events_if_needed(context, true, &mut events)?;
+            runtime_tool_state_compressed |= compress_runtime_tool_state_with_events_if_needed(
+                context,
+                true,
+                &mut events,
+                event_tx.as_ref(),
+            )?;
         }
         message_groups = context_message_groups(
             &context.provider_request.messages,
@@ -179,6 +194,7 @@ pub(crate) async fn ensure_context_compression(
                 context,
                 &message_groups,
                 &mut events,
+                event_tx.as_ref(),
                 LlmContextCompressionMode::RequiredOverflow,
                 total_used_context_tokens,
             )
@@ -222,10 +238,23 @@ fn context_compression_event_detail(
     }
 }
 
+/// Record a compression event for the returned batch and, when present, push it on the live sink.
+fn push_context_compression_event(
+    events: &mut Vec<ContextCompressionEventDetail>,
+    event_tx: Option<&mpsc::UnboundedSender<ContextCompressionEventDetail>>,
+    detail: ContextCompressionEventDetail,
+) {
+    if let Some(tx) = event_tx {
+        let _ = tx.send(detail.clone());
+    }
+    events.push(detail);
+}
+
 fn compress_runtime_tool_state_with_events_if_needed(
     context: &mut PreparedChatContext,
     force: bool,
     events: &mut Vec<ContextCompressionEventDetail>,
+    event_tx: Option<&mpsc::UnboundedSender<ContextCompressionEventDetail>>,
 ) -> Result<bool, ApiError> {
     let compression_started_at = utc_timestamp();
     let compressed = compress_runtime_tool_state_if_needed(context, force)?;
@@ -233,26 +262,34 @@ fn compress_runtime_tool_state_with_events_if_needed(
         return Ok(false);
     }
 
-    events.push(context_compression_event_detail(
-        "start",
-        CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
-        None,
-        None,
-        None,
-        Some(compression_started_at.clone()),
-        None,
-        context,
-    ));
-    events.push(context_compression_event_detail(
-        "completed",
-        CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
-        None,
-        None,
-        None,
-        Some(compression_started_at),
-        Some(utc_timestamp()),
-        context,
-    ));
+    push_context_compression_event(
+        events,
+        event_tx,
+        context_compression_event_detail(
+            "start",
+            CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+            None,
+            None,
+            None,
+            Some(compression_started_at.clone()),
+            None,
+            context,
+        ),
+    );
+    push_context_compression_event(
+        events,
+        event_tx,
+        context_compression_event_detail(
+            "completed",
+            CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+            None,
+            None,
+            None,
+            Some(compression_started_at),
+            Some(utc_timestamp()),
+            context,
+        ),
+    );
     Ok(true)
 }
 
@@ -408,6 +445,7 @@ async fn ensure_llm_context_compression(
     context: &mut PreparedChatContext,
     message_groups: &[ContextMessageGroup],
     events: &mut Vec<ContextCompressionEventDetail>,
+    event_tx: Option<&mpsc::UnboundedSender<ContextCompressionEventDetail>>,
     mode: LlmContextCompressionMode,
     local_total_used_tokens: u64,
 ) -> Result<bool, ApiError> {
@@ -429,22 +467,36 @@ async fn ensure_llm_context_compression(
     let covered_snapshot_ids = plan.covered_snapshot_ids;
     let covered_sequences = plan.covered_sequences;
     let compression_started_at = utc_timestamp();
-    events.push(context_compression_event_detail(
-        "start",
-        CONTEXT_COMPRESSION_KIND_LLM,
-        None,
-        Some(i64::try_from(original_tokens).map_err(|_| {
-            ApiError::internal("context compression original token count exceeds i64")
-        })?),
-        None,
-        Some(compression_started_at.clone()),
-        None,
-        context,
-    ));
+    // Emit start before the summary provider request so the UI can show the compression block
+    // while the dedicated checkpoint LLM call is still in flight.
+    push_context_compression_event(
+        events,
+        event_tx,
+        context_compression_event_detail(
+            "start",
+            CONTEXT_COMPRESSION_KIND_LLM,
+            None,
+            Some(i64::try_from(original_tokens).map_err(|_| {
+                ApiError::internal("context compression original token count exceeds i64")
+            })?),
+            None,
+            Some(compression_started_at.clone()),
+            None,
+            context,
+        ),
+    );
+    // Index of the live start event; pop only from the batch vec on failure (live already sent).
+    let compression_start_event_index = events.len() - 1;
 
-    let summary = llm_context_compression_summary(context, &checkpoint_messages).await?;
+    let summary = match llm_context_compression_summary(context, &checkpoint_messages).await {
+        Ok(summary) => summary,
+        Err(error) => {
+            events.truncate(compression_start_event_index);
+            return Err(error);
+        }
+    };
     if !context_compression_summary_has_benefit(&summary, original_tokens) {
-        events.pop();
+        events.truncate(compression_start_event_index);
         return Ok(false);
     }
     let summary_token_count = estimate_text_tokens(&summary);
@@ -485,7 +537,7 @@ async fn ensure_llm_context_compression(
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
-        events.pop();
+        events.truncate(compression_start_event_index);
         return Ok(false);
     }
 
@@ -506,7 +558,7 @@ async fn ensure_llm_context_compression(
     {
         snapshot_metadata["triggerSource"] = json!(trigger_source);
     }
-    let snapshot = persist_context_compression_snapshot(
+    let snapshot = match persist_context_compression_snapshot(
         context,
         &covered_indices,
         summary,
@@ -514,19 +566,30 @@ async fn ensure_llm_context_compression(
         summary_token_count,
         CONTEXT_COMPRESSION_KIND_LLM,
         snapshot_metadata,
-    )?;
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            events.truncate(compression_start_event_index);
+            return Err(error);
+        }
+    };
     // A full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
     context.runtime_tool_state_compression_count = 0;
-    events.push(context_compression_event_detail(
-        "completed",
-        CONTEXT_COMPRESSION_KIND_LLM,
-        Some(snapshot.id.clone()),
-        Some(snapshot.original_token_count),
-        Some(snapshot.summary_token_count),
-        Some(compression_started_at),
-        Some(utc_timestamp()),
-        context,
-    ));
+    // completed only after snapshot is durable so history reload never sees a half-success block.
+    push_context_compression_event(
+        events,
+        event_tx,
+        context_compression_event_detail(
+            "completed",
+            CONTEXT_COMPRESSION_KIND_LLM,
+            Some(snapshot.id.clone()),
+            Some(snapshot.original_token_count),
+            Some(snapshot.summary_token_count),
+            Some(compression_started_at),
+            Some(utc_timestamp()),
+            context,
+        ),
+    );
 
     let post_summary = context
         .hook_runtime
@@ -2617,9 +2680,16 @@ pub(crate) fn persist_chat_result(
         return Ok(());
     }
 
+    // Final assistant parts must include durable stream events (especially context_compression
+    // start/completed) for success, tool-only, failure, and cancel paths. Relying on browser
+    // memory alone would drop compression blocks after refresh.
     let assistant_message_id = if !context.agent_primary_chat_output {
         None
-    } else if let Some(assistant_text) = assistant_text {
+    } else if assistant_text.is_some()
+        || !tool_calls.is_empty()
+        || events_contain_assistant_history_parts(events)
+    {
+        let content = assistant_text.unwrap_or("");
         let tool_call_summaries = tool_calls
             .iter()
             .map(executed_tool_call_summary)
@@ -2627,15 +2697,24 @@ pub(crate) fn persist_chat_result(
         let parts = finalized_assistant_message_parts(
             &context.assistant_message_id,
             events,
-            assistant_text,
+            content,
             assistant_reasoning,
             &tool_call_summaries,
         )?;
+        let streaming_state = if assistant_text.is_none() {
+            match final_state {
+                "cancelled" => Some("cancelled"),
+                "failed" => Some("failed"),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let metadata_json = assistant_message_metadata_json(
             assistant_reasoning,
             &context.memories_used,
             &context.code_change_stats,
-            None,
+            streaming_state,
             Some(&parts),
         )?;
         database
@@ -2643,41 +2722,11 @@ pub(crate) fn persist_chat_result(
                 id: &context.assistant_message_id,
                 chat_id: &context.chat_id,
                 role: "assistant",
-                content: assistant_text,
+                content,
                 sequence: context.assistant_sequence,
                 metadata_json: Some(&metadata_json),
             })
             .map_err(ApiError::from_workspace_error)?;
-        Some(context.assistant_message_id.as_str())
-    } else if !tool_calls.is_empty() {
-        if database
-            .message(&context.assistant_message_id)
-            .map_err(ApiError::from_workspace_error)?
-            .is_none()
-        {
-            let streaming_state = match final_state {
-                "cancelled" => Some("cancelled"),
-                "failed" => Some("failed"),
-                _ => None,
-            };
-            let metadata_json = assistant_message_metadata_json(
-                None,
-                &context.memories_used,
-                &context.code_change_stats,
-                streaming_state,
-                None,
-            )?;
-            database
-                .upsert_message_content(NewMessage {
-                    id: &context.assistant_message_id,
-                    chat_id: &context.chat_id,
-                    role: "assistant",
-                    content: "",
-                    sequence: context.assistant_sequence,
-                    metadata_json: Some(&metadata_json),
-                })
-                .map_err(ApiError::from_workspace_error)?;
-        }
         Some(context.assistant_message_id.as_str())
     } else {
         None
@@ -2738,6 +2787,21 @@ pub(crate) fn persist_chat_result(
     }
 
     Ok(())
+}
+
+/// True when the captured stream has part-bearing history events that must land in
+/// assistant `metadata.parts` even when the turn ends without final text (failure/cancel).
+fn events_contain_assistant_history_parts(events: &[CapturedAuditEvent]) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "text_delta"
+                | "reasoning_delta"
+                | "tool_call"
+                | "context_compression"
+                | "guidance_applied"
+        )
+    })
 }
 
 fn persist_inline_chat_derived_effects(

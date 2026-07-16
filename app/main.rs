@@ -2993,7 +2993,54 @@ impl PreparedChatContext {
                     yield event;
                 }
 
-                let compression_result = match ensure_context_compression(&mut self).await {
+                // Drive compression and live-yield ContextCompression events (LLM start before
+                // the summary provider request) without waiting for ensure to finish.
+                // Prefer the compression future when Ready so a closed channel cannot spin forever.
+                // While the future is Pending, ContextCompression events still flow via recv.
+                // Scope the pin so `&mut self` is released before post-compression uses of self.
+                let compression_result = {
+                    let (compression_event_tx, mut compression_event_rx) =
+                        mpsc::unbounded_channel::<ContextCompressionEventDetail>();
+                    let assistant_message_id_for_compression = self.assistant_message_id.clone();
+                    let mut compression_future = std::pin::pin!(ensure_context_compression(
+                        &mut self,
+                        Some(compression_event_tx),
+                    ));
+                    loop {
+                        tokio::select! {
+                            biased;
+                            result = &mut compression_future => {
+                                while let Ok(detail) = compression_event_rx.try_recv() {
+                                    let event = ChatSseEvent::ContextCompression {
+                                        assistant_message_id: assistant_message_id_for_compression.clone(),
+                                        snapshot_id: detail.snapshot_id.clone(),
+                                        kind: detail.kind.clone(),
+                                        status: detail.status.clone(),
+                                        detail: Some(detail),
+                                    };
+                                    events.push(captured_event(&event));
+                                    yield event;
+                                }
+                                break result;
+                            }
+                            maybe_detail = compression_event_rx.recv() => {
+                                let Some(detail) = maybe_detail else {
+                                    break compression_future.await;
+                                };
+                                let event = ChatSseEvent::ContextCompression {
+                                    assistant_message_id: assistant_message_id_for_compression.clone(),
+                                    snapshot_id: detail.snapshot_id.clone(),
+                                    kind: detail.kind.clone(),
+                                    status: detail.status.clone(),
+                                    detail: Some(detail),
+                                };
+                                events.push(captured_event(&event));
+                                yield event;
+                            }
+                        }
+                    }
+                };
+                let compression_result = match compression_result {
                     Ok(result) => result,
                     Err(error) => {
                         let message = error.message;
@@ -3023,21 +3070,12 @@ impl PreparedChatContext {
                     }
                 };
                 let turn_active_tool_start_index = compression_result.active_tool_start_index;
+                // Live path already yielded compression events; do not re-emit result.events.
+                let _ = compression_result.events;
                 for notification in std::mem::take(&mut self.hook_notifications) {
                     let event = ChatSseEvent::HookNotification {
                         assistant_message_id: self.assistant_message_id.clone(),
                         notification,
-                    };
-                    events.push(captured_event(&event));
-                    yield event;
-                }
-                for detail in compression_result.events.clone() {
-                    let event = ChatSseEvent::ContextCompression {
-                        assistant_message_id: self.assistant_message_id.clone(),
-                        snapshot_id: detail.snapshot_id.clone(),
-                        kind: detail.kind.clone(),
-                        status: detail.status.clone(),
-                        detail: Some(detail),
                     };
                     events.push(captured_event(&event));
                     yield event;
@@ -10700,9 +10738,9 @@ fn non_empty_string(value: &str) -> Option<String> {
 
 fn assistant_message_needs_part_materialization(metadata_json: &str) -> Result<bool, ApiError> {
     let metadata = parse_json_value(metadata_json, "assistant message metadata")?;
-    if assistant_message_has_current_parts(&metadata)
-        && metadata.get("partsSource").and_then(Value::as_str) == Some("run_events")
-    {
+    // Prefer durable current-version parts (live_sse or prior run_events writeback).
+    // Only rematerialize when parts are missing or on an older partsVersion.
+    if assistant_message_has_current_parts(&metadata) {
         return Ok(false);
     }
 

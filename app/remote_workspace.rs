@@ -378,6 +378,9 @@ impl RemoteSidecarRuntimeToolState {
     /// Same overflow matrix as local `ensure_context_compression`: when
     /// `runtime_tool_state_compression_enabled` is OFF, required-overflow `force=true` is a no-op
     /// and overflow goes to RequiredOverflow LLM only (no stacked tool-state prefix rewrite).
+    ///
+    /// When `event_tx` is set, events are also pushed live (LLM `start` before the first broker
+    /// contextCompression request; `completed` after snapshot insert).
     #[allow(clippy::too_many_arguments)]
     async fn ensure_compression_then_pack(
         &mut self,
@@ -392,6 +395,7 @@ impl RemoteSidecarRuntimeToolState {
         assistant_message_id: &str,
         provider_id: &str,
         model_id: &str,
+        event_tx: Option<mpsc::UnboundedSender<RemoteSidecarContextCompressionEventDetail>>,
     ) -> Result<
         (
             Vec<NeutralChatMessage>,
@@ -412,6 +416,7 @@ impl RemoteSidecarRuntimeToolState {
                 assistant_message_id,
                 provider_id,
                 model_id,
+                event_tx,
             )
             .await?;
         let packed = pack_neutral_messages(
@@ -439,6 +444,7 @@ impl RemoteSidecarRuntimeToolState {
         assistant_message_id: &str,
         provider_id: &str,
         model_id: &str,
+        event_tx: Option<mpsc::UnboundedSender<RemoteSidecarContextCompressionEventDetail>>,
     ) -> Result<Vec<RemoteSidecarContextCompressionEventDetail>, ApiError> {
         let mut events = Vec::new();
         let mut runtime_tool_state_compressed = self.compress_runtime_tool_state_with_events(
@@ -447,6 +453,7 @@ impl RemoteSidecarRuntimeToolState {
             provider_id,
             model_id,
             &mut events,
+            event_tx.as_ref(),
         )?;
 
         let mut message_groups = context_message_groups(
@@ -467,6 +474,7 @@ impl RemoteSidecarRuntimeToolState {
                     messages,
                     &message_groups,
                     &mut events,
+                    event_tx.as_ref(),
                     LlmContextCompressionMode::Normal,
                     total_used_context_tokens,
                     state,
@@ -496,6 +504,7 @@ impl RemoteSidecarRuntimeToolState {
                     provider_id,
                     model_id,
                     &mut events,
+                    event_tx.as_ref(),
                 )?;
             }
             message_groups = context_message_groups(
@@ -511,6 +520,7 @@ impl RemoteSidecarRuntimeToolState {
                         messages,
                         &message_groups,
                         &mut events,
+                        event_tx.as_ref(),
                         LlmContextCompressionMode::RequiredOverflow,
                         total_used_context_tokens,
                         state,
@@ -539,34 +549,43 @@ impl RemoteSidecarRuntimeToolState {
         provider_id: &str,
         model_id: &str,
         events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
+        event_tx: Option<&mpsc::UnboundedSender<RemoteSidecarContextCompressionEventDetail>>,
     ) -> Result<bool, ApiError> {
         let compression_started_at = utc_timestamp();
         let compressed = self.compress_if_needed(messages, force)?;
         if !compressed {
             return Ok(false);
         }
-        events.push(RemoteSidecarContextCompressionEventDetail {
-            status: "start".to_string(),
-            kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
-            snapshot_id: None,
-            original_token_count: None,
-            summary_token_count: None,
-            started_at: Some(compression_started_at.clone()),
-            completed_at: None,
-            provider_id: provider_id.to_string(),
-            model_id: model_id.to_string(),
-        });
-        events.push(RemoteSidecarContextCompressionEventDetail {
-            status: "completed".to_string(),
-            kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
-            snapshot_id: None,
-            original_token_count: None,
-            summary_token_count: None,
-            started_at: Some(compression_started_at),
-            completed_at: Some(utc_timestamp()),
-            provider_id: provider_id.to_string(),
-            model_id: model_id.to_string(),
-        });
+        remote_push_context_compression_event(
+            events,
+            event_tx,
+            RemoteSidecarContextCompressionEventDetail {
+                status: "start".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                snapshot_id: None,
+                original_token_count: None,
+                summary_token_count: None,
+                started_at: Some(compression_started_at.clone()),
+                completed_at: None,
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            },
+        );
+        remote_push_context_compression_event(
+            events,
+            event_tx,
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                snapshot_id: None,
+                original_token_count: None,
+                summary_token_count: None,
+                started_at: Some(compression_started_at),
+                completed_at: Some(utc_timestamp()),
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            },
+        );
         Ok(true)
     }
 
@@ -576,6 +595,7 @@ impl RemoteSidecarRuntimeToolState {
         messages: &mut Vec<NeutralChatMessage>,
         message_groups: &[crate::ContextMessageGroup],
         events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
+        event_tx: Option<&mpsc::UnboundedSender<RemoteSidecarContextCompressionEventDetail>>,
         mode: LlmContextCompressionMode,
         local_total_used_tokens: u64,
         state: &RemoteSidecarState,
@@ -607,20 +627,25 @@ impl RemoteSidecarRuntimeToolState {
         let covered_snapshot_ids = plan.covered_snapshot_ids;
         let covered_sequences = plan.covered_sequences;
         let compression_started_at = utc_timestamp();
-        let compression_start_event_index = events.len();
-        events.push(RemoteSidecarContextCompressionEventDetail {
-            status: "start".to_string(),
-            kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
-            snapshot_id: None,
-            original_token_count: Some(i64::try_from(original_tokens).map_err(|_| {
-                ApiError::internal("context compression original token count exceeds i64")
-            })?),
-            summary_token_count: None,
-            started_at: Some(compression_started_at.clone()),
-            completed_at: None,
-            provider_id: provider_id.to_string(),
-            model_id: model_id.to_string(),
-        });
+        // Live start before the first broker contextCompression request.
+        remote_push_context_compression_event(
+            events,
+            event_tx,
+            RemoteSidecarContextCompressionEventDetail {
+                status: "start".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: None,
+                original_token_count: Some(i64::try_from(original_tokens).map_err(|_| {
+                    ApiError::internal("context compression original token count exceeds i64")
+                })?),
+                summary_token_count: None,
+                started_at: Some(compression_started_at.clone()),
+                completed_at: None,
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+            },
+        );
+        let compression_start_event_index = events.len() - 1;
 
         let (summary, resolved_provider_id) =
             match remote_sidecar_run_broker_context_compression_summary(
@@ -645,13 +670,13 @@ impl RemoteSidecarRuntimeToolState {
                     ..
                 } => (summary, provider_id),
                 RemoteSidecarContextCompressionOutcome::Cancelled => {
-                    events.pop();
+                    events.truncate(compression_start_event_index);
                     return Err(ApiError::bad_request(
                         "context compression summary was cancelled",
                     ));
                 }
                 RemoteSidecarContextCompressionOutcome::Failed { message } => {
-                    events.pop();
+                    events.truncate(compression_start_event_index);
                     return Err(ApiError::bad_request(
                         remote_sidecar_context_compression_failure_message(
                             RemoteSidecarContextCompressionFailureKind::SummaryGeneration,
@@ -663,7 +688,7 @@ impl RemoteSidecarRuntimeToolState {
         events[compression_start_event_index].provider_id = resolved_provider_id.clone();
 
         if !context_compression_summary_has_benefit(&summary, original_tokens) {
-            events.pop();
+            events.truncate(compression_start_event_index);
             return Ok(false);
         }
         let summary_token_count = estimate_text_tokens(&summary);
@@ -672,7 +697,7 @@ impl RemoteSidecarRuntimeToolState {
             match remote_sidecar_hook_environment(state, None).await {
                 Ok(environment) => environment,
                 Err(error) => {
-                    events.pop();
+                    events.truncate(compression_start_event_index);
                     run_stream.push_hook_notifications(vec![HookNotification {
                         event: "PreCompact".to_string(),
                         level: "error".to_string(),
@@ -710,7 +735,7 @@ impl RemoteSidecarRuntimeToolState {
         run_stream.push_hook_notifications(pre_summary.hook_messages("PreCompact"));
         self.append_hook_context(messages, &pre_summary.additional_context);
         if pre_summary.first_block_reason().is_some() {
-            events.pop();
+            events.truncate(compression_start_event_index);
             return Ok(false);
         }
 
@@ -734,7 +759,7 @@ impl RemoteSidecarRuntimeToolState {
             }
             metadata
         };
-        let prepared = prepare_context_compression_snapshot(
+        let prepared = match prepare_context_compression_snapshot(
             chat_id,
             run_id,
             messages,
@@ -748,8 +773,17 @@ impl RemoteSidecarRuntimeToolState {
             original_tokens,
             summary_token_count,
             metadata,
-        )?;
-        insert_context_compression_snapshot_record(database, &prepared)?;
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                events.truncate(compression_start_event_index);
+                return Err(error);
+            }
+        };
+        if let Err(error) = insert_context_compression_snapshot_record(database, &prepared) {
+            events.truncate(compression_start_event_index);
+            return Err(error);
+        }
 
         *messages = prepared.replaced.messages;
         self.message_source_sequences = prepared.replaced.message_source_sequences;
@@ -759,17 +793,21 @@ impl RemoteSidecarRuntimeToolState {
         // Full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
         self.runtime_tool_state_compression_count = 0;
 
-        events.push(RemoteSidecarContextCompressionEventDetail {
-            status: "completed".to_string(),
-            kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
-            snapshot_id: Some(prepared.snapshot.id.clone()),
-            original_token_count: Some(prepared.snapshot.original_token_count),
-            summary_token_count: Some(prepared.snapshot.summary_token_count),
-            started_at: Some(compression_started_at),
-            completed_at: Some(utc_timestamp()),
-            provider_id: resolved_provider_id.clone(),
-            model_id: model_id.to_string(),
-        });
+        remote_push_context_compression_event(
+            events,
+            event_tx,
+            RemoteSidecarContextCompressionEventDetail {
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                snapshot_id: Some(prepared.snapshot.id.clone()),
+                original_token_count: Some(prepared.snapshot.original_token_count),
+                summary_token_count: Some(prepared.snapshot.summary_token_count),
+                started_at: Some(compression_started_at),
+                completed_at: Some(utc_timestamp()),
+                provider_id: resolved_provider_id.clone(),
+                model_id: model_id.to_string(),
+            },
+        );
 
         let post_summary = hook_runtime
             .run_hooks(HookRunRequest {
@@ -11366,6 +11404,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                         compression_events,
                         content_parts_prefix,
                     ),
+                    "partsVersion": 5,
+                    "partsSource": "live_sse",
                     "metrics": metrics,
                 });
                 let assistant_sequence = database
@@ -11826,6 +11866,17 @@ struct RemoteSidecarContextCompressionEventDetail {
     completed_at: Option<String>,
     provider_id: String,
     model_id: String,
+}
+
+fn remote_push_context_compression_event(
+    events: &mut Vec<RemoteSidecarContextCompressionEventDetail>,
+    event_tx: Option<&mpsc::UnboundedSender<RemoteSidecarContextCompressionEventDetail>>,
+    detail: RemoteSidecarContextCompressionEventDetail,
+) {
+    if let Some(tx) = event_tx {
+        let _ = tx.send(detail.clone());
+    }
+    events.push(detail);
 }
 
 fn remote_sidecar_context_compression_sse_event(
@@ -12657,21 +12708,100 @@ async fn remote_sidecar_chat_stream(
         'run: loop {
             // Before every brokered chat completion request (first turn and tool follow-ups):
             // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
-            let compression_result = runtime_tool_state
-                .ensure_compression_then_pack(
-                    &mut current_request.messages,
-                    &stream_state,
-                    &run_stream,
-                    &mut database,
-                    &stream_state.workspace_id,
-                    &chat_id,
-                    &run_id,
-                    &queued_user_message_id,
-                    &assistant_message_id,
-                    &provider_id,
-                    &model_id,
-                )
-                .await;
+            // Live-yield ContextCompression (start before broker summary) while ensure runs.
+            // ensure holds `&mut database` for snapshot writes; open a separate connection so
+            // start/completed run_events can persist before the client sees each SSE event.
+            let mut live_compression_db = match WorkspaceDatabase::open_or_create(
+                sidecar_workspace_path(&stream_state),
+            ) {
+                Ok(db) => Some(db),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        chat_id = %chat_id,
+                        run_id = %run_id,
+                        "failed to open workspace database for live context compression run_events"
+                    );
+                    None
+                }
+            };
+            let compression_result = {
+                let (compression_event_tx, mut compression_event_rx) =
+                    mpsc::unbounded_channel::<RemoteSidecarContextCompressionEventDetail>();
+                let mut compression_future =
+                    std::pin::pin!(runtime_tool_state.ensure_compression_then_pack(
+                        &mut current_request.messages,
+                        &stream_state,
+                        &run_stream,
+                        &mut database,
+                        &stream_state.workspace_id,
+                        &chat_id,
+                        &run_id,
+                        &queued_user_message_id,
+                        &assistant_message_id,
+                        &provider_id,
+                        &model_id,
+                        Some(compression_event_tx),
+                    ));
+                loop {
+                    tokio::select! {
+                        biased;
+                        result = &mut compression_future => {
+                            while let Ok(detail) = compression_event_rx.try_recv() {
+                                sequence += 1;
+                                let payload = remote_sidecar_context_compression_sse_event(
+                                    &assistant_message_id,
+                                    &detail,
+                                );
+                                if let Some(db) = live_compression_db.as_mut() {
+                                    remote_sidecar_persist_context_compression_run_event(
+                                        db,
+                                        &chat_id,
+                                        &run_id,
+                                        sequence,
+                                        &payload,
+                                    );
+                                }
+                                run_compression_events.push(detail);
+                                yield Ok(remote_sidecar_record_run_event(
+                                    &run_stream,
+                                    sequence,
+                                    payload,
+                                ));
+                                last_yielded_sequence = sequence;
+                            }
+                            break result;
+                        }
+                        maybe_detail = compression_event_rx.recv() => {
+                            let Some(detail) = maybe_detail else {
+                                break compression_future.await;
+                            };
+                            sequence += 1;
+                            let payload = remote_sidecar_context_compression_sse_event(
+                                &assistant_message_id,
+                                &detail,
+                            );
+                            if let Some(db) = live_compression_db.as_mut() {
+                                remote_sidecar_persist_context_compression_run_event(
+                                    db,
+                                    &chat_id,
+                                    &run_id,
+                                    sequence,
+                                    &payload,
+                                );
+                            }
+                            run_compression_events.push(detail);
+                            yield Ok(remote_sidecar_record_run_event(
+                                &run_stream,
+                                sequence,
+                                payload,
+                            ));
+                            last_yielded_sequence = sequence;
+                        }
+                    }
+                }
+            };
+            drop(live_compression_db);
             for notification in run_stream.take_hook_notifications() {
                 sequence += 1;
                 yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
@@ -12681,10 +12811,43 @@ async fn remote_sidecar_chat_stream(
                 })));
                 last_yielded_sequence = sequence;
             }
-            let (packed_messages, compression_events) = match compression_result {
+            let (packed_messages, _compression_events) = match compression_result {
                 Ok(result) => result,
                 Err(error) => {
                     let message = error.message;
+                    if !run_compression_events.is_empty() {
+                        // Keep live start/completed compression blocks durable in message parts
+                        // even when ensure fails (e.g. summary cancelled after start).
+                        let assistant_sequence = database
+                            .message(&assistant_message_id)
+                            .ok()
+                            .flatten()
+                            .map(|message| message.sequence)
+                            .unwrap_or_else(|| {
+                                database
+                                    .next_message_sequence_for_chat(&chat_id)
+                                    .unwrap_or(0)
+                            });
+                        let metadata = json!({
+                            "parts": remote_chat_parts_with_context_compression(
+                                "",
+                                None,
+                                &run_compression_events,
+                                &content_parts_prefix,
+                            ),
+                            "partsVersion": 5,
+                            "partsSource": "live_sse",
+                            "streamingState": "failed",
+                        });
+                        let _ = database.upsert_message_content(NewMessage {
+                            id: &assistant_message_id,
+                            chat_id: &chat_id,
+                            role: "assistant",
+                            content: "",
+                            sequence: assistant_sequence,
+                            metadata_json: Some(&metadata.to_string()),
+                        });
+                    }
                     sequence += 1;
                     yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
                         "type": "error",
@@ -12697,25 +12860,7 @@ async fn remote_sidecar_chat_stream(
                     break;
                 }
             };
-            for detail in &compression_events {
-                sequence += 1;
-                let payload =
-                    remote_sidecar_context_compression_sse_event(&assistant_message_id, detail);
-                remote_sidecar_persist_context_compression_run_event(
-                    &mut database,
-                    &chat_id,
-                    &run_id,
-                    sequence,
-                    &payload,
-                );
-                run_compression_events.push(detail.clone());
-                yield Ok(remote_sidecar_record_run_event(
-                    &run_stream,
-                    sequence,
-                    payload,
-                ));
-                last_yielded_sequence = sequence;
-            }
+            // Live path already yielded compression events; do not re-emit.
             let mut broker_request = current_request.clone();
             broker_request.messages = packed_messages;
             let broker_request_id = unique_id("broker-request");
@@ -13169,6 +13314,8 @@ async fn remote_sidecar_chat_stream(
                             &run_compression_events,
                             &content_parts_prefix,
                         ),
+                        "partsVersion": 5,
+                        "partsSource": "live_sse",
                         "metrics": metrics,
                     });
                     let assistant_sequence = database
@@ -23021,6 +23168,7 @@ mod tests {
                         "msg-assistant-1",
                         "provider-1",
                         "model-1",
+                        None,
                     )
                     .await
                     .map(|(packed, events)| (packed, events, messages, runtime_tool_state))
@@ -23320,6 +23468,7 @@ mod tests {
                         "msg-assistant-block",
                         "provider-1",
                         "model-1",
+                        None,
                     )
                     .await
                     .map(|(packed, events)| (packed, events, messages, runtime_tool_state))
@@ -23531,6 +23680,7 @@ mod tests {
                         "msg-assistant-2",
                         "provider-1",
                         "model-1",
+                        None,
                     )
                     .await
             }
@@ -23788,6 +23938,7 @@ mod tests {
                         "msg-assistant-1",
                         "provider-1",
                         "model-1",
+                        None,
                     )
                     .await
             }
@@ -23920,6 +24071,7 @@ mod tests {
                         "msg-assistant-1",
                         "provider-1",
                         "model-1",
+                        None,
                     )
                     .await
                     .map(|(packed, events)| (packed, events, messages, runtime_tool_state))

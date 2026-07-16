@@ -5460,7 +5460,7 @@ async fn context_compression_runtime_tool_state_events_precede_llm_events() {
         "precondition: start below 95% so only local 80% should run after force-free content is reduced"
     );
 
-    let result = ensure_context_compression(&mut context)
+    let result = ensure_context_compression(&mut context, None)
         .await
         .expect("runtime compression should succeed without llm work");
 
@@ -5504,7 +5504,7 @@ async fn ensure_context_compression_skips_rule_snapshots_below_llm_threshold() {
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!((800..950).contains(&total_used_context_tokens));
 
-    let result = ensure_context_compression(&mut context)
+    let result = ensure_context_compression(&mut context, None)
         .await
         .expect("context compression");
 
@@ -5540,11 +5540,59 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!(total_used_context_tokens >= 950);
 
-    let error = ensure_context_compression(&mut context)
+    let error = ensure_context_compression(&mut context, None)
         .await
         .expect_err("llm compression branch should try the provider");
 
     assert!(error.message().contains("API key"));
+    assert!(context.compression_snapshots.is_empty());
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+/// Live sink must receive LLM `start` before the summary provider request fails (no completed).
+#[tokio::test]
+async fn ensure_context_compression_emits_live_start_before_summary_provider_failure() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-llm-compression-live-start-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut messages = vec![neutral_text_message(
+        NeutralChatRole::System,
+        "system".to_string(),
+    )];
+    let mut sequences = vec![None];
+    let mut sources = vec![PromptContextSource::ReservedPrompt];
+    for sequence in 0..7 {
+        messages.push(neutral_text_message(
+            NeutralChatRole::Assistant,
+            "h".repeat(560),
+        ));
+        sequences.push(Some(sequence));
+        sources.push(PromptContextSource::StoredMessage { sequence });
+    }
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 900);
+    context.provider_config.api_key = None;
+    context.active_tool_start_index = context.provider_request.messages.len();
+    assert!(prepared_context_total_used_tokens(&context) >= 950);
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let error = ensure_context_compression(&mut context, Some(event_tx))
+        .await
+        .expect_err("llm compression branch should try the provider");
+    assert!(error.message().contains("API key"));
+
+    let start = event_rx
+        .try_recv()
+        .expect("start event should be pushed before provider failure");
+    assert_eq!(start.status, "start");
+    assert_eq!(start.kind, "llm");
+    assert!(start.started_at.is_some());
+    assert!(start.completed_at.is_none());
+    assert!(start.snapshot_id.is_none());
+    assert!(
+        event_rx.try_recv().is_err(),
+        "no completed without snapshot"
+    );
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -5647,7 +5695,7 @@ async fn ensure_context_compression_reaches_llm_branch_from_provider_input_below
     assert!((800..950).contains(&total_used_context_tokens));
     context.last_chat_completion_input_tokens = Some(950);
 
-    let error = ensure_context_compression(&mut context)
+    let error = ensure_context_compression(&mut context, None)
         .await
         .expect_err("provider input >= 95% should force llm compression");
 
@@ -5682,7 +5730,7 @@ async fn ensure_context_compression_skips_when_provider_input_below_threshold() 
     assert!((800..950).contains(&total_used_context_tokens));
     context.last_chat_completion_input_tokens = Some(949);
 
-    let result = ensure_context_compression(&mut context)
+    let result = ensure_context_compression(&mut context, None)
         .await
         .expect("context compression");
 
@@ -6674,7 +6722,7 @@ async fn ensure_context_compression_tries_llm_when_recent_large_group_would_be_d
     context.active_tool_start_index = context.provider_request.messages.len();
     assert!(prepared_context_total_used_tokens(&context) >= 950);
 
-    let error = ensure_context_compression(&mut context)
+    let error = ensure_context_compression(&mut context, None)
         .await
         .expect_err("large recent group should enter the LLM compression branch");
 
@@ -6792,7 +6840,7 @@ async fn ensure_context_compression_required_overflow_adds_runtime_events_before
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!(total_used_context_tokens < 9_500);
 
-    let result = ensure_context_compression(&mut context)
+    let result = ensure_context_compression(&mut context, None)
         .await
         .expect("forced runtime compression should not require llm when overflow resolves");
 
@@ -6855,7 +6903,7 @@ async fn ensure_context_compression_disabled_overflow_skips_runtime_tool_state_e
 
     // Switch OFF: no local runtimeToolState snapshot, but full LLM checkpoint still covers raw
     // RuntimeToolState and reaches the provider path.
-    let error = ensure_context_compression(&mut context)
+    let error = ensure_context_compression(&mut context, None)
         .await
         .expect_err("disabled runtime tool-state still enters full LLM checkpoint");
 
@@ -6924,7 +6972,7 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
         vec![2, 3, 4]
     );
 
-    let error = ensure_context_compression(&mut context)
+    let error = ensure_context_compression(&mut context, None)
         .await
         .expect_err("required overflow should try the LLM fallback");
 
@@ -8524,6 +8572,292 @@ fn finalized_assistant_parts_persist_context_compression_events() {
                 && detail.summary_token_count == Some(320)
     ));
     assert!(matches!(&parts[1], ChatMessagePart::Text { text } if text == "Done."));
+}
+
+#[test]
+fn finalized_assistant_parts_keep_start_only_compression_without_completed() {
+    let events = [CapturedAuditEvent {
+        event_at: "2026-06-18T10:00:00Z".to_string(),
+        event_type: "context_compression".to_string(),
+        normalized_event_json: json!({
+            "assistantMessageId": "assistant-1",
+            "type": "contextCompression",
+            "kind": "llm",
+            "status": "start",
+            "detail": {
+                "status": "start",
+                "kind": "llm",
+                "originalTokenCount": 1200,
+                "startedAt": "2026-06-18T10:00:00Z",
+                "providerId": "openai",
+                "modelId": "gpt-test"
+            }
+        })
+        .to_string(),
+    }];
+
+    let stored_parts =
+        finalized_assistant_message_parts("assistant-1", &events, "", None, &[]).expect("parts");
+    assert_eq!(stored_parts.len(), 1);
+    assert!(matches!(
+        &stored_parts[0],
+        StoredChatMessagePart::ContextCompression { status, detail, .. }
+            if status == "start"
+                && detail.snapshot_id.is_none()
+                && detail.completed_at.is_none()
+                && detail.original_token_count == Some(1200)
+    ));
+}
+
+#[test]
+fn historical_chat_materializes_start_and_completed_compression_from_run_events() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-history-compression-parts-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Compression history")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "Answer.",
+            sequence: 0,
+            metadata_json: Some(r#"{}"#),
+        })
+        .expect("assistant insert");
+    for (sequence, value) in [
+        (
+            0,
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "llm",
+                "status": "start",
+                "detail": {
+                    "status": "start",
+                    "kind": "llm",
+                    "originalTokenCount": 5000,
+                    "startedAt": "2026-06-18T10:00:04Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            }),
+        ),
+        (
+            1,
+            json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "llm",
+                "snapshotId": "llm-snapshot-1",
+                "status": "completed",
+                "detail": {
+                    "status": "completed",
+                    "kind": "llm",
+                    "snapshotId": "llm-snapshot-1",
+                    "originalTokenCount": 5000,
+                    "summaryTokenCount": 1200,
+                    "startedAt": "2026-06-18T10:00:04Z",
+                    "completedAt": "2026-06-18T10:00:05Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            }),
+        ),
+        (
+            2,
+            json!({ "assistantMessageId": "assistant-1", "delta": "Answer." }),
+        ),
+    ] {
+        let event_type = if sequence == 2 {
+            "text_delta"
+        } else {
+            "context_compression"
+        };
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("run-event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "run-1",
+                sequence,
+                event_type,
+                payload_json: &value.to_string(),
+            })
+            .expect("run event insert");
+    }
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert_eq!(summary.parts.len(), 2);
+    assert!(matches!(
+        &summary.parts[0],
+        ChatMessagePart::ContextCompression { status, detail, .. }
+            if status == "completed"
+                && detail.snapshot_id.as_deref() == Some("llm-snapshot-1")
+                && detail.summary_token_count == Some(1200)
+    ));
+    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Answer."));
+
+    // Idempotent: second load prefers current-version parts and does not duplicate.
+    let messages = database
+        .messages_for_chat("chat-1")
+        .expect("messages reload");
+    let summary_again =
+        chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+            .expect("message summaries reload")
+            .into_iter()
+            .next()
+            .expect("assistant summary reload");
+    assert_eq!(summary_again.parts.len(), 2);
+    assert!(matches!(
+        &summary_again.parts[0],
+        ChatMessagePart::ContextCompression { status, .. } if status == "completed"
+    ));
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
+    assert!(
+        saved
+            .metadata_json
+            .contains(r#""partsSource":"run_events""#)
+    );
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn historical_chat_materializes_start_only_compression_without_faking_completed() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-history-compression-start-only-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Interrupted compression")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "",
+            sequence: 0,
+            metadata_json: Some(r#"{}"#),
+        })
+        .expect("assistant insert");
+    database
+        .insert_run_event(NewRunEvent {
+            id: "run-event-0",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            sequence: 0,
+            event_type: "context_compression",
+            payload_json: &json!({
+                "assistantMessageId": "assistant-1",
+                "type": "contextCompression",
+                "kind": "llm",
+                "status": "start",
+                "detail": {
+                    "status": "start",
+                    "kind": "llm",
+                    "originalTokenCount": 900,
+                    "startedAt": "2026-06-18T10:00:04Z",
+                    "providerId": "openai",
+                    "modelId": "gpt-test"
+                }
+            })
+            .to_string(),
+        })
+        .expect("run event insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert_eq!(summary.parts.len(), 1);
+    assert!(matches!(
+        &summary.parts[0],
+        ChatMessagePart::ContextCompression { status, detail, .. }
+            if status == "start"
+                && detail.snapshot_id.is_none()
+                && detail.completed_at.is_none()
+    ));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn historical_chat_prefers_current_live_sse_parts_without_rematerializing() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-live-sse-parts-prefer-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Live parts")
+        .expect("chat insert");
+    let live_metadata = r#"{"parts":[{"type":"contextCompression","id":"llm-snapshot-live","status":"completed","kind":"llm","detail":{"status":"completed","kind":"llm","snapshotId":"llm-snapshot-live","originalTokenCount":100,"summaryTokenCount":10,"startedAt":"2026-06-18T10:00:00Z","completedAt":"2026-06-18T10:00:01Z","providerId":"openai","modelId":"gpt-test"}},{"type":"text","text":"From live."}],"partsVersion":5,"partsSource":"live_sse"}"#;
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "From live.",
+            sequence: 0,
+            metadata_json: Some(live_metadata),
+        })
+        .expect("assistant insert");
+    // Divergent run_events must not replace current-version live parts.
+    database
+        .insert_run_event(NewRunEvent {
+            id: "run-event-0",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            sequence: 0,
+            event_type: "text_delta",
+            payload_json: &json!({
+                "assistantMessageId": "assistant-1",
+                "delta": "From events."
+            })
+            .to_string(),
+        })
+        .expect("run event insert");
+
+    let messages = database.messages_for_chat("chat-1").expect("messages");
+    let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries")
+        .into_iter()
+        .next()
+        .expect("assistant summary");
+    assert_eq!(summary.parts.len(), 2);
+    assert!(matches!(
+        &summary.parts[0],
+        ChatMessagePart::ContextCompression { detail, .. }
+            if detail.snapshot_id.as_deref() == Some("llm-snapshot-live")
+    ));
+    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "From live."));
+
+    let saved = database
+        .message("assistant-1")
+        .expect("saved message read")
+        .expect("saved message");
+    assert!(saved.metadata_json.contains(r#""partsSource":"live_sse""#));
+    assert!(!saved.metadata_json.contains("From events."));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
 #[test]

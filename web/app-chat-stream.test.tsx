@@ -999,6 +999,7 @@ describe("app-chat-stream verification surfaces", () => {
 
     expect(await screen.findByText("Context compression")).toBeInTheDocument();
     expect(screen.getByText("Compressing")).toBeInTheDocument();
+    expect(screen.getByText("Context compression in progress")).toBeInTheDocument();
 
     expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart);
     await act(async () => {
@@ -1023,6 +1024,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Compressed")).toBeInTheDocument();
+    expect(screen.getByText("Context compression completed")).toBeInTheDocument();
     expect(screen.getByText(/Saved 880 tokens/)).toBeInTheDocument();
     await waitFor(() => expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart + 1));
     expect(screen.getAllByText("Context compression")).toHaveLength(1);
@@ -1036,6 +1038,134 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
+  });
+
+  it("keeps a single in-progress LLM compression part after start then completed", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "compress please",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          kind: "llm",
+          originalTokenCount: 5000,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-06T07:00:00Z",
+          status: "start",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Compressing")).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        kind: "llm",
+        snapshotId: "llm-snapshot-live",
+        status: "completed",
+        type: "contextCompression",
+        detail: {
+          kind: "llm",
+          snapshotId: "llm-snapshot-live",
+          originalTokenCount: 5000,
+          summaryTokenCount: 900,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-06T07:00:00Z",
+          completedAt: "2026-07-06T07:00:02Z",
+          status: "completed",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Compressed")).toBeInTheDocument();
+    expect(screen.queryByText("Compressing")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    expect(screen.getByText(/Saved 4,100 tokens|Saved 4100 tokens/)).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("restores durable compression parts when chat messages are reloaded", async () => {
+    const durableMessages = {
+      activeRun: null,
+      messages: [
+        {
+          id: "message-user-history",
+          role: "user",
+          content: "history",
+          sequence: 0,
+          createdAt: "2026-07-06T07:00:00Z",
+          parts: [{ type: "text", text: "history" }],
+          toolCalls: [],
+        },
+        {
+          id: "message-assistant-history",
+          role: "assistant",
+          content: "Recovered answer.",
+          sequence: 1,
+          createdAt: "2026-07-06T07:00:01Z",
+          parts: [
+            {
+              type: "contextCompression",
+              id: "llm-snapshot-history",
+              status: "completed",
+              kind: "llm",
+              detail: {
+                status: "completed",
+                kind: "llm",
+                snapshotId: "llm-snapshot-history",
+                originalTokenCount: 4200,
+                summaryTokenCount: 800,
+                startedAt: "2026-07-06T07:00:00Z",
+                completedAt: "2026-07-06T07:00:01Z",
+                providerId: "openai",
+                modelId: "gpt-test",
+              },
+            },
+            { type: "text", text: "Recovered answer." },
+          ],
+          toolCalls: [],
+        },
+      ],
+    };
+
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse(durableMessages);
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(await screen.findByText("Recovered answer.")).toBeInTheDocument();
+    expect(screen.getByText("Context compression")).toBeInTheDocument();
+    expect(screen.getByText("Compressed")).toBeInTheDocument();
+    expect(screen.getByText(/Saved 3,400 tokens|Saved 3400 tokens/)).toBeInTheDocument();
   });
 
   it("opens and reloads active plans after a plan refresh side event", async () => {

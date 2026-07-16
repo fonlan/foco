@@ -2684,7 +2684,10 @@ function ContextCompressionBlock({
   ];
 
   return (
-    <details className="tool-call-block group min-w-0">
+    <details
+      aria-busy={compression.status === "start" ? true : undefined}
+      className="tool-call-block group min-w-0"
+    >
       <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
         <Shrink aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
         <span className="min-w-0 shrink-0 truncate">{t("Context compression")}</span>
@@ -2697,12 +2700,22 @@ function ContextCompressionBlock({
           {savedLabel} · {modelLabel}
         </span>
         <span
+          aria-live={compression.status === "start" ? "polite" : undefined}
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${compression.status === "completed"
               ? "bg-emerald-50 text-emerald-700"
-              : "bg-stone-100 text-stone-600"
+              : compression.status === "start"
+                ? "bg-amber-50 text-amber-800"
+                : "bg-stone-100 text-stone-600"
             }`}
         >
           {statusLabel}
+        </span>
+        <span className="sr-only">
+          {compression.status === "start"
+            ? t("Context compression in progress")
+            : compression.status === "completed"
+              ? t("Context compression completed")
+              : statusLabel}
         </span>
       </summary>
       <div className="mt-2 grid gap-1.5 border-l border-stone-200 pl-3 text-[11px] text-stone-600">
