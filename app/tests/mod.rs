@@ -2137,6 +2137,51 @@ fn rejected_tool_batch_results_pair_every_call_and_preserve_conflict_path_case()
 }
 
 #[test]
+fn rejected_tool_batch_results_budget_each_oversized_failure_independently() {
+    let huge_path = "x".repeat(foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+    let tool_calls = vec![
+        test_neutral_tool_call(
+            "call-write-1",
+            "write_file",
+            json!({ "path": huge_path, "content": "first" }),
+        ),
+        test_neutral_tool_call(
+            "call-write-2",
+            "write_file",
+            json!({ "path": huge_path, "content": "second" }),
+        ),
+    ];
+    let error = ToolConflictError::SameFileWrite {
+        path: huge_path,
+        first_call_id: "call-write-1".to_string(),
+        second_call_id: "call-write-2".to_string(),
+    };
+
+    let results = rejected_tool_batch_results(&tool_calls, &error)
+        .expect("same-file write conflict should return budgeted tool results");
+
+    assert_eq!(results.len(), 2);
+    for result in results {
+        assert!(result.is_error);
+        assert_eq!(result.output["outputOmitted"], true);
+        assert!(result.output.get("retryUnsafe").is_none());
+        let event = ChatSseEvent::ToolResult {
+            assistant_message_id: "assistant-message".to_string(),
+            tool_call_id: result.id,
+            output: result.output,
+            is_error: result.is_error,
+            started_at: "2026-07-16T00:00:00Z".to_string(),
+            completed_at: "2026-07-16T00:00:01Z".to_string(),
+        };
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&event)
+                .expect("measure rejected tool result event")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
+}
+
+#[test]
 fn read_only_tool_progress_detector_warns_once_and_continues_varied_exploration() {
     let mut detector = ReadOnlyToolProgressDetector::default();
 

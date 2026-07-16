@@ -514,6 +514,8 @@ pub(crate) fn search_text(
         Some(CommandOutputLimits {
             stdout_bytes: Some(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES),
             stderr_bytes: Some(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES),
+            output_delta_bytes: None,
+            truncate: false,
         }),
     ) {
         Ok(output) => output,

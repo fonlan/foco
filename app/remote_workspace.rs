@@ -154,6 +154,9 @@ const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const MAX_BROKER_REQUEST_ID_BYTES: usize =
+    foco_tools::output_budget::TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT;
+const MAX_BROKER_ERROR_CODE_BYTES: usize = 128;
 const MAX_BROKERED_IMAGE_FILE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_BROKERED_IMAGE_TOTAL_BYTES: usize = 24 * 1024 * 1024;
 /// Broker `requestKind` values accepted for main-process LLM audit rows.
@@ -4125,6 +4128,16 @@ async fn connect_control_ws(
                                         let Ok(envelope) = serde_json::from_str::<ControlEnvelope>(&text) else {
                                             continue;
                                         };
+                                        if envelope.id.as_ref().is_some_and(|id| {
+                                            id.len() > MAX_BROKER_REQUEST_ID_BYTES
+                                        }) {
+                                            tracing::warn!(
+                                                server_id = %log_server_id,
+                                                workspace_id = %log_workspace_id,
+                                                "closing remote control connection after oversized broker request id"
+                                            );
+                                            break;
+                                        }
                                         match envelope.message_type.as_str() {
                                             "heartbeat" => {
                                                 update_remote_active_runs(&active_runs, &envelope.payload);
@@ -5449,6 +5462,89 @@ async fn broker_llm_stream(
     let _ = send_broker_envelope(write, &response).await;
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerToolExecutionPayload<'a> {
+    status: &'static str,
+    result: &'a Value,
+    is_error: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrokerToolExecutionEnvelope<'a> {
+    version: u32,
+    #[serde(rename = "type")]
+    message_type: &'static str,
+    id: Option<&'a str>,
+    method: Option<&'a str>,
+    payload: BrokerToolExecutionPayload<'a>,
+    timestamp: Option<&'a str>,
+}
+
+fn normalize_broker_tool_execution(
+    tool_name: &str,
+    output: Value,
+    is_error: bool,
+) -> foco_tools::ToolExecution {
+    crate::runtime::budget_tool_execution(tool_name, foco_tools::ToolExecution { output, is_error })
+        .execution
+}
+
+fn normalize_broker_tool_execution_for_envelope(
+    id: &str,
+    timestamp: &str,
+    tool_name: &str,
+    output: Value,
+    is_error: bool,
+) -> foco_tools::ToolExecution {
+    foco_tools::output_budget::normalize_tool_execution_for_envelope(
+        tool_name,
+        crate::runtime::tool_output_semantics(tool_name),
+        foco_tools::ToolExecution { output, is_error },
+        |execution| {
+            foco_tools::output_budget::serialized_json_size(&BrokerToolExecutionEnvelope {
+                version: 1,
+                message_type: "response",
+                id: Some(id),
+                method: None,
+                payload: BrokerToolExecutionPayload {
+                    status: "ok",
+                    result: &execution.output,
+                    is_error: execution.is_error,
+                },
+                timestamp: Some(timestamp),
+            })
+        },
+    )
+    .execution
+}
+
+async fn send_broker_tool_execution(
+    write: &SharedBrokerWsWrite,
+    id: &str,
+    tool_name: &str,
+    output: Value,
+    is_error: bool,
+) {
+    let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let execution =
+        normalize_broker_tool_execution_for_envelope(id, &timestamp, tool_name, output, is_error);
+    let response = ControlEnvelope {
+        version: 1,
+        message_type: "response".to_string(),
+        id: Some(id.to_string()),
+        method: None,
+        payload: json!({
+            "status": "ok",
+            "result": execution.output,
+            "isError": execution.is_error,
+        }),
+        timestamp: Some(timestamp),
+    };
+    let _ = send_broker_envelope(write, &response).await;
+}
+
 async fn broker_memory_global_search(
     state: &AppState,
     write: &SharedBrokerWsWrite,
@@ -5555,26 +5651,20 @@ async fn broker_execute_global_memory_tool(
         memory_settings,
     };
     let tool_name = tool_name.to_string();
+    let worker_tool_name = tool_name.clone();
     let result = tokio::task::spawn_blocking(move || {
-        execute_memory_tool(&context, &tool_name, payload.arguments)
+        execute_memory_tool(&context, &worker_tool_name, payload.arguments)
     })
     .await
     .map_err(|source| format!("memory broker worker failed: {source}"))
     .and_then(|result| result);
     match result {
         Ok(result) => {
-            let response = ControlEnvelope {
-                version: 1,
-                message_type: "response".to_string(),
-                id: Some(id.to_string()),
-                method: None,
-                payload: json!({ "status": "ok", "result": result }),
-                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-            };
-            let _ = send_broker_envelope(write, &response).await;
+            send_broker_tool_execution(write, id, &tool_name, result, false).await;
         }
         Err(error) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
+            send_broker_tool_execution(write, id, &tool_name, json!({ "error": error }), true)
+                .await;
         }
     }
 }
@@ -5622,7 +5712,7 @@ async fn broker_web_tool(
             return;
         }
     };
-    let result = match execute_web_tool(
+    match execute_web_tool(
         &config.web_search,
         tool_name,
         arguments,
@@ -5630,21 +5720,13 @@ async fn broker_web_tool(
     )
     .await
     {
-        Ok(result) => result,
-        Err(error) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
-            return;
+        Ok(result) => {
+            send_broker_tool_execution(write, id, tool_name, result, false).await;
         }
-    };
-    let response = ControlEnvelope {
-        version: 1,
-        message_type: "response".to_string(),
-        id: Some(id.to_string()),
-        method: None,
-        payload: json!({ "status": "ok", "result": result }),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
-    let _ = send_broker_envelope(write, &response).await;
+        Err(error) => {
+            send_broker_tool_execution(write, id, tool_name, json!({ "error": error }), true).await;
+        }
+    }
 }
 
 /// Handle `image.generate`: generate with local provider credentials and transfer bounded bytes.
@@ -5704,7 +5786,8 @@ async fn broker_image_generate(
     {
         Ok(result) => result,
         Err(error) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", error).await;
+            send_broker_tool_execution(write, id, "image_gen", json!({ "error": error }), true)
+                .await;
             return;
         }
     };
@@ -5717,6 +5800,7 @@ async fn broker_image_generate(
         }
     };
     result["files"] = Value::Array(Vec::new());
+    let execution = normalize_broker_tool_execution("image_gen", result, false);
     let response = ControlEnvelope {
         version: 1,
         message_type: "response".to_string(),
@@ -5724,7 +5808,8 @@ async fn broker_image_generate(
         method: None,
         payload: json!({
             "status": "ok",
-            "result": result,
+            "result": execution.output,
+            "isError": execution.is_error,
             "files": transferred_files,
         }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
@@ -5880,21 +5965,17 @@ async fn broker_ask_question(
 
     match registration.answer_rx.await {
         Ok(answer) => {
-            let response = ControlEnvelope {
-                version: 1,
-                message_type: "response".to_string(),
-                id: Some(id.to_string()),
-                method: None,
-                payload: json!({
-                    "status": "ok",
-                    "result": {
-                        "questionId": question_id,
-                        "answers": answer.answers,
-                    }
+            send_broker_tool_execution(
+                write,
+                id,
+                "ask_question",
+                json!({
+                    "questionId": question_id,
+                    "answers": answer.answers,
                 }),
-                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-            };
-            let _ = send_broker_envelope(write, &response).await;
+                false,
+            )
+            .await;
         }
         Err(_) => {
             let _ = send_broker_error(
@@ -6027,22 +6108,18 @@ async fn broker_mcp_execute(
         .await
     {
         Ok(execution) => {
-            let response = ControlEnvelope {
-                version: 1,
-                message_type: "response".to_string(),
-                id: Some(id.to_string()),
-                method: None,
-                payload: json!({
-                    "status": "ok",
-                    "result": execution.output,
-                    "isError": execution.is_error,
-                }),
-                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-            };
-            let _ = send_broker_envelope(write, &response).await;
+            send_broker_tool_execution(write, id, tool_name, execution.output, execution.is_error)
+                .await;
         }
         Err(error) => {
-            let _ = send_broker_error(write, Some(id), "tool_error", error.to_string()).await;
+            send_broker_tool_execution(
+                write,
+                id,
+                tool_name,
+                json!({ "error": error.to_string() }),
+                true,
+            )
+            .await;
         }
     }
 }
@@ -6059,24 +6136,45 @@ async fn send_broker_envelope(
         .map_err(|_| ())
 }
 
+fn broker_error_envelope(
+    request_id: Option<&str>,
+    code: impl Into<String>,
+    message: impl Into<String>,
+) -> ControlEnvelope {
+    let code = code.into();
+    let (code, code_truncated) =
+        foco_tools::output_budget::bounded_utf8_prefix(&code, MAX_BROKER_ERROR_CODE_BYTES);
+    let message = message.into();
+    let original_bytes = message.len();
+    let (message, message_truncated) = foco_tools::output_budget::bounded_utf8_prefix(
+        &message,
+        foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+    );
+    ControlEnvelope {
+        version: 1,
+        message_type: "error".to_string(),
+        id: request_id.map(str::to_string),
+        method: None,
+        payload: json!({
+            "code": code,
+            "codeTruncated": code_truncated,
+            "message": message,
+            "messageTruncated": message_truncated,
+            "originalBytes": original_bytes,
+            "hardLimitBytes": foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT,
+            "retryable": false,
+        }),
+        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+    }
+}
+
 async fn send_broker_error(
     write: &SharedBrokerWsWrite,
     request_id: Option<&str>,
     code: impl Into<String>,
     message: impl Into<String>,
 ) -> Result<(), ()> {
-    let envelope = ControlEnvelope {
-        version: 1,
-        message_type: "error".to_string(),
-        id: request_id.map(|s| s.to_string()),
-        method: None,
-        payload: json!({
-            "code": code.into(),
-            "message": message.into(),
-            "retryable": false,
-        }),
-        timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-    };
+    let envelope = broker_error_envelope(request_id, code, message);
     send_broker_envelope(write, &envelope).await
 }
 
@@ -10209,17 +10307,23 @@ fn remote_sidecar_reject_tool_batch(
             arguments: rejection.arguments.clone(),
             thought_signatures: None,
         };
-        let output = json!({ "error": rejection.message });
+        let execution = normalize_broker_tool_execution(
+            &rejection.tool_name,
+            json!({ "error": rejection.message }),
+            true,
+        );
+        let output = execution.output;
+        let is_error = execution.is_error;
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
         let _ = remote_sidecar_record_tool_result(
-            database, &tool_call, &output, true, &timestamp, &timestamp,
+            database, &tool_call, &output, is_error, &timestamp, &timestamp,
         );
         events.push(json!({
             "type": "toolResult",
             "assistantMessageId": assistant_message_id,
             "toolCallId": rejection.call_id,
             "output": output,
-            "isError": true,
+            "isError": is_error,
             "startedAt": timestamp,
             "completedAt": timestamp,
         }));
@@ -10302,19 +10406,25 @@ fn remote_sidecar_close_unexecuted_tool_calls(
         .iter()
         .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
         .map(|tool_call| {
-            let output = json!({
-                "error": reason,
-                "skipped": true,
-            });
+            let execution = normalize_broker_tool_execution(
+                &tool_call.name,
+                json!({
+                    "error": reason,
+                    "skipped": true,
+                }),
+                true,
+            );
+            let output = execution.output;
+            let is_error = execution.is_error;
             let _ = remote_sidecar_record_tool_result(
-                database, tool_call, &output, true, &timestamp, &timestamp,
+                database, tool_call, &output, is_error, &timestamp, &timestamp,
             );
             json!({
                 "type": "toolResult",
                 "assistantMessageId": assistant_message_id,
                 "toolCallId": tool_call.call_id,
                 "output": output,
-                "isError": true,
+                "isError": is_error,
                 "startedAt": timestamp,
                 "completedAt": timestamp,
             })
@@ -10660,7 +10770,8 @@ async fn remote_sidecar_execute_broker_tool(
             files,
         )?;
     }
-    Ok((output, is_error))
+    let execution = normalize_broker_tool_execution(&tool_call.name, output, is_error);
+    Ok((execution.output, execution.is_error))
 }
 
 async fn remote_sidecar_execute_tool_call(
@@ -10736,24 +10847,22 @@ async fn remote_sidecar_execute_tool_call(
             .await
         };
         let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-        return match result {
-            Ok((output, is_error)) => (
-                output,
-                is_error,
-                started_at,
-                completed_at,
-                Vec::new(),
-                Vec::new(),
-            ),
-            Err(error) => (
-                json!({ "error": error }),
-                true,
-                started_at,
-                completed_at,
-                Vec::new(),
-                Vec::new(),
-            ),
+        let execution = match result {
+            Ok((output, is_error)) => {
+                normalize_broker_tool_execution(&tool_call.name, output, is_error)
+            }
+            Err(error) => {
+                normalize_broker_tool_execution(&tool_call.name, json!({ "error": error }), true)
+            }
         };
+        return (
+            execution.output,
+            execution.is_error,
+            started_at,
+            completed_at,
+            Vec::new(),
+            Vec::new(),
+        );
     }
     let workspace_path = PathBuf::from(&state.workspace_path);
     let (_hook_mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
@@ -12794,7 +12903,13 @@ async fn remote_sidecar_chat_stream(
                         );
                         for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
                             if !allowed_tools.contains(tool_call.name.as_str()) {
-                                let output = json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) });
+                                let execution = normalize_broker_tool_execution(
+                                    &tool_call.name,
+                                    json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) }),
+                                    true,
+                                );
+                                let output = execution.output;
+                                let is_error = execution.is_error;
                                 let started_at =
                                     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                                 let completed_at =
@@ -12803,7 +12918,7 @@ async fn remote_sidecar_chat_stream(
                                     &mut database,
                                     tool_call,
                                     &output,
-                                    true,
+                                    is_error,
                                     &started_at,
                                     &completed_at,
                                 );
@@ -12812,7 +12927,7 @@ async fn remote_sidecar_chat_stream(
                                     "assistantMessageId": assistant_message_id,
                                     "toolCallId": tool_call.call_id,
                                     "output": output,
-                                    "isError": true,
+                                    "isError": is_error,
                                     "startedAt": started_at,
                                     "completedAt": completed_at,
                                 }));
@@ -12866,6 +12981,13 @@ async fn remote_sidecar_chat_stream(
                                     }
                                 }
                             };
+                            let execution = normalize_broker_tool_execution(
+                                &tool_call.name,
+                                output,
+                                is_error,
+                            );
+                            let output = execution.output;
+                            let is_error = execution.is_error;
                             if run_stream.is_finished() {
                                 remote_sidecar_close_cancelled_tool_batch(
                                     &mut database,
@@ -15118,6 +15240,72 @@ async fn remote_sidecar_plans_worktree_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn broker_tool_execution_applies_retry_unsafe_budget_before_transport() {
+        let execution = normalize_broker_tool_execution(
+            "mcp__server__mutate",
+            json!({
+                "result": "x".repeat(foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT)
+            }),
+            false,
+        );
+
+        assert!(!execution.is_error);
+        assert_eq!(execution.output["outputOmitted"], true);
+        assert_eq!(execution.output["retryUnsafe"], true);
+    }
+
+    #[test]
+    fn broker_tool_execution_measures_complete_control_envelope() {
+        let timestamp = "2026-07-16T00:00:00Z";
+        let execution = normalize_broker_tool_execution_for_envelope(
+            "broker-request",
+            timestamp,
+            "mcp__server__mutate",
+            json!({
+                "result": "x".repeat(
+                    foco_tools::output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+                )
+            }),
+            false,
+        );
+        let envelope = ControlEnvelope {
+            version: 1,
+            message_type: "response".to_string(),
+            id: Some("broker-request".to_string()),
+            method: None,
+            payload: json!({
+                "status": "ok",
+                "result": execution.output,
+                "isError": execution.is_error,
+            }),
+            timestamp: Some(timestamp.to_string()),
+        };
+
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&envelope)
+                .expect("measure broker tool envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn broker_error_envelope_bounds_oversized_messages_before_transport() {
+        let envelope = broker_error_envelope(
+            Some("broker-request"),
+            "c".repeat(foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT),
+            "x".repeat(foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT),
+        );
+
+        assert_eq!(envelope.payload["codeTruncated"], true);
+        assert_eq!(envelope.payload["messageTruncated"], true);
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&envelope)
+                .expect("measure broker error envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
 
     fn test_sidecar_state(
         workspace_path: String,

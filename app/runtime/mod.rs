@@ -77,7 +77,9 @@ pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
     RepeatedToolCallDetector, execute_tool_calls_parallel, is_agent_tool_name, pending_tool_calls,
 };
-pub(crate) use tool_execution::{execute_tool, run_post_tool_hooks};
+pub(crate) use tool_execution::{
+    budget_tool_execution, execute_tool, run_post_tool_hooks, tool_output_semantics,
+};
 pub(crate) use tool_locks::{
     ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
     ToolResourceLockRegistry,

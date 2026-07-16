@@ -9,8 +9,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    COMMAND_WAIT_POLL_MS, DEFAULT_RUN_COMMAND_TIMEOUT_MS, DEFAULT_SLEEP_TIMEOUT_MS,
-    ToolCancellationToken, ToolOutputSink,
+    COMMAND_WAIT_POLL_MS, CommandOutputLimits, DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+    DEFAULT_SLEEP_TIMEOUT_MS, MAX_COMMAND_CAPTURE_BYTES_PER_STREAM, ToolCancellationToken,
+    ToolOutputSink,
     errors::{ToolRuntimeError, tool_timeout_ms},
     limited_output_text, parse_arguments, relative_workspace_path, resolve_workspace_path,
     run_command_with_timeout,
@@ -59,12 +60,20 @@ pub(crate) fn run_command(
         Duration::from_millis(timeout_ms),
         cancellation_token,
         output_sink,
-        None,
+        Some(CommandOutputLimits {
+            stdout_bytes: Some(MAX_COMMAND_CAPTURE_BYTES_PER_STREAM),
+            stderr_bytes: Some(MAX_COMMAND_CAPTURE_BYTES_PER_STREAM),
+            output_delta_bytes: Some(crate::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT),
+            truncate: true,
+        }),
     )?;
-    let (stdout, stdout_truncated) = limited_output_text(&output.stdout);
-    let (stderr, stderr_truncated) = limited_output_text(&output.stderr);
+    let (stdout, stdout_limited) = limited_output_text(&output.stdout);
+    let (stderr, stderr_limited) = limited_output_text(&output.stderr);
+    let stdout_truncated = output.stdout_truncated || stdout_limited;
+    let stderr_truncated = output.stderr_truncated || stderr_limited;
+    let output_omitted = stdout_truncated || stderr_truncated || output.output_delta_truncated;
 
-    Ok(json!({
+    let mut result = json!({
         "command": command,
         "args": args,
         "cwd": relative_workspace_path(workspace_path, &cwd)?,
@@ -73,10 +82,18 @@ pub(crate) fn run_command(
         "success": output.status.success(),
         "stdout": stdout,
         "stderr": stderr,
+        "stdoutBytes": output.stdout_bytes,
+        "stderrBytes": output.stderr_bytes,
         "stdoutTruncated": stdout_truncated,
         "stderrTruncated": stderr_truncated,
+        "outputDeltaTruncated": output.output_delta_truncated,
         "timeoutMs": timeout_ms
-    }))
+    });
+    if output_omitted {
+        result["outputOmitted"] = Value::Bool(true);
+        result["retryUnsafe"] = Value::Bool(true);
+    }
+    Ok(result)
 }
 
 pub(crate) fn sleep_tool(

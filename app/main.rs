@@ -9195,14 +9195,24 @@ fn rejected_tool_batch_results(
     Some(
         rejections
             .into_iter()
-            .map(|rejection| ExecutedToolCall {
-                id: rejection.call_id,
-                name: rejection.tool_name,
-                input: rejection.arguments,
-                output: json!({ "error": rejection.message }),
-                is_error: true,
-                started_at: timestamp.clone(),
-                completed_at: timestamp.clone(),
+            .map(|rejection| {
+                let execution = crate::runtime::budget_tool_execution(
+                    &rejection.tool_name,
+                    ToolExecution {
+                        output: json!({ "error": rejection.message }),
+                        is_error: true,
+                    },
+                )
+                .execution;
+                ExecutedToolCall {
+                    id: rejection.call_id,
+                    name: rejection.tool_name,
+                    input: rejection.arguments,
+                    output: execution.output,
+                    is_error: execution.is_error,
+                    started_at: timestamp.clone(),
+                    completed_at: timestamp.clone(),
+                }
             })
             .collect(),
     )

@@ -893,6 +893,7 @@ const MEMORY_WRITE_TOOL_NAME: &str = "memory_write";
 const MCP_TOOL_NAME_PREFIX: &str = "mcp__";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 const WEB_FETCH_TOOL_NAME: &str = "web_fetch";
+const IMAGE_GEN_TOOL_NAME: &str = "image_gen";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPromptInfo {
@@ -968,6 +969,21 @@ pub enum ToolEffect {
     ReadOnly,
     WorkspaceMutation,
     ExternalOrUnknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolRetrySafety {
+    RetrySafe,
+    RetryUnsafe,
+}
+
+impl ToolEffect {
+    pub fn retry_safety(self) -> ToolRetrySafety {
+        match self {
+            Self::ReadOnly => ToolRetrySafety::RetrySafe,
+            Self::WorkspaceMutation | Self::ExternalOrUnknown => ToolRetrySafety::RetryUnsafe,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1669,13 +1685,6 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | WEB_FETCH_TOOL_NAME
         | AGENT_LIST_TOOL_NAME
         | AGENT_GET_TASK_TOOL_NAME
-        | AGENT_SEND_MESSAGE_TOOL_NAME
-        | AGENT_DELEGATE_TASK_TOOL_NAME
-        | AGENT_CANCEL_TASK_TOOL_NAME
-        | AGENT_WAIT_TASKS_TOOL_NAME
-        | AGENT_TRANSFER_TASK_TOOL_NAME
-        | AGENT_CREATE_INSTANCES_TOOL_NAME
-        | ASK_QUESTION_TOOL_NAME
         | "sleep" => ToolEffect::ReadOnly,
         WRITE_FILE_TOOL_NAME
         | EDIT_FILE_TOOL_NAME
@@ -1687,7 +1696,15 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | DELETE_PLAN_TOOL_NAME
         | UPDATE_SPEC_TOOL_NAME
         | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
-        RUN_COMMAND_TOOL_NAME => ToolEffect::ExternalOrUnknown,
+        RUN_COMMAND_TOOL_NAME
+        | IMAGE_GEN_TOOL_NAME
+        | AGENT_SEND_MESSAGE_TOOL_NAME
+        | AGENT_DELEGATE_TASK_TOOL_NAME
+        | AGENT_CANCEL_TASK_TOOL_NAME
+        | AGENT_WAIT_TASKS_TOOL_NAME
+        | AGENT_TRANSFER_TASK_TOOL_NAME
+        | AGENT_CREATE_INSTANCES_TOOL_NAME
+        | ASK_QUESTION_TOOL_NAME => ToolEffect::ExternalOrUnknown,
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => ToolEffect::ExternalOrUnknown,
         _ => ToolEffect::ExternalOrUnknown,
     }
@@ -2197,10 +2214,26 @@ mod tests {
             ToolEffect::ExternalOrUnknown
         );
         assert_eq!(
+            tool_effect(IMAGE_GEN_TOOL_NAME),
+            ToolEffect::ExternalOrUnknown
+        );
+        assert_eq!(
+            tool_effect(AGENT_DELEGATE_TASK_TOOL_NAME),
+            ToolEffect::ExternalOrUnknown
+        );
+        assert_eq!(
             tool_effect("mcp__server__tool"),
             ToolEffect::ExternalOrUnknown
         );
         assert_eq!(tool_effect("future_tool"), ToolEffect::ExternalOrUnknown);
+        assert_eq!(
+            tool_effect(READ_FILE_TOOL_NAME).retry_safety(),
+            ToolRetrySafety::RetrySafe
+        );
+        assert_eq!(
+            tool_effect(AGENT_SEND_MESSAGE_TOOL_NAME).retry_safety(),
+            ToolRetrySafety::RetryUnsafe
+        );
     }
 
     #[test]

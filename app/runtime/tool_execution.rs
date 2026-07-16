@@ -30,7 +30,7 @@ use foco_tools::{
     execute_builtin_tool_with_context_and_options, read_file_target_outside_workspace,
 };
 use futures_util::future::join_all;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -85,6 +85,7 @@ pub(crate) struct RepeatedToolCallDetector {
 
 impl RepeatedToolCallDetector {
     pub(crate) fn check(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
+        validate_tool_call_transport_fields(tool_calls)?;
         let batch = tool_call_loop_signatures(tool_calls);
         if self.previous_batch.as_ref() == Some(&batch) {
             self.consecutive_count += 1;
@@ -113,6 +114,22 @@ impl RepeatedToolCallDetector {
             "agent run repeated the same tool call batch {MAX_REPEATED_TOOL_CALL_BATCHES} times ({tool_names}); possible tool-call loop"
         ))
     }
+}
+
+pub(crate) fn validate_tool_call_transport_fields(
+    tool_calls: &[NeutralToolCall],
+) -> Result<(), String> {
+    let limit = foco_tools::output_budget::TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT;
+    if let Some(tool_call) = tool_calls
+        .iter()
+        .find(|tool_call| tool_call.call_id.len() > limit)
+    {
+        let (tool_name, _) = foco_tools::output_budget::bounded_utf8_prefix(&tool_call.name, limit);
+        return Err(format!(
+            "provider tool call id for '{tool_name}' exceeds the {limit}-byte transport limit"
+        ));
+    }
+    Ok(())
 }
 
 fn tool_call_loop_signatures(tool_calls: &[NeutralToolCall]) -> Vec<ToolCallLoopSignature> {
@@ -418,7 +435,7 @@ async fn execute_tool_call(
 ) -> ToolHookOutcome {
     let started_at_text = utc_timestamp();
     memory_tool_context.tool_call_id = tool_call.call_id.clone();
-    let tool_execution = execute_tool(
+    let mut tool_execution = execute_tool(
         mcp_registry,
         hook_runtime.clone(),
         &global_hooks,
@@ -451,6 +468,15 @@ async fn execute_tool_call(
     )
     .await;
     let completed_at_text = utc_timestamp();
+    tool_execution.execution = budget_tool_result_envelope(
+        assistant_message_id,
+        &tool_call.call_id,
+        &tool_call.name,
+        &started_at_text,
+        &completed_at_text,
+        tool_execution.execution,
+    )
+    .execution;
     let mut hook_summary = tool_execution.hook_summary;
     let post_summary = run_post_tool_hooks(
         &hook_runtime,
@@ -529,7 +555,151 @@ pub(crate) async fn run_post_tool_hooks(
         .await
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolResultBudgetEnvelope<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    assistant_message_id: &'a str,
+    tool_call_id: &'a str,
+    output: &'a Value,
+    is_error: bool,
+    started_at: &'a str,
+    completed_at: &'a str,
+}
+
+pub(crate) fn tool_output_semantics(
+    tool_name: &str,
+) -> foco_tools::output_budget::ToolOutputSemantics {
+    match foco_agent::tool_effect(tool_name).retry_safety() {
+        foco_agent::ToolRetrySafety::RetrySafe => {
+            foco_tools::output_budget::ToolOutputSemantics::ReadOnly
+        }
+        foco_agent::ToolRetrySafety::RetryUnsafe => {
+            foco_tools::output_budget::ToolOutputSemantics::RetryUnsafe
+        }
+    }
+}
+
+pub(crate) fn budget_tool_execution(
+    tool_name: &str,
+    execution: ToolExecution,
+) -> foco_tools::output_budget::BudgetedToolExecution {
+    foco_tools::output_budget::normalize_tool_execution(
+        tool_name,
+        tool_output_semantics(tool_name),
+        execution,
+    )
+}
+
+fn budget_tool_result_envelope(
+    assistant_message_id: &str,
+    tool_call_id: &str,
+    tool_name: &str,
+    started_at: &str,
+    completed_at: &str,
+    execution: ToolExecution,
+) -> foco_tools::output_budget::BudgetedToolExecution {
+    foco_tools::output_budget::normalize_tool_execution_for_envelope(
+        tool_name,
+        tool_output_semantics(tool_name),
+        execution,
+        |execution| {
+            foco_tools::output_budget::serialized_json_size(&ToolResultBudgetEnvelope {
+                event_type: "toolResult",
+                assistant_message_id,
+                tool_call_id,
+                output: &execution.output,
+                is_error: execution.is_error,
+                started_at,
+                completed_at,
+            })
+        },
+    )
+}
+
 pub(crate) async fn execute_tool(
+    mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: &HookConfig,
+    api_audit_save_details: bool,
+    global_config: &GlobalConfig,
+    provider_config: Option<&ProviderConnectionConfig>,
+    web_search_settings: &WebSearchSettings,
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    memory_tool_context: MemoryToolContext,
+    agent_tool_context: Option<AgentToolContext>,
+    skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
+    tool_resource_lock_registry: ToolResourceLockRegistry,
+    cancellation_token: ToolCancellationToken,
+    tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    assistant_message_id: &str,
+    workspace_id: &str,
+    workspace_path: &Path,
+    tool_workspace_path: &Path,
+    chat_id: &str,
+    session_mode: Option<&str>,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
+    llm_request_retry_count: u32,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: Value,
+) -> ToolExecutionWithHooks {
+    let mut result = execute_tool_unbudgeted(
+        mcp_registry,
+        hook_runtime,
+        global_hooks,
+        api_audit_save_details,
+        global_config,
+        provider_config,
+        web_search_settings,
+        question_registry,
+        question_event_tx,
+        memory_tool_context,
+        agent_tool_context,
+        skill_read_root_dirs,
+        attachment_read_allowlist,
+        tool_resource_lock_registry,
+        cancellation_token,
+        tool_output_delta_tx,
+        assistant_message_id,
+        workspace_id,
+        workspace_path,
+        tool_workspace_path,
+        chat_id,
+        session_mode,
+        run_id,
+        model_id,
+        provider_id,
+        llm_request_retry_count,
+        tool_call_id,
+        tool_name,
+        arguments,
+    )
+    .await;
+    let budgeted = budget_tool_execution(tool_name, result.execution);
+    if budgeted.state != foco_tools::output_budget::ToolOutputBudgetState::WithinBudget {
+        let (original_bytes, original_lines) = budgeted
+            .original_measurement
+            .map(|measurement| (measurement.serialized_bytes, measurement.text_lines))
+            .unwrap_or_default();
+        tracing::warn!(
+            tool_name,
+            original_bytes,
+            original_lines,
+            budget_state = ?budgeted.state,
+            "tool output was normalized to the shared output budget"
+        );
+    }
+    result.execution = budgeted.execution;
+    result
+}
+
+async fn execute_tool_unbudgeted(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: &HookConfig,
@@ -3448,6 +3618,96 @@ mod tests {
         workspace::{NewAgentTeam, WorkspaceDatabase, workspace_database_path},
     };
     use std::fs;
+
+    #[test]
+    fn repeated_tool_call_detector_rejects_oversized_transport_id_before_execution() {
+        let mut detector = RepeatedToolCallDetector::default();
+        let tool_calls = vec![NeutralToolCall {
+            call_id: "x"
+                .repeat(foco_tools::output_budget::TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT + 1),
+            name: SEARCH_TEXT_TOOL.to_string(),
+            arguments: json!({ "query": "needle" }),
+            thought_signatures: None,
+        }];
+
+        let error = detector
+            .check(&tool_calls)
+            .expect_err("oversized tool call id must be rejected");
+
+        assert!(error.contains("transport limit"));
+    }
+
+    #[test]
+    fn budget_tool_execution_returns_retryable_failure_for_large_read_only_output() {
+        let budgeted = budget_tool_execution(
+            SEARCH_TEXT_TOOL,
+            ToolExecution {
+                output: json!({
+                    "matches": "x".repeat(
+                        foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+                    )
+                }),
+                is_error: false,
+            },
+        );
+
+        assert!(budgeted.execution.is_error);
+        assert_eq!(budgeted.execution.output["retryable"], true);
+    }
+
+    #[test]
+    fn budget_tool_result_envelope_measures_complete_sse_record() {
+        let assistant_message_id = "a".repeat(120 * 1024);
+        let budgeted = budget_tool_result_envelope(
+            &assistant_message_id,
+            "tool-call",
+            SEARCH_TEXT_TOOL,
+            "2026-07-16T00:00:00Z",
+            "2026-07-16T00:00:01Z",
+            ToolExecution {
+                output: json!({ "matches": "x".repeat(20 * 1024) }),
+                is_error: false,
+            },
+        );
+        let envelope = ToolResultBudgetEnvelope {
+            event_type: "toolResult",
+            assistant_message_id: &assistant_message_id,
+            tool_call_id: "tool-call",
+            output: &budgeted.execution.output,
+            is_error: budgeted.execution.is_error,
+            started_at: "2026-07-16T00:00:00Z",
+            completed_at: "2026-07-16T00:00:01Z",
+        };
+
+        assert_ne!(
+            budgeted.state,
+            foco_tools::output_budget::ToolOutputBudgetState::WithinBudget
+        );
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&envelope)
+                .expect("measure SSE tool result")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn budget_tool_execution_preserves_success_for_large_retry_unsafe_output() {
+        let budgeted = budget_tool_execution(
+            WRITE_FILE_TOOL,
+            ToolExecution {
+                output: json!({
+                    "result": "x".repeat(
+                        foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+                    )
+                }),
+                is_error: false,
+            },
+        );
+
+        assert!(!budgeted.execution.is_error);
+        assert_eq!(budgeted.execution.output["outputOmitted"], true);
+        assert_eq!(budgeted.execution.output["retryUnsafe"], true);
+    }
 
     #[test]
     fn builtin_workspace_database_tools_are_routed_to_canonical_workspace() {

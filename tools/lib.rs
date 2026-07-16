@@ -4,6 +4,7 @@ mod definitions;
 mod errors;
 mod file_tools;
 mod graph_tools;
+pub mod output_budget;
 mod plan_tools;
 mod spec_patch;
 mod spec_tools;
@@ -82,6 +83,7 @@ const SEARCH_RESULTS_DIR: &str = "search-results";
 const MAX_SEARCH_RESULT_FILES: usize = 20;
 const SEARCH_RESULT_TTL: Duration = Duration::from_secs(60 * 60);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_COMMAND_CAPTURE_BYTES_PER_STREAM: usize = output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT / 2;
 const DEFAULT_GRAPH_RESULT_LIMIT: usize = 20;
 const MAX_GRAPH_RESULT_LIMIT: usize = 50;
 const DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT: usize = 5;
@@ -104,6 +106,7 @@ const DEFAULT_SPEC_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_AGENT_TOOL_TIMEOUT_MS: u64 = 10_000;
 const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
+const MAX_COMMAND_PIPE_MESSAGES_PER_DRAIN: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
@@ -848,8 +851,10 @@ pub(crate) fn run_command_with_timeout(
     let started = Instant::now();
     let deadline = started + timeout;
     let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
-    let mut stdout_output = Vec::new();
-    let mut stderr_output = Vec::new();
+    let mut stdout_capture = CommandStreamCapture::default();
+    let mut stderr_capture = CommandStreamCapture::default();
+    let mut delta_budget =
+        CommandDeltaBudget::new(output_limits.and_then(|limits| limits.output_delta_bytes));
     let mut stdout_complete = false;
     let mut stderr_complete = false;
     let mut exit_status = None;
@@ -872,11 +877,13 @@ pub(crate) fn run_command_with_timeout(
             &command_label,
             &stdout_handle,
             ToolOutputStream::Stdout,
-            &mut stdout_output,
+            &mut stdout_capture,
             &mut stdout_complete,
             pid,
             output_sink,
+            &mut delta_budget,
             output_limits.and_then(|limits| limits.stdout_bytes),
+            output_limits.is_some_and(|limits| limits.truncate),
         ) {
             let _ = child.kill();
             let _ = child.wait();
@@ -886,11 +893,13 @@ pub(crate) fn run_command_with_timeout(
             &command_label,
             &stderr_handle,
             ToolOutputStream::Stderr,
-            &mut stderr_output,
+            &mut stderr_capture,
             &mut stderr_complete,
             pid,
             output_sink,
+            &mut delta_budget,
             output_limits.and_then(|limits| limits.stderr_bytes),
+            output_limits.is_some_and(|limits| limits.truncate),
         ) {
             let _ = child.kill();
             let _ = child.wait();
@@ -911,8 +920,13 @@ pub(crate) fn run_command_with_timeout(
                 return Ok(CommandRunOutput {
                     pid,
                     status,
-                    stdout: stdout_output,
-                    stderr: stderr_output,
+                    stdout: stdout_capture.output,
+                    stderr: stderr_capture.output,
+                    stdout_bytes: stdout_capture.observed_bytes,
+                    stderr_bytes: stderr_capture.observed_bytes,
+                    stdout_truncated: stdout_capture.truncated,
+                    stderr_truncated: stderr_capture.truncated,
+                    output_delta_truncated: delta_budget.truncated,
                 });
             }
         }
@@ -941,12 +955,42 @@ pub(crate) struct CommandRunOutput {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+    pub(crate) stdout_bytes: usize,
+    pub(crate) stderr_bytes: usize,
+    pub(crate) stdout_truncated: bool,
+    pub(crate) stderr_truncated: bool,
+    pub(crate) output_delta_truncated: bool,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct CommandOutputLimits {
     pub(crate) stdout_bytes: Option<usize>,
     pub(crate) stderr_bytes: Option<usize>,
+    pub(crate) output_delta_bytes: Option<usize>,
+    pub(crate) truncate: bool,
+}
+
+#[derive(Default)]
+struct CommandStreamCapture {
+    output: Vec<u8>,
+    observed_bytes: usize,
+    truncated: bool,
+}
+
+struct CommandDeltaBudget {
+    max_bytes: Option<usize>,
+    emitted_bytes: usize,
+    truncated: bool,
+}
+
+impl CommandDeltaBudget {
+    fn new(max_bytes: Option<usize>) -> Self {
+        Self {
+            max_bytes,
+            emitted_bytes: 0,
+            truncated: false,
+        }
+    }
 }
 
 enum CommandPipeMessage {
@@ -958,7 +1002,7 @@ fn read_command_pipe<T>(mut pipe: T) -> mpsc::Receiver<io::Result<CommandPipeMes
 where
     T: Read + Send + 'static,
 {
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         loop {
@@ -985,38 +1029,54 @@ where
     rx
 }
 
+const COMMAND_OUTPUT_DELTA_TRUNCATION_NOTICE: &str =
+    "\n[command output truncated: further stdout/stderr output omitted]\n";
+
 fn drain_command_pipe(
     command: &str,
     receiver: &mpsc::Receiver<io::Result<CommandPipeMessage>>,
     stream: ToolOutputStream,
-    output: &mut Vec<u8>,
+    capture: &mut CommandStreamCapture,
     complete: &mut bool,
     pid: u32,
     output_sink: Option<&dyn ToolOutputSink>,
+    delta_budget: &mut CommandDeltaBudget,
     output_limit: Option<usize>,
+    truncate_at_limit: bool,
 ) -> Result<(), ToolRuntimeError> {
     if *complete {
         return Ok(());
     }
 
-    loop {
+    for _ in 0..MAX_COMMAND_PIPE_MESSAGES_PER_DRAIN {
         match receiver.try_recv() {
             Ok(Ok(CommandPipeMessage::Chunk(chunk))) => {
-                if let Some(output_sink) = output_sink {
-                    output_sink.output_chunk(ToolOutputChunk {
-                        stream: stream.clone(),
-                        text: String::from_utf8_lossy(&chunk).to_string(),
-                    });
+                capture.observed_bytes = capture.observed_bytes.saturating_add(chunk.len());
+                let visible_chunk = if truncate_at_limit {
+                    let remaining = output_limit
+                        .map(|limit| limit.saturating_sub(capture.output.len()))
+                        .unwrap_or(chunk.len());
+                    if chunk.len() > remaining {
+                        capture.truncated = true;
+                    }
+                    &chunk[..chunk.len().min(remaining)]
+                } else {
+                    chunk.as_slice()
+                };
+                capture.output.extend_from_slice(visible_chunk);
+                emit_command_output_delta(output_sink, &stream, visible_chunk, delta_budget);
+                if capture.truncated {
+                    emit_command_output_truncation_notice(output_sink, &stream, delta_budget);
                 }
-                output.extend_from_slice(&chunk);
-                if let Some(limit) = output_limit
-                    && output.len() > limit
+                if !truncate_at_limit
+                    && let Some(limit) = output_limit
+                    && capture.output.len() > limit
                 {
                     return Err(ToolRuntimeError::CommandOutputTooLarge {
                         command: command.to_string(),
                         pid,
                         stream: stream.clone(),
-                        bytes: output.len(),
+                        bytes: capture.output.len(),
                         max_bytes: limit,
                     });
                 }
@@ -1042,6 +1102,71 @@ fn drain_command_pipe(
             }
         }
     }
+    Ok(())
+}
+
+fn emit_command_output_delta(
+    output_sink: Option<&dyn ToolOutputSink>,
+    stream: &ToolOutputStream,
+    chunk: &[u8],
+    budget: &mut CommandDeltaBudget,
+) {
+    let Some(output_sink) = output_sink else {
+        return;
+    };
+    if chunk.is_empty() || budget.truncated {
+        return;
+    }
+
+    let text = String::from_utf8_lossy(chunk);
+    let remaining = budget
+        .max_bytes
+        .map(|limit| limit.saturating_sub(budget.emitted_bytes))
+        .unwrap_or(text.len());
+    let notice_reserve = budget
+        .max_bytes
+        .map(|_| COMMAND_OUTPUT_DELTA_TRUNCATION_NOTICE.len().min(remaining))
+        .unwrap_or(0);
+    let content_budget = remaining.saturating_sub(notice_reserve);
+    let (visible_text, truncated) = output_budget::bounded_utf8_prefix(&text, content_budget);
+    if !visible_text.is_empty() {
+        output_sink.output_chunk(ToolOutputChunk {
+            stream: stream.clone(),
+            text: visible_text.to_string(),
+        });
+        budget.emitted_bytes = budget.emitted_bytes.saturating_add(visible_text.len());
+    }
+    if truncated {
+        emit_command_output_truncation_notice(Some(output_sink), stream, budget);
+    }
+}
+
+fn emit_command_output_truncation_notice(
+    output_sink: Option<&dyn ToolOutputSink>,
+    stream: &ToolOutputStream,
+    budget: &mut CommandDeltaBudget,
+) {
+    let Some(output_sink) = output_sink else {
+        return;
+    };
+    if budget.truncated {
+        return;
+    }
+
+    let remaining = budget
+        .max_bytes
+        .map(|limit| limit.saturating_sub(budget.emitted_bytes))
+        .unwrap_or(COMMAND_OUTPUT_DELTA_TRUNCATION_NOTICE.len());
+    let (notice, _) =
+        output_budget::bounded_utf8_prefix(COMMAND_OUTPUT_DELTA_TRUNCATION_NOTICE, remaining);
+    if !notice.is_empty() {
+        output_sink.output_chunk(ToolOutputChunk {
+            stream: stream.clone(),
+            text: notice.to_string(),
+        });
+        budget.emitted_bytes = budget.emitted_bytes.saturating_add(notice.len());
+    }
+    budget.truncated = true;
 }
 
 fn remaining_until(deadline: Instant) -> Option<Duration> {
@@ -1086,7 +1211,24 @@ mod tests {
         WorkspaceDatabase,
     };
     use serde_json::json;
-    use std::collections::BTreeSet;
+    use std::{
+        collections::BTreeSet,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct CountingOutputSink {
+        bytes: Arc<AtomicUsize>,
+        truncation_notices: Arc<AtomicUsize>,
+    }
+
+    impl ToolOutputSink for CountingOutputSink {
+        fn output_chunk(&self, chunk: ToolOutputChunk) {
+            self.bytes.fetch_add(chunk.text.len(), Ordering::Relaxed);
+            if chunk.text.contains(COMMAND_OUTPUT_DELTA_TRUNCATION_NOTICE) {
+                self.truncation_notices.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
 
     #[test]
     fn rejects_paths_outside_workspace() {
@@ -3332,6 +3474,67 @@ mod tests {
     }
 
     #[test]
+    fn command_output_delta_budget_counts_lossy_utf8_bytes() {
+        let streamed_bytes = Arc::new(AtomicUsize::new(0));
+        let truncation_notices = Arc::new(AtomicUsize::new(0));
+        let sink = CountingOutputSink {
+            bytes: streamed_bytes.clone(),
+            truncation_notices: truncation_notices.clone(),
+        };
+        let mut budget = CommandDeltaBudget::new(Some(1_024));
+
+        emit_command_output_delta(
+            Some(&sink),
+            &ToolOutputStream::Stdout,
+            &vec![0xff; 4_096],
+            &mut budget,
+        );
+
+        assert!(streamed_bytes.load(Ordering::Relaxed) <= 1_024);
+        assert_eq!(truncation_notices.load(Ordering::Relaxed), 1);
+        assert!(budget.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_caps_captured_and_streamed_output_without_failing() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let streamed_bytes = Arc::new(AtomicUsize::new(0));
+        let truncation_notices = Arc::new(AtomicUsize::new(0));
+        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+            workspace.path(),
+            None,
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": ["-c", "head -c 60000 /dev/zero | tr '\\0' x"],
+                "cwd": null,
+                "timeoutMs": null
+            }),
+            None,
+            Some(Arc::new(CountingOutputSink {
+                bytes: streamed_bytes.clone(),
+                truncation_notices: truncation_notices.clone(),
+            })),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["stdoutTruncated"], true);
+        assert_eq!(result.output["outputDeltaTruncated"], true);
+        assert_eq!(result.output["outputOmitted"], true);
+        assert_eq!(result.output["retryUnsafe"], true);
+        assert_eq!(result.output["stdoutBytes"], 60_000);
+        assert!(
+            result.output["stdout"].as_str().expect("stdout").len()
+                <= MAX_COMMAND_CAPTURE_BYTES_PER_STREAM
+        );
+        assert!(
+            streamed_bytes.load(Ordering::Relaxed) <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+        assert_eq!(truncation_notices.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn run_command_can_return_workspace_git_diff() {
         let workspace = tempfile::tempdir().expect("workspace");
         run_test_command(workspace.path(), "git", &["init"]);
@@ -3508,6 +3711,70 @@ mod tests {
                 .expect("stdout")
                 .contains("note.txt")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_timeout_remains_responsive_during_continuous_stdout() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let started = Instant::now();
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": ["-c", "while :; do printf '0123456789abcdef'; done"],
+                "cwd": null,
+                "timeoutMs": 100
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .expect("timeout error")
+                .contains("timed out")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_cancellation_remains_responsive_during_continuous_stdout() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cancellation = ToolCancellationToken::default();
+        let cancellation_trigger = cancellation.clone();
+        let started = Instant::now();
+        let trigger = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            cancellation_trigger.cancel();
+        });
+
+        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+            workspace.path(),
+            None,
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": ["-c", "while :; do printf '0123456789abcdef'; done"],
+                "cwd": null,
+                "timeoutMs": 5_000
+            }),
+            Some(cancellation),
+            None,
+        );
+        trigger.join().expect("join cancellation trigger");
+
+        assert!(result.is_error);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .expect("cancellation error")
+                .contains("cancelled")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
