@@ -63,4 +63,5 @@ winresource.workspace = true
 foco-mcp = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 rand = { version = "0.10", features = ["thread_rng"] }
+rusqlite.workspace = true
 tower = { version = "0.5", features = ["util"] }

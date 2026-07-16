@@ -76,13 +76,13 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    Migration,
+    MIGRATION_039, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 38;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 39;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -396,6 +396,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 38,
         sql: MIGRATION_038,
+    },
+    Migration {
+        version: 39,
+        sql: MIGRATION_039,
     },
 ];
 
@@ -15316,6 +15320,10 @@ fn run_migrations(
                         "llm_requests",
                         "thinking_level",
                     )?
+            }
+            39 => {
+                !table_exists(&transaction, database_path, "workspace_specs")?
+                    || !table_exists(&transaction, database_path, "chat_spec_snapshots")?
             }
             _ => false,
         };

@@ -102,6 +102,7 @@ use crate::{
         pack_neutral_messages, plan_llm_context_compression, plan_mode_builtin_tool_allowed,
         prepare_context_compression_snapshot, record_chat_completion_input_tokens,
         should_trigger_normal_llm_context_compression, tool_prompt_infos,
+        truncate_workspace_spec_markdown_for_prompt,
     },
     runtime::{
         BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
@@ -12334,16 +12335,20 @@ fn remote_project_spec_context_message(
     database: &WorkspaceDatabase,
     chat_id: &str,
 ) -> Result<Option<NeutralChatMessage>, axum::response::Response> {
-    if let Some(snapshot) = database
+    if let Some(mut snapshot) = database
         .chat_spec_snapshot(chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
     {
+        truncate_workspace_spec_markdown_for_prompt(
+            snapshot.spec_revision,
+            &mut snapshot.content_markdown,
+        );
         return Ok(remote_project_spec_message(
             snapshot.spec_revision,
             &snapshot.content_markdown,
         ));
     }
-    let Some(spec) = database
+    let Some(mut spec) = database
         .workspace_spec()
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
     else {
@@ -12358,6 +12363,7 @@ fn remote_project_spec_context_message(
     {
         return Ok(None);
     }
+    truncate_workspace_spec_markdown_for_prompt(spec.revision, &mut spec.content_markdown);
     Ok(remote_project_spec_message(
         spec.revision,
         &spec.content_markdown,

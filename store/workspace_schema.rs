@@ -1385,6 +1385,40 @@ ON memory_dream_jobs (scope)
 WHERE status IN ('queued', 'running');
 "#;
 
+// SQLite does not enforce VARCHAR(n) lengths. These triggers enforce the shared
+// 64 KiB UTF-8 byte limit even for callers that bypass the Rust store API.
+// Existing oversized rows remain readable so prompt assembly can recover by
+// truncating them; the triggers reject only future oversized writes.
+pub(crate) const MIGRATION_039: &str = r#"
+CREATE TRIGGER IF NOT EXISTS workspace_specs_markdown_bytes_insert
+BEFORE INSERT ON workspace_specs
+WHEN length(CAST(NEW.content_markdown AS BLOB)) > 65536
+BEGIN
+    SELECT RAISE(ABORT, 'workspace spec Markdown exceeds 65536 bytes');
+END;
+
+CREATE TRIGGER IF NOT EXISTS workspace_specs_markdown_bytes_update
+BEFORE UPDATE OF content_markdown ON workspace_specs
+WHEN length(CAST(NEW.content_markdown AS BLOB)) > 65536
+BEGIN
+    SELECT RAISE(ABORT, 'workspace spec Markdown exceeds 65536 bytes');
+END;
+
+CREATE TRIGGER IF NOT EXISTS chat_spec_snapshots_markdown_bytes_insert
+BEFORE INSERT ON chat_spec_snapshots
+WHEN length(CAST(NEW.content_markdown AS BLOB)) > 65536
+BEGIN
+    SELECT RAISE(ABORT, 'chat spec snapshot Markdown exceeds 65536 bytes');
+END;
+
+CREATE TRIGGER IF NOT EXISTS chat_spec_snapshots_markdown_bytes_update
+BEFORE UPDATE OF content_markdown ON chat_spec_snapshots
+WHEN length(CAST(NEW.content_markdown AS BLOB)) > 65536
+BEGIN
+    SELECT RAISE(ABORT, 'chat spec snapshot Markdown exceeds 65536 bytes');
+END;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

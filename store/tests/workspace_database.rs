@@ -606,6 +606,127 @@ fn workspace_spec_content_update_rejects_stale_revision() {
 }
 
 #[test]
+fn workspace_spec_trigger_rejects_oversized_direct_sql_update_by_utf8_bytes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .upsert_workspace_spec_settings(true, true)
+        .expect("settings save");
+    database
+        .update_workspace_spec_content(0, "# Project Spec\n\nValid")
+        .expect("spec save")
+        .expect("saved spec");
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let oversized = "界".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES / 3 + 1);
+    let connection = Connection::open(database_path).expect("raw connection");
+    let error = connection
+        .execute(
+            "UPDATE workspace_specs SET content_markdown = ?1 WHERE id = 'default'",
+            params![oversized],
+        )
+        .expect_err("direct oversized update must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("workspace spec Markdown exceeds 65536 bytes")
+    );
+}
+
+#[test]
+fn chat_spec_snapshot_trigger_rejects_oversized_direct_sql_update() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database.insert_chat("chat-1", "Chat").expect("chat insert");
+    database
+        .insert_chat_spec_snapshot("chat-1", 1, "# Project Spec\n\nValid")
+        .expect("snapshot insert");
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let connection = Connection::open(database_path).expect("raw connection");
+    let error = connection
+        .execute(
+            "UPDATE chat_spec_snapshots SET content_markdown = ?1 WHERE chat_id = 'chat-1'",
+            params!["x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1)],
+        )
+        .expect_err("direct oversized snapshot update must fail");
+
+    assert!(
+        error
+            .to_string()
+            .contains("chat spec snapshot Markdown exceeds 65536 bytes")
+    );
+}
+
+#[test]
+fn migration_039_preserves_existing_oversized_spec_and_blocks_future_oversized_writes() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .upsert_workspace_spec_settings(true, true)
+        .expect("settings save");
+    database
+        .update_workspace_spec_content(0, "# Project Spec\n\nValid")
+        .expect("spec save")
+        .expect("saved spec");
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let oversized = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1);
+    {
+        let connection = Connection::open(&database_path).expect("raw v38 connection");
+        connection
+            .execute_batch(
+                r#"
+                DROP TRIGGER workspace_specs_markdown_bytes_insert;
+                DROP TRIGGER workspace_specs_markdown_bytes_update;
+                DROP TRIGGER chat_spec_snapshots_markdown_bytes_insert;
+                DROP TRIGGER chat_spec_snapshots_markdown_bytes_update;
+                PRAGMA user_version = 38;
+                "#,
+            )
+            .expect("simulate v38 schema");
+        connection
+            .execute(
+                "UPDATE workspace_specs SET content_markdown = ?1 WHERE id = 'default'",
+                params![oversized],
+            )
+            .expect("seed legacy oversized spec");
+    }
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrate to 39");
+    let current = database
+        .workspace_spec()
+        .expect("current spec")
+        .expect("spec row");
+    assert_eq!(
+        current.content_markdown.len(),
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1
+    );
+    drop(database);
+
+    let connection = Connection::open(database_path).expect("post-migration connection");
+    let error = connection
+        .execute(
+            "UPDATE workspace_specs SET content_markdown = ?1 WHERE id = 'default'",
+            params!["y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1)],
+        )
+        .expect_err("restored trigger must reject oversized update");
+    assert!(
+        error
+            .to_string()
+            .contains("workspace spec Markdown exceeds 65536 bytes")
+    );
+}
+
+#[test]
 fn delete_plan_removes_plan_graph_and_reports_missing() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

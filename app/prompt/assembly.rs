@@ -13,6 +13,7 @@ use crate::runtime::{
 use crate::*;
 use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
 use foco_store::memory::MEMORY_DREAM_TRANSCRIPT_CHAT_KIND;
+use foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES;
 
 pub(crate) async fn prepare_prompt_context(
     state: &AppState,
@@ -663,12 +664,16 @@ fn project_spec_prompt_context(
     chat_id: Option<&str>,
     purpose: PromptAssemblyPurpose,
 ) -> Result<ProjectSpecPromptContext, ApiError> {
-    if let Some(snapshot) = chat_id
+    if let Some(mut snapshot) = chat_id
         .map(|chat_id| database.chat_spec_snapshot(chat_id))
         .transpose()
         .map_err(ApiError::from_workspace_error)?
         .flatten()
     {
+        truncate_workspace_spec_markdown_for_prompt(
+            snapshot.spec_revision,
+            &mut snapshot.content_markdown,
+        );
         return Ok(ProjectSpecPromptContext {
             message: project_spec_context_message(
                 snapshot.spec_revision,
@@ -698,12 +703,13 @@ fn project_spec_prompt_context(
         });
     }
 
-    let Some(spec) = spec else {
+    let Some(mut spec) = spec else {
         return Ok(ProjectSpecPromptContext {
             message: None,
             pending_snapshot: None,
         });
     };
+    truncate_workspace_spec_markdown_for_prompt(spec.revision, &mut spec.content_markdown);
     let message = project_spec_context_message(spec.revision, &spec.content_markdown);
     let pending_snapshot =
         if message.is_some() && purpose.allows_spec_snapshot_persistence() && chat_id.is_some() {
@@ -719,6 +725,29 @@ fn project_spec_prompt_context(
         message,
         pending_snapshot,
     })
+}
+
+pub(crate) fn truncate_workspace_spec_markdown_for_prompt(
+    revision: u64,
+    content_markdown: &mut String,
+) {
+    if content_markdown.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+        return;
+    }
+
+    let original_bytes = content_markdown.len();
+    let mut end = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES;
+    while !content_markdown.is_char_boundary(end) {
+        end -= 1;
+    }
+    content_markdown.truncate(end);
+    tracing::warn!(
+        revision,
+        original_bytes,
+        injected_bytes = content_markdown.len(),
+        max_bytes = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        "oversized workspace spec truncated for prompt injection"
+    );
 }
 
 fn project_spec_context_message(
@@ -739,4 +768,30 @@ fn project_spec_context_message(
             markdown_code_block("markdown", content_markdown)
         ),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_spec_prompt_truncation_preserves_utf8_boundary() {
+        let mut content = format!(
+            "{}界tail",
+            "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES - 1)
+        );
+
+        truncate_workspace_spec_markdown_for_prompt(7, &mut content);
+
+        assert_eq!(content.len(), WORKSPACE_SPEC_MAX_MARKDOWN_BYTES - 1);
+    }
+
+    #[test]
+    fn workspace_spec_prompt_truncation_keeps_content_at_limit() {
+        let mut content = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+
+        truncate_workspace_spec_markdown_for_prompt(7, &mut content);
+
+        assert_eq!(content.len(), WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+    }
 }

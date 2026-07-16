@@ -42,7 +42,8 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger,
-        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
+        WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -50,6 +51,7 @@ use foco_tools::{
     ToolCancellationToken, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
 };
 use futures_util::StreamExt;
+use rusqlite::{Connection, params};
 use serde_json::json;
 
 use crate::http::{
@@ -21588,6 +21590,83 @@ async fn prepare_chat_context_snapshots_project_spec_for_new_chat_and_followup()
         .expect("project spec message");
     assert!(second_spec.content.contains("Version one"));
     assert!(!second_spec.content.contains("Version two"));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_chat_context_truncates_oversized_legacy_project_spec_for_new_chat() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-project-spec-truncation-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-project-spec-truncation-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("spec settings");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\nValid")
+            .expect("spec content");
+    }
+    {
+        let connection = Connection::open(workspace_database_path(&workspace_dir))
+            .expect("raw workspace connection");
+        connection
+            .execute_batch("DROP TRIGGER workspace_specs_markdown_bytes_update;")
+            .expect("simulate legacy write path");
+        connection
+            .execute(
+                "UPDATE workspace_specs SET content_markdown = ?1 WHERE id = 'default'",
+                params![format!(
+                    "{}界tail",
+                    "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES - 1)
+                )],
+            )
+            .expect("seed oversized legacy spec");
+    }
+
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            skill_ids: None,
+            session_mode: None,
+            message: "start despite oversized spec".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let current = database
+        .workspace_spec()
+        .expect("workspace spec")
+        .expect("workspace spec row");
+    assert!(current.content_markdown.len() > WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+    let snapshot = database
+        .chat_spec_snapshot(&context.chat_id)
+        .expect("chat spec snapshot")
+        .expect("snapshot exists");
+    assert_eq!(
+        snapshot.content_markdown.len(),
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES - 1
+    );
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
