@@ -3,6 +3,16 @@
 @import "@fontsource/big-shoulders-display/latin-700.css";
 @import "@fontsource/big-shoulders-display/latin-500.css";
 
+/* Terminal-only bundled Cascadia Mono PL (does not set global UI fonts). */
+@font-face {
+  font-family: "Foco Cascadia Mono PL";
+  src: url("./assets/fonts/cascadia-code/CascadiaMonoPL-Regular.woff2")
+    format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: block;
+}
+
 :root {
   color: var(--foco-text, #14110b);
   background: var(--foco-canvas, #f5f1ea);

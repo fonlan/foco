@@ -1,0 +1,14 @@
+Cascadia Mono PL (bundled for the Foco terminal panel)
+
+Upstream project: Microsoft Cascadia Code
+Release tag: v2407.24
+Release name: Cascadia Code 2407.24
+Release page: https://github.com/microsoft/cascadia-code/releases/tag/v2407.24
+Download URL: https://github.com/microsoft/cascadia-code/releases/download/v2407.24/CascadiaCode-2407.24.zip
+Extracted path in archive: woff2/static/CascadiaMonoPL-Regular.woff2
+Bundled file: CascadiaMonoPL-Regular.woff2
+License: SIL Open Font License 1.1 (see OFL.txt)
+Upstream license: https://github.com/microsoft/cascadia-code/blob/main/LICENSE
+
+Only the Regular static WOFF2 for Cascadia Mono PL is vendored. Other weights,
+italics, Cascadia Code, and Nerd Font variants are intentionally omitted.

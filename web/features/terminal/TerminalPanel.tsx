@@ -23,6 +23,35 @@ import type {
 import { useI18n } from "../../shared/i18n";
 import { fallbackTerminalInputForKeyEvent } from "./terminal-key-events";
 
+/** Project-scoped CSS family for the bundled Cascadia Mono PL Regular face. */
+const TERMINAL_PRIMARY_FONT_FAMILY = "Foco Cascadia Mono PL";
+
+/** xterm font stack: bundled face first, then system/local fallbacks. */
+const TERMINAL_FONT_FAMILY = [
+  `"${TERMINAL_PRIMARY_FONT_FAMILY}"`,
+  '"Cascadia Mono PL"',
+  '"Cascadia Mono"',
+  "Consolas",
+  "monospace",
+].join(", ");
+
+/**
+ * Wait for the bundled terminal font when Font Loading API is available.
+ * Failures and missing API resolve immediately so the terminal still opens
+ * with system fallbacks.
+ */
+async function waitForTerminalFontReady(): Promise<void> {
+  if (typeof document === "undefined" || !document.fonts?.load) {
+    return;
+  }
+
+  try {
+    await document.fonts.load(`400 13px "${TERMINAL_PRIMARY_FONT_FAMILY}"`);
+  } catch {
+    // Keep going with fallback fonts.
+  }
+}
+
 function TerminalCommandButton({
   commands,
   disabled,
@@ -438,7 +467,7 @@ function TerminalSessionPane({
     const terminal = new XTerm({
       allowProposedApi: false,
       cursorBlink: true,
-      fontFamily: "Cascadia Mono, Consolas, monospace",
+      fontFamily: TERMINAL_FONT_FAMILY,
       fontSize: 13,
       rows: 12,
       theme: {
@@ -449,156 +478,167 @@ function TerminalSessionPane({
     });
     const fitAddon = new FitAddon();
     let socket: WebSocket | null = null;
+    let inputDisposable: { dispose: () => void } | null = null;
+    let observer: ResizeObserver | null = null;
 
     xtermRef.current = terminal;
     fitAddonRef.current = fitAddon;
     terminal.loadAddon(fitAddon);
     onUpdate(clientId, { error: null, status: "connecting" });
 
-    if (!containerRef.current) {
-      onUpdate(clientId, {
-        error: tRef.current("Terminal container was not mounted."),
-        status: "error",
-      });
-      terminal.dispose();
-      return;
-    }
-
-    terminal.open(containerRef.current);
-    fitAddon.fit();
-
-    const sendResize = () => {
-      if (socket?.readyState !== WebSocket.OPEN) {
+    async function startTerminal() {
+      await waitForTerminalFontReady();
+      if (cancelled) {
         return;
       }
 
-      socket.send(
-        JSON.stringify({
-          type: "resize",
-          cols: terminal.cols,
-          rows: terminal.rows,
-        }),
-      );
-    };
+      if (!containerRef.current) {
+        onUpdate(clientId, {
+          error: tRef.current("Terminal container was not mounted."),
+          status: "error",
+        });
+        terminal.dispose();
+        return;
+      }
 
-    const observer = new ResizeObserver(() => {
+      terminal.open(containerRef.current);
       fitAddon.fit();
-      sendResize();
-    });
-    observer.observe(containerRef.current);
-    resizeObserverRef.current = observer;
 
-    terminal.attachCustomKeyEventHandler((event) => {
-      // ponytail: narrow fallback for plain Backspace only; not a custom keymap system.
-      const fallbackInput = fallbackTerminalInputForKeyEvent(event);
-      if (fallbackInput !== null) {
-        sendTerminalInput(fallbackInput);
-        return false;
-      }
-
-      return true;
-    });
-
-    const inputDisposable = terminal.onData((data) => {
-      sendTerminalInput(data);
-    });
-
-    async function connectTerminal() {
-      if (!workspaceId) {
-        return;
-      }
-
-      try {
-        const serverSession = await requestJson<TerminalSessionResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/terminal/session`,
-          { method: "POST" },
-        );
-        if (cancelled) {
+      const sendResize = () => {
+        if (socket?.readyState !== WebSocket.OPEN) {
           return;
         }
 
-        onUpdate(clientId, {
-          cwd: serverSession.workingDirectory,
-          serverSessionId: serverSession.id,
-        });
-        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-        socket = new WebSocket(
-          `${protocol}//${window.location.host}/api/workspaces/${encodeURIComponent(
-            workspaceId,
-          )}/terminal/${encodeURIComponent(serverSession.id)}/ws?cols=${terminal.cols}&rows=${terminal.rows}`,
+        socket.send(
+          JSON.stringify({
+            type: "resize",
+            cols: terminal.cols,
+            rows: terminal.rows,
+          }),
         );
-        socketRef.current = socket;
+      };
 
-        socket.onopen = () => {
-          onUpdate(clientId, { status: "connected" });
-          sendResize();
-          if (isActiveRef.current) {
-            terminal.focus();
-          }
-        };
-        socket.onmessage = (event) => {
-          const parsed = JSON.parse(event.data as string) as unknown;
-          if (!isTerminalServerEvent(parsed)) {
-            onUpdate(clientId, {
-              error: tRef.current("Terminal returned an unknown event."),
-              status: "error",
-            });
+      observer = new ResizeObserver(() => {
+        fitAddon.fit();
+        sendResize();
+      });
+      observer.observe(containerRef.current);
+      resizeObserverRef.current = observer;
+
+      terminal.attachCustomKeyEventHandler((event) => {
+        // ponytail: narrow fallback for plain Backspace only; not a custom keymap system.
+        const fallbackInput = fallbackTerminalInputForKeyEvent(event);
+        if (fallbackInput !== null) {
+          sendTerminalInput(fallbackInput);
+          return false;
+        }
+
+        return true;
+      });
+
+      inputDisposable = terminal.onData((data) => {
+        sendTerminalInput(data);
+      });
+
+      async function connectTerminal() {
+        if (!workspaceId) {
+          return;
+        }
+
+        try {
+          const serverSession = await requestJson<TerminalSessionResponse>(
+            `/api/workspaces/${encodeURIComponent(workspaceId)}/terminal/session`,
+            { method: "POST" },
+          );
+          if (cancelled) {
             return;
           }
 
-          if (parsed.type === "started" || parsed.type === "cwd") {
-            onUpdate(clientId, { cwd: parsed.cwd });
-            return;
-          }
+          onUpdate(clientId, {
+            cwd: serverSession.workingDirectory,
+            serverSessionId: serverSession.id,
+          });
+          const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+          socket = new WebSocket(
+            `${protocol}//${window.location.host}/api/workspaces/${encodeURIComponent(
+              workspaceId,
+            )}/terminal/${encodeURIComponent(serverSession.id)}/ws?cols=${terminal.cols}&rows=${terminal.rows}`,
+          );
+          socketRef.current = socket;
 
-          if (parsed.type === "output") {
-            terminal.write(parsed.data);
-            return;
-          }
+          socket.onopen = () => {
+            onUpdate(clientId, { status: "connected" });
+            sendResize();
+            if (isActiveRef.current) {
+              terminal.focus();
+            }
+          };
+          socket.onmessage = (event) => {
+            const parsed = JSON.parse(event.data as string) as unknown;
+            if (!isTerminalServerEvent(parsed)) {
+              onUpdate(clientId, {
+                error: tRef.current("Terminal returned an unknown event."),
+                status: "error",
+              });
+              return;
+            }
 
-          if (parsed.type === "exit") {
-            onUpdate(clientId, { status: "closed" });
+            if (parsed.type === "started" || parsed.type === "cwd") {
+              onUpdate(clientId, { cwd: parsed.cwd });
+              return;
+            }
+
+            if (parsed.type === "output") {
+              terminal.write(parsed.data);
+              return;
+            }
+
+            if (parsed.type === "exit") {
+              onUpdate(clientId, { status: "closed" });
+              terminal.writeln(
+                `\r\n[${tRef.current("terminal exited: {status}", {
+                  status: parsed.status,
+                })}]`,
+              );
+              return;
+            }
+
+            onUpdate(clientId, { error: parsed.message, status: "error" });
             terminal.writeln(
-              `\r\n[${tRef.current("terminal exited: {status}", {
-                status: parsed.status,
+              `\r\n[${tRef.current("terminal error: {message}", {
+                message: parsed.message,
               })}]`,
             );
-            return;
+          };
+          socket.onerror = () => {
+            onUpdate(clientId, {
+              error: tRef.current("Terminal WebSocket failed."),
+              status: "error",
+            });
+          };
+          socket.onclose = () => {
+            markClosed(clientId);
+          };
+        } catch (requestError) {
+          if (!cancelled) {
+            const message = errorMessage(requestError);
+            onUpdate(clientId, { error: message, status: "error" });
+            terminal.writeln(
+              `[${tRef.current("terminal error: {message}", { message })}]`,
+            );
           }
-
-          onUpdate(clientId, { error: parsed.message, status: "error" });
-          terminal.writeln(
-            `\r\n[${tRef.current("terminal error: {message}", {
-              message: parsed.message,
-            })}]`,
-          );
-        };
-        socket.onerror = () => {
-          onUpdate(clientId, {
-            error: tRef.current("Terminal WebSocket failed."),
-            status: "error",
-          });
-        };
-        socket.onclose = () => {
-          markClosed(clientId);
-        };
-      } catch (requestError) {
-        if (!cancelled) {
-          const message = errorMessage(requestError);
-          onUpdate(clientId, { error: message, status: "error" });
-          terminal.writeln(
-            `[${tRef.current("terminal error: {message}", { message })}]`,
-          );
         }
       }
+
+      void connectTerminal();
     }
 
-    void connectTerminal();
+    void startTerminal();
 
     return () => {
       cancelled = true;
-      inputDisposable.dispose();
-      observer.disconnect();
+      inputDisposable?.dispose();
+      observer?.disconnect();
       socket?.close();
       terminal.dispose();
       socketRef.current = null;
