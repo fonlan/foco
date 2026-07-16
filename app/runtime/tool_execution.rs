@@ -3668,6 +3668,176 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    /// Absolute path inside the current execution root is internal: no ask_question and
+    /// `allow_external_read_access=false` when shared root equals tool root. Guards against
+    /// reclassifying internal absolute paths as external (which would reintroduce the
+    /// "path must be relative to the workspace" / dual-resolver gap).
+    #[tokio::test]
+    async fn read_file_external_access_skips_question_for_absolute_internal_workspace_file() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let inside = workspace.path().join("inside-abs.txt");
+        fs::write(&inside, "absolute inside").expect("write inside");
+        let absolute = fs::canonicalize(&inside).expect("canonicalize inside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-abs-inside-{}", unique_id("case"));
+        let arguments = json!({
+            "path": absolute.to_string_lossy(),
+            "startLine": null,
+            "endLine": null,
+            "timeoutMs": 5000
+        });
+
+        // shared == tool: classifier must treat absolute internal path as non-external.
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-abs-inside",
+            READ_FILE_TOOL,
+            &arguments,
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("absolute internal access check");
+        assert!(
+            !allowed,
+            "absolute internal path must not set allow_external_read_access"
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "absolute internal path must not emit questionRequest"
+        );
+
+        // End-to-end execute_tool: reads without external flag and without question.
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let output = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &HookConfig::default(),
+            true,
+            &config,
+            Some(&ProviderConnectionConfig {
+                kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+                    .expect("provider kind"),
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+                request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
+            }),
+            &WebSearchSettings::default(),
+            registry,
+            event_tx,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-abs-inside".to_string(),
+                tool_call_id: "call-abs-inside-exec".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            None,
+            "run-abs-inside",
+            "model-1",
+            "provider-1",
+            0,
+            "call-abs-inside-exec",
+            READ_FILE_TOOL,
+            arguments,
+        )
+        .await;
+
+        assert!(!output.execution.is_error, "{:?}", output.execution.output);
+        assert_eq!(output.execution.output["content"], "1\tabsolute inside");
+        assert!(
+            event_rx.try_recv().is_err(),
+            "execute_tool absolute internal read must not emit questionRequest"
+        );
+    }
+
+    /// Workspace-surface symlink that canonicalizes outside must stay external (prompted)
+    /// even when shared == tool and the absolute path string is under the workspace root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_external_access_treats_absolute_workspace_symlink_escape_as_external() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_file = outside.path().join("escaped.txt");
+        fs::write(&outside_file, "escaped").expect("write outside");
+        let link_path = workspace.path().join("escape-link.txt");
+        symlink(&outside_file, &link_path).expect("create symlink");
+        // Absolute path string lives under workspace; canonicalize follows the link.
+        let absolute_under_workspace = fs::canonicalize(workspace.path())
+            .expect("canon workspace")
+            .join("escape-link.txt");
+
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-external-access-symlink-escape-{}", unique_id("case"));
+        let arguments = json!({
+            "path": absolute_under_workspace.to_string_lossy(),
+            "startLine": null,
+            "endLine": null
+        });
+
+        let access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-escape",
+            READ_FILE_TOOL,
+            &arguments,
+            ToolCancellationToken::default(),
+        );
+        let (request, denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            access
+        );
+        let outside_display = outside_file.display().to_string();
+        assert!(
+            request.questions[0].question.contains(&outside_display)
+                || request.questions[0]
+                    .question
+                    .contains(&absolute_under_workspace.display().to_string()),
+            "symlink escape must prompt for external target"
+        );
+        assert!(
+            denied
+                .expect_err("symlink escape must not auto-allow as internal")
+                .contains("user denied read_file access")
+        );
+    }
+
     #[tokio::test]
     async fn read_file_external_access_skips_question_for_exact_attachment_file() {
         let workspace = tempfile::tempdir().expect("workspace");
