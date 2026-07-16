@@ -23951,6 +23951,15 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
 
         for request in [
             request(
+                "internal-spec-update-compaction",
+                &workspace_id,
+                "workspace spec update compaction",
+                950,
+                95,
+                "2026-07-06T10:00:06Z",
+                None,
+            ),
+            request(
                 "internal-spec-compaction",
                 &workspace_id,
                 "workspace spec compaction",
@@ -23966,6 +23975,15 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
                 800,
                 80,
                 "2026-07-06T10:00:04Z",
+                None,
+            ),
+            request(
+                "internal-spec-generation",
+                &workspace_id,
+                "workspace spec generation",
+                750,
+                75,
+                "2026-07-06T10:00:03.500Z",
                 None,
             ),
             request(

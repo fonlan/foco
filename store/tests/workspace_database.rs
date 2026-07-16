@@ -8278,6 +8278,14 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
 
     for request in [
         request(
+            "internal-spec-update-compaction",
+            "workspace spec update compaction",
+            900,
+            90,
+            "2026-07-06T10:00:07Z",
+            None,
+        ),
+        request(
             "internal-spec-compaction",
             "workspace spec compaction",
             800,
@@ -8291,6 +8299,14 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             700,
             70,
             "2026-07-06T10:00:05Z",
+            None,
+        ),
+        request(
+            "internal-spec-generation",
+            "workspace spec generation",
+            650,
+            65,
+            "2026-07-06T10:00:04.500Z",
             None,
         ),
         request(
@@ -8337,7 +8353,7 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
             ..LlmRequestAuditFilters::default()
         })
         .expect("all chat audit rows");
-    assert_eq!(all_chat_rows.len(), 6);
+    assert_eq!(all_chat_rows.len(), 8);
 
     let main_chat_filters = LlmRequestAuditFilters {
         chat_id: Some("chat-1"),
@@ -8423,6 +8439,44 @@ fn main_chat_llm_audit_filter_excludes_internal_requests_bound_to_chat() {
         .expect("request kind audit rows");
     assert_eq!(request_kind_rows.len(), 1);
     assert_eq!(request_kind_rows[0].id, "main-chat-request");
+
+    for request_kind in [
+        "workspace spec generation",
+        "workspace spec update",
+        "workspace spec compaction",
+        "workspace spec update compaction",
+    ] {
+        assert!(
+            MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS.contains(&request_kind),
+            "{request_kind} must stay in MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS"
+        );
+        let rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-1"),
+                request_kind: Some(request_kind),
+                exclude_request_kinds: &[],
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("explicit workspace spec kind rows");
+        assert_eq!(
+            rows.len(),
+            1,
+            "explicit requestKind={request_kind} must still find the audit row"
+        );
+        assert_eq!(rows[0].request_kind, request_kind);
+        assert!(
+            database
+                .llm_request_audit_rows(LlmRequestAuditFilters {
+                    chat_id: Some("chat-1"),
+                    request_kind: Some(request_kind),
+                    exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                    ..LlmRequestAuditFilters::default()
+                })
+                .expect("excluded workspace spec kind rows")
+                .is_empty(),
+            "default main-chat exclude must hide {request_kind}"
+        );
+    }
 }
 
 #[test]

@@ -49,9 +49,10 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
         NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
-        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -16662,6 +16663,84 @@ mod tests {
         app_task.abort();
     }
 
+    async fn wait_remote_sidecar_spec_job_status(
+        workspace_path: &Path,
+        job_id: &str,
+        expected: &str,
+    ) -> WorkspaceSpecJobRecord {
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let database =
+                WorkspaceDatabase::open_or_create(workspace_path).expect("reopen database");
+            let job = database
+                .workspace_spec_job(job_id)
+                .expect("read job")
+                .expect("job exists");
+            if job.status == expected {
+                return job;
+            }
+            if matches!(job.status.as_str(), "failed" | "skipped") {
+                panic!("job ended as {}: {:?}", job.status, job.error_message);
+            }
+        }
+        panic!("timed out waiting for remote sidecar spec job {job_id} to reach {expected}");
+    }
+
+    async fn next_broker_llm_stream_request(
+        broker_rx: &mut tokio::sync::broadcast::Receiver<ControlEnvelope>,
+    ) -> ControlEnvelope {
+        loop {
+            match broker_rx.recv().await {
+                Ok(envelope) if envelope.message_type == "request" => {
+                    assert_eq!(envelope.method.as_deref(), Some("llm.stream"));
+                    return envelope;
+                }
+                Ok(_) => continue,
+                Err(_) => panic!("broker channel closed"),
+            }
+        }
+    }
+
+    async fn answer_broker_spec_tool_call(
+        broker_pending: &Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<ControlEnvelope>>>>,
+        request: &ControlEnvelope,
+        tool_name: &str,
+        arguments: Value,
+    ) {
+        let request_id = request.id.clone().expect("broker request id");
+        let response = ControlEnvelope {
+            version: 1,
+            message_type: "response".to_string(),
+            id: Some(request_id.clone()),
+            method: None,
+            payload: json!({
+                "toolCalls": [{
+                    "callId": format!("tool-{request_id}"),
+                    "name": tool_name,
+                    "arguments": arguments
+                }],
+                "usage": null,
+                "llmRequestId": request_id.clone(),
+            }),
+            timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+        };
+        let tx = broker_pending
+            .lock()
+            .await
+            .remove(&request_id)
+            .expect("pending broker receiver");
+        tx.send(response).expect("send broker response");
+    }
+
+    fn remote_spec_runtime_bundle(
+        profile: &Path,
+        workspace_path: &Path,
+    ) -> crate::runtime::SidecarRuntimeConfigBundle {
+        let mut config = remote_test_config(workspace_path);
+        config.spec.generation_model_id = Some("model-1".to_string());
+        build_sidecar_runtime_config_bundle(profile, &config, 1).expect("runtime config bundle")
+    }
+
     #[tokio::test]
     async fn remote_sidecar_spec_generate_executes_job_via_broker() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -16674,47 +16753,25 @@ mod tests {
         drop(database);
 
         let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
-        let mut config = remote_test_config(workspace.path());
-        config.spec.generation_model_id = Some("model-1".to_string());
-        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
-            .expect("runtime config bundle");
-        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
 
         let broker_pending = state.broker_pending.clone();
         let broker_task = tokio::spawn(async move {
-            let request = loop {
-                match broker_rx.recv().await {
-                    Ok(envelope) if envelope.message_type == "request" => break envelope,
-                    Ok(_) => continue,
-                    Err(_) => panic!("broker channel closed"),
-                }
-            };
-            assert_eq!(request.method.as_deref(), Some("llm.stream"));
-            let request_id = request.id.expect("broker request id");
-            let response = ControlEnvelope {
-                version: 1,
-                message_type: "response".to_string(),
-                id: Some(request_id.clone()),
-                method: None,
-                payload: json!({
-                    "toolCalls": [{
-                        "callId": "tool-1",
-                        "name": "submit_workspace_spec",
-                        "arguments": {
-                            "contentMarkdown": "# Project Spec\n\n## Purpose\n\nRemote generated.\n"
-                        }
-                    }],
-                    "usage": null,
-                    "llmRequestId": request_id.clone(),
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION)
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &request,
+                "submit_workspace_spec",
+                json!({
+                    "contentMarkdown": "# Project Spec\n\n## Purpose\n\nRemote generated.\n"
                 }),
-                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
-            };
-            let tx = broker_pending
-                .lock()
-                .await
-                .remove(&request_id)
-                .expect("pending broker receiver");
-            tx.send(response).expect("send broker response");
+            )
+            .await;
         });
 
         let response = remote_sidecar_spec_generate(State(state.clone()), Json(json!({})))
@@ -16725,32 +16782,309 @@ mod tests {
             .expect("job id")
             .to_string();
 
-        let mut completed = false;
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            let database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
-            let job = database
-                .workspace_spec_job(&job_id)
-                .expect("read job")
-                .expect("job exists");
-            if job.status == "completed" {
-                completed = true;
-                let spec = database
-                    .workspace_spec()
-                    .expect("read spec")
-                    .expect("spec row");
-                assert!(spec.content_markdown.contains("Remote generated."));
-                break;
-            }
-            if matches!(job.status.as_str(), "failed" | "skipped") {
-                panic!("job ended as {}: {:?}", job.status, job.error_message);
-            }
-        }
-        assert!(
-            completed,
-            "remote sidecar should complete the queued spec job"
-        );
+        let job = wait_remote_sidecar_spec_job_status(workspace.path(), &job_id, "completed").await;
+        assert_eq!(job.status, "completed");
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let spec = database
+            .workspace_spec()
+            .expect("read spec")
+            .expect("spec row");
+        assert!(spec.content_markdown.contains("Remote generated."));
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_spec_generate_compaction_uses_workspace_spec_compaction_kind() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let generation = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                generation
+                    .payload
+                    .get("requestKind")
+                    .and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION)
+            );
+            let oversized = format!(
+                "# Project Spec\n\n## Purpose\n\n{}\n",
+                "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000)
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &generation,
+                "submit_workspace_spec",
+                json!({ "contentMarkdown": oversized }),
+            )
+            .await;
+
+            let compaction = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                compaction
+                    .payload
+                    .get("requestKind")
+                    .and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION)
+            );
+            assert_ne!(
+                compaction
+                    .payload
+                    .get("requestKind")
+                    .and_then(Value::as_str),
+                Some(BROKER_DEFAULT_LLM_REQUEST_KIND)
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &compaction,
+                "submit_workspace_spec",
+                json!({
+                    "contentMarkdown": "# Project Spec\n\n## Purpose\n\nRemote compacted.\n"
+                }),
+            )
+            .await;
+        });
+
+        let response = remote_sidecar_spec_generate(State(state.clone()), Json(json!({})))
+            .await
+            .expect("generate response");
+        let job_id = response.0["job"]["id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+        wait_remote_sidecar_spec_job_status(workspace.path(), &job_id, "completed").await;
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let spec = database
+            .workspace_spec()
+            .expect("read spec")
+            .expect("spec row");
+        assert!(spec.content_markdown.contains("Remote compacted."));
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_spec_update_uses_workspace_spec_update_kind() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        database
+            .update_workspace_spec_content(
+                0,
+                "# Project Spec\n\n## Purpose\n\nExisting remote spec.\n",
+            )
+            .expect("seed spec content")
+            .expect("content write");
+        database
+            .insert_chat("chat-1", "Remote chat")
+            .expect("insert chat");
+        let input_summary = json!({
+            "workspaceId": "workspace",
+            "chatId": "chat-1",
+            "currentSpecRevision": 1,
+            "userMessageId": "msg-user-1",
+            "assistantMessageId": "msg-assistant-1",
+            "runId": "run-1",
+            "codeChangeStats": null,
+            "chatExcerpt": {
+                "user": "please update remote contract",
+                "userTruncated": false,
+                "assistant": "updated remote contract",
+                "assistantTruncated": false
+            },
+            "currentSpecMarkdown": "# Project Spec\n\n## Purpose\n\nExisting remote spec.\n"
+        })
+        .to_string();
+        let job = database
+            .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+                id: "spec-update-job-1",
+                trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+                chat_id: Some("chat-1"),
+                run_id: Some("run-1"),
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: Some(&input_summary),
+            })
+            .expect("insert update job");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE)
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &request,
+                "submit_workspace_spec_update",
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{
+                        "oldText": "Existing remote spec.",
+                        "newText": "Updated remote contract."
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        wake_remote_sidecar_spec_runner(&state);
+        wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "completed").await;
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let spec = database
+            .workspace_spec()
+            .expect("read spec")
+            .expect("spec row");
+        assert!(spec.content_markdown.contains("Updated remote contract."));
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_spec_update_compaction_uses_update_compaction_kind() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\n## Purpose\n\nSeed.\n")
+            .expect("seed spec content")
+            .expect("content write");
+        database
+            .insert_chat("chat-1", "Remote chat")
+            .expect("insert chat");
+        let seed_markdown = "# Project Spec\n\n## Purpose\n\nSeed.\n";
+        let input_summary = json!({
+            "workspaceId": "workspace",
+            "chatId": "chat-1",
+            "currentSpecRevision": 1,
+            "userMessageId": "msg-user-1",
+            "assistantMessageId": "msg-assistant-1",
+            "runId": "run-1",
+            "codeChangeStats": null,
+            "chatExcerpt": {
+                "user": "expand then compact",
+                "userTruncated": false,
+                "assistant": "will compact",
+                "assistantTruncated": false
+            },
+            "currentSpecMarkdown": seed_markdown
+        })
+        .to_string();
+        let job = database
+            .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+                id: "spec-update-compact-job-1",
+                trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+                chat_id: Some("chat-1"),
+                run_id: Some("run-1"),
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: Some(&input_summary),
+            })
+            .expect("insert update job");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let update = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                update.payload.get("requestKind").and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE)
+            );
+            let oversized = format!(
+                "# Project Spec\n\n## Purpose\n\n{}\n",
+                "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &update,
+                "submit_workspace_spec_update",
+                json!({
+                    "updateNeeded": true,
+                    "edits": [{
+                        "oldText": seed_markdown,
+                        "newText": oversized
+                    }]
+                }),
+            )
+            .await;
+
+            let compaction = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                compaction
+                    .payload
+                    .get("requestKind")
+                    .and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION)
+            );
+            let request_tools = compaction
+                .payload
+                .pointer("/request/tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(
+                request_tools.iter().any(|tool| {
+                    tool.get("name").and_then(Value::as_str)
+                        == Some("submit_workspace_spec_update_compaction")
+                }),
+                "compaction broker payload must request submit_workspace_spec_update_compaction"
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &compaction,
+                "submit_workspace_spec_update_compaction",
+                json!({
+                    "edits": [{
+                        "oldText": format!(
+                            "# Project Spec\n\n## Purpose\n\n{}\n",
+                            "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+                        ),
+                        "newText": "# Project Spec\n\n## Purpose\n\nRemote update compacted.\n"
+                    }]
+                }),
+            )
+            .await;
+        });
+
+        wake_remote_sidecar_spec_runner(&state);
+        wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "completed").await;
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let spec = database
+            .workspace_spec()
+            .expect("read spec")
+            .expect("spec row");
+        assert!(spec.content_markdown.contains("Remote update compacted."));
         broker_task.await.expect("broker task");
     }
 
@@ -19880,6 +20214,144 @@ mod tests {
             .expect("all rows");
         assert_eq!(all_rows.len(), 1);
         assert_eq!(all_rows[0].request_kind, "contextCompression");
+    }
+
+    #[test]
+    fn brokered_workspace_spec_audit_kinds_match_payload_and_exclude_main_chat_stats() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let request_body = serde_json::to_string(&ProviderWireRequestDump {
+            format: "provider_request_v1".to_string(),
+            version: 1,
+            method: "POST".to_string(),
+            url: "https://example.test/v1/chat/completions".to_string(),
+            headers: BTreeMap::from([("authorization".to_string(), vec!["********".to_string()])]),
+            body: Some(r#"{"model":"model-1"}"#.to_string()),
+            body_encoding: Some("utf8".to_string()),
+        })
+        .expect("serialize request wire");
+        let response_body = r#"{"format":"provider_final_response_v1","version":1,"http":{"status":200,"version":"HTTP/1.1","headers":{}},"body":{"id":"resp-1"}}"#;
+
+        for (index, request_kind) in [
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request_id = format!("broker-spec-{index}");
+            let context = BrokerLlmAuditContext {
+                audit_path: workspace.path().to_path_buf(),
+                workspace_id: "remote-ws".to_string(),
+                chat_id: Some("chat-1".to_string()),
+                chat_title: Some("Remote chat".to_string()),
+                request_id: request_id.clone(),
+                request_kind: request_kind.to_string(),
+            };
+            let audit_writer = broker_llm_audit_writer_for_test(
+                &context,
+                "provider-1",
+                "model-1",
+                None,
+                "2026-07-08T00:00:00Z",
+            );
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("audit db")
+                .update_llm_request_body(&request_id, Some(&request_body))
+                .expect("update request detail");
+            finish_broker_llm_audit(
+                Some(&audit_writer),
+                BrokerLlmAuditOutcome {
+                    final_state: "succeeded",
+                    first_token_at: Some("2026-07-08T00:00:01Z"),
+                    completed_at: "2026-07-08T00:00:02Z",
+                    usage: None,
+                    first_token_latency_ms: Some(1000),
+                    total_latency_ms: 2000,
+                    status_code: Some(200),
+                    response_body_json: Some(response_body),
+                },
+                &[],
+            );
+
+            let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("audit db");
+            let request = database
+                .llm_request(&request_id)
+                .expect("request row")
+                .expect("inserted");
+            assert_eq!(request.request_kind, request_kind);
+            let stored_request = serde_json::from_str::<Value>(
+                request
+                    .request_body_json
+                    .as_deref()
+                    .expect("request body json"),
+            )
+            .expect("parse request body");
+            assert_eq!(
+                stored_request.get("format").and_then(Value::as_str),
+                Some("provider_request_v1")
+            );
+            assert_eq!(
+                stored_request.get("version").and_then(Value::as_u64),
+                Some(1)
+            );
+            let stored_response = serde_json::from_str::<Value>(
+                request
+                    .response_body_json
+                    .as_deref()
+                    .expect("response body json"),
+            )
+            .expect("parse response body");
+            assert_eq!(
+                stored_response.get("format").and_then(Value::as_str),
+                Some("provider_final_response_v1")
+            );
+            assert_eq!(
+                stored_response.get("version").and_then(Value::as_u64),
+                Some(1)
+            );
+            assert!(
+                database
+                    .llm_request_audit_rows(LlmRequestAuditFilters {
+                        chat_id: Some("chat-1"),
+                        request_kind: Some(request_kind),
+                        exclude_request_kinds: MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+                        ..LlmRequestAuditFilters::default()
+                    })
+                    .expect("excluded rows")
+                    .is_empty()
+            );
+            let explicit = database
+                .llm_request_audit_rows(LlmRequestAuditFilters {
+                    chat_id: Some("chat-1"),
+                    request_kind: Some(request_kind),
+                    exclude_request_kinds: &[],
+                    ..LlmRequestAuditFilters::default()
+                })
+                .expect("explicit kind rows");
+            assert_eq!(explicit.len(), 1);
+            assert_eq!(explicit[0].id, request_id);
+            assert_eq!(explicit[0].request_kind, request_kind);
+        }
+    }
+
+    #[test]
+    fn broker_llm_request_kind_missing_defaults_to_chat_completion() {
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({})).expect("default request kind"),
+            BROKER_DEFAULT_LLM_REQUEST_KIND
+        );
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": "   " }))
+                .expect("blank request kind"),
+            BROKER_DEFAULT_LLM_REQUEST_KIND
+        );
+        assert_eq!(
+            broker_llm_request_kind_from_payload(&json!({ "requestKind": null }))
+                .expect("null request kind"),
+            BROKER_DEFAULT_LLM_REQUEST_KIND
+        );
     }
 
     #[test]
