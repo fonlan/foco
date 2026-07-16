@@ -2569,7 +2569,7 @@ pub(crate) fn persist_chat_result(
     assistant_reasoning: Option<&str>,
     tool_calls: &[ExecutedToolCall],
 ) -> Result<(), ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+    let mut database = WorkspaceDatabase::open_or_create_critical(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let final_state = outcome.final_state;
 
@@ -2728,20 +2728,25 @@ pub(crate) fn persist_chat_result(
             .map_err(ApiError::from_workspace_error)?;
     }
 
-    if context.agent_primary_chat_output {
-        queue_chat_derived_effects(&mut database, context, final_state)?;
+    let queue_external_derived_effects = context.agent_primary_chat_output
+        && persist_inline_chat_derived_effects(&mut database, context, final_state)?;
+    drop(database);
+
+    if queue_external_derived_effects {
+        queue_memory_extraction_job(context, final_state)?;
+        crate::spec_runtime::queue_workspace_spec_update_job(context, final_state)?;
     }
 
     Ok(())
 }
 
-fn queue_chat_derived_effects(
+fn persist_inline_chat_derived_effects(
     database: &mut WorkspaceDatabase,
     context: &PreparedChatContext,
     final_state: &str,
-) -> Result<(), ApiError> {
+) -> Result<bool, ApiError> {
     if final_state != "succeeded" {
-        return Ok(());
+        return Ok(false);
     }
     if let Some(provenance) = &context.plan_phase_provenance {
         debug_assert_eq!(
@@ -2773,11 +2778,10 @@ fn queue_chat_derived_effects(
                 context_json: &context_json,
             })
             .map_err(ApiError::from_workspace_error)?;
-        return Ok(());
+        return Ok(false);
     }
 
-    queue_memory_extraction_job(context, final_state)?;
-    crate::spec_runtime::queue_workspace_spec_update_job(context, final_state)
+    Ok(true)
 }
 
 fn queued_chat_run_matches_context(

@@ -4046,6 +4046,65 @@ fn workspace_connections_wait_for_concurrent_writer_lock() {
 }
 
 #[test]
+fn run_events_for_run_after_returns_only_later_sequences() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Incremental run events")
+        .expect("chat insert");
+    for sequence in 0..5 {
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "run-1",
+                sequence,
+                event_type: "text_delta",
+                payload_json: &format!(r#"{{"sequence":{sequence}}}"#),
+            })
+            .expect("run event insert");
+    }
+
+    let sequences = database
+        .run_events_for_run_after("run-1", 2, 10)
+        .expect("incremental events")
+        .into_iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+
+    assert_eq!(sequences, vec![3, 4]);
+}
+
+#[test]
+fn run_events_for_run_after_respects_batch_limit() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Bounded run events")
+        .expect("chat insert");
+    for sequence in 0..3 {
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("event-{sequence}"),
+                chat_id: "chat-1",
+                run_id: "run-1",
+                sequence,
+                event_type: "text_delta",
+                payload_json: &format!(r#"{{"sequence":{sequence}}}"#),
+            })
+            .expect("run event insert");
+    }
+
+    let events = database
+        .run_events_for_run_after("run-1", -1, 2)
+        .expect("bounded incremental events");
+
+    assert_eq!(events.len(), 2);
+}
+
+#[test]
 fn counts_runtime_tool_state_compression_events_for_chat() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

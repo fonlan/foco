@@ -469,7 +469,7 @@ pub(crate) fn queue_workspace_spec_update_job_with_id(
         }
     }
 
-    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
+    let mut database = WorkspaceDatabase::open_or_create_critical(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let spec = database
         .workspace_spec()

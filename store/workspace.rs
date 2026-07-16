@@ -6871,6 +6871,43 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    pub fn run_events_for_run_after(
+        &self,
+        run_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<RunEventRecord>, WorkspaceDatabaseError> {
+        let limit =
+            i64::try_from(limit).map_err(|_| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "run event query limit is too large".to_string(),
+            })?;
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, chat_id, run_id, sequence, event_type, payload_json, created_at
+                 FROM run_events
+                 WHERE run_id = ?1 AND sequence > ?2
+                 ORDER BY sequence ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![run_id, after_sequence, limit], |row| {
+                Ok(RunEventRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    sequence: row.get(3)?,
+                    event_type: row.get(4)?,
+                    payload_json: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn next_run_event_sequence(&self, run_id: &str) -> Result<i64, WorkspaceDatabaseError> {
         self.connection
             .query_row(

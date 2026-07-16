@@ -37,6 +37,7 @@ type BoxedChatSse = Sse<KeepAliveStream<BoxedChatEventStream>>;
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const DEFAULT_AGENT_SYSTEM_PROMPT: &str = "# Default Coding Agent\n\n## Identity\n\nYou are Foco's default coding agent.\n\n## Instructions\n\nComplete simple tasks directly. When agent team tools are available, create and coordinate worker agents only when they materially help with parallel investigation, implementation, review, or verification. After completing non-trivial implementation work, when agent team tools are available, create a review-focused worker agent when practical to independently inspect the diff, run or recommend validation, and surface issues before finalizing.";
 const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TEAM_CHAT_TASK_STREAM_EVENT_BATCH_LIMIT: usize = 256;
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
 const CHAT_TITLE_GENERATION_REQUEST_KIND: &str = "chat title generation";
 const CHAT_TITLE_GENERATION_TIMEOUT_MS: u64 = 15_000;
@@ -1604,135 +1605,55 @@ fn team_chat_task_event_stream(
                 last_run_event_sequence = last_run_event_sequence.max(last_sequence);
             }
 
-            let database = match open_workspace_database(&workspace.path) {
-                Ok(database) => database,
+            let snapshot = match load_team_chat_task_poll_snapshot(
+                &workspace.path,
+                &task_id,
+                last_run_event_sequence,
+                last_agent_event_sequence.unwrap_or(-1),
+            ) {
+                Ok(snapshot) => snapshot,
                 Err(error) => {
                     yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
                     yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                     return;
                 }
             };
-            let task = match database
-                .agent_task(&task_id)
-                .map_err(ApiError::from_workspace_error)
-            {
-                Ok(Some(task)) => task,
-                Ok(None) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error {
-                        message: format!("Agent task '{task_id}' was not found"),
-                    }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-                Err(error) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-            };
-            let team = match database
-                .agent_team(&task.team_id)
-                .map_err(ApiError::from_workspace_error)
-            {
-                Ok(Some(team)) => team,
-                Ok(None) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error {
-                        message: format!("Agent team '{}' was not found", task.team_id),
-                    }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-                Err(error) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-            };
-            let new_run_events = match database
-                .run_events_for_run(task_id.as_str())
-                .map_err(ApiError::from_workspace_error)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-            };
-            for event in new_run_events {
+            let run_event_batch_full =
+                snapshot.run_events.len() == TEAM_CHAT_TASK_STREAM_EVENT_BATCH_LIMIT;
+            for event in snapshot.run_events {
                 if event.sequence > last_run_event_sequence {
                     last_run_event_sequence = event.sequence;
                     yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                 }
             }
-            let new_agent_events = match database
-                .agent_events_after(&task.team_id, last_agent_event_sequence.unwrap_or(-1))
-                .map_err(ApiError::from_workspace_error)
-            {
-                Ok(events) => events,
-                Err(error) => {
-                    yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                    yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                    return;
-                }
-            };
-            if let Some(event) = new_agent_events.last() {
+            if let Some(event) = snapshot.latest_agent_event.as_ref() {
                 let should_emit = last_agent_event_sequence.is_some() || streamed_active_run;
                 last_agent_event_sequence = Some(event.sequence);
                 if should_emit {
                     yield Ok(sse_event(&agent_team_refresh_event_from_agent_event(
                         &workspace.id,
-                        &team.chat_id,
-                        &task,
+                        &snapshot.team.chat_id,
+                        &snapshot.task,
                         event,
                     )));
                 }
             }
-            let has_pending_wait_recovery = if task.status
-                == foco_agent::AgentTaskStatus::Interrupted
+            if run_event_batch_full {
+                continue;
+            }
+            if !agent_task_keeps_team_stream_open(snapshot.task.status)
+                && !snapshot.has_pending_wait_recovery
             {
-                match database
-                    .agent_task_dependencies(&task.id)
-                    .map_err(ApiError::from_workspace_error)
-                {
-                    Ok(dependencies) => !dependencies.is_empty(),
-                    Err(error) => {
-                        yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                        return;
-                    }
-                }
-            } else {
-                false
-            };
-            if !agent_task_keeps_team_stream_open(task.status) && !has_pending_wait_recovery {
                 yield Ok(sse_event(&agent_team_refresh_event_for_task(
                     &workspace.id,
-                    &team.chat_id,
-                    &task,
+                    &snapshot.team.chat_id,
+                    &snapshot.task,
                     "agent_task_settled",
                     false,
                 )));
                 if streamed_active_run {
                     yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                     return;
-                }
-                let events = match database
-                    .run_events_for_run(task_id.as_str())
-                    .map_err(ApiError::from_workspace_error)
-                {
-                    Ok(events) => events,
-                    Err(error) => {
-                        yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
-                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                        return;
-                    }
-                };
-                for event in events {
-                    if event.sequence > last_run_event_sequence {
-                        last_run_event_sequence = event.sequence;
-                        yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
-                    }
                 }
                 yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                 return;
@@ -1741,6 +1662,61 @@ fn team_chat_task_event_stream(
         }
     };
     Box::pin(stream)
+}
+
+struct TeamChatTaskPollSnapshot {
+    task: foco_store::workspace::AgentTaskRecord,
+    team: foco_store::workspace::AgentTeamRecord,
+    run_events: Vec<foco_store::workspace::RunEventRecord>,
+    latest_agent_event: Option<foco_store::workspace::AgentEventRecord>,
+    has_pending_wait_recovery: bool,
+}
+
+fn load_team_chat_task_poll_snapshot(
+    workspace_path: &Path,
+    task_id: &foco_agent::AgentTaskId,
+    last_run_event_sequence: i64,
+    last_agent_event_sequence: i64,
+) -> Result<TeamChatTaskPollSnapshot, ApiError> {
+    let database = open_workspace_database(workspace_path)?;
+    let task = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal(format!("Agent task '{task_id}' was not found")))?;
+    let team = database
+        .agent_team(&task.team_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!("Agent team '{}' was not found", task.team_id))
+        })?;
+    let run_events = database
+        .run_events_for_run_after(
+            task_id.as_str(),
+            last_run_event_sequence,
+            TEAM_CHAT_TASK_STREAM_EVENT_BATCH_LIMIT,
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    let latest_agent_event = database
+        .agent_events_after(&task.team_id, last_agent_event_sequence)
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .last();
+    let has_pending_wait_recovery = if task.status == foco_agent::AgentTaskStatus::Interrupted {
+        !database
+            .agent_task_dependencies(&task.id)
+            .map_err(ApiError::from_workspace_error)?
+            .is_empty()
+    } else {
+        false
+    };
+
+    Ok(TeamChatTaskPollSnapshot {
+        task,
+        team,
+        run_events,
+        latest_agent_event,
+        has_pending_wait_recovery,
+    })
 }
 
 fn agent_team_refresh_event_from_agent_event(

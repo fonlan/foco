@@ -145,8 +145,9 @@ fn queue_memory_extraction_job_with_id(
         "providerId": context.provider_id,
     })
     .to_string();
-    let mut memory_database = MemoryDatabase::open_or_create_workspace(&context.workspace_path)
-        .map_err(ApiError::from_memory_error)?;
+    let mut memory_database =
+        MemoryDatabase::open_or_create_workspace_critical(&context.workspace_path)
+            .map_err(ApiError::from_memory_error)?;
     let job_id = job_id
         .map(str::to_string)
         .unwrap_or_else(|| unique_id("memory-extraction"));

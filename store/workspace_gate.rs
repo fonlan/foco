@@ -12,7 +12,7 @@
 //! gate.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ops::{Deref, DerefMut},
     panic::Location,
     path::{Path, PathBuf},
@@ -71,37 +71,80 @@ impl WorkspaceDatabaseGateKind {
 }
 
 struct CountingSemaphore {
-    available: Mutex<usize>,
+    state: Mutex<CountingSemaphoreState>,
     waiters: Condvar,
+}
+
+struct CountingSemaphoreState {
+    available: usize,
+    next_waiter_id: u64,
+    queue: VecDeque<u64>,
 }
 
 impl CountingSemaphore {
     fn new(capacity: usize) -> Self {
         Self {
-            available: Mutex::new(capacity),
+            state: Mutex::new(CountingSemaphoreState {
+                available: capacity,
+                next_waiter_id: 0,
+                queue: VecDeque::new(),
+            }),
             waiters: Condvar::new(),
         }
     }
 
     fn available_permits(&self) -> usize {
-        *self
-            .available
+        self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .available
     }
 
-    fn try_acquire(self: &Arc<Self>) -> Option<SemaphorePermit> {
-        let mut available = self
-            .available
+    fn acquire_until(
+        self: &Arc<Self>,
+        started_at: Instant,
+        timeout: Duration,
+    ) -> Option<SemaphorePermit> {
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *available == 0 {
-            return None;
+        if state.queue.is_empty() && state.available > 0 {
+            state.available -= 1;
+            return Some(SemaphorePermit {
+                semaphore: Arc::clone(self),
+            });
         }
-        *available -= 1;
-        Some(SemaphorePermit {
-            semaphore: Arc::clone(self),
-        })
+
+        let waiter_id = state.next_waiter_id;
+        state.next_waiter_id = state.next_waiter_id.wrapping_add(1);
+        state.queue.push_back(waiter_id);
+
+        loop {
+            if state.queue.front().copied() == Some(waiter_id) && state.available > 0 {
+                state.queue.pop_front();
+                state.available -= 1;
+                self.waiters.notify_all();
+                return Some(SemaphorePermit {
+                    semaphore: Arc::clone(self),
+                });
+            }
+
+            let waited = started_at.elapsed();
+            if waited >= timeout {
+                state.queue.retain(|queued_id| *queued_id != waiter_id);
+                self.waiters.notify_all();
+                return None;
+            }
+            let remaining = timeout
+                .saturating_sub(waited)
+                .min(WORKSPACE_DATABASE_GATE_POLL);
+            let (next_state, _) = self
+                .waiters
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state = next_state;
+        }
     }
 }
 
@@ -111,12 +154,12 @@ struct SemaphorePermit {
 
 impl Drop for SemaphorePermit {
     fn drop(&mut self) {
-        let mut available = self
+        let mut state = self
             .semaphore
-            .available
+            .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *available = available.saturating_add(1);
+        state.available = state.available.saturating_add(1);
         self.semaphore.waiters.notify_all();
     }
 }
@@ -470,59 +513,35 @@ fn acquire_workspace_database_gate_slot(
     started_at: Instant,
     timeout: Duration,
 ) -> Result<SemaphorePermit, WorkspaceDatabaseError> {
-    loop {
-        if let Some(permit) = semaphore.try_acquire() {
-            return Ok(permit);
-        }
-        let waited = started_at.elapsed();
-        if waited >= timeout {
-            tracing::warn!(
-                workspace = %key.display(),
-                gate = gate_kind.as_str(),
-                slot = slot_kind,
-                waited_ms = waited.as_millis() as u64,
-                total_capacity = WORKSPACE_DATABASE_TOTAL_CAPACITY,
-                total_available = gate.total.available_permits(),
-                ordinary_capacity = WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-                ordinary_available = gate.ordinary.available_permits(),
-                "workspace database permit acquisition timed out"
-            );
-            return Err(WorkspaceDatabaseError::ConcurrencyLimit {
-                message: format!(
-                    "workspace database concurrency limit reached for {} after {} ms (gate={}, slot={}, total={}/{}, ordinary={}/{})",
-                    key.display(),
-                    waited.as_millis(),
-                    gate_kind.as_str(),
-                    slot_kind,
-                    gate.total.available_permits(),
-                    WORKSPACE_DATABASE_TOTAL_CAPACITY,
-                    gate.ordinary.available_permits(),
-                    WORKSPACE_DATABASE_ORDINARY_CAPACITY,
-                ),
-            });
-        }
-        // ponytail: process-local backpressure only; cross-process pressure stays with SQLite/OS.
-        // Upgrade path is a pooled workspace DB runtime.
-        // Sleep-poll is intentional: sync openers run from tools/graph and must not depend on a
-        // Tokio runtime; Condvar is still notified on release for prompt wakeup when waiters race.
-        let remaining = timeout
-            .saturating_sub(waited)
-            .min(WORKSPACE_DATABASE_GATE_POLL);
-        let mut available = semaphore
-            .available
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if *available > 0 {
-            *available -= 1;
-            return Ok(SemaphorePermit {
-                semaphore: Arc::clone(&semaphore),
-            });
-        }
-        let (_guard, _waited) = semaphore
-            .waiters
-            .wait_timeout(available, remaining)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(permit) = semaphore.acquire_until(started_at, timeout) {
+        return Ok(permit);
     }
+
+    let waited = started_at.elapsed();
+    tracing::warn!(
+        workspace = %key.display(),
+        gate = gate_kind.as_str(),
+        slot = slot_kind,
+        waited_ms = waited.as_millis() as u64,
+        total_capacity = WORKSPACE_DATABASE_TOTAL_CAPACITY,
+        total_available = gate.total.available_permits(),
+        ordinary_capacity = WORKSPACE_DATABASE_ORDINARY_CAPACITY,
+        ordinary_available = gate.ordinary.available_permits(),
+        "workspace database permit acquisition timed out"
+    );
+    Err(WorkspaceDatabaseError::ConcurrencyLimit {
+        message: format!(
+            "workspace database concurrency limit reached for {} after {} ms (gate={}, slot={}, total={}/{}, ordinary={}/{})",
+            key.display(),
+            waited.as_millis(),
+            gate_kind.as_str(),
+            slot_kind,
+            gate.total.available_permits(),
+            WORKSPACE_DATABASE_TOTAL_CAPACITY,
+            gate.ordinary.available_permits(),
+            WORKSPACE_DATABASE_ORDINARY_CAPACITY,
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -650,6 +669,76 @@ mod tests {
         drop(opened);
         drop(ordinary_1);
         drop(ordinary_2);
+    }
+
+    #[test]
+    fn semaphore_waiters_acquire_in_fifo_order() {
+        let semaphore = Arc::new(CountingSemaphore::new(1));
+        let initial = semaphore
+            .acquire_until(Instant::now(), Duration::from_secs(1))
+            .expect("initial permit");
+        let (order_tx, order_rx) = std::sync::mpsc::channel();
+        let (release_waiter_tx, release_waiter_rx) = std::sync::mpsc::channel();
+
+        let waiter_semaphore = Arc::clone(&semaphore);
+        let waiter_order_tx = order_tx.clone();
+        let waiter = thread::spawn(move || {
+            let permit = waiter_semaphore
+                .acquire_until(Instant::now(), Duration::from_secs(2))
+                .expect("queued waiter permit");
+            waiter_order_tx.send("waiter").expect("waiter order");
+            release_waiter_rx.recv().expect("release waiter");
+            drop(permit);
+        });
+        wait_for_semaphore_queue_len(&semaphore, 1);
+
+        let reacquirer_semaphore = Arc::clone(&semaphore);
+        let reacquirer = thread::spawn(move || {
+            let permit = reacquirer_semaphore
+                .acquire_until(Instant::now(), Duration::from_secs(2))
+                .expect("reacquirer permit");
+            order_tx.send("reacquirer").expect("reacquirer order");
+            drop(permit);
+        });
+        wait_for_semaphore_queue_len(&semaphore, 2);
+
+        drop(initial);
+        assert_eq!(
+            order_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first acquisition"),
+            "waiter"
+        );
+        release_waiter_tx.send(()).expect("release waiter");
+        assert_eq!(
+            order_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second acquisition"),
+            "reacquirer"
+        );
+
+        waiter.join().expect("join waiter");
+        reacquirer.join().expect("join reacquirer");
+    }
+
+    fn wait_for_semaphore_queue_len(semaphore: &CountingSemaphore, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let queued = semaphore
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .queue
+                .len();
+            if queued == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "semaphore queue length did not reach {expected}; current={queued}"
+            );
+            thread::yield_now();
+        }
     }
 
     #[test]

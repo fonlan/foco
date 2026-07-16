@@ -12736,6 +12736,76 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
 }
 
 #[test]
+fn persist_chat_result_uses_critical_capacity_for_terminal_derived_effects() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-terminal-critical-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat("chat-1", "Terminal critical persistence")
+            .expect("chat insert");
+    }
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Hello".to_string(),
+        )],
+        vec![Some(0)],
+        vec![PromptContextSource::StoredMessage { sequence: 0 }],
+        984,
+    );
+    context.memory_settings = MemorySettings {
+        enabled: true,
+        extraction_mode: "pending_review".to_string(),
+        extraction_model_id: Some("extract-model".to_string()),
+        ..MemorySettings::default()
+    };
+    context.global_config.spec.auto_enabled = false;
+    persist_running_llm_request(&context, "request-1", "2026-06-06T09:00:00Z", None, &[])
+        .expect("persist running request");
+
+    let ordinary_1 = open_workspace_database(&workspace_dir).expect("ordinary holder 1");
+    let ordinary_2 = open_workspace_database(&workspace_dir).expect("ordinary holder 2");
+    persist_chat_result(
+        &context,
+        "2026-06-06T09:00:00Z",
+        ChatAuditOutcome {
+            first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
+            completed_at: "2026-06-06T09:00:01Z".to_string(),
+            first_token_latency_ms: Some(100),
+            total_latency_ms: 1_000,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            reasoning_tokens: None,
+            status_code: Some(200),
+            final_state: "succeeded",
+            response_body_json: None,
+        },
+        &[],
+        Some("Done."),
+        None,
+        &[],
+    )
+    .expect("terminal persistence should use reserved critical capacity");
+    drop(ordinary_1);
+    drop(ordinary_2);
+
+    let memory_database =
+        MemoryDatabase::open_workspace_at(workspace_database_path(&workspace_dir))
+            .expect("workspace memory database");
+    let jobs = memory_database
+        .extraction_jobs_for_scope(Some("chat-1"), Some(MemoryExtractionJobStatus::Queued), 10)
+        .expect("memory extraction jobs");
+
+    assert_eq!(jobs.len(), 1);
+    drop(memory_database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-plan-derived-effects-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -13840,6 +13910,68 @@ async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting()
     assert!(body.contains("Already running."), "{body}");
     drop(stream);
 
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn team_chat_task_sse_releases_database_before_yielding() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-team-stream-gate-release-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-team-stream-gate-release-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-team-stream-gate-release";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Team stream gate release")
+            .expect("chat insert");
+        let task_id = insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            "user-team-stream-gate-release",
+            "team-stream-gate-release",
+        );
+        let run_id = task_id.to_string();
+        let event = captured_event(&ChatSseEvent::TextDelta {
+            assistant_message_id: "assistant-team-stream-gate-release".to_string(),
+            delta: "ready".to_string(),
+            reasoning_duration_ms: None,
+        });
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-team-stream-gate-release",
+                chat_id,
+                run_id: &run_id,
+                sequence: 0,
+                event_type: &event.event_type,
+                payload_json: &event.normalized_event_json,
+            })
+            .expect("run event insert");
+        task_id
+    };
+
+    let held_permit = open_workspace_database(&workspace_dir).expect("held ordinary permit");
+    let state = test_app_state(config, profile_dir.clone());
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id, -1)
+        .await
+        .expect("team stream response");
+    let mut stream = response.into_response().into_body().into_data_stream();
+    timeout(Duration::from_millis(500), stream.next())
+        .await
+        .expect("persisted event should be yielded")
+        .expect("persisted event chunk")
+        .expect("persisted event body");
+
+    let second_permit = open_workspace_database(&workspace_dir)
+        .expect("stream must release its database permit before yielding");
+
+    drop(second_permit);
+    drop(stream);
+    drop(held_permit);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
 }
@@ -16292,6 +16424,8 @@ fn workspace_spec_successful_primary_turn_queues_update_job() {
         deletions: 1,
     };
 
+    let ordinary_1 = open_workspace_database(&workspace_dir).expect("ordinary holder 1");
+    let ordinary_2 = open_workspace_database(&workspace_dir).expect("ordinary holder 2");
     persist_chat_result(
         &context,
         "2026-06-06T09:00:00Z",
@@ -16302,6 +16436,8 @@ fn workspace_spec_successful_primary_turn_queues_update_job() {
         &[],
     )
     .expect("persist chat result");
+    drop(ordinary_1);
+    drop(ordinary_2);
 
     let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
     let jobs = database
