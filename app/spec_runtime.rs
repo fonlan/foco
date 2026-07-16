@@ -388,22 +388,35 @@ fn recover_stale_running_workspace_spec_job(
         return Ok(false);
     };
     let now = Utc::now();
+    let lease_at = job.lease_or_started_or_created_at().to_string();
+    let elapsed_ms = DateTime::parse_from_rfc3339(&lease_at)
+        .ok()
+        .map(|lease_at| {
+            now.signed_duration_since(lease_at.with_timezone(&Utc))
+                .num_milliseconds()
+        });
+    // Fast path: skip opening a fail transaction when the snapshot is clearly live.
     if !workspace_spec_running_job_is_stale(&job, now) {
         return Ok(false);
     }
 
-    let lease_at = job.lease_or_started_or_created_at();
-    let elapsed_ms = DateTime::parse_from_rfc3339(lease_at).ok().map(|lease_at| {
-        now.signed_duration_since(lease_at.with_timezone(&Utc))
-            .num_milliseconds()
-    });
     let error_message = format!(
         "workspace spec job lease was not renewed for {} ms and was recovered as failed",
         WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS
     );
-    database
-        .mark_workspace_spec_job_failed(&job.id, &error_message)
+    // Atomic re-check under IMMEDIATE: heartbeat renewal between the snapshot
+    // read and this write must keep the job running.
+    let failed = database
+        .fail_stale_running_workspace_spec_job(
+            &job.id,
+            now,
+            WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS,
+            &error_message,
+        )
         .map_err(ApiError::from_workspace_error)?;
+    if !failed {
+        return Ok(false);
+    }
     tracing::warn!(
         workspace_id = %workspace_id,
         job_id = %job.id,
@@ -431,16 +444,22 @@ pub(crate) fn recover_workspace_spec_queue_for_test(
     if let Some(job) = database
         .running_workspace_spec_job()
         .map_err(ApiError::from_workspace_error)?
-        .filter(|job| workspace_spec_running_job_is_stale(job, now))
     {
-        tracing::warn!(
-            workspace_id = %workspace_id,
-            job_id = %job.id,
-            "stale running workspace spec job recovered in test drain"
-        );
-        database
-            .mark_workspace_spec_job_failed(&job.id, "stale running test recovery")
+        let failed = database
+            .fail_stale_running_workspace_spec_job(
+                &job.id,
+                now,
+                WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS,
+                "stale running test recovery",
+            )
             .map_err(ApiError::from_workspace_error)?;
+        if failed {
+            tracing::warn!(
+                workspace_id = %workspace_id,
+                job_id = %job.id,
+                "stale running workspace spec job recovered in test drain"
+            );
+        }
     }
     let mut claimed = Vec::new();
     while let Some(job) = database

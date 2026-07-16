@@ -1808,6 +1808,75 @@ impl WorkspaceDatabase {
         Ok(updated == 1)
     }
 
+    /// Fails a running workspace spec job only when its liveness timestamp is still
+    /// stale as of `now` inside a single `IMMEDIATE` transaction.
+    ///
+    /// Liveness uses lease → started_at → created_at. Concurrent heartbeat renewal
+    /// either commits before this transaction (job stays running) or waits until it
+    /// finishes (touch then sees a non-running row). Snapshot-based fail-after-read
+    /// races are not possible.
+    ///
+    /// Returns `true` when the job was marked failed.
+    pub fn fail_stale_running_workspace_spec_job(
+        &mut self,
+        id: &str,
+        now: DateTime<Utc>,
+        stale_after_ms: i64,
+        error_message: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let completed_at = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(job) = transaction
+            .query_row(
+                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                        input_summary_json, output_json, error_message, created_at,
+                        started_at, completed_at, lease_renewed_at,
+                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
+                 FROM workspace_spec_jobs
+                 WHERE id = ?1 AND status = ?2",
+                params![id, WorkspaceSpecJobStatus::Running.as_str()],
+                workspace_spec_job_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+        if !workspace_spec_job_liveness_is_stale(&job, now, stale_after_ms) {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+        let updated = transaction
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET status = ?2,
+                     error_message = ?3,
+                     completed_at = ?4
+                 WHERE id = ?1 AND status = ?5",
+                params![
+                    id,
+                    WorkspaceSpecJobStatus::Failed.as_str(),
+                    error_message,
+                    completed_at,
+                    WorkspaceSpecJobStatus::Running.as_str()
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(updated == 1)
+    }
+
     pub fn mark_workspace_spec_job_completed(
         &mut self,
         id: &str,
@@ -15993,6 +16062,23 @@ fn collect_rows<T>(
 
 fn now_timestamp() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// Liveness stale check for workspace spec jobs: lease → started_at → created_at.
+///
+/// Uses strict `>` on elapsed milliseconds so exactly `stale_after_ms` is not stale.
+pub(crate) fn workspace_spec_job_liveness_is_stale(
+    job: &WorkspaceSpecJobRecord,
+    now: DateTime<Utc>,
+    stale_after_ms: i64,
+) -> bool {
+    let lease_at = job.lease_or_started_or_created_at();
+    let Ok(lease_at) = DateTime::parse_from_rfc3339(lease_at) else {
+        return false;
+    };
+    now.signed_duration_since(lease_at.with_timezone(&Utc))
+        .num_milliseconds()
+        > stale_after_ms
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

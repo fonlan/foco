@@ -16946,22 +16946,270 @@ fn workspace_spec_running_job_stale_detection_uses_lease_then_started_at() {
     };
 
     // Fresh lease keeps the job live even when started_at is older than 30 minutes.
+    // 29 minutes since lease: still live.
     assert!(!workspace_spec_running_job_is_stale(&job, now));
 
-    // Stale lease past the threshold is recovered.
+    // Exactly 30 minutes is not stale (`>` threshold, not `>=`).
+    job.lease_renewed_at = Some("2026-06-30T11:30:00Z".to_string());
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
+
+    // 31 minutes past lease: recovered.
     job.lease_renewed_at = Some("2026-06-30T11:29:00Z".to_string());
     assert!(workspace_spec_running_job_is_stale(&job, now));
 
-    // No lease: fall back to started_at.
+    // No lease: fall back to started_at (29 / exact 30 / 31 minutes).
     job.lease_renewed_at = None;
     job.started_at = Some("2026-06-30T11:31:00Z".to_string());
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
+    job.started_at = Some("2026-06-30T11:30:00Z".to_string());
     assert!(!workspace_spec_running_job_is_stale(&job, now));
     job.started_at = Some("2026-06-30T11:29:00Z".to_string());
     assert!(workspace_spec_running_job_is_stale(&job, now));
 
     // No lease and no started_at: fall back to created_at.
     job.started_at = None;
+    job.created_at = "2026-06-30T11:31:00Z".to_string();
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
+    job.created_at = "2026-06-30T11:30:00Z".to_string();
+    assert!(!workspace_spec_running_job_is_stale(&job, now));
+    job.created_at = "2026-06-30T11:29:00Z".to_string();
     assert!(workspace_spec_running_job_is_stale(&job, now));
+}
+
+#[test]
+fn workspace_spec_recovery_keeps_live_lease_and_does_not_claim_second_running_job() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        for id in ["spec-job-live", "spec-job-queued"] {
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model"),
+                    base_revision: Some(0),
+                    input_summary_json: None,
+                })
+                .expect("spec job");
+        }
+        database
+            .mark_workspace_spec_job_running("spec-job-live")
+            .expect("mark live running");
+        let database_path = database.database_path().to_path_buf();
+        drop(database);
+        // Total run age > 30 minutes, but lease was renewed recently.
+        let connection = Connection::open(&database_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET started_at = '2026-06-30T11:00:00Z',
+                     lease_renewed_at = '2026-06-30T11:55:00Z'
+                 WHERE id = 'spec-job-live'",
+                [],
+            )
+            .expect("seed long-running live lease");
+    }
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-06-30T12:00:00Z")
+        .expect("recovery time")
+        .with_timezone(&chrono::Utc);
+
+    // Injected-now recovery path: live lease must not be failed, so claim cannot start a second runner.
+    let claimed = recover_workspace_spec_queue_for_test(workspace.path(), "workspace-test", now)
+        .expect("recover with live lease");
+    assert!(
+        claimed.is_empty(),
+        "live lease must block claim of queued jobs while running: {claimed:?}"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let live = database
+        .workspace_spec_job("spec-job-live")
+        .expect("live lookup")
+        .expect("live job");
+    assert_eq!(live.status, "running");
+    assert_eq!(
+        live.lease_renewed_at.as_deref(),
+        Some("2026-06-30T11:55:00Z")
+    );
+    assert_eq!(live.started_at.as_deref(), Some("2026-06-30T11:00:00Z"));
+    let queued = database
+        .workspace_spec_job("spec-job-queued")
+        .expect("queued lookup")
+        .expect("queued job");
+    assert_eq!(queued.status, "queued");
+}
+
+#[test]
+fn workspace_spec_concurrent_recovery_keeps_live_lease_and_single_runner() {
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        for id in ["spec-job-live", "spec-job-queued"] {
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model"),
+                    base_revision: Some(0),
+                    input_summary_json: None,
+                })
+                .expect("spec job");
+        }
+        database
+            .mark_workspace_spec_job_running("spec-job-live")
+            .expect("mark live running");
+        let database_path = database.database_path().to_path_buf();
+        drop(database);
+        // Total run age > 30 minutes, but lease was renewed recently.
+        let connection = Connection::open(&database_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET started_at = '2026-06-30T11:00:00Z',
+                     lease_renewed_at = '2026-06-30T11:55:00Z'
+                 WHERE id = 'spec-job-live'",
+                [],
+            )
+            .expect("seed long-running live lease");
+    }
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-06-30T12:00:00Z")
+        .expect("recovery time")
+        .with_timezone(&chrono::Utc);
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(3));
+    let mut workers = Vec::new();
+    for _ in 0..2 {
+        let workspace_path = workspace_path.clone();
+        let barrier = barrier.clone();
+        workers.push(thread::spawn(move || {
+            barrier.wait();
+            recover_workspace_spec_queue_for_test(workspace_path.as_path(), "workspace-test", now)
+                .expect("concurrent recover")
+        }));
+    }
+    barrier.wait();
+    let claimed_batches = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("recover worker"))
+        .collect::<Vec<_>>();
+    assert!(
+        claimed_batches.iter().all(|claimed| claimed.is_empty()),
+        "concurrent recovery must not claim queued jobs under a live lease: {claimed_batches:?}"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let live = database
+        .workspace_spec_job("spec-job-live")
+        .expect("live lookup")
+        .expect("live job");
+    assert_eq!(live.status, "running");
+    assert_eq!(
+        live.lease_renewed_at.as_deref(),
+        Some("2026-06-30T11:55:00Z")
+    );
+    assert_eq!(live.started_at.as_deref(), Some("2026-06-30T11:00:00Z"));
+    let queued = database
+        .workspace_spec_job("spec-job-queued")
+        .expect("queued lookup")
+        .expect("queued job");
+    assert_eq!(queued.status, "queued");
+    assert_eq!(
+        database
+            .running_workspace_spec_job()
+            .expect("running lookup")
+            .expect("exactly one running")
+            .id,
+        "spec-job-live"
+    );
+}
+
+#[test]
+fn workspace_spec_stale_recovery_does_not_fail_after_heartbeat_renewal() {
+    // Models the race: recovery snapshot sees a stale lease, but heartbeat renews
+    // before the conditional fail write. Atomic re-check must keep the job running.
+    let workspace = tempfile::tempdir().expect("workspace");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        for id in ["spec-job-live", "spec-job-queued"] {
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model"),
+                    base_revision: Some(0),
+                    input_summary_json: None,
+                })
+                .expect("spec job");
+        }
+        database
+            .mark_workspace_spec_job_running("spec-job-live")
+            .expect("mark live running");
+        let database_path = database.database_path().to_path_buf();
+        drop(database);
+        let connection = Connection::open(&database_path).expect("open db");
+        connection
+            .execute(
+                "UPDATE workspace_spec_jobs
+                 SET started_at = '2026-06-30T11:00:00Z',
+                     lease_renewed_at = '2026-06-30T11:29:00Z'
+                 WHERE id = 'spec-job-live'",
+                [],
+            )
+            .expect("seed stale lease snapshot");
+    }
+
+    let now = chrono::DateTime::parse_from_rfc3339("2026-06-30T12:00:00Z")
+        .expect("recovery time")
+        .with_timezone(&chrono::Utc);
+
+    // Heartbeat renews after the "stale snapshot" moment and before fail write.
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        assert!(
+            database
+                .touch_workspace_spec_job_lease("spec-job-live")
+                .expect("heartbeat renew")
+        );
+    }
+
+    let claimed = recover_workspace_spec_queue_for_test(workspace.path(), "workspace-test", now)
+        .expect("recover after heartbeat");
+    assert!(
+        claimed.is_empty(),
+        "renewed lease must block fail and claim: {claimed:?}"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let live = database
+        .workspace_spec_job("spec-job-live")
+        .expect("live lookup")
+        .expect("live job");
+    assert_eq!(live.status, "running");
+    assert_ne!(
+        live.lease_renewed_at.as_deref(),
+        Some("2026-06-30T11:29:00Z")
+    );
+    assert_eq!(live.started_at.as_deref(), Some("2026-06-30T11:00:00Z"));
+    let queued = database
+        .workspace_spec_job("spec-job-queued")
+        .expect("queued lookup")
+        .expect("queued job");
+    assert_eq!(queued.status, "queued");
 }
 
 #[tokio::test]
