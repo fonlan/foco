@@ -9469,6 +9469,9 @@ fn remote_sidecar_skill_context(
         ));
     }
 
+    crate::skills::validate_selected_skills_total_budget(&selected_entries)
+        .map_err(|error| ApiError::bad_request(error).into_response())?;
+
     Ok(RemoteSidecarSkillContext {
         routing_message,
         selected_entries,

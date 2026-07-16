@@ -10,6 +10,7 @@ use globset::{Glob, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::output_budget::{SKILL_MD_MAX_BYTES, path_is_skill_md};
 use crate::{
     CommandOutputLimits, DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
     DEFAULT_WRITE_FILE_TIMEOUT_MS, LineRange, MAX_FIND_ENTRIES, MAX_FULL_READ_BYTES,
@@ -63,7 +64,27 @@ fn read_file_inner(
         return Err(ToolRuntimeError::NotFile(path));
     }
 
-    let max_source_bytes = if requested_line_range.is_some() {
+    let is_skill_md = path_is_skill_md(&path);
+    if is_skill_md {
+        if requested_line_range.is_some() {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{}' targets SKILL.md, which must be read in full (startLine and endLine must both be null). Oversized skills cannot be reconstructed by stitching line ranges.",
+                request.path
+            )));
+        }
+        if metadata.len() > SKILL_MD_MAX_BYTES as u64 {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
+                request.path,
+                metadata.len(),
+                SKILL_MD_MAX_BYTES
+            )));
+        }
+    }
+
+    let max_source_bytes = if is_skill_md {
+        SKILL_MD_MAX_BYTES as u64
+    } else if requested_line_range.is_some() {
         MAX_RANGED_READ_SOURCE_BYTES
     } else {
         MAX_FULL_READ_BYTES
@@ -81,7 +102,25 @@ fn read_file_inner(
         path: path.clone(),
         source,
     })?;
+    if is_skill_md && bytes.len() > SKILL_MD_MAX_BYTES {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
+            request.path,
+            bytes.len(),
+            SKILL_MD_MAX_BYTES
+        )));
+    }
+
     let (content, _) = decode_text_file(&path, &bytes)?;
+    if is_skill_md && content.len() > SKILL_MD_MAX_BYTES {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} UTF-8 bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
+            request.path,
+            content.len(),
+            SKILL_MD_MAX_BYTES
+        )));
+    }
+
     let line_range = if let Some(range) = requested_line_range {
         Some(normalize_read_line_range(
             range,

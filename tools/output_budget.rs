@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::Path;
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -8,6 +9,10 @@ use crate::ToolExecution;
 pub const TOOL_OUTPUT_SOFT_BYTE_LIMIT: usize = 50 * 1024;
 pub const TOOL_OUTPUT_SOFT_LINE_LIMIT: usize = 2_000;
 pub const TOOL_EXECUTION_HARD_BYTE_LIMIT: usize = 128 * 1024;
+/// Single `SKILL.md` hard limit: full document success or explicit failure (no partial load).
+pub const SKILL_MD_MAX_BYTES: usize = 64 * 1024;
+/// Total UTF-8 bytes of deduplicated selected skill bodies for one provider turn.
+pub const SELECTED_SKILLS_MAX_TOTAL_BYTES: usize = 128 * 1024;
 pub const TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT: usize = 512;
 /// Reserved for the enclosing SSE, Store, provider, or broker record that carries a tool execution.
 /// Keeping the normalized execution below this derived ceiling ensures the complete transport record
@@ -186,6 +191,22 @@ where
             original_measurement: Some(measurement),
         };
     };
+
+    // SKILL.md is an integrity-critical instruction document: allow full successful results
+    // through the soft byte/line caps when the file itself is within SKILL_MD_MAX_BYTES.
+    // Hard envelope limits still apply.
+    if semantics == ToolOutputSemantics::ReadOnly
+        && tool_name == "read_file"
+        && !execution.is_error
+        && reason != ToolOutputBudgetReason::HardByteLimit
+        && read_file_output_is_skill_md_within_limit(&execution.output)
+    {
+        return BudgetedToolExecution {
+            execution,
+            state: ToolOutputBudgetState::WithinBudget,
+            original_measurement: Some(measurement),
+        };
+    }
 
     if execution.is_error {
         let state = if reason == ToolOutputBudgetReason::HardByteLimit {
@@ -385,6 +406,26 @@ pub fn bounded_utf8_prefix(text: &str, max_bytes: usize) -> (&str, bool) {
         end -= 1;
     }
     (&text[..end], true)
+}
+
+/// Returns true when the path's file name is exactly `SKILL.md` (case-sensitive).
+pub fn path_is_skill_md(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "SKILL.md")
+}
+
+fn read_file_output_is_skill_md_within_limit(output: &Value) -> bool {
+    let Some(path) = output.get("path").and_then(Value::as_str) else {
+        return false;
+    };
+    if !path_is_skill_md(Path::new(path)) {
+        return false;
+    }
+    match output.get("bytes").and_then(Value::as_u64) {
+        Some(bytes) => bytes <= SKILL_MD_MAX_BYTES as u64,
+        None => false,
+    }
 }
 
 fn attach_output_preview(output: &mut Value, original_output: &Value) {
@@ -647,5 +688,40 @@ mod tests {
             normalize_tool_execution("search_text", ToolOutputSemantics::ReadOnly, execution);
 
         assert_eq!(budgeted.execution.output["reason"], "softLineLimit");
+    }
+
+    #[test]
+    fn normalize_tool_execution_allows_skill_md_read_above_soft_limit() {
+        let content_len = TOOL_OUTPUT_SOFT_BYTE_LIMIT + 4 * 1024;
+        let execution = ToolExecution {
+            output: json!({
+                "path": ".agents/skills/mid/SKILL.md",
+                "content": "x".repeat(content_len),
+                "bytes": content_len,
+                "startLine": null,
+                "endLine": null,
+            }),
+            is_error: false,
+        };
+
+        let budgeted = normalize_tool_execution(
+            "read_file",
+            ToolOutputSemantics::ReadOnly,
+            execution.clone(),
+        );
+
+        assert_eq!(budgeted.state, ToolOutputBudgetState::WithinBudget);
+        assert_eq!(budgeted.execution, execution);
+    }
+
+    #[test]
+    fn path_is_skill_md_matches_exact_file_name_only() {
+        assert!(path_is_skill_md(Path::new("SKILL.md")));
+        assert!(path_is_skill_md(Path::new(
+            "/home/u/.agents/skills/x/SKILL.md"
+        )));
+        assert!(!path_is_skill_md(Path::new("skill.md")));
+        assert!(!path_is_skill_md(Path::new("references/SKILL.md.bak")));
+        assert!(!path_is_skill_md(Path::new("references/large.md")));
     }
 }

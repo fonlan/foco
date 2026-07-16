@@ -2679,6 +2679,27 @@ name: gitmemo
 }
 
 #[test]
+fn parse_skill_file_rejects_oversized_skill_md_with_safe_error() {
+    let dir = tempfile::tempdir().expect("dir");
+    let path = dir.path().join("SKILL.md");
+    let header = "---\nname: huge\ndescription: too large\n---\n\n";
+    let body_len = foco_tools::output_budget::SKILL_MD_MAX_BYTES - header.len() + 1;
+    let body = "z".repeat(body_len);
+    fs::write(&path, format!("{header}{body}")).expect("write");
+
+    let error = parse_skill_file(&path).expect_err("oversized skill");
+    assert!(
+        error.contains("exceeds the maximum SKILL.md size"),
+        "{error}"
+    );
+    assert!(error.contains(&format!(
+        "max {}",
+        foco_tools::output_budget::SKILL_MD_MAX_BYTES
+    )));
+    assert!(!error.contains(&"z".repeat(32)));
+}
+
+#[test]
 fn enabled_skill_frontmatter_messages_list_enabled_skill_frontmatter() {
     let profile_dir = env::temp_dir().join(unique_id("foco-skill-frontmatter-profile-test"));
     let workspace_dir = env::temp_dir().join(unique_id("foco-skill-frontmatter-workspace-test"));

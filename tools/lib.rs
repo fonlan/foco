@@ -1790,6 +1790,151 @@ mod tests {
     }
 
     #[test]
+    fn read_file_rejects_line_range_for_skill_md() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo skill\n---\n\n# Demo\n\nline1\nline2\nline3\n",
+        )
+        .expect("skill");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": ".agents/skills/demo/SKILL.md",
+                "startLine": 1,
+                "endLine": 2,
+            }),
+        );
+        assert!(result.is_error);
+        let message = result.output["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("SKILL.md") && message.contains("full"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn read_file_rejects_oversized_skill_md() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents").join("skills").join("huge");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        let header = "---\nname: huge\ndescription: huge\n---\n\n";
+        let body_len = output_budget::SKILL_MD_MAX_BYTES - header.len() + 1;
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("{header}{}", "x".repeat(body_len)),
+        )
+        .expect("skill");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": ".agents/skills/huge/SKILL.md",
+                "startLine": null,
+                "endLine": null,
+            }),
+        );
+        assert!(result.is_error);
+        let message = result.output["error"].as_str().unwrap_or_default();
+        assert!(message.contains("SKILL.md"), "{message}");
+        assert!(
+            message.contains("exceeds") || message.contains("maximum"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn read_file_returns_full_skill_md_between_soft_and_hard_limits() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents").join("skills").join("mid");
+        fs::create_dir_all(&skill_dir).expect("skill dir");
+        // 56 KiB is above the 50 KiB soft tool budget but under the 64 KiB skill hard limit.
+        let target = 56 * 1024;
+        let header = "---\nname: mid\ndescription: mid size\n---\n\n";
+        let body_len = target - header.len();
+        let content = format!("{header}{}", "m".repeat(body_len));
+        assert!(content.len() > output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        assert!(content.len() <= output_budget::SKILL_MD_MAX_BYTES);
+        fs::write(skill_dir.join("SKILL.md"), &content).expect("skill");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": ".agents/skills/mid/SKILL.md",
+                "startLine": null,
+                "endLine": null,
+            }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.contains("name: mid"));
+        // Numbered content still contains the full body payload.
+        assert!(body.contains(&"m".repeat(32)));
+        assert_eq!(result.output["bytes"], content.len() as u64);
+    }
+
+    #[test]
+    fn read_file_allows_ranged_read_for_skill_reference_files() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_dir = workspace.path().join(".agents").join("skills").join("demo");
+        let references = skill_dir.join("references");
+        fs::create_dir_all(&references).expect("references");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: demo\ndescription: demo\n---\n\nSee references.\n",
+        )
+        .expect("skill");
+        let large = (1..=50)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(references.join("large.md"), &large).expect("reference");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": ".agents/skills/demo/references/large.md",
+                "startLine": 2,
+                "endLine": 4,
+            }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["startLine"], 2);
+        assert_eq!(result.output["endLine"], 4);
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.contains("line-2"));
+        assert!(body.contains("line-4"));
+        assert!(!body.contains("line-50"));
+    }
+
+    #[test]
+    fn read_file_schema_documents_skill_md_full_read_rules() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == READ_FILE_TOOL)
+            .expect("read_file definition");
+        assert!(
+            definition.description.contains("SKILL.md"),
+            "{}",
+            definition.description
+        );
+        let start_description = definition.input_schema["properties"]["startLine"]["description"]
+            .as_str()
+            .expect("startLine description");
+        assert!(
+            start_description.contains("SKILL.md"),
+            "{start_description}"
+        );
+    }
+
+    #[test]
     fn strict_tool_schemas_require_every_property() {
         for tool in builtin_tool_definitions() {
             if tool.strict {
