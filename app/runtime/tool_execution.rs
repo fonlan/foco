@@ -3710,6 +3710,281 @@ mod tests {
     }
 
     #[test]
+    fn budget_tool_execution_budgets_mixed_results_independently() {
+        // One oversized read-only result becomes a recoverable error; a small sibling stays intact.
+        let large = budget_tool_execution(
+            SEARCH_TEXT_TOOL,
+            ToolExecution {
+                output: json!({
+                    "matches": "x".repeat(
+                        foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 1
+                    )
+                }),
+                is_error: false,
+            },
+        );
+        let small = budget_tool_execution(
+            READ_FILE_TOOL,
+            ToolExecution {
+                output: json!({ "content": "ok", "path": "a.txt" }),
+                is_error: false,
+            },
+        );
+
+        assert!(large.execution.is_error);
+        assert_eq!(large.execution.output["retryable"], true);
+        assert!(!small.execution.is_error);
+        assert_eq!(small.execution.output["content"], "ok");
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&large.execution)
+                .expect("measure large")
+                <= foco_tools::output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&small.execution)
+                .expect("measure small")
+                <= foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn repeated_tool_call_detector_does_not_treat_output_omission_as_auto_retry() {
+        // Side-effect success with outputOmitted must remain a completed result; the detector only
+        // fires on identical *call* batches from the model, never on budget omission shape.
+        let omitted = budget_tool_execution(
+            RUN_COMMAND_TOOL,
+            ToolExecution {
+                output: json!({
+                    "stdout": "x".repeat(
+                        foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 8
+                    ),
+                    "exitCode": 0
+                }),
+                is_error: false,
+            },
+        );
+        assert!(!omitted.execution.is_error);
+        assert_eq!(omitted.execution.output["outputOmitted"], true);
+        assert_eq!(omitted.execution.output["retryUnsafe"], true);
+
+        let mut detector = RepeatedToolCallDetector::default();
+        let batch = vec![NeutralToolCall {
+            call_id: "call-1".to_string(),
+            name: RUN_COMMAND_TOOL.to_string(),
+            arguments: json!({ "command": "echo", "args": ["hi"] }),
+            thought_signatures: None,
+        }];
+        // First two identical batches are allowed (count < MAX); omission status is irrelevant.
+        assert!(detector.check(&batch).is_ok());
+        assert!(detector.check(&batch).is_ok());
+        // Only the N-th identical batch trips the loop detector.
+        let err = detector
+            .check(&batch)
+            .expect_err("identical batch should eventually trip the loop detector");
+        assert!(err.contains("repeated the same tool call batch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn side_effect_tool_with_omitted_output_executes_once_and_stays_success() {
+        // Real execute_tool path: a successful command whose captured stdout exceeds the soft
+        // budget must keep is_error=false + outputOmitted, proving the side effect completed once.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let marker = workspace.path().join("side-effect-once.marker");
+        let huge_len = foco_tools::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 64;
+
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let first = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry.clone()),
+            &HookConfig::default(),
+            true,
+            &GlobalConfig::first_run(workspace.path().to_path_buf()),
+            Some(&ProviderConnectionConfig {
+                kind: foco_providers::parse_provider_kind(foco_providers::OPENAI_RESPONSES_KIND)
+                    .expect("provider kind"),
+                base_url: None,
+                api_key: Some("test-key".to_string()),
+                proxy_url: None,
+                request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
+            }),
+            &WebSearchSettings::default(),
+            QuestionRegistry::default(),
+            mpsc::unbounded_channel().0,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: "chat-omit".to_string(),
+                run_id: "run-omit".to_string(),
+                tool_call_id: "call-omit-1".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-omit",
+            "workspace-omit",
+            workspace.path(),
+            workspace.path(),
+            "chat-omit",
+            None,
+            "run-omit",
+            "model-1",
+            "provider-1",
+            0,
+            "call-omit-1",
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "python3",
+                "args": [
+                    "-c",
+                    format!(
+                        "from pathlib import Path; Path('side-effect-once.marker').write_text('done'); print('x'*{huge_len}, end='')"
+                    )
+                ],
+                "cwd": null,
+                "timeoutMs": 30_000
+            }),
+        )
+        .await;
+
+        assert!(!first.execution.is_error, "{:?}", first.execution.output);
+        assert_eq!(first.execution.output["outputOmitted"], true);
+        assert_eq!(first.execution.output["retryUnsafe"], true);
+        assert!(
+            foco_tools::output_budget::serialized_json_size(&first.execution).expect("measure")
+                <= foco_tools::output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+        assert_eq!(
+            fs::read_to_string(&marker).expect("side effect applied once"),
+            "done"
+        );
+
+        // Detector only counts model call signatures; omission must not imply auto re-execution.
+        let mut detector = RepeatedToolCallDetector::default();
+        let batch = vec![NeutralToolCall {
+            call_id: "call-omit-1".to_string(),
+            name: RUN_COMMAND_TOOL.to_string(),
+            arguments: json!({
+                "command": "python3",
+                "args": ["-c", "print('nope')"],
+                "cwd": null,
+                "timeoutMs": 30_000
+            }),
+            thought_signatures: None,
+        }];
+        assert!(detector.check(&batch).is_ok());
+        assert_eq!(
+            fs::read_to_string(&marker).expect("file unchanged by detector"),
+            "done"
+        );
+        let mtime_before = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("mtime");
+        assert!(detector.check(&batch).is_ok());
+        let mtime_after = fs::metadata(&marker)
+            .and_then(|meta| meta.modified())
+            .expect("mtime after");
+        assert_eq!(mtime_before, mtime_after);
+    }
+
+    #[test]
+    fn budget_tool_result_envelope_exact_hard_limit_boundary() {
+        // Construct payload so the full SSE toolResult record is exactly at / one over 128 KiB.
+        let assistant_message_id = "asst-boundary";
+        let tool_call_id = "call-boundary";
+        let started_at = "2026-07-16T00:00:00Z";
+        let completed_at = "2026-07-16T00:00:01Z";
+
+        let measure = |execution: &ToolExecution| {
+            foco_tools::output_budget::serialized_json_size(&ToolResultBudgetEnvelope {
+                event_type: "toolResult",
+                assistant_message_id,
+                tool_call_id,
+                output: &execution.output,
+                is_error: execution.is_error,
+                started_at,
+                completed_at,
+            })
+        };
+
+        let mut content = "x".repeat(foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT);
+        let mut over = ToolExecution {
+            output: json!({ "matches": content.clone() }),
+            is_error: false,
+        };
+        while measure(&over).expect("grow")
+            > foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        {
+            content.pop();
+            over.output = json!({ "matches": content.clone() });
+        }
+        while measure(&over).expect("grow")
+            < foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        {
+            content.push('x');
+            over.output = json!({ "matches": content.clone() });
+        }
+        assert_eq!(
+            measure(&over).expect("over"),
+            foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        );
+        content.pop();
+        let at = ToolExecution {
+            output: json!({ "matches": content }),
+            is_error: false,
+        };
+        assert_eq!(
+            measure(&at).expect("at"),
+            foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let within = budget_tool_result_envelope(
+            assistant_message_id,
+            tool_call_id,
+            SEARCH_TEXT_TOOL,
+            started_at,
+            completed_at,
+            at,
+        );
+        // Exact hard envelope size is still under the hard gate (`>` not `>=`): only soft recovery.
+        assert_eq!(
+            within.state,
+            foco_tools::output_budget::ToolOutputBudgetState::ReadOnlyRecoverableFailure
+        );
+        assert!(within.execution.is_error);
+        assert_eq!(within.execution.output["reason"], "softByteLimit");
+        assert!(
+            measure(&within.execution).expect("within envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let budgeted_over = budget_tool_result_envelope(
+            assistant_message_id,
+            tool_call_id,
+            SEARCH_TEXT_TOOL,
+            started_at,
+            completed_at,
+            over,
+        );
+        assert_ne!(
+            budgeted_over.state,
+            foco_tools::output_budget::ToolOutputBudgetState::WithinBudget
+        );
+        assert!(budgeted_over.execution.is_error);
+        assert_eq!(budgeted_over.execution.output["reason"], "hardByteLimit");
+        assert!(
+            measure(&budgeted_over.execution).expect("over envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
     fn builtin_workspace_database_tools_are_routed_to_canonical_workspace() {
         for tool_name in [
             CREATE_TODO_GRAPH_TOOL,

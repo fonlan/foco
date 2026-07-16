@@ -698,8 +698,7 @@ fn search_text_initial(
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let incomplete = output.stdout.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES
-        || output.stderr.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES;
+    let incomplete = search_text_collection_is_incomplete(&output.stdout, &output.stderr);
     let mut entries = Vec::new();
     for line in stdout.lines() {
         let event: Value =
@@ -748,9 +747,7 @@ fn search_text_initial(
     });
 
     if incomplete {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "search_text collection is incomplete for query '{pattern}' in '{input_path}': ripgrep output hit the command safety ceiling ({MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES} bytes). Refine the query or narrow the path before searching again; collected partial matches are not reported as a complete total."
-        )));
+        return Err(search_text_incomplete_collection_error(pattern, input_path));
     }
 
     let total_matches = entries.len();
@@ -1173,6 +1170,17 @@ fn prune_search_results_dir(results_dir: &Path) {
     }
 }
 
+fn search_text_collection_is_incomplete(stdout: &[u8], stderr: &[u8]) -> bool {
+    stdout.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES
+        || stderr.len() >= MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES
+}
+
+fn search_text_incomplete_collection_error(pattern: &str, input_path: &str) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(format!(
+        "search_text collection is incomplete for query '{pattern}' in '{input_path}': ripgrep output hit the command safety ceiling ({MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES} bytes). Refine the query or narrow the path before searching again; collected partial matches are not reported as a complete total."
+    ))
+}
+
 fn search_text_too_many_matches_error(
     pattern: &str,
     input_path: &str,
@@ -1418,12 +1426,17 @@ pub(crate) struct EditFileInput {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        path::Path,
+        time::{Duration, SystemTime},
+    };
 
     use serde_json::json;
     use tempfile::tempdir;
 
     use super::*;
+    use crate::{MAX_SEARCH_RESULT_FILES, MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, SEARCH_RESULT_TTL};
 
     #[test]
     fn find_files_excludes_internal_foco_directory() {
@@ -1461,5 +1474,111 @@ mod tests {
         assert!(filter.prunes_directory("node_modules"));
         assert!(!filter.matches("node_modules/package.json"));
         assert!(filter.matches("package.json"));
+    }
+
+    fn touch_mtime(path: &Path, age: Duration) {
+        let target = SystemTime::now()
+            .checked_sub(age)
+            .expect("mtime within epoch");
+        let file = fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open for mtime");
+        file.set_modified(target).expect("set mtime");
+    }
+
+    #[test]
+    fn prune_search_results_dir_drops_ttl_expired_and_caps_snapshot_count() {
+        let workspace = tempdir().expect("workspace");
+        let results_dir = workspace
+            .path()
+            .join(WORKSPACE_FOCO_DIR)
+            .join(SEARCH_RESULTS_DIR);
+        fs::create_dir_all(&results_dir).expect("create results dir");
+
+        // One expired snapshot pair must be removed by TTL.
+        let expired_id = "search-expired-1";
+        let expired_json = results_dir.join(format!("{expired_id}.json"));
+        let expired_txt = results_dir.join(format!("{expired_id}.txt"));
+        fs::write(&expired_json, "{}").expect("write expired json");
+        fs::write(&expired_txt, "old").expect("write expired txt");
+        touch_mtime(&expired_json, SEARCH_RESULT_TTL + Duration::from_secs(5));
+        touch_mtime(&expired_txt, SEARCH_RESULT_TTL + Duration::from_secs(5));
+
+        // Fill to the cap with fresh pairs; prune keeps room for one new snapshot.
+        for index in 0..MAX_SEARCH_RESULT_FILES {
+            let id = format!("search-fresh-{index}");
+            let json_path = results_dir.join(format!("{id}.json"));
+            let txt_path = results_dir.join(format!("{id}.txt"));
+            fs::write(&json_path, format!(r#"{{"id":{index}}}"#)).expect("write json");
+            fs::write(&txt_path, format!("match {index}")).expect("write txt");
+            // Older indices are older so they are preferred for eviction.
+            let age = Duration::from_secs((MAX_SEARCH_RESULT_FILES - index) as u64);
+            touch_mtime(&json_path, age);
+            touch_mtime(&txt_path, age);
+        }
+
+        prune_search_results_dir(&results_dir);
+
+        assert!(!expired_json.exists());
+        assert!(!expired_txt.exists());
+
+        let remaining_ids = fs::read_dir(&results_dir)
+            .expect("read results")
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                name.strip_suffix(".json")
+                    .or_else(|| name.strip_suffix(".txt"))
+                    .map(str::to_string)
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        // Cap is MAX_SEARCH_RESULT_FILES exclusive of the next write: prune leaves at most 19.
+        assert!(
+            remaining_ids.len() < MAX_SEARCH_RESULT_FILES,
+            "remaining={}",
+            remaining_ids.len()
+        );
+        assert!(!remaining_ids.contains("search-fresh-0"));
+        assert!(remaining_ids.contains(&format!("search-fresh-{}", MAX_SEARCH_RESULT_FILES - 1)));
+    }
+
+    #[test]
+    fn search_text_incomplete_collection_error_refuses_full_total() {
+        // Command collection ceiling is a hard safety bound (4 MiB), independent of soft preview.
+        assert_eq!(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, 4 * 1024 * 1024);
+
+        assert!(!search_text_collection_is_incomplete(
+            &vec![0u8; MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES - 1],
+            &[]
+        ));
+        assert!(search_text_collection_is_incomplete(
+            &vec![0u8; MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES],
+            &[]
+        ));
+        assert!(search_text_collection_is_incomplete(
+            &[],
+            &vec![0u8; MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES]
+        ));
+
+        // incomplete path must not invent totalMatches; error text is the only response surface.
+        let error = search_text_incomplete_collection_error("needle", ".");
+        let message = error.to_string();
+        assert!(message.contains("incomplete"));
+        assert!(message.contains("complete total"));
+        assert!(message.contains(&MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES.to_string()));
+        assert!(!message.contains("totalMatches"));
+
+        // Related refine error used when collection is truncated before match materialization.
+        let refine = search_text_too_many_matches_error(
+            "needle",
+            ".",
+            Some(MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES),
+        )
+        .to_string();
+        assert!(
+            refine.contains("incomplete") && refine.contains("full total"),
+            "{refine}"
+        );
     }
 }

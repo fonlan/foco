@@ -15294,6 +15294,104 @@ mod tests {
     }
 
     #[test]
+    fn broker_tool_execution_exact_hard_limit_boundary() {
+        // Construct payload so the full Control response envelope is exactly at / one over 128 KiB.
+        let request_id = "broker-boundary";
+        let timestamp = "2026-07-16T00:00:00Z";
+        let measure = |execution: &foco_tools::ToolExecution| {
+            foco_tools::output_budget::serialized_json_size(&BrokerToolExecutionEnvelope {
+                version: 1,
+                message_type: "response",
+                id: Some(request_id),
+                method: None,
+                payload: BrokerToolExecutionPayload {
+                    status: "ok",
+                    result: &execution.output,
+                    is_error: execution.is_error,
+                },
+                timestamp: Some(timestamp),
+            })
+        };
+
+        let mut content = "x".repeat(foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT);
+        let mut over = foco_tools::ToolExecution {
+            output: json!({ "result": content.clone() }),
+            is_error: false,
+        };
+        while measure(&over).expect("grow")
+            > foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        {
+            content.pop();
+            over.output = json!({ "result": content.clone() });
+        }
+        while measure(&over).expect("grow")
+            < foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        {
+            content.push('x');
+            over.output = json!({ "result": content.clone() });
+        }
+        assert_eq!(
+            measure(&over).expect("over"),
+            foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT + 1
+        );
+        content.pop();
+        let at = foco_tools::ToolExecution {
+            output: json!({ "result": content }),
+            is_error: false,
+        };
+        assert_eq!(
+            measure(&at).expect("at"),
+            foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let within = normalize_broker_tool_execution_for_envelope(
+            request_id,
+            timestamp,
+            "mcp__server__mutate",
+            at.output,
+            false,
+        );
+        assert!(!within.is_error);
+        assert!(
+            measure(&within).expect("within envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let budgeted_over = normalize_broker_tool_execution_for_envelope(
+            request_id,
+            timestamp,
+            "mcp__server__mutate",
+            over.output,
+            false,
+        );
+        // Side-effect / MCP default is retry-unsafe: hard oversize keeps success + omit.
+        assert!(!budgeted_over.is_error);
+        assert_eq!(budgeted_over.output["outputOmitted"], true);
+        assert_eq!(budgeted_over.output["retryUnsafe"], true);
+        assert!(
+            measure(&budgeted_over).expect("over envelope")
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+        assert!(
+            serde_json::to_vec(&ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id.to_string()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "result": budgeted_over.output,
+                    "isError": budgeted_over.is_error,
+                }),
+                timestamp: Some(timestamp.to_string()),
+            })
+            .expect("control envelope bytes")
+            .len()
+                <= foco_tools::output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
     fn broker_error_envelope_bounds_oversized_messages_before_transport() {
         let envelope = broker_error_envelope(
             Some("broker-request"),

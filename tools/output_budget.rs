@@ -789,4 +789,324 @@ mod tests {
         assert!(!path_is_skill_md(Path::new("references/SKILL.md.bak")));
         assert!(!path_is_skill_md(Path::new("references/large.md")));
     }
+
+    #[test]
+    fn soft_byte_boundary_is_measured_on_final_serialized_execution() {
+        // Grow content until the full ToolExecution JSON is just over the soft limit,
+        // then shrink one char so it sits exactly at the soft limit.
+        let mut content = String::from("x");
+        let mut over_limit = ToolExecution {
+            output: json!({ "content": content.clone() }),
+            is_error: false,
+        };
+        while serialized_json_size(&over_limit).expect("measure") <= TOOL_OUTPUT_SOFT_BYTE_LIMIT {
+            content.push('x');
+            over_limit.output = json!({ "content": content.clone() });
+        }
+        let over_bytes = serialized_json_size(&over_limit).expect("measure over");
+        assert_eq!(over_bytes, TOOL_OUTPUT_SOFT_BYTE_LIMIT + 1);
+
+        content.pop();
+        let at_limit = ToolExecution {
+            output: json!({ "content": content }),
+            is_error: false,
+        };
+        let at_bytes = serialized_json_size(&at_limit).expect("measure at");
+        assert_eq!(at_bytes, TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+
+        let within = normalize_tool_execution("read_file", ToolOutputSemantics::ReadOnly, at_limit);
+        assert_eq!(within.state, ToolOutputBudgetState::WithinBudget);
+        assert!(!within.execution.is_error);
+
+        let over = normalize_tool_execution("read_file", ToolOutputSemantics::ReadOnly, over_limit);
+        assert_eq!(
+            over.state,
+            ToolOutputBudgetState::ReadOnlyRecoverableFailure
+        );
+        assert!(over.execution.is_error);
+        assert_eq!(over.execution.output["reason"], "softByteLimit");
+        assert_eq!(
+            serde_json::to_vec(&over.execution)
+                .expect("serialize over result")
+                .len(),
+            serialized_json_size(&over.execution).expect("remeasure over result")
+        );
+        assert!(
+            serialized_json_size(&over.execution).expect("remeasure")
+                <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn soft_line_boundary_accepts_exact_limit_and_rejects_plus_one() {
+        // value_text_lines counts trailing-newline-free text as N lines for N newlines + 1.
+        // "line\n" * 1999 ends with newline → 1999 lines; plus final "line" → 2000 lines.
+        let at_limit_text = format!("{}line", "line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT - 1));
+        let at_limit = ToolExecution {
+            output: json!({ "content": at_limit_text }),
+            is_error: false,
+        };
+        assert_eq!(
+            measure_tool_execution(&at_limit)
+                .expect("measure at")
+                .text_lines,
+            TOOL_OUTPUT_SOFT_LINE_LIMIT
+        );
+        // Keep total serialized size under the soft byte limit so only the line gate fires.
+        assert!(serialized_json_size(&at_limit).expect("bytes at") <= TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        let within =
+            normalize_tool_execution("search_text", ToolOutputSemantics::ReadOnly, at_limit);
+        assert_eq!(within.state, ToolOutputBudgetState::WithinBudget);
+
+        let over_text = format!("{}line", "line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT));
+        let over_limit = ToolExecution {
+            output: json!({ "content": over_text }),
+            is_error: false,
+        };
+        assert_eq!(
+            measure_tool_execution(&over_limit)
+                .expect("measure over")
+                .text_lines,
+            TOOL_OUTPUT_SOFT_LINE_LIMIT + 1
+        );
+        assert!(
+            serialized_json_size(&over_limit).expect("bytes over") <= TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+        let over =
+            normalize_tool_execution("search_text", ToolOutputSemantics::ReadOnly, over_limit);
+        assert_eq!(
+            over.state,
+            ToolOutputBudgetState::ReadOnlyRecoverableFailure
+        );
+        assert_eq!(over.execution.output["reason"], "softLineLimit");
+        assert!(over.execution.is_error);
+    }
+
+    #[test]
+    fn multibyte_utf8_and_json_escape_use_final_serialized_bytes() {
+        // Chinese characters are multi-byte; quotes inside strings become JSON escapes (`\"`).
+        // 20_000 × 3-byte chars + escaped quotes exceeds the 50 KiB soft limit on final UTF-8 JSON.
+        let text = format!("\"你好\"{}", "界".repeat(20_000));
+        let execution = ToolExecution {
+            output: json!({ "content": text }),
+            is_error: false,
+        };
+        let measured = serialized_json_size(&execution).expect("measure");
+        let vec_len = serde_json::to_vec(&execution).expect("to_vec").len();
+        assert_eq!(measured, vec_len);
+        assert!(
+            measured > TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+            "measured={measured} soft={TOOL_OUTPUT_SOFT_BYTE_LIMIT}"
+        );
+
+        let budgeted =
+            normalize_tool_execution("read_file", ToolOutputSemantics::ReadOnly, execution);
+        assert!(budgeted.execution.is_error);
+        let result_bytes = serde_json::to_vec(&budgeted.execution)
+            .expect("serialize result")
+            .len();
+        assert_eq!(
+            result_bytes,
+            serialized_json_size(&budgeted.execution).expect("remeasure")
+        );
+        assert!(result_bytes <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn hard_byte_boundary_forces_fallback_when_payload_exceeds_reserve() {
+        // Payload over the hard envelope limit must still land under the reserved payload ceiling.
+        let execution = ToolExecution {
+            output: json!({
+                "blob": "x".repeat(TOOL_EXECUTION_HARD_BYTE_LIMIT)
+            }),
+            is_error: false,
+        };
+        let original = serialized_json_size(&execution).expect("measure original");
+        assert!(original > TOOL_EXECUTION_HARD_BYTE_LIMIT);
+
+        let budgeted =
+            normalize_tool_execution("run_command", ToolOutputSemantics::RetryUnsafe, execution);
+        assert!(!budgeted.execution.is_error);
+        assert!(
+            matches!(
+                budgeted.state,
+                ToolOutputBudgetState::HardLimitFallback
+                    | ToolOutputBudgetState::RetryUnsafeOutputOmitted
+            ),
+            "{:?}",
+            budgeted.state
+        );
+        assert_eq!(budgeted.execution.output["outputOmitted"], true);
+        assert_eq!(budgeted.execution.output["retryUnsafe"], true);
+        assert!(
+            serialized_json_size(&budgeted.execution).expect("measure fallback")
+                <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+    }
+
+    #[test]
+    fn hard_byte_boundary_accepts_exact_payload_limit_and_rejects_plus_one() {
+        // Hard gate uses TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT for bare ToolExecution.
+        // Soft limits fire first for large payloads; exact hard size must still avoid hard fallback
+        // until the measured size exceeds the hard ceiling by one byte.
+        let mut content = "x".repeat(TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+        let mut over_limit = ToolExecution {
+            output: json!({ "content": content.clone() }),
+            is_error: false,
+        };
+        // Grow or shrink to land exactly one byte over the payload hard ceiling.
+        while serialized_json_size(&over_limit).expect("measure")
+            > TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT + 1
+        {
+            content.pop();
+            over_limit.output = json!({ "content": content.clone() });
+        }
+        while serialized_json_size(&over_limit).expect("measure")
+            < TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT + 1
+        {
+            content.push('x');
+            over_limit.output = json!({ "content": content.clone() });
+        }
+        let over_bytes = serialized_json_size(&over_limit).expect("measure over");
+        assert_eq!(over_bytes, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT + 1);
+        assert_eq!(
+            over_bytes,
+            serde_json::to_vec(&over_limit).expect("to_vec over").len()
+        );
+
+        content.pop();
+        let at_limit = ToolExecution {
+            output: json!({ "content": content }),
+            is_error: false,
+        };
+        let at_bytes = serialized_json_size(&at_limit).expect("measure at");
+        assert_eq!(at_bytes, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+        assert_eq!(
+            at_bytes,
+            serde_json::to_vec(&at_limit).expect("to_vec at").len()
+        );
+
+        let at_budgeted =
+            normalize_tool_execution("read_file", ToolOutputSemantics::ReadOnly, at_limit);
+        // Exact hard payload size is still under the hard gate (`>` not `>=`), so only soft
+        // recovery may apply — never hardByteLimit / HardLimitFallback.
+        assert_eq!(
+            at_budgeted.state,
+            ToolOutputBudgetState::ReadOnlyRecoverableFailure
+        );
+        assert!(at_budgeted.execution.is_error);
+        assert_eq!(at_budgeted.execution.output["reason"], "softByteLimit");
+        assert!(
+            serialized_json_size(&at_budgeted.execution).expect("measure at result")
+                <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+        // Original at-limit execution was over soft but not over hard.
+        assert!(at_bytes > TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        assert!(at_bytes <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+
+        let over_budgeted =
+            normalize_tool_execution("read_file", ToolOutputSemantics::ReadOnly, over_limit);
+        // One byte over the payload hard ceiling must take the hard-reason path (not stay WithinBudget).
+        // Read-only shrink usually lands as recoverable failure with reason hardByteLimit; only when
+        // that still cannot fit does state become HardLimitFallback.
+        assert_ne!(over_budgeted.state, ToolOutputBudgetState::WithinBudget);
+        assert!(over_budgeted.execution.is_error);
+        assert_eq!(over_budgeted.execution.output["reason"], "hardByteLimit");
+        assert!(
+            serialized_json_size(&over_budgeted.execution).expect("measure over result")
+                <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+        );
+        assert_eq!(
+            serde_json::to_vec(&over_budgeted.execution)
+                .expect("to_vec result")
+                .len(),
+            serialized_json_size(&over_budgeted.execution).expect("remeasure")
+        );
+    }
+
+    #[test]
+    fn hard_byte_envelope_accepts_exact_limit_and_rejects_plus_one() {
+        // Envelope-aware hard limit: measure a synthetic transport wrapper, not bare ToolExecution.
+        #[derive(serde::Serialize)]
+        struct SyntheticEnvelope<'a> {
+            #[serde(rename = "type")]
+            event_type: &'static str,
+            tool_call_id: &'static str,
+            output: &'a Value,
+            is_error: bool,
+        }
+
+        let measure = |execution: &ToolExecution| {
+            serialized_json_size(&SyntheticEnvelope {
+                event_type: "toolResult",
+                tool_call_id: "call-boundary",
+                output: &execution.output,
+                is_error: execution.is_error,
+            })
+        };
+
+        let mut content = "x".repeat(TOOL_EXECUTION_HARD_BYTE_LIMIT);
+        let mut over_limit = ToolExecution {
+            output: json!({ "content": content.clone() }),
+            is_error: false,
+        };
+        while measure(&over_limit).expect("measure envelope") > TOOL_EXECUTION_HARD_BYTE_LIMIT + 1 {
+            content.pop();
+            over_limit.output = json!({ "content": content.clone() });
+        }
+        while measure(&over_limit).expect("measure envelope") < TOOL_EXECUTION_HARD_BYTE_LIMIT + 1 {
+            content.push('x');
+            over_limit.output = json!({ "content": content.clone() });
+        }
+        let over_envelope = measure(&over_limit).expect("measure over envelope");
+        assert_eq!(over_envelope, TOOL_EXECUTION_HARD_BYTE_LIMIT + 1);
+
+        content.pop();
+        let at_limit = ToolExecution {
+            output: json!({ "content": content }),
+            is_error: false,
+        };
+        let at_envelope = measure(&at_limit).expect("measure at envelope");
+        assert_eq!(at_envelope, TOOL_EXECUTION_HARD_BYTE_LIMIT);
+
+        let at_budgeted = normalize_tool_execution_for_envelope(
+            "run_command",
+            ToolOutputSemantics::RetryUnsafe,
+            at_limit,
+            measure,
+        );
+        // Exact hard envelope size is still soft-only: hard gate uses `>` not `>=`.
+        assert_eq!(
+            at_budgeted.state,
+            ToolOutputBudgetState::RetryUnsafeOutputOmitted
+        );
+        assert!(!at_budgeted.execution.is_error);
+        assert_eq!(at_budgeted.execution.output["reason"], "softByteLimit");
+        assert_eq!(at_budgeted.execution.output["outputOmitted"], true);
+        assert_eq!(at_budgeted.execution.output["retryUnsafe"], true);
+        assert!(
+            measure(&at_budgeted.execution).expect("remeasure at")
+                <= TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let over_budgeted = normalize_tool_execution_for_envelope(
+            "run_command",
+            ToolOutputSemantics::RetryUnsafe,
+            over_limit,
+            measure,
+        );
+        // Hard+1 must leave the soft-only path: either hard fallback or retry-unsafe omit after
+        // hard reason. Final envelope must fit the hard ceiling.
+        assert_ne!(over_budgeted.state, ToolOutputBudgetState::WithinBudget);
+        assert!(!over_budgeted.execution.is_error);
+        assert_eq!(over_budgeted.execution.output["outputOmitted"], true);
+        assert_eq!(over_budgeted.execution.output["retryUnsafe"], true);
+        assert_eq!(over_budgeted.execution.output["reason"], "hardByteLimit");
+        assert!(
+            measure(&over_budgeted.execution).expect("remeasure over")
+                <= TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+        // Confirm hard path was required: over-limit original would not pass soft-only sizing.
+        assert!(over_envelope > TOOL_EXECUTION_HARD_BYTE_LIMIT);
+    }
 }
