@@ -27,6 +27,7 @@ use foco_tools::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
 
 const WORKSPACE_SPEC_TOOL_NAME: &str = "submit_workspace_spec";
 const WORKSPACE_SPEC_UPDATE_TOOL_NAME: &str = "submit_workspace_spec_update";
+const WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME: &str = "submit_workspace_spec_update_compaction";
 // ponytail: coarse stale-job recovery; replace with runner heartbeat/lease if long jobs become normal.
 const WORKSPACE_SPEC_STALE_RUNNING_AFTER_MS: i64 = 30 * 60 * 1000;
 const WORKSPACE_SPEC_MAX_OUTPUT_TOKENS: u32 = 4_000;
@@ -163,6 +164,12 @@ struct WorkspaceSpecToolOutput {
 struct WorkspaceSpecUpdateToolOutput {
     update_needed: bool,
     edits: Option<Vec<SpecTextEdit>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkspaceSpecUpdateCompactionToolOutput {
+    edits: Vec<SpecTextEdit>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -806,6 +813,60 @@ pub(crate) fn prepare_workspace_spec_update_job(
     prepare_workspace_spec_update_job_input(workspace_id, workspace_path, &job)
 }
 
+/// Prepare a chat-completed Spec update job for remote sidecar execution.
+/// Models/prompts come from the synced runtime config; LLM runs via broker.
+pub(crate) fn prepare_remote_workspace_spec_update_job(
+    workspace_id: &str,
+    workspace_path: &std::path::Path,
+    job: &WorkspaceSpecJobRecord,
+    models: &[ModelSettings],
+    generation_model_id: Option<&str>,
+    update_system_prompt: Option<&str>,
+    app_language: &str,
+) -> Result<Option<PreparedRemoteWorkspaceSpecUpdateJob>, ApiError> {
+    let Some((base_revision, input_summary)) =
+        prepare_workspace_spec_update_job_input(workspace_id, workspace_path, job)?
+    else {
+        return Ok(None);
+    };
+    let model = resolve_workspace_spec_model_from_models(
+        models,
+        job.model_id.as_deref().or(generation_model_id),
+    )?;
+    let request = workspace_spec_update_provider_request(
+        &model.model_id,
+        app_language,
+        update_system_prompt,
+        model.max_output_tokens,
+        &input_summary,
+    )?;
+    Ok(Some(PreparedRemoteWorkspaceSpecUpdateJob {
+        job_id: job.id.clone(),
+        chat_id: job.chat_id.clone(),
+        base_revision,
+        provider_id: model.provider_id,
+        model_id: model.model_id,
+        max_output_tokens: model.max_output_tokens,
+        request,
+        base_markdown: input_summary.current_spec_markdown,
+        workspace_path: workspace_path.to_path_buf(),
+    }))
+}
+
+/// Remote sidecar update job: provider/model ids for brokered LLM; secrets stay local.
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedRemoteWorkspaceSpecUpdateJob {
+    pub(crate) job_id: String,
+    pub(crate) chat_id: Option<String>,
+    pub(crate) base_revision: u64,
+    pub(crate) provider_id: String,
+    pub(crate) model_id: String,
+    pub(crate) max_output_tokens: u32,
+    pub(crate) request: NeutralChatRequest,
+    pub(crate) base_markdown: String,
+    pub(crate) workspace_path: PathBuf,
+}
+
 fn prepare_workspace_spec_update_job_input(
     workspace_id: &str,
     workspace_path: &std::path::Path,
@@ -868,33 +929,8 @@ pub(crate) fn apply_workspace_spec_update_job_output(
     )
 }
 
-fn workspace_spec_update_base_markdown_for_job(
-    workspace_path: &std::path::Path,
-    job_id: &str,
-) -> Result<String, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    let job = database
-        .workspace_spec_job(job_id)
-        .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("workspace spec job was not found: {job_id}"))
-        })?;
-    if !job.input_summary_json.trim().is_empty() {
-        let input: WorkspaceSpecUpdateInput = serde_json::from_str(&job.input_summary_json)
-            .map_err(|source| {
-                ApiError::bad_request(format!("malformed workspace spec update input: {source}"))
-            })?;
-        return Ok(input.current_spec_markdown);
-    }
-    Ok(database
-        .workspace_spec()
-        .map_err(ApiError::from_workspace_error)?
-        .map(|spec| spec.content_markdown)
-        .unwrap_or_default())
-}
-
-fn apply_workspace_spec_update_job_parsed_output(
+/// Apply a parsed automatic Spec update (patch or no-op) with shared CAS/write semantics.
+pub(crate) fn apply_workspace_spec_update_job_parsed_output(
     workspace_path: &std::path::Path,
     job_id: &str,
     base_revision: u64,
@@ -920,6 +956,32 @@ fn apply_workspace_spec_update_job_parsed_output(
             &content_markdown,
         ),
     }
+}
+
+fn workspace_spec_update_base_markdown_for_job(
+    workspace_path: &std::path::Path,
+    job_id: &str,
+) -> Result<String, ApiError> {
+    let database = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    let job = database
+        .workspace_spec_job(job_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("workspace spec job was not found: {job_id}"))
+        })?;
+    if !job.input_summary_json.trim().is_empty() {
+        let input: WorkspaceSpecUpdateInput = serde_json::from_str(&job.input_summary_json)
+            .map_err(|source| {
+                ApiError::bad_request(format!("malformed workspace spec update input: {source}"))
+            })?;
+        return Ok(input.current_spec_markdown);
+    }
+    Ok(database
+        .workspace_spec()
+        .map_err(ApiError::from_workspace_error)?
+        .map(|spec| spec.content_markdown)
+        .unwrap_or_default())
 }
 
 fn apply_workspace_spec_update_job_patch_output(
@@ -1261,10 +1323,7 @@ async fn ensure_workspace_spec_update_fits_limit(
             edits,
             content_markdown,
         } => {
-            // Phase 1: size-check the in-memory patched candidate. Compaction may still
-            // rewrite full Markdown for oversized candidates; later phases switch that
-            // path to pure shrink edits without a full-document tool payload.
-            let content_markdown = ensure_workspace_spec_markdown_fits_limit(
+            let content_markdown = ensure_workspace_spec_update_markdown_fits_limit(
                 config,
                 workspace_path,
                 workspace_id,
@@ -1282,6 +1341,52 @@ async fn ensure_workspace_spec_update_fits_limit(
             })
         }
     }
+}
+
+async fn ensure_workspace_spec_update_markdown_fits_limit(
+    config: &GlobalConfig,
+    workspace_path: &std::path::Path,
+    workspace_id: &str,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+    chat_id: Option<&str>,
+) -> Result<String, ApiError> {
+    compact_oversized_workspace_spec_update_markdown(
+        model_id,
+        max_output_tokens,
+        content_markdown,
+        |request| {
+            let workspace_path = workspace_path.to_path_buf();
+            let workspace_id = workspace_id.to_string();
+            let chat_id = chat_id.map(str::to_string);
+            let provider_id = provider_id.to_string();
+            let provider_config = provider_config.clone();
+            let timeout_ms = config.spec.llm_timeout_ms;
+            let retry_count = config.app.llm_request_retry_count;
+            let save_details = api_audit_save_details(config);
+            async move {
+                audited_provider_tool_request(
+                    &workspace_path,
+                    &workspace_id,
+                    chat_id.as_deref(),
+                    &provider_id,
+                    &provider_config,
+                    request,
+                    "workspace spec update compaction",
+                    WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME,
+                    "submit workspace spec update compaction tool",
+                    timeout_ms,
+                    retry_count,
+                    save_details,
+                )
+                .await
+            }
+        },
+    )
+    .await
 }
 
 async fn ensure_workspace_spec_markdown_fits_limit(
@@ -1330,9 +1435,10 @@ async fn ensure_workspace_spec_markdown_fits_limit(
     .await
 }
 
-/// Multi-round LLM compaction when Spec Markdown exceeds the hard store limit.
+/// Multi-round full-Markdown LLM compaction when generated Spec Markdown exceeds the hard store limit.
 ///
-/// Shared by local and remote Spec jobs so both paths refine oversized output before write.
+/// Shared by local and remote Spec generation jobs. Automatic update jobs must use
+/// [`compact_oversized_workspace_spec_update_markdown`] instead (patch-only shrink edits).
 pub(crate) async fn compact_oversized_workspace_spec_markdown<F, Fut>(
     model_id: &str,
     max_output_tokens: Option<u32>,
@@ -1397,6 +1503,91 @@ where
         original_bytes,
         last_compacted_bytes,
     )))
+}
+
+/// Multi-round patch-only LLM compaction when an automatic Spec update candidate exceeds the hard store limit.
+///
+/// Each attempt must return ordered exact-text edits against the current in-memory candidate.
+/// Expansions and no-op patches are rejected for that attempt; later rounds continue from the best
+/// shorter candidate. Generation must continue using full-Markdown compaction.
+pub(crate) async fn compact_oversized_workspace_spec_update_markdown<F, Fut>(
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+    mut invoke_compaction: F,
+) -> Result<String, ApiError>
+where
+    F: FnMut(NeutralChatRequest) -> Fut,
+    Fut: std::future::Future<Output = Result<Value, ApiError>>,
+{
+    if content_markdown.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+        return Ok(content_markdown.to_string());
+    }
+
+    let original_bytes = content_markdown.len();
+    let mut current = content_markdown.to_string();
+    let mut last_candidate_bytes = Some(original_bytes);
+    let compaction_max_output_tokens = compaction_max_output_tokens(max_output_tokens);
+
+    for attempt in 1..=WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS {
+        let target_bytes = workspace_spec_compaction_target_bytes(attempt);
+        let required_cut_percent = required_cut_percent(current.len(), target_bytes);
+        tracing::warn!(
+            content_bytes = current.len(),
+            original_bytes,
+            max_bytes = WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+            target_bytes,
+            attempt,
+            max_attempts = WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS,
+            required_cut_percent,
+            "workspace spec update exceeded size limit; requesting patch compaction"
+        );
+
+        let request = workspace_spec_update_compaction_provider_request(
+            model_id,
+            compaction_max_output_tokens,
+            &current,
+            attempt,
+            target_bytes,
+        );
+        let tool_arguments = invoke_compaction(request).await?;
+        match parse_workspace_spec_update_compaction_output(tool_arguments, &current) {
+            Ok(candidate) => {
+                last_candidate_bytes = Some(candidate.len());
+                if candidate.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES {
+                    tracing::info!(
+                        original_bytes,
+                        compacted_bytes = candidate.len(),
+                        attempt,
+                        "workspace spec update patch compaction succeeded"
+                    );
+                    return Ok(candidate);
+                }
+                // Feed only strictly shorter candidates into the next round.
+                if candidate.len() < current.len() {
+                    current = candidate;
+                } else {
+                    tracing::warn!(
+                        attempt,
+                        candidate_bytes = candidate.len(),
+                        current_bytes = current.len(),
+                        "workspace spec update patch compaction expanded or left size unchanged; keeping best candidate"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    attempt,
+                    error = %error.message,
+                    "workspace spec update patch compaction attempt rejected; keeping best candidate"
+                );
+            }
+        }
+    }
+
+    Err(ApiError::bad_request(
+        workspace_spec_update_markdown_limit_error(original_bytes, last_candidate_bytes),
+    ))
 }
 
 fn compaction_max_output_tokens(base: Option<u32>) -> Option<u32> {
@@ -1477,6 +1668,64 @@ Submit a substantially shorter complete Project Spec. contentMarkdown MUST be un
     }
 }
 
+/// Build a patch-only compaction request for an oversized automatic Spec update candidate.
+pub(crate) fn workspace_spec_update_compaction_provider_request(
+    model_id: &str,
+    max_output_tokens: Option<u32>,
+    content_markdown: &str,
+    attempt: u32,
+    target_bytes: usize,
+) -> NeutralChatRequest {
+    let current_bytes = content_markdown.len();
+    let cut_percent = required_cut_percent(current_bytes, target_bytes);
+    let aggression = match attempt {
+        1 => {
+            "Prefer deletion and merge via exact-text edits. Reconcile Open Questions: keep only currently unresolved decisions; delete completed work, optional backlog, residual-risk dumps, and verification logs."
+        }
+        2 => {
+            "Be aggressive: delete whole low-value subsections with edits, collapse long matrices into short bullets, keep only durable contracts and still-unresolved Open Questions."
+        }
+        _ => {
+            "Emergency cut via patches only: keep Purpose, Architecture, key contracts, and only still-unresolved Open Questions; ruthlessly delete examples, tables, repeated operational prose, completed work, optional backlog, residual-risk dumps, and verification logs."
+        }
+    };
+    let system_prompt = format!(
+        "Shrink the provided Project Spec Markdown candidate using ordered exact-text edits only. \
+Your ONLY success criterion is that the Spec after applying all edits has UTF-8 length STRICTLY under {target_bytes} bytes \
+(hard store limit {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES}). \
+Do not return a full-document replacement. Never submit a single edit whose oldText is the entire candidate document. \
+Each edit.oldText must be a non-empty exact substring of the CURRENT candidate Markdown below and must match exactly once after prior edits in the same list are applied. Apply edits in declaration order. \
+Preserve the existing language and section shape. Preserve durable product behavior, architecture, runtime flows, data contracts, commands, settings, UI contracts, agent/tool contracts, and operational constraints. \
+For Open Questions, reconcile and preserve only currently unresolved decisions or unknowns that still materially affect future product or implementation; do not unconditionally keep historical Open Questions content. \
+If a resolved item still defines current behavior, keep a concise final form in the matching formal section first; delete delivery history, phase status, and verification logs rather than dropping live contracts. \
+{aggression} \
+Omit low-value details such as long file lists, exhaustive symbol lists, repeated facts, transient task history, implementation blow-by-blow notes, verbose local-vs-SSH dual write-ups, and UI copy minutiae unless they define a contract. \
+Do not invent facts. Use the submit_workspace_spec_update_compaction tool exactly once."
+    );
+    let user_prompt = format!(
+        "SIZE BUDGET (UTF-8 bytes):\n\
+- current: {current_bytes}\n\
+- hard_limit: {WORKSPACE_SPEC_MAX_MARKDOWN_BYTES}\n\
+- target: {target_bytes}\n\
+- required_cut: ~{cut_percent}%\n\
+- attempt: {attempt}/{WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS}\n\n\
+Submit ordered exact-text edits that shrink the CURRENT candidate. After all edits, the candidate MUST be under {target_bytes} bytes.\n\nCURRENT CANDIDATE:\n{}",
+        markdown_code_block("markdown", content_markdown)
+    );
+    NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(NeutralChatRole::System, system_prompt),
+            neutral_text_message(NeutralChatRole::User, user_prompt),
+        ],
+        tools: vec![workspace_spec_update_compaction_tool_definition()],
+        thinking_level: None,
+        max_output_tokens,
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    }
+}
+
 pub(crate) fn workspace_spec_markdown_limit_error(
     original_bytes: usize,
     compacted_bytes: Option<usize>,
@@ -1491,6 +1740,25 @@ pub(crate) fn workspace_spec_markdown_limit_error(
         ),
         None => format!(
             "workspace spec generation exceeded {} bytes ({} bytes). Regenerate, or manually shorten long file lists, repeated facts, transient task history, and low-value implementation details.",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, original_bytes
+        ),
+    }
+}
+
+pub(crate) fn workspace_spec_update_markdown_limit_error(
+    original_bytes: usize,
+    compacted_bytes: Option<usize>,
+) -> String {
+    match compacted_bytes {
+        Some(compacted_bytes) => format!(
+            "workspace spec update exceeded {} bytes after {} patch-compression attempts (initial {} bytes, last candidate {} bytes). Shorten the Spec with smaller durable contracts, or manually remove low-value implementation details.",
+            WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+            WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS,
+            original_bytes,
+            compacted_bytes
+        ),
+        None => format!(
+            "workspace spec update exceeded {} bytes ({} bytes). Shorten the Spec with smaller durable contracts, or manually remove low-value implementation details.",
             WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, original_bytes
         ),
     }
@@ -1787,6 +2055,41 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
     }
 }
 
+fn workspace_spec_update_compaction_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME.to_string(),
+        description: "Submit ordered exact-text edits that shrink the current oversized Project Spec candidate. Do not return full-document Markdown.".to_string(),
+        strict: true,
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "description": "Ordered exact-text patches against the current in-memory candidate. Each oldText must be non-empty and match exactly once. Do not use a single edit that replaces the entire document.",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "oldText": {
+                                "type": "string",
+                                "description": "Exact non-empty substring of the current candidate Markdown."
+                            },
+                            "newText": {
+                                "type": "string",
+                                "description": "Replacement text for oldText. Prefer shorter text; empty string deletes."
+                            }
+                        },
+                        "required": ["oldText", "newText"]
+                    }
+                }
+            },
+            "required": ["edits"]
+        }),
+    }
+}
+
 /// Shared Project Spec definition, admission, and exclusion baseline for generation and update prompts.
 fn workspace_spec_definition_and_admission_baseline() -> &'static str {
     "Project Spec definition: the Spec is the project's current, concise, normative truth. \
@@ -1927,7 +2230,7 @@ pub(crate) fn recover_stale_running_workspace_spec_job_for_path(
     Ok(())
 }
 
-fn parse_workspace_spec_update_output(
+pub(crate) fn parse_workspace_spec_update_output(
     value: Value,
     base_markdown: &str,
 ) -> Result<WorkspaceSpecUpdateOutput, ApiError> {
@@ -1961,6 +2264,25 @@ fn parse_workspace_spec_update_output(
         edits,
         content_markdown,
     })
+}
+
+fn parse_workspace_spec_update_compaction_output(
+    value: Value,
+    base_markdown: &str,
+) -> Result<String, ApiError> {
+    let output: WorkspaceSpecUpdateCompactionToolOutput =
+        serde_json::from_value(value).map_err(|source| {
+            ApiError::bad_request(format!(
+                "malformed workspace spec update compaction JSON: {source}"
+            ))
+        })?;
+    if output.edits.is_empty() {
+        return Err(ApiError::bad_request(
+            "workspace spec update compaction requires non-empty edits",
+        ));
+    }
+    apply_spec_text_edits(base_markdown, &output.edits)
+        .map_err(|error| ApiError::bad_request(map_spec_patch_error_message(error)))
 }
 
 fn map_spec_patch_error_message(error: SpecPatchError) -> String {
@@ -2534,6 +2856,215 @@ mod tests {
 
         assert_eq!(attempts, 0);
         assert_eq!(result, content);
+    }
+
+    #[test]
+    fn workspace_spec_update_compaction_tool_schema_is_edits_only() {
+        let tool = workspace_spec_update_compaction_tool_definition();
+        assert_eq!(tool.name, WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME);
+        assert_eq!(tool.input_schema["required"], json!(["edits"]));
+        assert!(
+            tool.input_schema["properties"]
+                .as_object()
+                .expect("properties")
+                .get("contentMarkdown")
+                .is_none()
+        );
+        assert_eq!(
+            tool.input_schema["properties"]["edits"]["items"]["required"],
+            json!(["oldText", "newText"])
+        );
+    }
+
+    #[test]
+    fn workspace_spec_update_compaction_prompt_is_patch_only() {
+        let request = workspace_spec_update_compaction_provider_request(
+            "model-1",
+            Some(8_000),
+            &"x".repeat(70_000),
+            1,
+            WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES,
+        );
+        let system = request.messages[0].content.as_str();
+        let user = request.messages[1].content.as_str();
+        assert!(system.contains("ordered exact-text edits only"));
+        assert!(system.contains("Never submit a single edit whose oldText is the entire"));
+        assert!(system.contains(WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME));
+        assert!(!system.contains("complete replacement document"));
+        assert!(!system.contains("contentMarkdown MUST"));
+        assert!(user.contains("SIZE BUDGET"));
+        assert!(user.contains("CURRENT CANDIDATE"));
+        assert_eq!(
+            request.tools[0].name,
+            WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_update_returns_unchanged_when_within_limit() {
+        let content = "short enough".to_string();
+        let mut attempts = 0_u32;
+        let result = compact_oversized_workspace_spec_update_markdown(
+            "model-1",
+            None,
+            &content,
+            |_request| {
+                attempts += 1;
+                async move {
+                    Ok(json!({
+                        "edits": [{ "oldText": "short", "newText": "x" }]
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("under-limit content should pass through");
+
+        assert_eq!(attempts, 0);
+        assert_eq!(result, content);
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_update_applies_patch_rounds() {
+        let oversized = format!(
+            "HEAD\n{}",
+            "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+        );
+        let mut attempts = 0_u32;
+        let last_candidate = std::sync::Arc::new(std::sync::Mutex::new(oversized.clone()));
+        let result = compact_oversized_workspace_spec_update_markdown(
+            "model-1",
+            Some(4_000),
+            &oversized,
+            |request| {
+                attempts += 1;
+                assert_eq!(
+                    request.tools[0].name,
+                    WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME
+                );
+                assert!(
+                    !request
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name == WORKSPACE_SPEC_TOOL_NAME)
+                );
+                let old_text = last_candidate.lock().expect("candidate lock").clone();
+                let new_text = if attempts < 2 {
+                    format!(
+                        "HEAD\n{}",
+                        "z".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 200)
+                    )
+                } else {
+                    format!(
+                        "HEAD\n{}",
+                        "w".repeat(WORKSPACE_SPEC_TARGET_MARKDOWN_BYTES - 50)
+                    )
+                };
+                *last_candidate.lock().expect("candidate lock") = new_text.clone();
+                async move {
+                    Ok(json!({
+                        "edits": [{
+                            "oldText": old_text,
+                            "newText": new_text
+                        }]
+                    }))
+                }
+            },
+        )
+        .await
+        .expect("patch compaction should succeed");
+
+        assert_eq!(attempts, 2);
+        assert!(result.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+        assert!(result.starts_with("HEAD\n"));
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_update_ignores_expansion_and_fails_after_max() {
+        let oversized = format!(
+            "EXPAND_MARKER\n{}",
+            "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000)
+        );
+        let mut attempts = 0_u32;
+        let error = compact_oversized_workspace_spec_update_markdown(
+            "model-1",
+            None,
+            &oversized,
+            |_request| {
+                attempts += 1;
+                let old = oversized.clone();
+                // Each attempt expands; helper must keep the original best candidate.
+                let expanded = format!(
+                    "EXPAND_MARKER\n{}",
+                    "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000 + attempts as usize * 10)
+                );
+                async move {
+                    Ok(json!({
+                        "edits": [{
+                            "oldText": old,
+                            "newText": expanded
+                        }]
+                    }))
+                }
+            },
+        )
+        .await
+        .expect_err("expansions must not accept a worse candidate");
+
+        assert_eq!(attempts, WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS);
+        let message = error.message();
+        assert!(message.contains("patch-compression attempts"));
+        assert!(message.contains(&format!("initial {} bytes", oversized.len())));
+    }
+
+    #[tokio::test]
+    async fn compact_oversized_workspace_spec_update_rejects_invalid_edits_without_accepting() {
+        let oversized = "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 100);
+        let mut attempts = 0_u32;
+        let error = compact_oversized_workspace_spec_update_markdown(
+            "model-1",
+            None,
+            &oversized,
+            |_request| {
+                attempts += 1;
+                async move {
+                    Ok(json!({
+                        "edits": [{ "oldText": "missing-substring", "newText": "y" }]
+                    }))
+                }
+            },
+        )
+        .await
+        .expect_err("invalid patches should exhaust attempts without write");
+
+        assert_eq!(attempts, WORKSPACE_SPEC_COMPACTION_MAX_ATTEMPTS);
+        assert!(error.message().contains("patch-compression"));
+    }
+
+    #[test]
+    fn parse_workspace_spec_update_compaction_output_applies_shared_patch_core() {
+        let base = "# Project Spec\n\nToo long section.";
+        let compacted = parse_workspace_spec_update_compaction_output(
+            json!({
+                "edits": [{
+                    "oldText": "Too long section.",
+                    "newText": "Short."
+                }]
+            }),
+            base,
+        )
+        .expect("valid compaction edits");
+        assert_eq!(compacted, "# Project Spec\n\nShort.");
+        assert!(
+            parse_workspace_spec_update_compaction_output(
+                json!({ "contentMarkdown": "# Full" }),
+                base
+            )
+            .is_err()
+        );
+        assert!(
+            parse_workspace_spec_update_compaction_output(json!({ "edits": [] }), base).is_err()
+        );
     }
 
     #[test]

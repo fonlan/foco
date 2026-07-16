@@ -122,10 +122,13 @@ use crate::{
         skill_read_root_dirs_from_settings,
     },
     spec_runtime::{
-        apply_workspace_spec_job_output, claim_next_workspace_spec_job_for_path,
-        compact_oversized_workspace_spec_markdown, log_workspace_spec_job_status,
+        WorkspaceSpecUpdateOutput, apply_workspace_spec_job_output,
+        apply_workspace_spec_update_job_parsed_output, claim_next_workspace_spec_job_for_path,
+        compact_oversized_workspace_spec_markdown,
+        compact_oversized_workspace_spec_update_markdown, log_workspace_spec_job_status,
         mark_workspace_spec_job_failed, parse_workspace_spec_output,
-        prepare_remote_workspace_spec_generation_job,
+        parse_workspace_spec_update_output, prepare_remote_workspace_spec_generation_job,
+        prepare_remote_workspace_spec_update_job,
         recover_stale_running_workspace_spec_job_for_path,
     },
     ssh_client::{
@@ -14364,6 +14367,9 @@ async fn run_remote_sidecar_spec_job(
     state: &RemoteSidecarState,
     job: WorkspaceSpecJobRecord,
 ) -> Result<(), ApiError> {
+    if job.trigger_type == WorkspaceSpecTriggerType::ChatCompleted.as_str() {
+        return run_remote_sidecar_spec_update_job(state, job).await;
+    }
     if job.trigger_type != WorkspaceSpecTriggerType::ManualInitial.as_str()
         && job.trigger_type != WorkspaceSpecTriggerType::ManualRefresh.as_str()
     {
@@ -14406,8 +14412,10 @@ async fn run_remote_sidecar_spec_job(
         prepared.request,
         prepared.chat_id.as_deref(),
         payload.spec.llm_timeout_ms,
+        "submit_workspace_spec",
     )
-    .await?;
+    .await
+    .and_then(parse_workspace_spec_output)?;
     let content_markdown = {
         let provider_id = prepared.provider_id.clone();
         let model_id = prepared.model_id.clone();
@@ -14429,9 +14437,9 @@ async fn run_remote_sidecar_spec_job(
                         request,
                         chat_id.as_deref(),
                         timeout_ms,
+                        "submit_workspace_spec",
                     )
                     .await
-                    .map(|content| json!({ "contentMarkdown": content }))
                 }
             },
         )
@@ -14451,6 +14459,100 @@ async fn run_remote_sidecar_spec_job(
     Ok(())
 }
 
+async fn run_remote_sidecar_spec_update_job(
+    state: &RemoteSidecarState,
+    job: WorkspaceSpecJobRecord,
+) -> Result<(), ApiError> {
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone())
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "remote sidecar runtime config is unavailable; wait for runtime config sync",
+            )
+        })?;
+    let payload = &bundle.payload;
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let Some(prepared) = prepare_remote_workspace_spec_update_job(
+        &state.workspace_id,
+        &workspace_path,
+        &job,
+        &payload.models,
+        payload.spec.generation_model_id.as_deref(),
+        payload.spec.update_system_prompt.as_deref(),
+        &payload.app.language,
+    )?
+    else {
+        return Ok(());
+    };
+
+    let tool_arguments = remote_sidecar_broker_workspace_spec_tool_request(
+        state,
+        &prepared.provider_id,
+        &prepared.model_id,
+        prepared.request,
+        prepared.chat_id.as_deref(),
+        payload.spec.llm_timeout_ms,
+        "submit_workspace_spec_update",
+    )
+    .await?;
+    let update_output =
+        parse_workspace_spec_update_output(tool_arguments, &prepared.base_markdown)?;
+    let update_output = match update_output {
+        WorkspaceSpecUpdateOutput::NoUpdateNeeded => WorkspaceSpecUpdateOutput::NoUpdateNeeded,
+        WorkspaceSpecUpdateOutput::Patch {
+            edits,
+            content_markdown,
+        } => {
+            let provider_id = prepared.provider_id.clone();
+            let model_id = prepared.model_id.clone();
+            let chat_id = prepared.chat_id.clone();
+            let timeout_ms = payload.spec.llm_timeout_ms;
+            let content_markdown = compact_oversized_workspace_spec_update_markdown(
+                &prepared.model_id,
+                Some(prepared.max_output_tokens),
+                &content_markdown,
+                |request| {
+                    let provider_id = provider_id.clone();
+                    let model_id = model_id.clone();
+                    let chat_id = chat_id.clone();
+                    async move {
+                        remote_sidecar_broker_workspace_spec_tool_request(
+                            state,
+                            &provider_id,
+                            &model_id,
+                            request,
+                            chat_id.as_deref(),
+                            timeout_ms,
+                            "submit_workspace_spec_update_compaction",
+                        )
+                        .await
+                    }
+                },
+            )
+            .await?;
+            WorkspaceSpecUpdateOutput::Patch {
+                edits,
+                content_markdown,
+            }
+        }
+    };
+    apply_workspace_spec_update_job_parsed_output(
+        &prepared.workspace_path,
+        &prepared.job_id,
+        prepared.base_revision,
+        update_output,
+    )?;
+    if let Ok(database) = WorkspaceDatabase::open_or_create(&prepared.workspace_path) {
+        if let Ok(Some(job)) = database.workspace_spec_job(&prepared.job_id) {
+            log_workspace_spec_job_status(&state.workspace_id, &job);
+        }
+    }
+    Ok(())
+}
+
 async fn remote_sidecar_broker_workspace_spec_tool_request(
     state: &RemoteSidecarState,
     provider_id: &str,
@@ -14458,7 +14560,8 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
     request: NeutralChatRequest,
     chat_id: Option<&str>,
     timeout_ms: u64,
-) -> Result<String, ApiError> {
+    expected_tool_name: &str,
+) -> Result<Value, ApiError> {
     let broker_request_id = unique_id("broker-spec");
     let broker_payload = json!({
         "workspaceId": state.workspace_id,
@@ -14525,13 +14628,13 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
                 };
                 let submit = tool_calls
                     .into_iter()
-                    .find(|tool_call| tool_call.name == "submit_workspace_spec")
+                    .find(|tool_call| tool_call.name == expected_tool_name)
                     .ok_or_else(|| {
-                        ApiError::bad_request(
-                            "workspace spec generation completed without submit_workspace_spec tool call",
-                        )
+                        ApiError::bad_request(format!(
+                            "workspace spec job completed without {expected_tool_name} tool call"
+                        ))
                     })?;
-                return parse_workspace_spec_output(submit.arguments);
+                return Ok(submit.arguments);
             }
             "error" => {
                 let message = envelope
