@@ -1162,6 +1162,171 @@ mod tests {
                 .expect("inside path"),
             None
         );
+
+        let inside_absolute =
+            fs::canonicalize(workspace.path().join("inside.txt")).expect("canonicalize inside");
+        assert_eq!(
+            read_file_target_outside_workspace(
+                workspace.path(),
+                inside_absolute.to_str().expect("utf8 path")
+            )
+            .expect("absolute inside path"),
+            None
+        );
+    }
+
+    #[test]
+    fn reads_workspace_file_via_absolute_path_without_external_access() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let note_path = workspace.path().join("note.txt");
+        fs::write(&note_path, "hello absolute").expect("write note");
+        let absolute = fs::canonicalize(&note_path).expect("canonicalize note");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": absolute.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+        );
+
+        assert!(
+            !result.is_error,
+            "absolute internal path should read without external access: {:?}",
+            result.output
+        );
+        assert_eq!(result.output["content"], "1\thello absolute");
+        assert_eq!(result.output["path"], absolute.to_string_lossy().as_ref());
+    }
+
+    #[test]
+    fn absolute_internal_read_file_path_does_not_require_external_access_flag() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let note_path = workspace.path().join("note.txt");
+        fs::write(&note_path, "flag free").expect("write note");
+        let absolute = fs::canonicalize(&note_path).expect("canonicalize note");
+
+        let without_flag = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": absolute.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+        );
+        let with_flag =
+            execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                workspace.path(),
+                Some("chat-absolute-internal"),
+                READ_FILE_TOOL,
+                json!({
+                    "path": absolute.to_string_lossy(),
+                    "startLine": null,
+                    "endLine": null
+                }),
+                None,
+                None,
+                true,
+            );
+
+        assert!(!without_flag.is_error, "{:?}", without_flag.output);
+        assert!(!with_flag.is_error, "{:?}", with_flag.output);
+        assert_eq!(without_flag.output["content"], "1\tflag free");
+        assert_eq!(with_flag.output["content"], "1\tflag free");
+    }
+
+    #[test]
+    fn absolute_path_outside_workspace_still_requires_external_access() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_path = outside.path().join("secret.txt");
+        fs::write(&outside_path, "secret").expect("write outside");
+        let absolute = fs::canonicalize(&outside_path).expect("canonicalize outside");
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": absolute.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+        );
+        assert!(denied.is_error);
+        let denied_error = denied
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(
+            denied_error.contains("escapes the workspace")
+                || denied_error.contains("path must be relative"),
+            "{denied_error}"
+        );
+
+        let allowed =
+            execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                workspace.path(),
+                Some("chat-absolute-external"),
+                READ_FILE_TOOL,
+                json!({
+                    "path": absolute.to_string_lossy(),
+                    "startLine": null,
+                    "endLine": null
+                }),
+                None,
+                None,
+                true,
+            );
+        assert!(!allowed.is_error, "{:?}", allowed.output);
+        assert_eq!(allowed.output["content"], "1\tsecret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn absolute_workspace_symlink_escape_is_not_internal() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let outside_file = outside.path().join("escaped.txt");
+        fs::write(&outside_file, "escaped").expect("write outside");
+        let link_path = workspace.path().join("link.txt");
+        symlink(&outside_file, &link_path).expect("create symlink");
+
+        // Absolute path that points at the symlink entry under the workspace; canonicalize
+        // follows the link, so the real target is outside and must not count as internal.
+        let absolute_under_workspace = fs::canonicalize(workspace.path())
+            .expect("canon workspace")
+            .join("link.txt");
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": absolute_under_workspace.to_string_lossy(),
+                "startLine": null,
+                "endLine": null
+            }),
+        );
+        assert!(
+            denied.is_error,
+            "symlink escape must not count as internal: {:?}",
+            denied.output
+        );
+
+        assert!(
+            read_file_target_outside_workspace(
+                workspace.path(),
+                absolute_under_workspace.to_str().expect("utf8")
+            )
+            .expect("classify")
+            .is_some(),
+            "symlink escape should classify as external"
+        );
     }
 
     #[test]
@@ -1447,6 +1612,23 @@ mod tests {
             definition.description.contains("fail") || definition.description.contains("fails"),
             "{}",
             definition.description
+        );
+        let path_description = definition.input_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("path description");
+        assert!(
+            path_description.contains("absolute"),
+            "path schema should document absolute path support: {path_description}"
+        );
+        assert!(
+            path_description.contains("Workspace-relative")
+                || path_description.contains("workspace-relative"),
+            "path schema should still document relative paths: {path_description}"
+        );
+        assert!(
+            path_description.contains("Other path tools")
+                || path_description.contains("do not accept absolute"),
+            "path schema must not imply other tools accept absolute paths: {path_description}"
         );
         let start_description = definition.input_schema["properties"]["startLine"]["description"]
             .as_str()

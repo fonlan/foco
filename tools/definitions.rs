@@ -52,7 +52,7 @@ fn read_file_definition() -> ToolDefinition {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative file path."
+                    "description": "Workspace-relative file path, or an absolute path. Absolute paths whose canonical target is inside the current execution workspace are read as ordinary internal files (no external authorization). Absolute paths outside the execution workspace require explicit external-read authorization (Skill roots, current-chat attachment allowlist, shared-workspace trust from an isolated worktree, chat allow-all, or user confirmation). Other path tools do not accept absolute paths."
                 },
                 "startLine": {
                     "type": ["integer", "null"],

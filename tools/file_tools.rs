@@ -46,10 +46,13 @@ fn read_file_inner(
     let request: ReadFileInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let requested_line_range = parse_optional_line_range(request.start_line, request.end_line)?;
+    // read_file-only resolver: absolute paths inside the execution workspace are internal
+    // reads. Shared normalize_workspace_path_text / resolve_workspace_path stay relative-only
+    // for write/search/command/graph tools.
     let path = if allow_external_access {
         resolve_read_file_path(workspace_path, &request.path)?
     } else {
-        resolve_workspace_file(workspace_path, &request.path)?
+        resolve_internal_read_file_path(workspace_path, &request.path)?
     };
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
@@ -113,8 +116,71 @@ fn read_file_inner(
 }
 
 fn resolve_read_file_path(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
-    resolve_workspace_file(workspace_path, input)
+    resolve_internal_read_file_path(workspace_path, input)
         .or_else(|_| resolve_external_read_file_path(workspace_path, input))
+}
+
+/// Resolve a `read_file` path that must land inside the execution workspace root.
+///
+/// Accepts workspace-relative paths (same rules as other tools) and absolute paths whose
+/// canonical target is a component-level member of the canonical workspace root. Symlink
+/// escape targets outside the root are rejected as internal paths.
+fn resolve_internal_read_file_path(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
+    let path = resolve_internal_read_path(workspace_path, input)?;
+    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+
+    if metadata.is_file() {
+        Ok(path)
+    } else {
+        Err(ToolRuntimeError::NotFile(path))
+    }
+}
+
+fn resolve_internal_read_path(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err(ToolRuntimeError::InvalidPath(
+            "path must not be empty".to_string(),
+        ));
+    }
+
+    let requested = Path::new(trimmed);
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+
+    let path = if requested.is_absolute() {
+        fs::canonicalize(requested).map_err(|source| ToolRuntimeError::Io {
+            path: requested.to_path_buf(),
+            source,
+        })?
+    } else {
+        // Relative inputs keep the same component checks as other workspace tools.
+        let normalized = normalize_workspace_path_text(trimmed)?;
+        let joined = workspace.join(Path::new(&normalized));
+        fs::canonicalize(&joined).map_err(|source| ToolRuntimeError::Io {
+            path: joined,
+            source,
+        })?
+    };
+
+    if !path.starts_with(&workspace) {
+        return Err(ToolRuntimeError::InvalidPath(format!(
+            "path escapes the workspace: {trimmed}"
+        )));
+    }
+
+    Ok(path)
 }
 
 fn resolve_external_read_file_path(
@@ -162,7 +228,8 @@ pub(crate) fn read_file_target_outside_workspace(
 ) -> Result<Option<PathBuf>, ToolRuntimeError> {
     match resolve_external_read_file_path(workspace_path, input) {
         Ok(path) => Ok(Some(path)),
-        Err(_) => resolve_workspace_file(workspace_path, input).map(|_| None),
+        // Absolute or relative internal paths resolve here and are not external targets.
+        Err(_) => resolve_internal_read_file_path(workspace_path, input).map(|_| None),
     }
 }
 
