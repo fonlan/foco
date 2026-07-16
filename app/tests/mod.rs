@@ -2679,6 +2679,340 @@ name: gitmemo
 }
 
 #[test]
+fn parse_skill_markdown_rejects_empty_description_inline() {
+    let error = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: gitmemo
+description:
+---
+
+# GitMemo
+",
+    )
+    .expect_err("empty description should fail");
+
+    assert!(error.contains("frontmatter field 'description' must not be empty"));
+}
+
+#[test]
+fn parse_skill_markdown_rejects_empty_block_scalar_description() {
+    let error = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: gitmemo
+description: >
+license: MIT
+---
+
+# GitMemo
+",
+    )
+    .expect_err("empty block description should fail");
+
+    assert!(error.contains("frontmatter field 'description' must not be empty"));
+}
+
+#[test]
+fn parse_skill_markdown_accepts_inline_description_and_unquotes() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: gitmemo
+description: \"Project memory.\"
+---
+
+# GitMemo
+",
+    )
+    .expect("inline description");
+
+    assert_eq!(parsed.id, "gitmemo");
+    assert_eq!(parsed.description, "Project memory.");
+}
+
+#[test]
+fn parse_skill_markdown_accepts_vercel_unindented_multiline_description() {
+    // Shape matches upstream vercel-composition-patterns SKILL.md frontmatter:
+    // `description:` with empty value, then unindented multi-line text, then sibling keys.
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: vercel-composition-patterns
+description:
+React composition patterns that scale. Use when refactoring components with
+boolean prop proliferation, building flexible component libraries, or
+designing reusable APIs. Triggers on tasks involving compound components,
+render props, context providers, or component architecture. Includes React 19
+API changes.
+license: MIT
+metadata:
+  author: vercel
+  version: '1.0.0'
+---
+
+# React Composition Patterns
+
+Composition patterns for building flexible, maintainable React components.
+",
+    )
+    .expect("vercel multiline description");
+
+    assert_eq!(parsed.id, "vercel-composition-patterns");
+    assert!(
+        parsed
+            .description
+            .starts_with("React composition patterns that scale.")
+    );
+    assert!(
+        parsed
+            .description
+            .contains("Includes React 19 API changes.")
+    );
+    assert!(!parsed.description.contains("license"));
+    assert!(!parsed.description.contains("metadata"));
+    assert!(!parsed.description.contains("author"));
+    assert!(!parsed.description.contains("MIT"));
+}
+
+#[test]
+fn parse_skill_markdown_accepts_folded_block_scalar_description() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: folded-skill
+description: >
+  Folded description line one.
+  Folded description line two.
+license: MIT
+---
+
+# Folded Skill
+",
+    )
+    .expect("folded block description");
+
+    assert_eq!(parsed.id, "folded-skill");
+    assert_eq!(
+        parsed.description,
+        "Folded description line one. Folded description line two."
+    );
+    assert!(!parsed.description.contains("license"));
+    assert!(!parsed.description.contains("MIT"));
+}
+
+#[test]
+fn parse_skill_markdown_accepts_literal_block_scalar_description() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: literal-skill
+description: |
+  Literal description line one.
+  Literal description line two.
+metadata:
+  author: test
+---
+
+# Literal Skill
+",
+    )
+    .expect("literal block description");
+
+    assert_eq!(parsed.id, "literal-skill");
+    assert_eq!(
+        parsed.description,
+        "Literal description line one. Literal description line two."
+    );
+    assert!(!parsed.description.contains("metadata"));
+    assert!(!parsed.description.contains("author"));
+}
+
+#[test]
+fn parse_skill_markdown_keeps_url_lines_in_unindented_description() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: url-skill
+description:
+See the documentation:
+https://example.com/docs
+license: MIT
+---
+
+# URL Skill
+",
+    )
+    .expect("url continuation description");
+
+    assert_eq!(parsed.id, "url-skill");
+    assert!(parsed.description.contains("See the documentation:"));
+    assert!(parsed.description.contains("https://example.com/docs"));
+    assert!(!parsed.description.contains("license"));
+    assert!(!parsed.description.contains("MIT"));
+}
+
+#[test]
+fn parse_skill_markdown_keeps_hash_content_in_block_scalar_description() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: hash-skill
+description: |
+  # Overview
+  Detailed description.
+license: MIT
+---
+
+# Hash Skill
+",
+    )
+    .expect("block scalar with hash content");
+
+    assert_eq!(parsed.id, "hash-skill");
+    assert!(parsed.description.contains("# Overview"));
+    assert!(parsed.description.contains("Detailed description."));
+    assert!(!parsed.description.contains("license"));
+    assert!(!parsed.description.contains("MIT"));
+}
+
+#[test]
+fn parse_skill_markdown_accepts_block_scalar_with_indent_then_chomp() {
+    let parsed = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: header-skill
+description: >2-
+  Folded with indent-then-chomp header.
+license: MIT
+---
+
+# Header Skill
+",
+    )
+    .expect("block scalar header combination");
+
+    assert_eq!(parsed.id, "header-skill");
+    assert_eq!(parsed.description, "Folded with indent-then-chomp header.");
+    assert!(!parsed.description.contains("license"));
+}
+
+#[test]
+fn parse_skill_markdown_accepts_block_scalar_with_trailing_comment() {
+    let folded = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: comment-folded
+description: > # Folded summary
+  First line of description.
+  Second line.
+license: MIT
+---
+
+# Comment Folded
+",
+    )
+    .expect("folded block with trailing comment");
+
+    assert_eq!(folded.id, "comment-folded");
+    assert_eq!(
+        folded.description,
+        "First line of description. Second line."
+    );
+    assert!(!folded.description.contains("Folded summary"));
+    assert!(!folded.description.contains("license"));
+
+    let literal = parse_skill_markdown(
+        Path::new("SKILL.md"),
+        "---
+name: comment-literal
+description: | # Literal summary
+  # Overview
+  Detailed description.
+metadata:
+  author: test
+---
+
+# Comment Literal
+",
+    )
+    .expect("literal block with trailing comment");
+
+    assert_eq!(literal.id, "comment-literal");
+    assert!(literal.description.contains("# Overview"));
+    assert!(literal.description.contains("Detailed description."));
+    assert!(!literal.description.contains("Literal summary"));
+    assert!(!literal.description.contains("metadata"));
+}
+
+#[test]
+fn skill_store_install_discovers_multiline_description_skill() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-skill-store-multiline-profile-test"));
+    let target_root = profile_dir.join(".agents").join("skills");
+    let skill_md = "---
+name: vercel-composition-patterns
+description:
+React composition patterns that scale. Use when refactoring components with
+boolean prop proliferation, building flexible component libraries, or
+designing reusable APIs.
+license: MIT
+metadata:
+  author: vercel
+  version: '1.0.0'
+---
+
+# React Composition Patterns
+
+Use composition over boolean props.
+";
+    let files = vec![SkillStoreFile::text(
+        "SKILL.md".to_string(),
+        skill_md.to_string(),
+    )];
+
+    let install_path = install_skill_files_to_target_dir(
+        &target_root,
+        "vercel-composition-patterns",
+        &files,
+        false,
+    )
+    .expect("multiline skill install");
+
+    let config = GlobalConfig::first_run(env::temp_dir());
+    let discovery = discover_skills_in_all_locations(&profile_dir, &config.workspaces);
+
+    assert!(
+        discovery.errors.is_empty(),
+        "discovery errors: {}",
+        discovery
+            .errors
+            .iter()
+            .map(|error| format!("{}: {}", error.path, error.message))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    assert_eq!(
+        install_path,
+        target_root.join("vercel-composition-patterns")
+    );
+    assert_eq!(discovery.skills.len(), 1);
+    assert_eq!(
+        discovery.skills[0].key,
+        "global:vercel-composition-patterns"
+    );
+    assert_eq!(discovery.skills[0].id, "vercel-composition-patterns");
+    assert!(
+        discovery.skills[0]
+            .description
+            .starts_with("React composition patterns that scale.")
+    );
+    assert!(!discovery.skills[0].description.contains("license"));
+    assert!(!discovery.skills[0].description.contains("metadata"));
+
+    fs::remove_dir_all(profile_dir).expect("remove skill store multiline profile test");
+}
+
+#[test]
 fn parse_skill_file_rejects_oversized_skill_md_with_safe_error() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("SKILL.md");

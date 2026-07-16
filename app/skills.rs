@@ -42,7 +42,7 @@ pub(crate) struct SkillSearchRoot {
 pub(crate) struct ParsedSkillFile {
     pub(crate) id: String,
     pub(crate) name: String,
-    description: String,
+    pub(crate) description: String,
     pub(crate) markdown: String,
 }
 
@@ -889,7 +889,7 @@ pub(crate) fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedS
 
     let id = skill_frontmatter_field(path, &frontmatter, "name")?;
     validate_skill_id(&id).map_err(|error| format!("skill file {}: {}", path.display(), error))?;
-    let description = skill_frontmatter_field(path, &frontmatter, "description")?;
+    let description = skill_frontmatter_description(path, &frontmatter)?;
 
     // Runtime enablement requires documents within SKILL_MD_MAX_BYTES. Structural parse
     // (e.g. Skill Store install validation) may still inspect larger archives; those
@@ -968,6 +968,205 @@ fn skill_frontmatter_field<T: AsRef<str>>(
         path.display(),
         field
     ))
+}
+
+/// Parse frontmatter `description`, supporting:
+/// - inline scalar: `description: value`
+/// - YAML block scalars: `description: >` / `description: |` (+ optional chomping/indent)
+/// - ecosystem-compatible unindented multi-line text after `description:`
+///
+/// Multi-line forms are folded into a single display string (whitespace-joined).
+/// Stops at the next top-level mapping key (e.g. `license:`, `metadata:`) so sibling
+/// fields are never swallowed into the description.
+fn skill_frontmatter_description<T: AsRef<str>>(
+    path: &Path,
+    frontmatter: &[T],
+) -> Result<String, String> {
+    let mut lines = frontmatter.iter().map(|line| line.as_ref()).peekable();
+
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let Some((key, rest)) = trimmed.split_once(':') else {
+            continue;
+        };
+
+        if key.trim() != "description" {
+            continue;
+        }
+
+        let rest = rest.trim();
+        if !rest.is_empty() {
+            // Standard YAML folded/literal block scalar indicators. Headers may include a
+            // trailing YAML comment (`description: > # folded summary`).
+            let block_header = frontmatter_value_without_inline_comment(rest);
+            if is_yaml_block_scalar_indicator(block_header) {
+                return collect_description_continuation(path, &mut lines, true);
+            }
+
+            let value = unquote_frontmatter_value(rest);
+            if value.trim().is_empty() {
+                return Err(format!(
+                    "skill file {} frontmatter field 'description' must not be empty",
+                    path.display()
+                ));
+            }
+            return Ok(value.trim().to_string());
+        }
+
+        // Empty inline value: accept indented/unindented continuation until the next
+        // top-level key (vercel-composition-patterns and similar agent-skill frontmatter).
+        return collect_description_continuation(path, &mut lines, false);
+    }
+
+    Err(format!(
+        "skill file {} frontmatter is missing required field 'description'",
+        path.display()
+    ))
+}
+
+fn is_yaml_block_scalar_indicator(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let style = bytes[0];
+    if style != b'>' && style != b'|' {
+        return false;
+    }
+
+    // YAML block headers allow chomping (`-`/`+`) and indent digit (1-9) in either order.
+    let mut idx = 1;
+    let mut saw_chomp = false;
+    let mut saw_indent = false;
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if !saw_chomp && (b == b'-' || b == b'+') {
+            saw_chomp = true;
+            idx += 1;
+            continue;
+        }
+        if !saw_indent && b.is_ascii_digit() && b != b'0' {
+            saw_indent = true;
+            idx += 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+/// Strip a YAML end-of-line comment (` # ...`) from an unquoted frontmatter value.
+/// `#` only starts a comment when it is at the start of the value or preceded by whitespace.
+fn frontmatter_value_without_inline_comment(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'#' && (idx == 0 || bytes[idx - 1].is_ascii_whitespace()) {
+            return value[..idx].trim_end();
+        }
+        idx += 1;
+    }
+    value
+}
+
+fn is_top_level_frontmatter_key_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return false;
+    }
+
+    // Top-level mapping keys in skill frontmatter are unindented `key: ...` lines.
+    // Indented nested content (e.g. under `metadata:`) is not a top-level key boundary.
+    if line.starts_with(' ') || line.starts_with('\t') {
+        return false;
+    }
+
+    let Some((key, rest)) = trimmed.split_once(':') else {
+        return false;
+    };
+
+    let key = key.trim();
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    // Require YAML mapping separation: after `:` the value is empty or starts with
+    // whitespace. This keeps `license: MIT` as a boundary while rejecting bare URLs
+    // (`https://example.com`) and prose colons (`See docs: more`) as false keys.
+    rest.is_empty() || rest.starts_with(char::is_whitespace)
+}
+
+fn collect_description_continuation<'a, I>(
+    path: &Path,
+    lines: &mut std::iter::Peekable<I>,
+    require_indented_block: bool,
+) -> Result<String, String>
+where
+    I: Iterator<Item = &'a str>,
+{
+    let mut parts = Vec::new();
+    let mut saw_indented_line = false;
+
+    while let Some(&next) = lines.peek() {
+        if is_top_level_frontmatter_key_line(next) {
+            break;
+        }
+
+        let line = lines.next().expect("peeked line must exist");
+        let trimmed = line.trim();
+        let is_indented = line.starts_with(' ') || line.starts_with('\t');
+
+        // Only unindented `# ...` lines are YAML comments. Indented `# Heading` inside a
+        // block scalar is description content and must be preserved.
+        if trimmed.is_empty() || (!is_indented && trimmed.starts_with('#')) {
+            // Preserve paragraph breaks only after content has started.
+            if !parts.is_empty() {
+                parts.push(String::new());
+            }
+            continue;
+        }
+
+        if require_indented_block {
+            if is_indented {
+                saw_indented_line = true;
+                parts.push(trimmed.to_string());
+            } else if !saw_indented_line {
+                // Non-indented text immediately after `>`/`|` with no block body yet is
+                // treated as empty (block scalar without content).
+                break;
+            } else {
+                // After an indented block body, a non-indented non-key line is unusual;
+                // stop so we do not absorb sibling content.
+                break;
+            }
+        } else {
+            parts.push(trimmed.to_string());
+        }
+    }
+
+    // Descriptions are used as flat skill metadata text; fold block content to a single
+    // whitespace-joined line (display-oriented, not full YAML literal fidelity).
+    let description = parts
+        .into_iter()
+        .map(|part| part.trim().to_string())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if description.is_empty() {
+        return Err(format!(
+            "skill file {} frontmatter field 'description' must not be empty",
+            path.display()
+        ));
+    }
+
+    Ok(description)
 }
 
 fn unquote_frontmatter_value(value: &str) -> String {
