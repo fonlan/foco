@@ -2118,7 +2118,7 @@ fn agent_wait_resume_payload(
     }))
 }
 
-fn agent_wait_resume_messages(
+pub(crate) fn agent_wait_resume_messages(
     dependencies: &[AgentTaskDependencyRecord],
     dependency_tasks: &[AgentTaskRecord],
 ) -> Result<Vec<NeutralChatMessage>, ApiError> {

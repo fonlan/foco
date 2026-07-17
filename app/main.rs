@@ -156,8 +156,9 @@ use crate::runtime::{
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
-    GithubReleaseAsset, reconcile_agent_runtime, ripgrep_asset_target, ripgrep_executable_name,
-    ripgrep_install_dir, select_ripgrep_asset, spawn_code_graph_workspace_initialization_if_needed,
+    GithubReleaseAsset, agent_wait_resume_messages, reconcile_agent_runtime, ripgrep_asset_target,
+    ripgrep_executable_name, ripgrep_install_dir, select_ripgrep_asset,
+    spawn_code_graph_workspace_initialization_if_needed,
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 

@@ -11017,6 +11017,126 @@ fn agent_scheduler_reconciliation_skips_premature_repair_when_later_phase_active
     remove_dir_if_exists(&profile_dir);
 }
 
+#[test]
+fn agent_scheduler_startup_recovers_running_task_with_registered_wait_dependencies() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-wait-startup-recover-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-wait-startup-recover-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+
+    let (team_id, instance_id, parent_task_id, _attempt_id) =
+        insert_claimed_agent_task(&workspace.path, "wait-startup-recover");
+    let child_task_id = {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        let worker_id =
+            foco_agent::AgentInstanceId::new("agent-instance-wait-startup-recover-worker")
+                .expect("worker id");
+        let worker_definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-wait-startup-recover-worker")
+                .expect("definition id"),
+            revision: 1,
+            name: "Wait startup worker".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Work.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_instances_with_limits(
+                &[foco_store::workspace::NewAgentInstance {
+                    id: &worker_id,
+                    team_id: &team_id,
+                    definition: &worker_definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                2,
+                1,
+            )
+            .expect("worker create");
+        let child_task_id =
+            foco_agent::AgentTaskId::new("agent-task-wait-startup-recover-child").expect("child");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &child_task_id,
+                team_id: &team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&instance_id),
+                parent_task_id: Some(&parent_task_id),
+                input_json: r#"{"goal":"child"}"#,
+            })
+            .expect("child enqueue");
+        // Two-phase wait: durable registration before Running→Waiting.
+        database
+            .register_agent_task_wait_dependencies(
+                foco_store::workspace::RegisterAgentTaskWaitDependencies {
+                    team_id: &team_id,
+                    waiting_task_id: &parent_task_id,
+                    dependency_task_ids: std::slice::from_ref(&child_task_id),
+                    wait_mode: foco_agent::AgentTaskWaitMode::All,
+                    pending_tool_call_id: Some("call-wait-startup-recover"),
+                    deadline_at: None,
+                    event_instance_id: Some(&instance_id),
+                },
+            )
+            .expect("register wait round");
+        assert_eq!(
+            database
+                .agent_task(&parent_task_id)
+                .expect("parent")
+                .expect("parent")
+                .status,
+            foco_agent::AgentTaskStatus::Running
+        );
+        child_task_id
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+    let parent = database
+        .agent_task(&parent_task_id)
+        .expect("parent")
+        .expect("parent");
+    assert_eq!(
+        parent.status,
+        foco_agent::AgentTaskStatus::Waiting,
+        "registered wait dependencies must suspend Running tasks on startup instead of interrupting"
+    );
+    let attempts = database
+        .agent_attempts_for_task(&parent_task_id)
+        .expect("attempts");
+    assert_eq!(
+        attempts[0].status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    let deps = database
+        .agent_task_dependencies(&parent_task_id)
+        .expect("dependencies");
+    assert_eq!(deps.len(), 1);
+    assert_eq!(deps[0].dependency_task_id, child_task_id);
+    assert_eq!(
+        deps[0].pending_tool_call_id.as_deref(),
+        Some("call-wait-startup-recover")
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
 fn insert_claimed_agent_task(
     workspace_dir: &Path,
     suffix: &str,

@@ -24,8 +24,8 @@ use foco_store::{
         WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
     },
     workspace::{
-        AgentTaskStateUpdate, LlmRequestAuditFilters, LlmRequestRecord,
-        LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, LlmRequestAuditFilters,
+        LlmRequestRecord, LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
         MessageMetadataMutation, NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry,
         NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
         NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
@@ -35,16 +35,16 @@ use foco_store::{
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
         NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
         PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL, RegisterAgentTaskWaitDependencies,
-        RewriteChatFromUserMessage, AgentTaskWaitRegistrationOutcome,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
+        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
+        RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
+        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -14100,7 +14100,10 @@ fn register_agent_wait_dependencies_replays_identical_wait_round() {
         .agent_task_dependencies(&waiting)
         .expect("dependencies");
     assert_eq!(first_rows.len(), 2);
-    let first_created: Vec<_> = first_rows.iter().map(|row| row.created_at.clone()).collect();
+    let first_created: Vec<_> = first_rows
+        .iter()
+        .map(|row| row.created_at.clone())
+        .collect();
     let first_events = database
         .agent_events_after(&team_id, -1)
         .expect("events")
@@ -14432,8 +14435,7 @@ fn register_agent_wait_dependencies_replaces_terminal_round_and_allows_same_chil
         })
         .expect("first wait");
 
-    let attempt_id =
-        AgentAttemptId::new("agent-attempt-wait-replace-child").expect("attempt id");
+    let attempt_id = AgentAttemptId::new("agent-attempt-wait-replace-child").expect("attempt id");
     database
         .claim_runnable_agent_task(&team_id, &child, &attempt_id)
         .expect("claim child")

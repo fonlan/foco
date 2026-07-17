@@ -8,10 +8,10 @@ use std::{
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 
 use foco_agent::{
-    AgentCollaborationTool, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
-    AgentMessageId, AgentMessageKind, AgentPermissions, AgentRunAssociations, AgentTaskId,
-    AgentTaskStatus, AgentTaskWaitMode, PendingToolCall, ToolExecutionMode, ToolExecutionPlan,
-    ToolResourceLock, tool_resource_locks,
+    AgentAttemptId, AgentCollaborationTool, AgentDefinitionId, AgentExecutionWorkspaceMode,
+    AgentInstanceId, AgentMessageId, AgentMessageKind, AgentPermissions, AgentRunAssociations,
+    AgentTaskId, AgentTaskStatus, AgentTaskWaitMode, PendingToolCall, ToolExecutionMode,
+    ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
@@ -2616,7 +2616,49 @@ fn append_agent_tool_event(
 }
 
 fn agent_store_error(error: foco_store::workspace::WorkspaceDatabaseError) -> String {
-    agent_tool_error("store_error", error.to_string())
+    use foco_agent::AgentDomainErrorCode;
+    use foco_store::workspace::WorkspaceDatabaseError;
+
+    match error {
+        WorkspaceDatabaseError::AgentDomain { source } => {
+            let code = match source.code() {
+                AgentDomainErrorCode::DependencyCycle => "dependency_cycle",
+                AgentDomainErrorCode::CrossTeamReference => "cross_team_reference",
+                AgentDomainErrorCode::PermissionDenied => "permission_denied",
+                AgentDomainErrorCode::QueueConflict => "queue_conflict",
+                AgentDomainErrorCode::InstanceLimitExceeded => "limit_exceeded",
+                AgentDomainErrorCode::MutationLeaseConflict => "mutation_lease_conflict",
+                AgentDomainErrorCode::InvalidId => "invalid_arguments",
+                AgentDomainErrorCode::InvalidStateTransition => "invalid_task_status",
+                AgentDomainErrorCode::MissingCoordinatorDefinition => "not_found",
+                AgentDomainErrorCode::TeamBusy => "team_busy",
+            };
+            agent_tool_error(code, source.message().to_string())
+        }
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { message } => {
+            let lower = message.to_ascii_lowercase();
+            let code = if lower.contains("active wait round") {
+                "wait_round_active"
+            } else if lower.contains("conflicts with existing registration")
+                || lower.contains("cannot change dependency set")
+            {
+                "wait_round_conflict"
+            } else if lower.contains("must not be empty")
+                || lower.contains("pending tool call id")
+                || lower.contains("duplicate dependency")
+            {
+                "invalid_arguments"
+            } else {
+                "invalid_agent_runtime"
+            };
+            agent_tool_error(code, message)
+        }
+        WorkspaceDatabaseError::Sqlite { .. } => agent_tool_error(
+            "store_error",
+            "workspace database operation failed; retry the agent tool call",
+        ),
+        other => agent_tool_error("store_error", other.to_string()),
+    }
 }
 
 fn agent_tool_error(code: &'static str, message: impl Into<String>) -> String {
@@ -7767,6 +7809,532 @@ mod tests {
             children
                 .iter()
                 .any(|task| task.owner_instance_id.to_string() == worker_instance_id)
+        );
+    }
+
+    fn claim_parent_running(
+        workspace_path: &std::path::Path,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        attempt_suffix: &str,
+    ) {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
+        let attempt_id =
+            AgentAttemptId::new(format!("agent-attempt-{attempt_suffix}")).expect("attempt id");
+        database
+            .claim_runnable_agent_task(team_id, task_id, &attempt_id)
+            .expect("claim parent")
+            .expect("parent claimed");
+    }
+
+    fn create_worker_child(
+        workspace_path: &std::path::Path,
+        team_id: &AgentTeamId,
+        parent_instance_id: &AgentInstanceId,
+        parent_task_id: &AgentTaskId,
+        child_suffix: &str,
+    ) -> AgentTaskId {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
+        let worker_id =
+            AgentInstanceId::new(format!("agent-instance-{child_suffix}")).expect("worker id");
+        let worker_definition = test_agent_definition(
+            child_suffix,
+            AgentPermissions {
+                can_create_instances: false,
+                can_delegate: false,
+                allowed_agent_definition_ids: Vec::new(),
+            },
+        );
+        database
+            .create_agent_instances_with_limits(
+                &[NewAgentInstance {
+                    id: &worker_id,
+                    team_id,
+                    definition: &worker_definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                4,
+                2,
+            )
+            .expect("create worker");
+        let child_task_id =
+            AgentTaskId::new(format!("agent-task-{child_suffix}")).expect("child task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &child_task_id,
+                team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(parent_instance_id),
+                parent_task_id: Some(parent_task_id),
+                input_json: r#"{"message":"child"}"#,
+            })
+            .expect("enqueue child");
+        child_task_id
+    }
+
+    #[test]
+    fn agent_wait_tasks_registers_round_idempotently_and_maps_active_conflict() {
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions {
+                can_create_instances: true,
+                can_delegate: true,
+                allowed_agent_definition_ids: Vec::new(),
+            });
+        claim_parent_running(
+            workspace.path(),
+            &team_id,
+            &parent_task_id,
+            "wait-idempotent-parent",
+        );
+        let child_a = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "wait-idempotent-a",
+        );
+        let child_b = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "wait-idempotent-b",
+        );
+
+        let wait_args = json!({
+            "taskIds": [child_a.to_string(), child_b.to_string()],
+            "mode": "all",
+            "deadlineMs": null,
+        });
+        let first = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-round-1",
+            wait_args.clone(),
+        )
+        .expect("first wait must register");
+        assert_eq!(first["waiting"], true);
+        assert_eq!(first["suspend"]["kind"], "agent_wait_tasks");
+        assert_eq!(first["suspend"]["pendingToolCallId"], "call-wait-round-1");
+        assert_eq!(
+            first["taskIds"].as_array().map(|items| items.len()),
+            Some(2)
+        );
+
+        let replay = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-round-1",
+            wait_args,
+        )
+        .expect("identical wait round must replay");
+        assert_eq!(replay["waiting"], true);
+        assert_eq!(replay["suspend"]["pendingToolCallId"], "call-wait-round-1");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("dependencies");
+        assert_eq!(deps.len(), 2);
+        assert!(
+            deps.iter()
+                .all(|dep| dep.pending_tool_call_id.as_deref() == Some("call-wait-round-1"))
+        );
+        let waiting_events = database
+            .agent_events_after(&team_id, -1)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event_type == "task_waiting_requested")
+            .filter(|event| event.task_id.as_ref() == Some(&parent_task_id))
+            .count();
+        assert_eq!(
+            waiting_events, 1,
+            "replay must not emit a second task_waiting_requested event"
+        );
+
+        let conflict = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-round-2",
+            json!({
+                "taskIds": [child_a.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect_err("active wait round must reject a different tool call");
+        let conflict_output = agent_tool_error_output(&conflict);
+        assert_eq!(conflict_output["code"], "wait_round_active");
+        let message = conflict_output["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("active wait round"),
+            "expected active wait message, got {message}"
+        );
+        assert!(
+            !message.contains("foco.sqlite"),
+            "must not leak database path: {message}"
+        );
+        assert!(
+            !message.contains("1555"),
+            "must not leak SQLite constraint code: {message}"
+        );
+
+        // Prior wait set and pending tool call stay unchanged on conflict.
+        let deps_after = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("dependencies after conflict");
+        assert_eq!(deps_after.len(), 2);
+        assert!(
+            deps_after
+                .iter()
+                .all(|dep| dep.pending_tool_call_id.as_deref() == Some("call-wait-round-1"))
+        );
+        drop(database);
+
+        // Two-phase lifecycle: durable registration can still reach Waiting and resume
+        // with the same pending tool call id after a replayed registration.
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(
+                    r#"{"control":{"kind":"agent_wait_tasks","pendingToolCallId":"call-wait-round-1"}}"#,
+                ),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent after durable wait registration");
+        for (child_id, suffix) in [
+            (&child_a, "wait-idempotent-a"),
+            (&child_b, "wait-idempotent-b"),
+        ] {
+            let child_attempt =
+                AgentAttemptId::new(format!("agent-attempt-{suffix}")).expect("child attempt");
+            database
+                .claim_runnable_agent_task(&team_id, child_id, &child_attempt)
+                .expect("claim child")
+                .expect("child claimed");
+            database
+                .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: child_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: foco_agent::AgentTaskTransition::Complete,
+                    result_json: Some(r#"{"text":"done"}"#),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("complete child");
+        }
+        let resumed = database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume satisfied wait round");
+        assert!(
+            resumed
+                .iter()
+                .any(|task| task.id == parent_task_id && task.status == AgentTaskStatus::Queued),
+            "satisfied wait round must re-queue the parent for claim"
+        );
+        let parent_attempt =
+            AgentAttemptId::new("agent-attempt-wait-idempotent-resume").expect("parent attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &parent_task_id, &parent_attempt)
+            .expect("claim resumed parent")
+            .expect("parent claimed after resume");
+        let deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("dependencies for resume messages");
+        let dependency_tasks = deps
+            .iter()
+            .map(|dep| {
+                database
+                    .agent_task(&dep.dependency_task_id)
+                    .expect("dependency task lookup")
+                    .expect("dependency task")
+            })
+            .collect::<Vec<_>>();
+        drop(database);
+
+        let resume_messages = crate::agent_wait_resume_messages(&deps, &dependency_tasks)
+            .expect("wait resume messages after replayed registration");
+        assert_eq!(resume_messages.len(), 3);
+        assert_eq!(
+            resume_messages[1].tool_calls[0].call_id,
+            "call-wait-round-1"
+        );
+        assert_eq!(
+            resume_messages[2].tool_call_id.as_deref(),
+            Some("call-wait-round-1")
+        );
+        let _ = context;
+    }
+
+    #[test]
+    fn agent_wait_tasks_replaces_terminal_round_for_sequential_wait() {
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions {
+                can_create_instances: true,
+                can_delegate: true,
+                allowed_agent_definition_ids: Vec::new(),
+            });
+        claim_parent_running(
+            workspace.path(),
+            &team_id,
+            &parent_task_id,
+            "wait-replace-parent",
+        );
+        let child_a = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "wait-replace-a",
+        );
+        let child_b = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "wait-replace-b",
+        );
+
+        execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-first",
+            json!({
+                "taskIds": [child_a.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect("first wait");
+
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        // Parent is still Running (two-phase wait). Free team concurrency so the child
+        // can be claimed, then complete it to make the first wait round terminal.
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(
+                    r#"{"control":{"kind":"agent_wait_tasks","pendingToolCallId":"call-wait-first"}}"#,
+                ),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent after durable wait registration");
+        let child_attempt =
+            AgentAttemptId::new("agent-attempt-wait-replace-a").expect("child attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &child_a, &child_attempt)
+            .expect("claim child")
+            .expect("child claimed");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child_a,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"first child done"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete first child");
+        let resumed = database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume first wait round through scheduler store path");
+        assert!(
+            resumed
+                .iter()
+                .any(|task| task.id == parent_task_id && task.status == AgentTaskStatus::Queued)
+        );
+        let first_resume_attempt =
+            AgentAttemptId::new("agent-attempt-wait-replace-resume-1").expect("parent attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &parent_task_id, &first_resume_attempt)
+            .expect("claim parent after first wait")
+            .expect("parent claimed after first wait");
+        let first_round_deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("first-round dependencies");
+        let first_round_tasks = first_round_deps
+            .iter()
+            .map(|dep| {
+                database
+                    .agent_task(&dep.dependency_task_id)
+                    .expect("dependency task lookup")
+                    .expect("dependency task")
+            })
+            .collect::<Vec<_>>();
+        let first_resume_messages =
+            crate::agent_wait_resume_messages(&first_round_deps, &first_round_tasks)
+                .expect("first-round wait resume messages");
+        assert_eq!(
+            first_resume_messages[1].tool_calls[0].call_id,
+            "call-wait-first"
+        );
+        assert_eq!(
+            first_resume_messages[2].tool_call_id.as_deref(),
+            Some("call-wait-first")
+        );
+        assert!(
+            first_resume_messages[2]
+                .content
+                .contains("first child done")
+        );
+        drop(database);
+
+        // Parent is Running again; prior dependency is terminal so a new tool call may replace.
+        let second = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-second",
+            json!({
+                "taskIds": [child_b.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect("second wait after terminal first round");
+        assert_eq!(second["suspend"]["pendingToolCallId"], "call-wait-second");
+        assert_eq!(second["taskIds"], json!([child_b.to_string()]));
+
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("dependencies");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].dependency_task_id, child_b);
+        assert_eq!(
+            deps[0].pending_tool_call_id.as_deref(),
+            Some("call-wait-second")
+        );
+
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(
+                    r#"{"control":{"kind":"agent_wait_tasks","pendingToolCallId":"call-wait-second"}}"#,
+                ),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent for second wait round");
+        let child_b_attempt =
+            AgentAttemptId::new("agent-attempt-wait-replace-b").expect("child b attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &child_b, &child_b_attempt)
+            .expect("claim second child")
+            .expect("second child claimed");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child_b,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"second child done"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete second child");
+        let resumed_second = database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume second wait round");
+        assert!(
+            resumed_second
+                .iter()
+                .any(|task| task.id == parent_task_id && task.status == AgentTaskStatus::Queued)
+        );
+        let second_resume_attempt =
+            AgentAttemptId::new("agent-attempt-wait-replace-resume-2").expect("parent attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &parent_task_id, &second_resume_attempt)
+            .expect("claim parent after second wait")
+            .expect("parent claimed after second wait");
+        let second_round_deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("second-round dependencies");
+        let second_round_tasks = second_round_deps
+            .iter()
+            .map(|dep| {
+                database
+                    .agent_task(&dep.dependency_task_id)
+                    .expect("dependency task lookup")
+                    .expect("dependency task")
+            })
+            .collect::<Vec<_>>();
+        drop(database);
+
+        let second_resume_messages =
+            crate::agent_wait_resume_messages(&second_round_deps, &second_round_tasks)
+                .expect("second-round wait resume messages");
+        assert_eq!(second_resume_messages.len(), 3);
+        assert_eq!(
+            second_resume_messages[1].tool_calls[0].call_id, "call-wait-second",
+            "second resume assistant tool-call must use the new pending tool call id"
+        );
+        assert_eq!(
+            second_resume_messages[2].tool_call_id.as_deref(),
+            Some("call-wait-second"),
+            "second resume tool message must pair with the new pending tool call id"
+        );
+        assert!(
+            second_resume_messages[2]
+                .content
+                .contains("second child done")
+        );
+        assert!(
+            !second_resume_messages[2]
+                .content
+                .contains("first child done"),
+            "second resume must not include the prior wait-round child payload"
+        );
+        let _ = context;
+    }
+
+    #[test]
+    fn agent_store_error_hides_sqlite_path_and_maps_wait_conflicts() {
+        let path = std::path::PathBuf::from("/tmp/example/.foco/foco.sqlite");
+        let sqlite = agent_store_error(foco_store::workspace::WorkspaceDatabaseError::Sqlite {
+            path: path.clone(),
+            source: rusqlite::Error::InvalidQuery,
+        });
+        let sqlite_output = agent_tool_error_output(&sqlite);
+        assert_eq!(sqlite_output["code"], "store_error");
+        let message = sqlite_output["error"].as_str().unwrap_or_default();
+        assert!(!message.contains("foco.sqlite"));
+        assert!(!message.contains(path.to_string_lossy().as_ref()));
+        assert!(message.contains("workspace database operation failed"));
+
+        let active = agent_store_error(
+            foco_store::workspace::WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message:
+                    "agent task 'agent-task-x' already has an active wait round that has not finished; cannot register a different wait round"
+                        .to_string(),
+            },
+        );
+        assert_eq!(
+            agent_tool_error_output(&active)["code"],
+            "wait_round_active"
         );
     }
 }

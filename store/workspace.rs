@@ -13,7 +13,8 @@ use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
     AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus, TeamWorkload,
+    AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
+    TeamWorkload,
 };
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
@@ -45,11 +46,12 @@ pub use crate::workspace_gate::{
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
-    AgentTaskRecord, AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
-    ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord,
-    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
-    LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, AgentTeamRecord,
+    ChatPage, ChatPageCursor, ChatRecord, ChatSpecSnapshotRecord, CodeChangeStats,
+    CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphReferenceRecord,
+    CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
+    ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
+    LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
     LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
     LlmRequestUsageRecord, LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord,
@@ -64,7 +66,8 @@ pub use workspace_records::{
     PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
     PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
     PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-    PreStreamFailureMaterialization, PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
+    PreStreamFailureMaterialization, PromptContextInjectionRecord,
+    RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
     ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
     ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
@@ -11731,10 +11734,8 @@ impl WorkspaceDatabase {
             &database_path,
         )?;
         let requested_ids: HashSet<&AgentTaskId> = dependency_task_ids.iter().collect();
-        let existing_ids: HashSet<&AgentTaskId> = existing
-            .iter()
-            .map(|row| &row.dependency_task_id)
-            .collect();
+        let existing_ids: HashSet<&AgentTaskId> =
+            existing.iter().map(|row| &row.dependency_task_id).collect();
 
         let outcome = if existing.is_empty() {
             insert_agent_task_dependency_rows(
@@ -13983,10 +13984,9 @@ fn task_waiting_requested_event_exists(
         )
         .map_err(|source| sqlite_error(database_path, source))?;
     let rows = statement
-        .query_map(
-            params![team_id.as_str(), waiting_task_id.as_str()],
-            |row| row.get::<_, String>(0),
-        )
+        .query_map(params![team_id.as_str(), waiting_task_id.as_str()], |row| {
+            row.get::<_, String>(0)
+        })
         .map_err(|source| sqlite_error(database_path, source))?;
     for payload_json in rows {
         let payload_json = payload_json.map_err(|source| sqlite_error(database_path, source))?;
