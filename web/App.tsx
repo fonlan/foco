@@ -1575,6 +1575,12 @@ export function App() {
   const activeRunAbortByChatKeyRef = useRef<Map<string, AbortController>>(
     new Map(),
   );
+  // Assistants that received live stream content for a chat. Survives GET
+  // reattach across Coordinator wait handoffs so later `start` events keep
+  // history instead of wiping the bubble.
+  const liveStreamAssistantIdsByChatKeyRef = useRef<Map<string, Set<string>>>(
+    new Map(),
+  );
   const contextUsageAbortByChatKeyRef = useRef<Map<string, AbortController>>(
     new Map(),
   );
@@ -9402,6 +9408,18 @@ export function App() {
         });
       }
     };
+    // Track assistants that already received live deltas/tools for this chat so
+    // later Coordinator attempt `start` events (including GET reattach) keep history.
+    const markAssistantLiveStreamEvent = (eventAssistantMessageId?: string) => {
+      const assistantId = resolvedAssistantMessageId(eventAssistantMessageId);
+      const tracked =
+        liveStreamAssistantIdsByChatKeyRef.current.get(chatKey) ?? new Set<string>();
+      tracked.add(assistantId);
+      liveStreamAssistantIdsByChatKeyRef.current.set(chatKey, tracked);
+    };
+    const hasSeenLiveStreamEventsForAssistant = (assistantId: string) =>
+      liveStreamAssistantIdsByChatKeyRef.current.get(chatKey)?.has(assistantId) ??
+      false;
 
     setChatRunning(chatKey, true);
     setChatRunFailed(chatKey, false);
@@ -9481,21 +9499,29 @@ export function App() {
           if (startsNewAssistantBubble) {
             finishStreamingAssistantMessage(previousAssistantMessageId);
           }
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              message.role === "assistant" && message.id === streamEvent.assistantMessageId
-                ? {
-                  ...message,
-                  content: "",
-                  reasoning: null,
-                  toolCalls: [],
-                  parts: [],
-                  metrics: null,
-                  status: "streaming",
-                }
+          setMessagesForChatKey(chatKey, (current) => {
+            const existing = current.find(
+              (message) =>
+                message.role === "assistant" &&
+                message.id === streamEvent.assistantMessageId,
+            );
+            const preserveHistory = shouldPreserveAssistantHistoryOnStart(
+              hasSeenLiveStreamEventsForAssistant(streamEvent.assistantMessageId),
+            );
+            if (!existing) {
+              return current;
+            }
+            return current.map((message) =>
+              message.role === "assistant" &&
+              message.id === streamEvent.assistantMessageId
+                ? mergeAssistantMessageOnStreamStart(
+                    message,
+                    streamEvent.memoriesUsed,
+                    preserveHistory,
+                  )
                 : message,
-            ),
-          );
+            );
+          });
           ensureStreamingAssistantMessage(
             streamEvent.assistantMessageId,
             streamEvent.memoriesUsed,
@@ -9525,6 +9551,7 @@ export function App() {
         }
 
         if (streamEvent.type === "textDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           finishLiveReasoningDuration(
             streamEvent.assistantMessageId,
             streamEvent.reasoningDurationMs,
@@ -9543,6 +9570,7 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           const reasoningStartedAtMs = startLiveReasoningDuration();
           const targetAssistantMessageId = resolvedAssistantMessageId(
             streamEvent.assistantMessageId,
@@ -9724,6 +9752,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           finishLiveReasoningDuration(
             streamEvent.assistantMessageId,
             streamEvent.reasoningDurationMs,
@@ -9756,6 +9785,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           const messageOwnsToolCall = (message: ShellMessage) =>
             messageHasToolCall(message, streamEvent.toolCallId);
           deferStreamSideUpdate(() => {
@@ -9792,6 +9822,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolOutputDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           const targetAssistantMessageId = resolvedAssistantMessageId(
             streamEvent.assistantMessageId,
           );
@@ -10330,6 +10361,14 @@ export function App() {
       }
       return eventAssistantMessageId ?? currentAssistantMessageId;
     };
+    const markAssistantLiveStreamEvent = (eventAssistantMessageId?: string) => {
+      const assistantId = resolvedAssistantMessageId(eventAssistantMessageId);
+      const tracked =
+        liveStreamAssistantIdsByChatKeyRef.current.get(runMessagesKey) ??
+        new Set<string>();
+      tracked.add(assistantId);
+      liveStreamAssistantIdsByChatKeyRef.current.set(runMessagesKey, tracked);
+    };
     let activeReasoningStartedAtMs: number | null = null;
     let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
@@ -10485,6 +10524,26 @@ export function App() {
                 abortController,
               );
             }
+            const pendingLiveAssistantIds =
+              liveStreamAssistantIdsByChatKeyRef.current.get(runMessagesKey);
+            if (pendingLiveAssistantIds?.size) {
+              const nextLiveIds =
+                liveStreamAssistantIdsByChatKeyRef.current.get(
+                  currentRunningChatKey,
+                ) ?? new Set<string>();
+              for (const id of pendingLiveAssistantIds) {
+                nextLiveIds.add(
+                  id === localAssistantId
+                    ? streamEvent.assistantMessageId
+                    : id,
+                );
+              }
+              liveStreamAssistantIdsByChatKeyRef.current.set(
+                currentRunningChatKey,
+                nextLiveIds,
+              );
+              liveStreamAssistantIdsByChatKeyRef.current.delete(runMessagesKey);
+            }
             const pendingQueuedRequests =
               queuedRunRequestsByChatKeyRef.current[runMessagesKey] ?? [];
             if (pendingQueuedRequests.length) {
@@ -10524,6 +10583,13 @@ export function App() {
 
             runMessagesKey = currentRunningChatKey;
           } else {
+            const liveIds = liveStreamAssistantIdsByChatKeyRef.current.get(
+              currentRunningChatKey,
+            );
+            if (liveIds?.has(localAssistantId)) {
+              liveIds.delete(localAssistantId);
+              liveIds.add(streamEvent.assistantMessageId);
+            }
             setMessagesForChatKey(currentRunningChatKey, (current) =>
               current.map((message) => {
                 if (message.id === localUserId) {
@@ -10594,6 +10660,7 @@ export function App() {
           return;
         }
         if (streamEvent.type === "textDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           finishLiveReasoningDuration(
             streamEvent.assistantMessageId,
             streamEvent.reasoningDurationMs,
@@ -10613,6 +10680,7 @@ export function App() {
         }
 
         if (streamEvent.type === "reasoningDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           const reasoningStartedAtMs = startLiveReasoningDuration();
           const targetAssistantMessageId = resolvedAssistantMessageId(
             streamEvent.assistantMessageId,
@@ -10798,6 +10866,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolCall") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           finishLiveReasoningDuration(
             streamEvent.assistantMessageId,
             streamEvent.reasoningDurationMs,
@@ -10830,6 +10899,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolResult") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
@@ -10869,6 +10939,7 @@ export function App() {
         }
 
         if (streamEvent.type === "toolOutputDelta") {
+          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
           const targetAssistantMessageId = resolvedAssistantMessageId(
             streamEvent.assistantMessageId,
           );
@@ -16945,6 +17016,46 @@ function streamingAssistantMessage(
     extractedMemories: [],
         specUpdates: [],
     runBadges: [],
+  };
+}
+
+/**
+ * Whether a stream `start` for an existing assistant bubble should keep prior
+ * content (Coordinator cross-attempt / same-bubble resume) instead of wiping it.
+ *
+ * Uses chat-scoped live event tracking so GET reattach after wait still preserves
+ * history, while first attach (persisted fallback only, no local live events)
+ * continues to clear the draft before new deltas arrive.
+ */
+function shouldPreserveAssistantHistoryOnStart(
+  hasSeenLiveEventsForAssistant: boolean,
+): boolean {
+  return hasSeenLiveEventsForAssistant;
+}
+
+function mergeAssistantMessageOnStreamStart(
+  message: ShellMessage,
+  memoriesUsed: ChatMemoryUsedSummary[],
+  preserveHistory: boolean,
+): ShellMessage {
+  if (preserveHistory) {
+    return {
+      ...message,
+      memoriesUsed: message.memoriesUsed.length
+        ? message.memoriesUsed
+        : memoriesUsed,
+      status: "streaming",
+    };
+  }
+  return {
+    ...message,
+    content: "",
+    reasoning: null,
+    toolCalls: [],
+    parts: [],
+    metrics: null,
+    memoriesUsed: memoriesUsed.length ? memoriesUsed : message.memoriesUsed,
+    status: "streaming",
   };
 }
 

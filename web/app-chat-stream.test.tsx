@@ -2221,15 +2221,65 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId,
+        delta: "Planning handoff.",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
         delta: "Waiting for worker.",
         type: "textDelta",
       });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-delegate",
+          input: {
+            targetInstanceId: "agent-instance-worker-1",
+            input: { message: "do work" },
+          },
+          isError: false,
+          name: "agent_delegate_task",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: { taskId: "agent-task-worker-1" },
+        toolCallId: "call-delegate",
+        type: "toolResult",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-wait",
+          input: { mode: "all", taskIds: ["agent-task-worker-1"] },
+          isError: false,
+          name: "agent_wait_tasks",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: { waiting: true, suspend: true },
+        toolCallId: "call-wait",
+        type: "toolResult",
+      });
     });
     expect(await screen.findByText("Waiting for worker.")).toBeInTheDocument();
+    expect(screen.getByText("Planning handoff.")).toBeInTheDocument();
+    expect(screen.getByText("Delegate Task")).toBeInTheDocument();
+    expect(screen.getByText("Wait Tasks")).toBeInTheDocument();
     const waitingRow = screen
       .getByText("Waiting for worker.")
       .closest(".message-row") as HTMLElement | null;
     expect(waitingRow).not.toBeNull();
+    expect(within(waitingRow as HTMLElement).getAllByText("Waiting for worker.").length).toBeGreaterThan(0);
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -2272,10 +2322,349 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() =>
       expect(waitingRow).toHaveTextContent("Final worker summary."),
     );
+    expect(waitingRow).toHaveTextContent("Waiting for worker.");
+    expect(waitingRow).toHaveTextContent("Planning handoff.");
+    expect(within(waitingRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
+    expect(within(waitingRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
+    expect(screen.getAllByText("Waiting for worker.").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
 
     await act(async () => {
       enqueueChatStreamEvent({ type: "streamEnd" });
       appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("preserves pre-delegate history across GET active-run reattach and start", async () => {
+    const assistantMessageId = "message-assistant-stream";
+    const fetchMock = vi.mocked(fetch);
+    let reattachActiveRun = false;
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return Promise.resolve(
+          jsonResponse({
+            ...chatMessages,
+            messages: [
+              chatMessages.messages[0],
+              chatMessages.messages[1],
+              {
+                content: "delegate then wait",
+                createdAt: "2026-06-10T08:00:00.000Z",
+                extractedMemories: [],
+                id: "message-user-stream",
+                memoriesUsed: [],
+                metrics: null,
+                parts: [{ text: "delegate then wait", type: "text" }],
+                reasoning: null,
+                role: "user",
+                toolCalls: [],
+              },
+              {
+                content: "Before handoff.",
+                createdAt: "2026-06-10T08:00:01.000Z",
+                extractedMemories: [],
+                id: assistantMessageId,
+                memoriesUsed: [],
+                metrics: null,
+                parts: [
+                  { text: "Pre-delegate reasoning.", type: "reasoning" },
+                  { text: "Before handoff.", type: "text" },
+                  {
+                    toolCall: {
+                      id: "call-delegate-reattach",
+                      input: { targetInstanceId: "agent-instance-worker-2" },
+                      isError: false,
+                      name: "agent_delegate_task",
+                      output: { taskId: "agent-task-worker-2" },
+                      status: "completed",
+                    },
+                    type: "toolCall",
+                  },
+                  {
+                    toolCall: {
+                      id: "call-wait-reattach",
+                      input: {
+                        mode: "all",
+                        taskIds: ["agent-task-worker-2"],
+                      },
+                      isError: false,
+                      name: "agent_wait_tasks",
+                      output: { waiting: true, suspend: true },
+                      status: "completed",
+                    },
+                    type: "toolCall",
+                  },
+                ],
+                reasoning: "Pre-delegate reasoning.",
+                role: "assistant",
+                status: "streaming",
+                toolCalls: [
+                  {
+                    id: "call-delegate-reattach",
+                    input: { targetInstanceId: "agent-instance-worker-2" },
+                    isError: false,
+                    name: "agent_delegate_task",
+                    output: { taskId: "agent-task-worker-2" },
+                    status: "completed",
+                  },
+                  {
+                    id: "call-wait-reattach",
+                    input: {
+                      mode: "all",
+                      taskIds: ["agent-task-worker-2"],
+                    },
+                    isError: false,
+                    name: "agent_wait_tasks",
+                    output: { waiting: true, suspend: true },
+                    status: "completed",
+                  },
+                ],
+              },
+            ],
+            activeRun: reattachActiveRun
+              ? {
+                  acceptingGuidance: true,
+                  chatId: "chat-1",
+                  lastSequence: 12,
+                  runId: "request-stream-resumed",
+                  workspaceId: "workspace-1",
+                }
+              : null,
+          }),
+        );
+      }
+      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream") {
+        const encoder = new TextEncoder();
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            appTestState.chatStreamControllers.set(
+              "request-stream-resumed",
+              controller,
+            );
+            appTestState.activeChatStreamController = controller;
+            controller.enqueue(
+              encoder.encode(
+                `id: 13\ndata: ${JSON.stringify({
+                  assistantMessageId,
+                  chatId: "chat-1",
+                  llmRequestId: "request-stream-resumed",
+                  memoriesUsed: [],
+                  type: "start",
+                  userMessageId: "message-user-stream",
+                })}\n\n`,
+              ),
+            );
+          },
+        });
+        return Promise.resolve(
+          new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          }),
+        );
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "delegate then wait",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "Pre-delegate reasoning.",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        delta: "Before handoff.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-delegate-reattach",
+          input: { targetInstanceId: "agent-instance-worker-2" },
+          isError: false,
+          name: "agent_delegate_task",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: { taskId: "agent-task-worker-2" },
+        toolCallId: "call-delegate-reattach",
+        type: "toolResult",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-wait-reattach",
+          input: { mode: "all", taskIds: ["agent-task-worker-2"] },
+          isError: false,
+          name: "agent_wait_tasks",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: { waiting: true, suspend: true },
+        toolCallId: "call-wait-reattach",
+        type: "toolResult",
+      });
+    });
+
+    const historyRows = await screen.findAllByText("Before handoff.");
+    const historyRow = historyRows[0]?.closest(".message-row") as HTMLElement | null;
+    expect(historyRow).not.toBeNull();
+    expect(historyRow).toHaveTextContent("Pre-delegate reasoning.");
+    expect(within(historyRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
+    expect(within(historyRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
+    // Content may appear in both summary and body nodes inside one bubble.
+    expect(
+      new Set(
+        screen.getAllByText("Before handoff.").map((node) => node.closest(".message-row")),
+      ).size,
+    ).toBe(1);
+
+    // Wait gap: activeRun temporarily null while durable run remains running.
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats.map((chat) =>
+          chat.id === "chat-1"
+            ? {
+                ...chat,
+                activeRun: null,
+                queuedRun: {
+                  assistantMessageId,
+                  content: "delegate then wait",
+                  modelId: "gpt-test",
+                  providerId: "openai",
+                  skillIds: [],
+                  status: "running",
+                  thinkingLevel: null,
+                  userMessageId: "message-user-stream",
+                },
+              }
+            : chat,
+        ),
+      },
+      secondaryWorkspace,
+    ];
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument(),
+    );
+
+    // Later attempt appears under a new runId; reopen chat to take GET reattach path.
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats.map((chat) =>
+          chat.id === "chat-1"
+            ? {
+                ...chat,
+                activeRun: {
+                  acceptingGuidance: true,
+                  chatId: "chat-1",
+                  lastSequence: 12,
+                  runId: "request-stream-resumed",
+                  workspaceId: "workspace-1",
+                },
+                queuedRun: {
+                  assistantMessageId,
+                  content: "delegate then wait",
+                  modelId: "gpt-test",
+                  providerId: "openai",
+                  skillIds: [],
+                  status: "running",
+                  thinkingLevel: null,
+                  userMessageId: "message-user-stream",
+                },
+              }
+            : chat,
+        ),
+      },
+      secondaryWorkspace,
+    ];
+    reattachActiveRun = true;
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await userEvent.click(within(workspaceList).getByText("Tool run"));
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url.includes(
+              "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream",
+            ),
+        ),
+      ).toBe(true);
+    });
+
+    // History must survive the reattach `start` before later deltas arrive.
+    const historyAfterStart = await screen.findAllByText("Before handoff.");
+    expect(
+      new Set(historyAfterStart.map((node) => node.closest(".message-row"))).size,
+    ).toBe(1);
+    expect(screen.getByText("Pre-delegate reasoning.")).toBeInTheDocument();
+    expect(screen.getByText("Delegate Task")).toBeInTheDocument();
+    expect(screen.getByText("Wait Tasks")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream-resumed", {
+        assistantMessageId,
+        delta: "Post-wait summary.",
+        type: "textDelta",
+      });
+    });
+
+    const resumedRow = (await screen.findByText("Post-wait summary.")).closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(resumedRow).not.toBeNull();
+    expect(resumedRow).toHaveTextContent("Before handoff.");
+    expect(resumedRow).toHaveTextContent("Pre-delegate reasoning.");
+    expect(within(resumedRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
+    expect(within(resumedRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
+    expect(
+      new Set(
+        screen.getAllByText("Before handoff.").map((node) => node.closest(".message-row")),
+      ).size,
+    ).toBe(1);
+    expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream-resumed")?.close();
     });
   });
 
