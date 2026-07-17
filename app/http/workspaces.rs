@@ -717,6 +717,9 @@ pub(crate) async fn add_workspace(
     }
 
     let id = unique_workspace_id(&config, &name);
+    // New workspaces become active so follow-up client calls (e.g. Spec
+    // enablement on create) target the created workspace, not the previous one.
+    config.app.active_workspace_id = id.clone();
     config.workspaces.insert(
         0,
         WorkspaceConfig {
@@ -813,6 +816,10 @@ async fn add_remote_workspace(
     if let Some((bytes, kind)) = logo.as_ref() {
         save_workspace_logo_file(&local_logo_path, bytes, *kind)?;
     }
+    // Match local add: activate the new remote workspace before save so the
+    // response activeWorkspaceId and any immediate workspace-scoped settings
+    // (including Project Spec) address the created entry.
+    config.app.active_workspace_id = id.clone();
     config.workspaces.insert(
         0,
         WorkspaceConfig {

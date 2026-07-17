@@ -21922,6 +21922,7 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
         .first()
         .expect("response workspace first");
     assert_eq!(response_workspace.name, "New Workspace");
+    assert_eq!(response.active_workspace_id, response_workspace.id);
     assert!(
         response_workspace.logo_url.as_deref().is_some_and(
             |logo_url| logo_url.starts_with("/api/workspaces/new-workspace/logo/thumbnail?v=")
@@ -21935,6 +21936,8 @@ async fn add_workspace_creates_missing_directory_and_registers_it() {
     let registered_workspace = config.workspaces.first().expect("new workspace first");
     assert_eq!(registered_workspace.name, "New Workspace");
     assert_eq!(registered_workspace.path, registered_path);
+    assert_eq!(config.app.active_workspace_id, registered_workspace.id);
+    assert_eq!(config.app.active_workspace_id, response_workspace.id);
     drop(config);
 
     fs::remove_dir_all(existing_workspace_dir).expect("remove existing workspace directory");
@@ -22009,7 +22012,7 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
     let state = test_app_state(config, profile_dir.clone());
 
     let response = add_workspace(
-        State(state),
+        State(state.clone()),
         Json(WorkspacePathRequest {
             name: "Remote Workspace".to_string(),
             path: "/srv/remote-workspace".to_string(),
@@ -22030,6 +22033,7 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
         .first()
         .expect("response workspace first");
     assert_eq!(response_workspace.name, "Remote Workspace");
+    assert_eq!(response.active_workspace_id, response_workspace.id);
     assert!(
         response_workspace
             .logo_url
@@ -22041,6 +22045,14 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
                 ))
             })
     );
+    let config = state.config.lock().expect("config lock");
+    let registered_workspace = config
+        .workspaces
+        .first()
+        .expect("new remote workspace first");
+    assert_eq!(registered_workspace.id, response_workspace.id);
+    assert_eq!(config.app.active_workspace_id, registered_workspace.id);
+    drop(config);
 
     remove_dir_if_exists(&existing_workspace_dir);
     remove_dir_if_exists(&profile_dir);
