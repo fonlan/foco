@@ -18,6 +18,7 @@ import {
   mockFetch,
   renderApp,
   resetAppTestEnvironment,
+  secondChatMessages,
   settings,
   workspace,
   workspaceChats,
@@ -1729,6 +1730,7 @@ describe("app agents verification surfaces", () => {
   });
 
   it("restores Plan mode from the last real user message when switching chats", async () => {
+    // History fixtures only: last real user message sessionMode, no in-memory plan cache seeding.
     const planChatMessages = {
       ...chatMessages,
       messages: [
@@ -1742,6 +1744,23 @@ describe("app agents verification surfaces", () => {
         chatMessages.messages[1],
       ],
     };
+    const normalChatMessages = {
+      ...secondChatMessages,
+      messages: [
+        {
+          ...secondChatMessages.messages[0],
+          content: "Normal follow-up.",
+          id: "message-user-normal-last",
+          parts: [{ text: "Normal follow-up.", type: "text" }],
+          sessionMode: null,
+        },
+        secondChatMessages.messages[1],
+      ],
+    };
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": planChatMessages,
+      "workspace-1/chat-2": normalChatMessages,
+    };
     vi.stubGlobal(
       "fetch",
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1752,6 +1771,9 @@ describe("app agents verification surfaces", () => {
         if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
           return jsonResponse({ ...planChatMessages, activeRun: null });
         }
+        if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+          return jsonResponse({ ...normalChatMessages, activeRun: null });
+        }
         return mockFetch(input, init);
       }),
     );
@@ -1760,6 +1782,7 @@ describe("app agents verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
+    // Sidebar list: open plan chat, then normal chat.
     await userEvent.click(await within(workspaceList).findByText("Tool run"));
     await waitFor(() => {
       expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
@@ -1767,6 +1790,7 @@ describe("app agents verification surfaces", () => {
         "true",
       );
     });
+    expect(await screen.findByText("Plan this feature.")).toBeInTheDocument();
 
     await userEvent.click(within(workspaceList).getByText("Second chat"));
     await waitFor(() => {
@@ -1775,12 +1799,66 @@ describe("app agents verification surfaces", () => {
         "false",
       );
     });
+    expect(await screen.findByText("Normal follow-up.")).toBeInTheDocument();
 
-    await userEvent.click(within(workspaceList).getByText("Tool run"));
+    // Open chat tabs: switching tabs restores the same committed history state.
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Tool run/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+
+    // Unsent draft OFF on a plan-history chat must not stick after leave/return.
+    await userEvent.click(screen.getByRole("button", { name: "Plan mode" }));
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    });
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Tool run/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+
+    // Unsent draft ON on a normal-history chat must not stick after leave/return.
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Plan mode" }));
     expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
       "aria-pressed",
       "true",
     );
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Tool run/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    });
   });
 
   it("keeps disabled Team mode after leaving Plan mode", async () => {

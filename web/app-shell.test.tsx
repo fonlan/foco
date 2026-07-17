@@ -842,6 +842,81 @@ describe("app-shell verification surfaces", () => {
     expect(within(normalBubble).queryByText("Plan mode")).not.toBeInTheDocument();
   });
 
+  it("restores Plan mode from the last user message after URL refresh", async () => {
+    const planChatMessages = {
+      ...chatMessages,
+      messages: [
+        {
+          ...chatMessages.messages[0],
+          content: "Plan after refresh.",
+          id: "message-user-plan-refresh",
+          parts: [{ text: "Plan after refresh.", type: "text" }],
+          sessionMode: "plan",
+        },
+        chatMessages.messages[1],
+      ],
+    };
+    const normalChatMessages = {
+      ...secondChatMessages,
+      messages: [
+        {
+          ...secondChatMessages.messages[0],
+          content: "Normal after refresh.",
+          id: "message-user-normal-refresh",
+          parts: [{ text: "Normal after refresh.", type: "text" }],
+          sessionMode: null,
+        },
+        secondChatMessages.messages[1],
+      ],
+    };
+    // chat-1 override is honored by the harness; chat-2 hardcodes secondChatMessages
+    // unless fetch is stubbed, so both keys use an explicit messages stub.
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": planChatMessages,
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({ ...planChatMessages, activeRun: null });
+        }
+        if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+          return jsonResponse({ ...normalChatMessages, activeRun: null });
+        }
+        return mockFetch(input, init);
+      }),
+    );
+
+    // Fresh App mount with URL pointing at the plan chat (browser refresh path).
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    const { unmount } = renderApp();
+
+    expect(await screen.findByText("Plan after refresh.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+    unmount();
+
+    // Re-mount with URL on the normal chat; Plan toggle stays off after messages load.
+    window.history.replaceState(null, "", "/workspace-1/chat-2");
+    renderApp();
+
+    expect(await screen.findByText("Normal after refresh.")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    });
+  });
+
   it("formats reply total duration human-readably", async () => {
     const messagesWithLongReplyDuration = {
       ...chatMessages,
