@@ -696,6 +696,11 @@ async fn run_server_until_shutdown(
         ScheduledTaskScheduler::new();
     let (plan_auto_run_scheduler, plan_auto_run_scheduler_wake_rx) = PlanAutoRunScheduler::new();
     let memory_dream_scheduler = MemoryDreamScheduler::new();
+    let mut initial_update_state = crate::update_runtime::UpdateState::default();
+    crate::update_runtime::load_last_install_failure_into_state(
+        &mut initial_update_state,
+        &loaded_config.paths.user_profile_dir,
+    );
     let state = AppState {
         config: Arc::new(Mutex::new(loaded_config.config)),
         config_file: loaded_config.paths.config_file,
@@ -705,7 +710,7 @@ async fn run_server_until_shutdown(
         ripgrep_install_lock: Arc::new(AsyncMutex::new(())),
         update_install_lock: Arc::new(AsyncMutex::new(())),
         config_write_lock: Arc::new(AsyncMutex::new(())),
-        update_state: Arc::new(Mutex::new(crate::update_runtime::UpdateState::default())),
+        update_state: Arc::new(Mutex::new(initial_update_state)),
         ripgrep_status: Arc::new(Mutex::new(ripgrep_status)),
         user_profile_dir: loaded_config.paths.user_profile_dir,
         terminal_registry: terminal::TerminalRegistry::default(),
@@ -751,6 +756,7 @@ async fn run_server_until_shutdown(
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
     let remote_workspace_manager = state.remote_workspace_manager.clone();
+    let user_profile_dir_for_update_ready = state.user_profile_dir.clone();
     let app = crate::http::router::app_router(state);
     let bind_started_at = Instant::now();
     tracing::info!(%addr, "HTTP listener bind started");
@@ -797,6 +803,12 @@ async fn run_server_until_shutdown(
         "starting local HTTP server"
     );
     println!("Foco is running at http://{addr}");
+    // Only mark the update ready after the server is accepting /api/health, so helpers
+    // never discard the previous install merely because the listener bound.
+    crate::update_runtime::spawn_mark_updated_restart_ready_when_serving(
+        user_profile_dir_for_update_ready,
+        addr,
+    );
     let companion_server_task = companion_listener.map(|companion_listener| {
         let companion_app = app.clone();
         let mut companion_shutdown_rx = app_shutdown_rx.clone();

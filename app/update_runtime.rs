@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     env,
+    net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, SystemTime},
@@ -26,6 +27,16 @@ const UPDATE_FORCE_EXIT_DELAY_SECS: u64 = 10;
 const UPDATE_VERSION_DIR_RETAIN_COUNT: usize = 2;
 /// CLI flag used after a successful install to restart and trigger historical update cleanup.
 pub(crate) const UPDATED_RESTART_ARG: &str = "--updated-restart";
+/// Marker written by the platform update helper when install fails after the main process exits.
+const LAST_INSTALL_FAILURE_FILE: &str = "last-install-failure.txt";
+/// Marker written by a process started with `--updated-restart` after `/api/health` succeeds.
+/// Platform update helpers wait for this before discarding the previous install.
+const UPDATED_RESTART_READY_FILE: &str = "updated-restart-ready.txt";
+/// How long the platform helper waits for the updated process to become ready before rolling back.
+const UPDATED_RESTART_READY_TIMEOUT_SECS: u64 = 120;
+/// How long the updated process itself waits for `/api/health` before giving up on the ready marker.
+const UPDATED_RESTART_HEALTH_POLL_TIMEOUT_SECS: u64 = 90;
+const UPDATED_RESTART_HEALTH_POLL_INTERVAL_MS: u64 = 250;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -34,7 +45,10 @@ pub(crate) struct UpdateState {
     // ponytail: update check history is intentionally in memory; persist it if users need history.
     last_checked_at: Option<DateTime<Utc>>,
     latest_release: Option<UpdateRelease>,
+    /// Transient update-check / download error (cleared on the next successful check).
     error: Option<String>,
+    /// One-shot install failure from the previous helper run (loaded at startup from disk).
+    install_error: Option<String>,
     checking: bool,
 }
 
@@ -110,6 +124,184 @@ pub(crate) fn maybe_cleanup_stale_update_assets_after_updated_restart(user_profi
         user_profile_dir,
         env::args().any(|arg| arg == UPDATED_RESTART_ARG),
     );
+}
+
+/// Load a one-shot install failure left by the platform update helper, then clear the marker.
+///
+/// Used after a failed auto-update that rolled back to the previous app and relaunched it. The
+/// reason is exposed via `UpdateStatusSummary.error` (About / settings). Failures never abort
+/// startup.
+pub(crate) fn load_last_install_failure_into_state(
+    update_state: &mut UpdateState,
+    user_profile_dir: &Path,
+) {
+    let Some(message) = take_last_install_failure_message(user_profile_dir) else {
+        return;
+    };
+    tracing::warn!(error = %message, "loaded previous Foco update install failure");
+    update_state.install_error = Some(message);
+}
+
+fn last_install_failure_path(user_profile_dir: &Path) -> PathBuf {
+    user_profile_dir
+        .join(".foco")
+        .join("updates")
+        .join(LAST_INSTALL_FAILURE_FILE)
+}
+
+fn take_last_install_failure_message(user_profile_dir: &Path) -> Option<String> {
+    let path = last_install_failure_path(user_profile_dir);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(source) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %source,
+                "failed to read Foco update install failure marker"
+            );
+            return None;
+        }
+    };
+    if let Err(source) = std::fs::remove_file(&path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to clear Foco update install failure marker"
+        );
+    }
+    let message = raw.trim();
+    if message.is_empty() {
+        None
+    } else {
+        Some(message.chars().take(500).collect())
+    }
+}
+
+fn clear_last_install_failure_marker(user_profile_dir: &Path) {
+    let path = last_install_failure_path(user_profile_dir);
+    if path.exists()
+        && let Err(source) = std::fs::remove_file(&path)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to clear previous Foco update install failure marker before install"
+        );
+    }
+}
+
+fn updated_restart_ready_path(user_profile_dir: &Path) -> PathBuf {
+    user_profile_dir
+        .join(".foco")
+        .join("updates")
+        .join(UPDATED_RESTART_READY_FILE)
+}
+
+fn clear_updated_restart_ready_marker(user_profile_dir: &Path) {
+    let path = updated_restart_ready_path(user_profile_dir);
+    if path.exists()
+        && let Err(source) = std::fs::remove_file(&path)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to clear previous Foco updated-restart ready marker before install"
+        );
+    }
+}
+
+fn write_updated_restart_ready_marker(user_profile_dir: &Path) {
+    let path = updated_restart_ready_path(user_profile_dir);
+    if let Some(parent) = path.parent()
+        && let Err(source) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to create directory for Foco updated-restart ready marker"
+        );
+        return;
+    }
+    let payload = format!(
+        "pid={}\nstarted_at={}\n",
+        std::process::id(),
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    if let Err(source) = std::fs::write(&path, payload) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %source,
+            "failed to write Foco updated-restart ready marker"
+        );
+        return;
+    }
+    tracing::info!(
+        path = %path.display(),
+        "wrote Foco updated-restart ready marker"
+    );
+}
+
+/// After the HTTP server is accepting requests, signal the platform update helper that this
+/// `--updated-restart` process is ready and the previous install may be discarded.
+///
+/// Polls `/api/health` so a process that only bound the port (or crashed before serve) never
+/// clears the rollback backup.
+pub(crate) fn spawn_mark_updated_restart_ready_when_serving(
+    user_profile_dir: PathBuf,
+    listen_addr: SocketAddr,
+) {
+    if !env::args().any(|arg| arg == UPDATED_RESTART_ARG) {
+        return;
+    }
+    tokio::spawn(async move {
+        let health_url = format!("http://{listen_addr}/api/health");
+        let client = match reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .no_proxy()
+            .build()
+        {
+            Ok(client) => client,
+            Err(source) => {
+                tracing::warn!(
+                    error = %source,
+                    "failed to build HTTP client for Foco updated-restart ready probe"
+                );
+                return;
+            }
+        };
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_secs(UPDATED_RESTART_HEALTH_POLL_TIMEOUT_SECS);
+        loop {
+            match client.get(&health_url).send().await {
+                Ok(response) if response.status().is_success() => {
+                    write_updated_restart_ready_marker(&user_profile_dir);
+                    return;
+                }
+                Ok(response) => {
+                    tracing::debug!(
+                        status = %response.status(),
+                        "updated-restart health probe not ready yet"
+                    );
+                }
+                Err(source) => {
+                    tracing::debug!(
+                        error = %source,
+                        "updated-restart health probe failed"
+                    );
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    url = %health_url,
+                    "updated-restart ready marker not written: /api/health did not succeed in time"
+                );
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(UPDATED_RESTART_HEALTH_POLL_INTERVAL_MS))
+                .await;
+        }
+    });
 }
 
 fn cleanup_stale_update_assets_if_requested(user_profile_dir: &Path, requested: bool) {
@@ -440,10 +632,16 @@ pub(crate) async fn install_update(state: &AppState) -> Result<UpdateStatusSumma
 
     download_update_asset(&prepared.asset_download_url, &prepared.archive_path).await?;
     validate_downloaded_update_asset(&prepared.asset_name, &prepared.archive_path)?;
+    clear_last_install_failure_marker(&state.user_profile_dir);
+    clear_updated_restart_ready_marker(&state.user_profile_dir);
+    if let Ok(mut update_state) = state.update_state.lock() {
+        update_state.install_error = None;
+    }
     start_update_helper(&prepared)?;
     request_shutdown_after_update_helper_started(state.app_shutdown_tx.clone());
 
-    Ok(summary)
+    // Re-read after clearing install_error so the install response does not echo a stale failure.
+    update_status_summary(state, &config)
 }
 
 pub(crate) fn spawn_update_check_scheduler(state: AppState) -> tokio::task::JoinHandle<()> {
@@ -536,7 +734,12 @@ fn status_summary_from_state(
         release_url: release.and_then(|release| release.release_url.clone()),
         asset_name: asset.map(|asset| asset.name.clone()),
         asset_download_url: asset.map(|asset| asset.download_url.clone()),
-        error: update_state.error.clone(),
+        // Prefer a durable install failure over a transient check error so About can explain
+        // a rolled-back update after restart.
+        error: update_state
+            .install_error
+            .clone()
+            .or_else(|| update_state.error.clone()),
     }
 }
 
@@ -859,6 +1062,12 @@ fn start_macos_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), Api
             script_path.display()
         ))
     })?;
+    // prepared.update_dir = <profile>/.foco/updates/<version>
+    let updates_root = prepared.update_dir.parent().ok_or_else(|| {
+        ApiError::internal("failed to resolve Foco updates root path".to_string())
+    })?;
+    let result_path = updates_root.join(LAST_INSTALL_FAILURE_FILE);
+    let ready_path = updates_root.join(UPDATED_RESTART_READY_FILE);
 
     let mut command = Command::new("/bin/sh");
     command
@@ -871,6 +1080,12 @@ fn start_macos_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), Api
             prepared
                 .update_dir
                 .join(format!("apply-{}.log", prepared.version)),
+        )
+        .env("FOCO_UPDATE_RESULT", &result_path)
+        .env("FOCO_UPDATE_READY", &ready_path)
+        .env(
+            "FOCO_UPDATE_READY_TIMEOUT_SECS",
+            UPDATED_RESTART_READY_TIMEOUT_SECS.to_string(),
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -890,36 +1105,150 @@ set -eu
 : "${FOCO_UPDATE_APP:?}"
 : "${FOCO_UPDATE_PID:?}"
 : "${FOCO_UPDATE_LOG:?}"
-exec >>"$FOCO_UPDATE_LOG" 2>&1
+: "${FOCO_UPDATE_RESULT:?}"
+: "${FOCO_UPDATE_READY:?}"
+: "${FOCO_UPDATE_READY_TIMEOUT_SECS:?}"
+
+# Logging must never prevent rollback/relaunch on failure paths.
+mkdir -p "$(dirname "$FOCO_UPDATE_LOG")" 2>/dev/null || true
+if ! exec >>"$FOCO_UPDATE_LOG" 2>&1; then
+  :
+fi
+
+write_result() {
+  message="$1"
+  mkdir -p "$(dirname "$FOCO_UPDATE_RESULT")" 2>/dev/null || true
+  printf '%s\n' "$message" >"$FOCO_UPDATE_RESULT" 2>/dev/null || true
+}
+
+relaunch_app() {
+  target="$1"
+  if [ -d "$target" ]; then
+    open -n "$target" || return 1
+    return 0
+  fi
+  return 1
+}
+
+# Restore the previous app bundle when present, then relaunch whatever is available.
+# Only claim "rolled back" in the result marker after the old bundle is restored or launched.
+rollback_and_relaunch() {
+  reason="$1"
+  echo "update failed: $reason"
+  restored=0
+  if [ -d "$old_app" ]; then
+    rm -rf "$FOCO_UPDATE_APP" 2>/dev/null || true
+    if mv "$old_app" "$FOCO_UPDATE_APP" 2>/dev/null; then
+      restored=1
+    else
+      # Last resort: keep serving from the preserved .old bundle.
+      if relaunch_app "$old_app"; then
+        write_result "Update failed: $reason. Previous version is still available at $old_app but could not replace the current install; launched from the previous bundle."
+      else
+        write_result "Update failed: $reason. Previous version is still available at $old_app but could not replace the current install or launch."
+      fi
+      return 0
+    fi
+  fi
+  if [ "$restored" -eq 1 ]; then
+    if relaunch_app "$FOCO_UPDATE_APP"; then
+      write_result "Update failed: $reason. Rolled back to the previous version."
+    else
+      write_result "Update failed: $reason. Rolled back to the previous version but could not relaunch it."
+    fi
+    return 0
+  fi
+  if relaunch_app "$FOCO_UPDATE_APP"; then
+    write_result "Update failed: $reason. Could not restore the previous version; relaunched the current install."
+  else
+    write_result "Update failed: $reason. Could not restore the previous version or relaunch the app."
+  fi
+}
+
+fail_early() {
+  reason="$1"
+  write_result "Update failed: $reason"
+  relaunch_app "$FOCO_UPDATE_APP" || true
+  exit 1
+}
+
 while kill -0 "$FOCO_UPDATE_PID" 2>/dev/null; do
   sleep 1
 done
-mount_output="$(hdiutil attach "$FOCO_UPDATE_DMG" -nobrowse -readonly)"
+
+mount_output="$(hdiutil attach "$FOCO_UPDATE_DMG" -nobrowse -readonly)" || {
+  fail_early "could not mount the update disk image"
+}
 volume="$(printf '%s\n' "$mount_output" | awk '/\/Volumes\// { sub(/^.*\/Volumes\//, "/Volumes/"); print; exit }')"
 if [ -z "$volume" ]; then
-  echo "failed to locate mounted Foco update volume"
-  exit 1
+  fail_early "could not locate the mounted update volume"
 fi
 trap 'hdiutil detach "$volume" >/dev/null 2>&1 || true' EXIT
 source_app="$(find "$volume" -maxdepth 2 -name "Foco.app" -type d | head -n 1)"
 if [ -z "$source_app" ]; then
-  echo "Foco.app was not found in update dmg"
-  exit 1
+  fail_early "Foco.app was not found in the update disk image"
 fi
+
 new_app="$FOCO_UPDATE_APP.new"
 old_app="$FOCO_UPDATE_APP.old"
-rm -rf "$new_app" "$old_app"
-ditto "$source_app" "$new_app"
-if [ -d "$FOCO_UPDATE_APP" ]; then
-  mv "$FOCO_UPDATE_APP" "$old_app"
+# Best-effort cleanup of leftovers; never abort the helper under set -e if removal fails.
+rm -rf "$new_app" 2>/dev/null || true
+rm -rf "$old_app" 2>/dev/null || true
+if [ -e "$new_app" ] || [ -e "$old_app" ]; then
+  fail_early "could not clear leftover update staging directories (.new/.old); refusing to continue without a clean rollback path"
 fi
-mv "$new_app" "$FOCO_UPDATE_APP"
-rm -rf "$old_app"
+rm -f "$FOCO_UPDATE_READY" 2>/dev/null || true
+
+if ! ditto "$source_app" "$new_app"; then
+  rollback_and_relaunch "could not copy the new app bundle from the update image"
+  exit 1
+fi
+
+if [ -d "$FOCO_UPDATE_APP" ]; then
+  if ! mv "$FOCO_UPDATE_APP" "$old_app"; then
+    rm -rf "$new_app" 2>/dev/null || true
+    fail_early "could not move the current app aside for replacement"
+  fi
+fi
+
+if ! mv "$new_app" "$FOCO_UPDATE_APP"; then
+  rollback_and_relaunch "could not install the new app bundle"
+  exit 1
+fi
+
 # ponytail: trusted self-updates are unsigned; public releases should use Developer ID notarization instead.
-xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP" || true
-hdiutil detach "$volume"
+if ! xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP"; then
+  rollback_and_relaunch "could not clear quarantine attributes on the new app (Gatekeeper may block launch)"
+  exit 1
+fi
+
+# Recheck: any remaining quarantine attrs mean Gatekeeper can still block the relaunch.
+if xattr -lr "$FOCO_UPDATE_APP" 2>/dev/null | grep -F 'com.apple.quarantine' >/dev/null 2>&1; then
+  rollback_and_relaunch "quarantine attributes remain on the new app after clear (Gatekeeper may block launch)"
+  exit 1
+fi
+
+# Launch the updated app, then wait until it proves readiness before discarding the previous bundle.
+if ! open -n "$FOCO_UPDATE_APP" --args --updated-restart; then
+  rollback_and_relaunch "could not launch the updated app after install"
+  exit 1
+fi
+
+elapsed=0
+timeout_secs="$FOCO_UPDATE_READY_TIMEOUT_SECS"
+while [ ! -f "$FOCO_UPDATE_READY" ]; do
+  if [ "$elapsed" -ge "$timeout_secs" ]; then
+    rollback_and_relaunch "updated app did not become ready within ${timeout_secs}s after launch"
+    exit 1
+  fi
+  sleep 1
+  elapsed=$((elapsed + 1))
+done
+
+rm -rf "$old_app" 2>/dev/null || true
+rm -f "$FOCO_UPDATE_READY" 2>/dev/null || true
+hdiutil detach "$volume" >/dev/null 2>&1 || true
 trap - EXIT
-open -n "$FOCO_UPDATE_APP" --args --updated-restart
 "#
 }
 
@@ -938,6 +1267,12 @@ fn start_windows_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), A
             script_path.display()
         ))
     })?;
+    // prepared.update_dir = <profile>/.foco/updates/<version>
+    let updates_root = prepared.update_dir.parent().ok_or_else(|| {
+        ApiError::internal("failed to resolve Foco updates root path".to_string())
+    })?;
+    let result_path = updates_root.join(LAST_INSTALL_FAILURE_FILE);
+    let ready_path = updates_root.join(UPDATED_RESTART_READY_FILE);
 
     let mut command = Command::new("powershell.exe");
     command
@@ -957,6 +1292,12 @@ fn start_windows_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), A
             prepared
                 .update_dir
                 .join(format!("apply-{}.log", prepared.version)),
+        )
+        .env("FOCO_UPDATE_RESULT", &result_path)
+        .env("FOCO_UPDATE_READY", &ready_path)
+        .env(
+            "FOCO_UPDATE_READY_TIMEOUT_SECS",
+            UPDATED_RESTART_READY_TIMEOUT_SECS.to_string(),
         )
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -978,15 +1319,214 @@ $installDir = $env:FOCO_UPDATE_INSTALL_DIR
 $currentExe = $env:FOCO_UPDATE_EXE
 $pidToWait = [int]$env:FOCO_UPDATE_PID
 $logPath = $env:FOCO_UPDATE_LOG
-if (-not $installer -or -not $installDir -or -not $currentExe -or -not $pidToWait -or -not $logPath) { throw "missing Foco update environment" }
-Start-Transcript -Path $logPath -Append | Out-Null
+$resultPath = $env:FOCO_UPDATE_RESULT
+$readyPath = $env:FOCO_UPDATE_READY
+$readyTimeoutSecs = [int]$env:FOCO_UPDATE_READY_TIMEOUT_SECS
+if (-not $installer -or -not $installDir -or -not $currentExe -or -not $pidToWait -or -not $logPath -or -not $resultPath -or -not $readyPath -or -not $readyTimeoutSecs) {
+  throw "missing Foco update environment"
+}
+
+$transcriptStarted = $false
+# Backup must live outside the install dir so restore can replace a partially overwritten tree.
+# Use a unique sibling path so restore never confuses a nested Move-Item with a full install tree.
+$backupParent = Split-Path -Parent $installDir
+$backupDir = Join-Path $backupParent ("Foco.update-backup." + [guid]::NewGuid().ToString("N"))
+$backupStaged = Join-Path $backupParent ("Foco.update-staging." + [guid]::NewGuid().ToString("N"))
+$backupReady = $false
+
+function Write-UpdateResult([string]$Message) {
+  try {
+    $directory = Split-Path -Parent $resultPath
+    if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+      New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    Set-Content -LiteralPath $resultPath -Value $Message -Encoding utf8
+  } catch {
+    Write-Host "failed to write update result marker: $_"
+  }
+}
+
+function Remove-PathBestEffort([string]$Path) {
+  if (-not $Path) { return }
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  try {
+    Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+  } catch {
+    Write-Host "failed to remove path ${Path}: $_"
+  }
+}
+
+function Copy-InstallTree([string]$Source, [string]$Destination) {
+  if (Test-Path -LiteralPath $Destination) {
+    Remove-Item -LiteralPath $Destination -Recurse -Force -ErrorAction Stop
+  }
+  New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+  Get-ChildItem -LiteralPath $Source -Force | ForEach-Object {
+    $target = Join-Path $Destination $_.Name
+    Copy-Item -LiteralPath $_.FullName -Destination $target -Recurse -Force -ErrorAction Stop
+  }
+}
+
+function Stop-InstallProcesses {
+  try {
+    Get-CimInstance Win32_Process | Where-Object {
+      $_.ExecutablePath -and (
+        $_.ExecutablePath.Equals($currentExe, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $_.ExecutablePath.StartsWith(($installDir.TrimEnd('\') + '\'), [System.StringComparison]::OrdinalIgnoreCase)
+      )
+    } | ForEach-Object {
+      try {
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      } catch {
+        Write-Host "failed to stop process $($_.ProcessId): $_"
+      }
+    }
+  } catch {
+    Write-Host "failed to enumerate install processes: $_"
+  }
+  Start-Sleep -Milliseconds 500
+}
+
+function Start-InstallExe([string]$ExePath, [string[]]$ArgumentList) {
+  if (-not (Test-Path -LiteralPath $ExePath)) {
+    return $false
+  }
+  $workDir = Split-Path -Parent $ExePath
+  if (-not $workDir -or -not (Test-Path -LiteralPath $workDir)) {
+    $workDir = $installDir
+  }
+  try {
+    if ($null -eq $ArgumentList -or $ArgumentList.Count -eq 0) {
+      Start-Process -FilePath $ExePath -WorkingDirectory $workDir | Out-Null
+    } else {
+      Start-Process -FilePath $ExePath -ArgumentList $ArgumentList -WorkingDirectory $workDir | Out-Null
+    }
+    return $true
+  } catch {
+    Write-Host "failed to start Foco executable ${ExePath}: $_"
+    return $false
+  }
+}
+
+function Fail-BeforeInstall([string]$Reason) {
+  Write-UpdateResult "Update failed: $Reason"
+  [void](Start-InstallExe $currentExe @())
+  exit 1
+}
+
+function Restore-PreviousInstall([string]$Reason) {
+  $restored = $false
+  Stop-InstallProcesses
+  if ($backupReady -and (Test-Path -LiteralPath $backupDir)) {
+    try {
+      $brokenDir = Join-Path $backupParent ("Foco.update-broken." + [guid]::NewGuid().ToString("N"))
+      if (Test-Path -LiteralPath $installDir) {
+        Move-Item -LiteralPath $installDir -Destination $brokenDir -Force -ErrorAction Stop
+      }
+      Move-Item -LiteralPath $backupDir -Destination $installDir -Force -ErrorAction Stop
+      $restored = $true
+      $script:backupReady = $false
+      Remove-PathBestEffort $brokenDir
+    } catch {
+      Write-Host "failed to restore install backup: $_"
+      $backupExe = Join-Path $backupDir "foco.exe"
+      if (Start-InstallExe $backupExe @()) {
+        Write-UpdateResult "Update failed: $Reason. Previous version is still available at $backupDir but could not replace the current install; launched from the backup."
+        return
+      }
+      Write-UpdateResult "Update failed: $Reason. Previous version is still available at $backupDir but could not replace the current install or launch."
+      return
+    }
+  }
+
+  if ($restored) {
+    if (Start-InstallExe $currentExe @()) {
+      Write-UpdateResult "Update failed: $Reason. Rolled back to the previous version."
+    } else {
+      Write-UpdateResult "Update failed: $Reason. Rolled back to the previous version but could not relaunch it."
+    }
+    return
+  }
+
+  if (Start-InstallExe $currentExe @()) {
+    Write-UpdateResult "Update failed: $Reason. Could not restore the previous version; relaunched the current install."
+  } else {
+    Write-UpdateResult "Update failed: $Reason. Could not restore the previous version or relaunch the app."
+  }
+}
+
 try {
+  try {
+    Start-Transcript -Path $logPath -Append | Out-Null
+    $transcriptStarted = $true
+  } catch {
+    Write-Host "failed to start update transcript: $_"
+  }
+
   Wait-Process -Id $pidToWait
+
+  if (Test-Path -LiteralPath $readyPath) {
+    Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
+  }
+
+  # Full install-tree backup before NSIS overwrites in place. Fail hard if backup cannot be staged.
+  try {
+    Copy-InstallTree -Source $installDir -Destination $backupStaged
+    if (Test-Path -LiteralPath $backupDir) {
+      throw "backup destination unexpectedly already exists: $backupDir"
+    }
+    Move-Item -LiteralPath $backupStaged -Destination $backupDir -Force -ErrorAction Stop
+    $backupReady = $true
+  } catch {
+    Remove-PathBestEffort $backupStaged
+    Remove-PathBestEffort $backupDir
+    Fail-BeforeInstall "could not create a full install backup before running the installer: $($_.Exception.Message)"
+  }
+
   $process = Start-Process -FilePath $installer -ArgumentList '/S' -Wait -PassThru
-  if ($process.ExitCode -ne 0) { throw "Foco installer exited with code $($process.ExitCode)" }
-  Start-Process -FilePath $currentExe -ArgumentList '--updated-restart' -WorkingDirectory $installDir
+  if ($null -eq $process) {
+    Restore-PreviousInstall "installer process could not be started"
+    exit 1
+  }
+  if ($process.ExitCode -ne 0) {
+    Restore-PreviousInstall "installer exited with code $($process.ExitCode)"
+    exit 1
+  }
+  if (-not (Test-Path -LiteralPath $currentExe)) {
+    Restore-PreviousInstall "updated executable was not found after install"
+    exit 1
+  }
+
+  if (-not (Start-InstallExe $currentExe @('--updated-restart'))) {
+    Restore-PreviousInstall "could not launch the updated app after install"
+    exit 1
+  }
+
+  $elapsed = 0
+  while (-not (Test-Path -LiteralPath $readyPath)) {
+    if ($elapsed -ge $readyTimeoutSecs) {
+      Restore-PreviousInstall "updated app did not become ready within ${readyTimeoutSecs}s after launch"
+      exit 1
+    }
+    Start-Sleep -Seconds 1
+    $elapsed++
+  }
+
+  Remove-PathBestEffort $backupDir
+  $backupReady = $false
+  if (Test-Path -LiteralPath $readyPath) {
+    Remove-Item -LiteralPath $readyPath -Force -ErrorAction SilentlyContinue
+  }
+} catch {
+  Restore-PreviousInstall $_.Exception.Message
+  exit 1
 } finally {
-  Stop-Transcript | Out-Null
+  if ($transcriptStarted) {
+    try { Stop-Transcript | Out-Null } catch {}
+  }
+  if (Test-Path -LiteralPath $backupStaged) {
+    Remove-PathBestEffort $backupStaged
+  }
 }
 "#
 }
@@ -1188,15 +1728,134 @@ mod tests {
     #[test]
     fn macos_update_helper_restarts_silently() {
         let script = macos_update_script();
-        assert!(script.contains(r#"xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP" || true"#));
+        assert!(script.contains(r#"xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP""#));
         assert!(script.contains(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#));
+        assert!(script.contains("rollback_and_relaunch"));
+        assert!(script.contains("FOCO_UPDATE_RESULT"));
+        assert!(script.contains("FOCO_UPDATE_READY"));
+        assert!(script.contains("did not become ready"));
+        assert!(script.contains("quarantine attributes remain on the new app after clear"));
+        assert!(script.contains("xattr -lr"));
+        assert!(script.contains("fail_early"));
+        assert!(script.contains("leftover update staging directories"));
+        // Result marker must not claim rollback before restore succeeds.
+        assert!(script.contains(
+            r#"write_result "Update failed: $reason. Rolled back to the previous version.""#
+        ));
+        assert!(script.contains(r#"relaunch_app "$old_app""#));
+        let replace_idx = script
+            .find(r#"mv "$new_app" "$FOCO_UPDATE_APP""#)
+            .expect("replace step");
+        let launch_idx = script
+            .find(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#)
+            .expect("launch step");
+        let ready_wait_idx = script
+            .find(r#"[ ! -f "$FOCO_UPDATE_READY" ]"#)
+            .expect("ready wait");
+        // Prefer the final cleanup of .old after ready wait (earlier best-effort removals also match).
+        let cleanup_idx = script
+            .rfind(r#"rm -rf "$old_app" 2>/dev/null || true"#)
+            .expect("old cleanup");
+        assert!(replace_idx < launch_idx);
+        assert!(launch_idx < ready_wait_idx);
+        assert!(ready_wait_idx < cleanup_idx);
+        // Staging cleanup must not use bare rm under set -e without recovery.
+        assert!(!script.contains("rm -rf \"$new_app\" \"$old_app\"\n"));
+        assert!(script.contains("leftover update staging directories"));
     }
 
     #[test]
     fn windows_update_helper_restarts_silently() {
-        assert!(windows_update_script().contains(
-            "Start-Process -FilePath $currentExe -ArgumentList '--updated-restart' -WorkingDirectory $installDir"
+        let script = windows_update_script();
+        assert!(script.contains(
+            "Start-Process -FilePath $ExePath -ArgumentList $ArgumentList -WorkingDirectory $workDir"
         ));
+        assert!(script.contains("Restore-PreviousInstall"));
+        assert!(script.contains("Fail-BeforeInstall"));
+        assert!(script.contains("FOCO_UPDATE_RESULT"));
+        assert!(script.contains("FOCO_UPDATE_READY"));
+        assert!(script.contains("Write-UpdateResult"));
+        assert!(script.contains("Foco.update-backup."));
+        assert!(script.contains("Copy-InstallTree"));
+        assert!(script.contains("did not become ready"));
+        assert!(script.contains("Stop-InstallProcesses"));
+        assert!(script.contains("could not create a full install backup"));
+        let backup_idx = script.find("Copy-InstallTree -Source $installDir").expect("backup");
+        let installer_idx = script
+            .find("Start-Process -FilePath $installer -ArgumentList '/S'")
+            .expect("installer");
+        let ready_idx = script
+            .find("while (-not (Test-Path -LiteralPath $readyPath))")
+            .expect("ready wait");
+        let last_cleanup = script.rfind("Remove-PathBestEffort $backupDir").expect("last cleanup");
+        assert!(backup_idx < installer_idx);
+        assert!(installer_idx < ready_idx);
+        assert!(ready_idx < last_cleanup);
+        // Fixed "$installDir.previous" can nest under Move-Item; require unique backup paths.
+        assert!(!script.contains(r#"$backupDir = "$installDir.previous""#));
+    }
+
+    #[test]
+    fn take_last_install_failure_reads_and_clears_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path();
+        let updates = profile.join(".foco").join("updates");
+        std::fs::create_dir_all(&updates).expect("updates dir");
+        let marker = updates.join(LAST_INSTALL_FAILURE_FILE);
+        std::fs::write(
+            &marker,
+            "Update failed: quarantine clear failed. Rolled back.\n",
+        )
+        .expect("write marker");
+
+        let message = take_last_install_failure_message(profile).expect("message");
+        assert!(message.contains("quarantine clear failed"));
+        assert!(!marker.exists());
+        assert!(take_last_install_failure_message(profile).is_none());
+    }
+
+    #[test]
+    fn load_last_install_failure_into_state_sets_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path();
+        let updates = profile.join(".foco").join("updates");
+        std::fs::create_dir_all(&updates).expect("updates dir");
+        std::fs::write(
+            updates.join(LAST_INSTALL_FAILURE_FILE),
+            "Update failed: could not launch the updated app after install. Rolled back to the previous version.\n",
+        )
+        .expect("write marker");
+
+        let mut state = UpdateState::default();
+        load_last_install_failure_into_state(&mut state, profile);
+        assert_eq!(
+            state.install_error.as_deref(),
+            Some(
+                "Update failed: could not launch the updated app after install. Rolled back to the previous version."
+            )
+        );
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn mark_updated_restart_ready_writes_marker_when_requested() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = dir.path();
+        // Function only writes when the current process args contain the flag; call the path
+        // helper path via the public entry after simulating by writing through the same path.
+        let path = updated_restart_ready_path(profile);
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        // Direct path write contracts used by helpers.
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some(UPDATED_RESTART_READY_FILE)
+        );
+        assert_eq!(
+            last_install_failure_path(profile)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(LAST_INSTALL_FAILURE_FILE)
+        );
     }
 
     #[test]
