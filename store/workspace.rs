@@ -13,7 +13,7 @@ use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDomainError, AgentEntityKind,
     AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition, AgentTeamId, AgentTeamStatus, TeamWorkload,
+    AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus, TeamWorkload,
 };
 use rusqlite::{
     Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params, params_from_iter,
@@ -45,7 +45,7 @@ pub use crate::workspace_gate::{
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
-    AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
+    AgentTaskRecord, AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
     ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord,
     CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
     CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
@@ -64,7 +64,7 @@ pub use workspace_records::{
     PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
     PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
     PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-    PreStreamFailureMaterialization, PromptContextInjectionRecord, RewriteChatFromUserMessage,
+    PreStreamFailureMaterialization, PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
     ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
     ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
@@ -11646,81 +11646,225 @@ impl WorkspaceDatabase {
         &mut self,
         dependency: NewAgentTaskDependency<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
+        // Narrow single-row entry retained for fixtures and older callers. Prefer
+        // `register_agent_task_wait_dependencies` for production wait registration.
+        self.register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: dependency.team_id,
+            waiting_task_id: dependency.waiting_task_id,
+            dependency_task_ids: std::slice::from_ref(dependency.dependency_task_id),
+            wait_mode: dependency.wait_mode,
+            pending_tool_call_id: dependency.pending_tool_call_id,
+            deadline_at: dependency.deadline_at,
+            event_instance_id: None,
+        })
+        .map(|_| ())
+    }
+
+    /// Atomically register a full wait-round dependency set for `waiting_task_id`.
+    ///
+    /// Wait rounds are identified by `pending_tool_call_id` (together with mode and
+    /// deadline). Same-round retries are idempotent and may repair a partial legacy
+    /// write. A different round replaces prior rows only when every prior dependency
+    /// task is terminal. Emits `task_waiting_requested` in the same transaction when
+    /// the wait intent is first durable for that pending tool call (created/repaired/
+    /// replaced, or when the event was missing on an exact replay).
+    pub fn register_agent_task_wait_dependencies(
+        &mut self,
+        request: RegisterAgentTaskWaitDependencies<'_>,
+    ) -> Result<AgentTaskWaitRegistrationOutcome, WorkspaceDatabaseError> {
+        let dependency_task_ids =
+            dedupe_agent_wait_dependency_task_ids(request.dependency_task_ids)?;
+        if dependency_task_ids.is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent wait dependency set must not be empty".to_string(),
+            });
+        }
+        if let Some(pending_tool_call_id) = request.pending_tool_call_id {
+            if pending_tool_call_id.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "pending tool call id must not be empty when provided".to_string(),
+                });
+            }
+        }
+
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
+
         ensure_agent_entity_team(
             &transaction,
             "agent_tasks",
-            dependency.waiting_task_id.as_str(),
-            dependency.team_id,
+            request.waiting_task_id.as_str(),
+            request.team_id,
             AgentEntityKind::Task,
             &database_path,
         )?;
-        ensure_agent_entity_team(
-            &transaction,
-            "agent_tasks",
-            dependency.dependency_task_id.as_str(),
-            dependency.team_id,
-            AgentEntityKind::Task,
-            &database_path,
-        )?;
-        if dependency.waiting_task_id == dependency.dependency_task_id
-            || agent_dependency_path_exists(
+        for dependency_task_id in &dependency_task_ids {
+            ensure_agent_entity_team(
                 &transaction,
-                dependency.team_id,
-                dependency.dependency_task_id,
-                dependency.waiting_task_id,
+                "agent_tasks",
+                dependency_task_id.as_str(),
+                request.team_id,
+                AgentEntityKind::Task,
                 &database_path,
-            )?
-        {
-            return Err(WorkspaceDatabaseError::AgentDomain {
-                source: AgentDomainError::dependency_cycle(dependency.waiting_task_id.clone()),
-            });
+            )?;
+            if dependency_task_id == request.waiting_task_id
+                || agent_dependency_path_exists(
+                    &transaction,
+                    request.team_id,
+                    dependency_task_id,
+                    request.waiting_task_id,
+                    &database_path,
+                )?
+            {
+                return Err(WorkspaceDatabaseError::AgentDomain {
+                    source: AgentDomainError::dependency_cycle(request.waiting_task_id.clone()),
+                });
+            }
         }
-        let existing_mode = transaction
-            .query_row(
-                "SELECT wait_mode FROM agent_task_dependencies
-                 WHERE team_id = ?1 AND waiting_task_id = ?2 LIMIT 1",
-                params![
-                    dependency.team_id.as_str(),
-                    dependency.waiting_task_id.as_str()
-                ],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|source| sqlite_error(&database_path, source))?;
-        if existing_mode
-            .as_deref()
-            .is_some_and(|mode| mode != dependency.wait_mode.as_str())
-        {
+
+        let existing = load_agent_task_dependencies_for_waiting_task(
+            &transaction,
+            request.waiting_task_id,
+            &database_path,
+        )?;
+        let requested_ids: HashSet<&AgentTaskId> = dependency_task_ids.iter().collect();
+        let existing_ids: HashSet<&AgentTaskId> = existing
+            .iter()
+            .map(|row| &row.dependency_task_id)
+            .collect();
+
+        let outcome = if existing.is_empty() {
+            insert_agent_task_dependency_rows(
+                &transaction,
+                request.team_id,
+                request.waiting_task_id,
+                &dependency_task_ids,
+                request.wait_mode,
+                request.pending_tool_call_id,
+                request.deadline_at,
+                &database_path,
+            )?;
+            ensure_task_waiting_requested_event(
+                &transaction,
+                request.team_id,
+                request.waiting_task_id,
+                request.event_instance_id,
+                request.pending_tool_call_id,
+                &dependency_task_ids,
+                request.wait_mode,
+                request.deadline_at,
+                &database_path,
+            )?;
+            AgentTaskWaitRegistrationOutcome::Created
+        } else if existing_rows_match_wait_round(
+            &existing,
+            request.wait_mode,
+            request.pending_tool_call_id,
+            request.deadline_at,
+        ) {
+            if existing_ids == requested_ids {
+                ensure_task_waiting_requested_event(
+                    &transaction,
+                    request.team_id,
+                    request.waiting_task_id,
+                    request.event_instance_id,
+                    request.pending_tool_call_id,
+                    &dependency_task_ids,
+                    request.wait_mode,
+                    request.deadline_at,
+                    &database_path,
+                )?;
+                AgentTaskWaitRegistrationOutcome::Replayed
+            } else if existing_ids.is_subset(&requested_ids) {
+                let missing: Vec<AgentTaskId> = dependency_task_ids
+                    .iter()
+                    .filter(|id| !existing_ids.contains(id))
+                    .cloned()
+                    .collect();
+                insert_agent_task_dependency_rows(
+                    &transaction,
+                    request.team_id,
+                    request.waiting_task_id,
+                    &missing,
+                    request.wait_mode,
+                    request.pending_tool_call_id,
+                    request.deadline_at,
+                    &database_path,
+                )?;
+                ensure_task_waiting_requested_event(
+                    &transaction,
+                    request.team_id,
+                    request.waiting_task_id,
+                    request.event_instance_id,
+                    request.pending_tool_call_id,
+                    &dependency_task_ids,
+                    request.wait_mode,
+                    request.deadline_at,
+                    &database_path,
+                )?;
+                AgentTaskWaitRegistrationOutcome::Repaired
+            } else {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "agent wait round for task '{}' cannot change dependency set for pending tool call {:?}",
+                        request.waiting_task_id, request.pending_tool_call_id
+                    ),
+                });
+            }
+        } else if existing_rows_same_pending_tool_call(&existing, request.pending_tool_call_id) {
+            // Same wait-round identity with conflicting mode/deadline/set shape:
+            // never silent mutate and never treat as sequential replacement.
             return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
-                message: "all dependencies for a waiting task must use the same wait mode"
-                    .to_string(),
+                message: format!(
+                    "agent wait round for task '{}' conflicts with existing registration for pending tool call {:?}",
+                    request.waiting_task_id, request.pending_tool_call_id
+                ),
             });
-        }
-        transaction
-            .execute(
-                "INSERT INTO agent_task_dependencies
-                    (team_id, waiting_task_id, dependency_task_id, wait_mode,
-                     pending_tool_call_id, deadline_at, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    dependency.team_id.as_str(),
-                    dependency.waiting_task_id.as_str(),
-                    dependency.dependency_task_id.as_str(),
-                    dependency.wait_mode.as_str(),
-                    dependency.pending_tool_call_id,
-                    dependency.deadline_at,
-                    now_timestamp()
-                ],
-            )
-            .map_err(|source| sqlite_error(&database_path, source))?;
+        } else if existing_wait_round_is_terminal(&transaction, &existing, &database_path)? {
+            transaction
+                .execute(
+                    "DELETE FROM agent_task_dependencies WHERE waiting_task_id = ?1",
+                    params![request.waiting_task_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            insert_agent_task_dependency_rows(
+                &transaction,
+                request.team_id,
+                request.waiting_task_id,
+                &dependency_task_ids,
+                request.wait_mode,
+                request.pending_tool_call_id,
+                request.deadline_at,
+                &database_path,
+            )?;
+            ensure_task_waiting_requested_event(
+                &transaction,
+                request.team_id,
+                request.waiting_task_id,
+                request.event_instance_id,
+                request.pending_tool_call_id,
+                &dependency_task_ids,
+                request.wait_mode,
+                request.deadline_at,
+                &database_path,
+            )?;
+            AgentTaskWaitRegistrationOutcome::Replaced
+        } else {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "agent task '{}' already has an active wait round that has not finished; cannot register a different wait round",
+                    request.waiting_task_id
+                ),
+            });
+        };
+
         transaction
             .commit()
-            .map_err(|source| sqlite_error(&database_path, source))
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(outcome)
     }
 
     pub fn agent_task_dependencies(
@@ -12023,66 +12167,16 @@ impl WorkspaceDatabase {
         &mut self,
         event: NewAgentEvent<'_>,
     ) -> Result<AgentEventRecord, WorkspaceDatabaseError> {
-        if event.event_type.trim().is_empty() {
-            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
-                message: "agent event type must not be empty".to_string(),
-            });
-        }
-        let payload_json = redact_agent_json(event.payload_json, "payload_json")?;
-        let now = now_timestamp();
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
-        let sequence: i64 = transaction
-            .query_row(
-                "SELECT next_event_sequence FROM agent_teams WHERE id = ?1",
-                params![event.team_id.as_str()],
-                |row| row.get(0),
-            )
-            .map_err(|source| sqlite_error(&database_path, source))?;
-        transaction
-            .execute(
-                "UPDATE agent_teams
-                 SET next_event_sequence = next_event_sequence + 1, updated_at = ?2
-                 WHERE id = ?1",
-                params![event.team_id.as_str(), now],
-            )
-            .map_err(|source| sqlite_error(&database_path, source))?;
-        transaction
-            .execute(
-                "INSERT INTO agent_events
-                    (team_id, sequence, event_type, instance_id, task_id, attempt_id,
-                     message_id, payload_json, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    event.team_id.as_str(),
-                    sequence,
-                    event.event_type,
-                    event.instance_id.map(AgentInstanceId::as_str),
-                    event.task_id.map(AgentTaskId::as_str),
-                    event.attempt_id.map(AgentAttemptId::as_str),
-                    event.message_id.map(AgentMessageId::as_str),
-                    payload_json,
-                    now
-                ],
-            )
-            .map_err(|source| sqlite_error(&database_path, source))?;
+        let record = append_agent_event_in_transaction(&transaction, event, &database_path)?;
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
-        Ok(AgentEventRecord {
-            team_id: event.team_id.clone(),
-            sequence,
-            event_type: event.event_type.to_string(),
-            instance_id: event.instance_id.cloned(),
-            task_id: event.task_id.cloned(),
-            attempt_id: event.attempt_id.cloned(),
-            message_id: event.message_id.cloned(),
-            payload_json,
-            created_at: now,
-        })
+        Ok(record)
     }
 
     pub fn agent_events_after(
@@ -13680,6 +13774,298 @@ fn agent_dependency_path_exists(
             |row| row.get::<_, bool>(0),
         )
         .map_err(|source| sqlite_error(database_path, source))
+}
+
+fn dedupe_agent_wait_dependency_task_ids(
+    dependency_task_ids: &[AgentTaskId],
+) -> Result<Vec<AgentTaskId>, WorkspaceDatabaseError> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::with_capacity(dependency_task_ids.len());
+    for dependency_task_id in dependency_task_ids {
+        if !seen.insert(dependency_task_id.clone()) {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "duplicate dependency task id '{dependency_task_id}' in wait registration"
+                ),
+            });
+        }
+        unique.push(dependency_task_id.clone());
+    }
+    Ok(unique)
+}
+
+fn load_agent_task_dependencies_for_waiting_task(
+    transaction: &Transaction<'_>,
+    waiting_task_id: &AgentTaskId,
+    database_path: &Path,
+) -> Result<Vec<AgentTaskDependencyRecord>, WorkspaceDatabaseError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT team_id, waiting_task_id, dependency_task_id, wait_mode,
+                    pending_tool_call_id, deadline_at, created_at
+             FROM agent_task_dependencies
+             WHERE waiting_task_id = ?1
+             ORDER BY dependency_task_id ASC",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(params![waiting_task_id.as_str()], |row| {
+            Ok(AgentTaskDependencyRecord {
+                team_id: agent_id_from_row(row, 0)?,
+                waiting_task_id: agent_id_from_row(row, 1)?,
+                dependency_task_id: agent_id_from_row(row, 2)?,
+                wait_mode: agent_enum_from_row(row, 3)?,
+                pending_tool_call_id: row.get(4)?,
+                deadline_at: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|source| sqlite_error(database_path, source))?;
+    collect_rows(rows, database_path)
+}
+
+fn existing_rows_same_pending_tool_call(
+    existing: &[AgentTaskDependencyRecord],
+    pending_tool_call_id: Option<&str>,
+) -> bool {
+    !existing.is_empty()
+        && existing
+            .iter()
+            .all(|row| row.pending_tool_call_id.as_deref() == pending_tool_call_id)
+}
+
+fn existing_rows_match_wait_round(
+    existing: &[AgentTaskDependencyRecord],
+    wait_mode: AgentTaskWaitMode,
+    pending_tool_call_id: Option<&str>,
+    deadline_at: Option<&str>,
+) -> bool {
+    existing.iter().all(|row| {
+        row.wait_mode == wait_mode
+            && row.pending_tool_call_id.as_deref() == pending_tool_call_id
+            && row.deadline_at.as_deref() == deadline_at
+    })
+}
+
+fn existing_wait_round_is_terminal(
+    transaction: &Transaction<'_>,
+    existing: &[AgentTaskDependencyRecord],
+    database_path: &Path,
+) -> Result<bool, WorkspaceDatabaseError> {
+    for row in existing {
+        let status: String = transaction
+            .query_row(
+                "SELECT status FROM agent_tasks WHERE id = ?1",
+                params![row.dependency_task_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        let terminal = matches!(
+            status.as_str(),
+            "completed" | "failed" | "cancelled" | "interrupted"
+        );
+        if !terminal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn insert_agent_task_dependency_rows(
+    transaction: &Transaction<'_>,
+    team_id: &AgentTeamId,
+    waiting_task_id: &AgentTaskId,
+    dependency_task_ids: &[AgentTaskId],
+    wait_mode: AgentTaskWaitMode,
+    pending_tool_call_id: Option<&str>,
+    deadline_at: Option<&str>,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    let created_at = now_timestamp();
+    for dependency_task_id in dependency_task_ids {
+        transaction
+            .execute(
+                "INSERT INTO agent_task_dependencies
+                    (team_id, waiting_task_id, dependency_task_id, wait_mode,
+                     pending_tool_call_id, deadline_at, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    team_id.as_str(),
+                    waiting_task_id.as_str(),
+                    dependency_task_id.as_str(),
+                    wait_mode.as_str(),
+                    pending_tool_call_id,
+                    deadline_at,
+                    created_at.as_str()
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+    }
+    Ok(())
+}
+
+fn ensure_task_waiting_requested_event(
+    transaction: &Transaction<'_>,
+    team_id: &AgentTeamId,
+    waiting_task_id: &AgentTaskId,
+    event_instance_id: Option<&AgentInstanceId>,
+    pending_tool_call_id: Option<&str>,
+    dependency_task_ids: &[AgentTaskId],
+    wait_mode: AgentTaskWaitMode,
+    deadline_at: Option<&str>,
+    database_path: &Path,
+) -> Result<(), WorkspaceDatabaseError> {
+    if task_waiting_requested_event_exists(
+        transaction,
+        team_id,
+        waiting_task_id,
+        pending_tool_call_id,
+        database_path,
+    )? {
+        return Ok(());
+    }
+    append_agent_event_in_transaction(
+        transaction,
+        NewAgentEvent {
+            team_id,
+            event_type: "task_waiting_requested",
+            instance_id: event_instance_id,
+            task_id: Some(waiting_task_id),
+            attempt_id: None,
+            message_id: None,
+            payload_json: &task_waiting_requested_payload_json(
+                pending_tool_call_id,
+                dependency_task_ids,
+                wait_mode,
+                deadline_at,
+            )?,
+        },
+        database_path,
+    )?;
+    Ok(())
+}
+
+fn task_waiting_requested_payload_json(
+    pending_tool_call_id: Option<&str>,
+    dependency_task_ids: &[AgentTaskId],
+    wait_mode: AgentTaskWaitMode,
+    deadline_at: Option<&str>,
+) -> Result<String, WorkspaceDatabaseError> {
+    let dependency_task_ids: Vec<String> = dependency_task_ids
+        .iter()
+        .map(AgentTaskId::to_string)
+        .collect();
+    let payload = json!({
+        "pendingToolCallId": pending_tool_call_id,
+        "dependencyTaskIds": dependency_task_ids,
+        "mode": wait_mode.as_str(),
+        "deadlineAt": deadline_at,
+    });
+    serde_json::to_string(&payload).map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson {
+        field: "payload_json",
+        source,
+    })
+}
+
+fn task_waiting_requested_event_exists(
+    transaction: &Transaction<'_>,
+    team_id: &AgentTeamId,
+    waiting_task_id: &AgentTaskId,
+    pending_tool_call_id: Option<&str>,
+    database_path: &Path,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT payload_json FROM agent_events
+             WHERE team_id = ?1
+               AND task_id = ?2
+               AND event_type = 'task_waiting_requested'",
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let rows = statement
+        .query_map(
+            params![team_id.as_str(), waiting_task_id.as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    for payload_json in rows {
+        let payload_json = payload_json.map_err(|source| sqlite_error(database_path, source))?;
+        let payload: Value = serde_json::from_str(&payload_json).map_err(|source| {
+            WorkspaceDatabaseError::AgentRuntimeJson {
+                field: "payload_json",
+                source,
+            }
+        })?;
+        // Missing key treats as null pending tool call id for legacy payloads.
+        let event_pending = match payload.get("pendingToolCallId") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(value)) => Some(value.as_str()),
+            Some(_) => continue,
+        };
+        if event_pending == pending_tool_call_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn append_agent_event_in_transaction(
+    transaction: &Transaction<'_>,
+    event: NewAgentEvent<'_>,
+    database_path: &Path,
+) -> Result<AgentEventRecord, WorkspaceDatabaseError> {
+    if event.event_type.trim().is_empty() {
+        return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+            message: "agent event type must not be empty".to_string(),
+        });
+    }
+    let payload_json = redact_agent_json(event.payload_json, "payload_json")?;
+    let now = now_timestamp();
+    let sequence: i64 = transaction
+        .query_row(
+            "SELECT next_event_sequence FROM agent_teams WHERE id = ?1",
+            params![event.team_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE agent_teams
+             SET next_event_sequence = next_event_sequence + 1, updated_at = ?2
+             WHERE id = ?1",
+            params![event.team_id.as_str(), now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "INSERT INTO agent_events
+                (team_id, sequence, event_type, instance_id, task_id, attempt_id,
+                 message_id, payload_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.team_id.as_str(),
+                sequence,
+                event.event_type,
+                event.instance_id.map(AgentInstanceId::as_str),
+                event.task_id.map(AgentTaskId::as_str),
+                event.attempt_id.map(AgentAttemptId::as_str),
+                event.message_id.map(AgentMessageId::as_str),
+                payload_json,
+                now
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(AgentEventRecord {
+        team_id: event.team_id.clone(),
+        sequence,
+        event_type: event.event_type.to_string(),
+        instance_id: event.instance_id.cloned(),
+        task_id: event.task_id.cloned(),
+        attempt_id: event.attempt_id.cloned(),
+        message_id: event.message_id.cloned(),
+        payload_json,
+        created_at: now,
+    })
 }
 
 fn validate_agent_json(value: &str, field: &'static str) -> Result<(), WorkspaceDatabaseError> {

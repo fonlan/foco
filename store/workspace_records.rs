@@ -233,6 +233,35 @@ pub struct NewAgentTaskDependency<'a> {
     pub deadline_at: Option<&'a str>,
 }
 
+/// Atomic registration of a full `agent_wait_tasks` dependency set for one wait round.
+///
+/// `pending_tool_call_id` identifies the wait round. Same-round retries are idempotent
+/// (and may repair a partial legacy multi-row write). A different round may replace the
+/// previous set only when every prior dependency task is terminal.
+#[derive(Clone, Debug)]
+pub struct RegisterAgentTaskWaitDependencies<'a> {
+    pub team_id: &'a AgentTeamId,
+    pub waiting_task_id: &'a AgentTaskId,
+    pub dependency_task_ids: &'a [AgentTaskId],
+    pub wait_mode: AgentTaskWaitMode,
+    pub pending_tool_call_id: Option<&'a str>,
+    pub deadline_at: Option<&'a str>,
+    /// Optional instance stamped on the `task_waiting_requested` event.
+    pub event_instance_id: Option<&'a AgentInstanceId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTaskWaitRegistrationOutcome {
+    /// First durable registration for this wait round.
+    Created,
+    /// Exact same wait round already present; no dependency rows changed.
+    Replayed,
+    /// Same wait round metadata; missing dependency rows were inserted (legacy partial write).
+    Repaired,
+    /// Prior wait round was fully terminal and replaced by this registration.
+    Replaced,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTaskDependencyRecord {
     pub team_id: AgentTeamId,

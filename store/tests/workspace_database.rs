@@ -35,7 +35,8 @@ use foco_store::{
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
         NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
         PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL, RewriteChatFromUserMessage,
+        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL, RegisterAgentTaskWaitDependencies,
+        RewriteChatFromUserMessage, AgentTaskWaitRegistrationOutcome,
         ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
         ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
         UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
@@ -14048,6 +14049,649 @@ fn agent_store_rejects_cross_team_references_and_dependency_cycles() {
         !database
             .agent_task_dependencies_satisfied(&first_task)
             .expect("dependency state")
+    );
+}
+
+#[test]
+fn register_agent_wait_dependencies_replays_identical_wait_round() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-replay", "wait-replay");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-replay-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-replay-parent").expect("task id");
+    let child_a = AgentTaskId::new("agent-task-wait-replay-a").expect("task id");
+    let child_b = AgentTaskId::new("agent-task-wait-replay-b").expect("task id");
+    for (id, owner) in [
+        (&waiting, &coordinator_id),
+        (&child_a, &worker_id),
+        (&child_b, &worker_id),
+    ] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    let deps = [child_a.clone(), child_b.clone()];
+    let request = RegisterAgentTaskWaitDependencies {
+        team_id: &team_id,
+        waiting_task_id: &waiting,
+        dependency_task_ids: &deps,
+        wait_mode: AgentTaskWaitMode::All,
+        pending_tool_call_id: Some("call-wait-replay"),
+        deadline_at: Some("2026-07-17T12:00:00.000Z"),
+        event_instance_id: Some(&coordinator_id),
+    };
+    assert_eq!(
+        database
+            .register_agent_task_wait_dependencies(request.clone())
+            .expect("create"),
+        AgentTaskWaitRegistrationOutcome::Created
+    );
+    let first_rows = database
+        .agent_task_dependencies(&waiting)
+        .expect("dependencies");
+    assert_eq!(first_rows.len(), 2);
+    let first_created: Vec<_> = first_rows.iter().map(|row| row.created_at.clone()).collect();
+    let first_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "task_waiting_requested")
+        .count();
+    assert_eq!(first_events, 1);
+
+    assert_eq!(
+        database
+            .register_agent_task_wait_dependencies(request)
+            .expect("replay"),
+        AgentTaskWaitRegistrationOutcome::Replayed
+    );
+    let second_rows = database
+        .agent_task_dependencies(&waiting)
+        .expect("dependencies after replay");
+    assert_eq!(second_rows.len(), 2);
+    assert_eq!(
+        second_rows
+            .iter()
+            .map(|row| row.created_at.clone())
+            .collect::<Vec<_>>(),
+        first_created
+    );
+    let second_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.event_type == "task_waiting_requested")
+        .count();
+    assert_eq!(second_events, 1);
+}
+
+#[test]
+fn register_agent_wait_dependencies_repairs_partial_legacy_subset() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-repair", "wait-repair");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-repair-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-repair-parent").expect("task id");
+    let child_a = AgentTaskId::new("agent-task-wait-repair-a").expect("task id");
+    let child_b = AgentTaskId::new("agent-task-wait-repair-b").expect("task id");
+    for (id, owner) in [
+        (&waiting, &coordinator_id),
+        (&child_a, &worker_id),
+        (&child_b, &worker_id),
+    ] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    // Simulate a legacy partial multi-row write for the same wait round.
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_id: &child_a,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-repair"),
+            deadline_at: None,
+        })
+        .expect("partial insert");
+    let partial_created = database
+        .agent_task_dependencies(&waiting)
+        .expect("partial")
+        .into_iter()
+        .find(|row| row.dependency_task_id == child_a)
+        .expect("child a")
+        .created_at;
+
+    let deps = [child_a.clone(), child_b.clone()];
+    assert_eq!(
+        database
+            .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+                team_id: &team_id,
+                waiting_task_id: &waiting,
+                dependency_task_ids: &deps,
+                wait_mode: AgentTaskWaitMode::All,
+                pending_tool_call_id: Some("call-wait-repair"),
+                deadline_at: None,
+                event_instance_id: Some(&coordinator_id),
+            })
+            .expect("repair"),
+        AgentTaskWaitRegistrationOutcome::Repaired
+    );
+    let rows = database
+        .agent_task_dependencies(&waiting)
+        .expect("repaired rows");
+    assert_eq!(rows.len(), 2);
+    let child_a_row = rows
+        .iter()
+        .find(|row| row.dependency_task_id == child_a)
+        .expect("child a");
+    assert_eq!(child_a_row.created_at, partial_created);
+    assert!(rows.iter().any(|row| row.dependency_task_id == child_b));
+    let waiting_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            event.event_type == "task_waiting_requested" && event.task_id.as_ref() == Some(&waiting)
+        })
+        .count();
+    // Partial insert already created one event; repair must not duplicate for same pending id.
+    assert_eq!(waiting_events, 1);
+}
+
+#[test]
+fn register_agent_wait_dependencies_rolls_back_when_later_dependency_is_invalid() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-rollback", "wait-rollback");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-rollback-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-rollback-parent").expect("task id");
+    let child_ok = AgentTaskId::new("agent-task-wait-rollback-ok").expect("task id");
+    let missing = AgentTaskId::new("agent-task-wait-rollback-missing").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child_ok, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    let deps = [child_ok.clone(), missing];
+    let error = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-rollback"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect_err("missing dependency must fail");
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+    ));
+    assert!(
+        database
+            .agent_task_dependencies(&waiting)
+            .expect("dependencies")
+            .is_empty()
+    );
+    assert!(
+        database
+            .agent_events_after(&team_id, -1)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event_type == "task_waiting_requested")
+            .count()
+            == 0
+    );
+}
+
+#[test]
+fn register_agent_wait_dependencies_rejects_metadata_conflict_for_same_tool_call() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-meta", "wait-meta");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-meta-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-meta-parent").expect("task id");
+    let child = AgentTaskId::new("agent-task-wait-meta-child").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+    let deps = [child.clone()];
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-meta"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect("create");
+
+    let error = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-meta"),
+            deadline_at: Some("2026-07-17T12:00:00.000Z"),
+            event_instance_id: None,
+        })
+        .expect_err("deadline conflict");
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { message }
+            if message.contains("conflicts with existing registration")
+    ));
+    assert_eq!(
+        database
+            .agent_task_dependencies(&waiting)
+            .expect("unchanged")
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn register_agent_wait_dependencies_rejects_active_round_when_new_tool_call_arrives() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-active", "wait-active");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-active-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-active-parent").expect("task id");
+    let child = AgentTaskId::new("agent-task-wait-active-child").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+    let deps = [child.clone()];
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-active-1"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect("create");
+
+    let error = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-active-2"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect_err("active wait must block replacement");
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { message }
+            if message.contains("active wait round")
+    ));
+    let rows = database
+        .agent_task_dependencies(&waiting)
+        .expect("dependencies");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].pending_tool_call_id.as_deref(),
+        Some("call-wait-active-1")
+    );
+}
+
+#[test]
+fn register_agent_wait_dependencies_replaces_terminal_round_and_allows_same_child_again() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-replace", "wait-replace");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-replace-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-replace-parent").expect("task id");
+    let child = AgentTaskId::new("agent-task-wait-replace-child").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+    let deps = [child.clone()];
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-replace-1"),
+            deadline_at: None,
+            event_instance_id: Some(&coordinator_id),
+        })
+        .expect("first wait");
+
+    let attempt_id =
+        AgentAttemptId::new("agent-attempt-wait-replace-child").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &child, &attempt_id)
+        .expect("claim child")
+        .expect("child claimed");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"ok":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete child")
+    );
+
+    assert_eq!(
+        database
+            .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+                team_id: &team_id,
+                waiting_task_id: &waiting,
+                dependency_task_ids: &deps,
+                wait_mode: AgentTaskWaitMode::All,
+                pending_tool_call_id: Some("call-wait-replace-2"),
+                deadline_at: None,
+                event_instance_id: Some(&coordinator_id),
+            })
+            .expect("second wait after terminal"),
+        AgentTaskWaitRegistrationOutcome::Replaced
+    );
+    let rows = database
+        .agent_task_dependencies(&waiting)
+        .expect("replaced dependencies");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].dependency_task_id, child);
+    assert_eq!(
+        rows[0].pending_tool_call_id.as_deref(),
+        Some("call-wait-replace-2")
+    );
+    let waiting_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            event.event_type == "task_waiting_requested" && event.task_id.as_ref() == Some(&waiting)
+        })
+        .count();
+    assert_eq!(waiting_events, 2);
+}
+
+#[test]
+fn register_agent_wait_dependencies_rejects_cross_team_and_cycles() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (first_team, first_instance) =
+        create_test_agent_team(&mut database, "chat-wait-cross-a", "wait-cross-a");
+    let (second_team, second_instance) =
+        create_test_agent_team(&mut database, "chat-wait-cross-b", "wait-cross-b");
+    let first_task = AgentTaskId::new("agent-task-wait-cross-first").expect("task");
+    let second_task = AgentTaskId::new("agent-task-wait-cross-second").expect("task");
+    let third_task = AgentTaskId::new("agent-task-wait-cross-third").expect("task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &first_task,
+            team_id: &first_team,
+            owner_instance_id: &first_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("first");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &second_task,
+            team_id: &second_team,
+            owner_instance_id: &second_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("second");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &third_task,
+            team_id: &first_team,
+            owner_instance_id: &first_instance,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("third");
+
+    let cross = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &first_team,
+            waiting_task_id: &first_task,
+            dependency_task_ids: std::slice::from_ref(&second_task),
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-cross"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect_err("cross-team");
+    assert!(matches!(
+        cross,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::CrossTeamReference
+    ));
+
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &first_team,
+            waiting_task_id: &first_task,
+            dependency_task_ids: std::slice::from_ref(&third_task),
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-cycle-1"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect("first edge");
+    let cycle = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &first_team,
+            waiting_task_id: &third_task,
+            dependency_task_ids: std::slice::from_ref(&first_task),
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-cycle-2"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect_err("cycle");
+    assert!(matches!(
+        cycle,
+        WorkspaceDatabaseError::AgentDomain { ref source }
+            if source.code() == AgentDomainErrorCode::DependencyCycle
+    ));
+    assert!(
+        database
+            .agent_task_dependencies(&third_task)
+            .expect("third deps")
+            .is_empty()
+    );
+}
+
+#[test]
+fn register_agent_wait_dependencies_backfills_missing_event_on_replay() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-event-gap", "wait-event-gap");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-event-gap-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-event-gap-parent").expect("task id");
+    let child = AgentTaskId::new("agent-task-wait-event-gap-child").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    // Insert a dependency row without going through the registration event path.
+    let connection = rusqlite::Connection::open(database.database_path()).expect("connection");
+    connection
+        .execute(
+            "INSERT INTO agent_task_dependencies
+                (team_id, waiting_task_id, dependency_task_id, wait_mode,
+                 pending_tool_call_id, deadline_at, created_at)
+             VALUES (?1, ?2, ?3, 'all', ?4, NULL, '2026-07-17T00:00:00.000Z')",
+            rusqlite::params![
+                team_id.as_str(),
+                waiting.as_str(),
+                child.as_str(),
+                "call-wait-event-gap",
+            ],
+        )
+        .expect("raw dependency insert");
+    drop(connection);
+
+    assert_eq!(
+        database
+            .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+                team_id: &team_id,
+                waiting_task_id: &waiting,
+                dependency_task_ids: std::slice::from_ref(&child),
+                wait_mode: AgentTaskWaitMode::All,
+                pending_tool_call_id: Some("call-wait-event-gap"),
+                deadline_at: None,
+                event_instance_id: Some(&coordinator_id),
+            })
+            .expect("replay with event backfill"),
+        AgentTaskWaitRegistrationOutcome::Replayed
+    );
+    let waiting_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("events")
+        .into_iter()
+        .filter(|event| {
+            event.event_type == "task_waiting_requested" && event.task_id.as_ref() == Some(&waiting)
+        })
+        .count();
+    assert_eq!(waiting_events, 1);
+}
+
+#[test]
+fn register_agent_wait_dependencies_rejects_duplicate_dependency_ids() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-dup", "wait-dup");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-dup-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-dup-parent").expect("task id");
+    let child = AgentTaskId::new("agent-task-wait-dup-child").expect("task id");
+    for (id, owner) in [(&waiting, &coordinator_id), (&child, &worker_id)] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    let deps = [child.clone(), child.clone()];
+    let error = database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &deps,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-dup"),
+            deadline_at: None,
+            event_instance_id: None,
+        })
+        .expect_err("duplicate dependency ids must fail");
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { message }
+            if message.contains("duplicate dependency task id")
+    ));
+    assert!(
+        database
+            .agent_task_dependencies(&waiting)
+            .expect("dependencies")
+            .is_empty()
     );
 }
 

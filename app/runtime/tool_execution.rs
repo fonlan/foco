@@ -20,7 +20,7 @@ use foco_store::config::{
 };
 use foco_store::workspace::{
     AgentInstanceRecord, AgentTaskRecord, NewAgentEvent, NewAgentInstance, NewAgentMessage,
-    NewAgentTask, NewAgentTaskDependency, WorkspaceDatabase,
+    NewAgentTask, RegisterAgentTaskWaitDependencies, WorkspaceDatabase,
 };
 use foco_tools::{
     AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
@@ -1865,42 +1865,36 @@ fn execute_agent_wait_tasks(
         dependencies.push(dependency_task);
     }
 
-    for dependency_task in &dependencies {
-        database
-            .insert_agent_task_dependency(NewAgentTaskDependency {
-                team_id,
-                waiting_task_id: current_task_id,
-                dependency_task_id: &dependency_task.id,
-                wait_mode: AgentTaskWaitMode::All,
-                pending_tool_call_id: Some(tool_call_id),
-                deadline_at: deadline_at.as_deref(),
-            })
-            .map_err(agent_store_error)?;
-    }
-    append_agent_tool_event(
-        &mut database,
-        team_id,
-        "task_waiting_requested",
-        Some(actor_instance_id),
-        Some(current_task_id),
-        None,
-        json!({
-            "pendingToolCallId": tool_call_id,
-            "dependencyTaskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
-            "mode": AgentTaskWaitMode::All.as_str(),
-            "deadlineAt": deadline_at,
-        }),
-    )?;
+    let dependency_task_ids: Vec<AgentTaskId> =
+        dependencies.iter().map(|task| task.id.clone()).collect();
+    // Full wait-round registration is atomic in the store (deps + task_waiting_requested).
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id,
+            waiting_task_id: current_task_id,
+            dependency_task_ids: &dependency_task_ids,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some(tool_call_id),
+            deadline_at: deadline_at.as_deref(),
+            event_instance_id: Some(actor_instance_id),
+        })
+        .map_err(agent_store_error)?;
     Ok(json!({
         "waiting": true,
         "taskId": current_task_id.to_string(),
         "mode": AgentTaskWaitMode::All.as_str(),
-        "taskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
+        "taskIds": dependency_task_ids
+            .iter()
+            .map(|task_id| task_id.to_string())
+            .collect::<Vec<_>>(),
         "deadlineAt": deadline_at,
         "suspend": {
             "kind": "agent_wait_tasks",
             "pendingToolCallId": tool_call_id,
-            "taskIds": dependencies.iter().map(|task| task.id.to_string()).collect::<Vec<_>>(),
+            "taskIds": dependency_task_ids
+                .iter()
+                .map(|task_id| task_id.to_string())
+                .collect::<Vec<_>>(),
             "mode": AgentTaskWaitMode::All.as_str(),
             "deadlineAt": deadline_at,
         }
