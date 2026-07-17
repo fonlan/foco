@@ -320,7 +320,9 @@ function ChatPanelComponent({
   const lastMessageScrollTopRef = useRef(0);
   const lastUpwardHistoryIntentAtRef = useRef(0);
   // True while a primary pointer is pressed on the list (scrollbar drag / touch).
-  // Cleared via pointer capture end events so release outside the element cannot stick.
+  // Cleared via element + window pointerup/cancel so release outside cannot stick.
+  // Do not setPointerCapture on the list: capture retargets click away from nested
+  // interactive UI (native <details>/<summary>, buttons, links).
   const pointerHistoryGestureActiveRef = useRef(false);
   const activeHistoryPointerIdRef = useRef<number | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
@@ -609,6 +611,19 @@ function ChatPanelComponent({
     setIsResizingComposer(true);
   }
 
+  useEffect(() => {
+    function handleWindowPointerEnd(event: PointerEvent) {
+      clearPointerHistoryGesture(event.pointerId);
+    }
+
+    window.addEventListener("pointerup", handleWindowPointerEnd);
+    window.addEventListener("pointercancel", handleWindowPointerEnd);
+    return () => {
+      window.removeEventListener("pointerup", handleWindowPointerEnd);
+      window.removeEventListener("pointercancel", handleWindowPointerEnd);
+    };
+  }, []);
+
   function requestMoreMessages() {
     if (!hasMoreMessagesBefore || isLoadingMoreMessages) {
       return;
@@ -724,13 +739,9 @@ function ChatPanelComponent({
     }
     pointerHistoryGestureActiveRef.current = true;
     activeHistoryPointerIdRef.current = event.pointerId;
-    // Capture so pointerup/cancel still fire when the pointer is released outside the list
-    // (common when dragging the scrollbar thumb or panning past the edge).
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // Some environments (jsdom) do not implement pointer capture.
-    }
+    // Window listeners clear the gesture when the pointer is released outside the list
+    // (scrollbar drag, pan past the edge). Avoid setPointerCapture so nested
+    // <details>/<summary>, buttons, and links keep receiving the full click sequence.
   }
 
   function handleMessageListPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {

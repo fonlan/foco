@@ -3051,12 +3051,10 @@ describe("app-shell verification surfaces", () => {
     expect(messageList).toBeInstanceOf(HTMLElement);
     const list = messageList as HTMLElement;
     let scrollTopValue = 0;
-    let capturedPointerId: number | null = null;
+    const setPointerCapture = vi.fn();
     Object.defineProperty(list, "setPointerCapture", {
       configurable: true,
-      value: vi.fn((pointerId: number) => {
-        capturedPointerId = pointerId;
-      }),
+      value: setPointerCapture,
     });
 
     Object.defineProperty(list, "clientHeight", {
@@ -3085,6 +3083,7 @@ describe("app-shell verification surfaces", () => {
     });
 
     // Pointer drag that decreases scrollTop near top loads history.
+    // Message list must not capture on pointerdown (preserves nested click targets).
     list.dispatchEvent(
       new PointerEvent("pointerdown", {
         bubbles: true,
@@ -3093,12 +3092,27 @@ describe("app-shell verification surfaces", () => {
         pointerType: "mouse",
       }),
     );
-    expect(capturedPointerId).toBe(7);
+    expect(setPointerCapture).not.toHaveBeenCalled();
     scrollTopValue = 10;
     list.dispatchEvent(new Event("scroll", { bubbles: true }));
     expect(await screen.findByText("Earlier note from pointer.")).toBeInTheDocument();
     expect(messageRequests).toHaveLength(2);
     expect(new URL(messageRequests[1]).searchParams.get("limit")).toBe("100");
+
+    // Release outside the list via window; gesture must clear so pure scroll does not reload.
+    window.dispatchEvent(
+      new PointerEvent("pointerup", {
+        bubbles: true,
+        pointerId: 7,
+        pointerType: "mouse",
+      }),
+    );
+    scrollTopValue = 5;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(2);
   });
 
   it("clears pointer history gesture on pointerup so later pure scrolls do not auto-load", async () => {
@@ -3168,7 +3182,7 @@ describe("app-shell verification surfaces", () => {
     scrollTopValue = 80;
     list.dispatchEvent(new Event("scroll", { bubbles: true }));
 
-    // Press, release outside (captured pointerup), then pure upward scroll must not load.
+    // Press, release outside via window (no list capture), then pure upward scroll must not load.
     list.dispatchEvent(
       new PointerEvent("pointerdown", {
         bubbles: true,
@@ -3177,7 +3191,7 @@ describe("app-shell verification surfaces", () => {
         pointerType: "mouse",
       }),
     );
-    list.dispatchEvent(
+    window.dispatchEvent(
       new PointerEvent("pointerup", {
         bubbles: true,
         pointerId: 9,
@@ -3199,6 +3213,97 @@ describe("app-shell verification surfaces", () => {
     expect(messageRequests).toHaveLength(2);
   });
 
+  it("clears pointer history gesture on window pointercancel after outside drag", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note after pointer cancel.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-pointer-cancel",
+      parts: [{ text: "Earlier note after pointer cancel.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(1);
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    scrollTopValue = 80;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    list.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerId: 11,
+        pointerType: "mouse",
+      }),
+    );
+    window.dispatchEvent(
+      new PointerEvent("pointercancel", {
+        bubbles: true,
+        pointerId: 11,
+        pointerType: "mouse",
+      }),
+    );
+    scrollTopValue = 10;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    list.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -30 }));
+    scrollTopValue = 5;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(await screen.findByText("Earlier note after pointer cancel.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(2);
+  });
+
   it("marks upward pointer intent before bottom-lock evaluation", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
@@ -3208,9 +3313,10 @@ describe("app-shell verification surfaces", () => {
     expect(messageList).toBeInstanceOf(HTMLElement);
     const list = messageList as HTMLElement;
     let scrollTopValue = 1600;
+    const setPointerCapture = vi.fn();
     Object.defineProperty(list, "setPointerCapture", {
       configurable: true,
-      value: vi.fn(),
+      value: setPointerCapture,
     });
 
     Object.defineProperty(list, "clientHeight", {
@@ -3245,6 +3351,7 @@ describe("app-shell verification surfaces", () => {
         pointerType: "mouse",
       }),
     );
+    expect(setPointerCapture).not.toHaveBeenCalled();
     scrollTopValue = 1200;
     list.dispatchEvent(new Event("scroll", { bubbles: true }));
     list.dispatchEvent(
@@ -3261,6 +3368,55 @@ describe("app-shell verification surfaces", () => {
     // on the next messages-driven layout effect; here we only assert the scroll
     // position itself was not rewritten by the scroll handler.
     expect(scrollTopValue).toBe(1100);
+  });
+
+  it("toggles native tool-call details and message actions without list pointer capture", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    const setPointerCapture = vi.fn();
+    Object.defineProperty(list, "setPointerCapture", {
+      configurable: true,
+      value: setPointerCapture,
+    });
+
+    const toolSummary = await screen.findByLabelText("Edit (edit_file)");
+    const toolDetails = toolSummary.closest("details");
+    expect(toolDetails).toBeInstanceOf(HTMLDetailsElement);
+    const details = toolDetails as HTMLDetailsElement;
+    expect(details.open).toBe(false);
+
+    await userEvent.click(toolSummary);
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(details.open).toBe(true);
+
+    await userEvent.click(within(details).getByRole("button", { name: "Raw" }));
+    expect(within(details).getByText("Input")).toBeInTheDocument();
+    expect(within(details).getByText("Output")).toBeInTheDocument();
+    expect(setPointerCapture).not.toHaveBeenCalled();
+
+    await userEvent.click(within(details).getByRole("button", { name: "Compact" }));
+    expect(within(details).queryByText("Input")).not.toBeInTheDocument();
+
+    await userEvent.click(toolSummary);
+    expect(details.open).toBe(false);
+
+    const assistantBubble = toolSummary.closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+    const copyButton = within(assistantBubble).getByRole("button", { name: "Copy message" });
+    await userEvent.click(copyButton);
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(
+      within(assistantBubble.closest(".message-row") as HTMLElement).getByRole("button", {
+        name: "Copied message",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("keeps open tabs for chats scrolled out of the recent 5-page window", async () => {
