@@ -21984,6 +21984,386 @@ mod tests {
         );
     }
 
+    /// Public main-process remote proxy path: POST chat/stream → drop body →
+    /// GET chat/runs/{runId}/stream?afterSequence=… returns 200 with the same run,
+    /// final persistence + broker audit id remain complete (not cancelled by drop).
+    #[tokio::test]
+    async fn remote_main_proxy_chat_stream_survives_sse_drop_and_reattaches() {
+        use futures_util::StreamExt;
+
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let sidecar_workspace = tempfile::tempdir().expect("sidecar workspace");
+        fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(sidecar_workspace.path()).expect("sidecar db");
+        database
+            .insert_chat_with_metadata("chat-proxy-1", "Proxy reconnect chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-proxy",
+                chat_id: "chat-proxy-1",
+                role: "user",
+                content: "hello via proxy",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-proxy",
+                            "assistantMessageId": "msg-assistant-proxy",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user");
+        drop(database);
+
+        let (sidecar_state, broker_rx) =
+            test_sidecar_state(sidecar_workspace.path().to_string_lossy().to_string(), 1);
+        let mut sidecar_state = sidecar_state;
+        sidecar_state.workspace_id = "remote".to_string();
+        sidecar_state.token = "sidecar-proxy-token".to_string();
+        let mut broker_rx =
+            test_sidecar_broker_with_tool_discovery(sidecar_state.clone(), broker_rx);
+
+        let sidecar_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind real sidecar router");
+        let sidecar_addr = sidecar_listener.local_addr().expect("sidecar addr");
+        let sidecar_app = Router::new()
+            .route(
+                "/api/remote/workspace/chat/stream",
+                post(remote_sidecar_chat_stream),
+            )
+            .route(
+                "/api/remote/workspace/chat/runs/{run_id}/stream",
+                get(remote_sidecar_chat_run_stream),
+            )
+            .route(
+                "/api/remote/workspace/chats",
+                get(remote_sidecar_workspace_chats),
+            )
+            .route(
+                "/api/remote/workspace/chats/{chat_id}/messages",
+                get(remote_sidecar_chat_messages),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                sidecar_state.clone(),
+                sidecar_bearer_auth,
+            ))
+            .with_state(sidecar_state.clone());
+        let sidecar_task = tokio::spawn(async move {
+            let _ = axum::serve(sidecar_listener, sidecar_app).await;
+        });
+
+        let mut config = remote_test_config(sidecar_workspace.path());
+        config.remote_servers.push(RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..RemoteServerProfile::default()
+        });
+        config.workspaces.clear();
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: PathBuf::new(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "srv".to_string(),
+                remote_path: "/srv/project".to_string(),
+            },
+            pinned: false,
+            terminal_shell: foco_store::config::DEFAULT_TERMINAL_SHELL.to_string(),
+            common_commands: Vec::new(),
+        });
+        let app_state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        app_state
+            .remote_workspace_manager
+            .insert_fake_session_for_test(
+                "srv",
+                "remote",
+                "/srv/project",
+                sidecar_addr.port(),
+                "sidecar-proxy-token",
+            );
+
+        let app_listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("bind main app");
+        let app_addr = app_listener.local_addr().expect("app addr");
+        let app = crate::http::router::app_router(app_state);
+        let app_task = tokio::spawn(async move {
+            let _ = axum::serve(app_listener, app).await;
+        });
+
+        let broker_state = sidecar_state.clone();
+        let (partial_sent_tx, partial_sent_rx) = oneshot::channel::<String>();
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let id = request.id.clone().expect("broker request id");
+            let pending = loop {
+                if let Some(pending) = broker_state.broker_pending.lock().await.get(&id).cloned() {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            };
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "proxy-partial ",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send partial");
+            let _ = partial_sent_tx.send(id.clone());
+            let _ = finish_rx.await;
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "proxy-done",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send rest");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 5, "outputTokens": 4 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send completion");
+        });
+
+        let client = reqwest::Client::new();
+        let initial = client
+            .post(format!(
+                "http://{app_addr}/api/workspaces/remote/chat/stream"
+            ))
+            .json(&json!({
+                "chatId": "chat-proxy-1",
+                "queuedUserMessageId": "msg-user-proxy",
+                "visibleAssistantMessageId": "msg-assistant-proxy",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            }))
+            .send()
+            .await
+            .expect("proxied POST chat/stream");
+        assert_eq!(
+            initial.status(),
+            StatusCode::OK,
+            "first stream through main proxy must be 200"
+        );
+        assert!(
+            initial
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("text/event-stream")),
+            "proxied response should be SSE"
+        );
+
+        // Hold the body so the proxy/sidecar subscription stays alive until drop.
+        let mut initial_stream = initial.bytes_stream();
+        let mut first_chunk = String::new();
+        let first = timeout(Duration::from_secs(3), initial_stream.next())
+            .await
+            .expect("first SSE chunk timeout")
+            .expect("first SSE chunk present")
+            .expect("first SSE bytes");
+        first_chunk.push_str(std::str::from_utf8(&first).expect("utf8 first chunk"));
+
+        let broker_request_id = timeout(Duration::from_secs(3), partial_sent_rx)
+            .await
+            .expect("partial sent")
+            .expect("broker id channel");
+        assert!(
+            broker_request_id.starts_with("broker-request-")
+                || !broker_request_id.starts_with("run-"),
+            "audit identity must be broker RPC id, got {broker_request_id}"
+        );
+
+        let run_id = wait_until(Duration::from_secs(3), || {
+            !sidecar_state
+                .active_runs
+                .lock()
+                .expect("active runs")
+                .is_empty()
+        })
+        .await;
+        assert!(run_id, "active run should register before disconnect");
+        let run_id = sidecar_state
+            .active_runs
+            .lock()
+            .expect("active runs")
+            .first()
+            .expect("run")
+            .run_id
+            .clone();
+        let after_sequence = sidecar_state
+            .active_run_streams
+            .lock()
+            .ok()
+            .and_then(|streams| streams.get(&run_id).map(|s| s.last_sequence()))
+            .unwrap_or(0);
+
+        // Drop the proxied SSE body (simulates browser refresh / tab unmount).
+        drop(initial_stream);
+
+        // Public reattach path must return 200 with the same runId, not 400.
+        let reattach = client
+            .get(format!(
+                "http://{app_addr}/api/workspaces/remote/chat/runs/{run_id}/stream?afterSequence={after_sequence}"
+            ))
+            .send()
+            .await
+            .expect("proxied GET reattach");
+        assert_eq!(
+            reattach.status(),
+            StatusCode::OK,
+            "reattach after proxy SSE drop must be 200, not active-run-not-found"
+        );
+
+        let reattach_body = reattach.bytes_stream();
+        let reattach_reader = tokio::spawn(async move {
+            let mut stream = reattach_body;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                bytes.extend_from_slice(&chunk.expect("reattach chunk"));
+            }
+            bytes
+        });
+
+        let _ = finish_tx.send(());
+        broker.await.expect("broker task");
+
+        let reattach_bytes = timeout(Duration::from_secs(5), reattach_reader)
+            .await
+            .expect("reattach finishes")
+            .expect("reattach join");
+        let reattach_text = String::from_utf8(reattach_bytes).expect("utf8 reattach");
+        assert!(
+            reattach_text.contains("proxy-done")
+                || reattach_text.contains("\"type\":\"complete\"")
+                || reattach_text.contains("\"type\":\"streamEnd\""),
+            "reattach should deliver remaining events: {reattach_text}"
+        );
+        // No sequence gaps: every event id is strictly increasing from after_sequence.
+        let mut last_id = after_sequence;
+        for line in reattach_text.lines() {
+            if let Some(id) = line.strip_prefix("id:") {
+                let id = id.trim().parse::<i64>().expect("sse id");
+                assert!(
+                    id > last_id,
+                    "reattach event ids must advance without gaps/dups: last={last_id} next={id}"
+                );
+                last_id = id;
+            }
+        }
+
+        let finished = wait_until(Duration::from_secs(3), || {
+            remote_sidecar_active_run_stream(&sidecar_state, &run_id).is_none()
+                && sidecar_state.active_run_count.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        assert!(
+            finished,
+            "run should clear from active registry after complete"
+        );
+
+        // Stale reattach after terminal cleanup still returns 400 (frontend reloads messages).
+        let stale = client
+            .get(format!(
+                "http://{app_addr}/api/workspaces/remote/chat/runs/{run_id}/stream?afterSequence=-1"
+            ))
+            .send()
+            .await
+            .expect("stale reattach");
+        assert_eq!(
+            stale.status(),
+            StatusCode::BAD_REQUEST,
+            "finished runs stay 400 so frontend stale-run branch reloads history"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create_critical(sidecar_workspace.path()).expect("db");
+        let assistant = database
+            .message("msg-assistant-proxy")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        assert!(
+            assistant.content.contains("proxy-partial") && assistant.content.contains("proxy-done"),
+            "full turn text must persist after proxy reconnect: {:?}",
+            assistant.content
+        );
+        let metadata: Value =
+            serde_json::from_str(&assistant.metadata_json).expect("assistant metadata");
+        let llm_ids = metadata["metrics"]["llmRequestIds"]
+            .as_array()
+            .expect("llmRequestIds");
+        assert_eq!(llm_ids.len(), 1);
+        assert_eq!(
+            llm_ids[0].as_str(),
+            Some(broker_request_id.as_str()),
+            "metrics.llmRequestIds must use broker RPC request id"
+        );
+        let user = database
+            .message("msg-user-proxy")
+            .expect("user lookup")
+            .expect("user");
+        let user_meta: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
+        assert!(
+            user_meta.get("queuedRun").is_none(),
+            "queuedRun cleared after normal finish"
+        );
+
+        let audit_rows = database
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-proxy-1"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("sidecar audit rows");
+        assert_eq!(audit_rows.len(), 1);
+        assert_eq!(audit_rows[0].id, broker_request_id);
+        assert_eq!(
+            audit_rows[0].final_state, "succeeded",
+            "SSE drop must not mark broker request cancelled"
+        );
+        assert_ne!(audit_rows[0].final_state, "cancelled");
+
+        sidecar_task.abort();
+        app_task.abort();
+        let _ = sidecar_task.await;
+        let _ = app_task.await;
+    }
+
     #[tokio::test]
     async fn remote_sidecar_explicit_cancel_stops_background_runner_and_emits_terminal_events() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
