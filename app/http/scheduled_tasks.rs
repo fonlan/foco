@@ -198,14 +198,12 @@ pub(crate) async fn scheduled_tasks(
     )> = Vec::new();
 
     for workspace in scheduled_task_workspaces(&config, query.workspace_id.as_deref())? {
-        let database = match open_scheduled_task_workspace_database(
-            workspace,
-            query.workspace_id.is_some(),
-        ) {
-            Ok(Some(database)) => database,
-            Ok(None) => continue,
-            Err(error) => return Err(error),
-        };
+        let database =
+            match open_scheduled_task_workspace_database(workspace, query.workspace_id.is_some()) {
+                Ok(Some(database)) => database,
+                Ok(None) => continue,
+                Err(error) => return Err(error),
+            };
         let workspace_search_matches = search
             .as_deref()
             .map(|search| scheduled_workspace_matches_search(workspace, search))

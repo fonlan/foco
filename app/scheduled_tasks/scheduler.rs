@@ -166,7 +166,8 @@ pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(),
             };
             let metadata = task_metadata(&task, &workspace.id)?;
             let (task_status, next_run_at) = next_task_state(&task.schedule_json, now)?;
-            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)? else {
+            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)?
+            else {
                 break;
             };
             let active_runs = database
@@ -293,7 +294,8 @@ async fn reconcile_scheduled_task_runs_for_config(
                 continue;
             }
 
-            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)? else {
+            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)?
+            else {
                 break;
             };
             mark_scheduled_run_failed_in_database(

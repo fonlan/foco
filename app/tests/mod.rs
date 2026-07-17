@@ -12623,7 +12623,9 @@ async fn scheduled_tasks_list_skips_missing_workspace_paths() {
     });
 
     let response = reqwest::Client::new()
-        .get(format!("http://{addr}/api/scheduled-tasks?page=1&pageSize=25"))
+        .get(format!(
+            "http://{addr}/api/scheduled-tasks?page=1&pageSize=25"
+        ))
         .send()
         .await
         .expect("scheduled tasks list request");
@@ -12657,7 +12659,8 @@ async fn scheduled_tasks_list_missing_workspace_path_filter_returns_error() {
         fs::remove_dir_all(&missing_workspace_dir).expect("remove pre-existing missing path");
     }
 
-    let mut config = prompt_test_config(env::temp_dir().join(unique_id("foco-scheduled-list-dummy")));
+    let mut config =
+        prompt_test_config(env::temp_dir().join(unique_id("foco-scheduled-list-dummy")));
     // Replace the auto-created workspace with a missing path so the filter target is stale.
     let missing_workspace_id = "workspace-missing-filter".to_string();
     config.workspaces = vec![WorkspaceConfig {
@@ -12776,7 +12779,9 @@ async fn scheduled_tasks_list_remote_workspace_filter_returns_error() {
 
     // Aggregate list still succeeds and ignores remote workspaces.
     let response = reqwest::Client::new()
-        .get(format!("http://{addr}/api/scheduled-tasks?page=1&pageSize=25"))
+        .get(format!(
+            "http://{addr}/api/scheduled-tasks?page=1&pageSize=25"
+        ))
         .send()
         .await
         .expect("scheduled tasks aggregate with remote sibling");
