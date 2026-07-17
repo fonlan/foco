@@ -25,8 +25,7 @@ use crate::{
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     parse_optional_line_range, read_line_range, relative_workspace_path, replace_line_range,
-    resolve_workspace_file, resolve_workspace_path, resolve_workspace_write_path,
-    run_command_with_timeout,
+    resolve_workspace_file, resolve_workspace_write_path, run_command_with_timeout,
 };
 
 pub(crate) fn read_file(
@@ -324,14 +323,79 @@ pub(crate) fn read_file_target_outside_workspace(
     }
 }
 
+/// Classify a `find_files` directory path: `Some(canonical)` when outside the execution root.
+pub(crate) fn find_files_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, ToolRuntimeError> {
+    match resolve_external_path(workspace_path, input) {
+        Ok(path) => {
+            let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata.is_dir() {
+                Ok(Some(path))
+            } else {
+                Err(ToolRuntimeError::NotDirectory(path))
+            }
+        }
+        Err(_) => resolve_internal_find_files_directory(workspace_path, input).map(|_| None),
+    }
+}
+
+/// Classify a `search_text` path (file or directory): `Some(canonical)` when outside the root.
+pub(crate) fn search_text_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, ToolRuntimeError> {
+    match resolve_external_path(workspace_path, input) {
+        Ok(path) => Ok(Some(path)),
+        Err(_) => resolve_internal_read_path(workspace_path, input).map(|_| None),
+    }
+}
+
+/// Absolute-path external target that is not under the execution workspace root.
+/// Shared by `read_file` (file-only wrappers) and find/search directory-or-file roots.
+fn resolve_external_path(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
+    resolve_external_read_file_path(workspace_path, input)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PathListMode {
+    /// Entry / match paths are workspace-relative (default internal behavior).
+    WorkspaceRelative,
+    /// Entry / match paths are canonical absolute paths under an external search root.
+    AbsoluteExternal,
+}
+
 pub(crate) fn find_files(
     workspace_path: &Path,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
+    find_files_inner(workspace_path, arguments, false)
+}
+
+pub(crate) fn find_files_with_external_access(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    find_files_inner(workspace_path, arguments, true)
+}
+
+fn find_files_inner(
+    workspace_path: &Path,
+    arguments: Value,
+    allow_external_access: bool,
+) -> Result<Value, ToolRuntimeError> {
     let request: FindFilesInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_FILE_TOOL_TIMEOUT_MS)?;
     let input_path = request.path;
-    let path = resolve_workspace_path(workspace_path, &input_path)?;
+    // find_files-only resolver: relative + absolute-in-execution-root are internal.
+    // Outside absolute directories require allow_external_access. Does not use
+    // normalize_workspace_path_text / resolve_workspace_path (write/command/graph stay relative-only).
+    let (path, list_mode) =
+        resolve_find_files_directory(workspace_path, &input_path, allow_external_access)?;
     let filter = GlobFilter::new(request.include, request.exclude)?;
     let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
         path: path.clone(),
@@ -342,8 +406,17 @@ pub(crate) fn find_files(
         return Err(ToolRuntimeError::NotDirectory(path));
     }
 
+    // Glob match/prune paths are always relative to the search root (`path`).
+    // Reported entry paths are workspace-relative (internal) or absolute (external).
     let mut entries = Vec::new();
-    find_files_in_directory(workspace_path, &path, &filter, &mut entries)?;
+    find_files_in_directory(
+        workspace_path,
+        &path,
+        &path,
+        &filter,
+        list_mode,
+        &mut entries,
+    )?;
 
     entries.sort_by(|left, right| {
         left.get("path")
@@ -390,12 +463,54 @@ pub(crate) fn find_files(
     Ok(response)
 }
 
+fn resolve_find_files_directory(
+    workspace_path: &Path,
+    input: &str,
+    allow_external_access: bool,
+) -> Result<(PathBuf, PathListMode), ToolRuntimeError> {
+    if allow_external_access {
+        resolve_find_files_directory_with_external(workspace_path, input)
+    } else {
+        resolve_internal_find_files_directory(workspace_path, input)
+            .map(|path| (path, PathListMode::WorkspaceRelative))
+    }
+}
+
+fn resolve_find_files_directory_with_external(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<(PathBuf, PathListMode), ToolRuntimeError> {
+    match resolve_internal_find_files_directory(workspace_path, input) {
+        Ok(path) => Ok((path, PathListMode::WorkspaceRelative)),
+        Err(_) => resolve_external_path(workspace_path, input)
+            .map(|path| (path, PathListMode::AbsoluteExternal)),
+    }
+}
+
+fn resolve_internal_find_files_directory(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<PathBuf, ToolRuntimeError> {
+    let path = resolve_internal_read_path(workspace_path, input)?;
+    let metadata = fs::metadata(&path).map_err(|source| ToolRuntimeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        Ok(path)
+    } else {
+        Err(ToolRuntimeError::NotDirectory(path))
+    }
+}
+
 const INTERNAL_FIND_FILES_EXCLUDE_PATTERNS: &[&str] = &[".foco", ".foco/**"];
 
 fn find_files_in_directory(
-    workspace_path: &Path,
+    report_root: &Path,
+    search_root: &Path,
     directory_path: &Path,
     filter: &GlobFilter,
+    list_mode: PathListMode,
     entries: &mut Vec<Value>,
 ) -> Result<(), ToolRuntimeError> {
     let mut directory_entries = fs::read_dir(directory_path)
@@ -415,7 +530,8 @@ fn find_files_in_directory(
             return Ok(());
         }
         let entry_path = entry.path();
-        let relative_path = relative_workspace_path(workspace_path, &entry_path)?;
+        // Glob include/exclude/prune always use paths relative to the search root.
+        let glob_relative_path = relative_path_under_root(search_root, &entry_path)?;
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(source) if source.kind() == io::ErrorKind::NotFound => continue,
@@ -427,7 +543,7 @@ fn find_files_in_directory(
             }
         };
 
-        if file_type.is_dir() && filter.prunes_directory(&relative_path) {
+        if file_type.is_dir() && filter.prunes_directory(&glob_relative_path) {
             continue;
         }
 
@@ -453,20 +569,47 @@ fn find_files_in_directory(
             "other"
         };
 
-        if filter.matches(&relative_path) {
+        if filter.matches(&glob_relative_path) {
+            let reported_path = match list_mode {
+                // Internal results stay workspace-relative even when search starts in a subdirectory.
+                PathListMode::WorkspaceRelative => {
+                    relative_path_under_root(report_root, &entry_path)?
+                }
+                PathListMode::AbsoluteExternal => absolute_path_string(&entry_path)?,
+            };
             entries.push(json!({
-                "path": relative_path,
+                "path": reported_path,
                 "kind": kind,
                 "bytes": file_bytes
             }));
         }
 
         if file_type.is_dir() {
-            find_files_in_directory(workspace_path, &entry_path, filter, entries)?;
+            find_files_in_directory(
+                report_root,
+                search_root,
+                &entry_path,
+                filter,
+                list_mode,
+                entries,
+            )?;
         }
     }
 
     Ok(())
+}
+
+fn relative_path_under_root(root: &Path, path: &Path) -> Result<String, ToolRuntimeError> {
+    // Same strip semantics as relative_workspace_path, but the root may be an external search dir.
+    relative_workspace_path(root, path)
+}
+
+fn absolute_path_string(path: &Path) -> Result<String, ToolRuntimeError> {
+    let canonical = fs::canonicalize(path).map_err(|source| ToolRuntimeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(canonical.to_string_lossy().replace('\\', "/"))
 }
 
 struct GlobFilter {
@@ -601,6 +744,23 @@ pub(crate) fn search_text(
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
 ) -> Result<Value, ToolRuntimeError> {
+    search_text_inner(workspace_path, arguments, cancellation_token, false)
+}
+
+pub(crate) fn search_text_with_external_access(
+    workspace_path: &Path,
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
+    search_text_inner(workspace_path, arguments, cancellation_token, true)
+}
+
+fn search_text_inner(
+    workspace_path: &Path,
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+    allow_external_access: bool,
+) -> Result<Value, ToolRuntimeError> {
     let request: SearchTextInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_SEARCH_TEXT_TIMEOUT_MS)?;
     let pattern = request.query.trim();
@@ -618,6 +778,8 @@ pub(crate) fn search_text(
 
     // Treat missing, null, empty, and whitespace-only continuation as a fresh search.
     // Only a non-empty token (after trim) enters the snapshot pagination path.
+    // Continuation pages do not re-check external authorization: the snapshot was created
+    // only after an authorized initial search and is stored under the execution workspace.
     if let Some(continuation) = request
         .continuation
         .as_deref()
@@ -639,6 +801,7 @@ pub(crate) fn search_text(
         input_path,
         timeout_ms,
         cancellation_token,
+        allow_external_access,
     )
 }
 
@@ -648,8 +811,12 @@ fn search_text_initial(
     input_path: &str,
     timeout_ms: u64,
     cancellation_token: Option<&ToolCancellationToken>,
+    allow_external_access: bool,
 ) -> Result<Value, ToolRuntimeError> {
-    let path = resolve_workspace_path(workspace_path, input_path)?;
+    // search_text-only resolver (file or directory). Outside absolute targets require
+    // allow_external_access and fail before running rg or writing a snapshot.
+    let (path, list_mode) =
+        resolve_search_text_path(workspace_path, input_path, allow_external_access)?;
     let rg_args = vec![
         "--json".to_string(),
         "--line-number".to_string(),
@@ -659,6 +826,8 @@ fn search_text_initial(
         path.to_string_lossy().to_string(),
     ];
     let rg_command = ripgrep_command();
+    // cwd stays the execution workspace so snapshots land under workspace .foco/search-results/
+    // even when searching an external path.
     let output = match run_command_with_timeout(
         &rg_command,
         &rg_args,
@@ -736,10 +905,15 @@ fn search_text_initial(
             .unwrap_or_default()
             .trim_end_matches(['\r', '\n'])
             .to_string();
-        let relative_path = relative_workspace_path(workspace_path, Path::new(absolute_path))?;
+        let reported_path = match list_mode {
+            PathListMode::WorkspaceRelative => {
+                relative_workspace_path(workspace_path, Path::new(absolute_path))?
+            }
+            PathListMode::AbsoluteExternal => absolute_path_string(Path::new(absolute_path))?,
+        };
 
         entries.push(SearchMatch {
-            path: relative_path,
+            path: reported_path,
             line: line_number,
             text,
         });
@@ -795,6 +969,7 @@ fn search_text_initial(
         }));
     }
 
+    // Snapshots always live under the execution workspace (not the external search root).
     let snapshot_id =
         write_search_snapshot_file(workspace_path, pattern, input_path, &entries, false)?;
     let full_result_path = search_snapshot_text_relative_path(&snapshot_id);
@@ -817,6 +992,23 @@ fn search_text_initial(
         "note": note,
         "timeoutMs": timeout_ms
     }))
+}
+
+fn resolve_search_text_path(
+    workspace_path: &Path,
+    input: &str,
+    allow_external_access: bool,
+) -> Result<(PathBuf, PathListMode), ToolRuntimeError> {
+    if allow_external_access {
+        match resolve_internal_read_path(workspace_path, input) {
+            Ok(path) => Ok((path, PathListMode::WorkspaceRelative)),
+            Err(_) => resolve_external_path(workspace_path, input)
+                .map(|path| (path, PathListMode::AbsoluteExternal)),
+        }
+    } else {
+        resolve_internal_read_path(workspace_path, input)
+            .map(|path| (path, PathListMode::WorkspaceRelative))
+    }
 }
 
 fn search_text_continue(
@@ -1471,6 +1663,192 @@ mod tests {
 
         assert!(paths.contains(&"package.json"));
         assert!(paths.iter().all(|path| !path.starts_with(".foco")));
+    }
+
+    #[test]
+    fn find_files_external_directory_reports_absolute_paths() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        fs::write(outside.path().join("remote.txt"), "x").expect("write");
+        let outside_abs = fs::canonicalize(outside.path()).expect("canon");
+
+        let denied = find_files(
+            workspace.path(),
+            json!({
+                "path": outside_abs.to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(denied.is_err());
+
+        let output = find_files_with_external_access(
+            workspace.path(),
+            json!({
+                "path": outside_abs.to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 10000
+            }),
+        )
+        .expect("authorized external find");
+        let entries = output["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        let path = entries[0]["path"].as_str().expect("path");
+        assert!(Path::new(path).is_absolute());
+        assert!(path.ends_with("remote.txt") || path.contains("remote.txt"));
+    }
+
+    #[test]
+    fn find_files_internal_subdirectory_globs_are_relative_to_search_root() {
+        let workspace = tempdir().expect("workspace");
+        let src = workspace.path().join("src");
+        fs::create_dir(&src).expect("create src");
+        fs::write(src.join("main.rs"), "fn main() {}").expect("write main");
+        fs::create_dir(src.join("node_modules")).expect("create node_modules");
+        fs::write(src.join("node_modules").join("pkg.js"), "x").expect("write pkg");
+        fs::write(workspace.path().join("root.rs"), "root").expect("write root");
+
+        let include_exact = find_files(
+            workspace.path(),
+            json!({
+                "path": "src",
+                "include": ["main.rs"],
+                "exclude": null,
+                "timeoutMs": 10000
+            }),
+        )
+        .expect("include exact under search root");
+        let include_paths = include_exact["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("path").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            include_paths,
+            vec!["src/main.rs".to_string()],
+            "include should match relative to path=src, report workspace-relative: {include_paths:?}"
+        );
+
+        let exclude_prune = find_files(
+            workspace.path(),
+            json!({
+                "path": "src",
+                "include": null,
+                "exclude": ["node_modules/**"],
+                "timeoutMs": 10000
+            }),
+        )
+        .expect("exclude prune under search root");
+        let exclude_paths = exclude_prune["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["path"].as_str().expect("path").to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            exclude_paths.contains(&"src/main.rs".to_string()),
+            "{exclude_paths:?}"
+        );
+        assert!(
+            exclude_paths
+                .iter()
+                .all(|path| !path.contains("node_modules")),
+            "node_modules/** relative to src must prune: {exclude_paths:?}"
+        );
+        assert!(
+            !exclude_paths.iter().any(|path| path == "root.rs"),
+            "search must stay under src: {exclude_paths:?}"
+        );
+    }
+
+    #[test]
+    fn search_text_external_snapshot_stays_in_workspace() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside");
+        // Many lines so soft budget may truncate and force a snapshot when combined with long paths.
+        let mut body = String::new();
+        for i in 0..200 {
+            body.push_str(&format!(
+                "snapshot-marker-{i} pad-pad-pad-pad-pad-pad-pad\n"
+            ));
+        }
+        let outside_file = outside.path().join("big.txt");
+        fs::write(&outside_file, body).expect("write");
+        let outside_dir_abs = fs::canonicalize(outside.path()).expect("canon dir");
+        let outside_file_abs = fs::canonicalize(&outside_file).expect("canon file");
+
+        // Directory target (existing coverage).
+        let denied = search_text(
+            workspace.path(),
+            json!({
+                "query": "snapshot-marker",
+                "path": outside_dir_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+            None,
+        );
+        assert!(denied.is_err());
+
+        let output = search_text_with_external_access(
+            workspace.path(),
+            json!({
+                "query": "snapshot-marker",
+                "path": outside_dir_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+            None,
+        )
+        .expect("authorized external search");
+        assert!(output["totalMatches"].as_u64().unwrap_or(0) >= 1);
+        let match_path = output["matches"][0]["path"].as_str().expect("match path");
+        assert!(Path::new(match_path).is_absolute());
+        if let Some(full) = output["fullResultPath"].as_str() {
+            assert!(full.contains("search-results"));
+            assert!(!full.starts_with(outside_dir_abs.to_string_lossy().as_ref()));
+            let snap = workspace.path().join(full.replace('\\', "/"));
+            assert!(
+                snap.exists(),
+                "snapshot under workspace: {}",
+                snap.display()
+            );
+        }
+
+        // File target is also valid (rg-compatible; not directory-only).
+        let file_output = search_text_with_external_access(
+            workspace.path(),
+            json!({
+                "query": "snapshot-marker",
+                "path": outside_file_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+            None,
+        )
+        .expect("authorized external file search");
+        assert!(file_output["totalMatches"].as_u64().unwrap_or(0) >= 1);
+        let file_match = file_output["matches"][0]["path"]
+            .as_str()
+            .expect("file match path");
+        assert!(
+            Path::new(file_match).is_absolute(),
+            "external file match.path must be absolute: {file_match}"
+        );
+        assert!(
+            file_match.ends_with("big.txt") || file_match.contains("big.txt"),
+            "{file_match}"
+        );
+        if let Some(full) = file_output["fullResultPath"].as_str() {
+            assert!(
+                full.starts_with(".foco/search-results/")
+                    || full.starts_with(".foco\\search-results\\"),
+                "file-search snapshot stays under execution workspace: {full}"
+            );
+        }
     }
 
     #[test]

@@ -52,7 +52,7 @@ fn read_file_definition() -> ToolDefinition {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative file path, or an absolute path. Absolute paths whose canonical target is inside the current execution workspace are read as ordinary internal files (no external authorization). Absolute paths outside the execution workspace require explicit external-read authorization (Skill roots, current-chat attachment allowlist, shared-workspace trust from an isolated worktree, chat allow-all, or user confirmation). Other path tools do not accept absolute paths."
+                    "description": "Workspace-relative file path, or an absolute path. Absolute paths whose canonical target is inside the current execution workspace are ordinary internal reads (no external authorization). Absolute paths outside the execution workspace require user confirmation or another external-read grant (Skill roots, current-chat attachment allowlist, shared-workspace trust from an isolated worktree, chat allow-all). Only read_file, find_files, and search_text support authorized external paths; write_file, edit_file, run_command, and graph tools do not accept absolute paths outside the execution root."
                 },
                 "startLine": {
                     "type": ["integer", "null"],
@@ -76,24 +76,24 @@ fn read_file_definition() -> ToolDefinition {
 fn find_files_definition() -> ToolDefinition {
     ToolDefinition {
         name: FIND_FILES_TOOL,
-        description: "Find files and directories under a workspace-relative directory using optional glob include/exclude patterns. Results are sorted by path. Responses keep whole entry records under the shared soft output budget (50 KiB or 2,000 lines); when truncated, refine include/exclude or path rather than expecting silent mid-record cuts.",
+        description: "Find files and directories under a directory using optional glob include/exclude patterns. Results are sorted by path. Responses keep whole entry records under the shared soft output budget (50 KiB or 2,000 lines); when truncated, refine include/exclude or path rather than expecting silent mid-record cuts. Workspace-relative and execution-workspace absolute directories are internal; paths outside the execution workspace require the same user-confirmed external-read grant as read_file. Internal entry paths stay workspace-relative; external entry paths are absolute so they can be passed to read_file.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative directory path to search recursively. Use . for the workspace root."
+                    "description": "Directory to search recursively. Use . for the execution workspace root. Accepts workspace-relative paths, absolute paths inside the execution workspace (no external authorization), or absolute paths outside the execution workspace after user confirmation / external-read grant. Graph, write_file, edit_file, and run_command still do not accept absolute paths outside the execution root. Include/exclude globs match paths relative to the search root."
                 },
                 "include": {
                     "type": ["array", "null"],
                     "items": { "type": "string" },
-                    "description": "Optional glob patterns matched against returned workspace-relative paths. Null or an empty array includes everything not excluded."
+                    "description": "Optional glob patterns matched against paths relative to the search root. Null or an empty array includes everything not excluded. Internal results report workspace-relative paths; external results report absolute paths."
                 },
                 "exclude": {
                     "type": ["array", "null"],
                     "items": { "type": "string" },
-                    "description": "Optional glob patterns matched against returned workspace-relative paths to omit."
+                    "description": "Optional glob patterns matched against paths relative to the search root to omit."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -319,7 +319,7 @@ fn graph_explore_definition() -> ToolDefinition {
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
-        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. Large result sets return a stable small preview under the shared soft limits (50 KiB or 2,000 lines), with totalMatches/returnedMatches, an opaque continuation token (snapshot id + next offset), and fullResultPath pointing at the same snapshot under .foco/search-results/. Pass the same query/path plus a non-empty continuation to page further without re-running the search; expired/pruned/mismatched continuations fail with a stable invalid/expired error. Missing, null, empty, or whitespace-only continuation always starts a fresh search. Complete dumps still require ranged read_file when large. When ripgrep output hits the command collection ceiling the tool fails with incomplete/refine guidance rather than inventing a full total.",
+        description: "Search text under a path with ripgrep/rg and return matching lines. The query uses rg pattern syntax. Large result sets return a stable small preview under the shared soft limits (50 KiB or 2,000 lines), with totalMatches/returnedMatches, an opaque continuation token (snapshot id + next offset), and fullResultPath under the execution workspace .foco/search-results/ (never under an external search root). Pass the same query/path plus a non-empty continuation to page further without re-running the search; expired/pruned/mismatched continuations fail with a stable invalid/expired error. Missing, null, empty, or whitespace-only continuation always starts a fresh search. Complete dumps still require ranged read_file when large. When ripgrep output hits the command collection ceiling the tool fails with incomplete/refine guidance rather than inventing a full total. Paths outside the execution workspace require the same user-confirmed external-read grant as read_file; internal match.path stays workspace-relative and external match.path is absolute for read_file reuse.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -330,7 +330,7 @@ fn search_text_definition() -> ToolDefinition {
                 },
                 "path": {
                     "type": "string",
-                    "description": "Workspace-relative path to search. Use . for the workspace root. Must match the original path when using continuation."
+                    "description": "File or directory to search. Use . for the execution workspace root. Accepts workspace-relative paths, absolute paths inside the execution workspace (no external authorization), or absolute paths outside the execution workspace after user confirmation / external-read grant. Must match the original path when using continuation. Graph, write_file, edit_file, and run_command still do not accept absolute paths outside the execution root. Snapshots always write under the execution workspace .foco/search-results/."
                 },
                 "continuation": {
                     "type": ["string", "null"],

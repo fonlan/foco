@@ -27,7 +27,8 @@ use foco_tools::{
     AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
     AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, BuiltinToolContext, RUN_COMMAND_TOOL, SLEEP_TOOL,
     ToolCancellationToken, ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
-    execute_builtin_tool_with_context_and_options, read_file_target_outside_workspace,
+    execute_builtin_tool_with_context_and_options, find_files_target_outside_workspace,
+    read_file_target_outside_workspace, search_text_target_outside_workspace,
 };
 use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
@@ -3216,20 +3217,20 @@ fn matching_option_value(question: &QuestionItem, answer: &str) -> Option<String
         .map(|option| option.value.clone())
 }
 
-static READ_FILE_EXTERNAL_ACCESS_CHATS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-static READ_FILE_EXTERNAL_ACCESS_PROMPT_LOCKS: OnceLock<
+static EXTERNAL_READONLY_ACCESS_CHATS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static EXTERNAL_READONLY_ACCESS_PROMPT_LOCKS: OnceLock<
     Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = OnceLock::new();
 
-fn read_file_external_access_chats() -> &'static Mutex<HashSet<String>> {
-    READ_FILE_EXTERNAL_ACCESS_CHATS.get_or_init(|| Mutex::new(HashSet::new()))
+fn external_readonly_access_chats() -> &'static Mutex<HashSet<String>> {
+    EXTERNAL_READONLY_ACCESS_CHATS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn read_file_external_access_prompt_lock(chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-    let locks = READ_FILE_EXTERNAL_ACCESS_PROMPT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+fn external_readonly_access_prompt_lock(chat_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let locks = EXTERNAL_READONLY_ACCESS_PROMPT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks
         .lock()
-        .expect("external read access prompt lock table");
+        .expect("external readonly access prompt lock table");
 
     // ponytail: one lock per chat is tiny for process lifetime; add cleanup if chat churn becomes large.
     locks
@@ -3238,28 +3239,86 @@ fn read_file_external_access_prompt_lock(chat_id: &str) -> Arc<tokio::sync::Mute
         .clone()
 }
 
-fn chat_allows_external_read_file(chat_id: &str) -> bool {
-    read_file_external_access_chats()
+fn chat_allows_external_readonly(chat_id: &str) -> bool {
+    external_readonly_access_chats()
         .lock()
-        .expect("external read access lock")
+        .expect("external readonly access lock")
         .contains(chat_id)
 }
 
-fn allow_external_read_file_for_chat(chat_id: &str) {
+fn allow_external_readonly_for_chat(chat_id: &str) {
     // ponytail: process memory is enough for this session-scoped grant; persist per-chat auth if it must survive restarts.
-    read_file_external_access_chats()
+    external_readonly_access_chats()
         .lock()
-        .expect("external read access lock")
+        .expect("external readonly access lock")
         .insert(chat_id.to_string());
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadFileExternalAccessDecision {
+enum ExternalReadonlyAccessDecision {
     AllowOnce,
     AllowAll,
     Deny,
 }
 
+/// Target kind shown in confirmation copy (file vs directory vs path).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalReadonlyTargetKind {
+    File,
+    Directory,
+    Path,
+}
+
+fn is_external_readonly_access_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        READ_FILE_TOOL | FIND_FILES_TOOL | SEARCH_TEXT_TOOL
+    )
+}
+
+/// Classify whether `arguments.path` is outside the execution workspace for a
+/// restricted readonly tool. Returns `None` for internal paths (no prompt).
+fn classify_external_readonly_target(
+    tool_name: &str,
+    tool_workspace_path: &Path,
+    path: &str,
+) -> Result<Option<(PathBuf, ExternalReadonlyTargetKind)>, String> {
+    match tool_name {
+        READ_FILE_TOOL => Ok(
+            read_file_target_outside_workspace(tool_workspace_path, path)?
+                .map(|target| (target, ExternalReadonlyTargetKind::File)),
+        ),
+        FIND_FILES_TOOL => Ok(
+            find_files_target_outside_workspace(tool_workspace_path, path)?
+                .map(|target| (target, ExternalReadonlyTargetKind::Directory)),
+        ),
+        SEARCH_TEXT_TOOL => Ok(
+            search_text_target_outside_workspace(tool_workspace_path, path)?
+                .map(|target| (target, ExternalReadonlyTargetKind::Path)),
+        ),
+        _ => Ok(None),
+    }
+}
+
+fn external_readonly_target_label(kind: ExternalReadonlyTargetKind) -> &'static str {
+    match kind {
+        ExternalReadonlyTargetKind::File => "文件",
+        ExternalReadonlyTargetKind::Directory => "目录",
+        ExternalReadonlyTargetKind::Path => "路径",
+    }
+}
+
+/// Restricted readonly external-path authorization for `read_file`, `find_files`,
+/// and `search_text` only. Other tools always get `Ok(false)` (no external grant).
+///
+/// Contract summary (see also `docs/readonly-tools-external-path-contract.md`):
+/// - `search_text.path` may be a file or directory (rg); not directory-only.
+/// - External match/entry paths are absolute; internal remain workspace-relative.
+/// - `search_text` snapshots / `fullResultPath` always live under execution workspace
+///   `.foco/search-results/` (never the external root); reading `fullResultPath` is
+///   an ordinary internal `read_file` and needs no external grant.
+/// - Non-empty continuation skips external re-auth here; tool layer binds query/path.
+/// - Graph / write / edit / run never receive this grant; chat `allow_all` is readonly-only.
 async fn ensure_read_file_external_access(
     global_config: &GlobalConfig,
     skill_read_root_dirs: &[PathBuf],
@@ -3275,22 +3334,36 @@ async fn ensure_read_file_external_access(
     arguments: &Value,
     cancellation_token: ToolCancellationToken,
 ) -> Result<bool, String> {
-    // Tool audit: among built-in path tools only `read_file` has ask-before-external-read.
-    // find_files / search_text / graph_* stay on execution-root resolvers; write_file /
-    // edit_file / run_command never receive this auto-grant. Todo/Plan/Spec use the shared
-    // workspace database path via `builtin_tool_uses_workspace_database`, not this helper.
-    // Future external-read tools must reuse shared vs execution-root classification here
-    // rather than inventing a second trust flag.
-    if tool_name != READ_FILE_TOOL {
+    // Tool audit: only read_file / find_files / search_text participate in
+    // ask-before-external-readonly. graph_* stay on execution-root resolvers;
+    // write_file / edit_file / run_command never receive this auto-grant.
+    // Todo/Plan/Spec use the shared workspace database path via
+    // `builtin_tool_uses_workspace_database`, not this helper.
+    if !is_external_readonly_access_tool(tool_name) {
+        return Ok(false);
+    }
+
+    // search_text continuation pages only read an execution-workspace snapshot that was
+    // written after an authorized initial search. Do not re-prompt or re-check external path
+    // grants; keep allow_external_read_access=false so the tool layer takes the snapshot path.
+    if tool_name == SEARCH_TEXT_TOOL
+        && arguments
+            .get("continuation")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|token| !token.is_empty())
+    {
         return Ok(false);
     }
 
     let path = arguments
         .get("path")
         .and_then(Value::as_str)
-        .ok_or_else(|| "read_file requires string path".to_string())?;
+        .ok_or_else(|| format!("{tool_name} requires string path"))?;
     // External-read mode is relative to the execution root (worktree when isolated).
-    let Some(target_path) = read_file_target_outside_workspace(tool_workspace_path, path)? else {
+    let Some((target_path, target_kind)) =
+        classify_external_readonly_target(tool_name, tool_workspace_path, path)?
+    else {
         return Ok(false);
     };
 
@@ -3302,7 +3375,7 @@ async fn ensure_read_file_external_access(
     }
 
     // Prefer the run-scoped Skill snapshot from prompt assembly so routing-table
-    // visibility and read_file grants stay identical for shared + isolated worktrees.
+    // visibility and readonly grants stay identical for shared + isolated worktrees.
     // Global / other non-shared skill roots still use this path.
     if path_is_within_skill_read_roots(&target_path, skill_read_root_dirs)
         || read_file_target_is_configured_skill(global_config, workspace_id, &target_path)
@@ -3311,39 +3384,46 @@ async fn ensure_read_file_external_access(
     }
 
     // Exact chat attachment path grants (not parent dirs / siblings / lookalikes).
-    if path_is_exact_attachment_allowlist_match(&target_path, attachment_read_allowlist) {
+    // Attachment allowlist authorizes only read_file on the file itself — never
+    // find_files / search_text on a parent directory or sibling path.
+    if tool_name == READ_FILE_TOOL
+        && path_is_exact_attachment_allowlist_match(&target_path, attachment_read_allowlist)
+    {
         return Ok(true);
     }
 
-    if chat_allows_external_read_file(chat_id) {
+    if chat_allows_external_readonly(chat_id) {
         return Ok(true);
     }
 
-    let prompt_lock = read_file_external_access_prompt_lock(chat_id);
+    let prompt_lock = external_readonly_access_prompt_lock(chat_id);
     let _prompt_guard = prompt_lock.lock().await;
 
-    if chat_allows_external_read_file(chat_id) {
+    if chat_allows_external_readonly(chat_id) {
         return Ok(true);
     }
 
-    match ask_read_file_external_access(
+    match ask_external_readonly_access(
         question_registry,
         question_event_tx,
         workspace_id,
         chat_id,
         tool_call_id,
+        tool_name,
+        target_kind,
         &target_path,
         cancellation_token,
     )
     .await?
     {
-        ReadFileExternalAccessDecision::AllowOnce => Ok(true),
-        ReadFileExternalAccessDecision::AllowAll => {
-            allow_external_read_file_for_chat(chat_id);
+        ExternalReadonlyAccessDecision::AllowOnce => Ok(true),
+        ExternalReadonlyAccessDecision::AllowAll => {
+            allow_external_readonly_for_chat(chat_id);
             Ok(true)
         }
-        ReadFileExternalAccessDecision::Deny => Err(format!(
-            "user denied read_file access to workspace-external file: {}",
+        ExternalReadonlyAccessDecision::Deny => Err(format!(
+            "user denied {tool_name} access to workspace-external {}: {}",
+            external_readonly_target_label(target_kind),
             target_path.display()
         )),
     }
@@ -3380,16 +3460,19 @@ fn read_file_target_is_configured_skill(
     path_is_within_skill_read_roots(target_path, &roots)
 }
 
-async fn ask_read_file_external_access(
+async fn ask_external_readonly_access(
     question_registry: QuestionRegistry,
     question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
     workspace_id: &str,
     chat_id: &str,
     tool_call_id: &str,
+    tool_name: &str,
+    target_kind: ExternalReadonlyTargetKind,
     target_path: &Path,
     cancellation_token: ToolCancellationToken,
-) -> Result<ReadFileExternalAccessDecision, String> {
-    let request_id = unique_id("read-file-external-question");
+) -> Result<ExternalReadonlyAccessDecision, String> {
+    let target_label = external_readonly_target_label(target_kind);
+    let request_id = unique_id("external-readonly-question");
     let request = QuestionRequest {
         id: request_id.clone(),
         tool_call_id: tool_call_id.to_string(),
@@ -3398,26 +3481,27 @@ async fn ask_read_file_external_access(
         questions: vec![QuestionItem {
             id: format!("{request_id}-item-1"),
             question: format!(
-                "read_file 想要读取 workspace 外的文件:\n{}",
+                "{tool_name} 想要访问 workspace 外的{target_label}:\n{}",
                 target_path.display()
             ),
             options: vec![
                 QuestionOption {
                     label: "允许".to_string(),
                     value: "allow".to_string(),
-                    description: Some("仅允许本次读取。".to_string()),
+                    description: Some(format!("仅允许本次 {tool_name} 访问。")),
                 },
                 QuestionOption {
                     label: "全部允许".to_string(),
                     value: "allow_all".to_string(),
                     description: Some(
-                        "允许当前聊天会话内所有 workspace 外 read_file 读取。".to_string(),
+                        "允许当前聊天会话内所有 workspace 外的 read_file / find_files / search_text 只读访问。"
+                            .to_string(),
                     ),
                 },
                 QuestionOption {
                     label: "拒绝".to_string(),
                     value: "deny".to_string(),
-                    description: Some("阻止本次读取。".to_string()),
+                    description: Some(format!("阻止本次 {tool_name} 访问。")),
                 },
             ],
             allow_free_text: false,
@@ -3429,7 +3513,7 @@ async fn ask_read_file_external_access(
 
     if question_event_tx.send(request.clone()).is_err() {
         return Err(format!(
-            "failed to show read_file external access question '{}' because the chat stream is closed",
+            "failed to show {tool_name} external access question '{}' because the chat stream is closed",
             request.id
         ));
     }
@@ -3441,24 +3525,25 @@ async fn ask_read_file_external_access(
         Some(Ok(answer)) => answer,
         Some(Err(_)) => {
             return Err(format!(
-                "read_file external access question '{}' was cancelled before the user answered",
+                "{tool_name} external access question '{}' was cancelled before the user answered",
                 request.id
             ));
         }
         None => {
             return Err(format!(
-                "read_file external access question '{}' was cancelled because the chat run was cancelled",
+                "{tool_name} external access question '{}' was cancelled because the chat run was cancelled",
                 request.id
             ));
         }
     };
 
-    read_file_external_access_decision_from_answer(&answer)
+    external_readonly_access_decision_from_answer(tool_name, &answer)
 }
 
-fn read_file_external_access_decision_from_answer(
+fn external_readonly_access_decision_from_answer(
+    tool_name: &str,
     answer: &QuestionAnswer,
-) -> Result<ReadFileExternalAccessDecision, String> {
+) -> Result<ExternalReadonlyAccessDecision, String> {
     let selected = answer
         .answers
         .first()
@@ -3466,11 +3551,11 @@ fn read_file_external_access_decision_from_answer(
         .unwrap_or_default();
 
     match selected {
-        "allow" => Ok(ReadFileExternalAccessDecision::AllowOnce),
-        "allow_all" => Ok(ReadFileExternalAccessDecision::AllowAll),
-        "deny" => Ok(ReadFileExternalAccessDecision::Deny),
+        "allow" => Ok(ExternalReadonlyAccessDecision::AllowOnce),
+        "allow_all" => Ok(ExternalReadonlyAccessDecision::AllowAll),
+        "deny" => Ok(ExternalReadonlyAccessDecision::Deny),
         other => Err(format!(
-            "read_file external access question returned unknown option: {other}"
+            "{tool_name} external access question returned unknown option: {other}"
         )),
     }
 }
@@ -4115,30 +4200,34 @@ mod tests {
         };
 
         assert_eq!(
-            read_file_external_access_decision_from_answer(&answer("allow"))
+            external_readonly_access_decision_from_answer(READ_FILE_TOOL, &answer("allow"))
                 .expect("allow decision"),
-            ReadFileExternalAccessDecision::AllowOnce
+            ExternalReadonlyAccessDecision::AllowOnce
         );
         assert_eq!(
-            read_file_external_access_decision_from_answer(&answer("allow_all"))
+            external_readonly_access_decision_from_answer(FIND_FILES_TOOL, &answer("allow_all"))
                 .expect("allow all decision"),
-            ReadFileExternalAccessDecision::AllowAll
+            ExternalReadonlyAccessDecision::AllowAll
         );
         assert_eq!(
-            read_file_external_access_decision_from_answer(&answer("deny")).expect("deny decision"),
-            ReadFileExternalAccessDecision::Deny
+            external_readonly_access_decision_from_answer(SEARCH_TEXT_TOOL, &answer("deny"))
+                .expect("deny decision"),
+            ExternalReadonlyAccessDecision::Deny
         );
-        assert!(read_file_external_access_decision_from_answer(&answer("other")).is_err());
+        assert!(
+            external_readonly_access_decision_from_answer(READ_FILE_TOOL, &answer("other"))
+                .is_err()
+        );
     }
 
     #[test]
     fn tracks_read_file_external_access_by_chat() {
         let chat_id = format!("chat-external-access-test-{}", unique_id("case"));
 
-        assert!(!chat_allows_external_read_file(&chat_id));
-        allow_external_read_file_for_chat(&chat_id);
-        assert!(chat_allows_external_read_file(&chat_id));
-        assert!(!chat_allows_external_read_file(
+        assert!(!chat_allows_external_readonly(&chat_id));
+        allow_external_readonly_for_chat(&chat_id);
+        assert!(chat_allows_external_readonly(&chat_id));
+        assert!(!chat_allows_external_readonly(
             "chat-external-access-test-other"
         ));
     }
@@ -4369,7 +4458,7 @@ mod tests {
         assert!(
             denied
                 .expect_err("symlink escape must not auto-allow as internal")
-                .contains("user denied read_file access")
+                .contains("user denied")
         );
     }
 
@@ -4926,11 +5015,7 @@ mod tests {
                     .question
                     .contains(&path.display().to_string())
             );
-            assert!(
-                denied
-                    .expect_err("must prompt")
-                    .contains("user denied read_file access")
-            );
+            assert!(denied.expect_err("must prompt").contains("user denied"));
         }
 
         #[cfg(unix)]
@@ -4972,30 +5057,28 @@ mod tests {
             assert!(
                 denied
                     .expect_err("escape symlink must not auto-allow")
-                    .contains("user denied read_file access")
+                    .contains("user denied")
             );
         }
     }
 
-    /// Audit fixture: only `read_file` participates in external-read confirmation.
-    /// Other path tools always get `allow_external_read_access=false` from this helper.
+    /// Audit fixture: only the three restricted readonly tools participate in
+    /// external-path confirmation. write/edit/run/graph/todo/spec never get a grant.
     #[tokio::test]
-    async fn only_read_file_tool_enables_external_read_access_helper() {
+    async fn only_readonly_path_tools_enable_external_read_access_helper() {
         let workspace = tempfile::tempdir().expect("shared workspace");
         let outside = tempfile::NamedTempFile::new().expect("outside file");
         fs::write(outside.path(), "secret").expect("write outside");
         let config = GlobalConfig::first_run(workspace.path().to_path_buf());
         let registry = QuestionRegistry::default();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let chat_id = format!("chat-audit-only-read-file-{}", unique_id("case"));
+        let chat_id = format!("chat-audit-only-readonly-{}", unique_id("case"));
         let path = outside.path().to_string_lossy().to_string();
         let arguments = json!({ "path": path, "startLine": null, "endLine": null });
 
         for tool_name in [
             WRITE_FILE_TOOL,
             EDIT_FILE_TOOL,
-            FIND_FILES_TOOL,
-            SEARCH_TEXT_TOOL,
             RUN_COMMAND_TOOL,
             GRAPH_EXPLORE_TOOL,
             CREATE_TODO_GRAPH_TOOL,
@@ -5017,7 +5100,7 @@ mod tests {
                 ToolCancellationToken::default(),
             )
             .await
-            .expect("non-read_file tools short-circuit");
+            .expect("non-readonly tools short-circuit");
             assert!(
                 !allowed,
                 "{tool_name} must not receive external-read auto-grant"
@@ -5113,7 +5196,7 @@ mod tests {
         assert!(
             denied
                 .expect_err("lookalike must prompt")
-                .contains("user denied read_file access")
+                .contains("user denied")
         );
 
         // Absolute path with `..` that lands outside shared after canonicalize still prompts.
@@ -5154,7 +5237,7 @@ mod tests {
         assert!(
             denied
                 .expect_err(".. escape must not auto-allow")
-                .contains("user denied read_file access")
+                .contains("user denied")
         );
     }
 
@@ -5340,7 +5423,11 @@ mod tests {
         );
         assert!(run_escape.is_error, "{:?}", run_escape.output);
 
-        let find_escape = execute_builtin_tool_with_context_and_options(
+        // find_files may list an absolute shared path only when the app grants
+        // allow_external_read_access (same flag as read_file). Without the grant
+        // it stays execution-root-relative. With the grant it must not affect
+        // write isolation of shared content.
+        let find_without_grant = execute_builtin_tool_with_context_and_options(
             &worktree_dir,
             BuiltinToolContext::for_chat(Some(&chat_id)),
             FIND_FILES_TOOL,
@@ -5352,9 +5439,33 @@ mod tests {
             }),
             None,
             None,
+            false,
+        );
+        assert!(
+            find_without_grant.is_error,
+            "find_files without external grant must not escape: {:?}",
+            find_without_grant.output
+        );
+
+        let find_with_grant = execute_builtin_tool_with_context_and_options(
+            &worktree_dir,
+            BuiltinToolContext::for_chat(Some(&chat_id)),
+            FIND_FILES_TOOL,
+            json!({
+                "path": workspace.path().to_string_lossy(),
+                "include": ["protected.txt"],
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+            None,
+            None,
             true,
         );
-        assert!(find_escape.is_error, "{:?}", find_escape.output);
+        assert!(
+            !find_with_grant.is_error,
+            "find_files with external grant may list shared: {:?}",
+            find_with_grant.output
+        );
 
         assert_eq!(
             fs::read_to_string(&shared_file).expect("read shared after attempts"),
@@ -5591,7 +5702,7 @@ mod tests {
             assert!(
                 denied
                     .expect_err("external path should prompt and deny")
-                    .contains("user denied read_file access"),
+                    .contains("user denied"),
                 "{call_id} should be denied after ask_question"
             );
         }
@@ -5752,7 +5863,7 @@ mod tests {
             assert!(
                 denied
                     .expect_err("external path should prompt and deny")
-                    .contains("user denied read_file access")
+                    .contains("user denied")
             );
         }
     }
@@ -5835,7 +5946,7 @@ mod tests {
             access
         );
         let error = denied.expect_err("deny should block access");
-        assert!(error.contains("user denied read_file access"));
+        assert!(error.contains("user denied"));
 
         let result = execute_builtin_tool_with_context_and_options(
             workspace.path(),
@@ -6010,7 +6121,880 @@ mod tests {
         assert!(first_allowed.expect("first concurrent access"));
         assert!(second_allowed.expect("second concurrent access"));
         assert!(third_allowed.expect("third concurrent access"));
-        assert!(chat_allows_external_read_file(&chat_id));
+        assert!(chat_allows_external_readonly(&chat_id));
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    /// find_files / search_text share the same confirmation flow as read_file.
+    #[tokio::test]
+    async fn find_files_and_search_text_external_access_prompt_and_deny() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        fs::write(outside_dir.path().join("hit.txt"), "needle-outside").expect("write outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-find-search-deny-{}", unique_id("case"));
+        let outside_path = outside_dir.path().to_string_lossy().to_string();
+        let find_arguments = json!({
+            "path": outside_path,
+            "include": null,
+            "exclude": null,
+            "timeoutMs": 5000
+        });
+
+        let find_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-find",
+            FIND_FILES_TOOL,
+            &find_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (find_request, find_denied) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+            find_access
+        );
+        assert!(find_request.questions[0].question.contains(FIND_FILES_TOOL));
+        assert!(
+            find_request.questions[0]
+                .question
+                .contains(&outside_dir.path().display().to_string())
+        );
+        let find_error = find_denied.expect_err("deny find_files");
+        assert!(find_error.contains("user denied"));
+        assert!(find_error.contains(FIND_FILES_TOOL));
+
+        let search_chat = format!("{chat_id}-search");
+        let search_arguments = json!({
+            "query": "needle",
+            "path": outside_path,
+            "continuation": null,
+            "timeoutMs": 5000
+        });
+        let search_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &search_chat,
+            "call-search",
+            SEARCH_TEXT_TOOL,
+            &search_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (search_request, search_denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            search_access
+        );
+        assert!(
+            search_request.questions[0]
+                .question
+                .contains(SEARCH_TEXT_TOOL)
+        );
+        let search_error = search_denied.expect_err("deny search_text");
+        assert!(search_error.contains("user denied"));
+        assert!(search_error.contains(SEARCH_TEXT_TOOL));
+    }
+
+    /// allow_all on one readonly tool skips confirmation for the other two in the same chat.
+    #[tokio::test]
+    async fn external_readonly_allow_all_covers_read_find_search() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        let outside_file = outside_dir.path().join("note.txt");
+        fs::write(&outside_file, "shared-grant-body").expect("write outside");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-allow-all-three-{}", unique_id("case"));
+        let outside_dir_path = outside_dir.path().to_string_lossy().to_string();
+        let first_arguments = json!({
+            "path": outside_dir_path,
+            "include": null,
+            "exclude": null
+        });
+
+        let first = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-1",
+            FIND_FILES_TOOL,
+            &first_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (_, allowed) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "allow_all"),
+            first
+        );
+        assert!(allowed.expect("allow_all find_files"));
+
+        for (tool_name, arguments) in [
+            (
+                READ_FILE_TOOL,
+                json!({
+                    "path": outside_file.to_string_lossy(),
+                    "startLine": null,
+                    "endLine": null
+                }),
+            ),
+            (
+                SEARCH_TEXT_TOOL,
+                json!({
+                    "query": "shared-grant",
+                    "path": outside_dir.path().to_string_lossy(),
+                    "continuation": null
+                }),
+            ),
+            (
+                FIND_FILES_TOOL,
+                json!({
+                    "path": outside_dir.path().to_string_lossy(),
+                    "include": null,
+                    "exclude": null
+                }),
+            ),
+        ] {
+            let second = ensure_read_file_external_access(
+                &config,
+                &[],
+                &[],
+                registry.clone(),
+                event_tx.clone(),
+                "workspace-1",
+                workspace.path(),
+                workspace.path(),
+                &chat_id,
+                "call-followup",
+                tool_name,
+                &arguments,
+                ToolCancellationToken::default(),
+            )
+            .await
+            .expect("follow-up should skip question");
+            assert!(second, "{tool_name} should be covered by allow_all");
+            assert!(
+                event_rx.try_recv().is_err(),
+                "{tool_name} must not re-prompt after allow_all"
+            );
+        }
+
+        // Different chat does not inherit allow_all.
+        let other_chat = format!("{chat_id}-other");
+        let other_arguments = json!({
+            "query": "shared-grant",
+            "path": outside_dir_path,
+            "continuation": null
+        });
+        let other_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &[],
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &other_chat,
+            "call-other",
+            SEARCH_TEXT_TOOL,
+            &other_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (_, other_denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            other_access
+        );
+        assert!(
+            other_denied
+                .expect_err("other chat must re-prompt")
+                .contains("user denied")
+        );
+    }
+
+    /// Attachment exact allowlist never authorizes find_files/search_text on a parent dir.
+    #[tokio::test]
+    async fn attachment_allowlist_does_not_grant_find_or_search_on_parent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        let attachment = outside_dir.path().join("attach.txt");
+        fs::write(&attachment, "attach-body").expect("write attachment");
+        let attachment_canonical = fs::canonicalize(&attachment).expect("canonicalize");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-attach-no-dir-{}", unique_id("case"));
+        let allowlist = vec![attachment_canonical];
+        let attachment_path = attachment.to_string_lossy().to_string();
+        let parent_path = outside_dir.path().to_string_lossy().to_string();
+        let read_arguments = json!({
+            "path": attachment_path,
+            "startLine": null,
+            "endLine": null
+        });
+        let find_arguments = json!({
+            "path": parent_path,
+            "include": null,
+            "exclude": null
+        });
+        let search_arguments = json!({
+            "query": "attach",
+            "path": parent_path,
+            "continuation": null
+        });
+
+        // read_file exact hit still auto-allows.
+        let read_allowed = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-read",
+            READ_FILE_TOOL,
+            &read_arguments,
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("attachment read");
+        assert!(read_allowed);
+        assert!(event_rx.try_recv().is_err());
+
+        // find_files on the parent directory must still prompt (not attachment-granted).
+        let find_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx.clone(),
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-find",
+            FIND_FILES_TOOL,
+            &find_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (_, find_denied) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "deny"),
+            find_access
+        );
+        assert!(
+            find_denied
+                .expect_err("attachment must not grant find_files parent")
+                .contains("user denied")
+        );
+
+        // search_text on the same parent also prompts.
+        let search_access = ensure_read_file_external_access(
+            &config,
+            &[],
+            &allowlist,
+            registry.clone(),
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-search",
+            SEARCH_TEXT_TOOL,
+            &search_arguments,
+            ToolCancellationToken::default(),
+        );
+        let (_, search_denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            search_access
+        );
+        assert!(
+            search_denied
+                .expect_err("attachment must not grant search_text parent")
+                .contains("user denied")
+        );
+    }
+
+    /// Full execute_tool: external find_files prompts; allow once lists absolute paths;
+    /// deny produces zero traversal success. Shared-root absolute path from worktree
+    /// skips the question (same trust as read_file).
+    #[tokio::test]
+    async fn execute_tool_find_files_external_and_shared_workspace() {
+        let workspace = tempfile::tempdir().expect("shared workspace");
+        let worktree_dir = workspace
+            .path()
+            .join(".foco")
+            .join("agent-worktrees")
+            .join("find-wt");
+        fs::create_dir_all(&worktree_dir).expect("nested worktree");
+        fs::write(workspace.path().join("shared-list.txt"), "shared").expect("shared file");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        fs::write(outside_dir.path().join("ext.txt"), "ext").expect("outside file");
+
+        let chat_id = format!("chat-execute-find-{}", unique_id("case"));
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let hook_config = HookConfig::default();
+        let web_search_settings = WebSearchSettings::default();
+        let shared_path = workspace.path().to_string_lossy().to_string();
+        let outside_path = outside_dir.path().to_string_lossy().to_string();
+
+        // Shared absolute path from isolated worktree: no question.
+        let shared_list = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry.clone()),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx.clone(),
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-find-shared".to_string(),
+                tool_call_id: "call-find-shared".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            &worktree_dir,
+            &chat_id,
+            None,
+            "run-find-shared",
+            "model-1",
+            "provider-1",
+            0,
+            "call-find-shared",
+            FIND_FILES_TOOL,
+            json!({
+                "path": shared_path,
+                "include": ["shared-list.txt"],
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        )
+        .await;
+        assert!(
+            !shared_list.execution.is_error,
+            "{:?}",
+            shared_list.execution.output
+        );
+        assert!(
+            event_rx.try_recv().is_err(),
+            "shared find_files must not emit questionRequest"
+        );
+
+        // True external: prompt then allow.
+        let outside_chat = format!("{chat_id}-outside");
+        let external_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry.clone()),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx.clone(),
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: outside_chat.clone(),
+                run_id: "run-find-ext".to_string(),
+                tool_call_id: "call-find-ext".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            &worktree_dir,
+            &outside_chat,
+            None,
+            "run-find-ext",
+            "model-1",
+            "provider-1",
+            0,
+            "call-find-ext",
+            FIND_FILES_TOOL,
+            json!({
+                "path": outside_path,
+                "include": ["ext.txt"],
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        let (request, external_output) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "allow"),
+            external_future
+        );
+        assert!(request.questions[0].question.contains(FIND_FILES_TOOL));
+        assert!(
+            !external_output.execution.is_error,
+            "{:?}",
+            external_output.execution.output
+        );
+        let entries = external_output.execution.output["entries"]
+            .as_array()
+            .expect("entries");
+        assert!(
+            entries.iter().any(|entry| {
+                entry["path"]
+                    .as_str()
+                    .is_some_and(|p| Path::new(p).is_absolute() && p.ends_with("ext.txt"))
+            }),
+            "external find_files should return absolute paths: {:?}",
+            external_output.execution.output
+        );
+
+        // Deny: error, no success listing.
+        let deny_chat = format!("{chat_id}-deny");
+        let deny_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: deny_chat.clone(),
+                run_id: "run-find-deny".to_string(),
+                tool_call_id: "call-find-deny".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            &worktree_dir,
+            &deny_chat,
+            None,
+            "run-find-deny",
+            "model-1",
+            "provider-1",
+            0,
+            "call-find-deny",
+            FIND_FILES_TOOL,
+            json!({
+                "path": outside_path,
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        let (_, denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            deny_future
+        );
+        assert!(denied.execution.is_error);
+        assert!(
+            denied.execution.output["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("user denied")),
+            "{:?}",
+            denied.execution.output
+        );
+    }
+
+    /// Full execute_tool: external search_text prompts; allow once matches with absolute
+    /// paths; deny has no snapshot under execution workspace; continuation stays local.
+    #[tokio::test]
+    async fn execute_tool_search_text_external_allow_and_deny() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        fs::write(
+            outside_dir.path().join("hit.txt"),
+            "unique-search-token-xyz",
+        )
+        .expect("write");
+        let chat_id = format!("chat-execute-search-{}", unique_id("case"));
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let hook_config = HookConfig::default();
+        let web_search_settings = WebSearchSettings::default();
+        let outside_path = outside_dir.path().to_string_lossy().to_string();
+
+        let allow_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry.clone()),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx.clone(),
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-search-allow".to_string(),
+                tool_call_id: "call-search-allow".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            None,
+            "run-search-allow",
+            "model-1",
+            "provider-1",
+            0,
+            "call-search-allow",
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "unique-search-token-xyz",
+                "path": outside_path,
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        let (request, allowed) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "allow"),
+            allow_future
+        );
+        assert!(request.questions[0].question.contains(SEARCH_TEXT_TOOL));
+        assert!(
+            !allowed.execution.is_error,
+            "{:?}",
+            allowed.execution.output
+        );
+        if let Some(full) = allowed.execution.output["fullResultPath"].as_str() {
+            assert!(
+                full.contains(".foco/search-results") || full.contains(".foco\\search-results"),
+                "snapshot must stay under execution workspace: {full}"
+            );
+        }
+
+        let deny_chat = format!("{chat_id}-deny");
+        let before_snapshots = list_search_result_snapshot_count(workspace.path());
+        let deny_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: deny_chat.clone(),
+                run_id: "run-search-deny".to_string(),
+                tool_call_id: "call-search-deny".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &deny_chat,
+            None,
+            "run-search-deny",
+            "model-1",
+            "provider-1",
+            0,
+            "call-search-deny",
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "unique-search-token-xyz",
+                "path": outside_path,
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        let (_, denied) = tokio::join!(
+            answer_next_external_read_question(registry, &mut event_rx, "deny"),
+            deny_future
+        );
+        assert!(denied.execution.is_error);
+        assert_eq!(
+            list_search_result_snapshot_count(workspace.path()),
+            before_snapshots,
+            "denied search_text must not create a new snapshot"
+        );
+    }
+
+    /// Allow-once external search_text then continue from snapshot without a second prompt.
+    #[tokio::test]
+    async fn execute_tool_search_text_external_continuation_skips_second_prompt() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside_dir = tempfile::tempdir().expect("outside dir");
+        // Enough long matches that soft budget forces a multi-page snapshot.
+        let total = 400;
+        let mut content = String::new();
+        for index in 0..total {
+            content.push_str(&format!("needle {index} {}\n", "x".repeat(200)));
+        }
+        fs::write(outside_dir.path().join("big.txt"), content).expect("write big");
+        let chat_id = format!("chat-execute-search-cont-{}", unique_id("case"));
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mcp_registry = Arc::new(McpRegistry::default());
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let hook_config = HookConfig::default();
+        let web_search_settings = WebSearchSettings::default();
+        let outside_path = outside_dir.path().to_string_lossy().to_string();
+
+        let initial_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry.clone()),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry.clone(),
+            event_tx.clone(),
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-search-cont-1".to_string(),
+                tool_call_id: "call-search-cont-1".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            None,
+            "run-search-cont-1",
+            "model-1",
+            "provider-1",
+            0,
+            "call-search-cont-1",
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "needle",
+                "path": outside_path,
+                "continuation": null,
+                "timeoutMs": 15000
+            }),
+        );
+        let (request, initial) = tokio::join!(
+            answer_next_external_read_question(registry.clone(), &mut event_rx, "allow"),
+            initial_future
+        );
+        assert!(request.questions[0].question.contains(SEARCH_TEXT_TOOL));
+        assert!(
+            !initial.execution.is_error,
+            "{:?}",
+            initial.execution.output
+        );
+        assert_eq!(
+            initial.execution.output["truncated"], true,
+            "expected soft-truncated first page for continuation test: {:?}",
+            initial.execution.output
+        );
+        let continuation = initial.execution.output["continuation"]
+            .as_str()
+            .expect("continuation token")
+            .to_string();
+        assert!(!continuation.trim().is_empty());
+        if let Some(full) = initial.execution.output["fullResultPath"].as_str() {
+            assert!(
+                full.contains(".foco/search-results") || full.contains(".foco\\search-results"),
+                "snapshot must stay under execution workspace: {full}"
+            );
+        }
+
+        // Second page: must not emit another questionRequest (allow-once already used).
+        let continue_future = execute_tool(
+            mcp_registry.clone(),
+            HookRuntime::new(mcp_registry),
+            &hook_config,
+            true,
+            &config,
+            None,
+            &web_search_settings,
+            registry,
+            event_tx,
+            MemoryToolContext {
+                enabled: false,
+                workspace_path: workspace.path().to_path_buf(),
+                global_memory_database_file: workspace.path().join("memory.sqlite"),
+                chat_id: chat_id.clone(),
+                run_id: "run-search-cont-2".to_string(),
+                tool_call_id: "call-search-cont-2".to_string(),
+                target_status: MemoryStatus::Pending,
+                memory_settings: MemorySettings::default(),
+            },
+            None,
+            Vec::new(),
+            Vec::new(),
+            ToolResourceLockRegistry::default(),
+            ToolCancellationToken::default(),
+            mpsc::unbounded_channel().0,
+            "assistant-1",
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            None,
+            "run-search-cont-2",
+            "model-1",
+            "provider-1",
+            0,
+            "call-search-cont-2",
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "needle",
+                "path": outside_path,
+                "continuation": continuation,
+                "timeoutMs": 15000
+            }),
+        );
+        let page = continue_future.await;
+        assert!(
+            !page.execution.is_error,
+            "continuation must not re-prompt or fail after allow once: {:?}",
+            page.execution.output
+        );
+        assert!(
+            page.execution.output["matches"]
+                .as_array()
+                .is_some_and(|matches| !matches.is_empty()),
+            "{:?}",
+            page.execution.output
+        );
+        // No second question should have been queued for this chat.
+        assert!(
+            event_rx.try_recv().is_err(),
+            "continuation must not emit a second external-access question"
+        );
+    }
+
+    fn list_search_result_snapshot_count(workspace_path: &Path) -> usize {
+        let dir = workspace_path.join(".foco").join("search-results");
+        if !dir.exists() {
+            return 0;
+        }
+        fs::read_dir(&dir)
+            .map(|entries| entries.filter_map(Result::ok).count())
+            .unwrap_or(0)
+    }
+
+    /// Skill read roots auto-allow find_files / search_text the same as read_file.
+    #[tokio::test]
+    async fn find_files_external_access_skips_question_for_skill_root() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let skill_root = tempfile::tempdir().expect("skill root");
+        fs::write(skill_root.path().join("SKILL.md"), "skill").expect("write skill");
+        let config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        let registry = QuestionRegistry::default();
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let chat_id = format!("chat-skill-find-{}", unique_id("case"));
+        let skill_roots = vec![fs::canonicalize(skill_root.path()).expect("canonicalize skill")];
+        let skill_path = skill_root.path().to_string_lossy().to_string();
+        let skill_arguments = json!({
+            "path": skill_path,
+            "include": null,
+            "exclude": null
+        });
+
+        let allowed = ensure_read_file_external_access(
+            &config,
+            &skill_roots,
+            &[],
+            registry,
+            event_tx,
+            "workspace-1",
+            workspace.path(),
+            workspace.path(),
+            &chat_id,
+            "call-skill-find",
+            FIND_FILES_TOOL,
+            &skill_arguments,
+            ToolCancellationToken::default(),
+        )
+        .await
+        .expect("skill find_files");
+        assert!(allowed);
         assert!(event_rx.try_recv().is_err());
     }
 

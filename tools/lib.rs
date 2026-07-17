@@ -369,6 +369,22 @@ pub fn read_file_target_outside_workspace(
         .map_err(|error| error.to_string())
 }
 
+pub fn find_files_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, String> {
+    file_tools::find_files_target_outside_workspace(workspace_path, input)
+        .map_err(|error| error.to_string())
+}
+
+pub fn search_text_target_outside_workspace(
+    workspace_path: &Path,
+    input: &str,
+) -> Result<Option<PathBuf>, String> {
+    file_tools::search_text_target_outside_workspace(workspace_path, input)
+        .map_err(|error| error.to_string())
+}
+
 fn execute_builtin_tool_inner(
     workspace_path: &Path,
     context: BuiltinToolContext<'_>,
@@ -376,11 +392,10 @@ fn execute_builtin_tool_inner(
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
     output_sink: Option<&dyn ToolOutputSink>,
-    // Audit (2026-07): only `read_file` has an ask-before-external-read flow. This flag must
-    // never gate write/edit/run/find/search/graph path resolution — those stay on the
-    // execution-root resolvers (`resolve_workspace_path` / `resolve_workspace_write_path`).
-    // Shared-workspace auto-trust for Plan worktrees lives in app
-    // `ensure_read_file_external_access`, not in these resolvers.
+    // Supported read-only tools only: `read_file` / `find_files` / `search_text` may parse
+    // absolute paths outside the execution root when this flag is true (after app-layer
+    // authorization). write/edit/run/graph never consume it and stay on execution-root resolvers.
+    // Shared-workspace auto-trust for Plan worktrees lives in app authorization helpers, not here.
     allow_external_read_access: bool,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
@@ -388,6 +403,9 @@ fn execute_builtin_tool_inner(
             file_tools::read_file_with_external_access(workspace_path, arguments)
         }
         READ_FILE_TOOL => file_tools::read_file(workspace_path, arguments),
+        FIND_FILES_TOOL if allow_external_read_access => {
+            file_tools::find_files_with_external_access(workspace_path, arguments)
+        }
         FIND_FILES_TOOL => file_tools::find_files(workspace_path, arguments),
         GRAPH_FIND_SYMBOLS_TOOL => graph_tools::graph_find_symbols(workspace_path, arguments),
         GRAPH_FIND_CALLERS_TOOL => graph_tools::graph_find_callers(workspace_path, arguments),
@@ -395,6 +413,13 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_REFERENCES_TOOL => graph_tools::graph_find_references(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_tools::graph_related_files(workspace_path, arguments),
         GRAPH_EXPLORE_TOOL => graph_tools::graph_explore(workspace_path, arguments),
+        SEARCH_TEXT_TOOL if allow_external_read_access => {
+            file_tools::search_text_with_external_access(
+                workspace_path,
+                arguments,
+                cancellation_token,
+            )
+        }
         SEARCH_TEXT_TOOL => file_tools::search_text(workspace_path, arguments, cancellation_token),
         WEB_SEARCH_TOOL | WEB_FETCH_TOOL | IMAGE_GEN_TOOL => {
             Err(ToolRuntimeError::InvalidArguments(format!(
@@ -698,9 +723,9 @@ pub(crate) fn resolve_workspace_path(
     workspace_path: &Path,
     input: &str,
 ) -> Result<PathBuf, ToolRuntimeError> {
-    // Execution-root boundary only. Do not auto-trust a separate shared workspace root here:
-    // write_file / edit_file / find_files / search_text / run_command / graph source reads all
-    // share this resolver. Shared-root read trust is read_file-only via allow_external_read_access.
+    // Execution-root boundary only for tools that still use this resolver (write/edit/run/graph).
+    // read_file / find_files / search_text use dedicated internal/external resolvers when authorized.
+    // Do not auto-trust a separate shared workspace root here.
     let trimmed = normalize_workspace_path_text(input)?;
     let requested = Path::new(&trimmed);
 
@@ -1808,9 +1833,10 @@ mod tests {
             "path schema should still document relative paths: {path_description}"
         );
         assert!(
-            path_description.contains("Other path tools")
+            path_description.contains("write_file")
+                || path_description.contains("graph")
                 || path_description.contains("do not accept absolute"),
-            "path schema must not imply other tools accept absolute paths: {path_description}"
+            "path schema must not imply write/graph tools accept absolute external paths: {path_description}"
         );
         let start_description = definition.input_schema["properties"]["startLine"]["description"]
             .as_str()
@@ -3244,9 +3270,9 @@ mod tests {
         );
     }
 
-    /// Path-tool isolation under a nested worktree execution root: absolute shared paths and
-    /// parent escapes stay rejected even when `allow_external_read_access` is true. That flag is
-    /// read_file-only and must never become a write/search grant.
+    /// Path-tool isolation under a nested worktree execution root: write/edit absolute shared
+    /// paths and parent escapes stay rejected even when `allow_external_read_access` is true.
+    /// That flag only enables authorized external roots for read_file / find_files / search_text.
     #[test]
     fn nested_worktree_path_tools_stay_on_execution_root_despite_external_read_flag() {
         let shared = tempfile::tempdir().expect("shared");
@@ -3292,6 +3318,20 @@ mod tests {
         );
         assert!(edit.is_error, "{:?}", edit.output);
 
+        // Without the grant, absolute paths outside the execution root stay rejected.
+        let find_denied = execute_builtin_tool(
+            &worktree,
+            FIND_FILES_TOOL,
+            json!({
+                "path": shared.path().to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        assert!(find_denied.is_error, "{:?}", find_denied.output);
+
+        // With the grant, find_files may list the authorized external directory (absolute entry paths).
         let find = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
             &worktree,
             Some("chat-path-isolation"),
@@ -3306,7 +3346,17 @@ mod tests {
             None,
             true,
         );
-        assert!(find.is_error, "{:?}", find.output);
+        assert!(!find.is_error, "{:?}", find.output);
+        let entries = find.output["entries"].as_array().expect("entries");
+        assert!(
+            entries.iter().any(|entry| {
+                entry["path"].as_str().is_some_and(|path| {
+                    path.contains("secret.txt") && Path::new(path).is_absolute()
+                })
+            }),
+            "external find_files should report absolute entry paths: {:?}",
+            find.output
+        );
 
         let parent_write =
             execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
@@ -3338,6 +3388,601 @@ mod tests {
         );
         assert!(!local_read.is_error, "{:?}", local_read.output);
         assert_eq!(local_read.output["content"], "1\tlocal");
+    }
+
+    #[test]
+    fn find_files_internal_absolute_path_does_not_need_external_flag() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("a.txt"), "a").expect("write a");
+        let absolute = fs::canonicalize(workspace.path()).expect("canonicalize workspace");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            FIND_FILES_TOOL,
+            json!({
+                "path": absolute.to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        let entries = result.output["entries"].as_array().expect("entries");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["path"].as_str() == Some("a.txt")),
+            "internal absolute directory should still report workspace-relative paths: {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn find_files_external_requires_flag_and_returns_absolute_paths() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("ext.txt"), "ext").expect("write ext");
+        let outside_abs = fs::canonicalize(outside.path()).expect("canonicalize outside");
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            FIND_FILES_TOOL,
+            json!({
+                "path": outside_abs.to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        assert!(denied.is_error, "{:?}", denied.output);
+
+        let allowed = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some("chat-find-external"),
+            FIND_FILES_TOOL,
+            json!({
+                "path": outside_abs.to_string_lossy(),
+                "include": ["**/*.txt"],
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!allowed.is_error, "{:?}", allowed.output);
+        let entries = allowed.output["entries"].as_array().expect("entries");
+        assert_eq!(entries.len(), 1);
+        let path = entries[0]["path"].as_str().expect("path");
+        assert!(Path::new(path).is_absolute(), "{path}");
+        assert!(
+            path.ends_with("ext.txt") || path.contains("ext.txt"),
+            "{path}"
+        );
+    }
+
+    #[test]
+    fn search_text_external_requires_flag_absolute_matches_and_workspace_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("hit.txt"), "unique-token-xyz\n").expect("write hit");
+        let outside_abs = fs::canonicalize(outside.path()).expect("canonicalize outside");
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "unique-token-xyz",
+                "path": outside_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(denied.is_error, "{:?}", denied.output);
+        assert!(
+            !workspace
+                .path()
+                .join(".foco")
+                .join("search-results")
+                .exists()
+                || fs::read_dir(workspace.path().join(".foco").join("search-results"))
+                    .map(|dir| dir.count() == 0)
+                    .unwrap_or(true),
+            "denied external search must not create snapshots"
+        );
+
+        let allowed = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some("chat-search-external"),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "unique-token-xyz",
+                "path": outside_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!allowed.is_error, "{:?}", allowed.output);
+        let matches = allowed.output["matches"].as_array().expect("matches");
+        assert_eq!(matches.len(), 1);
+        let match_path = matches[0]["path"].as_str().expect("match path");
+        assert!(Path::new(match_path).is_absolute(), "{match_path}");
+        assert!(
+            match_path.ends_with("hit.txt") || match_path.contains("hit.txt"),
+            "{match_path}"
+        );
+
+        // If a snapshot is present (truncated), fullResultPath must be under the execution workspace.
+        if let Some(full) = allowed.output["fullResultPath"].as_str() {
+            assert!(
+                full.starts_with(".foco/search-results/")
+                    || full.starts_with(".foco\\search-results\\"),
+                "snapshot must stay in execution workspace: {full}"
+            );
+            assert!(
+                workspace.path().join(full).exists() || {
+                    // path may use forward slashes
+                    workspace.path().join(full.replace('\\', "/")).exists()
+                },
+                "fullResultPath should resolve under workspace: {full}"
+            );
+        }
+    }
+
+    #[test]
+    fn search_text_internal_match_paths_remain_workspace_relative() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("src.txt"), "internal-token-abc\n").expect("write");
+        let absolute = fs::canonicalize(workspace.path().join("src.txt")).expect("canon");
+
+        let relative = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "internal-token-abc",
+                "path": ".",
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(!relative.is_error, "{:?}", relative.output);
+        assert_eq!(
+            relative.output["matches"][0]["path"].as_str(),
+            Some("src.txt")
+        );
+
+        let abs_internal = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "internal-token-abc",
+                "path": absolute.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(!abs_internal.is_error, "{:?}", abs_internal.output);
+        assert_eq!(
+            abs_internal.output["matches"][0]["path"].as_str(),
+            Some("src.txt")
+        );
+    }
+
+    /// External search may paginate without re-checking the external-read flag: the snapshot
+    /// lives under the execution workspace and was created only after an authorized initial search.
+    #[test]
+    fn search_text_external_continuation_pages_without_external_flag() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let total = 400;
+        let mut content = String::new();
+        for index in 0..total {
+            content.push_str(&format!("ext-needle {index} {}\n", "y".repeat(200)));
+        }
+        fs::write(outside.path().join("big-ext.txt"), content).expect("write big");
+        let outside_abs = fs::canonicalize(outside.path()).expect("canon outside");
+
+        let first = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some("chat-search-ext-page"),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "ext-needle",
+                "path": outside_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 15000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["truncated"], true);
+        let continuation = first.output["continuation"]
+            .as_str()
+            .expect("continuation for truncated external search");
+        let full_path = first.output["fullResultPath"]
+            .as_str()
+            .expect("fullResultPath");
+        assert!(
+            full_path.starts_with(".foco/search-results/")
+                || full_path.starts_with(".foco\\search-results\\"),
+            "snapshot under execution workspace: {full_path}"
+        );
+        let match_path = first.output["matches"][0]["path"]
+            .as_str()
+            .expect("match path");
+        assert!(
+            Path::new(match_path).is_absolute(),
+            "external matches stay absolute: {match_path}"
+        );
+
+        // Continuation must not re-run rg against the external root, so no external flag is required.
+        let page_two = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "ext-needle",
+                "path": outside_abs.to_string_lossy(),
+                "continuation": continuation,
+                "timeoutMs": 15000
+            }),
+        );
+        assert!(!page_two.is_error, "{:?}", page_two.output);
+        assert_eq!(
+            page_two.output["totalMatches"].as_u64().expect("total"),
+            total as u64
+        );
+        let page_two_matches = page_two.output["matches"].as_array().expect("matches");
+        assert!(!page_two_matches.is_empty());
+        let first_page_first = first.output["matches"][0]["text"]
+            .as_str()
+            .expect("first page first");
+        let second_page_first = page_two_matches[0]["text"].as_str().expect("second");
+        assert_ne!(first_page_first, second_page_first);
+
+        // Query/path binding still applies on external continuation pages.
+        let mismatch = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "other-query",
+                "path": outside_abs.to_string_lossy(),
+                "continuation": continuation,
+                "timeoutMs": 15000
+            }),
+        );
+        assert!(mismatch.is_error, "{:?}", mismatch.output);
+        let error = mismatch
+            .output
+            .get("error")
+            .and_then(Value::as_str)
+            .expect("error");
+        assert!(
+            error.contains("continuation") && error.contains("invalid"),
+            "{error}"
+        );
+
+        // Empty / blank continuation restarts a search and still requires the external grant.
+        for continuation_value in [json!(""), json!("   ")] {
+            let restarted = execute_builtin_tool(
+                workspace.path(),
+                SEARCH_TEXT_TOOL,
+                json!({
+                    "query": "ext-needle",
+                    "path": outside_abs.to_string_lossy(),
+                    "continuation": continuation_value,
+                    "timeoutMs": 15000
+                }),
+            );
+            assert!(
+                restarted.is_error,
+                "blank continuation without external flag must fail: {:?}",
+                restarted.output
+            );
+        }
+
+        // fullResultPath is workspace-relative; reading the snapshot never needs external grant.
+        let snap_read = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": full_path,
+                "startLine": 1,
+                "endLine": 5,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(
+            !snap_read.is_error,
+            "fullResultPath must be readable without external grant: {:?}",
+            snap_read.output
+        );
+        assert!(
+            snap_read.output["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("ext-needle")),
+            "{:?}",
+            snap_read.output
+        );
+    }
+
+    /// search_text.path accepts a single file (rg-compatible), not only directories.
+    #[test]
+    fn search_text_external_file_path_absolute_match_and_workspace_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        let total = 350;
+        let mut content = String::new();
+        for index in 0..total {
+            content.push_str(&format!("file-needle {index} {}\n", "z".repeat(180)));
+        }
+        let outside_file = outside.path().join("only-file.txt");
+        fs::write(&outside_file, content).expect("write outside file");
+        let outside_file_abs = fs::canonicalize(&outside_file).expect("canon file");
+
+        let denied = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "file-needle",
+                "path": outside_file_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 15000
+            }),
+        );
+        assert!(
+            denied.is_error,
+            "external file path without grant must fail: {:?}",
+            denied.output
+        );
+
+        let allowed = execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+            workspace.path(),
+            Some("chat-search-ext-file"),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "file-needle",
+                "path": outside_file_abs.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 15000
+            }),
+            None,
+            None,
+            true,
+        );
+        assert!(!allowed.is_error, "{:?}", allowed.output);
+        assert_eq!(allowed.output["truncated"], true);
+        let match_path = allowed.output["matches"][0]["path"]
+            .as_str()
+            .expect("match path");
+        assert!(
+            Path::new(match_path).is_absolute(),
+            "external file search match must be absolute: {match_path}"
+        );
+        assert!(
+            match_path.ends_with("only-file.txt") || match_path.contains("only-file.txt"),
+            "{match_path}"
+        );
+
+        let full_path = allowed.output["fullResultPath"]
+            .as_str()
+            .expect("fullResultPath required when truncated");
+        assert!(
+            full_path.starts_with(".foco/search-results/")
+                || full_path.starts_with(".foco\\search-results\\"),
+            "snapshot must stay under execution workspace .foco: {full_path}"
+        );
+        let snap_abs = workspace.path().join(full_path.replace('\\', "/"));
+        assert!(
+            snap_abs.exists(),
+            "snapshot file must exist under workspace: {}",
+            snap_abs.display()
+        );
+        assert!(
+            !full_path.contains(outside_file_abs.to_string_lossy().as_ref()),
+            "fullResultPath must not point at external root: {full_path}"
+        );
+
+        // Continuation without external flag still works; query/path binding holds.
+        let continuation = allowed.output["continuation"]
+            .as_str()
+            .expect("continuation");
+        let page = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "file-needle",
+                "path": outside_file_abs.to_string_lossy(),
+                "continuation": continuation,
+                "timeoutMs": 15000
+            }),
+        );
+        assert!(!page.is_error, "{:?}", page.output);
+        assert_eq!(
+            page.output["totalMatches"].as_u64().expect("total"),
+            total as u64
+        );
+
+        // Snapshot dump is an internal workspace read — no external grant.
+        let snap_read = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": full_path,
+                "startLine": 1,
+                "endLine": 3,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(
+            !snap_read.is_error,
+            "reading fullResultPath must not require external grant: {:?}",
+            snap_read.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_files_and_search_text_symlink_escape_is_external() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let outside = tempfile::tempdir().expect("outside");
+        fs::write(outside.path().join("escaped.txt"), "escaped-token\n").expect("write outside");
+        let link_dir = workspace.path().join("linked-dir");
+        symlink(outside.path(), &link_dir).expect("symlink dir");
+
+        let absolute_link = fs::canonicalize(workspace.path())
+            .expect("canon workspace")
+            .join("linked-dir");
+
+        assert!(
+            find_files_target_outside_workspace(
+                workspace.path(),
+                absolute_link.to_str().expect("utf8")
+            )
+            .expect("classify find")
+            .is_some(),
+            "symlink dir escape should classify as external for find_files"
+        );
+        assert!(
+            search_text_target_outside_workspace(
+                workspace.path(),
+                absolute_link.to_str().expect("utf8")
+            )
+            .expect("classify search")
+            .is_some(),
+            "symlink dir escape should classify as external for search_text"
+        );
+
+        let find_denied = execute_builtin_tool(
+            workspace.path(),
+            FIND_FILES_TOOL,
+            json!({
+                "path": absolute_link.to_string_lossy(),
+                "include": null,
+                "exclude": null,
+                "timeoutMs": 5000
+            }),
+        );
+        assert!(
+            find_denied.is_error,
+            "find_files symlink escape without grant: {:?}",
+            find_denied.output
+        );
+
+        let find_allowed =
+            execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                workspace.path(),
+                Some("chat-find-symlink"),
+                FIND_FILES_TOOL,
+                json!({
+                    "path": absolute_link.to_string_lossy(),
+                    "include": ["**/*.txt"],
+                    "exclude": null,
+                    "timeoutMs": 5000
+                }),
+                None,
+                None,
+                true,
+            );
+        assert!(!find_allowed.is_error, "{:?}", find_allowed.output);
+        let entries = find_allowed.output["entries"].as_array().expect("entries");
+        assert!(
+            entries.iter().any(|entry| {
+                entry["path"].as_str().is_some_and(|path| {
+                    Path::new(path).is_absolute() && path.contains("escaped.txt")
+                })
+            }),
+            "authorized symlink find should list absolute external paths: {:?}",
+            find_allowed.output
+        );
+
+        let search_denied = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({
+                "query": "escaped-token",
+                "path": absolute_link.to_string_lossy(),
+                "continuation": null,
+                "timeoutMs": 10000
+            }),
+        );
+        assert!(
+            search_denied.is_error,
+            "search_text symlink escape without grant: {:?}",
+            search_denied.output
+        );
+
+        let search_allowed =
+            execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_external_read_access(
+                workspace.path(),
+                Some("chat-search-symlink"),
+                SEARCH_TEXT_TOOL,
+                json!({
+                    "query": "escaped-token",
+                    "path": absolute_link.to_string_lossy(),
+                    "continuation": null,
+                    "timeoutMs": 10000
+                }),
+                None,
+                None,
+                true,
+            );
+        assert!(!search_allowed.is_error, "{:?}", search_allowed.output);
+        let match_path = search_allowed.output["matches"][0]["path"]
+            .as_str()
+            .expect("match path");
+        assert!(
+            Path::new(match_path).is_absolute(),
+            "external symlink search match must be absolute: {match_path}"
+        );
+    }
+
+    #[test]
+    fn read_file_find_files_search_text_schema_document_external_paths() {
+        let definitions = builtin_tool_definitions();
+        for name in [READ_FILE_TOOL, FIND_FILES_TOOL, SEARCH_TEXT_TOOL] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name == name)
+                .unwrap_or_else(|| panic!("{name} definition"));
+            let path_description = definition.input_schema["properties"]["path"]["description"]
+                .as_str()
+                .expect("path description");
+            assert!(
+                path_description.contains("absolute") || path_description.contains("Absolute"),
+                "{name}: {path_description}"
+            );
+            assert!(
+                path_description.contains("execution")
+                    || path_description.contains("external")
+                    || path_description.contains("confirmation"),
+                "{name}: {path_description}"
+            );
+        }
+
+        // Graph path tools must not claim external absolute support.
+        let graph = definitions
+            .iter()
+            .find(|definition| definition.name == GRAPH_FIND_SYMBOLS_TOOL)
+            .expect("graph_find_symbols");
+        let graph_path = graph.input_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("graph path");
+        assert!(
+            graph_path.contains("workspace-relative") || graph_path.contains("Workspace-relative"),
+            "{graph_path}"
+        );
+        assert!(
+            !graph_path.contains("user confirmation")
+                && !graph_path.contains("external-read grant"),
+            "graph must not advertise external grants: {graph_path}"
+        );
     }
 
     #[test]
