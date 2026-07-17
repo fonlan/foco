@@ -1701,7 +1701,7 @@ describe("app agents verification surfaces", () => {
     });
   });
 
-  it("restores Plan mode per chat tab", async () => {
+  it("does not restore Plan mode from an unsent draft toggle", async () => {
     renderApp();
 
     const workspaceList = await screen.findByRole("navigation", {
@@ -1719,6 +1719,62 @@ describe("app agents verification surfaces", () => {
       "aria-pressed",
       "false",
     );
+
+    await userEvent.click(within(workspaceList).getByText("Tool run"));
+    // Fixture last real user message has no sessionMode=plan; draft must not stick.
+    expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("restores Plan mode from the last real user message when switching chats", async () => {
+    const planChatMessages = {
+      ...chatMessages,
+      messages: [
+        {
+          ...chatMessages.messages[0],
+          content: "Plan this feature.",
+          id: "message-user-plan-last",
+          parts: [{ text: "Plan this feature.", type: "text" }],
+          sessionMode: "plan",
+        },
+        chatMessages.messages[1],
+      ],
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({ ...planChatMessages, activeRun: null });
+        }
+        return mockFetch(input, init);
+      }),
+    );
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    await userEvent.click(await within(workspaceList).findByText("Tool run"));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+
+    await userEvent.click(within(workspaceList).getByText("Second chat"));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "false",
+      );
+    });
 
     await userEvent.click(within(workspaceList).getByText("Tool run"));
     expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(

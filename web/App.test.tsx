@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 function message(id: string): ShellMessage {
@@ -802,5 +802,71 @@ describe("expandMessagesWithUserInterruptions", () => {
       "hist-interrupt-assistant",
     ]);
     expect(expanded[1].syntheticSource).toBe("reasoningLoopGuard");
+  });
+});
+
+describe("planModeEnabledFromMessages", () => {
+  function userMessage(
+    id: string,
+    options: {
+      sessionMode?: "plan" | null;
+      syntheticSource?: string;
+    } = {},
+  ): ShellMessage {
+    return {
+      ...message(id),
+      role: "user",
+      sessionMode: options.sessionMode,
+      syntheticSource: options.syntheticSource,
+    };
+  }
+
+  it("uses the last real user message sessionMode", () => {
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("u1"),
+        message("a1"),
+        userMessage("u2", { sessionMode: "plan" }),
+        message("a2"),
+      ]),
+    ).toBe(true);
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("u1", { sessionMode: "plan" }),
+        message("a1"),
+        userMessage("u2"),
+      ]),
+    ).toBe(false);
+  });
+
+  it("ignores synthetic user interruptions", () => {
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("u1"),
+        userMessage("interrupt", {
+          sessionMode: "plan",
+          syntheticSource: "reasoningLoopGuard",
+        }),
+        message("a1"),
+      ]),
+    ).toBe(false);
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("u1", { sessionMode: "plan" }),
+        userMessage("interrupt", {
+          syntheticSource: "reasoningLoopGuard",
+        }),
+      ]),
+    ).toBe(true);
+  });
+
+  it("returns false when there is no real user message", () => {
+    expect(planModeEnabledFromMessages([])).toBe(false);
+    expect(planModeEnabledFromMessages([message("a1")])).toBe(false);
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("interrupt", { syntheticSource: "userInterruption" }),
+      ]),
+    ).toBe(false);
   });
 });

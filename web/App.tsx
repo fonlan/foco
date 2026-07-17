@@ -791,6 +791,21 @@ function expandAssistantMessageWithInterruptions(
   return result.length > 0 ? result : [message];
 }
 
+/**
+ * Derive whether Plan mode should be on for a chat from its loaded messages.
+ * Uses the last real user message only; synthetic interruptions are ignored.
+ */
+export function planModeEnabledFromMessages(messages: ShellMessage[]): boolean {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role !== "user" || message.syntheticSource) {
+      continue;
+    }
+    return message.sessionMode === "plan";
+  }
+  return false;
+}
+
 type WorkspaceChatContextMenuState = {
   chat: WorkspaceChatListItem;
   left: number;
@@ -5807,8 +5822,20 @@ export function App() {
     }
   }
 
+  function resolveCommittedPlanModeForChatKey(chatKey: string | null): boolean {
+    if (!chatKey) {
+      return false;
+    }
+    const cachedMessages = chatMessagesByKeyRef.current[chatKey];
+    if (cachedMessages !== undefined) {
+      return planModeEnabledFromMessages(cachedMessages);
+    }
+    // No message cache yet: use last committed send/load snapshot, else normal mode.
+    return planModeByChatKeyRef.current[chatKey] === true;
+  }
+
   function restorePlanModeForChatKey(chatKey: string | null) {
-    const enabled = chatKey ? planModeByChatKeyRef.current[chatKey] === true : false;
+    const enabled = resolveCommittedPlanModeForChatKey(chatKey);
     setIsPlanModeEnabled(enabled);
     applyComposerModelForPlanMode(enabled);
   }
@@ -5952,6 +5979,10 @@ export function App() {
     if (existingController && !existingController.signal.aborted) {
       return;
     }
+    // Capture before await so a superseded response cannot flip this after a newer load
+    // already wrote cache (same-chat abort → reload race).
+    const hadCachedMessagesBeforeLoad =
+      chatMessagesByKeyRef.current[chatKey] !== undefined;
     loadingChatKeysRef.current.add(chatKey);
     const controller = new AbortController();
     loadingChatControllersRef.current.set(chatKey, controller);
@@ -5962,6 +5993,10 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_PAGE_LIMIT}`,
         { signal: controller.signal },
       );
+      // Drop superseded loads for this chatKey before any cache/state mutation.
+      if (loadingChatControllersRef.current.get(chatKey) !== controller) {
+        return;
+      }
       const normalizedMessages = expandMessagesWithUserInterruptions(
         data.messages.map(normalizeChatMessageSummary),
       );
@@ -6013,6 +6048,9 @@ export function App() {
         mergeResult.preservedCachePrefix && existingPagination && !cacheWasTrimmed
           ? existingPagination
           : serverPagination;
+      if (loadingChatControllersRef.current.get(chatKey) !== controller) {
+        return;
+      }
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
       setReadOnlyChatKeys((current) => {
         const readOnly = data.chat?.readOnly === true;
@@ -6034,6 +6072,8 @@ export function App() {
       trimInactiveChatCaches();
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
       restoreRetryRunRequestFromFailedMessages(workspaceId, chatId, nextMessages);
+      const planModeFromMessages = planModeEnabledFromMessages(nextMessages);
+      rememberPlanModeForChatKey(chatKey, planModeFromMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
         setPendingQuestion((current) =>
@@ -6044,6 +6084,13 @@ export function App() {
           setQuestionError(null);
           setIsAnsweringQuestion(false);
         }
+        // Only push Plan toggle from server when this load is filling a chat that had no
+        // message cache yet (URL restore / first open). Soft reloads must not wipe a
+        // draft Plan toggle while the user stays on the same chat.
+        if (!hadCachedMessagesBeforeLoad) {
+          setIsPlanModeEnabled(planModeFromMessages);
+          applyComposerModelForPlanMode(planModeFromMessages);
+        }
       }
       if (activeRun) {
         void subscribeActiveChatRun(activeRun);
@@ -6053,7 +6100,11 @@ export function App() {
         clearWorkspaceChatActiveRun(workspaceId, chatId);
       }
     } catch (requestError) {
-      if (activeChatKeyRef.current === chatKey) {
+      if (
+        loadingChatControllersRef.current.get(chatKey) === controller &&
+        activeChatKeyRef.current === chatKey &&
+        !isAbortError(requestError)
+      ) {
         setError(errorMessage(requestError));
       }
     } finally {
@@ -8085,12 +8136,9 @@ export function App() {
   }
 
   function handlePlanModeEnabledChange(value: boolean) {
+    // Draft-only toggle: do not write chat history / restore cache until send or load.
     setIsPlanModeEnabled(value);
     applyComposerModelForPlanMode(value);
-    const chatKey = activeChatKeyRef.current;
-    if (chatKey) {
-      rememberPlanModeForChatKey(chatKey, value);
-    }
   }
 
   function activeRunForRequest(request: RetryRunRequest): ActiveRunInfo | null {
@@ -8208,6 +8256,7 @@ export function App() {
           ...message,
           content: edited.content,
           parts: edited.parts,
+          sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
           runConfig: {
             modelId,
             providerId,
@@ -8218,6 +8267,27 @@ export function App() {
           },
         },
       ]);
+      bindRequestPlanModeToChatKey(
+        {
+          attachments,
+          chatId,
+          content: edited.content,
+          modelId,
+          providerId,
+          skillIds: editedSkillIds,
+          sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? undefined,
+          teamModeEnabled: runConfig?.teamModeEnabled ?? false,
+          thinkingLevel: runConfig?.thinkingLevel ?? "",
+          workspaceId,
+        },
+        chatKey,
+      );
+      if (activeChatKeyRef.current === chatKey) {
+        const planEnabled =
+          (runConfig?.sessionMode ?? message.sessionMode) === "plan";
+        setIsPlanModeEnabled(planEnabled);
+        applyComposerModelForPlanMode(planEnabled);
+      }
       onAccepted();
       updateQueuedRunRequestsForChatKey(chatKey, () => []);
       updateScheduledWorkspaceRuns((current) => current.filter((run) => run.chatKey !== chatKey));
@@ -8444,6 +8514,7 @@ export function App() {
         },
       ]);
 
+      bindRequestPlanModeToChatKey(request, runInfo.chatKey);
       const queuedRequest = {
         ...request,
         chatId: runInfo.chatId ?? request.chatId,
