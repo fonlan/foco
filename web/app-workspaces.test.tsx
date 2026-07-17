@@ -1059,7 +1059,7 @@ describe("app-workspaces verification surfaces", () => {
     expect(screen.queryByText("Please inspect README.")).not.toBeInTheDocument();
     expect(await screen.findByRole("button", {
       name: (accessibleName, element) =>
-        element.hasAttribute("aria-expanded") && accessibleName.startsWith("New Workspace"),
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("NewWorkspace"),
     })).toBeInTheDocument();
 
     // URL matches "new workspace + no active chat" (open tabs may remain in query).
@@ -1086,6 +1086,130 @@ describe("app-workspaces verification surfaces", () => {
       }
       if (
         url === "/api/workspaces/new-workspace/context-usage" &&
+        typeof init?.body === "string"
+      ) {
+        try {
+          const body = JSON.parse(init.body) as { chatId?: string | null };
+          return body.chatId === "chat-1";
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    });
+    expect(staleChatScopedCalls).toEqual([]);
+  });
+
+  it("adds a remote SSH workspace without reusing the previous chat id", async () => {
+    const remoteServer = {
+      id: "server-1",
+      name: "dev-box",
+      hostAlias: "dev-box",
+      user: "fonla",
+      port: 22,
+      identityFile: null,
+      authMethod: "key" as const,
+      passwordConfigured: false,
+      defaultRemoteRoot: "/home/fonla",
+      focoCommand: null,
+      terminalShell: null,
+      connectTimeoutMs: 10000,
+      status: "ready",
+      lastError: null,
+      lastKnownTarget: null,
+      sidecarVersion: "0.1.8",
+      sidecarInstallState: "available",
+      workspaceCount: 0,
+      lastCheckedAt: null,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      remoteServers: [remoteServer],
+    };
+
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    // Establish a prior active chat so regression can detect leftover chatId.
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    expect(window.location.href).toContain("chat-1");
+
+    const fetchCallsBeforeAdd = fetchMock.mock.calls.length;
+
+    await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
+    await userEvent.click(within(dialog).getByRole("button", { name: "SSH" }));
+
+    const serverSelect = within(dialog).getByRole("combobox");
+    await userEvent.selectOptions(serverSelect, remoteServer.id);
+
+    const nameInput = within(dialog).getByPlaceholderText("Workspace name");
+    const pathInput = within(dialog).getByPlaceholderText("/home/name/workspace");
+    await userEvent.clear(nameInput);
+    await userEvent.type(nameInput, "Remote New");
+    await userEvent.clear(pathInput);
+    await userEvent.type(pathInput, "/home/fonla/repos/remote-new");
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
+
+    await waitFor(() => {
+      const addWorkspaceCall = fetchMock.mock.calls.find(
+        ([url, init]) => url === "/api/workspaces/add" && init?.method === "POST",
+      );
+      expect(addWorkspaceCall).toBeDefined();
+      expect(JSON.parse(String(addWorkspaceCall?.[1]?.body))).toEqual(
+        expect.objectContaining({
+          name: "Remote New",
+          path: "/home/fonla/repos/remote-new",
+          remotePath: "/home/fonla/repos/remote-new",
+          serverId: remoteServer.id,
+        }),
+      );
+    });
+
+    expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
+
+    // Prior chat messages must leave the main view (activeChatId cleared).
+    expect(screen.queryByText("Please inspect README.")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("Remote New"),
+    })).toBeInTheDocument();
+
+    // URL matches "new remote workspace + no active chat".
+    expect(window.location.pathname).toBe("/new-remote-workspace");
+    expect(window.location.pathname + window.location.search).not.toMatch(
+      /\/new-remote-workspace\/chat-1/,
+    );
+    expect(
+      browserRouteFromPathname(window.location.pathname, window.location.search),
+    ).toMatchObject({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: "new-remote-workspace",
+    });
+
+    // Must not pair the new workspace with the previous chat id (especially context-usage).
+    const callsAfterAdd = fetchMock.mock.calls.slice(fetchCallsBeforeAdd);
+    const staleChatScopedCalls = callsAfterAdd.filter(([url, init]) => {
+      if (typeof url !== "string") {
+        return false;
+      }
+      if (url.includes("/api/workspaces/new-remote-workspace/chats/chat-1")) {
+        return true;
+      }
+      if (
+        url === "/api/workspaces/new-remote-workspace/context-usage" &&
         typeof init?.body === "string"
       ) {
         try {

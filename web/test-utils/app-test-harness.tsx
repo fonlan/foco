@@ -3464,6 +3464,26 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/workspaces/add") {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      name?: string | null;
+      path?: string | null;
+      remotePath?: string | null;
+      serverId?: string | null;
+      terminalShell?: string | null;
+    };
+    const isRemote = Boolean(body.serverId?.trim());
+    const remoteServer = isRemote
+      ? appTestState.settingsResponse.remoteServers.find(
+          (server) => server.id === body.serverId,
+        ) ?? null
+      : null;
+    const workspaceId = isRemote ? "new-remote-workspace" : "new-workspace";
+    const remotePath = isRemote
+      ? (body.remotePath ?? body.path ?? "/home/fonla/repos/remote-new")
+      : null;
+    const displayPath = isRemote
+      ? `${remoteServer?.hostAlias ?? "remote"}:${remotePath}`
+      : (body.path ?? "C:/Users/fonla/Documents/Repos/NewWorkspace");
     const newWorkspace = {
       chatPagination: {
         hasMore: false,
@@ -3472,18 +3492,18 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
         total: 0,
       },
       chats: [],
-      id: "new-workspace",
-      connectionStatus: "local",
-      displayPath: "C:/Users/fonla/Documents/Repos/NewWorkspace",
+      id: workspaceId,
+      connectionStatus: isRemote ? "ready" : "local",
+      displayPath,
       lastRemoteError: null,
-      logoUrl: "/api/workspaces/new-workspace/logo/thumbnail?v=1",
-      name: "New Workspace",
-      path: "C:/Users/fonla/Documents/Repos/NewWorkspace",
-      remotePath: null,
-      serverId: null,
-      serverName: null,
+      logoUrl: `/api/workspaces/${workspaceId}/logo/thumbnail?v=1`,
+      name: body.name?.trim() || (isRemote ? "Remote New Workspace" : "New Workspace"),
+      path: displayPath,
+      remotePath,
+      serverId: isRemote ? (body.serverId ?? null) : null,
+      serverName: isRemote ? (remoteServer?.name ?? null) : null,
       pinned: false,
-      terminalShell: "powershell",
+      terminalShell: body.terminalShell?.trim() || (isRemote ? "bash" : "powershell"),
       commonCommands: [],
     };
     appTestState.workspaceResponseWorkspaces = [
@@ -3497,7 +3517,7 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     };
 
     return jsonResponse({
-      activeWorkspaceId: "new-workspace",
+      activeWorkspaceId: workspaceId,
       workspaces: appTestState.workspaceResponseWorkspaces,
     });
   }
