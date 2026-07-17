@@ -28,6 +28,7 @@ import {
   workspaceMemory,
   workspaceSpec,
 } from "./test-utils/app-test-harness";
+import { browserRouteFromPathname } from "./shared/browser-route";
 type WorkspaceFixture = {
   commonCommands: typeof workspace.commonCommands;
   connectionStatus?: string;
@@ -977,6 +978,21 @@ describe("app-workspaces verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
+    // Establish a prior active chat so regression can detect leftover chatId.
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyTitle = await within(workspaceList).findByText("Tool run");
+    const historyButton = historyTitle.closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+    await userEvent.click(historyButton);
+    await screen.findByText("Please inspect README.");
+    expect(window.location.href).toContain("chat-1");
+
+    const fetchCallsBeforeAdd = fetchMock.mock.calls.length;
+
     await userEvent.click(await screen.findByRole("button", { name: "Add workspace" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
@@ -1038,6 +1054,50 @@ describe("app-workspaces verification surfaces", () => {
     });
 
     expect(screen.queryByRole("dialog", { name: "Add workspace" })).not.toBeInTheDocument();
+
+    // Prior chat messages must leave the main view (activeChatId cleared).
+    expect(screen.queryByText("Please inspect README.")).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", {
+      name: (accessibleName, element) =>
+        element.hasAttribute("aria-expanded") && accessibleName.startsWith("New Workspace"),
+    })).toBeInTheDocument();
+
+    // URL matches "new workspace + no active chat" (open tabs may remain in query).
+    expect(window.location.pathname).toBe("/new-workspace");
+    expect(window.location.pathname + window.location.search).not.toMatch(
+      /\/new-workspace\/chat-1/,
+    );
+    expect(
+      browserRouteFromPathname(window.location.pathname, window.location.search),
+    ).toMatchObject({
+      chatId: null,
+      viewMode: "chat",
+      workspaceId: "new-workspace",
+    });
+
+    // Must not pair the new workspace with the previous chat id.
+    const callsAfterAdd = fetchMock.mock.calls.slice(fetchCallsBeforeAdd);
+    const staleChatScopedCalls = callsAfterAdd.filter(([url, init]) => {
+      if (typeof url !== "string") {
+        return false;
+      }
+      if (url.includes("/api/workspaces/new-workspace/chats/chat-1")) {
+        return true;
+      }
+      if (
+        url === "/api/workspaces/new-workspace/context-usage" &&
+        typeof init?.body === "string"
+      ) {
+        try {
+          const body = JSON.parse(init.body) as { chatId?: string | null };
+          return body.chatId === "chat-1";
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    });
+    expect(staleChatScopedCalls).toEqual([]);
   });
 
   it("localizes the add-workspace dialog in local mode for zh-CN", async () => {

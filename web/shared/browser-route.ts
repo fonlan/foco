@@ -82,11 +82,13 @@ export function browserRouteFromPathname(
   }
 
   if (segments.length === 1) {
+    // Workspace path without a chat segment means "this workspace, no active chat".
+    // Open tabs stay in the query for restore, but must not become the active selection.
     return chatRouteWithTabs(
       {
-        chatId: queryActiveChat?.chatId ?? null,
+        chatId: null,
         viewMode: "chat",
-        workspaceId: queryActiveChat?.workspaceId ?? segments[0],
+        workspaceId: segments[0],
       },
       tabs,
       files,
@@ -138,6 +140,13 @@ export function browserPathForRoute(route: BrowserRoute) {
 function browserPathnameForChatRoute(
   route: Extract<BrowserRoute, { viewMode: "chat" }>,
 ) {
+  // Null chatId + workspaceId is an intentional empty selection (new chat). Keep the
+  // workspace in the path even when open tabs remain so refresh does not treat the
+  // last ?tab= entry as the active chat/workspace.
+  if (!route.chatId && route.workspaceId) {
+    return `/${encodeURIComponent(route.workspaceId)}`;
+  }
+
   if (
     route.chatId ||
     route.tabs?.length ||
@@ -149,7 +158,7 @@ function browserPathnameForChatRoute(
     return "/";
   }
 
-  return route.workspaceId ? `/${encodeURIComponent(route.workspaceId)}` : "/";
+  return "/";
 }
 
 function chatTabsFromSearch(search: string): BrowserRouteChatTab[] {

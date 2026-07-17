@@ -2521,23 +2521,62 @@ export function App() {
       setWorkspaces(workspacesWithRemoteChats);
       syncOpenChatTabTitlesFromWorkspaces(workspacesWithRemoteChats);
       setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(workspacesWithRemoteChats));
-      setActiveWorkspaceId((current) =>
-        workspacesWithRemoteChats.some((workspace) => workspace.id === current)
-          ? current
-          : data.activeWorkspaceId,
+      const previousWorkspaceId = activeWorkspaceIdRef.current;
+      const previousStillPresent = workspacesWithRemoteChats.some(
+        (workspace) => workspace.id === previousWorkspaceId,
       );
-      setExpandedWorkspaceId((current) =>
-        current !== null &&
-          workspacesWithRemoteChats.some((workspace) => workspace.id === current)
-          ? current
-          : data.activeWorkspaceId,
-      );
+      if (!previousStillPresent) {
+        const nextWorkspaceId = data.activeWorkspaceId ?? "";
+        // Same class of bug as add-workspace: do not keep the previous chatId when
+        // the active workspace disappears and we fall back to another workspace.
+        if (previousWorkspaceId) {
+          activeWorkspaceIdRef.current = nextWorkspaceId;
+          activeChatIdRef.current = null;
+          activeChatKeyRef.current = null;
+          setActiveWorkspaceId(nextWorkspaceId);
+          setActiveChatId(null);
+          setActiveMainTab({
+            chatId: null,
+            type: "chat",
+            workspaceId: nextWorkspaceId,
+          });
+          setMessages([]);
+          setSelectedDiffPath(null);
+          // Keep React state and address bar aligned so refresh does not revive the
+          // removed workspace/chat path. Leave non-chat views (settings, etc.) alone.
+          if (currentBrowserRoute().viewMode === "chat") {
+            updateBrowserRoute(
+              {
+                chatId: null,
+                viewMode: "chat",
+                workspaceId: nextWorkspaceId || null,
+              },
+              "replace",
+            );
+          }
+        } else {
+          setActiveWorkspaceId(nextWorkspaceId);
+        }
+        setExpandedWorkspaceId((current) =>
+          current !== null &&
+            workspacesWithRemoteChats.some((workspace) => workspace.id === current)
+            ? current
+            : nextWorkspaceId || null,
+        );
+      } else {
+        setExpandedWorkspaceId((current) =>
+          current !== null &&
+            workspacesWithRemoteChats.some((workspace) => workspace.id === current)
+            ? current
+            : data.activeWorkspaceId,
+        );
+      }
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
       setIsLoading(false);
     }
-  }, [syncOpenChatTabTitlesFromWorkspaces]);
+  }, [syncOpenChatTabTitlesFromWorkspaces, updateBrowserRoute]);
 
   const loadSettings = useCallback(async () => {
     setIsLoadingSettings(true);
@@ -4533,12 +4572,15 @@ export function App() {
       setWorkspaces(data.workspaces);
       setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
       void loadSettings();
-      setActiveWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
-      setExpandedWorkspaceId(createdWorkspace?.id ?? data.activeWorkspaceId);
-      updateBrowserRoute({
-        chatId: null,
-        viewMode: "chat",
-        workspaceId: createdWorkspace?.id ?? data.activeWorkspaceId,
+      const nextWorkspaceId = createdWorkspace?.id ?? data.activeWorkspaceId;
+      // Clear prior chat/composer state atomically so the new workspace is never
+      // paired with the previous workspace's activeChatId (messages/context-usage).
+      // Keep the current view (e.g. Settings → Workspaces) so add-from-settings
+      // does not navigate away. Only rewrite the browser URL when already in chat
+      // so Settings stays on /settings/... after add.
+      startNewWorkspaceChat(nextWorkspaceId, {
+        activateChatView: false,
+        updateUrl: viewMode === "chat",
       });
       if (workspaceSpecEnabled && createdWorkspace?.id) {
         try {
@@ -6331,7 +6373,7 @@ export function App() {
 
   function startNewWorkspaceChat(
     workspaceId: string,
-    options: { updateUrl?: boolean } = {},
+    options: { activateChatView?: boolean; updateUrl?: boolean } = {},
   ) {
     resetComposerDefaultsForNewChat();
     setExpandedWorkspaceId(workspaceId);
@@ -6342,9 +6384,15 @@ export function App() {
     setIsTeamModeEnabled(settings?.general.defaultTeamModeEnabled ?? false);
     setMessages([]);
     setSelectedDiffPath(null);
-    setViewMode("chat");
+    // Adding a workspace from Settings must keep the settings view; only
+    // explicit "new chat" navigation forces chat viewMode.
+    if (options.activateChatView !== false) {
+      setViewMode("chat");
+    }
     setIsMobileWorkspaceOpen(false);
     if (options.updateUrl !== false) {
+      // chatId:null + workspace path keeps open tabs in the query without
+      // re-selecting the previous active chat on refresh (see browser-route).
       updateBrowserRoute({ chatId: null, viewMode: "chat", workspaceId });
     }
   }
@@ -6587,6 +6635,14 @@ export function App() {
     const nextTabs = upsertOpenFileTab(openFileTabsRef.current, file);
     openFileTabsRef.current = nextTabs;
     setOpenFileTabs(nextTabs);
+    // Cross-workspace file tabs must not keep the previous workspace's chatId
+    // (context-usage / stats / agent-team identity mismatch).
+    if (activeWorkspaceIdRef.current !== file.workspaceId) {
+      setActiveWorkspaceChatRefs(file.workspaceId, null);
+      setActiveChatId(null);
+      setMessages([]);
+      setSelectedDiffPath(null);
+    }
     setActiveWorkspaceId(file.workspaceId);
     setExpandedWorkspaceId(file.workspaceId);
     setActiveMainTab({ path: file.path, type: "file", workspaceId: file.workspaceId });
@@ -6625,6 +6681,13 @@ export function App() {
     const nextTabs = upsertOpenHtmlPreviewTab(openHtmlPreviewTabsRef.current, preview);
     openHtmlPreviewTabsRef.current = nextTabs;
     setOpenHtmlPreviewTabs(nextTabs);
+    // Same as file tabs: never pair a new workspace with the prior chat identity.
+    if (activeWorkspaceIdRef.current !== preview.workspaceId) {
+      setActiveWorkspaceChatRefs(preview.workspaceId, null);
+      setActiveChatId(null);
+      setMessages([]);
+      setSelectedDiffPath(null);
+    }
     setActiveWorkspaceId(preview.workspaceId);
     setExpandedWorkspaceId(preview.workspaceId);
     setActiveMainTab({

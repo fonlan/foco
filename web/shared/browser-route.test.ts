@@ -39,6 +39,39 @@ describe("browser route chat tabs", () => {
     );
   });
 
+  it("serializes empty active chat with open tabs under the workspace path", () => {
+    expect(
+      browserPathForRoute({
+        chatId: null,
+        tabs: [
+          { chatId: "chat-1", workspaceId: "workspace-1" },
+          { chatId: "chat-2", workspaceId: "workspace-1" },
+        ],
+        viewMode: "chat",
+        workspaceId: "workspace-new",
+      }),
+    ).toBe(
+      "/workspace-new?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
+    );
+  });
+
+  it("does not treat open tabs as active when the path is workspace-only", () => {
+    expect(
+      browserRouteFromPathname(
+        "/workspace-new",
+        "?tab=workspace-1%2Fchat-1&tab=workspace-1%2Fchat-2",
+      ),
+    ).toEqual({
+      chatId: null,
+      tabs: [
+        { chatId: "chat-1", workspaceId: "workspace-1" },
+        { chatId: "chat-2", workspaceId: "workspace-1" },
+      ],
+      viewMode: "chat",
+      workspaceId: "workspace-new",
+    });
+  });
+
   it("serializes file tabs into the route query string", () => {
     expect(
       browserPathForRoute({
@@ -52,7 +85,7 @@ describe("browser route chat tabs", () => {
         workspaceId: "workspace-1",
       }),
     ).toBe(
-      "/?file=workspace-1%2FREADME.md&file=workspace-1%2Fsrc%252Fmain.ts&activeFile=workspace-1%2Fsrc%252Fmain.ts",
+      "/workspace-1?file=workspace-1%2FREADME.md&file=workspace-1%2Fsrc%252Fmain.ts&activeFile=workspace-1%2Fsrc%252Fmain.ts",
     );
   });
 
@@ -87,7 +120,7 @@ describe("browser route chat tabs", () => {
         workspaceId: "workspace-1",
       }),
     ).toBe(
-      "/?preview=workspace-1%2Fdocs%252Freadme.html&preview=workspace-1%2Fdemo%252Findex.html&activePreview=workspace-1%2Fdemo%252Findex.html",
+      "/workspace-1?preview=workspace-1%2Fdocs%252Freadme.html&preview=workspace-1%2Fdemo%252Findex.html&activePreview=workspace-1%2Fdemo%252Findex.html",
     );
   });
 
