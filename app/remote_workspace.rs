@@ -62,7 +62,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{sleep, timeout},
 };
@@ -2138,11 +2138,22 @@ struct RemoteActiveRunStream {
     tx: tokio::sync::broadcast::Sender<(i64, Value)>,
     pending_hook_notifications: Arc<Mutex<Vec<HookNotification>>>,
     finished: Arc<AtomicBool>,
+    /// Explicit cancel / edit-delete invalidation / abnormal runner abort.
+    /// Independent of SSE subscription Drop: subscribers never set this flag.
+    cancel_requested: Arc<AtomicBool>,
+    cancel_tx: watch::Sender<bool>,
+    cancel_rx: watch::Receiver<bool>,
+    /// Shared with in-flight `execute_tool` so cancel can preempt long local tools.
+    tool_token: foco_tools::ToolCancellationToken,
+    /// Ensures finish/cancel/guard cleanup removes the active run and cancels
+    /// the broker at most once across concurrent terminal paths.
+    cleanup_committed: Arc<AtomicBool>,
 }
 
 impl RemoteActiveRunStream {
     fn new(chat_id: String) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(512);
+        let (cancel_tx, cancel_rx) = watch::channel(false);
         Self {
             chat_id,
             broker_request_id: Arc::new(Mutex::new(None)),
@@ -2150,6 +2161,11 @@ impl RemoteActiveRunStream {
             tx,
             pending_hook_notifications: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(AtomicBool::new(false)),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
+            cancel_tx,
+            cancel_rx,
+            tool_token: foco_tools::ToolCancellationToken::default(),
+            cleanup_committed: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2216,11 +2232,34 @@ impl RemoteActiveRunStream {
     }
 
     fn mark_finished(&self) {
-        self.finished.store(true, Ordering::Relaxed);
+        self.finished.store(true, Ordering::Release);
     }
 
     fn is_finished(&self) -> bool {
-        self.finished.load(Ordering::Relaxed)
+        self.finished.load(Ordering::Acquire)
+    }
+
+    fn request_cancel(&self) {
+        self.cancel_requested.store(true, Ordering::Release);
+        self.tool_token.cancel();
+        let _ = self.cancel_tx.send(true);
+    }
+
+    fn is_cancel_requested(&self) -> bool {
+        self.cancel_requested.load(Ordering::Acquire) || *self.cancel_rx.borrow()
+    }
+
+    fn subscribe_cancel(&self) -> watch::Receiver<bool> {
+        self.cancel_tx.subscribe()
+    }
+
+    fn tool_token(&self) -> foco_tools::ToolCancellationToken {
+        self.tool_token.clone()
+    }
+
+    /// First terminal cleanup path claims ownership. Returns true only once.
+    fn try_commit_cleanup(&self) -> bool {
+        !self.cleanup_committed.swap(true, Ordering::AcqRel)
     }
 }
 
@@ -2701,6 +2740,8 @@ fn remote_sidecar_clear_chat_run_streams(state: &RemoteSidecarState, chat_id: &s
         })
         .unwrap_or_default();
     for run_id in run_ids {
+        // Edit/delete invalidation: cancel the background runner without
+        // emitting terminal SSE events (history is already rewritten/deleted).
         remote_sidecar_cancel_active_run(state, &run_id, false, true);
     }
 }
@@ -2761,15 +2802,25 @@ fn remote_sidecar_cancel_broker_request_id(state: &RemoteSidecarState, broker_re
     let _ = state.broker_tx.send(cancel);
 }
 
+/// Normal completion/error path owned by the background runner after durable
+/// assistant/metrics/run_events/queuedRun writes. Marks finished and removes the
+/// active run once; does not send broker cancel (turn already terminal).
 fn remote_sidecar_finish_active_run(state: &RemoteSidecarState, run_id: &str) {
-    if let Ok(mut streams) = state.active_run_streams.lock() {
-        if let Some(run_stream) = streams.remove(run_id) {
-            run_stream.mark_finished();
-        }
+    let run_stream = state
+        .active_run_streams
+        .lock()
+        .ok()
+        .and_then(|mut streams| streams.remove(run_id));
+    if let Some(run_stream) = run_stream {
+        run_stream.mark_finished();
+        let _ = run_stream.try_commit_cleanup();
     }
     remote_sidecar_remove_active_run(state, run_id);
 }
 
+/// Explicit cancel, edit/delete invalidation, or abnormal runner abort.
+/// Signals the background runner via cancel_requested; cancels the current
+/// broker RPC once; optionally emits error/streamEnd for HTTP cancel.
 fn remote_sidecar_cancel_active_run(
     state: &RemoteSidecarState,
     run_id: &str,
@@ -2781,8 +2832,17 @@ fn remote_sidecar_cancel_active_run(
         .lock()
         .ok()
         .and_then(|mut streams| streams.remove(run_id));
-    if let Some(run_stream) = run_stream {
-        let broker_request_id = run_stream.broker_request_id();
+    let Some(run_stream) = run_stream else {
+        remote_sidecar_remove_active_run(state, run_id);
+        return;
+    };
+
+    // Wake the background runner even if another path already cleaned up.
+    run_stream.request_cancel();
+    let first_cleanup = run_stream.try_commit_cleanup();
+    let broker_request_id = run_stream.broker_request_id();
+
+    if first_cleanup {
         remote_sidecar_cancel_broker_request(state, &run_stream);
         if remove_pending {
             if let Some(broker_request_id) = broker_request_id {
@@ -2791,21 +2851,23 @@ fn remote_sidecar_cancel_active_run(
                 }
             }
         }
-        if emit_events {
-            let mut sequence = run_stream.last_sequence();
-            sequence += 1;
-            run_stream.record(
-                sequence,
-                json!({
-                    "type": "error",
-                    "message": "remote run was cancelled",
-                }),
-            );
-            sequence += 1;
-            run_stream.record(sequence, json!({ "type": "streamEnd" }));
-        }
-        run_stream.mark_finished();
     }
+
+    if emit_events {
+        // Safe to record after map removal: clone still holds the stream.
+        let mut sequence = run_stream.last_sequence();
+        sequence += 1;
+        run_stream.record(
+            sequence,
+            json!({
+                "type": "error",
+                "message": "remote run was cancelled",
+            }),
+        );
+        sequence += 1;
+        run_stream.record(sequence, json!({ "type": "streamEnd" }));
+    }
+    run_stream.mark_finished();
     remote_sidecar_remove_active_run(state, run_id);
 }
 
@@ -2841,17 +2903,20 @@ impl RemoteRunCleanupGuard {
     }
 
     fn disarm(&self) {
-        self.disarmed.store(true, Ordering::Relaxed);
+        self.disarmed.store(true, Ordering::Release);
     }
 }
 
 impl Drop for RemoteRunCleanupGuard {
     fn drop(&mut self) {
-        if self.disarmed.swap(true, Ordering::Relaxed) {
+        if self.disarmed.swap(true, Ordering::AcqRel) {
             return;
         }
+        // Abnormal runner exit (panic, early return without finish): clear
+        // queuedRun and cancel the active run if still present. Idempotent with
+        // remote_sidecar_finish_active_run / remote_sidecar_cancel_active_run.
         if let Some(queued_user_message_id) = self.queued_user_message_id.as_deref() {
-            // Critical open: stream may still hold an ordinary permit while this Drop runs.
+            // Critical open: runner may still hold an ordinary permit while Drop runs.
             match WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(&self.state)) {
                 Ok(mut database) => {
                     if let Err(error) =
@@ -8030,9 +8095,10 @@ async fn remote_sidecar_delete_chat(
     if chat_id.is_empty() {
         return Err(ApiError::bad_request("chat id must not be empty").into_response());
     }
-    if remote_chat_active_run(&state, &chat_id).is_some() {
-        return Err(ApiError::conflict("chat already has an active remote run").into_response());
-    }
+    // Stop background runners before mutating/deleting history so a late
+    // completion cannot rewrite a deleted chat. Matches host delete semantics
+    // (no 409) while keeping edit-under-active-run as 409.
+    remote_sidecar_clear_chat_run_streams(&state, &chat_id);
 
     let mut database = sidecar_workspace_database(&state)?;
     if !database
@@ -8045,6 +8111,7 @@ async fn remote_sidecar_delete_chat(
     }
     drop(database);
 
+    // Idempotent: covers races where a new stream registered after the first clear.
     remote_sidecar_clear_chat_run_streams(&state, &chat_id);
 
     Ok(Json(json!({
@@ -8505,6 +8572,51 @@ fn remote_clear_message_queued_run(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Whether this runner still owns the durable assistant/queuedRun identity.
+/// Returns false after edit truncation, chat deletion, or a replaced queued run.
+/// The assistant row may be missing until the first durable write; that alone is not
+/// a reason to drop ownership when the user queuedRun still targets this assistant id.
+fn remote_sidecar_runner_still_owns_turn(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+    assistant_message_id: &str,
+    queued_user_message_id: &str,
+) -> bool {
+    if let Some(assistant) = database.message(assistant_message_id).ok().flatten() {
+        if assistant.chat_id != chat_id || assistant.role != "assistant" {
+            return false;
+        }
+    }
+
+    let Some(user) = database.message(queued_user_message_id).ok().flatten() else {
+        return false;
+    };
+    if user.chat_id != chat_id || user.role != "user" {
+        return false;
+    }
+
+    let Ok(metadata) = serde_json::from_str::<Value>(&user.metadata_json) else {
+        return false;
+    };
+    let Some(queued_run) = metadata.get("queuedRun").and_then(Value::as_object) else {
+        // Cleared by cancel/cleanup: this runner must not rewrite history.
+        return false;
+    };
+    let assistant_ok = queued_run
+        .get("assistantMessageId")
+        .or_else(|| queued_run.get("assistant_message_id"))
+        .and_then(Value::as_str)
+        .map(|id| id == assistant_message_id)
+        .unwrap_or(false);
+    let user_ok = queued_run
+        .get("userMessageId")
+        .or_else(|| queued_run.get("user_message_id"))
+        .and_then(Value::as_str)
+        .map(|id| id == queued_user_message_id)
+        .unwrap_or(true);
+    assistant_ok && user_ok
 }
 
 fn remote_mark_message_queued_run_started(
@@ -10752,15 +10864,26 @@ async fn remote_sidecar_execute_broker_tool(
     .await
     .map_err(|_| format!("remote broker is unavailable for tool '{}'", tool_call.name))?;
     run_stream.set_broker_request_id(request_id.clone());
+    let mut cancel_rx = run_stream.subscribe_cancel();
     let response = timeout(wait_timeout, async {
         loop {
-            if run_stream.is_finished() {
+            if run_stream.is_cancel_requested() || run_stream.is_finished() {
                 return Err(format!(
                     "brokered tool '{}' was cancelled with its remote run",
                     tool_call.name
                 ));
             }
             tokio::select! {
+                biased;
+                changed = cancel_rx.changed() => {
+                    let _ = changed;
+                    if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                        return Err(format!(
+                            "brokered tool '{}' was cancelled with its remote run",
+                            tool_call.name
+                        ));
+                    }
+                }
                 response = response_rx.recv() => {
                     let response = response.ok_or_else(|| {
                         format!("brokered tool '{}' disconnected", tool_call.name)
@@ -10773,7 +10896,6 @@ async fn remote_sidecar_execute_broker_tool(
                     }
                     return Ok::<_, String>(response);
                 }
-                _ = sleep(Duration::from_millis(200)) => {}
             }
         }
     })
@@ -11001,7 +11123,7 @@ async fn remote_sidecar_execute_tool_call(
         skill_read_root_dirs,
         attachment_read_allowlist,
         ToolResourceLockRegistry::default(),
-        foco_tools::ToolCancellationToken::default(),
+        run_stream.tool_token(),
         tool_output_tx.clone(),
         assistant_message_id,
         &state.workspace_id,
@@ -11130,10 +11252,38 @@ async fn remote_sidecar_run_broker_llm_turn(
     let mut emitted_attempt_start = false;
     let mut saw_usage_delta = false;
     let mut reasoning_loop_detector = ReasoningLoopDetector::default();
+    let mut cancel_rx = run_stream.subscribe_cancel();
     loop {
-        let envelope = match timeout(BROKER_REQUEST_TIMEOUT, broker_rx.recv()).await {
+        if run_stream.is_cancel_requested() || run_stream.is_finished() {
+            // Explicit cancel / invalidation already cancelled the broker RPC
+            // and may have emitted terminal SSE. Exit without rewriting events.
+            state.broker_pending.lock().await.remove(broker_request_id);
+            return Err(());
+        }
+        let envelope = match timeout(BROKER_REQUEST_TIMEOUT, async {
+            loop {
+                tokio::select! {
+                    biased;
+                    changed = cancel_rx.changed() => {
+                        let _ = changed;
+                        if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                            return None::<ControlEnvelope>;
+                        }
+                    }
+                    envelope = broker_rx.recv() => {
+                        return envelope;
+                    }
+                }
+            }
+        })
+        .await
+        {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Err(());
+                }
                 let message = "remote broker closed before completion; retry to resume from persisted messages";
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = turn_metrics.total_latency_ms();
@@ -11164,6 +11314,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                 return Err(());
             }
             Err(_) => {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Err(());
+                }
                 let message =
                     "remote broker request timed out; retry to resume from persisted messages";
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -11332,6 +11486,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
             }
             "response" => {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Err(());
+                }
                 if let Some(response_request_id) = envelope
                     .payload
                     .get("llmRequestId")
@@ -11369,6 +11527,19 @@ async fn remote_sidecar_run_broker_llm_turn(
                     merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
                 };
                 if !tool_calls.is_empty() {
+                    // Tool-follow-up path: only continue if this runner still owns the turn.
+                    if run_stream.is_cancel_requested()
+                        || run_stream.is_finished()
+                        || !remote_sidecar_runner_still_owns_turn(
+                            database,
+                            chat_id,
+                            assistant_message_id,
+                            queued_user_message_id,
+                        )
+                    {
+                        state.broker_pending.lock().await.remove(broker_request_id);
+                        return Err(());
+                    }
                     run_metrics.capture_first_output();
                     turn_metrics.capture_first_output();
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
@@ -11398,6 +11569,21 @@ async fn remote_sidecar_run_broker_llm_turn(
                     });
                 }
 
+                // Final completion: re-check cancel and durable ownership at the
+                // persistence boundary so edit/delete cannot race a late upsert.
+                if run_stream.is_cancel_requested()
+                    || run_stream.is_finished()
+                    || !remote_sidecar_runner_still_owns_turn(
+                        database,
+                        chat_id,
+                        assistant_message_id,
+                        queued_user_message_id,
+                    )
+                {
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Err(());
+                }
+
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = run_metrics.total_latency_ms();
                 let metrics = remote_chat_metrics(
@@ -11423,25 +11609,61 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "partsSource": "live_sse",
                     "metrics": metrics,
                 });
-                let assistant_sequence = database
-                    .message(assistant_message_id)
-                    .ok()
-                    .flatten()
-                    .map(|message| message.sequence)
-                    .unwrap_or_else(|| {
-                        database
-                            .next_message_sequence_for_chat(chat_id)
-                            .unwrap_or(0)
-                    });
-                let _ = database.upsert_message_content(NewMessage {
-                    id: assistant_message_id,
+                // Prefer UPDATE of an existing streaming placeholder. Only insert when
+                // ownership still holds and the assistant row is genuinely missing.
+                let updated = database
+                    .update_existing_message_content(
+                        assistant_message_id,
+                        chat_id,
+                        "assistant",
+                        text,
+                        &metadata.to_string(),
+                    )
+                    .unwrap_or(false);
+                if !updated {
+                    if !remote_sidecar_runner_still_owns_turn(
+                        database,
+                        chat_id,
+                        assistant_message_id,
+                        queued_user_message_id,
+                    ) {
+                        state.broker_pending.lock().await.remove(broker_request_id);
+                        return Err(());
+                    }
+                    let assistant_sequence = database
+                        .message(assistant_message_id)
+                        .ok()
+                        .flatten()
+                        .map(|message| message.sequence)
+                        .unwrap_or_else(|| {
+                            database
+                                .next_message_sequence_for_chat(chat_id)
+                                .unwrap_or(0)
+                        });
+                    if database
+                        .upsert_message_content(NewMessage {
+                            id: assistant_message_id,
+                            chat_id,
+                            role: "assistant",
+                            content: text,
+                            sequence: assistant_sequence,
+                            metadata_json: Some(&metadata.to_string()),
+                        })
+                        .is_err()
+                    {
+                        state.broker_pending.lock().await.remove(broker_request_id);
+                        return Err(());
+                    }
+                }
+                // Clear only when ownership still holds after the write race window.
+                if remote_sidecar_runner_still_owns_turn(
+                    database,
                     chat_id,
-                    role: "assistant",
-                    content: text,
-                    sequence: assistant_sequence,
-                    metadata_json: Some(&metadata.to_string()),
-                });
-                let _ = remote_clear_message_queued_run(database, queued_user_message_id);
+                    assistant_message_id,
+                    queued_user_message_id,
+                ) {
+                    let _ = remote_clear_message_queued_run(database, queued_user_message_id);
+                }
                 let completion_payload = remote_chat_completion_event(
                     chat_id,
                     assistant_message_id,
@@ -11483,6 +11705,11 @@ async fn remote_sidecar_run_broker_llm_turn(
                 });
             }
             "error" => {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    // Prefer explicit cancel terminal events over a late broker error.
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Err(());
+                }
                 let message = envelope
                     .payload
                     .get("message")
@@ -12769,6 +12996,13 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut last_yielded_sequence = sequence;
 
     'run: loop {
+        // Explicit cancel / edit-delete invalidation: stop before the next turn.
+        if run_stream.is_cancel_requested() || run_stream.is_finished() {
+            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+            remote_sidecar_finish_active_run(&stream_state, &run_id);
+            cleanup_guard.disarm();
+            break;
+        }
         // Before every brokered chat completion request (first turn and tool follow-ups):
         // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
         // Live-yield ContextCompression (start before broker summary) while ensure runs.
@@ -12884,16 +13118,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 if !run_compression_events.is_empty() {
                     // Keep live start/completed compression blocks durable in message parts
                     // even when ensure fails (e.g. summary cancelled after start).
-                    let assistant_sequence = database
-                        .message(&assistant_message_id)
-                        .ok()
-                        .flatten()
-                        .map(|message| message.sequence)
-                        .unwrap_or_else(|| {
-                            database
-                                .next_message_sequence_for_chat(&chat_id)
-                                .unwrap_or(0)
-                        });
                     let metadata = json!({
                         "parts": remote_chat_parts_with_context_compression(
                             "",
@@ -12905,14 +13129,13 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         "partsSource": "live_sse",
                         "streamingState": "failed",
                     });
-                    let _ = database.upsert_message_content(NewMessage {
-                        id: &assistant_message_id,
-                        chat_id: &chat_id,
-                        role: "assistant",
-                        content: "",
-                        sequence: assistant_sequence,
-                        metadata_json: Some(&metadata.to_string()),
-                    });
+                    let _ = database.update_existing_message_content(
+                        &assistant_message_id,
+                        &chat_id,
+                        "assistant",
+                        "",
+                        &metadata.to_string(),
+                    );
                 }
                 sequence += 1;
                 remote_sidecar_record_run_event(
@@ -12935,6 +13158,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             }
         };
         // Live path already yielded compression events; do not re-emit.
+        if run_stream.is_cancel_requested() || run_stream.is_finished() {
+            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+            remote_sidecar_finish_active_run(&stream_state, &run_id);
+            cleanup_guard.disarm();
+            break;
+        }
         let mut broker_request = current_request.clone();
         broker_request.messages = packed_messages;
         let broker_request_id = unique_id("broker-request");
@@ -13195,6 +13424,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             attachment_read_allowlist.clone(),
                         );
                         tokio::pin!(execution);
+                        let mut cancel_rx = run_stream.subscribe_cancel();
                         let (
                             output,
                             is_error,
@@ -13204,6 +13434,16 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             additional_context,
                         ) = loop {
                             tokio::select! {
+                                biased;
+                                changed = cancel_rx.changed() => {
+                                    let _ = changed;
+                                    if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                                        // ToolCancellationToken was already signalled by
+                                        // request_cancel; keep waiting for execute_tool to
+                                        // observe cancel and return a cancelled result.
+                                        continue;
+                                    }
+                                }
                                 result = &mut execution => break result,
                                 Some(event) = broker_event_rx.recv() => {
                                     sequence += 1;
@@ -13220,7 +13460,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             normalize_broker_tool_execution(&tool_call.name, output, is_error);
                         let output = execution.output;
                         let is_error = execution.is_error;
-                        if run_stream.is_finished() {
+                        if run_stream.is_cancel_requested() || run_stream.is_finished() {
                             remote_sidecar_close_cancelled_tool_batch(
                                 &mut database,
                                 &assistant_message_id,
@@ -13396,24 +13636,20 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     "partsSource": "live_sse",
                     "metrics": metrics,
                 });
-                let assistant_sequence = database
-                    .message(&assistant_message_id)
-                    .ok()
-                    .flatten()
-                    .map(|message| message.sequence)
-                    .unwrap_or_else(|| {
-                        database
-                            .next_message_sequence_for_chat(&chat_id)
-                            .unwrap_or(0)
-                    });
-                let _ = database.upsert_message_content(NewMessage {
-                    id: &assistant_message_id,
-                    chat_id: &chat_id,
-                    role: "assistant",
-                    content: &text,
-                    sequence: assistant_sequence,
-                    metadata_json: Some(&metadata.to_string()),
-                });
+                if remote_sidecar_runner_still_owns_turn(
+                    &database,
+                    &chat_id,
+                    &assistant_message_id,
+                    &queued_user_message_id,
+                ) {
+                    let _ = database.update_existing_message_content(
+                        &assistant_message_id,
+                        &chat_id,
+                        "assistant",
+                        &text,
+                        &metadata.to_string(),
+                    );
+                }
                 sequence += 1;
                 remote_sidecar_record_run_event(
                     &run_stream,
@@ -18311,11 +18547,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_sidecar_delete_chat_rejects_active_run_without_mutation() {
+    async fn remote_sidecar_delete_chat_cancels_active_run_then_deletes() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (state, _broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 0);
         let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
         database.insert_chat("chat-1", "Chat").expect("chat insert");
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "run-1".to_string(),
+            "chat-1".to_string(),
+        );
         remote_sidecar_set_active_run(
             &state,
             RemoteActiveRunSummary {
@@ -18328,16 +18569,17 @@ mod tests {
             },
         );
 
-        let response = remote_sidecar_delete_chat(State(state), AxumPath("chat-1".to_string()))
-            .await
-            .expect_err("active run should conflict");
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("error response body");
-        let payload: Value = serde_json::from_slice(&body).expect("error response json");
-        assert_eq!(payload["error"], "chat already has an active remote run");
-        assert!(database.chat("chat-1").expect("chat query").is_some());
+        let Json(response) =
+            remote_sidecar_delete_chat(State(state.clone()), AxumPath("chat-1".to_string()))
+                .await
+                .expect("delete should succeed under active run");
+        assert_eq!(response, json!({ "deleted": true, "chatId": "chat-1" }));
+        assert!(database.chat("chat-1").expect("chat query").is_none());
+        assert!(remote_sidecar_active_run_stream(&state, "run-1").is_none());
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+        assert!(run_stream.is_finished());
+        assert!(run_stream.is_cancel_requested());
+        assert!(run_stream.tool_token().is_cancelled());
     }
 
     #[test]
@@ -18794,10 +19036,149 @@ mod tests {
         assert_eq!(cancel.id.as_deref(), Some("broker-request-1"));
         assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+        assert!(run_stream.tool_token().is_cancelled());
+        assert!(run_stream.is_cancel_requested());
+    }
+
+    #[test]
+    fn remote_sidecar_runner_still_owns_turn_requires_matching_queued_run_identity() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "running",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("user");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("assistant");
+
+        assert!(remote_sidecar_runner_still_owns_turn(
+            &database,
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+        ));
+
+        remote_clear_message_queued_run(&mut database, "msg-user-1").expect("clear queued");
+        assert!(
+            !remote_sidecar_runner_still_owns_turn(
+                &database,
+                "chat-1",
+                "msg-assistant-1",
+                "msg-user-1",
+            ),
+            "cleared queuedRun must drop ownership"
+        );
+
+        // Replaced identity (edit rerun with new assistant id).
+        database
+            .update_message_metadata(
+                "msg-user-1",
+                &json!({
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "msg-user-1",
+                        "assistantMessageId": "msg-assistant-new",
+                    }
+                })
+                .to_string(),
+            )
+            .expect("replace queued identity");
+        assert!(!remote_sidecar_runner_still_owns_turn(
+            &database,
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+        ));
+        // New identity still owns even before the assistant row is inserted.
+        assert!(remote_sidecar_runner_still_owns_turn(
+            &database,
+            "chat-1",
+            "msg-assistant-new",
+            "msg-user-1",
+        ));
+        assert!(!remote_sidecar_runner_still_owns_turn(
+            &database,
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-missing",
+        ));
+    }
+
+    #[test]
+    fn update_existing_message_content_does_not_reinsert_missing_assistant() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.insert_chat("chat-1", "Chat").expect("chat");
+        let updated = database
+            .update_existing_message_content(
+                "msg-assistant-1",
+                "chat-1",
+                "assistant",
+                "late write",
+                r#"{"metrics":{}}"#,
+            )
+            .expect("update");
+        assert!(!updated);
+        assert!(
+            database
+                .message("msg-assistant-1")
+                .expect("lookup")
+                .is_none()
+        );
+
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert");
+        let updated = database
+            .update_existing_message_content(
+                "msg-assistant-1",
+                "chat-1",
+                "assistant",
+                "final",
+                r#"{"ok":true}"#,
+            )
+            .expect("update existing");
+        assert!(updated);
+        let message = database
+            .message("msg-assistant-1")
+            .expect("lookup")
+            .expect("message");
+        assert_eq!(message.content, "final");
     }
 
     #[tokio::test]
-    async fn remote_run_cleanup_guard_removes_pending_broker_request() {
+    async fn remote_run_cleanup_guard_removes_pending_broker_request_on_abnormal_exit() {
         let (state, _broker_rx) = test_sidecar_state("/tmp/workspace".to_string(), 1);
         let run_stream = remote_sidecar_insert_active_run_stream(
             &state,
@@ -18813,6 +19194,7 @@ mod tests {
             .insert("broker-request-1".to_string(), tx);
 
         {
+            // Simulates abnormal runner exit (panic/abort) while still armed.
             let _guard = RemoteRunCleanupGuard::new(state.clone(), "remote-run-1".to_string());
         }
 
@@ -21139,6 +21521,798 @@ mod tests {
         .expect("reconnect stream");
         drop(reconnect);
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 1);
+    }
+
+    async fn wait_until(timeout_duration: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout_duration;
+        loop {
+            if condition() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_sse_drop_during_first_turn_keeps_pending_and_reconnects() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        let mut cancel_rx = state.broker_tx.subscribe();
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+        // Hold then drop the initial subscription mid-turn (simulates client disconnect).
+        let body = response.into_response().into_body();
+        let reader = tokio::spawn(async move { axum::body::to_bytes(body, usize::MAX).await });
+
+        let broker_state = state.clone();
+        let (partial_sent_tx, partial_sent_rx) = oneshot::channel::<()>();
+        let (finish_tx, finish_rx) = oneshot::channel::<()>();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let id = request.id.clone().expect("request id");
+            let pending = loop {
+                if let Some(pending) = broker_state.broker_pending.lock().await.get(&id).cloned() {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            };
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "partial ",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send partial delta");
+            let _ = partial_sent_tx.send(());
+            // Hold until the test drops the SSE and asserts pending/run still live.
+            let _ = finish_rx.await;
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "complete",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send rest of text");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 3, "outputTokens": 2 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send completion");
+        });
+
+        timeout(Duration::from_secs(2), partial_sent_rx)
+            .await
+            .expect("partial delta sent")
+            .expect("partial channel");
+
+        let run_id = state
+            .active_runs
+            .lock()
+            .expect("active runs")
+            .first()
+            .expect("active run")
+            .run_id
+            .clone();
+        let run_stream =
+            remote_sidecar_active_run_stream(&state, &run_id).expect("run stream active");
+        let saw_partial = wait_until(Duration::from_secs(2), || {
+            run_stream.snapshot_after(-1).iter().any(|(_, event)| {
+                event.get("type").and_then(Value::as_str) == Some("textDelta")
+                    && event
+                        .get("delta")
+                        .and_then(Value::as_str)
+                        .is_some_and(|delta| delta.contains("partial"))
+            })
+        })
+        .await;
+        assert!(
+            saw_partial,
+            "runner should record partial textDelta before disconnect"
+        );
+        let after_partial_sequence = run_stream.last_sequence();
+
+        // Drop initial SSE subscription mid-turn.
+        reader.abort();
+        let _ = reader.await;
+
+        assert!(
+            remote_sidecar_active_run_stream(&state, &run_id).is_some(),
+            "active run stream must survive SSE drop"
+        );
+        assert!(
+            !state.broker_pending.lock().await.is_empty(),
+            "broker pending must remain while runner continues"
+        );
+
+        // Drain briefly: subscription Drop must not emit broker cancel.
+        let mut saw_cancel = false;
+        let _ = timeout(Duration::from_millis(30), async {
+            loop {
+                match cancel_rx.recv().await {
+                    Ok(envelope) if envelope.message_type == "cancel" => {
+                        saw_cancel = true;
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+        assert!(!saw_cancel, "SSE drop must not cancel broker RPC");
+
+        // Reconnect while the turn is still open so the active run is still registered.
+        let reconnect = remote_sidecar_chat_run_stream(
+            State(state.clone()),
+            AxumPath(run_id.clone()),
+            Query(HashMap::from([(
+                "afterSequence".to_string(),
+                after_partial_sequence.to_string(),
+            )])),
+        )
+        .await
+        .expect("reconnect stream");
+        let reconnect_body = reconnect.into_response().into_body();
+        let reconnect_reader =
+            tokio::spawn(async move { axum::body::to_bytes(reconnect_body, usize::MAX).await });
+
+        let _ = finish_tx.send(());
+        broker.await.expect("broker task");
+
+        let reconnect_bytes = timeout(Duration::from_secs(2), reconnect_reader)
+            .await
+            .expect("reconnect SSE finishes")
+            .expect("reader join")
+            .expect("reconnect bytes");
+        let reconnect_text = String::from_utf8(reconnect_bytes.to_vec()).expect("utf8");
+        assert!(
+            reconnect_text.contains("complete")
+                || reconnect_text.contains("\"type\":\"complete\"")
+                || reconnect_text.contains("\"type\":\"streamEnd\""),
+            "reconnect should deliver missing events and terminal end: {reconnect_text}"
+        );
+
+        let finished = wait_until(Duration::from_secs(2), || {
+            remote_sidecar_active_run_stream(&state, &run_id).is_none()
+                && state.active_run_count.load(Ordering::Relaxed) == 0
+        })
+        .await;
+        assert!(finished, "run should finish after broker completion");
+
+        let database =
+            WorkspaceDatabase::open_or_create_critical(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        assert!(
+            assistant.content.contains("partial") && assistant.content.contains("complete"),
+            "assistant content should include full turn text, got {:?}",
+            assistant.content
+        );
+        let user = database
+            .message("msg-user-1")
+            .expect("user lookup")
+            .expect("user message");
+        let metadata: Value = serde_json::from_str(&user.metadata_json).expect("metadata");
+        assert!(
+            metadata.get("queuedRun").is_none(),
+            "queuedRun should clear after normal finish"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_sse_drop_between_tool_turns_preserves_followup_broker_request() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\n",
+        )
+        .expect("write tool fixture");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "read Cargo.toml",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+        // Drop initial subscription between turns (client disconnect after first model response).
+        drop(response);
+
+        let broker_state = state.clone();
+        let (first_done_tx, first_done_rx) = oneshot::channel::<()>();
+        let broker = tokio::spawn(async move {
+            let first_request = loop {
+                let envelope = broker_rx.recv().await.expect("first broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let first_id = first_request.id.expect("first request id");
+            let first_pending = loop {
+                if let Some(pending) = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&first_id)
+                    .cloned()
+                {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            };
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(first_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 4, "outputTokens": 2 },
+                        "toolCalls": [{
+                            "callId": "call-1",
+                            "name": "read_file",
+                            "arguments": {
+                                "path": "Cargo.toml",
+                                "startLine": null,
+                                "endLine": null,
+                                "timeoutMs": null
+                            }
+                        }],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send first response with tool call");
+            let _ = first_done_tx.send(());
+
+            let second_request = loop {
+                let envelope = broker_rx.recv().await.expect("second broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            assert!(
+                second_request.payload["request"]["messages"]
+                    .as_array()
+                    .expect("followup messages")
+                    .iter()
+                    .any(|message| message["role"] == "tool"),
+                "second turn must include tool results after SSE drop"
+            );
+            let second_id = second_request.id.expect("second request id");
+            let second_pending = loop {
+                if let Some(pending) = broker_state
+                    .broker_pending
+                    .lock()
+                    .await
+                    .get(&second_id)
+                    .cloned()
+                {
+                    break pending;
+                }
+                tokio::task::yield_now().await;
+            };
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(second_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "file contents",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send second text");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(second_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 6, "outputTokens": 3 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send second completion");
+        });
+
+        timeout(Duration::from_secs(2), first_done_rx)
+            .await
+            .expect("first turn response sent")
+            .expect("first done channel");
+
+        let run_id = state
+            .active_runs
+            .lock()
+            .expect("active runs")
+            .first()
+            .expect("active run")
+            .run_id
+            .clone();
+        assert!(
+            remote_sidecar_active_run_stream(&state, &run_id).is_some(),
+            "run must survive between tool turns after SSE drop"
+        );
+
+        // Reattach after first turn; should receive tool results + second turn + streamEnd.
+        let reconnect = remote_sidecar_chat_run_stream(
+            State(state.clone()),
+            AxumPath(run_id.clone()),
+            Query(HashMap::from([(
+                "afterSequence".to_string(),
+                "-1".to_string(),
+            )])),
+        )
+        .await
+        .expect("reconnect stream");
+        let reconnect_bytes = timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(reconnect.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("reconnect finishes")
+        .expect("reconnect bytes");
+        broker.await.expect("broker multi-turn task");
+        let reconnect_text = String::from_utf8(reconnect_bytes.to_vec()).expect("utf8");
+        assert!(
+            reconnect_text.contains("file contents") || reconnect_text.contains("toolResult"),
+            "multi-turn reconnect should include tool follow-up output: {reconnect_text}"
+        );
+        assert!(
+            reconnect_text.contains("\"type\":\"streamEnd\""),
+            "multi-turn run should end: {reconnect_text}"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create_critical(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        assert!(
+            assistant.content.contains("file contents"),
+            "assistant should persist second-turn text"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_explicit_cancel_stops_background_runner_and_emits_terminal_events() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        let mut cancel_rx = state.broker_tx.subscribe();
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+        // Keep a live subscription so cancel SSE events (error/streamEnd) are observable.
+        let body = response.into_response().into_body();
+        let reader = tokio::spawn(async move {
+            axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("SSE bytes")
+        });
+
+        let broker_state = state.clone();
+        let (request_ready_tx, request_ready_rx) = oneshot::channel::<String>();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            loop {
+                if broker_state.broker_pending.lock().await.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let _ = request_ready_tx.send(id.clone());
+            loop {
+                if broker_state.active_run_count.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let broker_request_id = timeout(Duration::from_secs(2), request_ready_rx)
+            .await
+            .expect("broker request ready")
+            .expect("request id channel");
+        let run_id = state
+            .active_runs
+            .lock()
+            .expect("active runs")
+            .first()
+            .expect("active run")
+            .run_id
+            .clone();
+        assert_eq!(
+            remote_sidecar_active_run_stream(&state, &run_id)
+                .and_then(|stream| stream.broker_request_id())
+                .as_deref(),
+            Some(broker_request_id.as_str())
+        );
+
+        let cancel_response =
+            remote_sidecar_chat_run_cancel(State(state.clone()), AxumPath(run_id.clone()))
+                .await
+                .expect("cancel response")
+                .0;
+        assert_eq!(cancel_response["ok"], true);
+
+        let cancel = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = cancel_rx.recv().await.expect("broker envelope");
+                if envelope.message_type == "cancel" {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("broker cancel envelope");
+        assert_eq!(cancel.id.as_deref(), Some(broker_request_id.as_str()));
+
+        assert!(
+            remote_sidecar_active_run_stream(&state, &run_id).is_none(),
+            "explicit cancel removes active run stream"
+        );
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+
+        let sse_bytes = timeout(Duration::from_secs(2), reader)
+            .await
+            .expect("SSE reader finishes")
+            .expect("reader join");
+        let sse_text = String::from_utf8(sse_bytes.to_vec()).expect("utf8");
+        assert!(
+            sse_text.contains("remote run was cancelled"),
+            "explicit cancel should emit cancel error: {sse_text}"
+        );
+        assert!(
+            sse_text.contains("\"type\":\"streamEnd\""),
+            "explicit cancel should emit streamEnd: {sse_text}"
+        );
+
+        let second = remote_sidecar_chat_run_cancel(State(state.clone()), AxumPath(run_id.clone()))
+            .await
+            .expect("second cancel")
+            .0;
+        assert_eq!(second["ok"], true);
+
+        let _ = timeout(Duration::from_secs(1), broker).await;
+
+        let database =
+            WorkspaceDatabase::open_or_create_critical(workspace.path()).expect("workspace db");
+        let user = database
+            .message("msg-user-1")
+            .expect("user lookup")
+            .expect("user message");
+        let metadata: Value = serde_json::from_str(&user.metadata_json).expect("metadata");
+        assert!(
+            metadata.get("queuedRun").is_none(),
+            "cleanup guard should clear queuedRun after cancel stops the runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_clear_chat_run_streams_stops_background_runner_without_sse_events() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-1",
+                chat_id: "chat-1",
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        let mut cancel_rx = state.broker_tx.subscribe();
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+        drop(response);
+
+        let broker_state = state.clone();
+        let (request_ready_tx, request_ready_rx) = oneshot::channel::<String>();
+        let held_turn = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            loop {
+                if broker_state.broker_pending.lock().await.contains_key(&id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let _ = request_ready_tx.send(id);
+            loop {
+                if broker_state.active_run_count.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+
+        let broker_request_id = timeout(Duration::from_secs(2), request_ready_rx)
+            .await
+            .expect("broker request ready")
+            .expect("request id");
+        let run_id = state
+            .active_runs
+            .lock()
+            .expect("active runs")
+            .first()
+            .expect("active run")
+            .run_id
+            .clone();
+
+        remote_sidecar_clear_chat_run_streams(&state, "chat-1");
+
+        assert!(remote_sidecar_active_run_stream(&state, &run_id).is_none());
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+
+        let cancel = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = cancel_rx.recv().await.expect("broker envelope");
+                if envelope.message_type == "cancel" {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("broker cancel from invalidation");
+        assert_eq!(cancel.id.as_deref(), Some(broker_request_id.as_str()));
+
+        assert!(
+            state
+                .broker_pending
+                .lock()
+                .await
+                .get(&broker_request_id)
+                .is_none()
+        );
+
+        let _ = timeout(Duration::from_secs(1), held_turn).await;
+
+        remote_sidecar_clear_chat_run_streams(&state, "chat-1");
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn remote_run_cleanup_guard_is_idempotent_after_normal_finish() {
+        let (state, mut broker_rx) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        run_stream.set_broker_request_id("broker-request-1".to_string());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        state
+            .broker_pending
+            .lock()
+            .await
+            .insert("broker-request-1".to_string(), tx);
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: "remote-run-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            },
+        );
+        while broker_rx.try_recv().is_ok() {}
+
+        remote_sidecar_finish_active_run(&state, "remote-run-1");
+        assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
+
+        {
+            let _guard = RemoteRunCleanupGuard::new(state.clone(), "remote-run-1".to_string());
+        }
+        let mut saw_cancel = false;
+        while let Ok(envelope) = broker_rx.try_recv() {
+            if envelope.message_type == "cancel" {
+                saw_cancel = true;
+            }
+        }
+        assert!(
+            !saw_cancel,
+            "cleanup after normal finish must not re-cancel broker"
+        );
+        assert!(
+            state
+                .broker_pending
+                .lock()
+                .await
+                .contains_key("broker-request-1")
+        );
     }
 
     #[tokio::test]

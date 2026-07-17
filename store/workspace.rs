@@ -6435,6 +6435,47 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    /// Update content/metadata only when the message already exists with the same
+    /// chat and role. Never inserts a new row (safe for cancel/edit races).
+    pub fn update_existing_message_content(
+        &mut self,
+        message_id: &str,
+        chat_id: &str,
+        role: &str,
+        content: &str,
+        metadata_json: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let changed = transaction
+            .execute(
+                "UPDATE messages
+                 SET content = ?1, metadata_json = ?2
+                 WHERE id = ?3 AND chat_id = ?4 AND role = ?5",
+                params![content, metadata_json, message_id, chat_id, role],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        if changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                    params![now, chat_id],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(changed > 0)
+    }
+
     pub fn messages_for_chat(
         &self,
         chat_id: &str,
