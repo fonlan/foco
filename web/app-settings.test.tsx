@@ -1446,7 +1446,7 @@ describe("app-settings verification surfaces", () => {
     expect(compressionToggle).not.toBeChecked();
     expect(
       screen.getByText(
-        "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost. When disabled, required overflow does not force tool-state compression and goes straight to LLM compression; when enabled, local tool-state compression still runs first on overflow to help later summarization.",
+        "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider's context cache.",
       ),
     ).toBeInTheDocument();
 

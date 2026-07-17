@@ -1242,8 +1242,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Chat title generation model": "会话标题生成模型",
     "Context management": "上下文管理",
     "Runtime tool-state compression": "运行期工具状态压缩",
-    "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider prompt cache; for GPT models, rebuilding cached input can increase cost. When disabled, required overflow does not force tool-state compression and goes straight to LLM compression; when enabled, local tool-state compression still runs first on overflow to help later summarization.":
-      "上下文用量达到 80% 时，将旧工具消息替换为精简快照。这会打断供应商的 prompt cache；对于 GPT 模型，重建缓存输入可能增加成本。关闭时，required overflow 不会强制压缩工具状态，overflow 直接走 LLM 压缩；开启时仍会在 overflow 前先做本地工具状态压缩，以便后续摘要。",
+    "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider's context cache.":
+      "上下文用量达到 80% 时，将旧工具消息替换为精简快照。这会打断供应商的上下文缓存。",
     "API request detail retention days": "API 请求详情保留天数",
     "API request details": "API 请求详情",
     "Save request and response bodies": "保存请求和响应正文",
