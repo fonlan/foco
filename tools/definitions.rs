@@ -319,7 +319,7 @@ fn graph_explore_definition() -> ToolDefinition {
 fn search_text_definition() -> ToolDefinition {
     ToolDefinition {
         name: SEARCH_TEXT_TOOL,
-        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. Large result sets return a stable small preview under the shared soft limits (50 KiB or 2,000 lines), with totalMatches/returnedMatches, an opaque continuation token (snapshot id + next offset), and fullResultPath pointing at the same snapshot under .foco/search-results/. Pass the same query/path plus continuation to page further without re-running the search; expired/pruned/mismatched continuations fail with a stable invalid/expired error. Complete dumps still require ranged read_file when large. When ripgrep output hits the command collection ceiling the tool fails with incomplete/refine guidance rather than inventing a full total.",
+        description: "Search workspace text and return matching lines. Powered by ripgrep/rg; the query uses rg pattern syntax. Large result sets return a stable small preview under the shared soft limits (50 KiB or 2,000 lines), with totalMatches/returnedMatches, an opaque continuation token (snapshot id + next offset), and fullResultPath pointing at the same snapshot under .foco/search-results/. Pass the same query/path plus a non-empty continuation to page further without re-running the search; expired/pruned/mismatched continuations fail with a stable invalid/expired error. Missing, null, empty, or whitespace-only continuation always starts a fresh search. Complete dumps still require ranged read_file when large. When ripgrep output hits the command collection ceiling the tool fails with incomplete/refine guidance rather than inventing a full total.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -334,7 +334,7 @@ fn search_text_definition() -> ToolDefinition {
                 },
                 "continuation": {
                     "type": ["string", "null"],
-                    "description": "Optional opaque token from a previous search_text response (format snapshotId:nextOffset). When set, pages the existing snapshot instead of running a new search. Null starts a fresh search."
+                    "description": "Opaque token from a previous search_text response (format snapshotId:nextOffset). A non-empty token (after trim) pages the existing snapshot instead of running a new search. Null, empty string, whitespace-only, or a missing field at runtime all start a fresh search. Required in the schema for strict-tool compatibility; pass null for the first page."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],

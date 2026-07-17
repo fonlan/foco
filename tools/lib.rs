@@ -2630,6 +2630,85 @@ mod tests {
     }
 
     #[test]
+    fn search_text_treats_missing_null_empty_and_blank_continuation_as_initial_search() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("note.txt"), "alpha\nbeta\n").expect("write note");
+
+        let with_null = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "beta", "path": ".", "continuation": null, "timeoutMs": null }),
+        );
+        let with_empty = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "beta", "path": ".", "continuation": "", "timeoutMs": null }),
+        );
+        let with_whitespace = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "beta", "path": ".", "continuation": "  \t  ", "timeoutMs": null }),
+        );
+        // Field omitted: serde default leaves continuation as None (fresh search).
+        let missing_field = execute_builtin_tool(
+            workspace.path(),
+            SEARCH_TEXT_TOOL,
+            json!({ "query": "beta", "path": ".", "timeoutMs": null }),
+        );
+
+        for (label, result) in [
+            ("null", &with_null),
+            ("empty", &with_empty),
+            ("whitespace", &with_whitespace),
+            ("missing", &missing_field),
+        ] {
+            assert!(
+                !result.is_error,
+                "{label} continuation must start a fresh search, got {:?}",
+                result.output
+            );
+            let error = result.output.get("error").and_then(Value::as_str);
+            if let Some(error) = error {
+                assert!(
+                    !(error.contains("continuation") && error.contains("invalid")),
+                    "{label} must not report a continuation format error: {error}"
+                );
+            }
+            let matches = result.output["matches"].as_array().expect("matches");
+            assert_eq!(matches.len(), 1, "{label}");
+            assert_eq!(matches[0]["path"], "note.txt", "{label}");
+            assert_eq!(matches[0]["line"], 2, "{label}");
+            assert_eq!(matches[0]["text"], "beta", "{label}");
+            assert_eq!(
+                result.output["totalMatches"].as_u64().expect("total"),
+                1,
+                "{label}"
+            );
+            assert_eq!(result.output["truncated"], false, "{label}");
+        }
+
+        // Equivalence: all four inputs produce the same first-page payload shape.
+        assert_eq!(with_null.output["matches"], with_empty.output["matches"]);
+        assert_eq!(
+            with_null.output["matches"],
+            with_whitespace.output["matches"]
+        );
+        assert_eq!(with_null.output["matches"], missing_field.output["matches"]);
+        assert_eq!(
+            with_null.output["totalMatches"],
+            with_empty.output["totalMatches"]
+        );
+        assert_eq!(
+            with_null.output["totalMatches"],
+            with_whitespace.output["totalMatches"]
+        );
+        assert_eq!(
+            with_null.output["totalMatches"],
+            missing_field.output["totalMatches"]
+        );
+    }
+
+    #[test]
     fn search_text_truncates_large_results_to_a_workspace_file() {
         let workspace = tempfile::tempdir().expect("workspace");
         // Enough long matches that soft 50 KiB budget forces a multi-page snapshot.

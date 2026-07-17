@@ -616,7 +616,14 @@ pub(crate) fn search_text(
         ));
     }
 
-    if let Some(continuation) = request.continuation.as_deref() {
+    // Treat missing, null, empty, and whitespace-only continuation as a fresh search.
+    // Only a non-empty token (after trim) enters the snapshot pagination path.
+    if let Some(continuation) = request
+        .continuation
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
         return search_text_continue(
             workspace_path,
             pattern,
