@@ -41,7 +41,7 @@ use foco_store::{
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, NewCodeGraphFileIndex,
         NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger,
+        NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger, PlanStepPatch,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
         WorkspaceSpecTriggerType,
     },
@@ -10454,6 +10454,567 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
     );
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn plan_phase_waiting_lifecycle_keeps_running_when_steps_complete() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-waiting-lifecycle-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let chat_id = "chat-plan-waiting-lifecycle";
+    let user_message_id = "user-plan-waiting-lifecycle";
+    let chat_metadata_json = format!(
+        r#"{{"queuedRun":{{"status":"running","userMessageId":"{user_message_id}","modelId":"gpt-5.4","providerId":"openai-responses","content":"Implement phase"}}}}"#
+    );
+    database
+        .insert_chat_with_metadata(chat_id, "Plan waiting lifecycle", &chat_metadata_json)
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: user_message_id,
+            chat_id,
+            role: "user",
+            content: "Implement phase",
+            sequence: 0,
+            metadata_json: Some(
+                r#"{"queuedRun":{"status":"running","modelId":"gpt-5.4","providerId":"openai-responses"}}"#,
+            ),
+        })
+        .expect("message insert");
+
+    let plan_id = "plan-waiting-lifecycle";
+    let phase_id = "plan-waiting-lifecycle-phase-1";
+    let step_id = "plan-waiting-lifecycle-step-1";
+    database
+        .create_plan(NewPlan {
+            id: plan_id,
+            title: "Waiting lifecycle",
+            overview: "Parent Waiting must keep phase running after step complete.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: phase_id,
+                title: "Phase one",
+                summary: "Coordinator waits on subagent.",
+                steps: vec![NewPlanStep {
+                    id: step_id,
+                    title: "Do work",
+                    detail: "May complete while parent waits.",
+                    acceptance: vec!["parent finishes".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan(plan_id, "start")
+        .expect("start plan");
+    let plan_attempt = database
+        .begin_plan_phase_attempt(
+            plan_id,
+            phase_id,
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let plan_attempt_id = plan_attempt.id.clone();
+
+    let parent_task_id =
+        insert_waiting_coordinator_task(&mut database, chat_id, user_message_id, "plan-wait-life");
+    let parent = database
+        .agent_task(&parent_task_id)
+        .expect("parent")
+        .expect("parent");
+    assert_eq!(parent.status, foco_agent::AgentTaskStatus::Waiting);
+
+    database
+        .attach_plan_phase_attempt_run(&plan_attempt_id, chat_id, &parent.team_id, &parent_task_id)
+        .expect("attach plan phase");
+
+    let worker_id =
+        foco_agent::AgentInstanceId::new("agent-instance-plan-wait-life-worker").expect("worker");
+    let worker_definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-plan-wait-life-worker")
+            .expect("definition id"),
+        revision: 1,
+        name: "Wait life worker".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Review.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .create_agent_instances_with_limits(
+            &[foco_store::workspace::NewAgentInstance {
+                id: &worker_id,
+                team_id: &parent.team_id,
+                definition: &worker_definition,
+                role: foco_agent::AgentRole::Worker,
+                execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                execution_root_path: None,
+                worktree_base_revision: None,
+                worktree_branch: None,
+                worktree_status: None,
+            }],
+            2,
+            1,
+        )
+        .expect("worker create");
+    let child_task_id =
+        foco_agent::AgentTaskId::new("agent-task-plan-wait-life-child").expect("child");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &child_task_id,
+            team_id: &parent.team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&parent.owner_instance_id),
+            parent_task_id: Some(&parent_task_id),
+            input_json: r#"{"goal":"review"}"#,
+        })
+        .expect("child enqueue");
+    database
+        .insert_agent_task_dependency(foco_store::workspace::NewAgentTaskDependency {
+            team_id: &parent.team_id,
+            waiting_task_id: &parent_task_id,
+            dependency_task_id: &child_task_id,
+            wait_mode: foco_agent::AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-plan-wait-life"),
+            deadline_at: None,
+        })
+        .expect("wait dependency");
+
+    // Last step completed while parent is still Waiting: progress only.
+    let mid = database
+        .update_plan_step(
+            plan_id,
+            step_id,
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step while waiting");
+    assert_eq!(mid.status, "running");
+    assert_eq!(mid.active_phase_id.as_deref(), Some(phase_id));
+    assert_eq!(mid.phases[0].status, "running");
+    assert_eq!(mid.phases[0].steps[0].status, "completed");
+    assert_eq!(mid.phases[0].attempts[0].status, "running");
+    assert_eq!(mid.phases[0].attempts[0].id, plan_attempt_id);
+    assert_eq!(
+        mid.phases[0].agent_task_id.as_deref(),
+        Some(parent_task_id.as_str())
+    );
+
+    let chat = database.chat(chat_id).expect("chat").expect("chat");
+    let summary =
+        chat_summary(&mut database, chat, CodeChangeStats::default(), None).expect("summary");
+    assert!(
+        summary.queued_run.is_some(),
+        "queuedRun must remain recoverable while coordinator waits"
+    );
+    assert_eq!(
+        database
+            .agent_task(&parent_task_id)
+            .expect("parent")
+            .expect("parent")
+            .status,
+        foco_agent::AgentTaskStatus::Waiting
+    );
+
+    // Child finishes; parent resumes Running without a new plan phase attempt.
+    let child_attempt = foco_agent::AgentAttemptId::new("agent-attempt-plan-wait-life-child")
+        .expect("child attempt");
+    database
+        .claim_runnable_agent_task(&parent.team_id, &child_task_id, &child_attempt)
+        .expect("claim child")
+        .expect("claimed child");
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &parent.team_id,
+            task_id: &child_task_id,
+            expected_status: foco_agent::AgentTaskStatus::Running,
+            transition: foco_agent::AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"child done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete child");
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &parent.team_id,
+            task_id: &parent_task_id,
+            expected_status: foco_agent::AgentTaskStatus::Waiting,
+            transition: foco_agent::AgentTaskTransition::Resume,
+            result_json: None,
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("resume parent");
+
+    let after_resume = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(after_resume.status, "running");
+    assert_eq!(after_resume.phases[0].status, "running");
+    assert_eq!(after_resume.phases[0].attempts.len(), 1);
+    assert_eq!(after_resume.phases[0].attempts[0].id, plan_attempt_id);
+    assert_eq!(after_resume.phases[0].attempts[0].status, "running");
+    assert_eq!(
+        after_resume.phases[0].agent_task_id.as_deref(),
+        Some(parent_task_id.as_str())
+    );
+    assert_eq!(
+        database
+            .agent_task(&parent_task_id)
+            .expect("parent")
+            .expect("parent")
+            .status,
+        foco_agent::AgentTaskStatus::Running
+    );
+
+    // Parent terminal outcome (finish_claimed_task Complete) then lifecycle close.
+    database
+        .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+            team_id: &parent.team_id,
+            task_id: &parent_task_id,
+            expected_status: foco_agent::AgentTaskStatus::Running,
+            transition: foco_agent::AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"phase done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete parent task");
+    let completed = database
+        .complete_plan_phase_run(&parent_task_id, Some("deadbeef"))
+        .expect("complete_plan_phase_run")
+        .expect("plan");
+    assert_eq!(completed.status, "implemented");
+    assert_eq!(completed.phases[0].status, "completed");
+    assert_eq!(completed.phases[0].attempts.len(), 1);
+    assert_eq!(completed.phases[0].attempts[0].id, plan_attempt_id);
+    assert_eq!(completed.phases[0].attempts[0].status, "completed");
+    assert_eq!(
+        completed.phases[0].attempts[0].commit_id.as_deref(),
+        Some("deadbeef")
+    );
+
+    // Completing again is a no-op for a settled phase (single completion).
+    let again = database
+        .complete_plan_phase_run(&parent_task_id, Some("deadbeef"))
+        .expect("second complete")
+        .expect("plan");
+    assert_eq!(again.status, "implemented");
+    assert_eq!(again.phases[0].attempts.len(), 1);
+    assert_eq!(again.phases[0].attempts[0].status, "completed");
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn agent_scheduler_reconciliation_repairs_premature_plan_phase_completion() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-premature-reconcile-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-premature-reconcile-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let plan_id = "plan-premature-startup";
+    let phase_id = "plan-premature-startup-phase-1";
+    let step_id = "plan-premature-startup-step-1";
+    let task_id;
+    let attempt_id;
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .insert_chat("chat-premature-startup", "Premature startup")
+            .expect("chat insert");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Premature startup",
+                overview: "Startup repair reopens false completed phase.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    NewPlanPhase {
+                        id: phase_id,
+                        title: "Phase one",
+                        summary: "False completed while task waits.",
+                        steps: vec![NewPlanStep {
+                            id: step_id,
+                            title: "Do work",
+                            detail: "Step stays completed.",
+                            acceptance: vec!["repaired".to_string()],
+                        }],
+                    },
+                    NewPlanPhase {
+                        id: "plan-premature-startup-phase-2",
+                        title: "Phase two",
+                        summary: "Still pending — safe to repair phase one.",
+                        steps: vec![NewPlanStep {
+                            id: "plan-premature-startup-step-2",
+                            title: "Later",
+                            detail: "Pending.",
+                            acceptance: vec!["later".to_string()],
+                        }],
+                    },
+                ],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                plan_id,
+                phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        attempt_id = attempt.id.clone();
+        task_id = insert_waiting_coordinator_task(
+            &mut database,
+            "chat-premature-startup",
+            "user-premature-startup",
+            "premature-startup",
+        );
+        let task = database.agent_task(&task_id).expect("task").expect("task");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt_id,
+                "chat-premature-startup",
+                &task.team_id,
+                &task_id,
+            )
+            .expect("attach");
+        database
+            .update_plan_step(
+                plan_id,
+                step_id,
+                PlanStepPatch {
+                    title: None,
+                    detail: None,
+                    acceptance: None,
+                    status: Some("completed"),
+                },
+            )
+            .expect("complete step");
+
+        let connection = Connection::open(database.database_path()).expect("raw db");
+        connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     commit_id = NULL,
+                     error_message = NULL,
+                     completed_at = '2026-07-16T00:00:00.000Z'
+                 WHERE id = ?1",
+                params![phase_id],
+            )
+            .expect("force completed phase");
+        connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'completed',
+                     commit_id = NULL,
+                     error_message = NULL,
+                     completed_at = '2026-07-16T00:00:00.000Z'
+                 WHERE id = ?1",
+                params![attempt_id],
+            )
+            .expect("force completed attempt");
+        connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'ready',
+                     active_phase_id = NULL,
+                     completed_at = NULL
+                 WHERE id = ?1",
+                params![plan_id],
+            )
+            .expect("force plan not running");
+        drop(connection);
+    }
+
+    let state = test_app_state(config, profile_dir.clone());
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+    let plan = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(plan.status, "running");
+    assert_eq!(plan.active_phase_id.as_deref(), Some(phase_id));
+    assert_eq!(plan.phases[0].status, "running");
+    assert!(plan.phases[0].completed_at.is_none());
+    assert_eq!(plan.phases[0].steps[0].status, "completed");
+    assert_eq!(plan.phases[0].attempts[0].status, "running");
+    assert!(plan.phases[0].attempts[0].completed_at.is_none());
+    assert_eq!(plan.phases[1].status, "pending");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Waiting
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn agent_scheduler_reconciliation_skips_premature_repair_when_later_phase_active() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-premature-skip-later-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-premature-skip-later-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let plan_id = "plan-premature-skip-later-app";
+    let phase1 = "plan-premature-skip-later-app-phase-1";
+    let phase2 = "plan-premature-skip-later-app-phase-2";
+    let attempt1_id;
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .insert_chat("chat-premature-skip-later-app", "Skip later")
+            .expect("chat insert");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Skip later app",
+                overview: "Later phase activity blocks auto-repair.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    NewPlanPhase {
+                        id: phase1,
+                        title: "Phase one",
+                        summary: "Ambiguous completed.",
+                        steps: vec![NewPlanStep {
+                            id: "plan-premature-skip-later-app-step-1",
+                            title: "One",
+                            detail: "Done early.",
+                            acceptance: vec!["done".to_string()],
+                        }],
+                    },
+                    NewPlanPhase {
+                        id: phase2,
+                        title: "Phase two",
+                        summary: "Already running.",
+                        steps: vec![NewPlanStep {
+                            id: "plan-premature-skip-later-app-step-2",
+                            title: "Two",
+                            detail: "Active later phase.",
+                            acceptance: vec!["running".to_string()],
+                        }],
+                    },
+                ],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                plan_id,
+                phase1,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        attempt1_id = attempt.id.clone();
+        let task_id = insert_waiting_coordinator_task(
+            &mut database,
+            "chat-premature-skip-later-app",
+            "user-premature-skip-later-app",
+            "premature-skip-later-app",
+        );
+        let task = database.agent_task(&task_id).expect("task").expect("task");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt1_id,
+                "chat-premature-skip-later-app",
+                &task.team_id,
+                &task_id,
+            )
+            .expect("attach");
+
+        let connection = Connection::open(database.database_path()).expect("raw db");
+        connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     commit_id = NULL,
+                     error_message = NULL,
+                     completed_at = '2026-07-16T00:00:00.000Z'
+                 WHERE id = ?1",
+                params![phase1],
+            )
+            .expect("force phase1 completed");
+        connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'completed',
+                     completed_at = '2026-07-16T00:00:00.000Z'
+                 WHERE id = ?1",
+                params![attempt1_id],
+            )
+            .expect("force attempt completed");
+        connection
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     commit_id = 'later-phase-commit',
+                     error_message = NULL,
+                     completed_at = '2026-07-16T00:00:01.000Z',
+                     started_at = COALESCE(started_at, '2026-07-16T00:00:01.000Z')
+                 WHERE id = ?1",
+                params![phase2],
+            )
+            .expect("force phase2 completed with commit (later activity)");
+        connection
+            .execute(
+                "UPDATE plans
+                 SET status = 'running',
+                     active_phase_id = NULL
+                 WHERE id = ?1",
+                params![plan_id],
+            )
+            .expect("plan after later phase progressed");
+        drop(connection);
+    }
+
+    let state = test_app_state(config, profile_dir.clone());
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+    let plan = database.plan(plan_id).expect("plan").expect("plan");
+    // Phase 1 stays false-completed: later phase activity makes repair ambiguous.
+    assert_eq!(plan.phases[0].status, "completed");
+    assert_eq!(plan.phases[0].attempts[0].status, "completed");
+    assert_eq!(plan.phases[1].status, "completed");
+    assert_eq!(
+        plan.phases[1].commit_id.as_deref(),
+        Some("later-phase-commit")
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 fn insert_claimed_agent_task(

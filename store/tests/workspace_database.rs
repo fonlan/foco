@@ -3958,8 +3958,7 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
         let plan_before = database.plan(&plan_id).expect("plan").expect("plan");
         assert!(
             plan_before.phases[0].attempts.is_empty()
-                || plan_before
-                    .phases[0]
+                || plan_before.phases[0]
                     .attempts
                     .iter()
                     .all(|attempt| !matches!(attempt.status.as_str(), "queued" | "running")),
@@ -3974,10 +3973,8 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
         let team_id = AgentTeamId::new(format!("agent-team-merge-task-gate-{suffix}-merge"))
             .expect("team id");
         if suffix != "queued" {
-            let attempt_id = AgentAttemptId::new(format!(
-                "agent-attempt-merge-task-gate-{suffix}"
-            ))
-            .expect("attempt");
+            let attempt_id = AgentAttemptId::new(format!("agent-attempt-merge-task-gate-{suffix}"))
+                .expect("attempt");
             database
                 .claim_runnable_agent_task(&team_id, &merge_task_id, &attempt_id)
                 .expect("claim")
@@ -4018,8 +4015,7 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
         );
         assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
         assert_eq!(
-            updated.phases[0].steps[0].status,
-            "completed",
+            updated.phases[0].steps[0].status, "completed",
             "step for {suffix}"
         );
         assert!(updated.phases[0].steps[0].checked_at.is_some());
@@ -4098,10 +4094,8 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
         assert_eq!(plan_before.phases[0].status, "running");
         assert_eq!(plan_before.phases[0].steps[0].status, "completed");
 
-        let team_id = AgentTeamId::new(format!(
-            "agent-team-terminal-before-sync-{suffix}-merge"
-        ))
-        .expect("team id");
+        let team_id = AgentTeamId::new(format!("agent-team-terminal-before-sync-{suffix}-merge"))
+            .expect("team id");
         let attempt_id =
             AgentAttemptId::new(format!("agent-attempt-terminal-before-sync-{suffix}"))
                 .expect("attempt");
@@ -4145,8 +4139,7 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
         );
         assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
         assert_eq!(
-            updated.phases[0].steps[0].status,
-            "completed",
+            updated.phases[0].steps[0].status, "completed",
             "step for {suffix}"
         );
         assert!(updated.phases[0].steps[0].checked_at.is_some());
@@ -4170,19 +4163,31 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
         match transition {
             AgentTaskTransition::Complete => {
                 assert_eq!(closed.status, "implemented", "final plan for {suffix}");
-                assert_eq!(closed.phases[0].status, "completed", "final phase for {suffix}");
+                assert_eq!(
+                    closed.phases[0].status, "completed",
+                    "final phase for {suffix}"
+                );
             }
             AgentTaskTransition::Cancel => {
                 assert_eq!(closed.status, "paused", "final plan for {suffix}");
-                assert_eq!(closed.phases[0].status, "cancelled", "final phase for {suffix}");
+                assert_eq!(
+                    closed.phases[0].status, "cancelled",
+                    "final phase for {suffix}"
+                );
             }
             AgentTaskTransition::Fail | AgentTaskTransition::Interrupt => {
                 assert_eq!(closed.status, "failed", "final plan for {suffix}");
-                assert_eq!(closed.phases[0].status, "failed", "final phase for {suffix}");
+                assert_eq!(
+                    closed.phases[0].status, "failed",
+                    "final phase for {suffix}"
+                );
             }
             _ => unreachable!("unexpected transition for {suffix}"),
         }
-        assert!(closed.active_phase_id.is_none(), "active phase for {suffix}");
+        assert!(
+            closed.active_phase_id.is_none(),
+            "active phase for {suffix}"
+        );
     }
 }
 
@@ -4302,6 +4307,392 @@ fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
         assert_eq!(attempts[1].status, "failed");
         assert_eq!(attempts[1].error_message.as_deref(), Some("old terminal"));
     }
+}
+
+#[test]
+fn reconcile_prematurely_completed_plan_phases_reopens_active_task_phase() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-premature-reopen",
+            title: "Premature reopen",
+            overview: "Startup repair reopens false completed phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-premature-reopen-phase-1",
+                title: "Phase one",
+                summary: "Still executing.",
+                steps: vec![NewPlanStep {
+                    id: "plan-premature-reopen-step-1",
+                    title: "Do work",
+                    detail: "Completed early via bug.",
+                    acceptance: vec!["step completed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-premature-reopen", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-premature-reopen",
+            "plan-premature-reopen-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-premature-reopen", "premature-reopen");
+    let task_id = AgentTaskId::new("agent-task-premature-reopen").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-reopen", &team_id, &task_id)
+        .expect("attach attempt");
+    let agent_attempt_id =
+        AgentAttemptId::new("agent-attempt-premature-reopen").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Wait,
+            result_json: Some(r#"{"control":{"kind":"agent_wait_tasks"}}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("wait task");
+    database
+        .update_plan_step(
+            "plan-premature-reopen",
+            "plan-premature-reopen-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step");
+
+    // Simulate the pre-fix row shape: phase/attempt completed without commit
+    // while the bound task is still waiting (step remains completed).
+    let connection = Connection::open(database.database_path()).expect("open database");
+    connection
+        .execute(
+            "UPDATE plan_phases
+             SET status = 'completed',
+                 commit_id = NULL,
+                 error_message = NULL,
+                 completed_at = '2026-07-16T00:00:00.000Z',
+                 updated_at = '2026-07-16T00:00:00.000Z'
+             WHERE id = 'plan-premature-reopen-phase-1'",
+            [],
+        )
+        .expect("force phase completed");
+    connection
+        .execute(
+            "UPDATE plan_phase_attempts
+             SET status = 'completed',
+                 commit_id = NULL,
+                 error_message = NULL,
+                 completed_at = '2026-07-16T00:00:00.000Z',
+                 updated_at = '2026-07-16T00:00:00.000Z'
+             WHERE id = ?1",
+            params![attempt.id],
+        )
+        .expect("force attempt completed");
+    connection
+        .execute(
+            "UPDATE plans
+             SET status = 'implemented',
+                 active_phase_id = NULL,
+                 completed_at = '2026-07-16T00:00:00.000Z',
+                 updated_at = '2026-07-16T00:00:00.000Z'
+             WHERE id = 'plan-premature-reopen'",
+            [],
+        )
+        .expect("force plan implemented");
+    drop(connection);
+
+    let repaired = database
+        .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+        .expect("reconcile premature");
+    assert_eq!(repaired, 1);
+
+    let plan = database
+        .plan("plan-premature-reopen")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "running");
+    assert_eq!(
+        plan.active_phase_id.as_deref(),
+        Some("plan-premature-reopen-phase-1")
+    );
+    assert_eq!(plan.phases[0].status, "running");
+    assert!(plan.phases[0].completed_at.is_none());
+    assert_eq!(plan.phases[0].steps[0].status, "completed");
+    assert!(plan.phases[0].steps[0].checked_at.is_some());
+    assert_eq!(plan.phases[0].attempts[0].status, "running");
+    assert!(plan.phases[0].attempts[0].completed_at.is_none());
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Waiting
+    );
+}
+
+#[test]
+fn reconcile_prematurely_completed_plan_phases_skips_when_later_phase_active() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-premature-skip-later",
+            title: "Premature skip later",
+            overview: "Do not reopen when a later phase already progressed.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-premature-skip-later-phase-1",
+                    title: "Phase one",
+                    summary: "False completed.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-premature-skip-later-step-1",
+                        title: "Do work",
+                        detail: "Completed early.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-premature-skip-later-phase-2",
+                    title: "Phase two",
+                    summary: "Already running.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-premature-skip-later-step-2",
+                        title: "Next",
+                        detail: "Later activity.",
+                        acceptance: vec!["running".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-premature-skip-later", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-premature-skip-later",
+            "plan-premature-skip-later-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-premature-skip-later",
+        "premature-skip-later",
+    );
+    let task_id = AgentTaskId::new("agent-task-premature-skip-later").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-skip-later", &team_id, &task_id)
+        .expect("attach attempt");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &task_id,
+            &AgentAttemptId::new("agent-attempt-premature-skip-later").expect("attempt"),
+        )
+        .expect("claim")
+        .expect("claimed");
+
+    let connection = Connection::open(database.database_path()).expect("open database");
+    connection
+        .execute(
+            "UPDATE plan_phases
+             SET status = 'completed',
+                 commit_id = NULL,
+                 error_message = NULL,
+                 completed_at = '2026-07-16T00:00:00.000Z'
+             WHERE id = 'plan-premature-skip-later-phase-1'",
+            [],
+        )
+        .expect("force phase 1 completed");
+    connection
+        .execute(
+            "UPDATE plan_phase_attempts
+             SET status = 'completed',
+                 completed_at = '2026-07-16T00:00:00.000Z'
+             WHERE id = ?1",
+            params![attempt.id],
+        )
+        .expect("force attempt completed");
+    connection
+        .execute(
+            "UPDATE plan_phases
+             SET status = 'running',
+                 started_at = COALESCE(started_at, '2026-07-16T00:00:01.000Z'),
+                 completed_at = NULL
+             WHERE id = 'plan-premature-skip-later-phase-2'",
+            [],
+        )
+        .expect("mark later phase running");
+    connection
+        .execute(
+            "UPDATE plans
+             SET status = 'running',
+                 active_phase_id = 'plan-premature-skip-later-phase-2'
+             WHERE id = 'plan-premature-skip-later'",
+            [],
+        )
+        .expect("point plan at phase 2");
+    drop(connection);
+
+    let repaired = database
+        .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+        .expect("reconcile");
+    assert_eq!(repaired, 0);
+
+    let plan = database
+        .plan("plan-premature-skip-later")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.phases[0].status, "completed");
+    assert_eq!(plan.phases[0].attempts[0].status, "completed");
+    assert_eq!(plan.phases[1].status, "running");
+    assert_eq!(
+        plan.active_phase_id.as_deref(),
+        Some("plan-premature-skip-later-phase-2")
+    );
+}
+
+#[test]
+fn reconcile_prematurely_completed_plan_phases_skips_real_commit_and_terminal_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-premature-skip-real",
+            title: "Premature skip real",
+            overview: "Real commit or terminal task must not reopen.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-premature-skip-real-phase-1",
+                title: "Phase one",
+                summary: "Legitimately completed.",
+                steps: vec![NewPlanStep {
+                    id: "plan-premature-skip-real-step-1",
+                    title: "Do work",
+                    detail: "Finished.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-premature-skip-real", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-premature-skip-real",
+            "plan-premature-skip-real-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-premature-skip-real",
+        "premature-skip-real",
+    );
+    let task_id = AgentTaskId::new("agent-task-premature-skip-real").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-skip-real", &team_id, &task_id)
+        .expect("attach attempt");
+    let agent_attempt_id =
+        AgentAttemptId::new("agent-attempt-premature-skip-real").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete task");
+    database
+        .complete_plan_phase_run(&task_id, Some("deadbeef"))
+        .expect("complete phase")
+        .expect("plan");
+
+    let repaired = database
+        .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+        .expect("reconcile");
+    assert_eq!(repaired, 0);
+    let plan = database
+        .plan("plan-premature-skip-real")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "implemented");
+    assert_eq!(plan.phases[0].status, "completed");
+    assert_eq!(plan.phases[0].commit_id.as_deref(), Some("deadbeef"));
+    assert_eq!(plan.phases[0].attempts[0].status, "completed");
 }
 
 #[test]

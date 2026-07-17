@@ -373,6 +373,12 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 "Plan phase start did not create an implementation chat or Agent task",
             )
             .map_err(ApiError::from_workspace_error)?;
+        // Before terminal attempt reconciliation: reopen false `completed`
+        // phases whose bound Agent task is still Queued/Running/Waiting so a
+        // stale completed phase cannot force live attempts terminal.
+        database
+            .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+            .map_err(ApiError::from_workspace_error)?;
         database
             .reconcile_plan_phase_attempts_for_terminal_phases()
             .map_err(ApiError::from_workspace_error)?;

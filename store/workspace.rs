@@ -3883,6 +3883,140 @@ impl WorkspaceDatabase {
         Ok(count)
     }
 
+    /// Startup-only repair for the pre-fix bug where step aggregation marked a
+    /// phase (and its attempt) `completed` while the bound Agent task was still
+    /// Queued/Running/Waiting. Safe only when there is no real lifecycle
+    /// terminal evidence (`commit_id` / `error_message`) and no later phase has
+    /// already progressed. Runs before
+    /// [`Self::reconcile_plan_phase_attempts_for_terminal_phases`] so a false
+    /// completed phase cannot force live attempts terminal.
+    pub fn reconcile_prematurely_completed_plan_phases_with_active_tasks(
+        &mut self,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let candidates = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT phase.plan_id,
+                            phase.id,
+                            phase.sequence,
+                            phase.agent_task_id,
+                            plan.status
+                     FROM plan_phases AS phase
+                     JOIN plans AS plan ON plan.id = phase.plan_id
+                     JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                     WHERE phase.status = 'completed'
+                       AND (phase.commit_id IS NULL OR TRIM(phase.commit_id) = '')
+                       AND (phase.error_message IS NULL OR TRIM(phase.error_message) = '')
+                       AND task.status IN ('queued', 'running', 'waiting')
+                       AND plan.status NOT IN ('completed', 'cancelled')
+                     ORDER BY phase.plan_id ASC, phase.sequence ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+
+        let mut repaired = 0usize;
+        let mut plans_to_refresh = Vec::new();
+        let now = now_timestamp();
+        for (plan_id, phase_id, sequence, agent_task_id, plan_status) in candidates {
+            let later_activity: i64 = self
+                .connection
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM plan_phases
+                     WHERE plan_id = ?1
+                       AND sequence > ?2
+                       AND status IN ('running', 'completed', 'failed', 'cancelled')",
+                    params![plan_id.as_str(), sequence],
+                    |row| row.get(0),
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            if later_activity > 0 {
+                tracing::warn!(
+                    plan_id = %plan_id,
+                    phase_id = %phase_id,
+                    agent_task_id = %agent_task_id,
+                    plan_status = %plan_status,
+                    later_activity,
+                    "skipping premature plan phase completion repair: later phase activity makes rollback ambiguous"
+                );
+                continue;
+            }
+
+            self.connection
+                .execute(
+                    "UPDATE plan_phases
+                     SET status = 'running',
+                         completed_at = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1
+                       AND status = 'completed'
+                       AND (commit_id IS NULL OR TRIM(commit_id) = '')
+                       AND (error_message IS NULL OR TRIM(error_message) = '')",
+                    params![phase_id.as_str(), now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+
+            // Reopen only the attempt bound to the still-active task (and any
+            // other completed attempts on this phase that lack lifecycle
+            // terminal evidence). Historical failed/interrupted attempts stay.
+            self.connection
+                .execute(
+                    "UPDATE plan_phase_attempts
+                     SET status = 'running',
+                         completed_at = NULL,
+                         updated_at = ?3
+                     WHERE phase_id = ?1
+                       AND plan_id = ?2
+                       AND status = 'completed'
+                       AND (commit_id IS NULL OR TRIM(commit_id) = '')
+                       AND (error_message IS NULL OR TRIM(error_message) = '')
+                       AND (
+                           agent_task_id = ?4
+                           OR agent_task_id IS NULL
+                       )",
+                    params![
+                        phase_id.as_str(),
+                        plan_id.as_str(),
+                        now,
+                        agent_task_id.as_str()
+                    ],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+
+            tracing::info!(
+                plan_id = %plan_id,
+                phase_id = %phase_id,
+                agent_task_id = %agent_task_id,
+                previous_plan_status = %plan_status,
+                "repaired prematurely completed plan phase while bound Agent task is still active"
+            );
+            repaired += 1;
+            if !plans_to_refresh.iter().any(|id| id == &plan_id) {
+                plans_to_refresh.push(plan_id);
+            }
+        }
+
+        for plan_id in plans_to_refresh {
+            // Restores plan `running` and `active_phase_id` via the unified
+            // step/execution priority (keeps completed steps).
+            self.refresh_plan_status_from_steps(&plan_id)?;
+        }
+        Ok(repaired)
+    }
+
     pub fn reconcile_plan_phase_attempts_for_terminal_phases(
         &mut self,
     ) -> Result<usize, WorkspaceDatabaseError> {
