@@ -2716,9 +2716,8 @@ fn remote_sidecar_record_run_event(
     run_stream: &RemoteActiveRunStream,
     sequence: i64,
     payload: Value,
-) -> Event {
-    run_stream.record(sequence, payload.clone());
-    remote_sse_json_event(sequence, payload)
+) {
+    run_stream.record(sequence, payload);
 }
 
 fn remote_sidecar_snapshot_run_events(
@@ -12583,6 +12582,871 @@ fn remote_chat_completion_event(
     })
 }
 
+/// Read-only SSE subscription over an active remote run stream.
+/// Dropping this stream only releases the broadcast receiver; it never cancels
+/// the background runner or removes the active run.
+fn remote_sidecar_subscribe_run_stream(
+    run_stream: RemoteActiveRunStream,
+    after_sequence: i64,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut rx = run_stream.tx.subscribe();
+        let replay = run_stream.snapshot_after(after_sequence);
+        let mut last_sent_sequence = after_sequence;
+        for (sequence, event) in replay {
+            if sequence <= last_sent_sequence {
+                continue;
+            }
+            let terminal = remote_stream_event_is_terminal(&event);
+            yield Ok(remote_sse_json_event(sequence, event));
+            last_sent_sequence = sequence;
+            if terminal {
+                return;
+            }
+        }
+        while !run_stream.finished.load(Ordering::Relaxed) {
+            tokio::select! {
+                event = rx.recv() => {
+                    match event {
+                        Ok((sequence, event)) => {
+                            if sequence <= last_sent_sequence {
+                                continue;
+                            }
+                            let terminal = remote_stream_event_is_terminal(&event);
+                            yield Ok(remote_sse_json_event(sequence, event));
+                            last_sent_sequence = sequence;
+                            if terminal {
+                                return;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            let sequence = last_sent_sequence.saturating_add(1);
+                            yield Ok(remote_sse_json_event(sequence, json!({
+                                "type": "error",
+                                "message": "remote run stream history was truncated; reload chat messages to recover persisted state",
+                            })));
+                            yield Ok(remote_sse_json_event(sequence.saturating_add(1), json!({ "type": "streamEnd" })));
+                            return;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+                // Poll finished: mark_finished may race with the last broadcast recv.
+                _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+            }
+        }
+        // Drain any events recorded between the finished check and loop exit.
+        for (sequence, event) in run_stream.snapshot_after(last_sent_sequence) {
+            if sequence <= last_sent_sequence {
+                continue;
+            }
+            let terminal = remote_stream_event_is_terminal(&event);
+            yield Ok(remote_sse_json_event(sequence, event));
+            last_sent_sequence = sequence;
+            if terminal {
+                return;
+            }
+        }
+    }
+}
+
+/// Owned state for a remote chat run that outlives any single SSE subscription.
+struct RemoteSidecarChatRunContext {
+    state: RemoteSidecarState,
+    run_id: String,
+    chat_id: String,
+    chat_title: String,
+    queued_user_message_id: String,
+    assistant_message_id: String,
+    model_id: String,
+    provider_id: String,
+    run_stream: RemoteActiveRunStream,
+    initial_provider_request: NeutralChatRequest,
+    tool_catalog: Arc<RemoteToolCatalog>,
+    session_mode: Option<String>,
+    skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
+    initial_runtime_tool_state: RemoteSidecarRuntimeToolState,
+}
+
+async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext) {
+    let RemoteSidecarChatRunContext {
+        state: stream_state,
+        run_id,
+        chat_id,
+        chat_title,
+        queued_user_message_id,
+        assistant_message_id,
+        model_id,
+        mut provider_id,
+        run_stream,
+        initial_provider_request,
+        tool_catalog,
+        session_mode,
+        skill_read_root_dirs,
+        attachment_read_allowlist,
+        initial_runtime_tool_state,
+    } = ctx;
+
+    // Create first so disconnect during mark/prepare still clears queuedRun.
+    let cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
+        stream_state.clone(),
+        run_id.clone(),
+        queued_user_message_id.clone(),
+    );
+    // Open the run-owned connection after spawn so the HTTP response body never holds DB permits.
+    let mut database =
+        match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
+            Ok(database) => database,
+            Err(error) => {
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    0,
+                    json!({
+                        "type": "error",
+                        "message": error.to_string(),
+                    }),
+                );
+                remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                // Leave armed so Drop clears queuedRun after this early exit path.
+                drop(cleanup_guard);
+                return;
+            }
+        };
+    if let Err(error) =
+        remote_mark_message_queued_run_started(&mut database, &queued_user_message_id)
+    {
+        remote_sidecar_record_run_event(
+            &run_stream,
+            0,
+            json!({
+                "type": "error",
+                "message": error.to_string(),
+            }),
+        );
+        remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+        remote_sidecar_finish_active_run(&stream_state, &run_id);
+        // Leave armed so Drop clears queuedRun after this early exit path.
+        drop(cleanup_guard);
+        return;
+    }
+    let mut sequence = 0_i64;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut run_metrics = RemoteSidecarRunMetrics::new();
+    let mut current_request = initial_provider_request;
+    let mut runtime_tool_state = initial_runtime_tool_state;
+    let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
+    // Accumulates start+completed compression details for this run so final
+    // assistant metadata.parts can include history-reload bubbles.
+    let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
+    // Ordered parts closed by reasoning-loop recoveries (before open turn suffix).
+    let mut content_parts_prefix: Vec<Value> = Vec::new();
+    let mut flushed_text_len = 0usize;
+    let mut flushed_reasoning_len = 0usize;
+    let mut reasoning_loop_recovery_count = 0usize;
+    remote_sidecar_record_run_event(
+        &run_stream,
+        sequence,
+        json!({
+            "type": "start",
+            "chatId": chat_id,
+            "userMessageId": queued_user_message_id,
+            "assistantMessageId": assistant_message_id,
+            "memoriesUsed": [],
+        }),
+    );
+    sequence += 1;
+    remote_sidecar_record_run_event(
+        &run_stream,
+        sequence,
+        json!({
+            "type": "connecting",
+            "message": "connecting to remote broker",
+        }),
+    );
+    let mut last_yielded_sequence = sequence;
+
+    'run: loop {
+        // Before every brokered chat completion request (first turn and tool follow-ups):
+        // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
+        // Live-yield ContextCompression (start before broker summary) while ensure runs.
+        // ensure holds `&mut database` for snapshot writes; open a separate connection so
+        // start/completed run_events can persist before the client sees each SSE event.
+        let mut live_compression_db =
+            match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
+                Ok(db) => Some(db),
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        chat_id = %chat_id,
+                        run_id = %run_id,
+                        "failed to open workspace database for live context compression run_events"
+                    );
+                    None
+                }
+            };
+        let compression_result = {
+            let (compression_event_tx, mut compression_event_rx) =
+                mpsc::unbounded_channel::<RemoteSidecarContextCompressionEventDetail>();
+            let mut compression_future =
+                std::pin::pin!(runtime_tool_state.ensure_compression_then_pack(
+                    &mut current_request.messages,
+                    &stream_state,
+                    &run_stream,
+                    &mut database,
+                    &stream_state.workspace_id,
+                    &chat_id,
+                    &run_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &provider_id,
+                    &model_id,
+                    Some(compression_event_tx),
+                ));
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut compression_future => {
+                        while let Ok(detail) = compression_event_rx.try_recv() {
+                            sequence += 1;
+                            let payload = remote_sidecar_context_compression_sse_event(
+                                &assistant_message_id,
+                                &detail,
+                            );
+                            if let Some(db) = live_compression_db.as_mut() {
+                                remote_sidecar_persist_context_compression_run_event(
+                                    db,
+                                    &chat_id,
+                                    &run_id,
+                                    sequence,
+                                    &payload,
+                                );
+                            }
+                            run_compression_events.push(detail);
+                            remote_sidecar_record_run_event(
+                                &run_stream,
+                                sequence,
+                                payload,
+                            );
+                            last_yielded_sequence = sequence;
+                        }
+                        break result;
+                    }
+                    maybe_detail = compression_event_rx.recv() => {
+                        let Some(detail) = maybe_detail else {
+                            break compression_future.await;
+                        };
+                        sequence += 1;
+                        let payload = remote_sidecar_context_compression_sse_event(
+                            &assistant_message_id,
+                            &detail,
+                        );
+                        if let Some(db) = live_compression_db.as_mut() {
+                            remote_sidecar_persist_context_compression_run_event(
+                                db,
+                                &chat_id,
+                                &run_id,
+                                sequence,
+                                &payload,
+                            );
+                        }
+                        run_compression_events.push(detail);
+                        remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            payload,
+                        );
+                        last_yielded_sequence = sequence;
+                    }
+                }
+            }
+        };
+        drop(live_compression_db);
+        for notification in run_stream.take_hook_notifications() {
+            sequence += 1;
+            remote_sidecar_record_run_event(
+                &run_stream,
+                sequence,
+                json!({
+                    "type": "hookNotification",
+                    "assistantMessageId": assistant_message_id,
+                    "notification": notification,
+                }),
+            );
+            last_yielded_sequence = sequence;
+        }
+        let (packed_messages, _compression_events) = match compression_result {
+            Ok(result) => result,
+            Err(error) => {
+                let message = error.message;
+                if !run_compression_events.is_empty() {
+                    // Keep live start/completed compression blocks durable in message parts
+                    // even when ensure fails (e.g. summary cancelled after start).
+                    let assistant_sequence = database
+                        .message(&assistant_message_id)
+                        .ok()
+                        .flatten()
+                        .map(|message| message.sequence)
+                        .unwrap_or_else(|| {
+                            database
+                                .next_message_sequence_for_chat(&chat_id)
+                                .unwrap_or(0)
+                        });
+                    let metadata = json!({
+                        "parts": remote_chat_parts_with_context_compression(
+                            "",
+                            None,
+                            &run_compression_events,
+                            &content_parts_prefix,
+                        ),
+                        "partsVersion": 5,
+                        "partsSource": "live_sse",
+                        "streamingState": "failed",
+                    });
+                    let _ = database.upsert_message_content(NewMessage {
+                        id: &assistant_message_id,
+                        chat_id: &chat_id,
+                        role: "assistant",
+                        content: "",
+                        sequence: assistant_sequence,
+                        metadata_json: Some(&metadata.to_string()),
+                    });
+                }
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                );
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({ "type": "streamEnd" }),
+                );
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
+                break;
+            }
+        };
+        // Live path already yielded compression events; do not re-emit.
+        let mut broker_request = current_request.clone();
+        broker_request.messages = packed_messages;
+        let broker_request_id = unique_id("broker-request");
+        run_stream.set_broker_request_id(broker_request_id.clone());
+        let broker_payload = json!({
+            "workspaceId": stream_state.workspace_id,
+            "chatId": chat_id,
+            "chatTitle": chat_title,
+            "runId": run_id,
+            "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
+            "providerId": provider_id,
+            "modelId": model_id,
+            "request": broker_request,
+        });
+        let turn_text_start = text.len();
+        let turn_reasoning_start = reasoning.len();
+        let llm_turn = remote_sidecar_run_broker_llm_turn(
+            &stream_state,
+            &run_stream,
+            &broker_request_id,
+            broker_payload,
+            &run_id,
+            &chat_id,
+            &assistant_message_id,
+            &queued_user_message_id,
+            &provider_id,
+            &model_id,
+            &mut database,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+            &run_compression_events,
+            &content_parts_prefix,
+            flushed_text_len,
+            flushed_reasoning_len,
+        )
+        .await;
+        let mut reached_terminal_event = false;
+        for (_event, terminal) in
+            remote_sidecar_snapshot_run_events(&run_stream, &mut last_yielded_sequence)
+        {
+            if terminal {
+                reached_terminal_event = true;
+                break;
+            }
+        }
+        let turn_text = remote_sidecar_current_turn_output(&text, turn_text_start);
+        let turn_reasoning = remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
+        match llm_turn {
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                tool_calls: None,
+                resolved_provider_id,
+                turn_input_tokens,
+            }) => {
+                let _ = resolved_provider_id;
+                record_chat_completion_input_tokens(
+                    &mut runtime_tool_state.last_chat_completion_input_tokens,
+                    turn_input_tokens,
+                );
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
+                break;
+            }
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
+                tool_calls: Some(tool_calls),
+                resolved_provider_id,
+                turn_input_tokens,
+            }) => {
+                provider_id = resolved_provider_id;
+                record_chat_completion_input_tokens(
+                    &mut runtime_tool_state.last_chat_completion_input_tokens,
+                    turn_input_tokens,
+                );
+                if reached_terminal_event {
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
+                if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
+                    sequence += 1;
+                    remote_sidecar_record_run_event(
+                        &run_stream,
+                        sequence,
+                        json!({
+                            "type": "error",
+                            "message": message,
+                        }),
+                    );
+                    sequence += 1;
+                    remote_sidecar_record_run_event(
+                        &run_stream,
+                        sequence,
+                        json!({ "type": "streamEnd" }),
+                    );
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
+                if tool_loop_guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS) {
+                    let recovery = runtime_tool_state.recover_after_round_cap(
+                        &mut current_request.messages,
+                        tool_calls.clone(),
+                        turn_text,
+                        (!turn_reasoning.is_empty()).then_some(turn_reasoning),
+                    );
+                    let (recovered, message) = match recovery {
+                        Ok(true) => (
+                            true,
+                            format!(
+                                "tool call was not executed because runtime tool state was compressed after reaching {MAX_AGENT_TOOL_ROUNDS} continuation rounds"
+                            ),
+                        ),
+                        Ok(false) => (
+                            false,
+                            remote_sidecar_tool_round_cap_error(MAX_AGENT_TOOL_ROUNDS),
+                        ),
+                        Err(error) => (false, error.message),
+                    };
+                    for event in remote_sidecar_close_unexecuted_tool_calls(
+                        &mut database,
+                        &assistant_message_id,
+                        &tool_calls,
+                        &tool_catalog.allowed_names,
+                        &message,
+                    ) {
+                        sequence += 1;
+                        remote_sidecar_record_run_event(&run_stream, sequence, event);
+                        last_yielded_sequence = sequence;
+                    }
+                    if recovered {
+                        tool_loop_guard.reset_after_compression();
+                        continue;
+                    }
+                    sequence += 1;
+                    remote_sidecar_record_run_event(
+                        &run_stream,
+                        sequence,
+                        json!({
+                            "type": "error",
+                            "message": message,
+                        }),
+                    );
+                    sequence += 1;
+                    remote_sidecar_record_run_event(
+                        &run_stream,
+                        sequence,
+                        json!({ "type": "streamEnd" }),
+                    );
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
+                let mut next_messages = current_request.messages.clone();
+                let mut batch_messages = vec![NeutralChatMessage {
+                    role: NeutralChatRole::Assistant,
+                    content: turn_text,
+                    attachments: Vec::new(),
+                    reasoning: (!turn_reasoning.is_empty()).then_some(turn_reasoning),
+                    tool_calls: tool_calls.clone(),
+                    tool_call_id: None,
+                    tool_name: None,
+                }];
+                let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
+                let _tool_execution_plan = plan_tool_execution(&pending_tool_calls);
+                let rejections = _tool_execution_plan
+                    .as_ref()
+                    .err()
+                    .and_then(|error| rejected_tool_batch(&pending_tool_calls, error));
+
+                let mut batch_hook_additional_context = Vec::new();
+                let followup_sse_events = if let Some(rejections) = rejections {
+                    let (events, messages) = remote_sidecar_reject_tool_batch(
+                        &mut database,
+                        &chat_id,
+                        &run_id,
+                        &assistant_message_id,
+                        &tool_calls,
+                        &rejections,
+                    );
+                    batch_messages.extend(messages);
+                    events
+                } else {
+                    let allowed_tools = &tool_catalog.allowed_names;
+                    let runnable_tool_calls = tool_calls
+                        .iter()
+                        .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let _ = remote_sidecar_record_pending_tool_calls(
+                        &mut database,
+                        &chat_id,
+                        &run_id,
+                        &assistant_message_id,
+                        &runnable_tool_calls,
+                        allowed_tools,
+                    );
+                    let mut events = remote_sidecar_capture_pending_tool_calls(
+                        &assistant_message_id,
+                        &runnable_tool_calls,
+                        allowed_tools,
+                    );
+                    for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
+                        if !allowed_tools.contains(tool_call.name.as_str()) {
+                            let execution = normalize_broker_tool_execution(
+                                &tool_call.name,
+                                json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) }),
+                                true,
+                            );
+                            let output = execution.output;
+                            let is_error = execution.is_error;
+                            let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                            let completed_at =
+                                Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                            let _ = remote_sidecar_record_tool_result(
+                                &mut database,
+                                tool_call,
+                                &output,
+                                is_error,
+                                &started_at,
+                                &completed_at,
+                            );
+                            events.push(json!({
+                                "type": "toolResult",
+                                "assistantMessageId": assistant_message_id,
+                                "toolCallId": tool_call.call_id,
+                                "output": output,
+                                "isError": is_error,
+                                "startedAt": started_at,
+                                "completedAt": completed_at,
+                            }));
+                            batch_messages.push(NeutralChatMessage {
+                                role: NeutralChatRole::Tool,
+                                content: serde_json::to_string(&output)
+                                    .unwrap_or_else(|_| "null".to_string()),
+                                attachments: Vec::new(),
+                                reasoning: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: Some(tool_call.call_id.clone()),
+                                tool_name: Some(tool_call.name.clone()),
+                            });
+                            continue;
+                        }
+                        let (broker_event_tx, mut broker_event_rx) = mpsc::unbounded_channel();
+                        let execution = remote_sidecar_execute_tool_call(
+                            &stream_state,
+                            &run_stream,
+                            &tool_catalog,
+                            broker_event_tx,
+                            tool_call.clone(),
+                            &chat_id,
+                            session_mode.as_deref(),
+                            &run_id,
+                            &assistant_message_id,
+                            &provider_id,
+                            &model_id,
+                            skill_read_root_dirs.clone(),
+                            attachment_read_allowlist.clone(),
+                        );
+                        tokio::pin!(execution);
+                        let (
+                            output,
+                            is_error,
+                            started_at,
+                            completed_at,
+                            mut extra_events,
+                            additional_context,
+                        ) = loop {
+                            tokio::select! {
+                                result = &mut execution => break result,
+                                Some(event) = broker_event_rx.recv() => {
+                                    sequence += 1;
+                                    remote_sidecar_record_run_event(
+                                        &run_stream,
+                                        sequence,
+                                        event,
+                                    );
+                                    last_yielded_sequence = sequence;
+                                }
+                            }
+                        };
+                        let execution =
+                            normalize_broker_tool_execution(&tool_call.name, output, is_error);
+                        let output = execution.output;
+                        let is_error = execution.is_error;
+                        if run_stream.is_finished() {
+                            remote_sidecar_close_cancelled_tool_batch(
+                                &mut database,
+                                &assistant_message_id,
+                                tool_call,
+                                &output,
+                                is_error,
+                                &started_at,
+                                &completed_at,
+                                &tool_calls[tool_call_index + 1..],
+                                allowed_tools,
+                            );
+                            break 'run;
+                        }
+                        let _ = remote_sidecar_record_tool_result(
+                            &mut database,
+                            tool_call,
+                            &output,
+                            is_error,
+                            &started_at,
+                            &completed_at,
+                        );
+                        events.append(&mut extra_events);
+                        batch_hook_additional_context.extend(additional_context);
+                        events.push(json!({
+                            "type": "toolResult",
+                            "assistantMessageId": assistant_message_id,
+                            "toolCallId": tool_call.call_id,
+                            "output": output,
+                            "isError": is_error,
+                            "startedAt": started_at,
+                            "completedAt": completed_at,
+                        }));
+                        batch_messages.push(NeutralChatMessage {
+                            role: NeutralChatRole::Tool,
+                            content: serde_json::to_string(&output)
+                                .unwrap_or_else(|_| "null".to_string()),
+                            attachments: Vec::new(),
+                            reasoning: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: Some(tool_call.call_id.clone()),
+                            tool_name: Some(tool_call.name.clone()),
+                        });
+                    }
+                    events
+                };
+                runtime_tool_state.append_runtime_tool_batch(&mut next_messages, batch_messages);
+                append_hook_context_messages(
+                    &mut next_messages,
+                    &mut runtime_tool_state.message_source_sequences,
+                    &mut runtime_tool_state.message_context_sources,
+                    &batch_hook_additional_context,
+                );
+                tool_loop_guard.record_executed_round();
+                runtime_tool_state.append_runtime_guard_message(
+                    &mut next_messages,
+                    tool_loop_guard.check_after_execution(&tool_calls),
+                );
+
+                for event in followup_sse_events {
+                    sequence += 1;
+                    remote_sidecar_record_run_event(&run_stream, sequence, event);
+                    last_yielded_sequence = sequence;
+                }
+
+                // Close the tool-producing turn into ordered parts so complete/history
+                // replay keeps Assistant → tools → later text (and interruption) order.
+                remote_sidecar_flush_open_content_parts(
+                    &mut content_parts_prefix,
+                    &text,
+                    &reasoning,
+                    &mut flushed_text_len,
+                    &mut flushed_reasoning_len,
+                );
+                for tool_call in &tool_calls {
+                    content_parts_prefix.push(json!({
+                        "type": "toolCall",
+                        "tool_call_id": tool_call.call_id,
+                    }));
+                }
+
+                current_request = NeutralChatRequest {
+                    model_id: current_request.model_id.clone(),
+                    messages: next_messages,
+                    tools: current_request.tools.clone(),
+                    thinking_level: current_request.thinking_level.clone(),
+                    max_output_tokens: current_request.max_output_tokens,
+                    prompt_cache_key: current_request.prompt_cache_key.clone(),
+                    prompt_cache_retention: current_request.prompt_cache_retention.clone(),
+                };
+            }
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
+                message,
+                resolved_provider_id,
+                turn_total_latency_ms,
+                turn_first_token_latency_ms,
+                turn_llm_request_id,
+            }) => {
+                provider_id = resolved_provider_id;
+                if reasoning_loop_recovery_count < MAX_REASONING_LOOP_RECOVERIES_PER_RUN {
+                    reasoning_loop_recovery_count = reasoning_loop_recovery_count.saturating_add(1);
+                    remote_sidecar_flush_open_content_parts(
+                        &mut content_parts_prefix,
+                        &text,
+                        &reasoning,
+                        &mut flushed_text_len,
+                        &mut flushed_reasoning_len,
+                    );
+                    let interrupted_metrics = json!({
+                        "modelId": model_id,
+                        "providerId": provider_id,
+                        "totalLatencyMs": turn_total_latency_ms,
+                        "firstTokenLatencyMs": turn_first_token_latency_ms,
+                        "outputTokens": null,
+                        "llmRequestIds": [turn_llm_request_id],
+                    });
+                    let guidance_id = unique_id("msg-guidance");
+                    let interruption_part = json!({
+                        "type": "userInterruption",
+                        "id": guidance_id,
+                        "content": REASONING_LOOP_RECOVERY_USER_TEXT,
+                        "source": REASONING_LOOP_GUARD_SOURCE,
+                        "interruptedAssistantMetrics": interrupted_metrics,
+                    });
+                    content_parts_prefix.push(interruption_part.clone());
+                    remote_sidecar_append_reasoning_loop_recovery_to_request(
+                        &mut current_request.messages,
+                        &mut runtime_tool_state,
+                        &turn_text,
+                        &turn_reasoning,
+                    );
+                    let guidance_payload = json!({
+                        "type": "guidanceApplied",
+                        "id": guidance_id,
+                        "content": REASONING_LOOP_RECOVERY_USER_TEXT,
+                        "parts": [],
+                        "source": REASONING_LOOP_GUARD_SOURCE,
+                        "assistantMessageId": assistant_message_id,
+                        "interruptedAssistantId": assistant_message_id,
+                        "interruptedAssistantMetrics": interrupted_metrics,
+                    });
+                    sequence += 1;
+                    let _ = database.insert_run_event(NewRunEvent {
+                        id: &unique_id("run-event"),
+                        chat_id: &chat_id,
+                        run_id: &run_id,
+                        sequence,
+                        event_type: "guidance_applied",
+                        payload_json: &guidance_payload.to_string(),
+                    });
+                    remote_sidecar_record_run_event(&run_stream, sequence, guidance_payload);
+                    last_yielded_sequence = sequence;
+                    // Same run / task / phase attempt continues with a new broker request.
+                    continue;
+                }
+
+                // Exhausted automatic recoveries: fail the run like the original guard.
+                let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
+                let remaining_reasoning = reasoning
+                    .get(flushed_reasoning_len..)
+                    .unwrap_or(reasoning.as_str());
+                let total_latency_ms = run_metrics.total_latency_ms();
+                let metrics =
+                    remote_chat_metrics(&model_id, &provider_id, &run_metrics, total_latency_ms);
+                let metadata = json!({
+                    "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                    "parts": remote_chat_parts_with_context_compression(
+                        remaining_text,
+                        (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
+                        &run_compression_events,
+                        &content_parts_prefix,
+                    ),
+                    "partsVersion": 5,
+                    "partsSource": "live_sse",
+                    "metrics": metrics,
+                });
+                let assistant_sequence = database
+                    .message(&assistant_message_id)
+                    .ok()
+                    .flatten()
+                    .map(|message| message.sequence)
+                    .unwrap_or_else(|| {
+                        database
+                            .next_message_sequence_for_chat(&chat_id)
+                            .unwrap_or(0)
+                    });
+                let _ = database.upsert_message_content(NewMessage {
+                    id: &assistant_message_id,
+                    chat_id: &chat_id,
+                    role: "assistant",
+                    content: &text,
+                    sequence: assistant_sequence,
+                    metadata_json: Some(&metadata.to_string()),
+                });
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({
+                        "type": "error",
+                        "message": message,
+                    }),
+                );
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({ "type": "streamEnd" }),
+                );
+                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
+                break;
+            }
+            Err(()) => {
+                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
+                break;
+            }
+        }
+    }
+    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+    remote_sidecar_finish_active_run(&stream_state, &run_id);
+    cleanup_guard.disarm();
+}
+
 async fn remote_sidecar_chat_stream(
     State(state): State<RemoteSidecarState>,
     Json(payload): Json<Value>,
@@ -12594,7 +13458,7 @@ async fn remote_sidecar_chat_stream(
     let queued_user_message_id =
         remote_required_text(payload.get("queuedUserMessageId"), "queuedUserMessageId")?;
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
-    let mut provider_id =
+    let provider_id =
         remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
     let database = sidecar_workspace_database(&state)?;
     let chat = database
@@ -12660,6 +13524,7 @@ async fn remote_sidecar_chat_stream(
     let attachment_read_allowlist = initial_prepared.attachment_read_allowlist.clone();
     let initial_runtime_tool_state =
         RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
+    drop(database);
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -12671,716 +13536,28 @@ async fn remote_sidecar_chat_stream(
     remote_sidecar_set_active_run(&state, run);
     let run_stream =
         remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
-    let stream_state = state.clone();
-    let run_stream = run_stream.clone();
-    let stream = async_stream::stream! {
-        // Create first so disconnect during mark/prepare still clears queuedRun.
-        let cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
-            stream_state.clone(),
-            run_id.clone(),
-            queued_user_message_id.clone(),
-        );
-        let mut database = database;
-        if let Err(error) = remote_mark_message_queued_run_started(&mut database, &queued_user_message_id) {
-            yield Ok(remote_sidecar_record_run_event(&run_stream, 0, json!({
-                "type": "error",
-                "message": error.to_string(),
-            })));
-            yield Ok(remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" })));
-            remote_sidecar_finish_active_run(&stream_state, &run_id);
-            // Leave armed so Drop clears queuedRun after this early exit path.
-            drop(cleanup_guard);
-            return;
-        }
-        let mut sequence = 0_i64;
-        let mut text = String::new();
-        let mut reasoning = String::new();
-        let mut run_metrics = RemoteSidecarRunMetrics::new();
-        let mut current_request = initial_provider_request;
-        let mut runtime_tool_state = initial_runtime_tool_state;
-        let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
-        // Accumulates start+completed compression details for this run so final
-        // assistant metadata.parts can include history-reload bubbles.
-        let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
-        // Ordered parts closed by reasoning-loop recoveries (before open turn suffix).
-        let mut content_parts_prefix: Vec<Value> = Vec::new();
-        let mut flushed_text_len = 0usize;
-        let mut flushed_reasoning_len = 0usize;
-        let mut reasoning_loop_recovery_count = 0usize;
-        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-            "type": "start",
-            "chatId": chat_id,
-            "userMessageId": queued_user_message_id,
-            "assistantMessageId": assistant_message_id,
-            "memoriesUsed": [],
-        })));
-        sequence += 1;
-        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-            "type": "connecting",
-            "message": "connecting to remote broker",
-        })));
-        let mut last_yielded_sequence = sequence;
-
-        'run: loop {
-            // Before every brokered chat completion request (first turn and tool follow-ups):
-            // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
-            // Live-yield ContextCompression (start before broker summary) while ensure runs.
-            // ensure holds `&mut database` for snapshot writes; open a separate connection so
-            // start/completed run_events can persist before the client sees each SSE event.
-            let mut live_compression_db = match WorkspaceDatabase::open_or_create(
-                sidecar_workspace_path(&stream_state),
-            ) {
-                Ok(db) => Some(db),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        chat_id = %chat_id,
-                        run_id = %run_id,
-                        "failed to open workspace database for live context compression run_events"
-                    );
-                    None
-                }
-            };
-            let compression_result = {
-                let (compression_event_tx, mut compression_event_rx) =
-                    mpsc::unbounded_channel::<RemoteSidecarContextCompressionEventDetail>();
-                let mut compression_future =
-                    std::pin::pin!(runtime_tool_state.ensure_compression_then_pack(
-                        &mut current_request.messages,
-                        &stream_state,
-                        &run_stream,
-                        &mut database,
-                        &stream_state.workspace_id,
-                        &chat_id,
-                        &run_id,
-                        &queued_user_message_id,
-                        &assistant_message_id,
-                        &provider_id,
-                        &model_id,
-                        Some(compression_event_tx),
-                    ));
-                loop {
-                    tokio::select! {
-                        biased;
-                        result = &mut compression_future => {
-                            while let Ok(detail) = compression_event_rx.try_recv() {
-                                sequence += 1;
-                                let payload = remote_sidecar_context_compression_sse_event(
-                                    &assistant_message_id,
-                                    &detail,
-                                );
-                                if let Some(db) = live_compression_db.as_mut() {
-                                    remote_sidecar_persist_context_compression_run_event(
-                                        db,
-                                        &chat_id,
-                                        &run_id,
-                                        sequence,
-                                        &payload,
-                                    );
-                                }
-                                run_compression_events.push(detail);
-                                yield Ok(remote_sidecar_record_run_event(
-                                    &run_stream,
-                                    sequence,
-                                    payload,
-                                ));
-                                last_yielded_sequence = sequence;
-                            }
-                            break result;
-                        }
-                        maybe_detail = compression_event_rx.recv() => {
-                            let Some(detail) = maybe_detail else {
-                                break compression_future.await;
-                            };
-                            sequence += 1;
-                            let payload = remote_sidecar_context_compression_sse_event(
-                                &assistant_message_id,
-                                &detail,
-                            );
-                            if let Some(db) = live_compression_db.as_mut() {
-                                remote_sidecar_persist_context_compression_run_event(
-                                    db,
-                                    &chat_id,
-                                    &run_id,
-                                    sequence,
-                                    &payload,
-                                );
-                            }
-                            run_compression_events.push(detail);
-                            yield Ok(remote_sidecar_record_run_event(
-                                &run_stream,
-                                sequence,
-                                payload,
-                            ));
-                            last_yielded_sequence = sequence;
-                        }
-                    }
-                }
-            };
-            drop(live_compression_db);
-            for notification in run_stream.take_hook_notifications() {
-                sequence += 1;
-                yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                    "type": "hookNotification",
-                    "assistantMessageId": assistant_message_id,
-                    "notification": notification,
-                })));
-                last_yielded_sequence = sequence;
-            }
-            let (packed_messages, _compression_events) = match compression_result {
-                Ok(result) => result,
-                Err(error) => {
-                    let message = error.message;
-                    if !run_compression_events.is_empty() {
-                        // Keep live start/completed compression blocks durable in message parts
-                        // even when ensure fails (e.g. summary cancelled after start).
-                        let assistant_sequence = database
-                            .message(&assistant_message_id)
-                            .ok()
-                            .flatten()
-                            .map(|message| message.sequence)
-                            .unwrap_or_else(|| {
-                                database
-                                    .next_message_sequence_for_chat(&chat_id)
-                                    .unwrap_or(0)
-                            });
-                        let metadata = json!({
-                            "parts": remote_chat_parts_with_context_compression(
-                                "",
-                                None,
-                                &run_compression_events,
-                                &content_parts_prefix,
-                            ),
-                            "partsVersion": 5,
-                            "partsSource": "live_sse",
-                            "streamingState": "failed",
-                        });
-                        let _ = database.upsert_message_content(NewMessage {
-                            id: &assistant_message_id,
-                            chat_id: &chat_id,
-                            role: "assistant",
-                            content: "",
-                            sequence: assistant_sequence,
-                            metadata_json: Some(&metadata.to_string()),
-                        });
-                    }
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                        "type": "error",
-                        "message": message,
-                    })));
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    break;
-                }
-            };
-            // Live path already yielded compression events; do not re-emit.
-            let mut broker_request = current_request.clone();
-            broker_request.messages = packed_messages;
-            let broker_request_id = unique_id("broker-request");
-            run_stream.set_broker_request_id(broker_request_id.clone());
-            let broker_payload = json!({
-                "workspaceId": stream_state.workspace_id,
-                "chatId": chat_id,
-                "chatTitle": chat.title,
-                "runId": run_id,
-                "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
-                "providerId": provider_id,
-                "modelId": model_id,
-                "request": broker_request,
-            });
-            let turn_text_start = text.len();
-            let turn_reasoning_start = reasoning.len();
-            let llm_turn = remote_sidecar_run_broker_llm_turn(
-                &stream_state,
-                &run_stream,
-                &broker_request_id,
-                broker_payload,
-                &run_id,
-                &chat_id,
-                &assistant_message_id,
-                &queued_user_message_id,
-                &provider_id,
-                &model_id,
-                &mut database,
-                &mut text,
-                &mut reasoning,
-                &mut run_metrics,
-                &mut sequence,
-                &run_compression_events,
-                &content_parts_prefix,
-                flushed_text_len,
-                flushed_reasoning_len,
-            ).await;
-            let mut reached_terminal_event = false;
-            for (event, terminal) in remote_sidecar_snapshot_run_events(&run_stream, &mut last_yielded_sequence) {
-                yield Ok(event);
-                if terminal {
-                    reached_terminal_event = true;
-                    break;
-                }
-            }
-            let turn_text = remote_sidecar_current_turn_output(&text, turn_text_start);
-            let turn_reasoning =
-                remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
-            match llm_turn {
-                Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
-                    tool_calls: None,
-                    resolved_provider_id,
-                    turn_input_tokens,
-                }) => {
-                    let _ = resolved_provider_id;
-                    record_chat_completion_input_tokens(
-                        &mut runtime_tool_state.last_chat_completion_input_tokens,
-                        turn_input_tokens,
-                    );
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    break;
-                }
-                Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
-                    tool_calls: Some(tool_calls),
-                    resolved_provider_id,
-                    turn_input_tokens,
-                }) => {
-                    provider_id = resolved_provider_id;
-                    record_chat_completion_input_tokens(
-                        &mut runtime_tool_state.last_chat_completion_input_tokens,
-                        turn_input_tokens,
-                    );
-                    if reached_terminal_event {
-                        remote_sidecar_finish_active_run(&stream_state, &run_id);
-                        cleanup_guard.disarm();
-                        break;
-                    }
-                    if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                            "type": "error",
-                            "message": message,
-                        })));
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                        remote_sidecar_finish_active_run(&stream_state, &run_id);
-                        cleanup_guard.disarm();
-                        break;
-                    }
-                    if tool_loop_guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS) {
-                        let recovery = runtime_tool_state.recover_after_round_cap(
-                            &mut current_request.messages,
-                            tool_calls.clone(),
-                            turn_text,
-                            (!turn_reasoning.is_empty()).then_some(turn_reasoning),
-                        );
-                        let (recovered, message) = match recovery {
-                            Ok(true) => (
-                                true,
-                                format!(
-                                    "tool call was not executed because runtime tool state was compressed after reaching {MAX_AGENT_TOOL_ROUNDS} continuation rounds"
-                                ),
-                            ),
-                            Ok(false) => (
-                                false,
-                                remote_sidecar_tool_round_cap_error(MAX_AGENT_TOOL_ROUNDS),
-                            ),
-                            Err(error) => (false, error.message),
-                        };
-                        for event in remote_sidecar_close_unexecuted_tool_calls(
-                            &mut database,
-                            &assistant_message_id,
-                            &tool_calls,
-                            &tool_catalog.allowed_names,
-                            &message,
-                        ) {
-                            sequence += 1;
-                            yield Ok(remote_sidecar_record_run_event(
-                                &run_stream,
-                                sequence,
-                                event,
-                            ));
-                            last_yielded_sequence = sequence;
-                        }
-                        if recovered {
-                            tool_loop_guard.reset_after_compression();
-                            continue;
-                        }
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                            "type": "error",
-                            "message": message,
-                        })));
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({ "type": "streamEnd" })));
-                        remote_sidecar_finish_active_run(&stream_state, &run_id);
-                        cleanup_guard.disarm();
-                        break;
-                    }
-                    let mut next_messages = current_request.messages.clone();
-                    let mut batch_messages = vec![NeutralChatMessage {
-                        role: NeutralChatRole::Assistant,
-                        content: turn_text,
-                        attachments: Vec::new(),
-                        reasoning: (!turn_reasoning.is_empty()).then_some(turn_reasoning),
-                        tool_calls: tool_calls.clone(),
-                        tool_call_id: None,
-                        tool_name: None,
-                    }];
-                    let pending_tool_calls = remote_sidecar_pending_tool_calls(&tool_calls);
-                    let _tool_execution_plan = plan_tool_execution(&pending_tool_calls);
-                    let rejections = _tool_execution_plan
-                        .as_ref()
-                        .err()
-                        .and_then(|error| rejected_tool_batch(&pending_tool_calls, error));
-
-                    let mut batch_hook_additional_context = Vec::new();
-                    let followup_sse_events = if let Some(rejections) = rejections {
-                        let (events, messages) = remote_sidecar_reject_tool_batch(
-                            &mut database,
-                            &chat_id,
-                            &run_id,
-                            &assistant_message_id,
-                            &tool_calls,
-                            &rejections,
-                        );
-                        batch_messages.extend(messages);
-                        events
-                    } else {
-                        let allowed_tools = &tool_catalog.allowed_names;
-                        let runnable_tool_calls = tool_calls
-                            .iter()
-                            .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
-                            .cloned()
-                            .collect::<Vec<_>>();
-                        let _ = remote_sidecar_record_pending_tool_calls(
-                            &mut database,
-                            &chat_id,
-                            &run_id,
-                            &assistant_message_id,
-                            &runnable_tool_calls,
-                            allowed_tools,
-                        );
-                        let mut events = remote_sidecar_capture_pending_tool_calls(
-                            &assistant_message_id,
-                            &runnable_tool_calls,
-                            allowed_tools,
-                        );
-                        for (tool_call_index, tool_call) in tool_calls.iter().enumerate() {
-                            if !allowed_tools.contains(tool_call.name.as_str()) {
-                                let execution = normalize_broker_tool_execution(
-                                    &tool_call.name,
-                                    json!({ "error": format!("remote sidecar cannot execute tool '{}'", tool_call.name) }),
-                                    true,
-                                );
-                                let output = execution.output;
-                                let is_error = execution.is_error;
-                                let started_at =
-                                    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                                let completed_at =
-                                    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                                let _ = remote_sidecar_record_tool_result(
-                                    &mut database,
-                                    tool_call,
-                                    &output,
-                                    is_error,
-                                    &started_at,
-                                    &completed_at,
-                                );
-                                events.push(json!({
-                                    "type": "toolResult",
-                                    "assistantMessageId": assistant_message_id,
-                                    "toolCallId": tool_call.call_id,
-                                    "output": output,
-                                    "isError": is_error,
-                                    "startedAt": started_at,
-                                    "completedAt": completed_at,
-                                }));
-                                batch_messages.push(NeutralChatMessage {
-                                    role: NeutralChatRole::Tool,
-                                    content: serde_json::to_string(&output)
-                                        .unwrap_or_else(|_| "null".to_string()),
-                                    attachments: Vec::new(),
-                                    reasoning: None,
-                                    tool_calls: Vec::new(),
-                                    tool_call_id: Some(tool_call.call_id.clone()),
-                                    tool_name: Some(tool_call.name.clone()),
-                                });
-                                continue;
-                            }
-                            let (broker_event_tx, mut broker_event_rx) = mpsc::unbounded_channel();
-                            let execution = remote_sidecar_execute_tool_call(
-                                &stream_state,
-                                &run_stream,
-                                &tool_catalog,
-                                broker_event_tx,
-                                tool_call.clone(),
-                                &chat_id,
-                                session_mode.as_deref(),
-                                &run_id,
-                                &assistant_message_id,
-                                &provider_id,
-                                &model_id,
-                                skill_read_root_dirs.clone(),
-                                attachment_read_allowlist.clone(),
-                            );
-                            tokio::pin!(execution);
-                            let (
-                                output,
-                                is_error,
-                                started_at,
-                                completed_at,
-                                mut extra_events,
-                                additional_context,
-                            ) = loop {
-                                tokio::select! {
-                                    result = &mut execution => break result,
-                                    Some(event) = broker_event_rx.recv() => {
-                                        sequence += 1;
-                                        yield Ok(remote_sidecar_record_run_event(
-                                            &run_stream,
-                                            sequence,
-                                            event,
-                                        ));
-                                        last_yielded_sequence = sequence;
-                                    }
-                                }
-                            };
-                            let execution = normalize_broker_tool_execution(
-                                &tool_call.name,
-                                output,
-                                is_error,
-                            );
-                            let output = execution.output;
-                            let is_error = execution.is_error;
-                            if run_stream.is_finished() {
-                                remote_sidecar_close_cancelled_tool_batch(
-                                    &mut database,
-                                    &assistant_message_id,
-                                    tool_call,
-                                    &output,
-                                    is_error,
-                                    &started_at,
-                                    &completed_at,
-                                    &tool_calls[tool_call_index + 1..],
-                                    allowed_tools,
-                                );
-                                break 'run;
-                            }
-                            let _ = remote_sidecar_record_tool_result(
-                                &mut database,
-                                tool_call,
-                                &output,
-                                is_error,
-                                &started_at,
-                                &completed_at,
-                            );
-                            events.append(&mut extra_events);
-                            batch_hook_additional_context.extend(additional_context);
-                            events.push(json!({
-                                "type": "toolResult",
-                                "assistantMessageId": assistant_message_id,
-                                "toolCallId": tool_call.call_id,
-                                "output": output,
-                                "isError": is_error,
-                                "startedAt": started_at,
-                                "completedAt": completed_at,
-                            }));
-                            batch_messages.push(NeutralChatMessage {
-                                role: NeutralChatRole::Tool,
-                                content: serde_json::to_string(&output)
-                                    .unwrap_or_else(|_| "null".to_string()),
-                                attachments: Vec::new(),
-                                reasoning: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: Some(tool_call.call_id.clone()),
-                                tool_name: Some(tool_call.name.clone()),
-                            });
-                        }
-                        events
-                    };
-                    runtime_tool_state
-                        .append_runtime_tool_batch(&mut next_messages, batch_messages);
-                    append_hook_context_messages(
-                        &mut next_messages,
-                        &mut runtime_tool_state.message_source_sequences,
-                        &mut runtime_tool_state.message_context_sources,
-                        &batch_hook_additional_context,
-                    );
-                    tool_loop_guard.record_executed_round();
-                    runtime_tool_state.append_runtime_guard_message(
-                        &mut next_messages,
-                        tool_loop_guard.check_after_execution(&tool_calls),
-                    );
-
-                    for event in followup_sse_events {
-                        sequence += 1;
-                        yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, event));
-                        last_yielded_sequence = sequence;
-                    }
-
-                    // Close the tool-producing turn into ordered parts so complete/history
-                    // replay keeps Assistant → tools → later text (and interruption) order.
-                    remote_sidecar_flush_open_content_parts(
-                        &mut content_parts_prefix,
-                        &text,
-                        &reasoning,
-                        &mut flushed_text_len,
-                        &mut flushed_reasoning_len,
-                    );
-                    for tool_call in &tool_calls {
-                        content_parts_prefix.push(json!({
-                            "type": "toolCall",
-                            "tool_call_id": tool_call.call_id,
-                        }));
-                    }
-
-                    current_request = NeutralChatRequest {
-                        model_id: current_request.model_id.clone(),
-                        messages: next_messages,
-                        tools: current_request.tools.clone(),
-                        thinking_level: current_request.thinking_level.clone(),
-                        max_output_tokens: current_request.max_output_tokens,
-                        prompt_cache_key: current_request.prompt_cache_key.clone(),
-                        prompt_cache_retention: current_request.prompt_cache_retention.clone(),
-                    };
-                }
-                Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
-                    message,
-                    resolved_provider_id,
-                    turn_total_latency_ms,
-                    turn_first_token_latency_ms,
-                    turn_llm_request_id,
-                }) => {
-                    provider_id = resolved_provider_id;
-                    if reasoning_loop_recovery_count < MAX_REASONING_LOOP_RECOVERIES_PER_RUN {
-                        reasoning_loop_recovery_count =
-                            reasoning_loop_recovery_count.saturating_add(1);
-                        remote_sidecar_flush_open_content_parts(
-                            &mut content_parts_prefix,
-                            &text,
-                            &reasoning,
-                            &mut flushed_text_len,
-                            &mut flushed_reasoning_len,
-                        );
-                        let interrupted_metrics = json!({
-                            "modelId": model_id,
-                            "providerId": provider_id,
-                            "totalLatencyMs": turn_total_latency_ms,
-                            "firstTokenLatencyMs": turn_first_token_latency_ms,
-                            "outputTokens": null,
-                            "llmRequestIds": [turn_llm_request_id],
-                        });
-                        let guidance_id = unique_id("msg-guidance");
-                        let interruption_part = json!({
-                            "type": "userInterruption",
-                            "id": guidance_id,
-                            "content": REASONING_LOOP_RECOVERY_USER_TEXT,
-                            "source": REASONING_LOOP_GUARD_SOURCE,
-                            "interruptedAssistantMetrics": interrupted_metrics,
-                        });
-                        content_parts_prefix.push(interruption_part.clone());
-                        remote_sidecar_append_reasoning_loop_recovery_to_request(
-                            &mut current_request.messages,
-                            &mut runtime_tool_state,
-                            &turn_text,
-                            &turn_reasoning,
-                        );
-                        let guidance_payload = json!({
-                            "type": "guidanceApplied",
-                            "id": guidance_id,
-                            "content": REASONING_LOOP_RECOVERY_USER_TEXT,
-                            "parts": [],
-                            "source": REASONING_LOOP_GUARD_SOURCE,
-                            "assistantMessageId": assistant_message_id,
-                            "interruptedAssistantId": assistant_message_id,
-                            "interruptedAssistantMetrics": interrupted_metrics,
-                        });
-                        sequence += 1;
-                        let _ = database.insert_run_event(NewRunEvent {
-                            id: &unique_id("run-event"),
-                            chat_id: &chat_id,
-                            run_id: &run_id,
-                            sequence,
-                            event_type: "guidance_applied",
-                            payload_json: &guidance_payload.to_string(),
-                        });
-                        yield Ok(remote_sidecar_record_run_event(
-                            &run_stream,
-                            sequence,
-                            guidance_payload,
-                        ));
-                        last_yielded_sequence = sequence;
-                        // Same run / task / phase attempt continues with a new broker request.
-                        continue;
-                    }
-
-                    // Exhausted automatic recoveries: fail the run like the original guard.
-                    let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
-                    let remaining_reasoning =
-                        reasoning.get(flushed_reasoning_len..).unwrap_or(reasoning.as_str());
-                    let total_latency_ms = run_metrics.total_latency_ms();
-                    let metrics =
-                        remote_chat_metrics(&model_id, &provider_id, &run_metrics, total_latency_ms);
-                    let metadata = json!({
-                        "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                        "parts": remote_chat_parts_with_context_compression(
-                            remaining_text,
-                            (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
-                            &run_compression_events,
-                            &content_parts_prefix,
-                        ),
-                        "partsVersion": 5,
-                        "partsSource": "live_sse",
-                        "metrics": metrics,
-                    });
-                    let assistant_sequence = database
-                        .message(&assistant_message_id)
-                        .ok()
-                        .flatten()
-                        .map(|message| message.sequence)
-                        .unwrap_or_else(|| {
-                            database
-                                .next_message_sequence_for_chat(&chat_id)
-                                .unwrap_or(0)
-                        });
-                    let _ = database.upsert_message_content(NewMessage {
-                        id: &assistant_message_id,
-                        chat_id: &chat_id,
-                        role: "assistant",
-                        content: &text,
-                        sequence: assistant_sequence,
-                        metadata_json: Some(&metadata.to_string()),
-                    });
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(&run_stream, sequence, json!({
-                        "type": "error",
-                        "message": message,
-                    })));
-                    sequence += 1;
-                    yield Ok(remote_sidecar_record_run_event(
-                        &run_stream,
-                        sequence,
-                        json!({ "type": "streamEnd" }),
-                    ));
-                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    break;
-                }
-                Err(()) => {
-                    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    break;
-                }
-            }
-        }
-        let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-        remote_sidecar_finish_active_run(&stream_state, &run_id);
-        cleanup_guard.disarm();
-    };
-    Ok(Sse::new(stream).keep_alive(
+    // Subscribe before spawn so the initial client never misses early events.
+    let subscription = remote_sidecar_subscribe_run_stream(run_stream.clone(), -1);
+    tokio::spawn(run_remote_sidecar_chat_in_background(
+        RemoteSidecarChatRunContext {
+            state: state.clone(),
+            run_id,
+            chat_id,
+            chat_title: chat.title,
+            queued_user_message_id,
+            assistant_message_id,
+            model_id,
+            provider_id,
+            run_stream,
+            initial_provider_request,
+            tool_catalog,
+            session_mode,
+            skill_read_root_dirs,
+            attachment_read_allowlist,
+            initial_runtime_tool_state,
+        },
+    ));
+    Ok(Sse::new(subscription).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(10))
             .text("keep-alive"),
@@ -13402,47 +13579,7 @@ async fn remote_sidecar_chat_run_stream(
     let run_stream = remote_sidecar_active_run_stream(&state, &run_id).ok_or_else(|| {
         ApiError::bad_request(format!("active chat run was not found: {run_id}")).into_response()
     })?;
-    let mut rx = run_stream.tx.subscribe();
-    let replay = run_stream.snapshot_after(after_sequence);
-    let stream = async_stream::stream! {
-        let mut last_sent_sequence = after_sequence;
-        for (sequence, event) in replay {
-            if sequence <= last_sent_sequence {
-                continue;
-            }
-            let terminal = remote_stream_event_is_terminal(&event);
-            yield Ok(remote_sse_json_event(sequence, event));
-            last_sent_sequence = sequence;
-            if terminal {
-                return;
-            }
-        }
-        while !run_stream.finished.load(Ordering::Relaxed) {
-            match rx.recv().await {
-                Ok((sequence, event)) => {
-                    if sequence <= last_sent_sequence {
-                        continue;
-                    }
-                    let terminal = remote_stream_event_is_terminal(&event);
-                    yield Ok(remote_sse_json_event(sequence, event));
-                    last_sent_sequence = sequence;
-                    if terminal {
-                        return;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    let sequence = last_sent_sequence.saturating_add(1);
-                    yield Ok(remote_sse_json_event(sequence, json!({
-                        "type": "error",
-                        "message": "remote run stream history was truncated; reload chat messages to recover persisted state",
-                    })));
-                    yield Ok(remote_sse_json_event(sequence.saturating_add(1), json!({ "type": "streamEnd" })));
-                    return;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
-            }
-        }
-    };
+    let stream = remote_sidecar_subscribe_run_stream(run_stream, after_sequence);
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(10))
@@ -20908,7 +21045,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_sidecar_chat_stream_clears_queue_after_started_stream_is_dropped() {
+    async fn remote_sidecar_chat_stream_keeps_run_after_initial_sse_is_dropped() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -20937,7 +21074,7 @@ mod tests {
         let (state, _broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
         let response = remote_sidecar_chat_stream(
-            State(state),
+            State(state.clone()),
             Json(json!({
                 "chatId": "chat-1",
                 "queuedUserMessageId": "msg-user-1",
@@ -20950,19 +21087,58 @@ mod tests {
         .expect("SSE response");
         let body = response.into_response().into_body();
         let reader = tokio::spawn(async move { axum::body::to_bytes(body, usize::MAX).await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Let the background runner mark queuedRun started and emit initial events.
+        tokio::time::sleep(Duration::from_millis(50)).await;
         reader.abort();
         let _ = reader.await;
         tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
-        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let active_runs = state.active_runs.lock().expect("active runs lock").clone();
+        assert_eq!(active_runs.len(), 1);
+        let run_id = active_runs[0].run_id.clone();
+        assert!(
+            remote_sidecar_active_run_stream(&state, &run_id).is_some(),
+            "active run stream should survive SSE disconnect"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create_critical(workspace.path()).expect("workspace db");
         let message = database
             .message("msg-user-1")
             .expect("message lookup")
             .expect("message");
         let metadata: Value =
             serde_json::from_str(&message.metadata_json).expect("message metadata");
-        assert!(metadata.get("queuedRun").is_none());
+        assert_eq!(
+            metadata["queuedRun"]["status"], "running",
+            "dropping the initial SSE subscription must not clear queuedRun"
+        );
+
+        let run_stream =
+            remote_sidecar_active_run_stream(&state, &run_id).expect("run stream still active");
+        let replay = run_stream.snapshot_after(-1);
+        assert!(
+            replay.iter().any(|(_, event)| {
+                event.get("type").and_then(Value::as_str) == Some("start")
+                    || event.get("type").and_then(Value::as_str) == Some("connecting")
+            }),
+            "background runner should have recorded start/connecting events"
+        );
+
+        // Shared reconnect path must accept the still-active run id.
+        let reconnect = remote_sidecar_chat_run_stream(
+            State(state.clone()),
+            AxumPath(run_id),
+            Query(HashMap::from([(
+                "afterSequence".to_string(),
+                "-1".to_string(),
+            )])),
+        )
+        .await
+        .expect("reconnect stream");
+        drop(reconnect);
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -21225,7 +21401,7 @@ mod tests {
         });
 
         let bytes = tokio::time::timeout(
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
         )
         .await
