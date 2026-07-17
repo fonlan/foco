@@ -7,8 +7,10 @@ import {
   useRef,
   useState,
   type ComponentPropsWithoutRef,
+  type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
+
 import { Check, Copy } from "lucide-react";
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import type { Components, UrlTransform } from "react-markdown";
@@ -63,13 +65,7 @@ const MERMAID_CONFIG: Record<string, unknown> = {
 let mermaidRuntimePromise: Promise<MermaidRuntime> | null = null;
 
 const MARKDOWN_COMPONENTS: Components = {
-  a({ children, node: _node, ...props }) {
-    return (
-      <a rel="noreferrer" target="_blank" {...props}>
-        {children}
-      </a>
-    );
-  },
+  a: MarkdownAnchor,
   img({ alt, ...props }) {
     return <img alt={alt ?? ""} loading="lazy" {...props} />;
   },
@@ -82,6 +78,61 @@ const MARKDOWN_COMPONENTS: Components = {
     return <CodeBlock preProps={props}>{children}</CodeBlock>;
   },
 };
+
+type MarkdownAnchorProps = ComponentPropsWithoutRef<"a"> & {
+  node?: unknown;
+};
+
+/**
+ * Shared markdown anchor: force a safe new-tab target, and for plain primary
+ * activation explicitly open via window.open so list gesture handlers cannot
+ * leave the link inert. Modifier / non-primary clicks keep native semantics.
+ */
+function MarkdownAnchor({
+  children,
+  href,
+  node: _node,
+  onClick,
+  ...props
+}: MarkdownAnchorProps) {
+  return (
+    <a
+      {...props}
+      href={href}
+      onClick={(event) => handleMarkdownAnchorClick(event, href, onClick)}
+      rel="noopener noreferrer"
+      target="_blank"
+    >
+      {children}
+    </a>
+  );
+}
+
+/** Primary-activation handler for markdown links; safe to unit-test in isolation. */
+export function handleMarkdownAnchorClick(
+  event: ReactMouseEvent<HTMLAnchorElement>,
+  href: string | undefined,
+  onClick?: ComponentPropsWithoutRef<"a">["onClick"],
+) {
+  onClick?.(event);
+  if (event.defaultPrevented || !href) {
+    return;
+  }
+
+  // Let the browser handle modified / non-primary activation (new tab, download, etc.).
+  if (
+    event.button !== 0 ||
+    event.metaKey ||
+    event.ctrlKey ||
+    event.shiftKey ||
+    event.altKey
+  ) {
+    return;
+  }
+
+  event.preventDefault();
+  window.open(href, "_blank", "noopener,noreferrer");
+}
 
 const MARKDOWN_REHYPE_PLUGINS: PluggableList = [rehypeKatex];
 const MARKDOWN_SANITIZE_SCHEMA = {

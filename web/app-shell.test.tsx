@@ -3419,6 +3419,72 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("activates markdown links after message-list pointer gestures without setPointerCapture", async () => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
+    appTestState.chatMessagesResponsesByChatKey["workspace-1/chat-1"] = {
+      ...chatMessages,
+      messages: [
+        {
+          ...chatMessages.messages[0],
+          content: "See [docs](https://example.com/message-link).",
+          parts: [
+            {
+              text: "See [docs](https://example.com/message-link).",
+              type: "text",
+            },
+          ],
+        },
+        chatMessages.messages[1],
+      ],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const link = await screen.findByRole("link", { name: "docs" });
+    expect(link).toHaveAttribute("href", "https://example.com/message-link");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    const setPointerCapture = vi.fn();
+    Object.defineProperty(list, "setPointerCapture", {
+      configurable: true,
+      value: setPointerCapture,
+    });
+
+    // History-pagination gesture: primary pointer on the list must not capture,
+    // or nested link clicks would be retargeted away from the anchor.
+    list.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerId: 11,
+        pointerType: "mouse",
+      }),
+    );
+    expect(setPointerCapture).not.toHaveBeenCalled();
+
+    window.dispatchEvent(
+      new PointerEvent("pointerup", {
+        bubbles: true,
+        pointerId: 11,
+        pointerType: "mouse",
+      }),
+    );
+
+    await userEvent.click(link);
+
+    expect(setPointerCapture).not.toHaveBeenCalled();
+    expect(openSpy).toHaveBeenCalledWith(
+      "https://example.com/message-link",
+      "_blank",
+      "noopener,noreferrer",
+    );
+  });
+
   it("keeps open tabs for chats scrolled out of the recent 5-page window", async () => {
     // First page: chat-1, chat-2, older-chat-1..3. Open older-chat-6 (page 2).
     const offPageChatId = "older-chat-6";
