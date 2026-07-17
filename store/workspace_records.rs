@@ -1050,6 +1050,14 @@ pub struct LlmRequestMetricsRecord {
     pub output_tokens: Option<i64>,
 }
 
+/// LLM metrics joined to the assistant message id from the request `start` event.
+/// Used by chat message page assembly so metrics load only for the current page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LlmRequestMetricsForAssistantRecord {
+    pub assistant_message_id: String,
+    pub metrics: LlmRequestMetricsRecord,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LlmRequestUsageRecord {
     pub input_tokens: i64,

@@ -53,19 +53,19 @@ pub use workspace_records::{
     ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
-    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord, LlmRequestRecord,
-    LlmRequestUsageRecord, LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord,
-    MessageRoleCountRecord, NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent,
-    NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam,
-    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
-    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
-    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
-    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
-    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
-    PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsForAssistantRecord,
+    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRecord, LlmRequestUsageRollupFilters,
+    MessageMetadataMutation, MessageRecord, MessageRoleCountRecord, NewAgentContextEntry,
+    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
+    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase,
+    NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection, NewRunEvent,
+    NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
+    NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
+    PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
+    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
     PreStreamFailureMaterialization, PromptContextInjectionRecord,
     RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
@@ -6560,6 +6560,22 @@ impl WorkspaceDatabase {
         Ok(records)
     }
 
+    /// Lowest sequence of an assistant message in the chat, if any.
+    pub fn first_assistant_sequence_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<i64>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT MIN(sequence)
+                 FROM messages
+                 WHERE chat_id = ?1 AND role = 'assistant'",
+                params![chat_id],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn message_role_counts_for_chat(
         &self,
         chat_id: &str,
@@ -7879,6 +7895,77 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    /// Load tool calls (with results) for the given message ids only.
+    /// Empty `message_ids` returns immediately without querying.
+    pub fn tool_calls_for_message_ids(
+        &self,
+        message_ids: &[String],
+    ) -> Result<Vec<ToolCallWithResultRecord>, WorkspaceDatabaseError> {
+        if message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (1..=message_ids.len())
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT
+                tool_calls.id,
+                tool_calls.chat_id,
+                tool_calls.run_id,
+                tool_calls.message_id,
+                tool_calls.tool_name,
+                tool_calls.input_json,
+                tool_calls.status,
+                tool_calls.started_at,
+                tool_calls.completed_at,
+                tool_results.id,
+                tool_results.output_json,
+                tool_results.is_error,
+                tool_results.created_at
+             FROM tool_calls
+             LEFT JOIN tool_results ON tool_results.tool_call_id = tool_calls.id
+             WHERE tool_calls.message_id IN ({placeholders})
+             ORDER BY tool_calls.started_at ASC, tool_calls.id ASC"
+        );
+        let parameters = message_ids
+            .iter()
+            .cloned()
+            .map(SqlValue::Text)
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
+                Ok(ToolCallWithResultRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    message_id: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_json: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                    result: match row.get::<_, Option<String>>(9)? {
+                        Some(id) => Some(ToolResultRecord {
+                            id,
+                            tool_call_id: row.get(0)?,
+                            output_json: row.get(10)?,
+                            is_error: row.get::<_, i64>(11)? != 0,
+                            created_at: row.get(12)?,
+                        }),
+                        None => None,
+                    },
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
     pub fn tool_call_counts_for_chat(
         &self,
         chat_id: &str,
@@ -8261,6 +8348,80 @@ impl WorkspaceDatabase {
                     first_token_latency_ms: row.get(3)?,
                     total_latency_ms: row.get(4)?,
                     output_tokens: row.get(5)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// LLM metrics for the given assistant message ids, joined via start events.
+    /// Empty `assistant_message_ids` returns immediately without querying.
+    /// Prefer existing indexes (`llm_requests_chat_valid_idx` / request PK + event
+    /// UNIQUE) rather than adding a new composite index without planner evidence.
+    pub fn llm_request_metrics_for_assistant_message_ids(
+        &self,
+        chat_id: &str,
+        assistant_message_ids: &[String],
+    ) -> Result<Vec<LlmRequestMetricsForAssistantRecord>, WorkspaceDatabaseError> {
+        if assistant_message_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (2..=assistant_message_ids.len() + 1)
+            .map(|index| format!("?{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // Filter by chat_id first (chat_valid_idx), then join start event sequence=0
+        // (UNIQUE on llm_request_id, sequence), then filter assistant ids via
+        // json_extract on the small start-event set for the chat.
+        let sql = format!(
+            "SELECT
+                CAST(
+                    COALESCE(
+                        json_extract(llm_request_events.normalized_event_json, '$.assistantMessageId'),
+                        json_extract(llm_request_events.normalized_event_json, '$.assistant_message_id')
+                    ) AS TEXT
+                ) AS assistant_message_id,
+                llm_requests.id,
+                llm_requests.provider_id,
+                llm_requests.model_id,
+                llm_requests.first_token_latency_ms,
+                llm_requests.total_latency_ms,
+                llm_requests.output_tokens
+             FROM llm_requests
+             INNER JOIN llm_request_events
+                ON llm_request_events.llm_request_id = llm_requests.id
+                AND llm_request_events.event_type = 'start'
+                AND llm_request_events.sequence = 0
+             WHERE llm_requests.chat_id = ?1
+               AND llm_requests.invalidated_at IS NULL
+               AND CAST(
+                    COALESCE(
+                        json_extract(llm_request_events.normalized_event_json, '$.assistantMessageId'),
+                        json_extract(llm_request_events.normalized_event_json, '$.assistant_message_id')
+                    ) AS TEXT
+               ) IN ({placeholders})
+             ORDER BY llm_requests.request_started_at ASC, llm_requests.id ASC"
+        );
+        let mut parameters = Vec::with_capacity(assistant_message_ids.len() + 1);
+        parameters.push(SqlValue::Text(chat_id.to_string()));
+        parameters.extend(assistant_message_ids.iter().cloned().map(SqlValue::Text));
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
+                Ok(LlmRequestMetricsForAssistantRecord {
+                    assistant_message_id: row.get(0)?,
+                    metrics: LlmRequestMetricsRecord {
+                        id: row.get(1)?,
+                        provider_id: row.get(2)?,
+                        model_id: row.get(3)?,
+                        first_token_latency_ms: row.get(4)?,
+                        total_latency_ms: row.get(5)?,
+                        output_tokens: row.get(6)?,
+                    },
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -9054,6 +9215,120 @@ impl WorkspaceDatabase {
                     sequence ASC,
                     created_at ASC,
                     id ASC",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![chat_id], |row| {
+                Ok(PromptContextInjectionRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    kind: row.get(2)?,
+                    sequence: row.get(3)?,
+                    messages_json: row.get(4)?,
+                    memory_keys_json: row.get(5)?,
+                    memory_summaries_json: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// Prompt context injections needed for a message page.
+    ///
+    /// Loads `stable` injections always, and `turn_memory` only when the user
+    /// sequence is in `[min_assistant_sequence - 1, max_assistant_sequence - 1]`
+    /// so memories attach to page assistants via `sequence + 1` without loading
+    /// the entire chat. When `include_stable` is false (older history pages),
+    /// stable injections are omitted so stable memory is not re-attached to the
+    /// first assistant of every page.
+    pub fn prompt_context_injections_for_message_page(
+        &self,
+        chat_id: &str,
+        min_assistant_sequence: Option<i64>,
+        max_assistant_sequence: Option<i64>,
+        include_stable: bool,
+    ) -> Result<Vec<PromptContextInjectionRecord>, WorkspaceDatabaseError> {
+        let Some(min_assistant_sequence) = min_assistant_sequence else {
+            // No assistants on the page: only optional stable (latest-page open).
+            if !include_stable {
+                return Ok(Vec::new());
+            }
+            return self.prompt_context_stable_for_chat(chat_id);
+        };
+        let max_assistant_sequence = max_assistant_sequence.unwrap_or(min_assistant_sequence);
+        // turn_memory.sequence is the user sequence; memories attach to assistant at +1.
+        let min_turn_sequence = min_assistant_sequence.saturating_sub(1).max(0);
+        let max_turn_sequence = max_assistant_sequence.saturating_sub(1).max(0);
+
+        let sql = if include_stable {
+            "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at
+             FROM prompt_context_injections
+             WHERE chat_id = ?1
+               AND (
+                    kind = 'stable'
+                    OR (
+                        kind = 'turn_memory'
+                        AND sequence IS NOT NULL
+                        AND sequence >= ?2
+                        AND sequence <= ?3
+                    )
+               )
+             ORDER BY
+                CASE kind WHEN 'stable' THEN 0 ELSE 1 END,
+                sequence ASC,
+                created_at ASC,
+                id ASC"
+        } else {
+            "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at
+             FROM prompt_context_injections
+             WHERE chat_id = ?1
+               AND kind = 'turn_memory'
+               AND sequence IS NOT NULL
+               AND sequence >= ?2
+               AND sequence <= ?3
+             ORDER BY
+                sequence ASC,
+                created_at ASC,
+                id ASC"
+        };
+        let mut statement = self
+            .connection
+            .prepare(sql)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![chat_id, min_turn_sequence, max_turn_sequence],
+                |row| {
+                    Ok(PromptContextInjectionRecord {
+                        id: row.get(0)?,
+                        chat_id: row.get(1)?,
+                        kind: row.get(2)?,
+                        sequence: row.get(3)?,
+                        messages_json: row.get(4)?,
+                        memory_keys_json: row.get(5)?,
+                        memory_summaries_json: row.get(6)?,
+                        created_at: row.get(7)?,
+                    })
+                },
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    fn prompt_context_stable_for_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<PromptContextInjectionRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at
+                 FROM prompt_context_injections
+                 WHERE chat_id = ?1 AND kind = 'stable'
+                 ORDER BY created_at ASC, id ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement

@@ -8870,6 +8870,461 @@ fn messages_for_chat_page_and_role_counts_are_ordered() {
 }
 
 #[test]
+fn tool_calls_for_message_ids_scopes_to_page_and_short_circuits_empty() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Scoped tools")
+        .expect("chat insert");
+    for sequence in 0..6 {
+        let role = if sequence % 2 == 0 {
+            "user"
+        } else {
+            "assistant"
+        };
+        database
+            .insert_message(NewMessage {
+                id: &format!("message-{sequence}"),
+                chat_id: "chat-1",
+                role,
+                content: &format!("message {sequence}"),
+                sequence,
+                metadata_json: None,
+            })
+            .expect("message insert");
+    }
+    for (call_index, message_id) in [
+        ("message-1", "message-1"),
+        ("message-3", "message-3"),
+        ("message-5", "message-5"),
+    ] {
+        database
+            .insert_tool_call(NewToolCall {
+                id: &format!("tool-{call_index}"),
+                chat_id: "chat-1",
+                run_id: "run-1",
+                message_id: Some(message_id),
+                tool_name: "read_file",
+                input_json: r#"{"path":"a.rs"}"#,
+                status: "completed",
+                started_at: "2026-07-01T00:00:00.000Z",
+                completed_at: Some("2026-07-01T00:00:01.000Z"),
+            })
+            .expect("tool call insert");
+        database
+            .insert_tool_result(NewToolResult {
+                id: &format!("result-{call_index}"),
+                tool_call_id: &format!("tool-{call_index}"),
+                output_json: r#"{"ok":true}"#,
+                is_error: false,
+                created_at: "2026-07-01T00:00:01.000Z",
+            })
+            .expect("tool result insert");
+    }
+
+    let empty = database
+        .tool_calls_for_message_ids(&[])
+        .expect("empty tool calls");
+    assert!(empty.is_empty());
+
+    let page = database
+        .tool_calls_for_message_ids(&["message-3".to_string(), "message-5".to_string()])
+        .expect("page tool calls");
+    assert_eq!(page.len(), 2);
+    assert!(
+        page.iter()
+            .all(|call| call.message_id.as_deref() == Some("message-3")
+                || call.message_id.as_deref() == Some("message-5"))
+    );
+    assert!(page.iter().all(|call| call.result.is_some()));
+}
+
+#[test]
+fn llm_request_metrics_for_assistant_message_ids_scopes_to_page() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Scoped metrics")
+        .expect("chat insert");
+    for sequence in [0_i64, 1, 2, 3] {
+        let role = if sequence % 2 == 0 {
+            "user"
+        } else {
+            "assistant"
+        };
+        database
+            .insert_message(NewMessage {
+                id: &format!("message-{sequence}"),
+                chat_id: "chat-1",
+                role,
+                content: &format!("message {sequence}"),
+                sequence,
+                metadata_json: None,
+            })
+            .expect("message insert");
+    }
+    for (request_id, assistant_id, started_at) in [
+        ("req-1", "message-1", "2026-07-01T00:00:00.000Z"),
+        ("req-2", "message-3", "2026-07-01T00:01:00.000Z"),
+        ("req-3", "message-3", "2026-07-01T00:01:30.000Z"),
+    ] {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: request_id,
+                workspace_id: "workspace-1",
+                chat_id: Some("chat-1"),
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "openai",
+                model_id: "gpt-test",
+                thinking_level: None,
+                request_started_at: started_at,
+                first_token_at: Some(started_at),
+                completed_at: Some(started_at),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                reasoning_tokens: None,
+                first_token_latency_ms: Some(10),
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("llm request insert");
+        database
+            .insert_llm_request_event(NewLlmRequestEvent {
+                id: &format!("{request_id}-start"),
+                llm_request_id: request_id,
+                sequence: 0,
+                event_at: started_at,
+                event_type: "start",
+                raw_chunk_json: None,
+                normalized_event_json: &format!(
+                    r#"{{"type":"start","assistantMessageId":"{assistant_id}"}}"#
+                ),
+            })
+            .expect("start event insert");
+    }
+
+    let empty = database
+        .llm_request_metrics_for_assistant_message_ids("chat-1", &[])
+        .expect("empty metrics");
+    assert!(empty.is_empty());
+
+    let page = database
+        .llm_request_metrics_for_assistant_message_ids("chat-1", &["message-3".to_string()])
+        .expect("page metrics");
+    assert_eq!(page.len(), 2);
+    assert!(
+        page.iter()
+            .all(|row| row.assistant_message_id == "message-3")
+    );
+    assert_eq!(
+        page.iter()
+            .map(|row| row.metrics.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["req-2", "req-3"]
+    );
+}
+
+#[test]
+fn prompt_context_injections_for_message_page_scopes_turn_memory_and_stable() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Paged injections")
+        .expect("chat insert");
+    database
+        .insert_prompt_context_injection(NewPromptContextInjection {
+            id: "stable-1",
+            chat_id: "chat-1",
+            kind: "stable",
+            sequence: None,
+            messages_json: r#"[{"role":"system","content":"stable"}]"#,
+            memory_keys_json: r#"["stable-key"]"#,
+            memory_summaries_json: r#"[{"id":"stable-key","content":"stable memory"}]"#,
+        })
+        .expect("stable injection");
+    for (id, sequence) in [
+        ("turn-0", 0_i64),
+        ("turn-2", 2),
+        ("turn-4", 4),
+        ("turn-6", 6),
+    ] {
+        database
+            .insert_prompt_context_injection(NewPromptContextInjection {
+                id,
+                chat_id: "chat-1",
+                kind: "turn_memory",
+                sequence: Some(sequence),
+                messages_json: r#"[{"role":"system","content":"turn"}]"#,
+                memory_keys_json: &format!(r#"["{id}"]"#),
+                memory_summaries_json: &format!(r#"[{{"id":"{id}","content":"memory for {id}"}}]"#),
+            })
+            .expect("turn injection");
+    }
+
+    // Page assistants sequences 5..7 → turn_memory user sequences 4..6.
+    let with_stable = database
+        .prompt_context_injections_for_message_page("chat-1", Some(5), Some(7), true)
+        .expect("page with stable");
+    assert!(
+        with_stable
+            .iter()
+            .any(|row| row.kind == "stable" && row.id == "stable-1")
+    );
+    let turn_ids = with_stable
+        .iter()
+        .filter(|row| row.kind == "turn_memory")
+        .map(|row| row.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(turn_ids, vec!["turn-4", "turn-6"]);
+
+    let without_stable = database
+        .prompt_context_injections_for_message_page("chat-1", Some(5), Some(7), false)
+        .expect("page without stable");
+    assert!(without_stable.iter().all(|row| row.kind != "stable"));
+    assert_eq!(
+        without_stable
+            .iter()
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["turn-4", "turn-6"]
+    );
+
+    let no_assistants = database
+        .prompt_context_injections_for_message_page("chat-1", None, None, false)
+        .expect("no assistants no stable");
+    assert!(no_assistants.is_empty());
+}
+
+#[test]
+fn large_chat_page_association_loads_only_current_page_ids() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Large chat")
+        .expect("chat insert");
+
+    const MESSAGE_COUNT: i64 = 4000;
+    const PAGE_LIMIT: usize = 60;
+    for sequence in 0..MESSAGE_COUNT {
+        let role = if sequence % 2 == 0 {
+            "user"
+        } else {
+            "assistant"
+        };
+        database
+            .insert_message(NewMessage {
+                id: &format!("message-{sequence}"),
+                chat_id: "chat-1",
+                role,
+                content: &format!("message {sequence}"),
+                sequence,
+                metadata_json: None,
+            })
+            .expect("message insert");
+        if role == "assistant" {
+            let message_id = format!("message-{sequence}");
+            let request_id = format!("req-{sequence}");
+            let tool_id = format!("tool-{sequence}");
+            let result_id = format!("result-{sequence}");
+            let minute = (sequence / 60) % 60;
+            let second = sequence % 60;
+            let started_at = format!("2026-07-01T12:{minute:02}:{second:02}.000Z");
+            database
+                .insert_llm_request(NewLlmRequest {
+                    id: &request_id,
+                    workspace_id: "workspace-1",
+                    chat_id: Some("chat-1"),
+                    request_kind: "chat completion",
+                    agent_team_id: None,
+                    agent_instance_id: None,
+                    agent_task_id: None,
+                    agent_attempt_id: None,
+                    provider_id: "openai",
+                    model_id: "gpt-test",
+                    thinking_level: None,
+                    request_started_at: &started_at,
+                    first_token_at: Some(&started_at),
+                    completed_at: Some(&started_at),
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    cache_read_tokens: Some(0),
+                    cache_write_tokens: Some(0),
+                    reasoning_tokens: None,
+                    first_token_latency_ms: Some(10),
+                    total_latency_ms: Some(100),
+                    status_code: Some(200),
+                    final_state: "succeeded",
+                    request_body_json: None,
+                    response_body_json: None,
+                })
+                .expect("llm request insert");
+            database
+                .insert_llm_request_event(NewLlmRequestEvent {
+                    id: &format!("{request_id}-start"),
+                    llm_request_id: &request_id,
+                    sequence: 0,
+                    event_at: &started_at,
+                    event_type: "start",
+                    raw_chunk_json: None,
+                    normalized_event_json: &format!(
+                        r#"{{"type":"start","assistantMessageId":"{message_id}"}}"#
+                    ),
+                })
+                .expect("start event insert");
+            database
+                .insert_tool_call(NewToolCall {
+                    id: &tool_id,
+                    chat_id: "chat-1",
+                    run_id: "run-1",
+                    message_id: Some(message_id.as_str()),
+                    tool_name: "read_file",
+                    input_json: r#"{"path":"a.rs"}"#,
+                    status: "completed",
+                    started_at: &started_at,
+                    completed_at: Some(&started_at),
+                })
+                .expect("tool call insert");
+            database
+                .insert_tool_result(NewToolResult {
+                    id: &result_id,
+                    tool_call_id: &tool_id,
+                    output_json: r#"{"ok":true}"#,
+                    is_error: false,
+                    created_at: &started_at,
+                })
+                .expect("tool result insert");
+        }
+    }
+
+    let whole_chat_tools = database
+        .tool_calls_for_chat("chat-1")
+        .expect("whole chat tools");
+    assert_eq!(whole_chat_tools.len(), (MESSAGE_COUNT / 2) as usize);
+
+    let latest = database
+        .messages_for_chat_page("chat-1", None, PAGE_LIMIT)
+        .expect("latest page");
+    assert_eq!(latest.len(), PAGE_LIMIT);
+    assert_eq!(
+        latest.first().map(|m| m.sequence),
+        Some(MESSAGE_COUNT - PAGE_LIMIT as i64)
+    );
+    assert_eq!(latest.last().map(|m| m.sequence), Some(MESSAGE_COUNT - 1));
+
+    let page_ids = latest
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let assistant_ids = latest
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let page_tools = database
+        .tool_calls_for_message_ids(&page_ids)
+        .expect("page tools");
+    assert_eq!(page_tools.len(), assistant_ids.len());
+    assert!(page_tools.iter().all(|call| {
+        call.message_id
+            .as_ref()
+            .is_some_and(|id| page_ids.contains(id))
+    }));
+
+    let page_metrics = database
+        .llm_request_metrics_for_assistant_message_ids("chat-1", &assistant_ids)
+        .expect("page metrics");
+    assert_eq!(page_metrics.len(), assistant_ids.len());
+    assert!(
+        page_metrics
+            .iter()
+            .all(|row| assistant_ids.contains(&row.assistant_message_id))
+    );
+
+    let next_before = latest
+        .first()
+        .map(|message| message.sequence)
+        .expect("cursor");
+    let previous = database
+        .messages_for_chat_page("chat-1", Some(next_before), PAGE_LIMIT)
+        .expect("previous page");
+    assert_eq!(previous.len(), PAGE_LIMIT);
+    let previous_ids = previous
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let latest_ids = latest
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(previous_ids.is_disjoint(&latest_ids));
+    assert_eq!(previous.last().map(|m| m.sequence), Some(next_before - 1));
+
+    // EXPLAIN: page-scoped metrics should use chat-valid index path, not full table scan.
+    let connection = Connection::open(database.database_path()).expect("open database");
+    let metrics_plan = explain_query_plan(
+        &connection,
+        "SELECT
+            CAST(
+                COALESCE(
+                    json_extract(llm_request_events.normalized_event_json, '$.assistantMessageId'),
+                    json_extract(llm_request_events.normalized_event_json, '$.assistant_message_id')
+                ) AS TEXT
+            ) AS assistant_message_id,
+            llm_requests.id
+         FROM llm_requests
+         INNER JOIN llm_request_events
+            ON llm_request_events.llm_request_id = llm_requests.id
+            AND llm_request_events.event_type = 'start'
+            AND llm_request_events.sequence = 0
+         WHERE llm_requests.chat_id = 'chat-1'
+           AND llm_requests.invalidated_at IS NULL
+           AND CAST(
+                COALESCE(
+                    json_extract(llm_request_events.normalized_event_json, '$.assistantMessageId'),
+                    json_extract(llm_request_events.normalized_event_json, '$.assistant_message_id')
+                ) AS TEXT
+           ) IN ('message-3999', 'message-3997')
+         ORDER BY llm_requests.request_started_at ASC, llm_requests.id ASC",
+    );
+    assert!(
+        plan_uses_index(&metrics_plan, "llm_requests_chat_valid_idx")
+            || plan_uses_index(&metrics_plan, "llm_requests_chat_idx")
+            || metrics_plan.contains("SEARCH llm_requests")
+            || metrics_plan.contains("USING INDEX"),
+        "page metrics should use indexed llm_requests path, plan:\n{metrics_plan}"
+    );
+    assert_no_unconstrained_table_scan(&metrics_plan, "llm_requests");
+
+    let tools_plan = explain_query_plan(
+        &connection,
+        "SELECT tool_calls.id
+         FROM tool_calls
+         LEFT JOIN tool_results ON tool_results.tool_call_id = tool_calls.id
+         WHERE tool_calls.message_id IN ('message-3999', 'message-3997')
+         ORDER BY tool_calls.started_at ASC, tool_calls.id ASC",
+    );
+    assert!(
+        plan_uses_index(&tools_plan, "tool_calls_message_idx")
+            || tools_plan.contains("SEARCH tool_calls")
+            || tools_plan.contains("USING INDEX"),
+        "page tool calls should use message_id index, plan:\n{tools_plan}"
+    );
+}
+
+#[test]
 fn repository_helpers_persist_terminal_working_directory() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

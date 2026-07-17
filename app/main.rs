@@ -11230,6 +11230,20 @@ fn chat_message_summaries_for_chat(
         .filter(|message| message.role == "assistant")
         .map(|message| message.id.clone())
         .collect::<Vec<_>>();
+    let page_message_ids = messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let page_min_assistant_sequence = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.sequence)
+        .min();
+    let page_max_assistant_sequence = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| message.sequence)
+        .max();
 
     // Phase 1: workspace ordinary only (no nested Memory open).
     let mut tool_calls_by_message = HashMap::<String, Vec<ChatToolCallSummary>>::new();
@@ -11239,7 +11253,7 @@ fn chat_message_summaries_for_chat(
     {
         let mut database = open_workspace_database(workspace_path)?;
         for tool_call in database
-            .tool_calls_for_chat(chat_id)
+            .tool_calls_for_message_ids(&page_message_ids)
             .map_err(ApiError::from_workspace_error)?
         {
             let Some(message_id) = tool_call.message_id.clone() else {
@@ -11258,29 +11272,21 @@ fn chat_message_summaries_for_chat(
             &tool_calls_by_message,
         )?;
 
-        let requests_by_id = database
-            .llm_request_metrics_for_chat(chat_id)
-            .map_err(ApiError::from_workspace_error)?
-            .into_iter()
-            .map(|request| (request.id.clone(), request))
-            .collect::<HashMap<_, _>>();
         let mut request_ids_by_message = HashMap::<String, Vec<String>>::new();
-        for event in database
-            .llm_request_start_events_for_chat(chat_id)
+        let mut requests_by_id = HashMap::<String, LlmRequestMetricsRecord>::new();
+        for linked in database
+            .llm_request_metrics_for_assistant_message_ids(chat_id, &assistant_message_ids)
             .map_err(ApiError::from_workspace_error)?
         {
-            let value = parse_json_value(&event.normalized_event_json, "LLM start event")?;
-            let Some(message_id) =
-                string_json_field(&value, "assistantMessageId", "assistant_message_id")
-            else {
-                continue;
-            };
             let request_ids = request_ids_by_message
-                .entry(message_id.to_string())
+                .entry(linked.assistant_message_id)
                 .or_default();
-            if !request_ids.contains(&event.llm_request_id) {
-                request_ids.push(event.llm_request_id);
+            if !request_ids.contains(&linked.metrics.id) {
+                request_ids.push(linked.metrics.id.clone());
             }
+            requests_by_id
+                .entry(linked.metrics.id.clone())
+                .or_insert(linked.metrics);
         }
         for (message_id, request_ids) in request_ids_by_message {
             let requests = request_ids
@@ -11298,8 +11304,23 @@ fn chat_message_summaries_for_chat(
             }
         }
 
+        let chat_first_assistant_sequence = database
+            .first_assistant_sequence_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?;
+        // Attach stable memory only when this page includes the chat's first
+        // assistant so older history pages do not re-bind stable to their first
+        // assistant.
+        let include_stable = matches!(
+            (page_min_assistant_sequence, chat_first_assistant_sequence),
+            (Some(page_min), Some(chat_min)) if page_min == chat_min
+        );
         prompt_injections = database
-            .prompt_context_injections_for_chat(chat_id)
+            .prompt_context_injections_for_message_page(
+                chat_id,
+                page_min_assistant_sequence,
+                page_max_assistant_sequence,
+                include_stable,
+            )
             .map_err(ApiError::from_workspace_error)?;
 
         for message in &messages {
@@ -11358,11 +11379,7 @@ fn chat_message_summaries_for_chat(
     let (mut memories_used_by_assistant_sequence, has_prompt_context_memory_summaries) =
         prompt_context_memory_summaries_by_assistant_sequence(
             &prompt_injections,
-            messages
-                .iter()
-                .filter(|message| message.role == "assistant")
-                .map(|message| message.sequence)
-                .min(),
+            page_min_assistant_sequence,
         )?;
 
     let mut summaries = Vec::new();

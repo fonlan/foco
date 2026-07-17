@@ -2356,11 +2356,14 @@ pub(crate) async fn chat_messages(
         .ok_or_else(|| ApiError::bad_request(format!("workspace was not found: {workspace_id}")))?;
     let mut database = open_workspace_database(&workspace.path)?;
 
-    // Best-effort historical heal: failed coordinator tasks that never wrote an
-    // assistant bubble (pre-stream DB congestion). Idempotent; does not re-run tasks.
-    database
-        .materialize_missing_pre_stream_failure_messages(chat_id)
-        .map_err(ApiError::from_workspace_error)?;
+    // Pre-stream failure heal is chat-scoped and idempotent, but only run on the
+    // latest page (no beforeSequence) so older history loads skip the scan.
+    let is_latest_page = query.before_sequence.is_none();
+    if is_latest_page {
+        database
+            .materialize_missing_pre_stream_failure_messages(chat_id)
+            .map_err(ApiError::from_workspace_error)?;
+    }
 
     let chat = database
         .chat(chat_id)
@@ -2371,6 +2374,17 @@ pub(crate) async fn chat_messages(
         chat_summary.kind.as_deref() == Some(MEMORY_DREAM_TRANSCRIPT_CHAT_KIND);
 
     let (message_records, pagination) = chat_message_records_for_query(&database, chat_id, &query)?;
+    // latest_response_usage is only useful on the initial latest page; older
+    // history pages skip the extra chat-wide usage lookup while keeping the
+    // response field optional/nullable.
+    let latest_response_usage = if is_latest_page {
+        database
+            .latest_completed_llm_usage_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .map(ChatUsageSummary::from)
+    } else {
+        None
+    };
     // Drop workspace ordinary before chat_message_summaries opens Memory (shared gate).
     drop(database);
     let messages = chat_message_summaries_for_chat(
@@ -2387,13 +2401,6 @@ pub(crate) async fn chat_messages(
     let pending_question = state
         .question_registry
         .pending_for_chat(workspace_id, chat_id)?;
-    let latest_response_usage = {
-        let database = open_workspace_database(&workspace.path)?;
-        database
-            .latest_completed_llm_usage_for_chat(chat_id)
-            .map_err(ApiError::from_workspace_error)?
-            .map(ChatUsageSummary::from)
-    };
 
     Ok(Json(ChatMessagesResponse {
         chat: Some(chat_summary),

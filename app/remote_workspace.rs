@@ -48,11 +48,11 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION, LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, RewriteChatFromUserMessage,
-        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, NewToolCall,
+        RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
+        UpdateLlmRequestOutcome, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase,
+        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -7847,27 +7847,45 @@ async fn remote_sidecar_chat_messages(
     AxumPath(chat_id): AxumPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    // Align with local MAX_CHAT_MESSAGES_PAGE_LIMIT and limit+1 hasMore semantics.
+    const MAX_REMOTE_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
     let limit = query
         .get("limit")
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(500)
-        .clamp(1, 500);
+        .unwrap_or(MAX_REMOTE_CHAT_MESSAGES_PAGE_LIMIT)
+        .clamp(1, MAX_REMOTE_CHAT_MESSAGES_PAGE_LIMIT);
     let before = query
         .get("beforeSequence")
         .and_then(|value| value.parse::<i64>().ok());
+    let is_latest_page = before.is_none();
     let mut database = sidecar_workspace_database(&state)?;
-    let _ = database.materialize_missing_pre_stream_failure_messages(&chat_id);
+    // Pre-stream heal only on the latest page (same as local chat_messages).
+    if is_latest_page {
+        let _ = database.materialize_missing_pre_stream_failure_messages(&chat_id);
+    }
     let chat = database
         .chat(&chat_id)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?
         .ok_or_else(|| {
             ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
         })?;
-    let tool_calls = database
-        .tool_calls_for_chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let fetch_limit = limit.saturating_add(1);
     let mut messages = database
-        .messages_for_chat_page(&chat_id, before, limit)
+        .messages_for_chat_page(&chat_id, before, fetch_limit)
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+    let has_more_before = messages.len() > limit;
+    if has_more_before {
+        messages.remove(0);
+    }
+    let next_before_sequence = has_more_before
+        .then(|| messages.first().map(|message| message.sequence))
+        .flatten();
+    let page_message_ids = messages
+        .iter()
+        .map(|message| message.id.clone())
+        .collect::<Vec<_>>();
+    let tool_calls = database
+        .tool_calls_for_message_ids(&page_message_ids)
         .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     // Best-effort: materialize compression/text/tool parts from run_events for
     // assistants that still lack metadata.parts (legacy or partial complete).
@@ -7877,8 +7895,6 @@ async fn remote_sidecar_chat_messages(
         &mut messages,
         &tool_calls,
     );
-    let has_more_before = messages.len() == limit;
-    let next_before_sequence = messages.first().map(|message| message.sequence);
     Ok(Json(json!({
         "chat": {
             "id": chat.id,
@@ -27034,6 +27050,149 @@ mod tests {
         assert_eq!(messages[1]["parts"][1]["type"], "text");
         assert_eq!(messages[1]["parts"][2]["type"], "toolCall");
         assert_eq!(messages[1]["parts"][2]["toolCall"]["id"], "call-1");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_pagination_matches_local_limit_plus_one() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Paged remote chat", "{}")
+            .expect("insert chat");
+        for sequence in 0..5 {
+            let role = if sequence % 2 == 0 {
+                "user"
+            } else {
+                "assistant"
+            };
+            let message_id = format!("msg-{sequence}");
+            database
+                .insert_message(NewMessage {
+                    id: &message_id,
+                    chat_id: "chat-1",
+                    role,
+                    content: &format!("content {sequence}"),
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("insert message");
+            if role == "assistant" {
+                let tool_id = format!("tool-{sequence}");
+                database
+                    .insert_tool_call(NewToolCall {
+                        id: &tool_id,
+                        chat_id: "chat-1",
+                        run_id: "run-1",
+                        message_id: Some(message_id.as_str()),
+                        tool_name: "read_file",
+                        input_json: r#"{"path":"a.rs"}"#,
+                        status: "completed",
+                        started_at: "2026-07-01T00:00:00.000Z",
+                        completed_at: Some("2026-07-01T00:00:01.000Z"),
+                    })
+                    .expect("tool call");
+            }
+        }
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "2".to_string());
+        let latest = remote_sidecar_chat_messages(
+            State(state.clone()),
+            AxumPath("chat-1".to_string()),
+            Query(query.clone()),
+        )
+        .await
+        .expect("latest page")
+        .0;
+        let latest_messages = latest["messages"].as_array().expect("messages");
+        assert_eq!(latest_messages.len(), 2);
+        assert_eq!(latest_messages[0]["id"], "msg-3");
+        assert_eq!(latest_messages[1]["id"], "msg-4");
+        assert_eq!(latest["pagination"]["hasMoreBefore"], true);
+        assert_eq!(latest["pagination"]["nextBeforeSequence"], 3);
+        assert_eq!(latest_messages[0]["toolCalls"][0]["id"], "tool-3");
+        assert!(
+            latest_messages[1]["toolCalls"]
+                .as_array()
+                .map(|calls| calls.is_empty())
+                .unwrap_or(true)
+        );
+
+        query.insert("beforeSequence".to_string(), "3".to_string());
+        let middle = remote_sidecar_chat_messages(
+            State(state.clone()),
+            AxumPath("chat-1".to_string()),
+            Query(query.clone()),
+        )
+        .await
+        .expect("middle page")
+        .0;
+        let middle_messages = middle["messages"].as_array().expect("messages");
+        assert_eq!(middle_messages.len(), 2);
+        assert_eq!(middle_messages[0]["id"], "msg-1");
+        assert_eq!(middle_messages[1]["id"], "msg-2");
+        assert_eq!(middle["pagination"]["hasMoreBefore"], true);
+        assert_eq!(middle["pagination"]["nextBeforeSequence"], 1);
+
+        query.insert("beforeSequence".to_string(), "1".to_string());
+        let earliest = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath("chat-1".to_string()),
+            Query(query),
+        )
+        .await
+        .expect("earliest page")
+        .0;
+        let earliest_messages = earliest["messages"].as_array().expect("messages");
+        assert_eq!(earliest_messages.len(), 1);
+        assert_eq!(earliest_messages[0]["id"], "msg-0");
+        assert_eq!(earliest["pagination"]["hasMoreBefore"], false);
+        assert!(earliest["pagination"]["nextBeforeSequence"].is_null());
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_exact_limit_boundary_is_not_false_has_more() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Boundary chat", "{}")
+            .expect("insert chat");
+        for sequence in 0..3 {
+            database
+                .insert_message(NewMessage {
+                    id: &format!("msg-{sequence}"),
+                    chat_id: "chat-1",
+                    role: if sequence % 2 == 0 {
+                        "user"
+                    } else {
+                        "assistant"
+                    },
+                    content: &format!("content {sequence}"),
+                    sequence,
+                    metadata_json: Some("{}"),
+                })
+                .expect("insert message");
+        }
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut query = HashMap::new();
+        query.insert("limit".to_string(), "3".to_string());
+        let response = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath("chat-1".to_string()),
+            Query(query),
+        )
+        .await
+        .expect("page")
+        .0;
+        assert_eq!(response["messages"].as_array().expect("messages").len(), 3);
+        assert_eq!(response["pagination"]["hasMoreBefore"], false);
+        assert!(response["pagination"]["nextBeforeSequence"].is_null());
     }
 
     #[tokio::test]
