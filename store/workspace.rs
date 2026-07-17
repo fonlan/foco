@@ -2913,6 +2913,115 @@ impl WorkspaceDatabase {
         Ok(count > 0)
     }
 
+    /// True when this phase still has non-terminal execution: an active
+    /// `plan_phase_attempt`, or a bound Agent task that is Queued/Running/Waiting.
+    /// Step completion must not terminalize the phase while this is true;
+    /// lifecycle entry points (`complete_plan_phase_*` / fail / cancel / merge)
+    /// remain the source of truth for execution-managed phases.
+    fn phase_has_active_execution(&self, phase_id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        if self.phase_has_active_attempt(phase_id)? {
+            return Ok(true);
+        }
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phases AS phase
+                 JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                 WHERE phase.id = ?1
+                   AND task.status IN ('queued', 'running', 'waiting')",
+                params![phase_id.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(count > 0)
+    }
+
+    /// True when a bound Agent task is already terminal but the phase has not
+    /// been closed by a lifecycle entry point yet (`complete_plan_phase_*` /
+    /// fail / cancel / merge sync). Step aggregation must keep the phase
+    /// running so recovery still finds `phase.status = 'running'` and cannot
+    /// mark the plan implemented from checkboxes alone.
+    fn phase_awaits_execution_lifecycle(
+        &self,
+        phase: &PlanPhaseRecord,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if !matches!(phase.status.as_str(), "running" | "pending") {
+            return Ok(false);
+        }
+        if phase
+            .agent_task_id
+            .as_ref()
+            .is_none_or(|task_id| task_id.trim().is_empty())
+        {
+            return Ok(false);
+        }
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phases AS phase
+                 JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                 WHERE phase.id = ?1
+                   AND task.status IN ('completed', 'failed', 'cancelled', 'interrupted')",
+                params![phase.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(count > 0)
+    }
+
+    /// True when this phase failed through an execution lifecycle (Agent task /
+    /// attempt outcome), not merely from aggregating a manual failed step.
+    /// Lifecycle failures stay sticky across step edits; manual step failures
+    /// remain recoverable when every step is later completed.
+    fn phase_has_lifecycle_failure(
+        &self,
+        phase: &PlanPhaseRecord,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if phase
+            .error_message
+            .as_ref()
+            .is_some_and(|message| !message.trim().is_empty())
+        {
+            return Ok(true);
+        }
+        // Only inspect the latest attempt: historical failed attempts must not
+        // sticky-block a later successful retry while the phase is running.
+        let latest_attempt_status: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT status
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![phase.id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        if latest_attempt_status
+            .as_deref()
+            .is_some_and(|status| matches!(status, "failed" | "interrupted"))
+        {
+            return Ok(true);
+        }
+        let task_failures: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phases AS phase
+                 JOIN agent_tasks AS task ON task.id = phase.agent_task_id
+                 WHERE phase.id = ?1
+                   AND task.status IN ('failed', 'interrupted')",
+                params![phase.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(task_failures > 0)
+    }
+
     fn plan_phase_attempt(
         &self,
         attempt_id: &str,
@@ -3532,6 +3641,7 @@ impl WorkspaceDatabase {
         agent_task_id: &AgentTaskId,
         commit_id: Option<&str>,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        // Execution-managed terminal: Agent task outcome (not step checkboxes).
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -3550,6 +3660,7 @@ impl WorkspaceDatabase {
         phase_id: &str,
         commit_id: Option<&str>,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        // Explicit lifecycle complete (e.g. merge path); steps are progress only.
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         self.update_latest_active_attempt_for_phase(
             plan_id,
@@ -3652,6 +3763,7 @@ impl WorkspaceDatabase {
         agent_task_id: &AgentTaskId,
         error_message: &str,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        // Execution-managed terminal: task Failed/Interrupted (steps may already be completed).
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -3665,6 +3777,7 @@ impl WorkspaceDatabase {
         agent_task_id: &AgentTaskId,
         error_message: &str,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
+        // Execution-managed terminal: task Cancelled.
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -3787,6 +3900,9 @@ impl WorkspaceDatabase {
         &mut self,
         plan_id: Option<&str>,
     ) -> Result<usize, WorkspaceDatabaseError> {
+        // Only repair attempts whose phase is already terminal. Step-driven
+        // refresh must not mark a phase terminal while execution is still
+        // active, so this path does not complete live attempts early.
         let now = now_timestamp();
         self.connection
             .execute(
@@ -4413,10 +4529,29 @@ impl WorkspaceDatabase {
                     },
                 )
                 .map_err(|source| self.sqlite_error(source))?;
+            // Priority: cancelled phase → failed steps → execution-lifecycle
+            // failure (sticky) → active execution (running) → bound task
+            // already terminal but phase not lifecycle-settled → all steps
+            // completed → other step/phase activity.
+            // Manual step failures are not sticky: completing every step may
+            // still implement a hand-managed plan. Lifecycle failures (task /
+            // attempt outcomes, phase error_message) stay sticky so a later
+            // step edit cannot revive a task-failed phase as completed.
+            // Active or unsettled Agent execution outranks "all steps
+            // completed" so checkboxes cannot finish an execution-managed
+            // phase early (including the window after a merge/task becomes
+            // terminal and before complete/fail/cancel runs).
+            let has_active_execution = self.phase_has_active_execution(&phase.id)?;
+            let awaits_lifecycle = self.phase_awaits_execution_lifecycle(phase)?;
+            let has_lifecycle_failure = self.phase_has_lifecycle_failure(phase)?;
             let status = if phase.status == "cancelled" {
                 "cancelled"
             } else if failed > 0 {
                 "failed"
+            } else if phase.status == "failed" && has_lifecycle_failure {
+                "failed"
+            } else if has_active_execution || awaits_lifecycle {
+                "running"
             } else if total > 0 && completed == total {
                 "completed"
             } else if running > 0 || phase.status == "running" {

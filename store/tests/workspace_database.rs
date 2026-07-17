@@ -3211,37 +3211,37 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
 }
 
 #[test]
-fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
+fn plan_phase_attempt_stays_running_when_step_completion_has_active_execution() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
     database
         .create_plan(NewPlan {
-            id: "plan-attempt-step-complete",
-            title: "Attempt step complete",
-            overview: "Manual step completion should finish the active attempt.",
+            id: "plan-attempt-step-active",
+            title: "Attempt step active",
+            overview: "Step completion must not finish an active execution.",
             status: "ready",
             source_chat_id: None,
             phases: vec![NewPlanPhase {
-                id: "plan-attempt-step-complete-phase-1",
+                id: "plan-attempt-step-active-phase-1",
                 title: "Phase one",
-                summary: "Complete via checkbox.",
+                summary: "Still executing.",
                 steps: vec![NewPlanStep {
-                    id: "plan-attempt-step-complete-step-1",
+                    id: "plan-attempt-step-active-step-1",
                     title: "Do work",
-                    detail: "Finish manually.",
-                    acceptance: vec!["attempt is completed".to_string()],
+                    detail: "Mark complete while agent runs.",
+                    acceptance: vec!["step completed".to_string()],
                 }],
             }],
         })
         .expect("create plan");
     database
-        .transition_plan("plan-attempt-step-complete", "start")
+        .transition_plan("plan-attempt-step-active", "start")
         .expect("start plan");
     let attempt = database
         .begin_plan_phase_attempt(
-            "plan-attempt-step-complete",
-            "plan-attempt-step-complete-phase-1",
+            "plan-attempt-step-active",
+            "plan-attempt-step-active-phase-1",
             PlanPhaseAttemptTrigger::Initial,
             Some("provider"),
             Some("model"),
@@ -3250,10 +3250,618 @@ fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
         &mut database,
-        "chat-attempt-step-complete",
-        "attempt-step-complete",
+        "chat-attempt-step-active",
+        "attempt-step-active",
     );
-    let task_id = AgentTaskId::new("agent-task-attempt-step-complete").expect("task id");
+    let task_id = AgentTaskId::new("agent-task-attempt-step-active").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-attempt-step-active", &team_id, &task_id)
+        .expect("attach attempt");
+
+    let updated = database
+        .update_plan_step(
+            "plan-attempt-step-active",
+            "plan-attempt-step-active-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step");
+
+    assert_eq!(updated.status, "running");
+    assert_eq!(
+        updated.active_phase_id.as_deref(),
+        Some("plan-attempt-step-active-phase-1")
+    );
+    assert_eq!(updated.phases[0].status, "running");
+    assert_eq!(updated.phases[0].steps[0].status, "completed");
+    assert!(updated.phases[0].steps[0].checked_at.is_some());
+    assert_eq!(updated.phases[0].attempts[0].status, "running");
+    assert!(updated.phases[0].attempts[0].completed_at.is_none());
+}
+
+#[test]
+fn plan_step_completion_keeps_phase_running_for_queued_running_and_waiting_tasks() {
+    for (suffix, make_waiting) in [("queued", false), ("running", false), ("waiting", true)] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+        let plan_id = format!("plan-step-active-{suffix}");
+        let phase_id = format!("{plan_id}-phase-1");
+        let step_id = format!("{plan_id}-step-1");
+        database
+            .create_plan(NewPlan {
+                id: &plan_id,
+                title: "Step active task",
+                overview: "All steps completed while agent task is non-terminal.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase one",
+                    summary: "Bound agent task still active.",
+                    steps: vec![NewPlanStep {
+                        id: &step_id,
+                        title: "Do work",
+                        detail: "Complete all steps early.",
+                        acceptance: vec!["step completed".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        let (team_id, instance_id) = create_test_agent_team(
+            &mut database,
+            &format!("chat-step-active-{suffix}"),
+            &format!("step-active-{suffix}"),
+        );
+        let task_id =
+            AgentTaskId::new(format!("agent-task-step-active-{suffix}")).expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                &format!("chat-step-active-{suffix}"),
+                &team_id,
+                &task_id,
+            )
+            .expect("attach attempt");
+        if suffix != "queued" {
+            let attempt_id = AgentAttemptId::new(format!("agent-attempt-step-active-{suffix}"))
+                .expect("attempt");
+            database
+                .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+                .expect("claim")
+                .expect("claimed");
+            if make_waiting {
+                database
+                    .update_agent_task_state(AgentTaskStateUpdate {
+                        team_id: &team_id,
+                        task_id: &task_id,
+                        expected_status: AgentTaskStatus::Running,
+                        transition: AgentTaskTransition::Wait,
+                        result_json: None,
+                        error_json: None,
+                        interruption_reason: None,
+                    })
+                    .expect("wait task");
+            }
+        }
+
+        let updated = database
+            .update_plan_step(
+                &plan_id,
+                &step_id,
+                PlanStepPatch {
+                    title: None,
+                    detail: None,
+                    acceptance: None,
+                    status: Some("completed"),
+                },
+            )
+            .expect("complete step");
+
+        assert_eq!(updated.status, "running", "plan status for {suffix}");
+        assert_eq!(
+            updated.active_phase_id.as_deref(),
+            Some(phase_id.as_str()),
+            "active_phase_id for {suffix}"
+        );
+        assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
+        assert_eq!(
+            updated.phases[0].steps[0].status, "completed",
+            "step for {suffix}"
+        );
+        assert!(updated.phases[0].steps[0].checked_at.is_some());
+        assert_eq!(
+            updated.phases[0].attempts[0].status, "running",
+            "attempt for {suffix}"
+        );
+        assert!(
+            updated.phases[0].attempts[0].completed_at.is_none(),
+            "attempt completed_at for {suffix}"
+        );
+
+        if make_waiting {
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &task_id,
+                    expected_status: AgentTaskStatus::Waiting,
+                    transition: AgentTaskTransition::Resume,
+                    result_json: None,
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("resume task");
+            let after_resume = database.plan(&plan_id).expect("plan").expect("plan");
+            assert_eq!(after_resume.status, "running");
+            assert_eq!(after_resume.phases[0].status, "running");
+            assert_eq!(after_resume.phases[0].attempts[0].status, "running");
+        }
+    }
+}
+
+#[test]
+fn plan_phase_completes_only_after_bound_task_completion_entry() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-complete-after-task",
+            title: "Complete after task",
+            overview: "Lifecycle complete finishes steps, phase, and attempt together.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-complete-after-task-phase-1",
+                title: "Phase one",
+                summary: "Needs complete_plan_phase_run.",
+                steps: vec![NewPlanStep {
+                    id: "plan-complete-after-task-step-1",
+                    title: "Do work",
+                    detail: "May be checked early.",
+                    acceptance: vec!["task completed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-complete-after-task", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-complete-after-task",
+            "plan-complete-after-task-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-complete-after-task",
+        "complete-after-task",
+    );
+    let task_id = AgentTaskId::new("agent-task-complete-after-task").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-complete-after-task", &team_id, &task_id)
+        .expect("attach attempt");
+    let agent_attempt_id =
+        AgentAttemptId::new("agent-attempt-complete-after-task").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
+        .update_plan_step(
+            "plan-complete-after-task",
+            "plan-complete-after-task-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step early");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"done"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete agent task");
+
+    let completed = database
+        .complete_plan_phase_run(&task_id, Some("deadbeef"))
+        .expect("complete phase run")
+        .expect("phase plan");
+
+    assert_eq!(completed.status, "implemented");
+    assert!(completed.active_phase_id.is_none());
+    assert_eq!(completed.phases[0].status, "completed");
+    assert_eq!(completed.phases[0].steps[0].status, "completed");
+    assert!(completed.phases[0].steps[0].checked_at.is_some());
+    assert_eq!(completed.phases[0].attempts[0].status, "completed");
+    assert!(completed.phases[0].attempts[0].completed_at.is_some());
+    assert_eq!(
+        completed.phases[0].attempts[0].commit_id.as_deref(),
+        Some("deadbeef")
+    );
+}
+
+#[test]
+fn manual_plan_without_active_execution_implements_when_all_steps_complete() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-manual-step-complete",
+            title: "Manual step complete",
+            overview: "No bound attempt or task: steps still drive implemented.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-manual-step-complete-phase-1",
+                title: "Phase one",
+                summary: "Manual checkbox plan.",
+                steps: vec![NewPlanStep {
+                    id: "plan-manual-step-complete-step-1",
+                    title: "Do work",
+                    detail: "Finish manually.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    let updated = database
+        .update_plan_step(
+            "plan-manual-step-complete",
+            "plan-manual-step-complete-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step");
+
+    assert_eq!(updated.status, "implemented");
+    assert!(updated.active_phase_id.is_none());
+    assert_eq!(updated.phases[0].status, "completed");
+    assert_eq!(updated.phases[0].steps[0].status, "completed");
+    assert!(updated.phases[0].steps[0].checked_at.is_some());
+    assert!(updated.phases[0].attempts.is_empty());
+}
+
+#[test]
+fn manual_plan_recovers_from_failed_step_when_all_steps_completed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-manual-recover-failed-step",
+            title: "Manual recover failed step",
+            overview: "Hand-managed failed step must not sticky-block implemented.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-manual-recover-failed-step-phase-1",
+                title: "Phase one",
+                summary: "Manual checkbox plan.",
+                steps: vec![NewPlanStep {
+                    id: "plan-manual-recover-failed-step-step-1",
+                    title: "Do work",
+                    detail: "Fail first, then complete.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    let failed = database
+        .update_plan_step(
+            "plan-manual-recover-failed-step",
+            "plan-manual-recover-failed-step-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("failed"),
+            },
+        )
+        .expect("fail step");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].steps[0].status, "failed");
+    assert!(failed.phases[0].error_message.is_none());
+    assert!(failed.phases[0].attempts.is_empty());
+
+    let recovered = database
+        .update_plan_step(
+            "plan-manual-recover-failed-step",
+            "plan-manual-recover-failed-step-step-1",
+            PlanStepPatch {
+                title: None,
+                detail: None,
+                acceptance: None,
+                status: Some("completed"),
+            },
+        )
+        .expect("complete step after fail");
+
+    assert_eq!(recovered.status, "implemented");
+    assert!(recovered.active_phase_id.is_none());
+    assert_eq!(recovered.phases[0].status, "completed");
+    assert_eq!(recovered.phases[0].steps[0].status, "completed");
+    assert!(recovered.phases[0].steps[0].checked_at.is_some());
+    assert!(recovered.phases[0].attempts.is_empty());
+}
+
+#[test]
+fn plan_phase_follows_task_terminal_status_even_when_all_steps_completed() {
+    for (
+        suffix,
+        transition,
+        expected_phase_status,
+        expected_attempt_status,
+        expected_plan_status,
+    ) in [
+        (
+            "failed",
+            AgentTaskTransition::Fail,
+            "failed",
+            "failed",
+            "failed",
+        ),
+        (
+            "cancelled",
+            AgentTaskTransition::Cancel,
+            "cancelled",
+            "cancelled",
+            "paused",
+        ),
+        (
+            "interrupted",
+            AgentTaskTransition::Interrupt,
+            "failed",
+            "interrupted",
+            "failed",
+        ),
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+        let plan_id = format!("plan-steps-done-then-{suffix}");
+        let phase_id = format!("{plan_id}-phase-1");
+        let step_id = format!("{plan_id}-step-1");
+        database
+            .create_plan(NewPlan {
+                id: &plan_id,
+                title: "Steps done then terminal",
+                overview: "Task outcome wins over completed steps.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: &phase_id,
+                    title: "Phase one",
+                    summary: "Steps already completed.",
+                    steps: vec![NewPlanStep {
+                        id: &step_id,
+                        title: "Do work",
+                        detail: "Checked before task ends.",
+                        acceptance: vec!["steps done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        let (team_id, instance_id) = create_test_agent_team(
+            &mut database,
+            &format!("chat-steps-done-{suffix}"),
+            &format!("steps-done-{suffix}"),
+        );
+        let task_id = AgentTaskId::new(format!("agent-task-steps-done-{suffix}")).expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        database
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                &format!("chat-steps-done-{suffix}"),
+                &team_id,
+                &task_id,
+            )
+            .expect("attach attempt");
+        let agent_attempt_id =
+            AgentAttemptId::new(format!("agent-attempt-steps-done-{suffix}")).expect("attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .expect("claim")
+            .expect("claimed");
+        database
+            .update_plan_step(
+                &plan_id,
+                &step_id,
+                PlanStepPatch {
+                    title: None,
+                    detail: None,
+                    acceptance: None,
+                    status: Some("completed"),
+                },
+            )
+            .expect("complete all steps");
+        let still_running = database.plan(&plan_id).expect("plan").expect("plan");
+        assert_eq!(still_running.status, "running");
+        assert_eq!(still_running.phases[0].status, "running");
+        assert_eq!(still_running.phases[0].steps[0].status, "completed");
+
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition,
+                result_json: None,
+                error_json: Some(r#"{"message":"task ended after steps completed"}"#),
+                interruption_reason: if matches!(transition, AgentTaskTransition::Interrupt) {
+                    Some("backend restarted")
+                } else {
+                    None
+                },
+            })
+            .expect("finish task");
+
+        let closed = if matches!(transition, AgentTaskTransition::Cancel) {
+            database
+                .cancel_plan_phase_run(&task_id, "task ended after steps completed")
+                .expect("cancel phase")
+                .expect("plan")
+        } else {
+            database
+                .fail_plan_phase_run(&task_id, "task ended after steps completed")
+                .expect("fail phase")
+                .expect("plan")
+        };
+
+        assert_eq!(closed.status, expected_plan_status, "plan for {suffix}");
+        assert!(
+            closed.active_phase_id.is_none(),
+            "active phase for {suffix}"
+        );
+        assert_eq!(
+            closed.phases[0].status, expected_phase_status,
+            "phase for {suffix}"
+        );
+        assert_eq!(
+            closed.phases[0].attempts[0].status, expected_attempt_status,
+            "attempt for {suffix}"
+        );
+        assert!(
+            closed.phases[0].attempts[0].completed_at.is_some(),
+            "attempt completed_at for {suffix}"
+        );
+    }
+}
+
+#[test]
+fn plan_phase_failed_status_stays_failed_after_step_edit_when_all_steps_completed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-failed-sticky-step-edit",
+            title: "Failed sticky step edit",
+            overview: "Task-failed phase must not revive on later step edits.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-failed-sticky-step-edit-phase-1",
+                title: "Phase one",
+                summary: "Fails after steps complete.",
+                steps: vec![NewPlanStep {
+                    id: "plan-failed-sticky-step-edit-step-1",
+                    title: "Do work",
+                    detail: "Checked before task fails.",
+                    acceptance: vec!["steps done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-failed-sticky-step-edit", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-failed-sticky-step-edit",
+            "plan-failed-sticky-step-edit-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-failed-sticky-step-edit",
+        "failed-sticky-step-edit",
+    );
+    let task_id = AgentTaskId::new("agent-task-failed-sticky-step-edit").expect("task id");
     database
         .enqueue_agent_task(NewAgentTask {
             id: &task_id,
@@ -3267,16 +3875,21 @@ fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
     database
         .attach_plan_phase_attempt_run(
             &attempt.id,
-            "chat-attempt-step-complete",
+            "chat-failed-sticky-step-edit",
             &team_id,
             &task_id,
         )
         .expect("attach attempt");
-
-    let updated = database
+    let agent_attempt_id =
+        AgentAttemptId::new("agent-attempt-failed-sticky-step-edit").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim")
+        .expect("claimed");
+    database
         .update_plan_step(
-            "plan-attempt-step-complete",
-            "plan-attempt-step-complete-step-1",
+            "plan-failed-sticky-step-edit",
+            "plan-failed-sticky-step-edit-step-1",
             PlanStepPatch {
                 title: None,
                 detail: None,
@@ -3284,12 +3897,293 @@ fn plan_phase_attempt_completes_when_step_completion_finishes_running_phase() {
                 status: Some("completed"),
             },
         )
-        .expect("complete step");
+        .expect("complete all steps");
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &task_id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Fail,
+            result_json: None,
+            error_json: Some(r#"{"message":"task failed after steps completed"}"#),
+            interruption_reason: None,
+        })
+        .expect("fail task");
+    let failed = database
+        .fail_plan_phase_run(&task_id, "task failed after steps completed")
+        .expect("fail phase")
+        .expect("plan");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].steps[0].status, "completed");
+    assert_eq!(failed.phases[0].attempts[0].status, "failed");
 
-    assert_eq!(updated.status, "implemented");
-    assert_eq!(updated.phases[0].status, "completed");
-    assert_eq!(updated.phases[0].attempts[0].status, "completed");
-    assert!(updated.phases[0].attempts[0].completed_at.is_some());
+    let after_edit = database
+        .update_plan_step(
+            "plan-failed-sticky-step-edit",
+            "plan-failed-sticky-step-edit-step-1",
+            PlanStepPatch {
+                title: Some("Do work (edited)"),
+                detail: Some("Still completed; title-only refresh."),
+                acceptance: None,
+                status: None,
+            },
+        )
+        .expect("edit step without status change");
+
+    assert_eq!(after_edit.status, "failed");
+    assert!(after_edit.active_phase_id.is_none());
+    assert_eq!(after_edit.phases[0].status, "failed");
+    assert_eq!(after_edit.phases[0].steps[0].status, "completed");
+    assert!(after_edit.phases[0].steps[0].checked_at.is_some());
+    assert_eq!(after_edit.phases[0].attempts[0].status, "failed");
+    assert!(after_edit.phases[0].attempts[0].completed_at.is_some());
+}
+
+#[test]
+fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attempt() {
+    for (suffix, make_waiting) in [("queued", false), ("running", false), ("waiting", true)] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+        let plan_id = format!("plan-merge-task-gate-{suffix}");
+        let phase_id = format!("{plan_id}-phase-1");
+        let step_id = format!("{phase_id}-step");
+        let merge_task_id = attach_test_plan_merge_run(
+            &mut database,
+            &plan_id,
+            &phase_id,
+            &format!("merge-task-gate-{suffix}"),
+        );
+        let plan_before = database.plan(&plan_id).expect("plan").expect("plan");
+        assert!(
+            plan_before.phases[0].attempts.is_empty()
+                || plan_before
+                    .phases[0]
+                    .attempts
+                    .iter()
+                    .all(|attempt| !matches!(attempt.status.as_str(), "queued" | "running")),
+            "merge gate must not rely on an active plan_phase_attempt for {suffix}"
+        );
+        assert_eq!(
+            plan_before.phases[0].agent_task_id.as_deref(),
+            Some(merge_task_id.as_str())
+        );
+        assert_eq!(plan_before.phases[0].steps[0].status, "completed");
+
+        let team_id = AgentTeamId::new(format!("agent-team-merge-task-gate-{suffix}-merge"))
+            .expect("team id");
+        if suffix != "queued" {
+            let attempt_id = AgentAttemptId::new(format!(
+                "agent-attempt-merge-task-gate-{suffix}"
+            ))
+            .expect("attempt");
+            database
+                .claim_runnable_agent_task(&team_id, &merge_task_id, &attempt_id)
+                .expect("claim")
+                .expect("claimed");
+            if make_waiting {
+                database
+                    .update_agent_task_state(AgentTaskStateUpdate {
+                        team_id: &team_id,
+                        task_id: &merge_task_id,
+                        expected_status: AgentTaskStatus::Running,
+                        transition: AgentTaskTransition::Wait,
+                        result_json: None,
+                        error_json: None,
+                        interruption_reason: None,
+                    })
+                    .expect("wait merge task");
+            }
+        }
+
+        let updated = database
+            .update_plan_step(
+                &plan_id,
+                &step_id,
+                PlanStepPatch {
+                    title: Some("Do work (still complete)"),
+                    detail: None,
+                    acceptance: None,
+                    status: Some("completed"),
+                },
+            )
+            .expect("refresh steps while merge task active");
+
+        assert_eq!(updated.status, "running", "plan status for {suffix}");
+        assert_eq!(
+            updated.active_phase_id.as_deref(),
+            Some(phase_id.as_str()),
+            "active_phase_id for {suffix}"
+        );
+        assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
+        assert_eq!(
+            updated.phases[0].steps[0].status,
+            "completed",
+            "step for {suffix}"
+        );
+        assert!(updated.phases[0].steps[0].checked_at.is_some());
+
+        if make_waiting {
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &merge_task_id,
+                    expected_status: AgentTaskStatus::Waiting,
+                    transition: AgentTaskTransition::Resume,
+                    result_json: None,
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("resume merge task");
+            let after_resume = database.plan(&plan_id).expect("plan").expect("plan");
+            assert_eq!(after_resume.status, "running");
+            assert_eq!(after_resume.phases[0].status, "running");
+
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &merge_task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Complete,
+                    result_json: Some(r#"{"text":"merged"}"#),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("complete merge task");
+            let completed = database
+                .complete_plan_phase_run(&merge_task_id, Some("shared-merge-commit"))
+                .expect("complete merge phase")
+                .expect("plan");
+            assert_eq!(completed.status, "implemented");
+            assert!(completed.active_phase_id.is_none());
+            assert_eq!(completed.phases[0].status, "completed");
+            assert_eq!(
+                completed.phases[0].commit_id.as_deref(),
+                Some("shared-merge-commit")
+            );
+        }
+    }
+}
+
+#[test]
+fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecycle_sync() {
+    for (suffix, transition) in [
+        ("completed", AgentTaskTransition::Complete),
+        ("failed", AgentTaskTransition::Fail),
+        ("cancelled", AgentTaskTransition::Cancel),
+        ("interrupted", AgentTaskTransition::Interrupt),
+    ] {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+        let plan_id = format!("plan-terminal-before-sync-{suffix}");
+        let phase_id = format!("{plan_id}-phase-1");
+        let step_id = format!("{phase_id}-step");
+        let merge_task_id = attach_test_plan_merge_run(
+            &mut database,
+            &plan_id,
+            &phase_id,
+            &format!("terminal-before-sync-{suffix}"),
+        );
+        let plan_before = database.plan(&plan_id).expect("plan").expect("plan");
+        assert!(
+            plan_before.phases[0].attempts.is_empty()
+                || plan_before.phases[0]
+                    .attempts
+                    .iter()
+                    .all(|attempt| !matches!(attempt.status.as_str(), "queued" | "running")),
+            "fixture must rely on bound task, not an active plan_phase_attempt, for {suffix}"
+        );
+        assert_eq!(plan_before.phases[0].status, "running");
+        assert_eq!(plan_before.phases[0].steps[0].status, "completed");
+
+        let team_id = AgentTeamId::new(format!(
+            "agent-team-terminal-before-sync-{suffix}-merge"
+        ))
+        .expect("team id");
+        let attempt_id =
+            AgentAttemptId::new(format!("agent-attempt-terminal-before-sync-{suffix}"))
+                .expect("attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &merge_task_id, &attempt_id)
+            .expect("claim")
+            .expect("claimed");
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &merge_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition,
+                result_json: matches!(transition, AgentTaskTransition::Complete)
+                    .then_some(r#"{"text":"merged"}"#),
+                error_json: (!matches!(transition, AgentTaskTransition::Complete))
+                    .then_some(r#"{"message":"merge ended before phase sync"}"#),
+                interruption_reason: matches!(transition, AgentTaskTransition::Interrupt)
+                    .then_some("backend restarted"),
+            })
+            .expect("finish merge task without phase lifecycle sync");
+
+        let updated = database
+            .update_plan_step(
+                &plan_id,
+                &step_id,
+                PlanStepPatch {
+                    title: Some("Do work (still complete)"),
+                    detail: None,
+                    acceptance: None,
+                    status: Some("completed"),
+                },
+            )
+            .expect("step edit before lifecycle sync");
+
+        assert_eq!(updated.status, "running", "plan status for {suffix}");
+        assert_eq!(
+            updated.active_phase_id.as_deref(),
+            Some(phase_id.as_str()),
+            "active_phase_id for {suffix}"
+        );
+        assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
+        assert_eq!(
+            updated.phases[0].steps[0].status,
+            "completed",
+            "step for {suffix}"
+        );
+        assert!(updated.phases[0].steps[0].checked_at.is_some());
+
+        let closed = match transition {
+            AgentTaskTransition::Complete => database
+                .complete_plan_phase_run(&merge_task_id, Some("shared-merge-commit"))
+                .expect("complete phase after window")
+                .expect("plan"),
+            AgentTaskTransition::Cancel => database
+                .cancel_plan_phase_run(&merge_task_id, "merge ended before phase sync")
+                .expect("cancel phase after window")
+                .expect("plan"),
+            AgentTaskTransition::Fail | AgentTaskTransition::Interrupt => database
+                .fail_plan_phase_run(&merge_task_id, "merge ended before phase sync")
+                .expect("fail phase after window")
+                .expect("plan"),
+            _ => unreachable!("unexpected transition for {suffix}"),
+        };
+
+        match transition {
+            AgentTaskTransition::Complete => {
+                assert_eq!(closed.status, "implemented", "final plan for {suffix}");
+                assert_eq!(closed.phases[0].status, "completed", "final phase for {suffix}");
+            }
+            AgentTaskTransition::Cancel => {
+                assert_eq!(closed.status, "paused", "final plan for {suffix}");
+                assert_eq!(closed.phases[0].status, "cancelled", "final phase for {suffix}");
+            }
+            AgentTaskTransition::Fail | AgentTaskTransition::Interrupt => {
+                assert_eq!(closed.status, "failed", "final plan for {suffix}");
+                assert_eq!(closed.phases[0].status, "failed", "final phase for {suffix}");
+            }
+            _ => unreachable!("unexpected transition for {suffix}"),
+        }
+        assert!(closed.active_phase_id.is_none(), "active phase for {suffix}");
+    }
 }
 
 #[test]

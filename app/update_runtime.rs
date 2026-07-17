@@ -298,8 +298,10 @@ pub(crate) fn spawn_mark_updated_restart_ready_when_serving(
                 );
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(UPDATED_RESTART_HEALTH_POLL_INTERVAL_MS))
-                .await;
+            tokio::time::sleep(Duration::from_millis(
+                UPDATED_RESTART_HEALTH_POLL_INTERVAL_MS,
+            ))
+            .await;
         }
     });
 }
@@ -1780,14 +1782,18 @@ mod tests {
         assert!(script.contains("did not become ready"));
         assert!(script.contains("Stop-InstallProcesses"));
         assert!(script.contains("could not create a full install backup"));
-        let backup_idx = script.find("Copy-InstallTree -Source $installDir").expect("backup");
+        let backup_idx = script
+            .find("Copy-InstallTree -Source $installDir")
+            .expect("backup");
         let installer_idx = script
             .find("Start-Process -FilePath $installer -ArgumentList '/S'")
             .expect("installer");
         let ready_idx = script
             .find("while (-not (Test-Path -LiteralPath $readyPath))")
             .expect("ready wait");
-        let last_cleanup = script.rfind("Remove-PathBestEffort $backupDir").expect("last cleanup");
+        let last_cleanup = script
+            .rfind("Remove-PathBestEffort $backupDir")
+            .expect("last cleanup");
         assert!(backup_idx < installer_idx);
         assert!(installer_idx < ready_idx);
         assert!(ready_idx < last_cleanup);
