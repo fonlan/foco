@@ -2320,6 +2320,10 @@ export const appTestState: {
   answeredQuestionIds: string[];
   workspaceResponseWorkspaces: unknown[];
   workspaceChatsByWorkspaceId: Record<string, Array<(typeof workspaceChats)[number]>>;
+  workspaceChatsResponsesByWorkspaceId: Record<
+    string,
+    Array<Response | Promise<Response>>
+  >;
   workspaceChatSearchResponseWorkspaces: unknown[] | null;
   memoryDreamJobsResponses: MemoryDreamJobsResponse[];
   memoriesById: Record<string, MemoryFactRecord>;
@@ -2363,6 +2367,7 @@ export const appTestState: {
   answeredQuestionIds: [],
   workspaceResponseWorkspaces: [workspace, secondaryWorkspace],
   workspaceChatsByWorkspaceId: {},
+  workspaceChatsResponsesByWorkspaceId: {},
   workspaceChatSearchResponseWorkspaces: null,
   memoryDreamJobsResponses: [],
   memoriesById: {
@@ -2859,6 +2864,7 @@ export function resetAppTestEnvironment() {
   appTestState.answeredQuestionIds = [];
   appTestState.workspaceResponseWorkspaces = [workspace, secondaryWorkspace];
   appTestState.workspaceChatsByWorkspaceId = {};
+  appTestState.workspaceChatsResponsesByWorkspaceId = {};
   appTestState.workspaceChatSearchResponseWorkspaces = null;
   appTestState.memoryDreamJobsResponses = [];
   appTestState.memoriesById = {
@@ -2948,8 +2954,14 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   const workspaceChatsMatch = path.match(/^\/api\/workspaces\/([^/]+)\/chats$/);
   if (workspaceChatsMatch) {
+    const workspaceId = decodeURIComponent(workspaceChatsMatch[1] ?? "");
+    const queued = appTestState.workspaceChatsResponsesByWorkspaceId[workspaceId];
+    if (queued && queued.length > 0) {
+      const next = queued.shift()!;
+      return next;
+    }
     return jsonResponse(workspaceChatsPage(
-      decodeURIComponent(workspaceChatsMatch[1] ?? ""),
+      workspaceId,
       requestUrl.searchParams.get("cursor"),
       requestUrl.searchParams.get("includeChatId"),
     ));

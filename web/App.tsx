@@ -1172,34 +1172,58 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
   );
 }
 
-async function workspaceSummariesWithRemoteChats(
+function workspaceConnectionLooksReady(status: string) {
+  const normalized = status.toLowerCase();
+  return normalized === "connected" || normalized === "ready" || normalized === "degraded";
+}
+
+/**
+ * Base workspace summaries from GET /api/workspaces. Remote entries ship empty chats
+ * with hasMore=false from the server; preserve any already-hydrated remote chat page
+ * and use hasMore=true placeholders so open tabs stay "unknown" (not "missing").
+ */
+function normalizeBaseWorkspaceSummaries(
   workspaces: WorkspaceSummary[],
-): Promise<WorkspaceSummary[]> {
-  return Promise.all(
-    workspaces.map(async (workspace) => {
-      if (!workspace.serverId) {
-        return workspace;
-      }
-      try {
-        const params = new URLSearchParams({ limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE) });
-        const data = await requestJson<WorkspaceChatsResponse>(
-          `/api/workspaces/${encodeURIComponent(workspace.id)}/chats?${params.toString()}`,
-        );
-        return {
-          ...workspace,
-          chatPagination: {
-            hasMore: data.hasMore,
-            limit: data.limit,
-            nextCursor: data.nextCursor,
-            total: data.total,
-          },
-          chats: data.chats,
-        };
-      } catch {
-        return workspace;
-      }
-    }),
+  previousWorkspaces: WorkspaceSummary[],
+): WorkspaceSummary[] {
+  const previousById = new Map(
+    previousWorkspaces.map((workspace) => [workspace.id, workspace] as const),
   );
+
+  return workspaces.map((workspace) => {
+    if (!workspace.serverId) {
+      return workspace;
+    }
+
+    const previous = previousById.get(workspace.id);
+    if (previous?.serverId) {
+      return {
+        ...workspace,
+        chatPagination: previous.chatPagination ?? {
+          hasMore: true,
+          limit: WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
+          nextCursor: null,
+          total: previous.chats.length,
+        },
+        chats: previous.chats,
+      };
+    }
+
+    return {
+      ...workspace,
+      chatPagination: {
+        hasMore: true,
+        limit: WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
+        nextCursor: null,
+        total: 0,
+      },
+      chats: [],
+    };
+  });
+}
+
+function shouldHydrateRemoteWorkspaceChats(workspace: WorkspaceSummary) {
+  return Boolean(workspace.serverId) && workspaceConnectionLooksReady(workspace.connectionStatus);
 }
 
 function workspaceChatPagingFromWorkspaces(
@@ -1223,6 +1247,31 @@ function workspaceChatPagingFromWorkspaces(
       ];
     }),
   );
+}
+
+function applyRemoteWorkspaceChatsPatch(
+  workspaces: WorkspaceSummary[],
+  workspaceId: string,
+  data: WorkspaceChatsResponse,
+): WorkspaceSummary[] {
+  let changed = false;
+  const next = workspaces.map((workspace) => {
+    if (workspace.id !== workspaceId) {
+      return workspace;
+    }
+    changed = true;
+    return {
+      ...workspace,
+      chatPagination: {
+        hasMore: data.hasMore,
+        limit: data.limit,
+        nextCursor: data.nextCursor,
+        total: data.total,
+      },
+      chats: data.chats,
+    };
+  });
+  return changed ? next : workspaces;
 }
 
 function isAbortError(value: unknown) {
@@ -1608,11 +1657,14 @@ export function App() {
   );
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
+  const workspacesRefreshGenerationRef = useRef(0);
+  const remoteChatsHydrationAbortRef = useRef<AbortController | null>(null);
   const selectedModelIdRef = useRef("");
   const selectedThinkingLevelRef = useRef("");
   const activeChatKeyRef = useRef<string | null>(null);
   const activeWorkspaceIdRef = useRef("");
   const activeChatIdRef = useRef<string | null>(null);
+  const workspacesRef = useRef<WorkspaceSummary[]>([]);
   const loadingChatKeysRef = useRef<Set<string>>(new Set());
   const loadingChatControllersRef = useRef<Map<string, AbortController>>(new Map());
   const loadingOlderChatMessageKeysRef = useRef<Set<string>>(new Set());
@@ -2259,6 +2311,10 @@ export function App() {
   }, [openHtmlPreviewTabs]);
 
   useEffect(() => {
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
+
+  useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
     for (const [workspaceId, observer] of workspaceSpecJobObserversRef.current) {
       if (workspaceId !== activeWorkspaceId) {
@@ -2517,22 +2573,14 @@ export function App() {
     [],
   );
 
-  const refreshWorkspaces = useCallback(async () => {
-    setIsLoading(true);
-    setError(null);
-
-    try {
-      const data = await requestJson<WorkspacesResponse>("/api/workspaces");
-      const workspacesWithRemoteChats = await workspaceSummariesWithRemoteChats(data.workspaces);
-      setWorkspaces(workspacesWithRemoteChats);
-      syncOpenChatTabTitlesFromWorkspaces(workspacesWithRemoteChats);
-      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(workspacesWithRemoteChats));
+  const reconcileActiveWorkspaceSelection = useCallback(
+    (nextWorkspaces: WorkspaceSummary[], activeWorkspaceIdFromServer: string | null | undefined) => {
       const previousWorkspaceId = activeWorkspaceIdRef.current;
-      const previousStillPresent = workspacesWithRemoteChats.some(
+      const previousStillPresent = nextWorkspaces.some(
         (workspace) => workspace.id === previousWorkspaceId,
       );
       if (!previousStillPresent) {
-        const nextWorkspaceId = data.activeWorkspaceId ?? "";
+        const nextWorkspaceId = activeWorkspaceIdFromServer ?? "";
         // Same class of bug as add-workspace: do not keep the previous chatId when
         // the active workspace disappears and we fall back to another workspace.
         if (previousWorkspaceId) {
@@ -2565,24 +2613,135 @@ export function App() {
         }
         setExpandedWorkspaceId((current) =>
           current !== null &&
-            workspacesWithRemoteChats.some((workspace) => workspace.id === current)
+            nextWorkspaces.some((workspace) => workspace.id === current)
             ? current
             : nextWorkspaceId || null,
         );
       } else {
         setExpandedWorkspaceId((current) =>
           current !== null &&
-            workspacesWithRemoteChats.some((workspace) => workspace.id === current)
+            nextWorkspaces.some((workspace) => workspace.id === current)
             ? current
-            : data.activeWorkspaceId,
+            : activeWorkspaceIdFromServer ?? null,
         );
       }
+    },
+    [updateBrowserRoute],
+  );
+
+  const applyRemoteWorkspaceChatsHydration = useCallback(
+    (
+      workspaceId: string,
+      data: WorkspaceChatsResponse,
+      generation: number,
+    ) => {
+      if (workspacesRefreshGenerationRef.current !== generation) {
+        return;
+      }
+
+      setWorkspaces((current) => {
+        if (workspacesRefreshGenerationRef.current !== generation) {
+          return current;
+        }
+        if (!current.some((workspace) => workspace.id === workspaceId)) {
+          return current;
+        }
+        const next = applyRemoteWorkspaceChatsPatch(current, workspaceId, data);
+        if (next === current) {
+          return current;
+        }
+        workspacesRef.current = next;
+        syncOpenChatTabTitlesFromWorkspaces(next);
+        return next;
+      });
+
+      setWorkspaceChatPaging((current) => {
+        if (workspacesRefreshGenerationRef.current !== generation) {
+          return current;
+        }
+        if (!(workspaceId in current) && !workspacesRef.current.some((item) => item.id === workspaceId)) {
+          return current;
+        }
+        return {
+          ...current,
+          [workspaceId]: {
+            hasMore: data.hasMore,
+            isLoading: false,
+            nextCursor: data.nextCursor,
+            total: data.total,
+          },
+        };
+      });
+    },
+    [syncOpenChatTabTitlesFromWorkspaces],
+  );
+
+  const hydrateRemoteWorkspaceChatsInBackground = useCallback(
+    (workspacesToHydrate: WorkspaceSummary[], generation: number) => {
+      remoteChatsHydrationAbortRef.current?.abort();
+      const abortController = new AbortController();
+      remoteChatsHydrationAbortRef.current = abortController;
+
+      for (const workspace of workspacesToHydrate) {
+        if (!shouldHydrateRemoteWorkspaceChats(workspace)) {
+          continue;
+        }
+
+        const workspaceId = workspace.id;
+        const params = new URLSearchParams({
+          limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE),
+        });
+        void requestJson<WorkspaceChatsResponse>(
+          `/api/workspaces/${encodeURIComponent(workspaceId)}/chats?${params.toString()}`,
+          { signal: abortController.signal },
+        )
+          .then((data) => {
+            if (abortController.signal.aborted) {
+              return;
+            }
+            applyRemoteWorkspaceChatsHydration(workspaceId, data, generation);
+          })
+          .catch((requestError) => {
+            if (isAbortError(requestError) || abortController.signal.aborted) {
+              return;
+            }
+            // Local isolation: keep base connection status / Retry UI; never set app error.
+          });
+      }
+    },
+    [applyRemoteWorkspaceChatsHydration],
+  );
+
+  const refreshWorkspaces = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const data = await requestJson<WorkspacesResponse>("/api/workspaces");
+      const generation = workspacesRefreshGenerationRef.current + 1;
+      workspacesRefreshGenerationRef.current = generation;
+      remoteChatsHydrationAbortRef.current?.abort();
+
+      const baseWorkspaces = normalizeBaseWorkspaceSummaries(
+        data.workspaces,
+        workspacesRef.current,
+      );
+      workspacesRef.current = baseWorkspaces;
+      setWorkspaces(baseWorkspaces);
+      syncOpenChatTabTitlesFromWorkspaces(baseWorkspaces);
+      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(baseWorkspaces));
+      reconcileActiveWorkspaceSelection(baseWorkspaces, data.activeWorkspaceId);
+      setIsLoading(false);
+      hydrateRemoteWorkspaceChatsInBackground(baseWorkspaces, generation);
     } catch (requestError) {
       setError(errorMessage(requestError));
-    } finally {
       setIsLoading(false);
     }
-  }, [syncOpenChatTabTitlesFromWorkspaces, updateBrowserRoute]);
+  }, [
+    hydrateRemoteWorkspaceChatsInBackground,
+    reconcileActiveWorkspaceSelection,
+    syncOpenChatTabTitlesFromWorkspaces,
+  ]);
 
   const loadSettings = useCallback(async () => {
     setIsLoadingSettings(true);
@@ -3853,6 +4012,12 @@ export function App() {
     void loadSettings();
     void loadUpdateStatus();
   }, [canUseApp, loadSettings, loadUpdateStatus, refreshWorkspaces]);
+
+  useEffect(() => {
+    return () => {
+      remoteChatsHydrationAbortRef.current?.abort();
+    };
+  }, []);
 
   useEffect(() => {
     if (!canUseApp || !updateStatus?.autoCheckEnabled) {
@@ -13894,11 +14059,6 @@ function ApiOverviewPanel({
       </div>
     </section>
   );
-}
-
-function workspaceConnectionLooksReady(status: string) {
-  const normalized = status.toLowerCase();
-  return normalized === "connected" || normalized === "ready" || normalized === "degraded";
 }
 
 function workspaceConnectionDotClass(status: string) {

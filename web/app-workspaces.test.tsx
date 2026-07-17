@@ -1566,4 +1566,299 @@ describe("app-workspaces verification surfaces", () => {
     );
   });
 
+  it("renders local workspaces without waiting for remote chat hydration", async () => {
+    const remoteWorkspace = remoteWorkspaceFixture();
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats,
+        chatPagination: workspace.chatPagination,
+      },
+      {
+        ...remoteWorkspace,
+        chats: [],
+        chatPagination: {
+          hasMore: false,
+          limit: 5,
+          nextCursor: null,
+          total: 0,
+        },
+      },
+    ];
+    const remoteChatsGate = deferred<Response>();
+    appTestState.workspaceChatsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: [remoteChatsGate.promise],
+    };
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", { name: "Workspace list" });
+    expect(await within(workspaceList).findByText("Tool run")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Refresh workspaces" })).toBeEnabled();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Remote chat 1")).not.toBeInTheDocument();
+
+    remoteChatsGate.resolve(
+      jsonResponse({
+        chats: [
+          chatSummary(
+            "remote-chat-1",
+            "Remote chat 1",
+            "2026-06-05T16:00:00Z",
+            "2026-06-05T16:05:00Z",
+          ),
+        ],
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 1,
+      }),
+    );
+
+    await userEvent.click(
+      await within(workspaceList).findByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Remote project"),
+      }),
+    );
+    expect(await within(workspaceList).findByText("Remote chat 1")).toBeInTheDocument();
+  });
+
+  it("isolates remote chat hydration failures from global loading and errors", async () => {
+    const remoteWorkspace = {
+      ...remoteWorkspaceFixture(),
+      chats: [],
+      chatPagination: {
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 0,
+      },
+    };
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+    appTestState.workspaceChatsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: [
+        jsonResponse({ error: "SSH connection timed out" }, { status: 502 }),
+      ],
+    };
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", { name: "Workspace list" });
+    expect(await within(workspaceList).findByText("Tool run")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Refresh workspaces" })).toBeEnabled();
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(within(workspaceList).queryByText("Remote chat 1")).not.toBeInTheDocument();
+  });
+
+  it("keeps remote off-page chat tabs while remote chats are still unknown", async () => {
+    const remoteWorkspace = {
+      ...remoteWorkspaceFixture(),
+      chats: [],
+      chatPagination: {
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 0,
+      },
+    };
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+    appTestState.workspaceChatsByWorkspaceId = {
+      [remoteWorkspace.id]: [
+        chatSummary(
+          "remote-offpage-chat",
+          "Remote off-page chat",
+          "2026-06-05T09:00:00Z",
+          "2026-06-05T09:05:00Z",
+        ),
+      ],
+    };
+    appTestState.chatMessagesResponsesByChatKey = {
+      ...appTestState.chatMessagesResponsesByChatKey,
+      [`${remoteWorkspace.id}/remote-offpage-chat`]: {
+        chat: {
+          id: "remote-offpage-chat",
+          kind: null,
+          readOnly: false,
+          title: "Remote off-page chat",
+        },
+        pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+        messages: [
+          {
+            content: "Remote off-page answer.",
+            createdAt: "2026-06-05T09:01:00Z",
+            extractedMemories: [],
+            id: "remote-offpage-message",
+            memoriesUsed: [],
+            metrics: null,
+            parts: [{ text: "Remote off-page answer.", type: "text" }],
+            reasoning: null,
+            role: "assistant",
+            toolCalls: [],
+          },
+        ],
+      },
+    };
+    const remoteChatsGate = deferred<Response>();
+    appTestState.workspaceChatsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: [remoteChatsGate.promise],
+    };
+
+    window.history.replaceState(
+      null,
+      "",
+      `/?tab=${encodeURIComponent(`${remoteWorkspace.id}/remote-offpage-chat`)}`,
+    );
+
+    renderApp();
+
+    await screen.findByRole("navigation", { name: "Workspace list" });
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    expect(
+      within(tabList).getByRole("tab", { name: /Chat|Remote off-page chat/ }),
+    ).toBeInTheDocument();
+    expect(currentChatTabsFromLocation()).toContain(
+      `${remoteWorkspace.id}/remote-offpage-chat`,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    remoteChatsGate.resolve(
+      jsonResponse({
+        chats: [
+          chatSummary(
+            "remote-offpage-chat",
+            "Remote off-page chat",
+            "2026-06-05T09:00:00Z",
+            "2026-06-05T09:05:00Z",
+          ),
+        ],
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 1,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(
+        within(tabList).getByRole("tab", { name: /Remote off-page chat/ }),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it("ignores stale remote chat hydration after a newer refresh generation", async () => {
+    const remoteWorkspace = {
+      ...remoteWorkspaceFixture(),
+      chats: [],
+      chatPagination: {
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 0,
+      },
+    };
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+
+    const firstRemotePage = deferred<Response>();
+    const secondRemotePage = deferred<Response>();
+    appTestState.workspaceChatsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: [firstRemotePage.promise, secondRemotePage.promise],
+    };
+
+    renderApp();
+
+    const workspaceList = await screen.findByRole("navigation", { name: "Workspace list" });
+    expect(await within(workspaceList).findByText("Tool run")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Refresh workspaces" })).toBeEnabled();
+    });
+
+    secondRemotePage.resolve(
+      jsonResponse({
+        chats: [
+          chatSummary(
+            "remote-chat-fresh",
+            "Fresh remote chat",
+            "2026-06-06T10:00:00Z",
+            "2026-06-06T10:05:00Z",
+          ),
+        ],
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 1,
+      }),
+    );
+
+    await userEvent.click(
+      await within(workspaceList).findByRole("button", {
+        name: (accessibleName, element) =>
+          element.hasAttribute("aria-expanded") && accessibleName.startsWith("Remote project"),
+      }),
+    );
+    expect(await within(workspaceList).findByText("Fresh remote chat")).toBeInTheDocument();
+
+    firstRemotePage.resolve(
+      jsonResponse({
+        chats: [
+          chatSummary(
+            "remote-chat-stale",
+            "Stale remote chat",
+            "2026-06-05T10:00:00Z",
+            "2026-06-05T10:05:00Z",
+          ),
+        ],
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 1,
+      }),
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(within(workspaceList).queryByText("Stale remote chat")).not.toBeInTheDocument();
+    expect(within(workspaceList).getByText("Fresh remote chat")).toBeInTheDocument();
+  });
+
+  it("does not auto-hydrate offline remote workspaces during refresh", async () => {
+    const offlineRemote = {
+      ...remoteWorkspaceFixture(),
+      connectionStatus: "offline",
+      chats: [],
+      chatPagination: {
+        hasMore: false,
+        limit: 5,
+        nextCursor: null,
+        total: 0,
+      },
+    };
+    appTestState.workspaceResponseWorkspaces = [{ ...workspace }, offlineRemote];
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+
+    await screen.findByRole("navigation", { name: "Workspace list" });
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Refresh workspaces" })).toBeEnabled();
+    });
+
+    expect(
+      fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url.startsWith(`/api/workspaces/${offlineRemote.id}/chats?`),
+      ),
+    ).toHaveLength(0);
+  });
+
 });
+
+function currentChatTabsFromLocation() {
+  return new URLSearchParams(window.location.search).getAll("tab");
+}
