@@ -8,7 +8,7 @@ use foco_store::{
     config::WorkspaceConfig,
     workspace::{
         LlmRequestAuditSummaryRow, NewScheduledTask, ScheduledTaskListFilter, ScheduledTaskRecord,
-        ScheduledTaskRunRecord, ScheduledTaskUpdate, WorkspaceDatabase,
+        ScheduledTaskRunRecord, ScheduledTaskUpdate, WorkspaceDatabase, WorkspaceDatabaseError,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -198,8 +198,14 @@ pub(crate) async fn scheduled_tasks(
     )> = Vec::new();
 
     for workspace in scheduled_task_workspaces(&config, query.workspace_id.as_deref())? {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = match open_scheduled_task_workspace_database(
+            workspace,
+            query.workspace_id.is_some(),
+        ) {
+            Ok(Some(database)) => database,
+            Ok(None) => continue,
+            Err(error) => return Err(error),
+        };
         let workspace_search_matches = search
             .as_deref()
             .map(|search| scheduled_workspace_matches_search(workspace, search))
@@ -636,6 +642,47 @@ fn scheduled_task_workspaces<'a>(
     }
 
     Ok(config.workspaces.iter().collect())
+}
+
+/// Opens a workspace DB for cross-workspace scheduled-task aggregation.
+///
+/// When `require_path` is false (all-workspace list), missing/invalid local
+/// directories and remote workspaces are skipped so one stale configured path
+/// cannot fail the entire scheduled-tasks list UI. Explicit single-workspace
+/// filters still surface clear errors (missing path or remote unsupported).
+fn open_scheduled_task_workspace_database(
+    workspace: &WorkspaceConfig,
+    require_path: bool,
+) -> Result<Option<WorkspaceDatabaseHandle>, ApiError> {
+    if workspace.is_remote() {
+        // Local process has no SQLite for remote workspaces; remote scheduled tasks
+        // are not supported on this aggregate path.
+        if require_path {
+            return Err(ApiError::bad_request(
+                "scheduled tasks are not available for remote workspaces",
+            ));
+        }
+        return Ok(None);
+    }
+    match WorkspaceDatabase::open_or_create(&workspace.path) {
+        Ok(database) => Ok(Some(database)),
+        Err(WorkspaceDatabaseError::WorkspaceNotDirectory { path }) if !require_path => {
+            tracing::debug!(
+                workspace_id = %workspace.id,
+                workspace_path = %path.display(),
+                "skipping scheduled task list for workspace whose path does not exist or is not a directory"
+            );
+            Ok(None)
+        }
+        // Explicit filter: stale configured path is a client-facing config problem, not a 500.
+        Err(WorkspaceDatabaseError::WorkspaceNotDirectory { path }) => {
+            Err(ApiError::bad_request(format!(
+                "workspace path does not exist or is not a directory: {}",
+                path.display()
+            )))
+        }
+        Err(error) => Err(ApiError::from_workspace_error(error)),
+    }
 }
 
 fn require_scheduled_task(

@@ -12569,6 +12569,287 @@ async fn scheduled_task_dispatch_queues_visible_chat_and_completes_one_shot() {
 }
 
 #[tokio::test]
+async fn scheduled_tasks_list_skips_missing_workspace_paths() {
+    let good_workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-list-good"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-list-profile"));
+    let missing_workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-list-missing"));
+    fs::create_dir_all(&good_workspace_dir).expect("good workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    if missing_workspace_dir.exists() {
+        fs::remove_dir_all(&missing_workspace_dir).expect("remove pre-existing missing path");
+    }
+
+    let mut config = prompt_test_config(good_workspace_dir.clone());
+    let good_workspace_id = config.workspaces[0].id.clone();
+    config.workspaces.push(WorkspaceConfig {
+        id: "workspace-missing".to_string(),
+        name: "Missing Workspace".to_string(),
+        path: missing_workspace_dir.clone(),
+        location: WorkspaceLocation::Local,
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{good_workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&good_workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-good",
+                title: "Good task",
+                description: None,
+                schedule_json: r#"{"type":"interval","every_seconds":60,"start_at":"2099-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Good prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2099-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    let state = test_app_state(config, profile_dir.clone());
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind scheduled tasks list fixture");
+    let addr = listener
+        .local_addr()
+        .expect("scheduled tasks list fixture address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/scheduled-tasks?page=1&pageSize=25"))
+        .send()
+        .await
+        .expect("scheduled tasks list request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "missing workspace path must not fail the aggregate scheduled tasks list"
+    );
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("scheduled tasks list response");
+    let tasks = body["tasks"].as_array().expect("tasks array");
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0]["id"], "scheduled-task-good");
+    assert_eq!(tasks[0]["workspaceId"], good_workspace_id);
+    assert_eq!(body["totalCount"], 1);
+
+    app_task.abort();
+    fs::remove_dir_all(good_workspace_dir).expect("remove good workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_tasks_list_missing_workspace_path_filter_returns_error() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-list-missing-filter-profile"));
+    let missing_workspace_dir =
+        env::temp_dir().join(unique_id("foco-scheduled-list-missing-filter-path"));
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    if missing_workspace_dir.exists() {
+        fs::remove_dir_all(&missing_workspace_dir).expect("remove pre-existing missing path");
+    }
+
+    let mut config = prompt_test_config(env::temp_dir().join(unique_id("foco-scheduled-list-dummy")));
+    // Replace the auto-created workspace with a missing path so the filter target is stale.
+    let missing_workspace_id = "workspace-missing-filter".to_string();
+    config.workspaces = vec![WorkspaceConfig {
+        id: missing_workspace_id.clone(),
+        name: "Missing Workspace".to_string(),
+        path: missing_workspace_dir.clone(),
+        location: WorkspaceLocation::Local,
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    }];
+    let state = test_app_state(config, profile_dir.clone());
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind scheduled tasks missing-filter fixture");
+    let addr = listener
+        .local_addr()
+        .expect("scheduled tasks missing-filter fixture address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/scheduled-tasks?workspaceId={missing_workspace_id}&page=1&pageSize=25"
+        ))
+        .send()
+        .await
+        .expect("scheduled tasks missing-filter request");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "explicit workspaceId with a missing path must surface an error, not an empty list"
+    );
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("scheduled tasks missing-filter error body");
+    let message = body["error"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("workspace path does not exist or is not a directory"),
+        "unexpected error payload: {body}"
+    );
+
+    app_task.abort();
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_tasks_list_remote_workspace_filter_returns_error() {
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-list-remote-filter-profile"));
+    let local_workspace_dir =
+        env::temp_dir().join(unique_id("foco-scheduled-list-remote-filter-local"));
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::create_dir_all(&local_workspace_dir).expect("local workspace directory");
+
+    let mut config = prompt_test_config(local_workspace_dir.clone());
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "srv-scheduled".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    config.workspaces.push(WorkspaceConfig {
+        id: "workspace-remote-scheduled".to_string(),
+        name: "Remote Scheduled".to_string(),
+        path: PathBuf::new(),
+        location: WorkspaceLocation::Ssh {
+            server_id: "srv-scheduled".to_string(),
+            remote_path: "/srv/project".to_string(),
+        },
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let state = test_app_state(config, profile_dir.clone());
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind scheduled tasks remote-filter fixture");
+    let addr = listener
+        .local_addr()
+        .expect("scheduled tasks remote-filter fixture address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/scheduled-tasks?workspaceId=workspace-remote-scheduled&page=1&pageSize=25"
+        ))
+        .send()
+        .await
+        .expect("scheduled tasks remote-filter request");
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "explicit remote workspaceId must not be silently empty"
+    );
+    let body = response
+        .json::<Value>()
+        .await
+        .expect("scheduled tasks remote-filter error body");
+    let message = body["error"]
+        .as_str()
+        .or_else(|| body["message"].as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains("scheduled tasks are not available for remote workspaces"),
+        "unexpected error payload: {body}"
+    );
+
+    // Aggregate list still succeeds and ignores remote workspaces.
+    let response = reqwest::Client::new()
+        .get(format!("http://{addr}/api/scheduled-tasks?page=1&pageSize=25"))
+        .send()
+        .await
+        .expect("scheduled tasks aggregate with remote sibling");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    app_task.abort();
+    fs::remove_dir_all(local_workspace_dir).expect("remove local workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn scheduled_task_dispatch_skips_missing_workspace_paths() {
+    let good_workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-good"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-missing-profile"));
+    let missing_workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-dispatch-missing"));
+    fs::create_dir_all(&good_workspace_dir).expect("good workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    if missing_workspace_dir.exists() {
+        fs::remove_dir_all(&missing_workspace_dir).expect("remove pre-existing missing path");
+    }
+
+    let mut config = prompt_test_config(good_workspace_dir.clone());
+    let good_workspace_id = config.workspaces[0].id.clone();
+    config.workspaces.push(WorkspaceConfig {
+        id: "workspace-missing".to_string(),
+        name: "Missing Workspace".to_string(),
+        path: missing_workspace_dir,
+        location: WorkspaceLocation::Local,
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+    state.agent_scheduler = agent_scheduler;
+    let metadata_json = format!(
+        r#"{{"workspaceId":"{good_workspace_id}","concurrencyPolicy":"skip_if_running","misfirePolicy":"catch_up_once"}}"#
+    );
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&good_workspace_dir).expect("database");
+        database
+            .insert_scheduled_task(NewScheduledTask {
+                id: "scheduled-task-due-with-missing-sibling",
+                title: "Due task",
+                description: None,
+                schedule_json: r#"{"type":"one_shot_at","run_at":"2020-01-01T00:00:00Z"}"#,
+                action_json: r#"{"type":"agent_prompt","prompt":"Scheduled prompt","session_mode":"create_new_chat","model_id":"model","provider_id":"provider","skill_ids":[],"collaboration_tools_enabled":false}"#,
+                status: "enabled",
+                next_run_at: Some("2020-01-01T00:00:00Z"),
+                metadata_json: Some(&metadata_json),
+            })
+            .expect("scheduled task insert");
+    }
+
+    crate::scheduled_tasks::scheduler::dispatch_due_scheduled_tasks(&state)
+        .await
+        .expect("dispatch should ignore missing sibling workspace paths");
+    assert_eq!(agent_scheduler_rx.recv().await, Some(()));
+
+    let database = WorkspaceDatabase::open_or_create(&good_workspace_dir).expect("database");
+    let task = database
+        .scheduled_task("scheduled-task-due-with-missing-sibling")
+        .expect("scheduled task lookup")
+        .expect("scheduled task");
+    assert_eq!(task.status, "completed");
+    drop(database);
+    fs::remove_dir_all(good_workspace_dir).expect("remove good workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn scheduled_task_dispatch_ignores_paused_due_task() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-scheduled-paused-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-scheduled-paused-profile"));

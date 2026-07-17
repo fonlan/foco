@@ -178,6 +178,11 @@ export function ScheduledTasksPage({
     [settings?.configuredModels],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
+  // Scheduled tasks run against local workspace SQLite only.
+  const localWorkspaces = useMemo(
+    () => workspaces.filter((workspace) => !workspace.serverId),
+    [workspaces],
+  );
 
   const selectedTask =
     tasks.find((task) => task.id === selectedTaskId) ?? tasks[0] ?? null;
@@ -198,6 +203,15 @@ export function ScheduledTasksPage({
     }, 250);
     return () => window.clearTimeout(timeout);
   }, [searchQuery]);
+
+  useEffect(() => {
+    if (
+      workspaceFilter !== "all" &&
+      !localWorkspaces.some((workspace) => workspace.id === workspaceFilter)
+    ) {
+      setWorkspaceFilter("all");
+    }
+  }, [localWorkspaces, workspaceFilter]);
 
   useEffect(() => {
     setTaskPage(1);
@@ -481,7 +495,7 @@ export function ScheduledTasksPage({
                 value={workspaceFilter}
               >
                 <option value="all">{t("All workspaces")}</option>
-                {workspaces.map((workspace) => (
+                {localWorkspaces.map((workspace) => (
                   <option key={workspace.id} value={workspace.id}>
                     {workspace.name}
                   </option>
@@ -604,7 +618,7 @@ export function ScheduledTasksPage({
           onSaved={(task) => void handleTaskSaved(task)}
           t={t}
           thinkingLevels={thinkingLevels}
-          workspaces={workspaces}
+          workspaces={localWorkspaces}
         />
       ) : null}
     </div>

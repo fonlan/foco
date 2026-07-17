@@ -7,6 +7,7 @@ use foco_store::{
     workspace::{
         AgentTaskRecord, NewScheduledTaskRun, ScheduledTaskDueRunClaim, ScheduledTaskRecord,
         ScheduledTaskRunRecord, ScheduledTaskRunUpdate, ScheduledTaskUpdate, WorkspaceDatabase,
+        WorkspaceDatabaseError,
     },
 };
 use serde_json::{Value, json};
@@ -115,8 +116,9 @@ fn next_scheduled_task_scan_delay(state: &AppState) -> Result<Duration, ApiError
     let mut next_run_at: Option<DateTime<Utc>> = None;
 
     for workspace in config.local_workspaces() {
-        let database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let Some(database) = open_local_scheduled_task_workspace_database(workspace)? else {
+            continue;
+        };
         let Some(value) = database
             .next_enabled_scheduled_task_run_at()
             .map_err(ApiError::from_workspace_error)?
@@ -164,8 +166,9 @@ pub(crate) async fn dispatch_due_scheduled_tasks(state: &AppState) -> Result<(),
             };
             let metadata = task_metadata(&task, &workspace.id)?;
             let (task_status, next_run_at) = next_task_state(&task.schedule_json, now)?;
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)? else {
+                break;
+            };
             let active_runs = database
                 .active_scheduled_task_run_count(&task.id)
                 .map_err(ApiError::from_workspace_error)?;
@@ -233,8 +236,9 @@ async fn reconcile_scheduled_task_runs_for_config(
 ) -> Result<(), ApiError> {
     for workspace in config.local_workspaces() {
         let runs = {
-            let database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let Some(database) = open_local_scheduled_task_workspace_database(workspace)? else {
+                continue;
+            };
             database
                 .active_scheduled_task_runs()
                 .map_err(ApiError::from_workspace_error)?
@@ -242,16 +246,20 @@ async fn reconcile_scheduled_task_runs_for_config(
 
         for run in runs {
             if run.agent_task_id.is_some() {
-                let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                    .map_err(ApiError::from_workspace_error)?;
+                let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)?
+                else {
+                    break;
+                };
                 sync_scheduled_task_run(&mut database, run)?;
                 continue;
             }
 
             if run.status == RUN_STATUS_PENDING {
                 let task = {
-                    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-                        .map_err(ApiError::from_workspace_error)?;
+                    let Some(database) = open_local_scheduled_task_workspace_database(workspace)?
+                    else {
+                        break;
+                    };
                     database
                         .scheduled_task(&run.task_id)
                         .map_err(ApiError::from_workspace_error)?
@@ -270,8 +278,11 @@ async fn reconcile_scheduled_task_runs_for_config(
                         .await?;
                     }
                     None => {
-                        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                            .map_err(ApiError::from_workspace_error)?;
+                        let Some(mut database) =
+                            open_local_scheduled_task_workspace_database(workspace)?
+                        else {
+                            break;
+                        };
                         mark_scheduled_run_failed_in_database(
                             &mut database,
                             run,
@@ -282,8 +293,9 @@ async fn reconcile_scheduled_task_runs_for_config(
                 continue;
             }
 
-            let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-                .map_err(ApiError::from_workspace_error)?;
+            let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)? else {
+                break;
+            };
             mark_scheduled_run_failed_in_database(
                 &mut database,
                 run,
@@ -301,8 +313,9 @@ fn prune_old_scheduled_task_runs(config: &GlobalConfig) -> Result<(), ApiError> 
         .ok_or_else(|| ApiError::internal("scheduled run retention cutoff overflowed"))?;
     let cutoff = format_utc_timestamp(cutoff);
     for workspace in config.local_workspaces() {
-        let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
-            .map_err(ApiError::from_workspace_error)?;
+        let Some(mut database) = open_local_scheduled_task_workspace_database(workspace)? else {
+            continue;
+        };
         database
             .delete_old_scheduled_task_runs(&cutoff)
             .map_err(ApiError::from_workspace_error)?;
@@ -525,8 +538,9 @@ fn next_due_task(
     workspace: &WorkspaceConfig,
     now: DateTime<Utc>,
 ) -> Result<Option<ScheduledTaskRecord>, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)
-        .map_err(ApiError::from_workspace_error)?;
+    let Some(database) = open_local_scheduled_task_workspace_database(workspace)? else {
+        return Ok(None);
+    };
     for task in database
         .scheduled_tasks(Some(STATUS_ENABLED))
         .map_err(ApiError::from_workspace_error)?
@@ -540,6 +554,27 @@ fn next_due_task(
         }
     }
     Ok(None)
+}
+
+/// Background scan/reconcile helper: skip missing local directories so one stale
+/// configured workspace cannot fail the whole scheduled-task scheduler loop.
+fn open_local_scheduled_task_workspace_database(
+    workspace: &WorkspaceConfig,
+) -> Result<Option<WorkspaceDatabaseHandle>, ApiError> {
+    match WorkspaceDatabase::open_or_create(&workspace.path) {
+        Ok(database) => Ok(Some(database)),
+        Err(WorkspaceDatabaseError::WorkspaceNotDirectory { path }) => {
+            // Expected for long-lived stale config; one scan hits this helper many
+            // times (delay/reconcile/prune/due). Keep at debug to avoid log spam.
+            tracing::debug!(
+                workspace_id = %workspace.id,
+                workspace_path = %path.display(),
+                "skipping scheduled task scan for workspace whose path does not exist or is not a directory"
+            );
+            Ok(None)
+        }
+        Err(error) => Err(ApiError::from_workspace_error(error)),
+    }
 }
 
 async fn dispatch_scheduled_task_run(
