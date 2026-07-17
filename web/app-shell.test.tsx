@@ -2812,11 +2812,455 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
 
-    expect(new URL(messageRequests[0]).searchParams.get("limit")).toBe("100");
+    expect(new URL(messageRequests[0]).searchParams.get("limit")).toBe("60");
 
     await userEvent.click(screen.getByRole("button", { name: "Load earlier messages" }));
     expect(await screen.findByText("Earlier note.")).toBeInTheDocument();
     expect(new URL(messageRequests[1]).searchParams.get("beforeSequence")).toBe("200");
+    expect(new URL(messageRequests[1]).searchParams.get("limit")).toBe("100");
+  });
+
+  it("auto-loads earlier messages only with near-top upward history intent", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note from scroll.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-scroll",
+      parts: [{ text: "Earlier note from scroll.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(1);
+    expect(new URL(messageRequests[0]).searchParams.get("limit")).toBe("60");
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 0;
+
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    // Seed lastScrollTop above the top threshold without upward intent.
+    scrollTopValue = 80;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // Near top without upward intent must not request history.
+    scrollTopValue = 20;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // Downward wheel near top must not request history.
+    list.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 40 }));
+    scrollTopValue = 30;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // Ordinary key without upward keys must not request history.
+    list.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "a" }));
+    scrollTopValue = 20;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // ArrowUp near top loads history with limit=100.
+    list.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "ArrowUp" }));
+    scrollTopValue = 10;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(await screen.findByText("Earlier note from scroll.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(2);
+    expect(new URL(messageRequests[1]).searchParams.get("beforeSequence")).toBe("200");
+    expect(new URL(messageRequests[1]).searchParams.get("limit")).toBe("100");
+  });
+
+  it("auto-loads earlier messages from upward wheel near top", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note from wheel.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-wheel",
+      parts: [{ text: "Earlier note from wheel.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(1);
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 0;
+
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    scrollTopValue = 80;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Downward wheel near top must not request history.
+    list.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: 40 }));
+    scrollTopValue = 30;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // Upward wheel + decreasing scrollTop near top loads history with limit=100.
+    list.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -40 }));
+    scrollTopValue = 10;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(await screen.findByText("Earlier note from wheel.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(2);
+    expect(new URL(messageRequests[1]).searchParams.get("beforeSequence")).toBe("200");
+    expect(new URL(messageRequests[1]).searchParams.get("limit")).toBe("100");
+  });
+
+  it("auto-loads earlier messages from pointer drag near top and clears outside release", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note from pointer.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-pointer",
+      parts: [{ text: "Earlier note from pointer.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(1);
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 0;
+    let capturedPointerId: number | null = null;
+    Object.defineProperty(list, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn((pointerId: number) => {
+        capturedPointerId = pointerId;
+      }),
+    });
+
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    // Seed scroll position without intent.
+    scrollTopValue = 80;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // Pointer drag that decreases scrollTop near top loads history.
+    list.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerId: 7,
+        pointerType: "mouse",
+      }),
+    );
+    expect(capturedPointerId).toBe(7);
+    scrollTopValue = 10;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(await screen.findByText("Earlier note from pointer.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(2);
+    expect(new URL(messageRequests[1]).searchParams.get("limit")).toBe("100");
+  });
+
+  it("clears pointer history gesture on pointerup so later pure scrolls do not auto-load", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const messageRequests: string[] = [];
+    const olderMessage = {
+      ...chatMessages.messages[0],
+      content: "Earlier note after pointer clear.",
+      createdAt: "2026-06-10T07:59:00.000Z",
+      id: "message-older-pointer-clear",
+      parts: [{ text: "Earlier note after pointer clear.", type: "text" }],
+    };
+    fetchMock.mockImplementation((input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const requestUrl = new URL(url, "http://127.0.0.1");
+
+      if (requestUrl.pathname === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        messageRequests.push(requestUrl.toString());
+        if (requestUrl.searchParams.get("beforeSequence") === "200") {
+          return Promise.resolve(jsonResponse({
+            ...chatMessages,
+            messages: [olderMessage],
+            pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+          }));
+        }
+        return Promise.resolve(jsonResponse({
+          ...chatMessages,
+          pagination: { hasMoreBefore: true, nextBeforeSequence: 200 },
+        }));
+      }
+
+      return mockFetch(input, init);
+    });
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(1);
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 0;
+    Object.defineProperty(list, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    scrollTopValue = 80;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    // Press, release outside (captured pointerup), then pure upward scroll must not load.
+    list.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerId: 9,
+        pointerType: "mouse",
+      }),
+    );
+    list.dispatchEvent(
+      new PointerEvent("pointerup", {
+        bubbles: true,
+        pointerId: 9,
+        pointerType: "mouse",
+      }),
+    );
+    scrollTopValue = 10;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(messageRequests).toHaveLength(1);
+
+    // Explicit upward wheel still loads after the gesture was cleared.
+    list.dispatchEvent(new WheelEvent("wheel", { bubbles: true, deltaY: -30 }));
+    scrollTopValue = 5;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    expect(await screen.findByText("Earlier note after pointer clear.")).toBeInTheDocument();
+    expect(messageRequests).toHaveLength(2);
+  });
+
+  it("marks upward pointer intent before bottom-lock evaluation", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+
+    const messageList = document.querySelector(".message-list");
+    expect(messageList).toBeInstanceOf(HTMLElement);
+    const list = messageList as HTMLElement;
+    let scrollTopValue = 1600;
+    Object.defineProperty(list, "setPointerCapture", {
+      configurable: true,
+      value: vi.fn(),
+    });
+
+    Object.defineProperty(list, "clientHeight", {
+      configurable: true,
+      value: 400,
+    });
+    Object.defineProperty(list, "scrollHeight", {
+      configurable: true,
+      value: 2000,
+    });
+    Object.defineProperty(list, "scrollTop", {
+      configurable: true,
+      get() {
+        return scrollTopValue;
+      },
+      set(value: number) {
+        scrollTopValue = Number(value);
+      },
+    });
+
+    // Seed bottom position (locked by initial layout).
+    scrollTopValue = 1600;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+    // Pointer-driven jump away from bottom should unlock; a follow-up pure scroll
+    // decrease mid-list must not re-arm bottom lock (isAtBottom is false).
+    list.dispatchEvent(
+      new PointerEvent("pointerdown", {
+        bubbles: true,
+        button: 0,
+        pointerId: 3,
+        pointerType: "mouse",
+      }),
+    );
+    scrollTopValue = 1200;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    list.dispatchEvent(
+      new PointerEvent("pointerup", {
+        bubbles: true,
+        pointerId: 3,
+        pointerType: "mouse",
+      }),
+    );
+
+    scrollTopValue = 1100;
+    list.dispatchEvent(new Event("scroll", { bubbles: true }));
+    // Stay mid-list: programmatic bottom snaps would set ~1600 if lock remained true
+    // on the next messages-driven layout effect; here we only assert the scroll
+    // position itself was not rewritten by the scroll handler.
+    expect(scrollTopValue).toBe(1100);
   });
 
   it("keeps open tabs for chats scrolled out of the recent 5-page window", async () => {

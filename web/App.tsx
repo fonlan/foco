@@ -390,7 +390,7 @@ export function trimInactiveChatMessageCaches(
     runningChatKeys: Set<string>;
   },
 ) {
-  const pageLimit = options.pageLimit ?? CHAT_MESSAGES_PAGE_LIMIT;
+  const pageLimit = options.pageLimit ?? CHAT_MESSAGES_INITIAL_PAGE_LIMIT;
   const fullCacheLimit = options.fullCacheLimit ?? INACTIVE_CHAT_FULL_CACHE_LIMIT;
   const inactiveChatKeys = accessOrder.filter(
     (chatKey) =>
@@ -985,7 +985,10 @@ type WorkspaceFileContextMenuState = {
 const LIVE_REASONING_DURATION_REFRESH_MS = 1000;
 const LIVE_CONTEXT_USAGE_REFRESH_MS = 5000;
 const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
-const CHAT_MESSAGES_PAGE_LIMIT = 100;
+/** Latest-page size when opening/switching chats or filling a missing cache. */
+export const CHAT_MESSAGES_INITIAL_PAGE_LIMIT = 60;
+/** Older-history page size when the user loads earlier messages. */
+export const CHAT_MESSAGES_HISTORY_PAGE_LIMIT = 100;
 const INACTIVE_CHAT_FULL_CACHE_LIMIT = 8;
 const DEFAULT_AGENT_DEFINITION_ID = "agent-definition-default";
 const EMPTY_CONFIGURED_PROVIDERS: ConfiguredProviderSummary[] = [];
@@ -5990,7 +5993,7 @@ export function App() {
 
     try {
       const data = await requestJson<ChatMessagesResponse>(
-        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_PAGE_LIMIT}`,
+        `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?limit=${CHAT_MESSAGES_INITIAL_PAGE_LIMIT}`,
         { signal: controller.signal },
       );
       // Drop superseded loads for this chatKey before any cache/state mutation.
@@ -6136,9 +6139,10 @@ export function App() {
     setError(null);
 
     try {
+      const beforeSequence = pagination.nextBeforeSequence;
       const params = new URLSearchParams({
-        beforeSequence: String(pagination.nextBeforeSequence),
-        limit: String(CHAT_MESSAGES_PAGE_LIMIT),
+        beforeSequence: String(beforeSequence),
+        limit: String(CHAT_MESSAGES_HISTORY_PAGE_LIMIT),
       });
       const data = await requestJson<ChatMessagesResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages?${params}`,

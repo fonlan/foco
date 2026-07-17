@@ -793,7 +793,7 @@ describe("app-panels-stats verification surfaces", () => {
       await screen.findByText("Existing implementation transcript."),
     ).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/workspaces/workspace-1/chats/plan-chat-open/messages?limit=100",
+      "/api/workspaces/workspace-1/chats/plan-chat-open/messages?limit=60",
       expect.any(Object),
     );
   });

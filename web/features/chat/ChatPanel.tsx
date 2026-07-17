@@ -33,6 +33,7 @@ import {
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
+  WheelEvent as ReactWheelEvent,
   memo,
   useCallback,
   useEffect,
@@ -76,6 +77,8 @@ const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
 const COMPOSER_EDITOR_KEY_STEP_PX = 24;
 const COMPOSER_EDITOR_MAX_HEIGHT_RATIO = 0.55;
 const CHAT_TOP_LOAD_THRESHOLD_PX = 64;
+/** How long an upward input keeps auto-loading earlier history enabled. */
+const UPWARD_HISTORY_INTENT_TTL_MS = 600;
 const MAX_GENERATED_IMAGE_PREVIEWS = 16;
 const TOOL_CALL_SCROLL_CLASS = "tool-call-scroll panel-scroll";
 
@@ -313,6 +316,13 @@ function ChatPanelComponent({
   const previousMessageCountRef = useRef(messages.length);
   const shouldLockMessageScrollRef = useRef(true);
   const userMessageScrollIntentRef = useRef(false);
+  // High-frequency scroll/intent state stays in refs so wheel/scroll handlers avoid setState.
+  const lastMessageScrollTopRef = useRef(0);
+  const lastUpwardHistoryIntentAtRef = useRef(0);
+  // True while a primary pointer is pressed on the list (scrollbar drag / touch).
+  // Cleared via pointer capture end events so release outside the element cannot stick.
+  const pointerHistoryGestureActiveRef = useRef(false);
+  const activeHistoryPointerIdRef = useRef<number | null>(null);
   const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageText, setEditingMessageText] = useState("");
@@ -427,6 +437,7 @@ function ChatPanelComponent({
     }
     shouldLockMessageScrollRef.current = false;
     element.scrollTop += Math.max(0, element.scrollHeight - previousScrollHeight);
+    lastMessageScrollTopRef.current = element.scrollTop;
   }, [messages.length]);
 
   useLayoutEffect(() => {
@@ -436,10 +447,17 @@ function ChatPanelComponent({
     previousChatScrollKeyRef.current = chatScrollKey;
     previousMessageCountRef.current = messages.length;
 
+    if (chatChanged) {
+      lastUpwardHistoryIntentAtRef.current = 0;
+      pointerHistoryGestureActiveRef.current = false;
+      activeHistoryPointerIdRef.current = null;
+    }
+
     if (messages.length === 0) {
       shouldLockMessageScrollRef.current = false;
       if (element) {
         element.scrollTop = 0;
+        lastMessageScrollTopRef.current = 0;
       }
       return;
     }
@@ -447,6 +465,7 @@ function ChatPanelComponent({
     if (chatChanged || wasEmpty) {
       shouldLockMessageScrollRef.current = true;
       scrollMessageListToBottom();
+      lastMessageScrollTopRef.current = element?.scrollTop ?? 0;
     }
   }, [chatScrollKey, messages.length]);
 
@@ -456,6 +475,10 @@ function ChatPanelComponent({
     }
 
     scrollMessageListToBottom();
+    const element = messageScrollRef.current;
+    if (element) {
+      lastMessageScrollTopRef.current = element.scrollTop;
+    }
   }, [messages]);
 
   useLayoutEffect(() => {
@@ -601,6 +624,29 @@ function ChatPanelComponent({
     userMessageScrollIntentRef.current = true;
   }
 
+  function markUpwardHistoryIntent() {
+    lastUpwardHistoryIntentAtRef.current = performance.now();
+    markUserMessageScrollIntent();
+  }
+
+  function hasRecentUpwardHistoryIntent() {
+    return (
+      performance.now() - lastUpwardHistoryIntentAtRef.current <=
+      UPWARD_HISTORY_INTENT_TTL_MS
+    );
+  }
+
+  function maybeLoadEarlierMessagesFromScroll(element: HTMLDivElement) {
+    if (
+      element.scrollTop <= CHAT_TOP_LOAD_THRESHOLD_PX &&
+      hasMoreMessagesBefore &&
+      !isLoadingMoreMessages &&
+      hasRecentUpwardHistoryIntent()
+    ) {
+      requestMoreMessages();
+    }
+  }
+
   function handleMessageScroll() {
     const element = messageScrollRef.current;
     if (!element) {
@@ -610,23 +656,96 @@ function ChatPanelComponent({
     if (messages.length === 0) {
       shouldLockMessageScrollRef.current = false;
       userMessageScrollIntentRef.current = false;
+      lastMessageScrollTopRef.current = 0;
       return;
     }
 
+    const nextScrollTop = element.scrollTop;
+    const previousScrollTop = lastMessageScrollTopRef.current;
+    const scrollTopDecreased = nextScrollTop < previousScrollTop;
+    lastMessageScrollTopRef.current = nextScrollTop;
+
+    // Mark upward pointer/touch drag before updating bottom-lock so the first
+    // scroll away from the bottom unlocks and streaming cannot snap back.
+    if (scrollTopDecreased && pointerHistoryGestureActiveRef.current) {
+      markUpwardHistoryIntent();
+    }
+
     const isAtBottom =
-      element.scrollHeight - element.scrollTop - element.clientHeight <=
+      element.scrollHeight - nextScrollTop - element.clientHeight <=
       CHAT_BOTTOM_LOCK_THRESHOLD_PX;
     if (isAtBottom || userMessageScrollIntentRef.current) {
       shouldLockMessageScrollRef.current = isAtBottom;
     }
     userMessageScrollIntentRef.current = false;
 
+    // Auto-load older history only when the user is actively scrolling upward
+    // near the top (not from layout, streaming growth, or programmatic scrollTop).
+    if (scrollTopDecreased && hasRecentUpwardHistoryIntent()) {
+      maybeLoadEarlierMessagesFromScroll(element);
+    }
+  }
+
+  function handleMessageListWheel(event: ReactWheelEvent<HTMLDivElement>) {
+    if (event.deltaY < 0) {
+      markUpwardHistoryIntent();
+    } else {
+      markUserMessageScrollIntent();
+    }
+  }
+
+  function handleMessageListKeyDown(event: ReactKeyboardEvent<HTMLDivElement>) {
     if (
-      element.scrollTop <= CHAT_TOP_LOAD_THRESHOLD_PX &&
-      hasMoreMessagesBefore &&
-      !isLoadingMoreMessages
+      event.key === "ArrowUp" ||
+      event.key === "PageUp" ||
+      event.key === "Home"
     ) {
-      requestMoreMessages();
+      markUpwardHistoryIntent();
+      return;
+    }
+    markUserMessageScrollIntent();
+  }
+
+  function clearPointerHistoryGesture(pointerId?: number) {
+    if (
+      pointerId !== undefined &&
+      activeHistoryPointerIdRef.current !== null &&
+      activeHistoryPointerIdRef.current !== pointerId
+    ) {
+      return;
+    }
+    pointerHistoryGestureActiveRef.current = false;
+    activeHistoryPointerIdRef.current = null;
+  }
+
+  function handleMessageListPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+    if (event.pointerType === "mouse" && event.button !== 0) {
+      return;
+    }
+    pointerHistoryGestureActiveRef.current = true;
+    activeHistoryPointerIdRef.current = event.pointerId;
+    // Capture so pointerup/cancel still fire when the pointer is released outside the list
+    // (common when dragging the scrollbar thumb or panning past the edge).
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Some environments (jsdom) do not implement pointer capture.
+    }
+  }
+
+  function handleMessageListPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
+    clearPointerHistoryGesture(event.pointerId);
+  }
+
+  function handleMessageListTouchStart() {
+    pointerHistoryGestureActiveRef.current = true;
+  }
+
+  function handleMessageListTouchEnd() {
+    // Touch pointers also emit pointer events when supported; keep touch handlers
+    // as a fallback for environments that only deliver touch events.
+    if (activeHistoryPointerIdRef.current === null) {
+      pointerHistoryGestureActiveRef.current = false;
     }
   }
 
@@ -779,11 +898,16 @@ function ChatPanelComponent({
     >
       <div
         className="message-list panel-scroll min-h-0 flex-1 overflow-y-auto px-3 py-3 sm:px-5 sm:py-4"
-        onKeyDown={markUserMessageScrollIntent}
+        onKeyDown={handleMessageListKeyDown}
+        onPointerCancel={handleMessageListPointerEnd}
+        onPointerDown={handleMessageListPointerDown}
+        onPointerUp={handleMessageListPointerEnd}
         onScroll={handleMessageScroll}
-        onTouchMove={markUserMessageScrollIntent}
-        onWheel={markUserMessageScrollIntent}
+        onTouchEnd={handleMessageListTouchEnd}
+        onTouchStart={handleMessageListTouchStart}
+        onWheel={handleMessageListWheel}
         ref={messageScrollRef}
+        tabIndex={0}
       >
         <div
           className={`message-stack mx-auto flex w-full flex-col ${messages.length ? "max-w-5xl gap-4" : "max-w-6xl"
