@@ -1342,7 +1342,7 @@ fn plan_phase_chat_title(plan_title: &str, phase_title: &str) -> String {
     format!("{plan_title} - {phase_title}")
 }
 
-fn previous_plan_phase_conclusions(
+pub(crate) fn previous_plan_phase_conclusions(
     database: &WorkspaceDatabase,
     plan: &PlanRecord,
     phase: &PlanPhaseRecord,

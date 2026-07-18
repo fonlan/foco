@@ -105,6 +105,7 @@ use crate::{
     },
     memory_tool_definitions, merge_hook_summaries, neutral_mcp_tool_definition,
     neutral_text_message, neutral_tool_definition,
+    plan_runtime::previous_plan_phase_conclusions,
     prompt::{
         ContextUsageInput, LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
         builtin_tool_definitions_for_runtime, compress_all_runtime_tool_state_messages,
@@ -16911,9 +16912,10 @@ fn remote_plan_phase_chat_title(plan_title: &str, phase_title: &str) -> String {
 }
 
 fn remote_plan_phase_prompt(
+    database: &WorkspaceDatabase,
     plan: &foco_store::workspace::PlanRecord,
     phase: &foco_store::workspace::PlanPhaseRecord,
-) -> String {
+) -> Result<String, WorkspaceDatabaseError> {
     let steps = phase
         .steps
         .iter()
@@ -16927,10 +16929,19 @@ fn remote_plan_phase_prompt(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
+    let mut prompt = format!(
         "你是 Plan 的 Coordinator。请在当前隔离 worktree 中实施以下阶段，使用工具检查、修改并验证代码；完成后总结实际改动与验证结果。\n\nPlan：{}\n{}\n\n阶段：{}\n{}\n\n步骤：\n{}",
         plan.title, plan.overview, phase.title, phase.summary, steps
-    )
+    );
+    if let Some(previous_conclusions) = previous_plan_phase_conclusions(database, plan, phase)?
+        .as_deref()
+        .map(str::trim)
+        .filter(|previous_conclusions| !previous_conclusions.is_empty())
+    {
+        prompt.push_str("\n\nPrevious phase conclusions:\n");
+        prompt.push_str(previous_conclusions);
+    }
+    Ok(prompt)
 }
 
 fn remote_fail_plan_phase_dispatch(
@@ -16971,25 +16982,29 @@ async fn remote_sidecar_dispatch_plan_phase(
         return Ok(plan);
     }
     let selection = remote_sidecar_plan_runner_selection(state, phase, retry_payload)?;
-    let attempt_id = match attempt_id {
-        Some(attempt_id) => attempt_id,
-        None => {
-            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .begin_plan_phase_attempt(
-                    &plan.id,
-                    &phase.id,
-                    PlanPhaseAttemptTrigger::Initial,
-                    Some(&selection.provider_id),
-                    Some(&selection.model_id),
-                    selection.thinking_level.as_deref(),
-                )
-                .map_err(ApiError::from_workspace_error)?
-                .id
-        }
+    let (attempt_id, prompt) = {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        let attempt_id = match attempt_id {
+            Some(attempt_id) => attempt_id,
+            None => {
+                database
+                    .begin_plan_phase_attempt(
+                        &plan.id,
+                        &phase.id,
+                        PlanPhaseAttemptTrigger::Initial,
+                        Some(&selection.provider_id),
+                        Some(&selection.model_id),
+                        selection.thinking_level.as_deref(),
+                    )
+                    .map_err(ApiError::from_workspace_error)?
+                    .id
+            }
+        };
+        let prompt = remote_plan_phase_prompt(&database, &plan, phase)
+            .map_err(ApiError::from_workspace_error)?;
+        (attempt_id, prompt)
     };
-    let prompt = remote_plan_phase_prompt(&plan, phase);
     let queued = remote_sidecar_chat_queue(
         State(state.clone()),
         Json(json!({
@@ -17544,6 +17559,128 @@ mod tests {
             .expect("reload plan")
             .expect("plan");
         assert!(!remote_plan_requires_initial_dispatch(&with_attempt));
+    }
+
+    #[test]
+    fn remote_plan_phase_prompt_uses_shared_previous_phase_conclusions() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let mut plan = database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-remote-prompt-conclusions",
+                title: "Remote conclusions",
+                overview: "Carry completed phase output into the next phase.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    foco_store::workspace::NewPlanPhase {
+                        id: "plan-remote-prompt-phase-1",
+                        title: "Discovery",
+                        summary: "Find the implementation details.",
+                        steps: Vec::new(),
+                    },
+                    foco_store::workspace::NewPlanPhase {
+                        id: "plan-remote-prompt-phase-2",
+                        title: "Implementation",
+                        summary: "Apply the discovery output.",
+                        steps: Vec::new(),
+                    },
+                ],
+            })
+            .expect("create plan");
+        database
+            .insert_chat("chat-remote-prompt-phase-1", "Discovery")
+            .expect("insert implementation chat");
+        for (id, role, content, sequence) in [
+            (
+                "remote-prompt-old",
+                "assistant",
+                "old assistant conclusion",
+                1,
+            ),
+            ("remote-prompt-empty", "assistant", "   ", 2),
+            (
+                "remote-prompt-final",
+                "assistant",
+                "  final assistant conclusion  ",
+                3,
+            ),
+            ("remote-prompt-user-tail", "user", "ignored user tail", 4),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id: "chat-remote-prompt-phase-1",
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: None,
+                })
+                .expect("insert message");
+        }
+        plan.phases[0].status = "completed".to_string();
+        plan.phases[0].implementation_chat_id = Some("chat-remote-prompt-phase-1".to_string());
+
+        let prompt = remote_plan_phase_prompt(&database, &plan, &plan.phases[1])
+            .expect("build remote plan phase prompt");
+
+        assert!(prompt.contains(
+            "Previous phase conclusions:\nPhase 1: Discovery\nfinal assistant conclusion"
+        ));
+        assert!(!prompt.contains("old assistant conclusion"));
+        assert!(!prompt.contains("ignored user tail"));
+    }
+
+    #[test]
+    fn remote_plan_phase_prompt_omits_empty_previous_phase_conclusions() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let mut plan = database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-remote-prompt-no-conclusions",
+                title: "Remote empty conclusions",
+                overview: "Do not render an empty conclusions section.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![
+                    foco_store::workspace::NewPlanPhase {
+                        id: "plan-remote-prompt-no-conclusions-phase-1",
+                        title: "Discovery",
+                        summary: "No completed summary.",
+                        steps: Vec::new(),
+                    },
+                    foco_store::workspace::NewPlanPhase {
+                        id: "plan-remote-prompt-no-conclusions-phase-2",
+                        title: "Implementation",
+                        summary: "No prior context to include.",
+                        steps: Vec::new(),
+                    },
+                ],
+            })
+            .expect("create plan");
+        database
+            .insert_chat("chat-remote-prompt-no-conclusions", "Discovery")
+            .expect("insert implementation chat");
+        database
+            .insert_message(NewMessage {
+                id: "remote-prompt-only-empty",
+                chat_id: "chat-remote-prompt-no-conclusions",
+                role: "assistant",
+                content: "   ",
+                sequence: 1,
+                metadata_json: None,
+            })
+            .expect("insert empty assistant message");
+        plan.phases[0].status = "completed".to_string();
+        plan.phases[0].implementation_chat_id =
+            Some("chat-remote-prompt-no-conclusions".to_string());
+
+        let prompt = remote_plan_phase_prompt(&database, &plan, &plan.phases[1])
+            .expect("build remote plan phase prompt");
+
+        assert!(!prompt.contains("Previous phase conclusions:"));
     }
 
     #[test]
