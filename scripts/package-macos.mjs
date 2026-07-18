@@ -70,6 +70,7 @@ function assertMacosHost() {
 async function buildAppBundle(options) {
   const targetRoot = path.resolve(repoRoot, process.env.CARGO_TARGET_DIR ?? "target");
   const releaseExecutable = path.join(targetRoot, MACOS_TARGET, "release", EXECUTABLE_NAME);
+  const appVersion = cargoPackageVersion();
 
   if (!existsSync(releaseExecutable)) {
     throw new Error(`release executable was not created: ${releaseExecutable}`);
@@ -85,9 +86,18 @@ async function buildAppBundle(options) {
   run("lipo", [bundledExecutable, "-verify_arch", MACOS_ARCH]);
 
   await writeIcns();
-  await writeInfoPlist(await cargoPackageVersion());
+  await writeInfoPlist(appVersion);
   if (options.bundleSidecars) {
-    runNode(["scripts/sidecars.mjs", "copy", "--dest", path.join(resourcesDir, "sidecars")]);
+    runNode([
+      "scripts/sidecars.mjs",
+      "copy",
+      "--dest",
+      path.join(resourcesDir, "sidecars"),
+      "--expected-version",
+      appVersion,
+      "--expected-targets",
+      "linux-x64,linux-arm64",
+    ]);
   } else {
     // ponytail: local-only DMGs can skip SSH remote-workspace sidecars; release CI keeps the default bundled path.
     console.warn("[macos] skipped sidecars; remote SSH workspaces will require a custom focoCommand.");

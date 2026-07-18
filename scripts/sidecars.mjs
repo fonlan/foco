@@ -15,7 +15,11 @@ try {
   if (command === "manifest") {
     await writeManifestEntry(options);
   } else if (command === "verify") {
-    await verifySidecars(options.root ?? defaultSidecarsRoot);
+    await verifySidecars(
+      options.root ?? defaultSidecarsRoot,
+      sidecarExpectedVersion(options),
+      sidecarExpectedTargets(options),
+    );
   } else if (command === "copy") {
     await copySidecars(options);
   } else {
@@ -66,23 +70,25 @@ async function writeManifestEntry(options) {
   manifest.sidecars.sort((left, right) => left.target.localeCompare(right.target));
 
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  await verifySidecars(sidecarsRoot);
+  await verifySidecars(sidecarsRoot, version);
   console.log(`[sidecars] wrote ${manifestPath}`);
 }
 
 async function copySidecars(options) {
   const source = path.resolve(options.source ?? defaultSidecarsRoot);
   const destination = path.resolve(requiredOption(options, "dest", "copy"));
+  const expectedVersion = sidecarExpectedVersion(options);
+  const expectedTargets = sidecarExpectedTargets(options);
 
-  await verifySidecars(source);
+  await verifySidecars(source, expectedVersion, expectedTargets);
   await rm(destination, { force: true, recursive: true });
   await mkdir(path.dirname(destination), { recursive: true });
   await cp(source, destination, { recursive: true });
-  await verifySidecars(destination);
+  await verifySidecars(destination, expectedVersion, expectedTargets);
   console.log(`[sidecars] copied ${source} -> ${destination}`);
 }
 
-async function verifySidecars(sidecarsRoot) {
+async function verifySidecars(sidecarsRoot, expectedVersion, expectedTargets) {
   const manifestPath = path.join(sidecarsRoot, "manifest.json");
   if (!existsSync(manifestPath)) {
     throw new Error(`missing sidecars/manifest.json at ${manifestPath}. ${sidecarFixHint()}`);
@@ -91,6 +97,11 @@ async function verifySidecars(sidecarsRoot) {
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"));
   if (!manifest.version || typeof manifest.version !== "string") {
     throw new Error("sidecars/manifest.json must include a string version");
+  }
+  if (manifest.version !== expectedVersion) {
+    throw new Error(
+      `sidecar manifest version mismatch at ${manifestPath}: expected ${JSON.stringify(expectedVersion)}, got ${JSON.stringify(manifest.version)}`,
+    );
   }
   if (!Array.isArray(manifest.sidecars) || manifest.sidecars.length === 0) {
     throw new Error("sidecars/manifest.json must include at least one sidecar entry");
@@ -108,6 +119,19 @@ async function verifySidecars(sidecarsRoot) {
     if (actualSha256 !== entry.sha256) {
       throw new Error(
         `sha256 mismatch for ${entry.path}: manifest has ${entry.sha256}, actual is ${actualSha256}`,
+      );
+    }
+  }
+
+  if (expectedTargets) {
+    const actualTargets = [...seenTargets].sort();
+    const requiredTargets = [...expectedTargets].sort();
+    if (
+      actualTargets.length !== requiredTargets.length ||
+      actualTargets.some((target, index) => target !== requiredTargets[index])
+    ) {
+      throw new Error(
+        `sidecar manifest targets mismatch at ${manifestPath}: expected ${JSON.stringify(requiredTargets)}, got ${JSON.stringify(actualTargets)}`,
       );
     }
   }
@@ -173,6 +197,23 @@ async function sha256File(filePath) {
       .once("end", resolve);
   });
   return hash.digest("hex");
+}
+
+function sidecarExpectedVersion(options) {
+  return options["expected-version"] ?? cargoPackageVersion();
+}
+
+function sidecarExpectedTargets(options) {
+  const value = options["expected-targets"];
+  if (!value) {
+    return null;
+  }
+
+  const targets = value.split(",").map((target) => target.trim());
+  if (targets.some((target) => target.length === 0) || new Set(targets).size !== targets.length) {
+    throw new Error("sidecars expected targets must be a comma-separated list of unique targets");
+  }
+  return new Set(targets);
 }
 
 function cargoPackageVersion() {

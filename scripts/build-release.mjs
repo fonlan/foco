@@ -18,7 +18,16 @@ try {
         : ["build", "--release", "-p", "foco-app"],
     );
     if (options.bundleSidecars) {
-      runNode(["scripts/sidecars.mjs", "copy", "--dest", windowsSidecarsDestination(options.profile)]);
+      runNode([
+        "scripts/sidecars.mjs",
+        "copy",
+        "--dest",
+        windowsSidecarsDestination(options.profile),
+        "--expected-version",
+        cargoPackageVersion(),
+        "--expected-targets",
+        "linux-x64,linux-arm64",
+      ]);
     }
   }
 } catch (error) {
@@ -99,6 +108,33 @@ function runNpm(args) {
 
 function runCargo(args) {
   run(process.platform === "win32" ? "cargo.exe" : "cargo", args);
+}
+
+function cargoPackageVersion() {
+  const result = spawnSync(
+    process.platform === "win32" ? "cargo.exe" : "cargo",
+    ["metadata", "--no-deps", "--format-version", "1"],
+    {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    },
+  );
+
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`cargo metadata exited with code ${result.status}: ${result.stderr.trim()}`);
+  }
+
+  const metadata = JSON.parse(result.stdout);
+  const appPackage = metadata.packages.find((pkg) => pkg.name === "foco-app");
+  if (!appPackage?.version) {
+    throw new Error("cargo metadata did not include foco-app version");
+  }
+  return appPackage.version;
 }
 
 function runNode(args) {

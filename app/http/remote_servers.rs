@@ -1046,7 +1046,15 @@ pub(crate) struct SelectedSidecarAsset {
 }
 
 pub(crate) fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset, String> {
-    for root in sidecar_roots() {
+    select_sidecar_asset_from_roots(target, env!("CARGO_PKG_VERSION"), sidecar_roots())
+}
+
+fn select_sidecar_asset_from_roots(
+    target: &str,
+    expected_version: &str,
+    roots: impl IntoIterator<Item = PathBuf>,
+) -> Result<SelectedSidecarAsset, String> {
+    for root in roots {
         let manifest_path = root.join("manifest.json");
         if !manifest_path.exists() {
             continue;
@@ -1055,6 +1063,13 @@ pub(crate) fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset,
             .map_err(|source| format!("failed to read {}: {source}", manifest_path.display()))?;
         let manifest: SidecarManifest = serde_json::from_str(&manifest_text)
             .map_err(|source| format!("failed to parse {}: {source}", manifest_path.display()))?;
+        if manifest.version != expected_version {
+            return Err(format!(
+                "sidecar manifest version mismatch at {}: expected {expected_version}, got {}",
+                manifest_path.display(),
+                manifest.version
+            ));
+        }
         let Some(entry) = manifest
             .sidecars
             .iter()
@@ -1077,7 +1092,7 @@ pub(crate) fn select_sidecar_asset(target: &str) -> Result<SelectedSidecarAsset,
             ));
         }
         return Ok(SelectedSidecarAsset {
-            version: manifest.version,
+            version: expected_version.to_string(),
             target: target.to_string(),
             sha256: digest,
             path: asset_path,
@@ -1193,6 +1208,73 @@ mod tests {
     fn normalizes_supported_linux_targets() {
         assert_eq!(normalize_target("Linux\nx86_64\n").unwrap(), "linux-x64");
         assert_eq!(normalize_target("Linux\naarch64\n").unwrap(), "linux-arm64");
+    }
+
+    #[test]
+    fn selects_sidecar_asset_when_manifest_version_and_sha_match() {
+        let root = tempfile::tempdir().expect("sidecar root");
+        write_test_sidecar(root.path(), "0.1.51", None);
+
+        let asset =
+            select_sidecar_asset_from_roots("linux-x64", "0.1.51", vec![root.path().to_path_buf()])
+                .expect("matching sidecar asset");
+
+        assert_eq!(asset.version, "0.1.51");
+    }
+
+    #[test]
+    fn rejects_sidecar_asset_with_stale_manifest_version() {
+        let root = tempfile::tempdir().expect("sidecar root");
+        write_test_sidecar(root.path(), "0.1.50", None);
+        let manifest_path = root.path().join("manifest.json");
+
+        let error =
+            select_sidecar_asset_from_roots("linux-x64", "0.1.51", vec![root.path().to_path_buf()])
+                .err()
+                .expect("stale manifest must be rejected");
+
+        assert!(error.contains("expected 0.1.51"));
+        assert!(error.contains("got 0.1.50"));
+        assert!(error.contains(&manifest_path.display().to_string()));
+    }
+
+    #[test]
+    fn rejects_sidecar_asset_with_invalid_sha256_after_version_matches() {
+        let root = tempfile::tempdir().expect("sidecar root");
+        write_test_sidecar(
+            root.path(),
+            "0.1.51",
+            Some("0000000000000000000000000000000000000000000000000000000000000000"),
+        );
+
+        let error =
+            select_sidecar_asset_from_roots("linux-x64", "0.1.51", vec![root.path().to_path_buf()])
+                .err()
+                .expect("invalid sha256 must be rejected");
+
+        assert!(error.contains("sidecar asset sha256 mismatch"));
+    }
+
+    fn write_test_sidecar(root: &std::path::Path, version: &str, manifest_sha256: Option<&str>) {
+        let asset_path = root.join("linux-x64").join("foco");
+        fs::create_dir_all(asset_path.parent().expect("asset parent")).expect("asset directory");
+        let bytes = b"test sidecar";
+        fs::write(&asset_path, bytes).expect("sidecar asset");
+        let actual_sha256 = format!("{:x}", Sha256::digest(bytes));
+        let manifest_sha256 = manifest_sha256.unwrap_or(&actual_sha256);
+        let manifest = serde_json::json!({
+            "version": version,
+            "sidecars": [{
+                "target": "linux-x64",
+                "path": "linux-x64/foco",
+                "sha256": manifest_sha256,
+            }],
+        });
+        fs::write(
+            root.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("manifest JSON"),
+        )
+        .expect("manifest");
     }
 
     #[test]

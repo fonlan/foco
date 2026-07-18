@@ -27,8 +27,49 @@ try {
     "--version",
     "0.0.0-test",
   ]);
-  runSidecars(["verify", "--root", sidecars]);
-  runSidecars(["copy", "--source", sidecars, "--dest", copied]);
+  const expectedVersion = "0.0.0-test";
+  runSidecars([
+    "verify",
+    "--root",
+    sidecars,
+    "--expected-version",
+    expectedVersion,
+    "--expected-targets",
+    "linux-x64",
+  ]);
+
+  const targetMismatch = spawnSidecars([
+    "verify",
+    "--root",
+    sidecars,
+    "--expected-version",
+    expectedVersion,
+    "--expected-targets",
+    "linux-x64,linux-arm64",
+  ]);
+  assert.notEqual(targetMismatch.status, 0);
+  assert.match(targetMismatch.stderr, /sidecar manifest targets mismatch/);
+
+  const versionMismatch = spawnSidecars([
+    "verify",
+    "--root",
+    sidecars,
+    "--expected-version",
+    "0.0.1-test",
+  ]);
+  assert.notEqual(versionMismatch.status, 0);
+  assert.match(versionMismatch.stderr, /sidecar manifest version mismatch/);
+  assert.match(versionMismatch.stderr, /expected "0.0.1-test", got "0.0.0-test"/);
+
+  runSidecars([
+    "copy",
+    "--source",
+    sidecars,
+    "--dest",
+    copied,
+    "--expected-version",
+    expectedVersion,
+  ]);
 
   const manifest = JSON.parse(await readFile(path.join(copied, "manifest.json"), "utf8"));
   assert.equal(manifest.version, "0.0.0-test");
@@ -37,7 +78,13 @@ try {
   assert.ok(existsSync(path.join(copied, ...manifest.sidecars[0].path.split("/"))));
 
   await writeFile(path.join(copied, ...manifest.sidecars[0].path.split("/")), "tampered\n", "utf8");
-  const failed = spawnSidecars(["verify", "--root", copied]);
+  const failed = spawnSidecars([
+    "verify",
+    "--root",
+    copied,
+    "--expected-version",
+    expectedVersion,
+  ]);
   assert.notEqual(failed.status, 0);
   assert.match(failed.stderr, /sha256 mismatch/);
 
