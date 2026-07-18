@@ -28,6 +28,7 @@ const macosDir = path.join(contentsDir, "MacOS");
 const resourcesDir = path.join(contentsDir, "Resources");
 const iconPath = path.join(resourcesDir, `${APP_NAME}.icns`);
 const dmgPath = path.join(distRoot, `${APP_NAME}.dmg`);
+const HDIUTIL_CREATE_MAX_ATTEMPTS = 4;
 
 try {
   const options = parseArgs(process.argv.slice(2));
@@ -200,20 +201,72 @@ async function buildDmg() {
       recursive: true,
     });
     await symlink("/Applications", path.join(stagingRoot, "Applications"));
-    run("hdiutil", [
-      "create",
-      "-volname",
-      APP_NAME,
-      "-srcfolder",
-      stagingRoot,
-      "-ov",
-      "-format",
-      "UDZO",
-      dmgPath,
-    ]);
+    await createDmgWithRetry(stagingRoot);
   } finally {
     await rm(stagingRoot, { force: true, recursive: true });
   }
+}
+
+async function createDmgWithRetry(stagingRoot) {
+  const args = [
+    "create",
+    "-volname",
+    APP_NAME,
+    "-srcfolder",
+    stagingRoot,
+    "-ov",
+    "-format",
+    "UDZO",
+    dmgPath,
+  ];
+
+  for (let attempt = 1; attempt <= HDIUTIL_CREATE_MAX_ATTEMPTS; attempt += 1) {
+    const result = spawnSync("hdiutil", args, {
+      cwd: repoRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    if (result.stdout) {
+      process.stdout.write(result.stdout);
+    }
+    if (result.stderr) {
+      process.stderr.write(result.stderr);
+    }
+
+    if (result.status === 0) {
+      return;
+    }
+
+    const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim();
+    const status = result.status ?? "unknown";
+    const failure = new Error(
+      `hdiutil ${args.join(" ")} exited with code ${status}${output ? `: ${output}` : ""}`,
+    );
+
+    if (!isHdiutilResourceBusy(output) || attempt === HDIUTIL_CREATE_MAX_ATTEMPTS) {
+      throw failure;
+    }
+
+    const delayMs = attempt * 1_000;
+    console.warn(
+      `[macos] hdiutil create reported Resource busy (attempt ${attempt}/${HDIUTIL_CREATE_MAX_ATTEMPTS}); retrying in ${delayMs}ms.`,
+    );
+    await sleep(delayMs);
+  }
+}
+
+function isHdiutilResourceBusy(output) {
+  return output.toLowerCase().includes("resource busy");
+}
+
+function sleep(durationMs) {
+  return new Promise((resolve) => setTimeout(resolve, durationMs));
 }
 
 function cargoPackageVersion() {
