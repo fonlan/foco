@@ -11185,6 +11185,7 @@ async fn remote_sidecar_execute_broker_tool(
 
 async fn remote_sidecar_execute_tool_call(
     state: &RemoteSidecarState,
+    tool_workspace_path: &Path,
     run_stream: &RemoteActiveRunStream,
     tool_catalog: &RemoteToolCatalog,
     broker_event_tx: mpsc::UnboundedSender<Value>,
@@ -11273,7 +11274,7 @@ async fn remote_sidecar_execute_tool_call(
             Vec::new(),
         );
     }
-    let workspace_path = PathBuf::from(&state.workspace_path);
+    let canonical_workspace_path = PathBuf::from(&state.workspace_path);
     let (_hook_mcp_registry, hook_runtime, global_hooks, global_config, retry_count) =
         match remote_sidecar_hook_environment(
             state,
@@ -11340,8 +11341,8 @@ async fn remote_sidecar_execute_tool_call(
         question_tx.clone(),
         crate::memory_runtime::MemoryToolContext {
             enabled: false,
-            workspace_path: workspace_path.clone(),
-            global_memory_database_file: workspace_path
+            workspace_path: canonical_workspace_path.clone(),
+            global_memory_database_file: canonical_workspace_path
                 .join(".foco/remote-sidecar-disabled-memory.sqlite"),
             chat_id: chat_id.to_string(),
             run_id: run_id.to_string(),
@@ -11357,8 +11358,8 @@ async fn remote_sidecar_execute_tool_call(
         tool_output_tx.clone(),
         assistant_message_id,
         &state.workspace_id,
-        &workspace_path,
-        &workspace_path,
+        &canonical_workspace_path,
+        tool_workspace_path,
         chat_id,
         session_mode,
         run_id,
@@ -11383,7 +11384,7 @@ async fn remote_sidecar_execute_tool_call(
         &global_hooks,
         false,
         &state.workspace_id,
-        &workspace_path,
+        &canonical_workspace_path,
         chat_id,
         run_id,
         model_id,
@@ -13189,10 +13190,13 @@ fn remote_sidecar_validate_plan_task_binding(
 
 /// Owned state for a remote chat run that outlives any single SSE subscription.
 struct RemoteSidecarChatRunContext {
-    state: RemoteSidecarState,
-    /// Tool execution may target an Agent worktree while durable chat/Plan state
-    /// remains anchored in the remote workspace database.
-    tool_state: RemoteSidecarState,
+    /// Canonical remote workspace state. Durable chat, Plan, Spec, Hook, and
+    /// workspace-memory operations remain anchored here even when tools execute
+    /// from an isolated Agent worktree.
+    workspace_state: RemoteSidecarState,
+    /// Validated execution root for file, command, and code-graph tools. This
+    /// equals the canonical workspace for normal remote chats.
+    tool_workspace_path: PathBuf,
     plan_task: Option<RemotePlanTaskBinding>,
     run_id: String,
     chat_id: String,
@@ -13212,8 +13216,8 @@ struct RemoteSidecarChatRunContext {
 
 async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext) {
     let RemoteSidecarChatRunContext {
-        state: stream_state,
-        tool_state,
+        workspace_state: stream_state,
+        tool_workspace_path,
         plan_task,
         run_id,
         chat_id,
@@ -13753,7 +13757,8 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         }
                         let (broker_event_tx, mut broker_event_rx) = mpsc::unbounded_channel();
                         let execution = remote_sidecar_execute_tool_call(
-                            &tool_state,
+                            &stream_state,
+                            &tool_workspace_path,
                             &run_stream,
                             &tool_catalog,
                             broker_event_tx,
@@ -14472,8 +14477,6 @@ async fn remote_sidecar_start_chat_run(
         Path::new(&state.workspace_path),
         &tool_workspace_path,
     )?;
-    let mut tool_state = state.clone();
-    tool_state.workspace_path = tool_workspace_path.display().to_string();
     let plan_task = remote_optional_string(payload.get("planTaskId"))
         .map(|task_id| AgentTaskId::new(task_id).map(|task_id| RemotePlanTaskBinding { task_id }))
         .transpose()
@@ -14562,8 +14565,8 @@ async fn remote_sidecar_start_chat_run(
         remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
     tokio::spawn(run_remote_sidecar_chat_in_background(
         RemoteSidecarChatRunContext {
-            state: state.clone(),
-            tool_state,
+            workspace_state: state.clone(),
+            tool_workspace_path,
             plan_task,
             run_id,
             chat_id,
@@ -28786,11 +28789,33 @@ mod tests {
         arguments: Value,
         session_mode: Option<&str>,
     ) -> (Value, bool, Vec<Value>, Vec<String>) {
+        test_execute_remote_sidecar_local_tool_at_workspace(
+            state,
+            sidecar_workspace_path(state),
+            catalog,
+            tool_call_id,
+            tool_name,
+            arguments,
+            session_mode,
+        )
+        .await
+    }
+
+    async fn test_execute_remote_sidecar_local_tool_at_workspace(
+        state: &RemoteSidecarState,
+        tool_workspace_path: &Path,
+        catalog: &RemoteToolCatalog,
+        tool_call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        session_mode: Option<&str>,
+    ) -> (Value, bool, Vec<Value>, Vec<String>) {
         let run_stream = RemoteActiveRunStream::new("chat-tools".to_string());
         let (broker_event_tx, _broker_event_rx) = mpsc::unbounded_channel();
         let (output, is_error, _started_at, _completed_at, events, additional_context) =
             remote_sidecar_execute_tool_call(
                 state,
+                tool_workspace_path,
                 &run_stream,
                 catalog,
                 broker_event_tx,
@@ -29138,6 +29163,85 @@ mod tests {
         assert!(blocked["error"].as_str().is_some_and(|message| {
             message.contains("Plan Mode cannot modify plan, phase, or step status")
         }));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_isolated_worktree_routes_database_tools_to_canonical_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let tool_workspace_path = workspace
+            .path()
+            .join(".foco/agent-worktrees/agent-instance-isolated");
+        fs::create_dir_all(&tool_workspace_path).expect("create isolated tool workspace");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("canonical workspace db");
+        database
+            .insert_chat_with_metadata("chat-tools", "Remote tools", "{}")
+            .expect("insert chat");
+        drop(database);
+        let (state, catalog) = test_remote_sidecar_local_catalog(workspace.path(), None).await;
+
+        let (todo, todo_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
+            &state,
+            &tool_workspace_path,
+            &catalog,
+            "call-isolated-todo-create",
+            "create_todo_graph",
+            json!({
+                "tasks": [{
+                    "id": "isolated-task",
+                    "title": "Canonical database task",
+                    "status": "ready",
+                    "dependsOn": [],
+                    "acceptance": ["persisted in canonical database"],
+                    "summary": "created from isolated worktree",
+                    "createdAt": null,
+                    "updatedAt": null,
+                    "subtasks": []
+                }],
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!todo_error, "{todo}");
+
+        let graph = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen canonical workspace db")
+            .todo_graph("chat-tools")
+            .expect("read canonical todo graph")
+            .expect("canonical todo graph");
+        assert_eq!(graph.tasks[0].id, "isolated-task");
+        assert!(
+            !tool_workspace_path.join(".foco/foco.sqlite").exists(),
+            "database tool must not create a worktree-local database"
+        );
+
+        let (write, write_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
+            &state,
+            &tool_workspace_path,
+            &catalog,
+            "call-isolated-write",
+            "write_file",
+            json!({
+                "path": "worktree-only.txt",
+                "content": "from isolated worktree\n",
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!write_error, "{write}");
+        assert_eq!(
+            fs::read_to_string(tool_workspace_path.join("worktree-only.txt"))
+                .expect("worktree file"),
+            "from isolated worktree\n"
+        );
+        assert!(
+            !workspace.path().join("worktree-only.txt").exists(),
+            "file tool must retain the isolated worktree as its execution root"
+        );
     }
 
     #[tokio::test]
@@ -31772,6 +31876,7 @@ mod tests {
             Duration::from_secs(5),
             remote_sidecar_execute_tool_call(
                 &grant_state,
+                sidecar_workspace_path(&grant_state),
                 &run_stream,
                 &catalog,
                 broker_event_tx,
@@ -31812,6 +31917,7 @@ mod tests {
             Duration::from_secs(5),
             remote_sidecar_execute_tool_call(
                 &grant_state,
+                sidecar_workspace_path(&grant_state),
                 &run_stream,
                 &catalog,
                 broker_event_tx,
@@ -31913,6 +32019,7 @@ mod tests {
             Duration::from_secs(5),
             remote_sidecar_execute_tool_call(
                 &state,
+                sidecar_workspace_path(&state),
                 &run_stream,
                 &catalog,
                 broker_event_tx,
@@ -31946,6 +32053,7 @@ mod tests {
         let (broker_event_tx, mut broker_rx) = mpsc::unbounded_channel();
         let sibling_future = remote_sidecar_execute_tool_call(
             &state,
+            sidecar_workspace_path(&state),
             &run_stream,
             &catalog,
             broker_event_tx,
