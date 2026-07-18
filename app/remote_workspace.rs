@@ -1394,7 +1394,48 @@ impl RemoteWorkspaceManager {
             })?;
         let workspace = workspace_by_id(&config, workspace_id)?.clone();
         let remote_path = workspace_remote_path(&workspace, server_id)?;
+        let target = detect_or_cached_target(&server, server_id, Some(workspace_id)).await?;
+        let expected_identity =
+            expected_remote_sidecar_identity(&server, &target, server_id, Some(workspace_id))
+                .await?;
         let key = session_key(server_id, workspace_id);
+        let replacement_lock_key = session_replacement_lock_key(server_id, workspace_id);
+        let replacement_lock = self.sidecar_install_lock(&replacement_lock_key)?;
+        let result = {
+            let _replacement_guard = replacement_lock.lock().await;
+            self.connect_workspace_with_expected_identity(
+                state,
+                &config,
+                &server,
+                server_id,
+                workspace_id,
+                &remote_path,
+                &key,
+                &target,
+                &expected_identity,
+            )
+            .await
+        };
+        self.remove_sidecar_install_lock(&replacement_lock_key, &replacement_lock)?;
+        result
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "connection setup keeps all validated session inputs explicit"
+    )]
+    async fn connect_workspace_with_expected_identity(
+        &self,
+        state: AppState,
+        config: &foco_store::config::GlobalConfig,
+        server: &RemoteServerProfile,
+        server_id: &str,
+        workspace_id: &str,
+        remote_path: &str,
+        key: &str,
+        target: &str,
+        expected_identity: &RemoteSidecarIdentity,
+    ) -> Result<RemoteWorkspaceSessionSummary, ApiError> {
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1402,11 +1443,39 @@ impl RemoteWorkspaceManager {
             None,
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Checking, None)?;
-        if let Some(existing) = self.session(&key)? {
-            return Ok(existing.summary());
+
+        let stale_session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+            match sessions.get(key) {
+                Some(existing)
+                    if existing.matches_expected_identity(
+                        server_id,
+                        workspace_id,
+                        expected_identity,
+                    ) =>
+                {
+                    self.set_status(
+                        server_id,
+                        Some(workspace_id),
+                        RemoteConnectionState::Ready,
+                        None,
+                    )?;
+                    self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
+                    return Ok(existing.summary());
+                }
+                Some(_) => sessions.remove(key),
+                None => None,
+            }
+        };
+        if let Some(session) = stale_session {
+            // The stale tunnel must be gone before an upgrade can install and launch a
+            // replacement. Keep the session-map lock out of this async teardown.
+            session.stop().await;
         }
 
-        let target = detect_or_cached_target(&server, server_id, Some(workspace_id)).await?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1415,7 +1484,15 @@ impl RemoteWorkspaceManager {
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Installing, None)?;
         let sidecar_command =
-            ensure_sidecar_command(&state, &server, server_id, Some(workspace_id), &target).await?;
+            ensure_sidecar_command(&state, server, server_id, Some(workspace_id), target).await?;
+        if sidecar_command.identity != *expected_identity {
+            return Err(remote_error(
+                server_id,
+                Some(workspace_id),
+                "remote sidecar identity changed while preparing the upgrade; retry the connection",
+            ));
+        }
+
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1424,15 +1501,15 @@ impl RemoteWorkspaceManager {
         )?;
         let token = random_token()?;
         let session_file = ensure_remote_session_file(
-            &server,
+            server,
             server_id,
             workspace_id,
-            &remote_path,
-            &target,
+            remote_path,
+            target,
             &token,
         )
         .await?;
-        stop_stale_remote_sidecars(&server, server_id, workspace_id, &remote_path).await?;
+        stop_stale_remote_sidecars(server, server_id, workspace_id, remote_path).await?;
         self.set_status(
             server_id,
             Some(workspace_id),
@@ -1442,7 +1519,7 @@ impl RemoteWorkspaceManager {
         // Long-lived SSH/sidecar/forward resources must be aborted explicitly on any
         // mid-connect failure; russh Handle Drop does not send Disconnect.
         let mut partial = PartialRemoteConnect::with_ssh(
-            open_remote_ssh_session(&server, server_id, Some(workspace_id)).await?,
+            open_remote_ssh_session(server, server_id, Some(workspace_id)).await?,
         );
         let finish: Result<
             (
@@ -1457,8 +1534,8 @@ impl RemoteWorkspaceManager {
                 partial.ssh_ref(),
                 server_id,
                 workspace_id,
-                &remote_path,
-                &target,
+                remote_path,
+                target,
                 &token,
                 &sidecar_command.command,
                 &session_file,
@@ -1500,7 +1577,7 @@ impl RemoteWorkspaceManager {
             partial.forward_task = Some(forward_task);
             let bundle = build_sidecar_runtime_config_bundle(
                 &state.user_profile_dir,
-                &config,
+                config,
                 Utc::now().timestamp_millis().max(0) as u64,
             )?;
             let active_runs = Arc::new(Mutex::new(Vec::new()));
@@ -1551,8 +1628,9 @@ impl RemoteWorkspaceManager {
         let session = Arc::new(RemoteWorkspaceSession {
             server_id: server_id.to_string(),
             workspace_id: workspace_id.to_string(),
-            remote_path,
-            target,
+            remote_path: remote_path.to_string(),
+            sidecar_identity: sidecar_command.identity.clone(),
+            target: target.to_string(),
             local_port,
             remote_port: bootstrap.port,
             token: token.clone(),
@@ -1587,14 +1665,14 @@ impl RemoteWorkspaceManager {
                 .sessions
                 .lock()
                 .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
-            sessions.insert(key, session);
+            sessions.insert(key.to_string(), session);
         }
 
         // Best-effort: after bootstrap identity + control broker succeed, prune older
         // Foco-managed sidecar version dirs. Custom focoCommand is skipped. Failures never
         // downgrade a successful Ready session.
         maybe_cleanup_stale_managed_remote_sidecar_versions(
-            &server,
+            server,
             server_id,
             workspace_id,
             &sidecar_command,
@@ -1756,6 +1834,11 @@ impl RemoteWorkspaceManager {
             server_id: server_id.to_string(),
             workspace_id: workspace_id.to_string(),
             remote_path: remote_path.to_string(),
+            sidecar_identity: RemoteSidecarIdentity {
+                version: "test".to_string(),
+                target: "linux-x64".to_string(),
+                build_id: "foco-sidecar-v2:sha256:test".to_string(),
+            },
             target: "linux-x64".to_string(),
             local_port,
             remote_port: local_port,
@@ -1933,6 +2016,7 @@ struct RemoteWorkspaceSession {
     server_id: String,
     workspace_id: String,
     remote_path: String,
+    sidecar_identity: RemoteSidecarIdentity,
     target: String,
     local_port: u16,
     remote_port: u16,
@@ -1949,6 +2033,22 @@ struct RemoteWorkspaceSession {
 }
 
 impl RemoteWorkspaceSession {
+    fn matches_expected_identity(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+        expected_identity: &RemoteSidecarIdentity,
+    ) -> bool {
+        remote_workspace_session_identity_matches(
+            &self.server_id,
+            &self.workspace_id,
+            &self.sidecar_identity,
+            server_id,
+            workspace_id,
+            expected_identity,
+        )
+    }
+
     fn summary(&self) -> RemoteWorkspaceSessionSummary {
         let active_runs = self
             .active_runs
@@ -2019,6 +2119,19 @@ struct RemoteSidecarIdentity {
     version: String,
     target: String,
     build_id: String,
+}
+
+fn remote_workspace_session_identity_matches(
+    session_server_id: &str,
+    session_workspace_id: &str,
+    session_identity: &RemoteSidecarIdentity,
+    expected_server_id: &str,
+    expected_workspace_id: &str,
+    expected_identity: &RemoteSidecarIdentity,
+) -> bool {
+    session_server_id == expected_server_id
+        && session_workspace_id == expected_workspace_id
+        && session_identity == expected_identity
 }
 
 #[derive(Clone, Debug)]
@@ -3381,6 +3494,30 @@ pub(crate) async fn run_remote_file_picker_command(
     }
     serde_json::from_slice(&output.stdout).map_err(|source| {
         ApiError::bad_gateway(format!("invalid remote file picker response: {source}"))
+    })
+}
+
+async fn expected_remote_sidecar_identity(
+    server: &RemoteServerProfile,
+    target: &str,
+    server_id: &str,
+    workspace_id: Option<&str>,
+) -> Result<RemoteSidecarIdentity, ApiError> {
+    if let Some(command) = server
+        .foco_command
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return verify_remote_command(server, command, target, None, server_id, workspace_id).await;
+    }
+
+    let asset = select_sidecar_asset(target)
+        .map_err(|message| remote_error(server_id, workspace_id, message))?;
+    Ok(RemoteSidecarIdentity {
+        version: asset.version,
+        target: asset.target,
+        build_id: sidecar_build_id_from_sha256(&asset.sha256),
     })
 }
 
@@ -6603,6 +6740,10 @@ fn session_key(server_id: &str, workspace_id: &str) -> String {
     format!("{server_id}:{workspace_id}")
 }
 
+fn session_replacement_lock_key(server_id: &str, workspace_id: &str) -> String {
+    format!("session\0{server_id}\0{workspace_id}")
+}
+
 fn sidecar_install_key(server_id: &str, target: &str, version: &str) -> String {
     format!("{server_id}\0{target}\0{version}")
 }
@@ -6806,10 +6947,6 @@ pub(crate) async fn ensure_remote_workspace_connected(
     state: &AppState,
     workspace_id: &str,
 ) -> Result<(), ApiError> {
-    match sidecar_proxy_target(state, workspace_id)? {
-        SidecarProxyTarget::Local | SidecarProxyTarget::Connected { .. } => return Ok(()),
-        SidecarProxyTarget::Disconnected => {}
-    }
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?;
     let Some(server_id) = workspace.server_id().map(str::to_string) else {
@@ -6871,6 +7008,7 @@ pub(crate) async fn proxy_sidecar_json_request(
     suffix: &str,
     payload: Option<Value>,
 ) -> Result<Value, ApiError> {
+    ensure_remote_workspace_connected(state, workspace_id).await?;
     let (base, token) = match sidecar_proxy_target(state, workspace_id)? {
         SidecarProxyTarget::Connected { base, token } => (base, token),
         SidecarProxyTarget::Local | SidecarProxyTarget::Disconnected => {
@@ -16843,6 +16981,63 @@ async fn remote_sidecar_plans_worktree_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_sidecar_identity(version: &str, build_id: &str) -> RemoteSidecarIdentity {
+        RemoteSidecarIdentity {
+            version: version.to_string(),
+            target: "linux-x64".to_string(),
+            build_id: build_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn matching_remote_session_identity_is_reusable_without_replacement() {
+        let identity = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:new");
+        assert!(remote_workspace_session_identity_matches(
+            "server-a",
+            "workspace-a",
+            &identity,
+            "server-a",
+            "workspace-a",
+            &identity,
+        ));
+    }
+
+    #[test]
+    fn older_remote_session_identity_is_stale_after_app_upgrade() {
+        let older = test_sidecar_identity("0.1.50", "foco-sidecar-v2:sha256:older");
+        let current = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:current");
+        assert!(!remote_workspace_session_identity_matches(
+            "server-a",
+            "workspace-a",
+            &older,
+            "server-a",
+            "workspace-a",
+            &current,
+        ));
+    }
+
+    #[test]
+    fn remote_session_identity_requires_matching_server_workspace_and_build() {
+        let identity = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:current");
+        let other_build = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:other");
+        assert!(!remote_workspace_session_identity_matches(
+            "server-a",
+            "workspace-a",
+            &identity,
+            "server-b",
+            "workspace-a",
+            &other_build,
+        ));
+    }
+
+    #[test]
+    fn session_replacement_locks_are_scoped_to_the_workspace() {
+        assert_ne!(
+            session_replacement_lock_key("server-a", "workspace-a"),
+            session_replacement_lock_key("server-a", "workspace-b"),
+        );
+    }
 
     #[test]
     fn remote_plan_dispatch_only_targets_unbound_running_phase() {
