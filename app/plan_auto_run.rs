@@ -160,6 +160,14 @@ async fn dispatch_next_plan_auto_run(
                     "Plan auto-run waiting for explicit failed phase retry"
                 );
             }
+            PlanAutoRunSelection::Paused { plan_id, phase_id } => {
+                tracing::debug!(
+                    workspace_id = %workspace.id,
+                    plan_id,
+                    phase_id,
+                    "Plan auto-run waiting for explicit user resume"
+                );
+            }
             PlanAutoRunSelection::Running { .. } | PlanAutoRunSelection::Candidate(_) => {}
         }
         selection
@@ -170,6 +178,7 @@ async fn dispatch_next_plan_auto_run(
         PlanAutoRunSelection::WaitingForReady { .. }
         | PlanAutoRunSelection::WaitingForRetry { .. }
         | PlanAutoRunSelection::BlockedByCancelledPhase { .. }
+        | PlanAutoRunSelection::Paused { .. }
         | PlanAutoRunSelection::Running { .. } => {
             return Ok(PlanAutoRunDispatch::Blocked);
         }
@@ -278,20 +287,21 @@ pub(crate) fn choose_plan_auto_run_candidate(
             phase_id,
         };
     }
+    if plan.status == "paused" {
+        return PlanAutoRunSelection::Paused {
+            plan_id: plan.id.clone(),
+            phase_id,
+        };
+    }
     if plan.status == "running" || matches!(phase_status, Some("running" | "queued")) {
         return PlanAutoRunSelection::Running {
             plan_id: plan.id.clone(),
             phase_id,
         };
     }
-    let action = if plan.status == "paused" {
-        "resume"
-    } else {
-        "start"
-    };
     PlanAutoRunSelection::Candidate(foco_store::workspace::PlanAutoRunCandidateRecord {
         plan_id: plan.id.clone(),
-        action: action.to_string(),
+        action: "start".to_string(),
     })
 }
 
@@ -510,6 +520,68 @@ mod tests {
         assert!(later.phases[0].agent_task_id.is_none());
     }
 
+    #[tokio::test]
+    async fn scheduler_preserves_user_paused_plan_without_dispatch() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let profile = tempfile::tempdir().expect("profile");
+        let config = foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        let (agent_scheduler, mut agent_scheduler_rx) = AgentScheduler::new();
+        let mut state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        state.agent_scheduler = agent_scheduler;
+        {
+            let mut database =
+                foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+                    .expect("database");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: "paused-plan",
+                    title: "Paused plan",
+                    overview: "User pause must gate automatic phase dispatch.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: "paused-phase",
+                        title: "Pending phase",
+                        summary: "Wait for explicit Resume.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "paused-step",
+                            title: "Do not dispatch",
+                            detail: "Only the user may resume this plan.",
+                            acceptance: vec!["still pending".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create plan");
+            database
+                .transition_plan("paused-plan", "pause")
+                .expect("pause plan");
+            database
+                .set_plan_auto_run_enabled(true)
+                .expect("enable auto-run");
+        }
+
+        assert!(!dispatch_plan_auto_run(&state).await.expect("dispatch scan"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), agent_scheduler_rx.recv())
+                .await
+                .is_err()
+        );
+
+        let database = foco_store::workspace::WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database");
+        let plan = database
+            .plan("paused-plan")
+            .expect("paused plan lookup")
+            .expect("paused plan");
+        assert_eq!(plan.status, "paused");
+        assert_eq!(plan.phases[0].status, "pending");
+        assert!(plan.phases[0].agent_task_id.is_none());
+        let auto_run = database.plan_auto_run_state().expect("auto-run state");
+        assert!(auto_run.desired_enabled);
+        assert!(auto_run.enabled);
+        assert!(!auto_run.busy);
+    }
+
     #[test]
     fn sidecar_store_action_preserves_cancelled_phase_barrier() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -630,15 +702,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_auto_run_candidate_allows_paused_plan_without_cancelled_barrier() {
+    fn plan_auto_run_candidate_respects_pause_during_active_phase() {
         let mut paused = plan("paused", "paused");
         paused.phases = vec![
             phase("completed-phase", "completed", 0),
-            phase("pending-phase", "pending", 1),
+            phase("running-phase", "running", 1),
         ];
 
-        let candidate = candidate(choose_plan_auto_run_candidate(&[paused]));
-        assert_eq!(candidate.plan_id, "paused");
-        assert_eq!(candidate.action, "resume");
+        assert_eq!(
+            choose_plan_auto_run_candidate(&[paused]),
+            PlanAutoRunSelection::Paused {
+                plan_id: "paused".to_string(),
+                phase_id: Some("running-phase".to_string()),
+            }
+        );
     }
 }

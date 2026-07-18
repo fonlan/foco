@@ -101,6 +101,11 @@ pub enum PlanAutoRunSelection {
         plan_id: String,
         phase_id: String,
     },
+    /// A user pause is a scheduling gate, including while the active Phase keeps running.
+    Paused {
+        plan_id: String,
+        phase_id: Option<String>,
+    },
     Running {
         plan_id: String,
         phase_id: Option<String>,

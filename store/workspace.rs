@@ -980,6 +980,7 @@ impl WorkspaceDatabase {
                 Some(phase_id.clone()),
             ),
             PlanAutoRunSelection::Candidate(_)
+            | PlanAutoRunSelection::Paused { .. }
             | PlanAutoRunSelection::Running { .. }
             | PlanAutoRunSelection::Idle => (None, None, None),
         };
@@ -1120,19 +1121,20 @@ impl WorkspaceDatabase {
         if status == "failed" || phase_status == Some("failed") {
             return Ok(PlanAutoRunSelection::WaitingForRetry { plan_id, phase_id });
         }
+        if status == "paused" {
+            // Pause is an explicit user scheduling gate. An active phase may keep
+            // executing, but neither it nor a following pending phase is eligible
+            // for automatic dispatch until the user resumes the plan.
+            return Ok(PlanAutoRunSelection::Paused { plan_id, phase_id });
+        }
         if status == "running" || matches!(phase_status, Some("running" | "queued")) {
             return Ok(PlanAutoRunSelection::Running { plan_id, phase_id });
         }
 
-        let action = if status == "paused" {
-            "resume"
-        } else {
-            "start"
-        };
         Ok(PlanAutoRunSelection::Candidate(
             PlanAutoRunCandidateRecord {
                 plan_id,
-                action: action.to_string(),
+                action: "start".to_string(),
             },
         ))
     }
@@ -2513,18 +2515,17 @@ impl WorkspaceDatabase {
 
     /// Plan lifecycle actions. Start / pause / resume invariants:
     ///
-    /// | action | no active execution | active attempt (queued/running) | active agent task (queued/running/waiting) |
-    /// |--------|---------------------|----------------------------------|--------------------------------------------|
-    /// | start  | mark earliest incomplete phase running | InvalidPlan (phase already running) | InvalidPlan (phase already running) |
-    /// | pause  | ready → paused (no phase cancel) | plan → paused; phase/attempt/task unchanged | plan → paused; phase/attempt/task unchanged |
-    /// | resume | start earliest incomplete phase | unpause plan only; keep active_phase_id + identity | unpause plan only; keep active_phase_id + identity |
+    /// | action | no running Phase | running Phase (with or without execution identity) |
+    /// |--------|------------------|----------------------------------------------------|
+    /// | start  | mark earliest incomplete phase running | InvalidPlan (phase already running) |
+    /// | pause  | ready → paused (no phase cancel) | plan → paused; phase/attempt/task unchanged |
+    /// | resume | start earliest incomplete phase | unpause plan only; keep active_phase_id + identity |
     ///
-    /// Pause never cancels the current phase. Resume of an active phase only lifts the
-    /// pause flag — it must not re-enter `start_next_plan_phase`. True conflicts (cancelled
-    /// barrier, completed plan, already-running phase on **start**) still return structured
-    /// `InvalidPlan`. Runtime owns creating chat/team/task/attempt after a successful
-    /// start; Store alone is not a full runner and must not treat a surface-only running
-    /// phase as resumable execution.
+    /// Pause never cancels the current phase. Resume of a running phase only lifts the
+    /// pause flag — it must not re-enter `start_next_plan_phase`. That also preserves the
+    /// short interval after Store marks a phase running and before runtime attaches its
+    /// chat/team/task identity. True conflicts (cancelled barrier, completed plan,
+    /// already-running phase on **start**) still return structured `InvalidPlan`.
     pub fn transition_plan(
         &mut self,
         plan_id: &str,
@@ -4462,9 +4463,9 @@ impl WorkspaceDatabase {
             });
         }
 
-        // Resume of an already-active phase only lifts plan-level pause. Do not re-enter
+        // Resume of an already-running phase only lifts plan-level pause. Do not re-enter
         // start_next_plan_phase, which would treat status=running as a conflict.
-        if self.plan_has_resumable_active_phase(&plan)? {
+        if Self::plan_has_running_active_phase(&plan) {
             if plan.status == "running" {
                 return Ok(plan);
             }
@@ -4497,26 +4498,16 @@ impl WorkspaceDatabase {
         self.start_next_plan_phase(plan_id)
     }
 
-    /// True when the plan still has non-terminal phase execution that resume must keep:
-    /// active_phase_id points at a running phase with a queued/running attempt or a
-    /// queued/running/waiting agent task.
-    fn plan_has_resumable_active_phase(
-        &self,
-        plan: &PlanRecord,
-    ) -> Result<bool, WorkspaceDatabaseError> {
-        let Some(active_phase_id) = plan.active_phase_id.as_deref() else {
-            return Ok(false);
-        };
-        let Some(phase) = plan.phases.iter().find(|phase| phase.id == active_phase_id) else {
-            return Ok(false);
-        };
-        if phase.status != "running" {
-            return Ok(false);
-        }
-        if self.phase_has_active_execution(&phase.id)? {
-            return Ok(true);
-        }
-        self.phase_awaits_execution_lifecycle(phase)
+    /// A paused Plan retains its active Phase while that Phase is still running, even before
+    /// runtime has attached an attempt or Agent task. The runtime uses that identity-free
+    /// interval to perform the initial dispatch after `transition_plan` returns.
+    fn plan_has_running_active_phase(plan: &PlanRecord) -> bool {
+        plan.active_phase_id
+            .as_deref()
+            .and_then(|active_phase_id| {
+                plan.phases.iter().find(|phase| phase.id == active_phase_id)
+            })
+            .is_some_and(|phase| phase.status == "running")
     }
 
     fn start_next_plan_phase(

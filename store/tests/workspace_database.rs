@@ -1412,7 +1412,7 @@ fn create_auto_run_test_plan(database: &mut WorkspaceDatabase, id: &str, status:
 }
 
 #[test]
-fn plan_auto_run_candidate_selects_next_runnable_plan() {
+fn plan_auto_run_paused_plan_is_a_scheduling_gate() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -1420,21 +1420,20 @@ fn plan_auto_run_candidate_selects_next_runnable_plan() {
 
     create_auto_run_test_plan(&mut database, "paused", "paused");
     create_auto_run_test_plan(&mut database, "ready", "ready");
-    create_auto_run_test_plan(&mut database, "failed", "failed");
 
-    let candidate = match database
-        .next_plan_auto_run_candidate()
-        .expect("candidate query")
-    {
-        foco_store::workspace::PlanAutoRunSelection::Candidate(candidate) => candidate,
-        other => panic!("expected candidate, got {other:?}"),
-    };
-    assert_eq!(candidate.plan_id, "paused");
-    assert_eq!(candidate.action, "resume");
+    assert_eq!(
+        database
+            .next_plan_auto_run_candidate()
+            .expect("candidate query"),
+        foco_store::workspace::PlanAutoRunSelection::Paused {
+            plan_id: "paused".to_string(),
+            phase_id: Some("paused-phase".to_string()),
+        }
+    );
 }
 
 #[test]
-fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_candidates() {
+fn plan_auto_run_distinguishes_start_candidates_from_user_paused_plans() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -1466,12 +1465,10 @@ fn plan_auto_run_draft_ready_failed_and_paused_without_cancelled_barrier_are_can
         ),
         (
             "paused",
-            foco_store::workspace::PlanAutoRunSelection::Candidate(
-                foco_store::workspace::PlanAutoRunCandidateRecord {
-                    plan_id: "candidate-3".to_string(),
-                    action: "resume".to_string(),
-                },
-            ),
+            foco_store::workspace::PlanAutoRunSelection::Paused {
+                plan_id: "candidate-3".to_string(),
+                phase_id: Some("candidate-3-phase".to_string()),
+            },
         ),
     ];
     for (index, (status, expected)) in cases.into_iter().enumerate() {
@@ -2143,9 +2140,9 @@ fn resume_after_pause_keeps_queued_attempt_without_agent_task() {
 }
 
 #[test]
-fn resume_after_pause_rejects_surface_running_phase_without_execution_identity() {
-    // A Store-only start is not execution. Resume must preserve the InvalidPlan
-    // boundary rather than silently treating this damaged state as a live phase.
+fn resume_after_pause_preserves_running_phase_before_execution_identity_is_attached() {
+    // Store marks the phase running before runtime attaches chat/team/task identity.
+    // Resume must only lift the plan-level scheduling gate during that interval.
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -2188,16 +2185,27 @@ fn resume_after_pause_rejects_surface_running_phase_without_execution_identity()
     database
         .transition_plan("plan-pause-resume-surface", "pause")
         .expect("pause");
-    let error = database
+    let resumed = database
         .transition_plan("plan-pause-resume-surface", "resume")
-        .expect_err("surface-only running phase is not resumable execution");
-    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+        .expect("resume keeps running phase for runtime dispatch");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-pause-resume-surface-phase-1")
+    );
+    assert!(resumed.pause_requested_at.is_none());
+    assert_eq!(resumed.phases[0].status, "running");
+    assert!(resumed.phases[0].agent_task_id.is_none());
+    assert!(resumed.phases[0].implementation_chat_id.is_none());
+    assert!(resumed.phases[0].agent_team_id.is_none());
+    assert!(resumed.phases[0].attempts.is_empty());
 }
 
 #[test]
-fn store_only_start_is_not_a_resumable_plan_execution() {
+fn store_only_start_preserves_identity_free_running_phase_across_resume() {
     // Store transitions deliberately do not create chat/team/task/attempt identity.
-    // A remote endpoint must therefore never return this state as a successful start.
+    // Runtime attaches that identity after its own dispatch step, so resume must keep
+    // the running phase intact rather than restarting it.
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -2272,10 +2280,20 @@ fn store_only_start_is_not_a_resumable_plan_execution() {
     database
         .transition_plan("plan-store-only-start", "pause")
         .expect("pause surface-only plan");
-    let error = database
+    let resumed = database
         .transition_plan("plan-store-only-start", "resume")
-        .expect_err("surface-only plan cannot resume as execution");
-    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+        .expect("resume keeps the identity-free running phase");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-store-only-start-phase-1")
+    );
+    assert!(resumed.pause_requested_at.is_none());
+    assert_eq!(resumed.phases[0].status, "running");
+    assert!(resumed.phases[0].agent_task_id.is_none());
+    assert!(resumed.phases[0].implementation_chat_id.is_none());
+    assert!(resumed.phases[0].agent_team_id.is_none());
+    assert!(resumed.phases[0].attempts.is_empty());
 }
 
 #[test]
@@ -2326,13 +2344,15 @@ fn plan_start_pause_resume_state_contract_matrix() {
         .expect("pause surface running");
     assert_eq!(paused_idle.status, "paused");
     assert_eq!(paused_idle.phases[0].status, "running");
-    let resume_idle = database
+    let resumed_idle = database
         .transition_plan("plan-contract-idle", "resume")
-        .expect_err("surface-only running phase is InvalidPlan");
-    assert!(matches!(
-        resume_idle,
-        WorkspaceDatabaseError::InvalidPlan { .. }
-    ));
+        .expect("resume keeps the running phase for runtime dispatch");
+    assert_eq!(resumed_idle.status, "running");
+    assert_eq!(resumed_idle.phases[0].status, "running");
+    assert_eq!(
+        resumed_idle.active_phase_id.as_deref(),
+        Some("plan-contract-idle-phase-1")
+    );
 
     // --- Active queued attempt ---
     database
