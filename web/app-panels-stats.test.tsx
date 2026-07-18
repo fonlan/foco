@@ -159,7 +159,7 @@ describe("app-panels-stats verification surfaces", () => {
       },
     };
 
-    return { chatId, title, workspaceId };
+    return { chatId, remoteWorkspace, title, workspaceId };
   }
 
   it("defaults Source Control diff to the active isolated coordinator worktree", async () => {
@@ -474,15 +474,17 @@ describe("app-panels-stats verification surfaces", () => {
     });
   }, 10000);
 
-  it("expands plan phases and opens the implementation chat after start", async () => {
+  it("runs a remote plan from start through pause and resume without losing its implementation chat", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T04:30:00Z";
+    const { chatId: remoteChatId, remoteWorkspace, workspaceId } =
+      configureRemoteSessionStatistics();
     const phaseStep = {
-      acceptance: ["Start queues a team chat."],
+      acceptance: ["Start queues a remote Coordinator chat."],
       checkedAt: null,
       createdAt: timestamp,
       detail:
-        "The workspace chat list shows the created implementation session.",
+        "The remote workspace chat list shows the created implementation session.",
       id: "plan-step-1",
       phaseId: "plan-phase-1",
       planId: "plan-1",
@@ -518,31 +520,39 @@ describe("app-panels-stats verification surfaces", () => {
       errorMessage: null,
       sharedMergeCommitId: null,
       id: "plan-1",
-      overview: "Run the implementation through normal visible chats.",
+      overview: "Run the remote implementation through normal visible chats.",
       pauseRequestedAt: null,
       phases: [pendingPhase],
       sortOrder: 0,
       sourceChatId: "chat-1",
       status: "ready",
-      title: "Build plan runner UI",
+      title: "Build remote plan runner UI",
       updatedAt: timestamp,
     };
-    const runningPlan = {
-      ...readyPlan,
-      activePhaseId: "plan-phase-1",
-      phases: [
-        {
-          ...pendingPhase,
-          agentTaskId: "agent-task-plan-1",
-          agentTeamId: "agent-team-plan-1",
-          implementationChatId: "plan-chat-1",
-          startedAt: timestamp,
-          status: "running",
-        },
-      ],
-      status: "running",
+    let planState: "ready" | "running" | "paused" = "ready";
+    const actionRequests: string[] = [];
+    const currentPlan = () => {
+      if (planState === "ready") {
+        return readyPlan;
+      }
+
+      return {
+        ...readyPlan,
+        activePhaseId: "plan-phase-1",
+        pauseRequestedAt: planState === "paused" ? timestamp : null,
+        phases: [
+          {
+            ...pendingPhase,
+            agentTaskId: "agent-task-plan-1",
+            agentTeamId: "agent-team-plan-1",
+            implementationChatId: "plan-chat-1",
+            startedAt: timestamp,
+            status: "running",
+          },
+        ],
+        status: planState,
+      };
     };
-    let didStartPlan = false;
     const planChat = chatSummary(
       "plan-chat-1",
       "Plan phase implementation",
@@ -553,54 +563,60 @@ describe("app-panels-stats verification surfaces", () => {
         chatId: "plan-chat-1",
         lastSequence: 0,
         runId: "agent-task-plan-1",
-        workspaceId: "workspace-1",
+        workspaceId,
       },
     );
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const url = typeof input === "string" ? input : input.toString();
-        const path = url.startsWith("http://127.0.0.1")
-          ? new URL(url).pathname
-          : url.split("?")[0];
+        const path = new URL(url, "http://127.0.0.1").pathname;
 
         if (path === "/api/workspaces") {
           return jsonResponse({
-            activeWorkspaceId: workspace.id,
+            activeWorkspaceId: workspaceId,
             workspaces: [
+              workspace,
               {
-                ...workspace,
-                chats: didStartPlan
-                  ? [planChat, ...workspace.chats]
-                  : workspace.chats,
+                ...remoteWorkspace,
+                chats:
+                  planState === "ready"
+                    ? remoteWorkspace.chats
+                    : [planChat, ...remoteWorkspace.chats],
               },
-              secondaryWorkspace,
             ],
           });
         }
 
-        if (path === "/api/workspaces/workspace-1/plans") {
-          const plan = didStartPlan ? runningPlan : readyPlan;
+        if (path === `/api/workspaces/${workspaceId}/plans`) {
           return jsonResponse({
             page: 1,
             pageSize: 50,
-            plans: [plan],
+            plans: [currentPlan()],
             totalCount: 1,
             totalPages: 1,
           });
         }
 
-        if (path === "/api/workspaces/workspace-1/plans/plan-1/action") {
-          didStartPlan = true;
-          return jsonResponse({ plan: runningPlan });
+        if (path === `/api/workspaces/${workspaceId}/plans/plan-1/action`) {
+          const request = JSON.parse(String(init?.body ?? "{}")) as {
+            action?: string;
+          };
+          actionRequests.push(request.action ?? "");
+          if (request.action === "start" || request.action === "resume") {
+            planState = "running";
+          } else if (request.action === "pause") {
+            planState = "paused";
+          }
+          return jsonResponse({ plan: currentPlan() });
         }
 
-        if (path === "/api/workspaces/workspace-1/chats/plan-chat-1/messages") {
+        if (path === `/api/workspaces/${workspaceId}/chats/plan-chat-1/messages`) {
           return jsonResponse({
             activeRun: {
               chatId: "plan-chat-1",
               lastSequence: 0,
               runId: "agent-task-plan-1",
-              workspaceId: "workspace-1",
+              workspaceId,
             },
             chat: {
               id: "plan-chat-1",
@@ -633,12 +649,12 @@ describe("app-panels-stats verification surfaces", () => {
       },
     );
     vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    window.history.replaceState(null, "", `/${workspaceId}/${remoteChatId}`);
 
     renderApp();
 
     await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(await screen.findByText("Build plan runner UI")).toBeInTheDocument();
+    expect(await screen.findByText("Build remote plan runner UI")).toBeInTheDocument();
     expect(screen.queryByText("Wire start action")).not.toBeInTheDocument();
 
     const phaseButton = (await screen.findByText("Phase 1")).closest("button");
@@ -648,25 +664,33 @@ describe("app-panels-stats verification surfaces", () => {
     await user.click(phaseButton);
 
     expect(await screen.findByText("Wire start action")).toBeInTheDocument();
-    expect(screen.getByText("Start queues a team chat.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Start queues a remote Coordinator chat."),
+    ).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Start" }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/workspaces/workspace-1/plans/plan-1/action",
-        expect.objectContaining({ method: "POST" }),
+        `/api/workspaces/${workspaceId}/plans/plan-1/action`,
+        expect.objectContaining({
+          body: JSON.stringify({ action: "start" }),
+          method: "POST",
+        }),
       );
     });
-    const workspaceList = await screen.findByRole("navigation", {
-      name: "Workspace list",
-    });
-    expect(
-      await within(workspaceList).findByText("Plan phase implementation"),
-    ).toBeInTheDocument();
     expect(
       await screen.findByText("Plan phase implementation request."),
     ).toBeInTheDocument();
+
+    expect(await screen.findByRole("button", { name: "Pause" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Pause" }));
+    expect(await screen.findByRole("button", { name: "Resume" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Resume" }));
+    expect(await screen.findByRole("button", { name: "Pause" })).toBeInTheDocument();
+    expect(actionRequests).toEqual(["start", "pause", "resume"]);
+    expect(screen.queryByText(/already running/i)).not.toBeInTheDocument();
   });
 
   it("opens an existing implementation chat from a plan phase", async () => {
