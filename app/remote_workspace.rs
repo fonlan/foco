@@ -18003,6 +18003,46 @@ mod tests {
         forward_rx
     }
 
+    fn seed_remote_queued_chat(
+        database: &mut WorkspaceDatabase,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+    ) {
+        database
+            .insert_chat_with_metadata(chat_id, "Remote chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: user_message_id,
+                chat_id,
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": user_message_id,
+                            "assistantMessageId": assistant_message_id,
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: assistant_message_id,
+                chat_id,
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("insert assistant placeholder");
+    }
+
     #[tokio::test]
     async fn remote_sidecar_chat_statistics_reuses_local_aggregation_and_brokered_global_memory() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -23511,30 +23551,11 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
-        database
-            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
-            .expect("insert chat");
-        database
-            .insert_message(NewMessage {
-                id: "msg-user-1",
-                chat_id: "chat-1",
-                role: "user",
-                content: "hello",
-                sequence: 0,
-                metadata_json: Some(
-                    &json!({
-                        "queuedRun": {
-                            "status": "queued",
-                            "userMessageId": "msg-user-1",
-                            "assistantMessageId": "msg-assistant-1",
-                        }
-                    })
-                    .to_string(),
-                ),
-            })
-            .expect("insert user message");
-        let (state, _broker_rx) =
-            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        seed_remote_queued_chat(&mut database, "chat-1", "msg-user-1", "msg-assistant-1");
+        drop(database);
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let _broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
         let response = remote_sidecar_chat_stream(
             State(state.clone()),
             Json(json!({
@@ -23591,7 +23612,7 @@ mod tests {
         // Shared reconnect path must accept the still-active run id.
         let reconnect = remote_sidecar_chat_run_stream(
             State(state.clone()),
-            AxumPath(run_id),
+            AxumPath(run_id.clone()),
             Query(HashMap::from([(
                 "afterSequence".to_string(),
                 "-1".to_string(),
@@ -23601,6 +23622,139 @@ mod tests {
         .expect("reconnect stream");
         drop(reconnect);
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 1);
+        remote_sidecar_cancel_active_run(&state, &run_id, false, true);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_concurrent_start_reuses_one_stream_and_broker_turn() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        seed_remote_queued_chat(
+            &mut database,
+            "chat-concurrent-start",
+            "user-concurrent-start",
+            "assistant-concurrent-start",
+        );
+        drop(database);
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        let payload = json!({
+            "chatId": "chat-concurrent-start",
+            "queuedUserMessageId": "user-concurrent-start",
+            "visibleAssistantMessageId": "assistant-concurrent-start",
+            "modelId": "model-1",
+            "providerId": "provider-1",
+        });
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let first_barrier = Arc::clone(&barrier);
+        let second_barrier = Arc::clone(&barrier);
+        let first_state = state.clone();
+        let second_state = state.clone();
+        let first_payload = payload.clone();
+        let second_payload = payload.clone();
+        let (first, second) = tokio::join!(
+            async move {
+                first_barrier.wait().await;
+                remote_sidecar_start_chat_run(first_state, first_payload).await
+            },
+            async move {
+                second_barrier.wait().await;
+                remote_sidecar_start_chat_run(second_state, second_payload).await
+            }
+        );
+        let first = first.expect("first start");
+        let second = second.expect("second start");
+        assert!(
+            Arc::ptr_eq(&first.events, &second.events),
+            "duplicate start must subscribe to the original active stream"
+        );
+
+        let active_runs = state.active_runs.lock().expect("active runs").clone();
+        assert_eq!(active_runs.len(), 1, "only one runner may be active");
+        let run_id = active_runs[0].run_id.clone();
+        let request = timeout(Duration::from_secs(2), async {
+            loop {
+                let envelope = broker_rx.recv().await.expect("broker envelope");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("one broker LLM request");
+        assert_eq!(request.payload["runId"], run_id);
+        let ordinary_one = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("first ordinary while broker waits");
+        let ordinary_two = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("second ordinary while broker waits");
+        let critical = WorkspaceDatabase::open_or_create_critical(workspace.path())
+            .expect("critical reservation remains available while broker waits");
+        drop(critical);
+        drop(ordinary_two);
+        drop(ordinary_one);
+        assert!(
+            timeout(Duration::from_millis(100), async {
+                loop {
+                    let envelope = broker_rx.recv().await.expect("broker envelope");
+                    if envelope.message_type == "request"
+                        && envelope.method.as_deref() == Some("llm.stream")
+                    {
+                        return envelope;
+                    }
+                }
+            })
+            .await
+            .is_err(),
+            "duplicate start must not spawn a second broker LLM request"
+        );
+
+        remote_sidecar_cancel_active_run(&state, &run_id, false, true);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_http_start_subscribes_to_plan_reservation_without_reclaim() {
+        let (state, _broker_rx) = test_sidecar_state("/tmp/remote-plan".to_string(), 0);
+        let plan_task_id = AgentTaskId::new("agent-task-plan-reservation").expect("plan task id");
+        let reservation = remote_sidecar_reserve_active_run(
+            &state,
+            "chat-plan-reservation".to_string(),
+            "user-plan-reservation".to_string(),
+            "assistant-plan-reservation".to_string(),
+            Some(plan_task_id),
+        )
+        .expect("plan reservation");
+        let (run_id, plan_stream) = match reservation {
+            RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
+            RemoteRunReservation::Existing { .. } => panic!("first Plan reservation must start"),
+        };
+
+        let http_stream = remote_sidecar_start_chat_run(
+            state.clone(),
+            json!({
+                "chatId": "chat-plan-reservation",
+                "queuedUserMessageId": "user-plan-reservation",
+            }),
+        )
+        .await
+        .expect("HTTP start must subscribe to active Plan run");
+        assert!(
+            Arc::ptr_eq(&plan_stream.events, &http_stream.events),
+            "HTTP start must return the Plan-owned stream without creating another run"
+        );
+        assert_eq!(
+            state
+                .active_run_streams
+                .lock()
+                .expect("active stream registry")
+                .by_run_id
+                .len(),
+            1
+        );
+        remote_sidecar_finish_active_run(&state, &run_id);
     }
 
     async fn wait_until(timeout_duration: Duration, mut condition: impl FnMut() -> bool) -> bool {

@@ -36,7 +36,8 @@ use foco_store::{
         NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
         PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
         PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
-        RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
+        RegisterAgentTaskWaitDependencies, RemoteQueuedRunClaimOutcome,
+        RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
         ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
         TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
         WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
@@ -553,6 +554,199 @@ fn concurrent_mark_and_clear_queued_run_preserve_chat_message_identity() {
             "chat and message queuedRun identity must stay aligned when present"
         );
     }
+}
+
+#[test]
+fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-remote-claim", "Remote claim")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-remote-claim",
+            chat_id: "chat-remote-claim",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                &json!({
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "user-remote-claim",
+                        "assistantMessageId": "assistant-remote-claim",
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .expect("user insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-remote-claim",
+            chat_id: "chat-remote-claim",
+            role: "assistant",
+            content: "",
+            sequence: 1,
+            metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+        })
+        .expect("assistant insert");
+
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-claim",
+                "user-remote-claim",
+                "assistant-remote-claim",
+                "remote-run-owner",
+            )
+            .expect("first claim"),
+        RemoteQueuedRunClaimOutcome::Claimed
+    );
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-claim",
+                "user-remote-claim",
+                "assistant-remote-claim",
+                "remote-run-owner",
+            )
+            .expect("owner replay"),
+        RemoteQueuedRunClaimOutcome::AlreadyOwned
+    );
+    let error = database
+        .claim_remote_queued_run(
+            "chat-remote-claim",
+            "user-remote-claim",
+            "assistant-remote-claim",
+            "remote-run-other",
+        )
+        .expect_err("another run must not claim the durable identity");
+    assert!(
+        error.to_string().contains("already owned by another run"),
+        "unexpected claim error: {error}"
+    );
+    assert_eq!(
+        database
+            .clear_remote_queued_run_if_owned(
+                "chat-remote-claim",
+                "user-remote-claim",
+                "assistant-remote-claim",
+                "remote-run-other",
+            )
+            .expect("late other-owner clear"),
+        RemoteQueuedRunClearOutcome::NotOwned
+    );
+    assert_eq!(
+        database
+            .clear_remote_queued_run_if_owned(
+                "chat-remote-claim",
+                "user-remote-claim",
+                "assistant-remote-claim",
+                "remote-run-owner",
+            )
+            .expect("owner clear"),
+        RemoteQueuedRunClearOutcome::Cleared
+    );
+}
+
+#[test]
+fn concurrent_remote_queued_run_claims_choose_one_owner() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-remote-claim-race", "Remote claim race")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-remote-claim-race",
+            chat_id: "chat-remote-claim-race",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                &json!({
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "user-remote-claim-race",
+                        "assistantMessageId": "assistant-remote-claim-race",
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .expect("user insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-remote-claim-race",
+            chat_id: "chat-remote-claim-race",
+            role: "assistant",
+            content: "",
+            sequence: 1,
+            metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+        })
+        .expect("assistant insert");
+    drop(database);
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let barrier = Arc::new(Barrier::new(2));
+    let (result_tx, result_rx) = mpsc::channel();
+    let threads = ["remote-run-a", "remote-run-b"]
+        .into_iter()
+        .map(|run_id| {
+            let workspace_path = Arc::clone(&workspace_path);
+            let barrier = Arc::clone(&barrier);
+            let result_tx = result_tx.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                let mut database =
+                    WorkspaceDatabase::open_or_create_ungated(workspace_path.as_path())
+                        .expect("workspace database");
+                let outcome = database.claim_remote_queued_run(
+                    "chat-remote-claim-race",
+                    "user-remote-claim-race",
+                    "assistant-remote-claim-race",
+                    run_id,
+                );
+                result_tx
+                    .send((run_id, outcome))
+                    .expect("send claim outcome");
+            })
+        })
+        .collect::<Vec<_>>();
+    drop(result_tx);
+    for thread in threads {
+        thread.join().expect("claim thread");
+    }
+
+    let outcomes = result_rx.into_iter().collect::<Vec<_>>();
+    assert_eq!(
+        outcomes.iter().filter(|(_, result)| result.is_ok()).count(),
+        1,
+        "exactly one concurrent owner must claim the queuedRun: {outcomes:?}"
+    );
+    let (owner_run_id, claim_outcome) = outcomes
+        .iter()
+        .find_map(|(run_id, result)| result.as_ref().ok().map(|outcome| (*run_id, *outcome)))
+        .expect("winning claim");
+    assert_eq!(claim_outcome, RemoteQueuedRunClaimOutcome::Claimed);
+
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-claim-race",
+                "user-remote-claim-race",
+                "assistant-remote-claim-race",
+                owner_run_id,
+            )
+            .expect("winner replay"),
+        RemoteQueuedRunClaimOutcome::AlreadyOwned
+    );
 }
 
 #[test]
