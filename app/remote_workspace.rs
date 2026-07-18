@@ -398,7 +398,6 @@ impl RemoteSidecarRuntimeToolState {
         messages: &mut Vec<NeutralChatMessage>,
         state: &RemoteSidecarState,
         run_stream: &RemoteActiveRunStream,
-        database: &mut WorkspaceDatabase,
         workspace_id: &str,
         chat_id: &str,
         run_id: &str,
@@ -419,7 +418,6 @@ impl RemoteSidecarRuntimeToolState {
                 messages,
                 state,
                 run_stream,
-                database,
                 workspace_id,
                 chat_id,
                 run_id,
@@ -447,7 +445,6 @@ impl RemoteSidecarRuntimeToolState {
         messages: &mut Vec<NeutralChatMessage>,
         state: &RemoteSidecarState,
         run_stream: &RemoteActiveRunStream,
-        database: &mut WorkspaceDatabase,
         workspace_id: &str,
         chat_id: &str,
         run_id: &str,
@@ -490,7 +487,6 @@ impl RemoteSidecarRuntimeToolState {
                     total_used_context_tokens,
                     state,
                     run_stream,
-                    database,
                     workspace_id,
                     chat_id,
                     run_id,
@@ -536,7 +532,6 @@ impl RemoteSidecarRuntimeToolState {
                         total_used_context_tokens,
                         state,
                         run_stream,
-                        database,
                         workspace_id,
                         chat_id,
                         run_id,
@@ -611,7 +606,6 @@ impl RemoteSidecarRuntimeToolState {
         local_total_used_tokens: u64,
         state: &RemoteSidecarState,
         run_stream: &RemoteActiveRunStream,
-        database: &mut WorkspaceDatabase,
         workspace_id: &str,
         chat_id: &str,
         run_id: &str,
@@ -662,7 +656,6 @@ impl RemoteSidecarRuntimeToolState {
             match remote_sidecar_run_broker_context_compression_summary(
                 state,
                 Some(run_stream),
-                database,
                 workspace_id,
                 chat_id,
                 run_id,
@@ -791,7 +784,11 @@ impl RemoteSidecarRuntimeToolState {
                 return Err(error);
             }
         };
-        if let Err(error) = insert_context_compression_snapshot_record(database, &prepared) {
+        if let Err(error) = (|| {
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            insert_context_compression_snapshot_record(&mut database, &prepared)
+        })() {
             events.truncate(compression_start_event_index);
             return Err(error);
         }
@@ -7346,6 +7343,16 @@ fn sidecar_workspace_database(
         .map_err(|e| ApiError::from_workspace_error(e).into_response())
 }
 
+/// Open the ordinary workspace gate only for one synchronous persistence section.
+/// Callers must pass data snapshots rather than a handle into async broker, tool, or Git work.
+fn with_sidecar_workspace_database<T>(
+    state: &RemoteSidecarState,
+    operation: impl FnOnce(&mut WorkspaceDatabase) -> Result<T, WorkspaceDatabaseError>,
+) -> Result<T, WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))?;
+    operation(&mut database)
+}
+
 fn remote_chat_parts(content: &str, reasoning: Option<&str>) -> Vec<Value> {
     let mut parts = Vec::new();
     if let Some(reasoning) = reasoning.filter(|value| !value.is_empty()) {
@@ -9319,6 +9326,37 @@ fn persist_sidecar_llm_audit(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn persist_sidecar_llm_audit_for_state(
+    state: &RemoteSidecarState,
+    workspace_id: &str,
+    chat_id: &str,
+    request_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    run_metrics: &RemoteSidecarRunMetrics,
+    completed_at: &str,
+    total_latency_ms: i64,
+    final_state: &str,
+    response_body: Value,
+) -> Result<(), WorkspaceDatabaseError> {
+    with_sidecar_workspace_database(state, |database| {
+        persist_sidecar_llm_audit(
+            database,
+            workspace_id,
+            chat_id,
+            request_id,
+            provider_id,
+            model_id,
+            run_metrics,
+            completed_at,
+            total_latency_ms,
+            final_state,
+            response_body,
+        )
+    })
+}
+
 /// Sidecar mirror audit for a single LLM request.
 /// Statistics use structured columns only; response detail stays NULL.
 /// Real provider wire lives on the main-process audit mirror (`provider_*_v1`).
@@ -9384,6 +9422,39 @@ fn persist_sidecar_llm_audit_for_kind(
         )?;
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_sidecar_llm_audit_for_kind_for_state(
+    state: &RemoteSidecarState,
+    workspace_id: &str,
+    chat_id: &str,
+    request_id: &str,
+    request_kind: &str,
+    provider_id: &str,
+    model_id: &str,
+    run_metrics: &RemoteSidecarRunMetrics,
+    completed_at: &str,
+    total_latency_ms: i64,
+    final_state: &str,
+    response_body: Value,
+) -> Result<(), WorkspaceDatabaseError> {
+    with_sidecar_workspace_database(state, |database| {
+        persist_sidecar_llm_audit_for_kind(
+            database,
+            workspace_id,
+            chat_id,
+            request_id,
+            request_kind,
+            provider_id,
+            model_id,
+            run_metrics,
+            completed_at,
+            total_latency_ms,
+            final_state,
+            response_body,
+        )
+    })
 }
 
 fn neutral_role_for_message(role: &str) -> NeutralChatRole {
@@ -11616,7 +11687,6 @@ async fn remote_sidecar_run_broker_llm_turn(
     queued_user_message_id: &str,
     provider_id: &str,
     model_id: &str,
-    database: &mut WorkspaceDatabase,
     text: &mut String,
     reasoning: &mut String,
     run_metrics: &mut RemoteSidecarRunMetrics,
@@ -11674,8 +11744,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = turn_metrics.total_latency_ms();
                 state.broker_pending.lock().await.remove(broker_request_id);
-                let _ = persist_sidecar_llm_audit(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_state(
+                    state,
                     &state.workspace_id,
                     chat_id,
                     broker_request_id,
@@ -11710,8 +11780,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                 let total_latency_ms = turn_metrics.total_latency_ms();
                 remote_sidecar_cancel_broker_request_id(state, broker_request_id);
                 state.broker_pending.lock().await.remove(broker_request_id);
-                let _ = persist_sidecar_llm_audit(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_state(
+                    state,
                     &state.workspace_id,
                     chat_id,
                     broker_request_id,
@@ -11795,8 +11865,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                         state.broker_pending.lock().await.remove(broker_request_id);
                         let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                         let turn_total_latency_ms = turn_metrics.total_latency_ms();
-                        let _ = persist_sidecar_llm_audit(
-                            database,
+                        let _ = persist_sidecar_llm_audit_for_state(
+                            state,
                             &state.workspace_id,
                             chat_id,
                             broker_request_id,
@@ -11914,16 +11984,17 @@ async fn remote_sidecar_run_broker_llm_turn(
                 };
                 if !tool_calls.is_empty() {
                     // Tool-follow-up path: only continue if this runner still owns the turn.
-                    if run_stream.is_cancel_requested()
-                        || run_stream.is_finished()
-                        || !remote_sidecar_runner_still_owns_turn(
+                    let owns_turn = with_sidecar_workspace_database(state, |database| {
+                        Ok(remote_sidecar_runner_still_owns_turn(
                             database,
                             chat_id,
                             assistant_message_id,
                             queued_user_message_id,
                             run_id,
-                        )
-                    {
+                        ))
+                    })
+                    .unwrap_or(false);
+                    if run_stream.is_cancel_requested() || run_stream.is_finished() || !owns_turn {
                         state.broker_pending.lock().await.remove(broker_request_id);
                         return Err(());
                     }
@@ -11931,8 +12002,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     turn_metrics.capture_first_output();
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     let total_latency_ms = turn_metrics.total_latency_ms();
-                    let _ = persist_sidecar_llm_audit(
-                        database,
+                    let _ = persist_sidecar_llm_audit_for_state(
+                        state,
                         &state.workspace_id,
                         chat_id,
                         broker_request_id,
@@ -11989,15 +12060,17 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "metrics": metrics,
                 });
                 let metadata_json = metadata.to_string();
-                match remote_sidecar_persist_owned_assistant_message(
-                    database,
-                    chat_id,
-                    assistant_message_id,
-                    queued_user_message_id,
-                    run_id,
-                    text,
-                    &metadata_json,
-                ) {
+                match with_sidecar_workspace_database(state, |database| {
+                    remote_sidecar_persist_owned_assistant_message(
+                        database,
+                        chat_id,
+                        assistant_message_id,
+                        queued_user_message_id,
+                        run_id,
+                        text,
+                        &metadata_json,
+                    )
+                }) {
                     Ok(true) => {}
                     Ok(false) => {
                         state.broker_pending.lock().await.remove(broker_request_id);
@@ -12015,20 +12088,23 @@ async fn remote_sidecar_run_broker_llm_turn(
                     }
                 }
                 // Clear only when ownership still holds after the write race window.
-                if remote_sidecar_runner_still_owns_turn(
-                    database,
-                    chat_id,
-                    assistant_message_id,
-                    queued_user_message_id,
-                    run_id,
-                ) {
-                    let _ = database.clear_remote_queued_run_if_owned(
+                let _ = with_sidecar_workspace_database(state, |database| {
+                    if remote_sidecar_runner_still_owns_turn(
+                        database,
                         chat_id,
-                        queued_user_message_id,
                         assistant_message_id,
+                        queued_user_message_id,
                         run_id,
-                    );
-                }
+                    ) {
+                        database.clear_remote_queued_run_if_owned(
+                            chat_id,
+                            queued_user_message_id,
+                            assistant_message_id,
+                            run_id,
+                        )?;
+                    }
+                    Ok(())
+                });
                 let completion_payload = remote_chat_completion_event(
                     chat_id,
                     assistant_message_id,
@@ -12038,8 +12114,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     metrics.clone(),
                 );
                 let turn_total_latency_ms = turn_metrics.total_latency_ms();
-                let _ = persist_sidecar_llm_audit(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_state(
+                    state,
                     &state.workspace_id,
                     chat_id,
                     broker_request_id,
@@ -12051,13 +12127,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "succeeded",
                     completion_payload.clone(),
                 );
-                let _ = database.insert_run_event(NewRunEvent {
-                    id: &unique_id("run-event"),
-                    chat_id,
-                    run_id,
-                    sequence: *sequence,
-                    event_type: "completion",
-                    payload_json: &completion_payload.to_string(),
+                let _ = with_sidecar_workspace_database(state, |database| {
+                    database.insert_run_event(NewRunEvent {
+                        id: &unique_id("run-event"),
+                        chat_id,
+                        run_id,
+                        sequence: *sequence,
+                        event_type: "completion",
+                        payload_json: &completion_payload.to_string(),
+                    })
                 });
                 *sequence += 1;
                 run_stream.record(*sequence, completion_payload);
@@ -12086,8 +12164,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     remote_sidecar_broker_error_audit_outcome(&envelope.payload, message);
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = turn_metrics.total_latency_ms();
-                let _ = persist_sidecar_llm_audit(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_state(
+                    state,
                     &state.workspace_id,
                     chat_id,
                     broker_request_id,
@@ -12516,7 +12594,6 @@ fn remote_sidecar_context_compression_sse_event(
 async fn remote_sidecar_run_broker_context_compression_summary(
     state: &RemoteSidecarState,
     run_stream: Option<&RemoteActiveRunStream>,
-    database: &mut WorkspaceDatabase,
     workspace_id: &str,
     chat_id: &str,
     run_id: &str,
@@ -12602,7 +12679,6 @@ async fn remote_sidecar_run_broker_context_compression_summary(
             return remote_sidecar_run_broker_context_compression_summary_once(
                 state,
                 run_stream,
-                database,
                 workspace_id,
                 chat_id,
                 run_id,
@@ -12643,7 +12719,6 @@ async fn remote_sidecar_run_broker_context_compression_summary(
             match remote_sidecar_run_broker_context_compression_summary_once(
                 state,
                 run_stream,
-                database,
                 workspace_id,
                 chat_id,
                 run_id,
@@ -12682,7 +12757,6 @@ async fn remote_sidecar_run_broker_context_compression_summary(
             return remote_sidecar_run_broker_context_compression_summary_once(
                 state,
                 run_stream,
-                database,
                 workspace_id,
                 chat_id,
                 run_id,
@@ -12712,7 +12786,6 @@ async fn remote_sidecar_run_broker_context_compression_summary(
 async fn remote_sidecar_run_broker_context_compression_summary_once(
     state: &RemoteSidecarState,
     run_stream: Option<&RemoteActiveRunStream>,
-    database: &mut WorkspaceDatabase,
     workspace_id: &str,
     chat_id: &str,
     run_id: &str,
@@ -12772,8 +12845,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         if run_stream.is_some_and(|stream| stream.is_finished()) {
             let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
             let total_latency_ms = compression_metrics.total_latency_ms();
-            let _ = persist_sidecar_llm_audit_for_kind(
-                database,
+            let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                state,
                 workspace_id,
                 chat_id,
                 &broker_request_id,
@@ -12803,8 +12876,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     "context compression summary failed: remote broker closed before completion";
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
-                let _ = persist_sidecar_llm_audit_for_kind(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                    state,
                     workspace_id,
                     chat_id,
                     &broker_request_id,
@@ -12831,8 +12904,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                 );
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
-                let _ = persist_sidecar_llm_audit_for_kind(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                    state,
                     workspace_id,
                     chat_id,
                     &broker_request_id,
@@ -12922,8 +12995,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     let message = "context compression summary called unsupported tool".to_string();
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     let total_latency_ms = compression_metrics.total_latency_ms();
-                    let _ = persist_sidecar_llm_audit_for_kind(
-                        database,
+                    let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                        state,
                         workspace_id,
                         chat_id,
                         &audit_request_id,
@@ -12946,8 +13019,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     let message = "context compression summary returned empty text".to_string();
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     let total_latency_ms = compression_metrics.total_latency_ms();
-                    let _ = persist_sidecar_llm_audit_for_kind(
-                        database,
+                    let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                        state,
                         workspace_id,
                         chat_id,
                         &audit_request_id,
@@ -12967,8 +13040,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                 }
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
-                let _ = persist_sidecar_llm_audit_for_kind(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                    state,
                     workspace_id,
                     chat_id,
                     &audit_request_id,
@@ -13010,8 +13083,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
                 if cancelled {
-                    let _ = persist_sidecar_llm_audit_for_kind(
-                        database,
+                    let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                        state,
                         workspace_id,
                         chat_id,
                         &broker_request_id,
@@ -13031,8 +13104,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     return RemoteSidecarContextCompressionOutcome::Cancelled;
                 }
                 let message = format!("context compression summary failed: {message}");
-                let _ = persist_sidecar_llm_audit_for_kind(
-                    database,
+                let _ = persist_sidecar_llm_audit_for_kind_for_state(
+                    state,
                     workspace_id,
                     chat_id,
                     &broker_request_id,
@@ -13406,42 +13479,11 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         queued_user_message_id.clone(),
         assistant_message_id.clone(),
     );
-    // Open the run-owned connection after spawn so the HTTP response body never holds DB permits.
-    let mut database =
-        match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
-            Ok(database) => database,
-            Err(error) => {
-                remote_sidecar_record_run_event(
-                    &run_stream,
-                    0,
-                    json!({
-                        "type": "error",
-                        "message": error.to_string(),
-                    }),
-                );
-                remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
-                if let Some(plan_task) = plan_task.as_ref()
-                    && let Err(plan_error) = remote_sidecar_fail_plan_task(
-                        &stream_state,
-                        &plan_task.task_id,
-                        "remote Plan Coordinator could not open its workspace database",
-                    )
-                {
-                    tracing::error!(
-                        task_id = %plan_task.task_id,
-                        error = %plan_error.message,
-                        "failed to close remote Plan task after workspace database open failure"
-                    );
-                }
-                remote_sidecar_finish_active_run(&stream_state, &run_id);
-                // Leave armed so Drop clears queuedRun after this early exit path.
-                drop(cleanup_guard);
-                return;
-            }
-        };
-    if let Err(error) =
-        remote_mark_message_queued_run_started(&mut database, &queued_user_message_id)
-    {
+    // Claim the durable queuedRun in one synchronous section; the permit is released
+    // before this background runner enters broker, hook, tool, or Git work.
+    if let Err(error) = with_sidecar_workspace_database(&stream_state, |database| {
+        remote_mark_message_queued_run_started(database, &queued_user_message_id)
+    }) {
         remote_sidecar_record_run_event(
             &run_stream,
             0,
@@ -13451,8 +13493,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             }),
         );
         remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
-        // Do not open a second ordinary workspace connection while this run owns one.
-        drop(database);
         if let Some(plan_task) = plan_task.as_ref()
             && let Err(plan_error) = remote_sidecar_fail_plan_task(
                 &stream_state,
@@ -13511,12 +13551,14 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     'run: loop {
         // Explicit cancel / edit-delete invalidation: stop before the next turn.
         if run_stream.is_cancel_requested() || run_stream.is_finished() {
-            let _ = database.clear_remote_queued_run_if_owned(
-                &chat_id,
-                &queued_user_message_id,
-                &assistant_message_id,
-                &run_id,
-            );
+            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                database.clear_remote_queued_run_if_owned(
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &run_id,
+                )
+            });
             remote_sidecar_finish_active_run(&stream_state, &run_id);
             cleanup_guard.disarm();
             break;
@@ -13524,21 +13566,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         // Before every brokered chat completion request (first turn and tool follow-ups):
         // runtime tool-state (gated by switch; force cannot bypass OFF), then 95%/overflow LLM, then pack.
         // Live-yield ContextCompression (start before broker summary) while ensure runs.
-        // ensure holds `&mut database` for snapshot writes; open a separate connection so
-        // start/completed run_events can persist before the client sees each SSE event.
-        let mut live_compression_db =
-            match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state)) {
-                Ok(db) => Some(db),
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        chat_id = %chat_id,
-                        run_id = %run_id,
-                        "failed to open workspace database for live context compression run_events"
-                    );
-                    None
-                }
-            };
         let compression_result = {
             let (compression_event_tx, mut compression_event_rx) =
                 mpsc::unbounded_channel::<RemoteSidecarContextCompressionEventDetail>();
@@ -13547,7 +13574,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     &mut current_request.messages,
                     &stream_state,
                     &run_stream,
-                    &mut database,
                     &stream_state.workspace_id,
                     &chat_id,
                     &run_id,
@@ -13567,9 +13593,11 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                                 &assistant_message_id,
                                 &detail,
                             );
-                            if let Some(db) = live_compression_db.as_mut() {
+                            if let Ok(mut database) =
+                                WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state))
+                            {
                                 remote_sidecar_persist_context_compression_run_event(
-                                    db,
+                                    &mut database,
                                     &chat_id,
                                     &run_id,
                                     sequence,
@@ -13595,9 +13623,11 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             &assistant_message_id,
                             &detail,
                         );
-                        if let Some(db) = live_compression_db.as_mut() {
+                        if let Ok(mut database) =
+                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(&stream_state))
+                        {
                             remote_sidecar_persist_context_compression_run_event(
-                                db,
+                                &mut database,
                                 &chat_id,
                                 &run_id,
                                 sequence,
@@ -13615,7 +13645,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 }
             }
         };
-        drop(live_compression_db);
         for notification in run_stream.take_hook_notifications() {
             sequence += 1;
             remote_sidecar_record_run_event(
@@ -13647,13 +13676,15 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         "partsSource": "live_sse",
                         "streamingState": "failed",
                     });
-                    let _ = database.update_existing_message_content(
-                        &assistant_message_id,
-                        &chat_id,
-                        "assistant",
-                        "",
-                        &metadata.to_string(),
-                    );
+                    let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                        database.update_existing_message_content(
+                            &assistant_message_id,
+                            &chat_id,
+                            "assistant",
+                            "",
+                            &metadata.to_string(),
+                        )
+                    });
                 }
                 sequence += 1;
                 remote_sidecar_record_run_event(
@@ -13677,12 +13708,14 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         };
         // Live path already yielded compression events; do not re-emit.
         if run_stream.is_cancel_requested() || run_stream.is_finished() {
-            let _ = database.clear_remote_queued_run_if_owned(
-                &chat_id,
-                &queued_user_message_id,
-                &assistant_message_id,
-                &run_id,
-            );
+            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                database.clear_remote_queued_run_if_owned(
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &run_id,
+                )
+            });
             remote_sidecar_finish_active_run(&stream_state, &run_id);
             cleanup_guard.disarm();
             break;
@@ -13714,7 +13747,6 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             &queued_user_message_id,
             &provider_id,
             &model_id,
-            &mut database,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -13806,13 +13838,26 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         ),
                         Err(error) => (false, error.message),
                     };
-                    for event in remote_sidecar_close_unexecuted_tool_calls(
-                        &mut database,
-                        &assistant_message_id,
-                        &tool_calls,
-                        &tool_catalog.allowed_names,
-                        &message,
-                    ) {
+                    let skipped_events =
+                        with_sidecar_workspace_database(&stream_state, |database| {
+                            Ok(remote_sidecar_close_unexecuted_tool_calls(
+                                database,
+                                &assistant_message_id,
+                                &tool_calls,
+                                &tool_catalog.allowed_names,
+                                &message,
+                            ))
+                        })
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                chat_id,
+                                run_id,
+                                error = %error,
+                                "failed to persist remote skipped tool calls"
+                            );
+                            Vec::new()
+                        });
+                    for event in skipped_events {
                         sequence += 1;
                         remote_sidecar_record_run_event(&run_stream, sequence, event);
                         last_yielded_sequence = sequence;
@@ -13859,14 +13904,26 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
 
                 let mut batch_hook_additional_context = Vec::new();
                 let followup_sse_events = if let Some(rejections) = rejections {
-                    let (events, messages) = remote_sidecar_reject_tool_batch(
-                        &mut database,
-                        &chat_id,
-                        &run_id,
-                        &assistant_message_id,
-                        &tool_calls,
-                        &rejections,
-                    );
+                    let (events, messages) =
+                        with_sidecar_workspace_database(&stream_state, |database| {
+                            Ok(remote_sidecar_reject_tool_batch(
+                                database,
+                                &chat_id,
+                                &run_id,
+                                &assistant_message_id,
+                                &tool_calls,
+                                &rejections,
+                            ))
+                        })
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(
+                                chat_id,
+                                run_id,
+                                error = %error,
+                                "failed to persist rejected remote tool batch"
+                            );
+                            (Vec::new(), Vec::new())
+                        });
                     batch_messages.extend(messages);
                     events
                 } else {
@@ -13876,14 +13933,16 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         .filter(|tool_call| allowed_tools.contains(tool_call.name.as_str()))
                         .cloned()
                         .collect::<Vec<_>>();
-                    let _ = remote_sidecar_record_pending_tool_calls(
-                        &mut database,
-                        &chat_id,
-                        &run_id,
-                        &assistant_message_id,
-                        &runnable_tool_calls,
-                        allowed_tools,
-                    );
+                    let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                        remote_sidecar_record_pending_tool_calls(
+                            database,
+                            &chat_id,
+                            &run_id,
+                            &assistant_message_id,
+                            &runnable_tool_calls,
+                            allowed_tools,
+                        )
+                    });
                     let mut events = remote_sidecar_capture_pending_tool_calls(
                         &assistant_message_id,
                         &runnable_tool_calls,
@@ -13901,14 +13960,16 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             let started_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                             let completed_at =
                                 Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-                            let _ = remote_sidecar_record_tool_result(
-                                &mut database,
-                                tool_call,
-                                &output,
-                                is_error,
-                                &started_at,
-                                &completed_at,
-                            );
+                            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                                remote_sidecar_record_tool_result(
+                                    database,
+                                    tool_call,
+                                    &output,
+                                    is_error,
+                                    &started_at,
+                                    &completed_at,
+                                )
+                            });
                             events.push(json!({
                                 "type": "toolResult",
                                 "assistantMessageId": assistant_message_id,
@@ -13985,27 +14046,32 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         let output = execution.output;
                         let is_error = execution.is_error;
                         if run_stream.is_cancel_requested() || run_stream.is_finished() {
-                            remote_sidecar_close_cancelled_tool_batch(
-                                &mut database,
-                                &assistant_message_id,
+                            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                                remote_sidecar_close_cancelled_tool_batch(
+                                    database,
+                                    &assistant_message_id,
+                                    tool_call,
+                                    &output,
+                                    is_error,
+                                    &started_at,
+                                    &completed_at,
+                                    &tool_calls[tool_call_index + 1..],
+                                    allowed_tools,
+                                );
+                                Ok(())
+                            });
+                            break 'run;
+                        }
+                        let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                            remote_sidecar_record_tool_result(
+                                database,
                                 tool_call,
                                 &output,
                                 is_error,
                                 &started_at,
                                 &completed_at,
-                                &tool_calls[tool_call_index + 1..],
-                                allowed_tools,
-                            );
-                            break 'run;
-                        }
-                        let _ = remote_sidecar_record_tool_result(
-                            &mut database,
-                            tool_call,
-                            &output,
-                            is_error,
-                            &started_at,
-                            &completed_at,
-                        );
+                            )
+                        });
                         events.append(&mut extra_events);
                         batch_hook_additional_context.extend(additional_context);
                         events.push(json!({
@@ -14126,13 +14192,15 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         "interruptedAssistantMetrics": interrupted_metrics,
                     });
                     sequence += 1;
-                    let _ = database.insert_run_event(NewRunEvent {
-                        id: &unique_id("run-event"),
-                        chat_id: &chat_id,
-                        run_id: &run_id,
-                        sequence,
-                        event_type: "guidance_applied",
-                        payload_json: &guidance_payload.to_string(),
+                    let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                        database.insert_run_event(NewRunEvent {
+                            id: &unique_id("run-event"),
+                            chat_id: &chat_id,
+                            run_id: &run_id,
+                            sequence,
+                            event_type: "guidance_applied",
+                            payload_json: &guidance_payload.to_string(),
+                        })
                     });
                     remote_sidecar_record_run_event(&run_stream, sequence, guidance_payload);
                     last_yielded_sequence = sequence;
@@ -14161,15 +14229,18 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     "metrics": metrics,
                 });
                 let metadata_json = metadata.to_string();
-                if let Err(error) = remote_sidecar_persist_owned_assistant_message(
-                    &mut database,
-                    &chat_id,
-                    &assistant_message_id,
-                    &queued_user_message_id,
-                    &run_id,
-                    &text,
-                    &metadata_json,
-                ) {
+                if let Err(error) = with_sidecar_workspace_database(&stream_state, |database| {
+                    remote_sidecar_persist_owned_assistant_message(
+                        database,
+                        &chat_id,
+                        &assistant_message_id,
+                        &queued_user_message_id,
+                        &run_id,
+                        &text,
+                        &metadata_json,
+                    )
+                    .map(|_| ())
+                }) {
                     tracing::warn!(
                         chat_id,
                         assistant_message_id,
@@ -14192,38 +14263,43 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     sequence,
                     json!({ "type": "streamEnd" }),
                 );
-                let _ = database.clear_remote_queued_run_if_owned(
-                    &chat_id,
-                    &queued_user_message_id,
-                    &assistant_message_id,
-                    &run_id,
-                );
+                let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        &chat_id,
+                        &queued_user_message_id,
+                        &assistant_message_id,
+                        &run_id,
+                    )
+                });
                 remote_sidecar_finish_active_run(&stream_state, &run_id);
                 cleanup_guard.disarm();
                 break;
             }
             Err(()) => {
-                let _ = database.clear_remote_queued_run_if_owned(
-                    &chat_id,
-                    &queued_user_message_id,
-                    &assistant_message_id,
-                    &run_id,
-                );
+                let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        &chat_id,
+                        &queued_user_message_id,
+                        &assistant_message_id,
+                        &run_id,
+                    )
+                });
                 remote_sidecar_finish_active_run(&stream_state, &run_id);
                 cleanup_guard.disarm();
                 break;
             }
         }
     }
-    let _ = database.clear_remote_queued_run_if_owned(
-        &chat_id,
-        &queued_user_message_id,
-        &assistant_message_id,
-        &run_id,
-    );
-    // Git operations must not retain the workspace DB connection. The Plan task
+    let _ = with_sidecar_workspace_database(&stream_state, |database| {
+        database.clear_remote_queued_run_if_owned(
+            &chat_id,
+            &queued_user_message_id,
+            &assistant_message_id,
+            &run_id,
+        )
+    });
+    // Git operations must not retain a workspace DB permit. The Plan task
     // lifecycle is persisted in short transactions around the worktree commit.
-    drop(database);
     if let Some(plan_task) = plan_task.as_ref() {
         match remote_sidecar_sync_plan_task_after_chat_with_retry(
             &stream_state,
@@ -24400,6 +24476,17 @@ mod tests {
                 ),
             })
             .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant message");
+        drop(database);
         let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
         let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
@@ -25117,7 +25204,6 @@ mod tests {
             "msg-user-1",
             "provider-legacy",
             "model-1",
-            &mut database,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -25272,7 +25358,6 @@ mod tests {
             "msg-user-1",
             "provider-1",
             "model-1",
-            &mut database,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -26239,7 +26324,6 @@ mod tests {
             "msg-user-1",
             "provider-legacy",
             "model-1",
-            &mut database,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -26635,7 +26719,6 @@ mod tests {
         let outcome = remote_sidecar_run_broker_context_compression_summary(
             &state,
             Some(&run_stream),
-            &mut database,
             "workspace",
             "chat-1",
             "remote-run-1",
@@ -26744,7 +26827,6 @@ mod tests {
             let outcome = remote_sidecar_run_broker_context_compression_summary(
                 &state,
                 None,
-                &mut database,
                 "workspace",
                 "chat-1",
                 "remote-run-empty",
@@ -26809,7 +26891,6 @@ mod tests {
             let outcome = remote_sidecar_run_broker_context_compression_summary(
                 &state,
                 None,
-                &mut database,
                 "workspace",
                 "chat-1",
                 "remote-run-tools",
@@ -26970,7 +27051,6 @@ mod tests {
                         &mut messages,
                         &state,
                         &run_stream,
-                        &mut database,
                         "workspace",
                         "chat-1",
                         "run-1",
@@ -27270,7 +27350,6 @@ mod tests {
                         &mut messages,
                         &state,
                         &run_stream,
-                        &mut database,
                         "workspace",
                         "chat-block",
                         "run-block",
@@ -27482,7 +27561,6 @@ mod tests {
                         &mut messages,
                         &state,
                         &run_stream,
-                        &mut database,
                         "workspace",
                         "chat-1",
                         "run-rebuild-1",
@@ -27740,7 +27818,6 @@ mod tests {
                         &mut messages,
                         &state,
                         &run_stream,
-                        &mut database,
                         "workspace",
                         "chat-1",
                         "run-fail-1",
@@ -27873,7 +27950,6 @@ mod tests {
                         &mut messages,
                         &state,
                         &run_stream,
-                        &mut database,
                         "workspace",
                         "chat-1",
                         "run-no-benefit-1",
