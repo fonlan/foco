@@ -420,6 +420,9 @@ export function ModelRoutingPanel({
                   : null;
                 const activeProviderLabel =
                   activeProvider?.name ?? activeProviderId ?? t("No route");
+                const visibleProviderIds = model.providerIds.filter(
+                  (providerId) => providerById.get(providerId)?.enabled !== false,
+                );
 
                 return (
                   <li
@@ -494,7 +497,7 @@ export function ModelRoutingPanel({
                         className="model-routing-providers"
                         role="group"
                       >
-                        {model.providerIds.map((providerId) => {
+                        {visibleProviderIds.map((providerId) => {
                           const provider = providerById.get(providerId);
                           const isActive = activeProviderId === providerId;
                           const providerDisabled =
@@ -558,7 +561,7 @@ export function ModelRoutingPanel({
                             </li>
                           );
                         })}
-                        {!model.providerIds.length ? (
+                        {!visibleProviderIds.length ? (
                           <li className="model-routing-empty px-3 py-2 text-xs text-stone-500">
                             {t("No linked providers")}
                           </li>

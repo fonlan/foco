@@ -188,6 +188,13 @@ function mockFlexibleStackLayout(
 
 function renderPanel(
   onRouteChange = vi.fn(async () => ({ ok: true as const })),
+  {
+    panelModels = models,
+    panelProviders = providers,
+  }: {
+    panelModels?: ConfiguredModelSummary[];
+    panelProviders?: ConfiguredProviderSummary[];
+  } = {},
 ) {
   return render(
     <I18nContext.Provider
@@ -202,9 +209,9 @@ function renderPanel(
           className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto"
         />
         <ModelRoutingPanel
-          models={models}
+          models={panelModels}
           onRouteChange={onRouteChange}
-          providers={providers}
+          providers={panelProviders}
         />
       </div>
     </I18nContext.Provider>,
@@ -416,12 +423,70 @@ describe("ModelRoutingPanel", () => {
     });
   });
 
-  it("disables unavailable providers", () => {
+  it("hides disabled providers while keeping enabled routes selectable", async () => {
     window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
-    renderPanel();
-    fireEvent.click(screen.getByRole("button", { name: /Claude/ }));
-    const anthropic = screen.getByRole("radio", { name: /Anthropic/ });
-    expect(anthropic).toBeDisabled();
+    const onRouteChange = vi.fn(async () => ({ ok: true as const }));
+    renderPanel(onRouteChange, {
+      panelModels: [
+        {
+          ...models[0],
+          activeProviderId: "anthropic",
+          providerIds: ["anthropic", "azure"],
+        },
+      ],
+    });
+
+    expect(screen.getByTitle("GPT-4.1 · Anthropic")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+
+    expect(screen.queryByRole("radio", { name: /Anthropic/ })).toBeNull();
+    const azure = screen.getByRole("radio", { name: /Azure/ });
+    expect(azure).not.toBeDisabled();
+
+    fireEvent.click(azure);
+    await waitFor(() => {
+      expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
+    });
+  });
+
+  it("shows the linked-provider empty state after filtering disabled providers", () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    renderPanel(undefined, {
+      panelModels: [
+        {
+          ...models[0],
+          activeProviderId: "anthropic",
+          providerIds: ["anthropic"],
+        },
+      ],
+    });
+
+    expect(screen.getByTitle("GPT-4.1 · Anthropic")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+
+    expect(screen.getByText("No linked providers")).toBeTruthy();
+    expect(screen.queryByRole("radio", { name: /Anthropic/ })).toBeNull();
+  });
+
+  it("retains unknown providers for their missing-provider diagnostic", () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    renderPanel(undefined, {
+      panelModels: [
+        {
+          ...models[0],
+          activeProviderId: "missing-provider",
+          providerIds: ["missing-provider"],
+        },
+      ],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
+
+    expect(
+      screen.getByRole("radio", {
+        name: /missing-provider.*Provider not found/,
+      }),
+    ).toBeDisabled();
   });
 
   it("resizes with mouse pointer events and persists the height ratio", async () => {
