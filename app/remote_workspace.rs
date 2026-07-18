@@ -1668,6 +1668,25 @@ impl RemoteWorkspaceManager {
             sessions.insert(key.to_string(), session);
         }
 
+        // The cache is diagnostics only. Refresh it only after this session's bootstrap
+        // identity and broker are both verified, never while a binary is merely installed.
+        if let Err(error) = update_verified_sidecar_cache(
+            &state,
+            server_id,
+            &sidecar_command.identity,
+            sidecar_command.managed_install_version.is_some(),
+        )
+        .await
+        {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                version = %sidecar_command.identity.version,
+                error = %error.message(),
+                "failed to persist verified remote sidecar diagnostic cache"
+            );
+        }
+
         // Best-effort: after bootstrap identity + control broker succeed, prune older
         // Foco-managed sidecar version dirs. Custom focoCommand is skipped. Failures never
         // downgrade a successful Ready session.
@@ -3559,7 +3578,6 @@ async fn ensure_sidecar_command(
         asset.version, asset.target, SIDECAR_BINARY_NAME
     ));
     if remote_sidecar_matches(server, &remote_bin, &identity, server_id, workspace_id).await? {
-        update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
         return Ok(RemoteSidecarCommand {
             command: remote_bin,
             identity,
@@ -3583,7 +3601,6 @@ async fn ensure_sidecar_command(
             )
             .await?
             {
-                update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
                 return Ok(RemoteSidecarCommand {
                     command: remote_bin.clone(),
                     identity: identity.clone(),
@@ -3630,7 +3647,6 @@ async fn ensure_sidecar_command(
                 workspace_id,
             )
             .await?;
-            update_sidecar_cache(state, server_id, target, &asset.version, None).await?;
             Ok(RemoteSidecarCommand {
                 command: remote_bin.clone(),
                 identity: identity.clone(),
@@ -4066,12 +4082,30 @@ fn hex_bytes(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-async fn update_sidecar_cache(
+fn apply_verified_sidecar_cache(
+    server: &mut RemoteServerProfile,
+    identity: &RemoteSidecarIdentity,
+    managed_install: bool,
+) {
+    server.last_known_target = Some(identity.target.clone());
+    server.last_sidecar_version = Some(identity.version.clone());
+    server.sidecar_install_state = Some(
+        if managed_install {
+            "available"
+        } else {
+            "customCommand"
+        }
+        .to_string(),
+    );
+    server.last_checked_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    server.last_error = None;
+}
+
+async fn update_verified_sidecar_cache(
     state: &AppState,
     server_id: &str,
-    target: &str,
-    version: &str,
-    error: Option<String>,
+    identity: &RemoteSidecarIdentity,
+    managed_install: bool,
 ) -> Result<(), ApiError> {
     let mut config = config_update_snapshot(state).await?;
     let server = config
@@ -4079,11 +4113,7 @@ async fn update_sidecar_cache(
         .iter_mut()
         .find(|server| server.id == server_id)
         .ok_or_else(|| remote_error(server_id, None, "remote server was not found"))?;
-    server.last_known_target = Some(target.to_string());
-    server.last_sidecar_version = Some(version.to_string());
-    server.sidecar_install_state = Some("available".to_string());
-    server.last_checked_at = Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
-    server.last_error = error;
+    apply_verified_sidecar_cache(server, identity, managed_install);
     save_config(state, &mut config)
 }
 
@@ -17015,6 +17045,37 @@ mod tests {
             "workspace-a",
             &current,
         ));
+    }
+
+    #[test]
+    fn verified_sidecar_cache_replaces_stale_diagnostics_after_a_ready_session() {
+        let mut server = RemoteServerProfile {
+            last_known_target: Some("linux-arm64".to_string()),
+            last_sidecar_version: Some("0.1.50".to_string()),
+            last_error: Some("stale connection failure".to_string()),
+            sidecar_install_state: Some("not_installed".to_string()),
+            ..RemoteServerProfile::default()
+        };
+        let identity = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:current");
+
+        apply_verified_sidecar_cache(&mut server, &identity, true);
+
+        assert_eq!(
+            (
+                server.last_known_target.as_deref(),
+                server.last_sidecar_version.as_deref(),
+                server.sidecar_install_state.as_deref(),
+                server.last_error.as_deref(),
+                server.last_checked_at.is_some(),
+            ),
+            (
+                Some("linux-x64"),
+                Some("0.1.51"),
+                Some("available"),
+                None,
+                true
+            ),
+        );
     }
 
     #[test]

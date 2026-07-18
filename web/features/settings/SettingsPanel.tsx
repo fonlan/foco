@@ -13069,6 +13069,9 @@ function RemoteServersSettingsSection({
                       <td className="px-4 py-3 text-xs text-stone-600">
                         <div>{server.sidecarVersion ?? "-"}</div>
                         <div className="mt-1 text-stone-400">
+                          {t("Cached diagnostic; refreshed after a verified workspace connection")}
+                        </div>
+                        <div className="mt-1 text-stone-400">
                           {remoteSidecarInstallStateLabel(server.sidecarInstallState, t)}
                         </div>
                       </td>
