@@ -1765,6 +1765,12 @@ fn plan_phase_run_completion_advances_until_pause() {
         attached.phases[0].agent_task_id.as_deref(),
         Some("agent-task-plan-runner-1")
     );
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &first_task_id,
+        "agent-attempt-plan-runner-1",
+    );
 
     let after_first = database
         .complete_plan_phase_run(&first_task_id, Some("commit-one"))
@@ -1808,6 +1814,12 @@ fn plan_phase_run_completion_advances_until_pause() {
             &second_task_id,
         )
         .expect("attach second phase");
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &second_task_id,
+        "agent-attempt-plan-runner-2",
+    );
     let paused = database
         .transition_plan("plan-runner", "pause")
         .expect("pause plan");
@@ -5506,6 +5518,7 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
         .execute_batch(
             "DROP INDEX IF EXISTS workspace_spec_jobs_active_retry_idx;
              ALTER TABLE workspace_spec_jobs DROP COLUMN retry_of_job_id;
+             ALTER TABLE workspace_spec_jobs DROP COLUMN lease_renewed_at;
              UPDATE plan_phases
              SET status = 'completed', commit_id = 'commit-from-phase', completed_at = '2026-07-02T00:00:00.000Z'
              WHERE id = 'plan-attempt-migration-024-completed';
@@ -5657,6 +5670,12 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
             &phase_task_id,
         )
         .expect("attach phase task");
+    complete_test_agent_task(
+        &mut database,
+        &phase_team_id,
+        &phase_task_id,
+        "agent-attempt-merge-running-phase",
+    );
     let implemented = database
         .complete_plan_phase_run(&phase_task_id, Some("worktree-commit"))
         .expect("complete phase")
@@ -5713,6 +5732,12 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
         Some("agent-task-merge-running-merge")
     );
     assert!(running.phases[0].commit_id.is_none());
+    complete_test_agent_task(
+        &mut database,
+        &merge_team_id,
+        &merge_task_id,
+        "agent-attempt-merge-running-merge",
+    );
 
     let completed = database
         .complete_plan_phase_by_id(
@@ -17345,6 +17370,32 @@ fn create_test_agent_team(
         })
         .expect("agent team create");
     (team_id, instance_id)
+}
+
+fn complete_test_agent_task(
+    database: &mut WorkspaceDatabase,
+    team_id: &AgentTeamId,
+    task_id: &AgentTaskId,
+    attempt_id: &str,
+) {
+    let attempt_id = AgentAttemptId::new(attempt_id).expect("attempt id");
+    database
+        .claim_runnable_agent_task(team_id, task_id, &attempt_id)
+        .expect("claim task")
+        .expect("claimed task");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id,
+                task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"ok":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete task")
+    );
 }
 
 fn create_test_isolated_agent_team(
