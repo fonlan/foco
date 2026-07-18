@@ -537,6 +537,23 @@ pub struct WorkspaceDatabase {
     connection: Connection,
 }
 
+/// Result of atomically claiming a queued remote chat run.
+///
+/// A replay by the same remote run id is intentionally idempotent. A different
+/// owner, malformed metadata, or a replaced queued identity is reported as a
+/// structured database error instead of being silently overwritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteQueuedRunClaimOutcome {
+    Claimed,
+    AlreadyOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemoteQueuedRunClearOutcome {
+    Cleared,
+    NotOwned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanPhaseAttemptTrigger {
     Initial,
@@ -5465,6 +5482,204 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(inserted > 0)
+    }
+
+    pub fn claim_remote_queued_run(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+    ) -> Result<RemoteQueuedRunClaimOutcome, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let user = message_from_transaction(&transaction, &database_path, user_message_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("remote queued user message was not found: {user_message_id}"),
+            })?;
+        if user.chat_id != chat_id || user.role != "user" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!(
+                    "remote queued user message '{user_message_id}' does not belong to chat '{chat_id}'"
+                ),
+            });
+        }
+        let assistant =
+            message_from_transaction(&transaction, &database_path, assistant_message_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!(
+                        "remote queued assistant message was not found: {assistant_message_id}"
+                    ),
+                })?;
+        if assistant.chat_id != chat_id || assistant.role != "assistant" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!(
+                    "remote queued assistant message '{assistant_message_id}' does not belong to chat '{chat_id}'"
+                ),
+            });
+        }
+
+        let mut metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let queued_run = metadata
+            .get_mut(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "remote user message metadata.queuedRun must be an object".to_string(),
+            })?;
+        let queued_user_message_id = queued_run
+            .get("userMessageId")
+            .or_else(|| queued_run.get("user_message_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "remote queuedRun.userMessageId is required".to_string(),
+            })?;
+        let queued_assistant_message_id = queued_run
+            .get("assistantMessageId")
+            .or_else(|| queued_run.get("assistant_message_id"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "remote queuedRun.assistantMessageId is required".to_string(),
+            })?;
+        if queued_user_message_id != user_message_id
+            || queued_assistant_message_id != assistant_message_id
+        {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "remote queuedRun identity was replaced before claim".to_string(),
+            });
+        }
+
+        let outcome = match queued_run.get("status").and_then(Value::as_str) {
+            Some("queued") => {
+                if queued_run.get("runId").and_then(Value::as_str).is_some() {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "queued remote queuedRun unexpectedly has a runId".to_string(),
+                    });
+                }
+                queued_run.insert("status".to_string(), Value::String("running".to_string()));
+                queued_run.insert("runId".to_string(), Value::String(run_id.to_string()));
+                RemoteQueuedRunClaimOutcome::Claimed
+            }
+            Some("running") => match queued_run.get("runId").and_then(Value::as_str) {
+                Some(owner_run_id) if owner_run_id == run_id => {
+                    RemoteQueuedRunClaimOutcome::AlreadyOwned
+                }
+                Some(_) => {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "remote queuedRun is already owned by another run".to_string(),
+                    });
+                }
+                None => {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "legacy running remote queuedRun has no runId owner".to_string(),
+                    });
+                }
+            },
+            Some(status) => {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("remote queuedRun has unsupported status '{status}'"),
+                });
+            }
+            None => {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "remote queuedRun.status is required".to_string(),
+                });
+            }
+        };
+
+        if outcome == RemoteQueuedRunClaimOutcome::Claimed {
+            let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("user message metadata is invalid JSON: {source}"),
+                }
+            })?;
+            transaction
+                .execute(
+                    "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                    params![metadata_json, user_message_id, chat_id],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(outcome)
+    }
+
+    pub fn clear_remote_queued_run_if_owned(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+    ) -> Result<RemoteQueuedRunClearOutcome, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(user) = message_from_transaction(&transaction, &database_path, user_message_id)?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        };
+        if user.chat_id != chat_id || user.role != "user" {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        }
+        let mut metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let Some(queued_run) = metadata
+            .get(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object)
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        };
+        let matches_owner = queued_run
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "running")
+            && queued_run
+                .get("userMessageId")
+                .or_else(|| queued_run.get("user_message_id"))
+                .and_then(Value::as_str)
+                == Some(user_message_id)
+            && queued_run
+                .get("assistantMessageId")
+                .or_else(|| queued_run.get("assistant_message_id"))
+                .and_then(Value::as_str)
+                == Some(assistant_message_id)
+            && queued_run.get("runId").and_then(Value::as_str) == Some(run_id);
+        if !matches_owner {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        }
+        metadata.remove(QUEUED_MESSAGE_METADATA_KEY);
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("user message metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![metadata_json, user_message_id, chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(RemoteQueuedRunClearOutcome::Cleared)
     }
 
     pub fn mark_chat_queued_run_started(

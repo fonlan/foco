@@ -2406,6 +2406,32 @@ impl RemoteActiveRunStream {
     }
 }
 
+#[derive(Clone)]
+struct RemoteActiveRunRegistration {
+    queued_user_message_id: String,
+    assistant_message_id: String,
+    plan_task_id: Option<AgentTaskId>,
+    run_stream: RemoteActiveRunStream,
+}
+
+#[derive(Default)]
+struct RemoteActiveRunRegistry {
+    by_run_id: HashMap<String, RemoteActiveRunRegistration>,
+    by_identity: HashMap<(String, String), String>,
+    by_chat_id: HashMap<String, String>,
+}
+
+enum RemoteRunReservation {
+    Started {
+        run_id: String,
+        run_stream: RemoteActiveRunStream,
+    },
+    Existing {
+        run_id: String,
+        run_stream: RemoteActiveRunStream,
+    },
+}
+
 pub(crate) async fn run_remote_sidecar_command_if_requested() -> AppResult<bool> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let Some(command) = args.first().map(String::as_str) else {
@@ -2474,7 +2500,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         ws_count: ws_count.clone(),
         active_run_count: active_run_count.clone(),
         active_runs: active_runs.clone(),
-        active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+        active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
         broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
         broker_tx,
         shutdown_tx: shutdown_tx.clone(),
@@ -2858,31 +2884,125 @@ fn remote_sidecar_remove_active_run(state: &RemoteSidecarState, run_id: &str) {
     remote_sidecar_send_heartbeat(state);
 }
 
+fn remote_sidecar_reserve_active_run(
+    state: &RemoteSidecarState,
+    chat_id: String,
+    queued_user_message_id: String,
+    assistant_message_id: String,
+    plan_task_id: Option<AgentTaskId>,
+) -> Result<RemoteRunReservation, ApiError> {
+    let mut registry = state
+        .active_run_streams
+        .lock()
+        .map_err(|_| ApiError::internal("remote active run registry lock is poisoned"))?;
+    let identity = (chat_id.clone(), queued_user_message_id.clone());
+    if let Some(existing_run_id) = registry.by_identity.get(&identity)
+        && let Some(existing) = registry.by_run_id.get(existing_run_id)
+    {
+        return Ok(RemoteRunReservation::Existing {
+            run_id: existing_run_id.clone(),
+            run_stream: existing.run_stream.clone(),
+        });
+    }
+    if let Some(existing_run_id) = registry.by_chat_id.get(&chat_id) {
+        return Err(ApiError::bad_request(format!(
+            "chat '{chat_id}' already has an active queued run '{existing_run_id}'"
+        )));
+    }
+
+    let run_id = unique_id("remote-run");
+    let run_stream = RemoteActiveRunStream::new(chat_id.clone());
+    registry.by_identity.insert(identity, run_id.clone());
+    registry.by_chat_id.insert(chat_id, run_id.clone());
+    registry.by_run_id.insert(
+        run_id.clone(),
+        RemoteActiveRunRegistration {
+            queued_user_message_id,
+            assistant_message_id,
+            plan_task_id,
+            run_stream: run_stream.clone(),
+        },
+    );
+    Ok(RemoteRunReservation::Started { run_id, run_stream })
+}
+
+#[cfg(test)]
 fn remote_sidecar_insert_active_run_stream(
     state: &RemoteSidecarState,
     run_id: String,
     chat_id: String,
 ) -> RemoteActiveRunStream {
-    let run_stream = RemoteActiveRunStream::new(chat_id);
-    if let Ok(mut streams) = state.active_run_streams.lock() {
-        streams.insert(run_id, run_stream.clone());
+    let run_stream = RemoteActiveRunStream::new(chat_id.clone());
+    if let Ok(mut registry) = state.active_run_streams.lock() {
+        registry.by_identity.insert(
+            (chat_id.clone(), format!("test-user:{run_id}")),
+            run_id.clone(),
+        );
+        registry.by_chat_id.insert(chat_id, run_id.clone());
+        registry.by_run_id.insert(
+            run_id,
+            RemoteActiveRunRegistration {
+                queued_user_message_id: String::new(),
+                assistant_message_id: String::new(),
+                plan_task_id: None,
+                run_stream: run_stream.clone(),
+            },
+        );
     }
     run_stream
 }
 
-fn remote_sidecar_clear_chat_run_streams(state: &RemoteSidecarState, chat_id: &str) {
-    let run_ids = state
+fn remote_sidecar_existing_active_run(
+    state: &RemoteSidecarState,
+    chat_id: &str,
+    queued_user_message_id: &str,
+) -> Result<Option<RemoteActiveRunStream>, ApiError> {
+    let registry = state
         .active_run_streams
         .lock()
-        .map(|streams| {
-            streams
-                .iter()
-                .filter(|(_, run_stream)| run_stream.chat_id == chat_id)
-                .map(|(run_id, _)| run_id.clone())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for run_id in run_ids {
+        .map_err(|_| ApiError::internal("remote active run registry lock is poisoned"))?;
+    let identity = (chat_id.to_string(), queued_user_message_id.to_string());
+    Ok(registry
+        .by_identity
+        .get(&identity)
+        .and_then(|run_id| registry.by_run_id.get(run_id))
+        .map(|registration| registration.run_stream.clone()))
+}
+
+fn remote_sidecar_remove_active_run_stream(
+    state: &RemoteSidecarState,
+    run_id: &str,
+) -> Option<RemoteActiveRunRegistration> {
+    let mut registry = state.active_run_streams.lock().ok()?;
+    let registration = registry.by_run_id.remove(run_id)?;
+    let identity = (
+        registration.run_stream.chat_id.clone(),
+        registration.queued_user_message_id.clone(),
+    );
+    if registry
+        .by_identity
+        .get(&identity)
+        .is_some_and(|id| id == run_id)
+    {
+        registry.by_identity.remove(&identity);
+    }
+    if registry
+        .by_chat_id
+        .get(&registration.run_stream.chat_id)
+        .is_some_and(|id| id == run_id)
+    {
+        registry.by_chat_id.remove(&registration.run_stream.chat_id);
+    }
+    Some(registration)
+}
+
+fn remote_sidecar_clear_chat_run_streams(state: &RemoteSidecarState, chat_id: &str) {
+    let run_id = state
+        .active_run_streams
+        .lock()
+        .ok()
+        .and_then(|registry| registry.by_chat_id.get(chat_id).cloned());
+    if let Some(run_id) = run_id {
         // Edit/delete invalidation: cancel the background runner without
         // emitting terminal SSE events (history is already rewritten/deleted).
         remote_sidecar_cancel_active_run(state, &run_id, false, true);
@@ -2893,7 +3013,13 @@ fn remote_sidecar_active_run_stream(
     state: &RemoteSidecarState,
     run_id: &str,
 ) -> Option<RemoteActiveRunStream> {
-    state.active_run_streams.lock().ok()?.get(run_id).cloned()
+    state
+        .active_run_streams
+        .lock()
+        .ok()?
+        .by_run_id
+        .get(run_id)
+        .map(|registration| registration.run_stream.clone())
 }
 
 fn remote_sidecar_record_run_event(
@@ -2949,14 +3075,9 @@ fn remote_sidecar_cancel_broker_request_id(state: &RemoteSidecarState, broker_re
 /// assistant/metrics/run_events/queuedRun writes. Marks finished and removes the
 /// active run once; does not send broker cancel (turn already terminal).
 fn remote_sidecar_finish_active_run(state: &RemoteSidecarState, run_id: &str) {
-    let run_stream = state
-        .active_run_streams
-        .lock()
-        .ok()
-        .and_then(|mut streams| streams.remove(run_id));
-    if let Some(run_stream) = run_stream {
-        run_stream.mark_finished();
-        let _ = run_stream.try_commit_cleanup();
+    if let Some(registration) = remote_sidecar_remove_active_run_stream(state, run_id) {
+        registration.run_stream.mark_finished();
+        let _ = registration.run_stream.try_commit_cleanup();
     }
     remote_sidecar_remove_active_run(state, run_id);
 }
@@ -2970,11 +3091,8 @@ fn remote_sidecar_cancel_active_run(
     emit_events: bool,
     remove_pending: bool,
 ) {
-    let run_stream = state
-        .active_run_streams
-        .lock()
-        .ok()
-        .and_then(|mut streams| streams.remove(run_id));
+    let run_stream = remote_sidecar_remove_active_run_stream(state, run_id)
+        .map(|registration| registration.run_stream);
     let Some(run_stream) = run_stream else {
         remote_sidecar_remove_active_run(state, run_id);
         return;
@@ -3017,7 +3135,9 @@ fn remote_sidecar_cancel_active_run(
 struct RemoteRunCleanupGuard {
     state: RemoteSidecarState,
     run_id: String,
+    chat_id: Option<String>,
     queued_user_message_id: Option<String>,
+    assistant_message_id: Option<String>,
     disarmed: Arc<AtomicBool>,
 }
 
@@ -3027,7 +3147,9 @@ impl RemoteRunCleanupGuard {
         Self {
             state,
             run_id,
+            chat_id: None,
             queued_user_message_id: None,
+            assistant_message_id: None,
             disarmed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3035,12 +3157,16 @@ impl RemoteRunCleanupGuard {
     fn for_queued_message(
         state: RemoteSidecarState,
         run_id: String,
+        chat_id: String,
         queued_user_message_id: String,
+        assistant_message_id: String,
     ) -> Self {
         Self {
             state,
             run_id,
+            chat_id: Some(chat_id),
             queued_user_message_id: Some(queued_user_message_id),
+            assistant_message_id: Some(assistant_message_id),
             disarmed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -3058,17 +3184,25 @@ impl Drop for RemoteRunCleanupGuard {
         // Abnormal runner exit (panic, early return without finish): clear
         // queuedRun and cancel the active run if still present. Idempotent with
         // remote_sidecar_finish_active_run / remote_sidecar_cancel_active_run.
-        if let Some(queued_user_message_id) = self.queued_user_message_id.as_deref() {
+        if let (Some(chat_id), Some(queued_user_message_id), Some(assistant_message_id)) = (
+            self.chat_id.as_deref(),
+            self.queued_user_message_id.as_deref(),
+            self.assistant_message_id.as_deref(),
+        ) {
             // Critical open: runner may still hold an ordinary permit while Drop runs.
             match WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(&self.state)) {
                 Ok(mut database) => {
-                    if let Err(error) =
-                        remote_clear_message_queued_run(&mut database, queued_user_message_id)
-                    {
+                    if let Err(error) = database.clear_remote_queued_run_if_owned(
+                        chat_id,
+                        queued_user_message_id,
+                        assistant_message_id,
+                        &self.run_id,
+                    ) {
                         tracing::warn!(
                             error = %error,
                             message_id = %queued_user_message_id,
-                            "failed to clear remote queuedRun during run cleanup"
+                            run_id = %self.run_id,
+                            "failed to clear owned remote queuedRun during run cleanup"
                         );
                     }
                 }
@@ -3094,7 +3228,7 @@ pub(crate) struct RemoteSidecarState {
     ws_count: Arc<AtomicUsize>,
     active_run_count: Arc<AtomicUsize>,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
-    active_run_streams: Arc<Mutex<HashMap<String, RemoteActiveRunStream>>>,
+    active_run_streams: Arc<Mutex<RemoteActiveRunRegistry>>,
     broker_pending: Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<ControlEnvelope>>>>,
     broker_tx: tokio::sync::broadcast::Sender<ControlEnvelope>,
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
@@ -8781,6 +8915,7 @@ fn remote_sidecar_runner_still_owns_turn(
     chat_id: &str,
     assistant_message_id: &str,
     queued_user_message_id: &str,
+    run_id: &str,
 ) -> bool {
     if let Some(assistant) = database.message(assistant_message_id).ok().flatten() {
         if assistant.chat_id != chat_id || assistant.role != "assistant" {
@@ -8814,7 +8949,10 @@ fn remote_sidecar_runner_still_owns_turn(
         .and_then(Value::as_str)
         .map(|id| id == queued_user_message_id)
         .unwrap_or(true);
-    assistant_ok && user_ok
+    assistant_ok
+        && user_ok
+        && queued_run.get("status").and_then(Value::as_str) == Some("running")
+        && queued_run.get("runId").and_then(Value::as_str) == Some(run_id)
 }
 
 fn remote_sidecar_persist_owned_assistant_message(
@@ -8822,6 +8960,7 @@ fn remote_sidecar_persist_owned_assistant_message(
     chat_id: &str,
     assistant_message_id: &str,
     queued_user_message_id: &str,
+    run_id: &str,
     content: &str,
     metadata_json: &str,
 ) -> Result<bool, WorkspaceDatabaseError> {
@@ -8830,6 +8969,7 @@ fn remote_sidecar_persist_owned_assistant_message(
         chat_id,
         assistant_message_id,
         queued_user_message_id,
+        run_id,
     ) {
         return Ok(false);
     }
@@ -8850,6 +8990,7 @@ fn remote_sidecar_persist_owned_assistant_message(
         chat_id,
         assistant_message_id,
         queued_user_message_id,
+        run_id,
     ) {
         return Ok(false);
     }
@@ -11780,6 +11921,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                             chat_id,
                             assistant_message_id,
                             queued_user_message_id,
+                            run_id,
                         )
                     {
                         state.broker_pending.lock().await.remove(broker_request_id);
@@ -11852,6 +11994,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     chat_id,
                     assistant_message_id,
                     queued_user_message_id,
+                    run_id,
                     text,
                     &metadata_json,
                 ) {
@@ -11877,8 +12020,14 @@ async fn remote_sidecar_run_broker_llm_turn(
                     chat_id,
                     assistant_message_id,
                     queued_user_message_id,
+                    run_id,
                 ) {
-                    let _ = remote_clear_message_queued_run(database, queued_user_message_id);
+                    let _ = database.clear_remote_queued_run_if_owned(
+                        chat_id,
+                        queued_user_message_id,
+                        assistant_message_id,
+                        run_id,
+                    );
                 }
                 let completion_payload = remote_chat_completion_event(
                     chat_id,
@@ -13253,7 +13402,9 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let cleanup_guard = RemoteRunCleanupGuard::for_queued_message(
         stream_state.clone(),
         run_id.clone(),
+        chat_id.clone(),
         queued_user_message_id.clone(),
+        assistant_message_id.clone(),
     );
     // Open the run-owned connection after spawn so the HTTP response body never holds DB permits.
     let mut database =
@@ -13360,7 +13511,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     'run: loop {
         // Explicit cancel / edit-delete invalidation: stop before the next turn.
         if run_stream.is_cancel_requested() || run_stream.is_finished() {
-            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+            let _ = database.clear_remote_queued_run_if_owned(
+                &chat_id,
+                &queued_user_message_id,
+                &assistant_message_id,
+                &run_id,
+            );
             remote_sidecar_finish_active_run(&stream_state, &run_id);
             cleanup_guard.disarm();
             break;
@@ -13521,7 +13677,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         };
         // Live path already yielded compression events; do not re-emit.
         if run_stream.is_cancel_requested() || run_stream.is_finished() {
-            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+            let _ = database.clear_remote_queued_run_if_owned(
+                &chat_id,
+                &queued_user_message_id,
+                &assistant_message_id,
+                &run_id,
+            );
             remote_sidecar_finish_active_run(&stream_state, &run_id);
             cleanup_guard.disarm();
             break;
@@ -14005,6 +14166,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     &chat_id,
                     &assistant_message_id,
                     &queued_user_message_id,
+                    &run_id,
                     &text,
                     &metadata_json,
                 ) {
@@ -14030,20 +14192,35 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     sequence,
                     json!({ "type": "streamEnd" }),
                 );
-                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                let _ = database.clear_remote_queued_run_if_owned(
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &run_id,
+                );
                 remote_sidecar_finish_active_run(&stream_state, &run_id);
                 cleanup_guard.disarm();
                 break;
             }
             Err(()) => {
-                let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+                let _ = database.clear_remote_queued_run_if_owned(
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    &run_id,
+                );
                 remote_sidecar_finish_active_run(&stream_state, &run_id);
                 cleanup_guard.disarm();
                 break;
             }
         }
     }
-    let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+    let _ = database.clear_remote_queued_run_if_owned(
+        &chat_id,
+        &queued_user_message_id,
+        &assistant_message_id,
+        &run_id,
+    );
     // Git operations must not retain the workspace DB connection. The Plan task
     // lifecycle is persisted in short transactions around the worktree commit.
     drop(database);
@@ -14466,6 +14643,42 @@ async fn remote_sidecar_finalize_plan_worktree(
     }
 }
 
+fn remote_sidecar_fail_reserved_start(
+    state: &RemoteSidecarState,
+    run_id: &str,
+    run_stream: &RemoteActiveRunStream,
+    chat_id: &str,
+    queued_user_message_id: &str,
+    assistant_message_id: &str,
+    plan_task: Option<&RemotePlanTaskBinding>,
+    message: &str,
+) {
+    remote_sidecar_record_run_event(
+        run_stream,
+        0,
+        json!({ "type": "error", "message": message }),
+    );
+    remote_sidecar_record_run_event(run_stream, 1, json!({ "type": "streamEnd" }));
+    if let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state)) {
+        let _ = database.clear_remote_queued_run_if_owned(
+            chat_id,
+            queued_user_message_id,
+            assistant_message_id,
+            run_id,
+        );
+    }
+    if let Some(plan_task) = plan_task {
+        if let Err(error) = remote_sidecar_fail_plan_task(state, &plan_task.task_id, message) {
+            tracing::error!(
+                task_id = %plan_task.task_id,
+                error = %error.message,
+                "failed to close remote Plan task after chat startup failure"
+            );
+        }
+    }
+    remote_sidecar_finish_active_run(state, run_id);
+}
+
 async fn remote_sidecar_start_chat_run(
     state: RemoteSidecarState,
     payload: Value,
@@ -14475,6 +14688,12 @@ async fn remote_sidecar_start_chat_run(
     let queued_user_message_id =
         remote_required_text(payload.get("queuedUserMessageId"), "queuedUserMessageId")
             .map_err(|_| ApiError::bad_request("queuedUserMessageId is required"))?;
+    if let Some(run_stream) =
+        remote_sidecar_existing_active_run(&state, &chat_id, &queued_user_message_id)?
+    {
+        return Ok(run_stream);
+    }
+
     let model_id = remote_required_text(payload.get("modelId"), "modelId")
         .map_err(|_| ApiError::bad_request("modelId is required"))?;
     let provider_id =
@@ -14495,77 +14714,85 @@ async fn remote_sidecar_start_chat_run(
         .map(|task_id| AgentTaskId::new(task_id).map(|task_id| RemotePlanTaskBinding { task_id }))
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-        .map_err(ApiError::from_workspace_error)?;
-    let chat = database
-        .chat(&chat_id)
-        .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
-    let user_message = database
-        .message(&queued_user_message_id)
-        .map_err(ApiError::from_workspace_error)?
-        .ok_or_else(|| ApiError::bad_request("queued user message was not found"))?;
-    remote_sidecar_validate_plan_task_binding(
-        &database,
-        plan_task.as_ref(),
-        &chat_id,
-        &tool_workspace_path,
-        &shared_workspace_path,
-    )?;
-    let assistant_message_id = payload
-        .get("visibleAssistantMessageId")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            let metadata = serde_json::from_str::<Value>(&user_message.metadata_json).ok()?;
-            metadata
-                .get("queuedRun")
-                .and_then(|run| run.get("assistantMessageId"))
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .unwrap_or_else(|| unique_id("msg-assistant"));
-    let run_id = unique_id("remote-run");
-    let session_mode = remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id)
-        .map_err(|_| ApiError::bad_request("queued user message does not belong to this chat"))?;
-    let bundle = state
-        .runtime_config
-        .lock()
-        .ok()
-        .and_then(|config| config.clone());
-    drop(database);
-    let tool_catalog =
-        match remote_sidecar_tool_catalog(&state, bundle.as_ref(), session_mode.as_deref()).await {
-            Ok(catalog) => catalog,
-            Err(_) => return Err(ApiError::internal("failed to prepare remote tool catalog")),
-        };
-    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-        .map_err(ApiError::from_workspace_error)?;
-    let initial_prepared = match remote_sidecar_prepare_chat_context(
-        &state,
-        &database,
-        &chat_id,
-        &queued_user_message_id,
-        &assistant_message_id,
-        &model_id,
-        payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
-        tool_catalog,
-        session_mode,
-    ) {
-        Ok(prepared) => prepared,
-        Err(_) => {
-            let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-            return Err(ApiError::internal("failed to prepare remote chat context"));
-        }
+    let (chat_title, assistant_message_id, session_mode) = {
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(ApiError::from_workspace_error)?;
+        let chat = database
+            .chat(&chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
+        let user_message = database
+            .message(&queued_user_message_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::bad_request("queued user message was not found"))?;
+        remote_sidecar_validate_plan_task_binding(
+            &database,
+            plan_task.as_ref(),
+            &chat_id,
+            &tool_workspace_path,
+            &shared_workspace_path,
+        )?;
+        let assistant_message_id = payload
+            .get("visibleAssistantMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                let metadata = serde_json::from_str::<Value>(&user_message.metadata_json).ok()?;
+                metadata
+                    .get("queuedRun")
+                    .and_then(|run| run.get("assistantMessageId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .ok_or_else(|| {
+                ApiError::bad_request("queued user message has no assistant identity")
+            })?;
+        let session_mode =
+            remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id).map_err(
+                |_| ApiError::bad_request("queued user message does not belong to this chat"),
+            )?;
+        (chat.title, assistant_message_id, session_mode)
     };
-    let initial_provider_request = initial_prepared.provider_request.clone();
-    let tool_catalog = initial_prepared.tool_catalog.clone();
-    let session_mode = initial_prepared.session_mode.clone();
-    let skill_read_root_dirs = initial_prepared.skill_read_root_dirs.clone();
-    let attachment_read_allowlist = initial_prepared.attachment_read_allowlist.clone();
-    let initial_runtime_tool_state =
-        RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
-    drop(database);
+
+    let (run_id, run_stream) = match remote_sidecar_reserve_active_run(
+        &state,
+        chat_id.clone(),
+        queued_user_message_id.clone(),
+        assistant_message_id.clone(),
+        plan_task.as_ref().map(|binding| binding.task_id.clone()),
+    )? {
+        RemoteRunReservation::Existing { run_id, run_stream } => {
+            tracing::debug!(
+                run_id,
+                chat_id,
+                queued_user_message_id,
+                "subscribing to existing remote chat run"
+            );
+            return Ok(run_stream);
+        }
+        RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
+    };
+
+    let claim_result = (|| {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))?;
+        database.claim_remote_queued_run(
+            &chat_id,
+            &queued_user_message_id,
+            &assistant_message_id,
+            &run_id,
+        )
+    })();
+    if let Err(error) = claim_result {
+        remote_sidecar_record_run_event(
+            &run_stream,
+            0,
+            json!({ "type": "error", "message": error.to_string() }),
+        );
+        remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+        remote_sidecar_finish_active_run(&state, &run_id);
+        return Ok(run_stream);
+    }
+
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
@@ -14575,8 +14802,81 @@ async fn remote_sidecar_start_chat_run(
         updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
     };
     remote_sidecar_set_active_run(&state, run);
-    let run_stream =
-        remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
+
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone());
+    let tool_catalog =
+        match remote_sidecar_tool_catalog(&state, bundle.as_ref(), session_mode.as_deref()).await {
+            Ok(catalog) => catalog,
+            Err(_) => {
+                remote_sidecar_fail_reserved_start(
+                    &state,
+                    &run_id,
+                    &run_stream,
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    plan_task.as_ref(),
+                    "failed to prepare remote tool catalog",
+                );
+                return Ok(run_stream);
+            }
+        };
+    let initial_prepared = {
+        let database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state)) {
+            Ok(database) => database,
+            Err(error) => {
+                remote_sidecar_fail_reserved_start(
+                    &state,
+                    &run_id,
+                    &run_stream,
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    plan_task.as_ref(),
+                    &error.to_string(),
+                );
+                return Ok(run_stream);
+            }
+        };
+        match remote_sidecar_prepare_chat_context(
+            &state,
+            &database,
+            &chat_id,
+            &queued_user_message_id,
+            &assistant_message_id,
+            &model_id,
+            payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+            tool_catalog,
+            session_mode,
+        ) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                drop(database);
+                remote_sidecar_fail_reserved_start(
+                    &state,
+                    &run_id,
+                    &run_stream,
+                    &chat_id,
+                    &queued_user_message_id,
+                    &assistant_message_id,
+                    plan_task.as_ref(),
+                    "failed to prepare remote chat context",
+                );
+                return Ok(run_stream);
+            }
+        }
+    };
+    let initial_provider_request = initial_prepared.provider_request.clone();
+    let tool_catalog = initial_prepared.tool_catalog.clone();
+    let session_mode = initial_prepared.session_mode.clone();
+    let skill_read_root_dirs = initial_prepared.skill_read_root_dirs.clone();
+    let attachment_read_allowlist = initial_prepared.attachment_read_allowlist.clone();
+    let initial_runtime_tool_state =
+        RemoteSidecarRuntimeToolState::from_prepared(&initial_prepared);
     tokio::spawn(run_remote_sidecar_chat_in_background(
         RemoteSidecarChatRunContext {
             workspace_state: state.clone(),
@@ -14584,7 +14884,7 @@ async fn remote_sidecar_start_chat_run(
             plan_task,
             run_id,
             chat_id,
-            chat_title: chat.title,
+            chat_title,
             queued_user_message_id,
             assistant_message_id,
             model_id,
@@ -17572,7 +17872,7 @@ mod tests {
                 ws_count: Arc::new(AtomicUsize::new(ws_count)),
                 active_run_count: Arc::new(AtomicUsize::new(0)),
                 active_runs: Arc::new(Mutex::new(Vec::new())),
-                active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+                active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
                 broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
                 broker_tx,
                 shutdown_tx: default_shutdown_tx(),
@@ -20398,7 +20698,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
-            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -20746,6 +21046,7 @@ mod tests {
                             "status": "running",
                             "userMessageId": "msg-user-1",
                             "assistantMessageId": "msg-assistant-1",
+                            "runId": "remote-run-1",
                         }
                     })
                     .to_string(),
@@ -20768,6 +21069,7 @@ mod tests {
             "chat-1",
             "msg-assistant-1",
             "msg-user-1",
+            "remote-run-1",
         ));
 
         remote_clear_message_queued_run(&mut database, "msg-user-1").expect("clear queued");
@@ -20777,6 +21079,7 @@ mod tests {
                 "chat-1",
                 "msg-assistant-1",
                 "msg-user-1",
+                "remote-run-1",
             ),
             "cleared queuedRun must drop ownership"
         );
@@ -20787,9 +21090,10 @@ mod tests {
                 "msg-user-1",
                 &json!({
                     "queuedRun": {
-                        "status": "queued",
+                        "status": "running",
                         "userMessageId": "msg-user-1",
                         "assistantMessageId": "msg-assistant-new",
+                        "runId": "remote-run-1",
                     }
                 })
                 .to_string(),
@@ -20800,6 +21104,7 @@ mod tests {
             "chat-1",
             "msg-assistant-1",
             "msg-user-1",
+            "remote-run-1",
         ));
         // New identity still owns even before the assistant row is inserted.
         assert!(remote_sidecar_runner_still_owns_turn(
@@ -20807,12 +21112,14 @@ mod tests {
             "chat-1",
             "msg-assistant-new",
             "msg-user-1",
+            "remote-run-1",
         ));
         assert!(!remote_sidecar_runner_still_owns_turn(
             &database,
             "chat-1",
             "msg-assistant-1",
             "msg-user-missing",
+            "remote-run-1",
         ));
     }
 
@@ -23086,7 +23393,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
-            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -23928,7 +24235,12 @@ mod tests {
             .active_run_streams
             .lock()
             .ok()
-            .and_then(|streams| streams.get(&run_id).map(|s| s.last_sequence()))
+            .and_then(|registry| {
+                registry
+                    .by_run_id
+                    .get(&run_id)
+                    .map(|registration| registration.run_stream.last_sequence())
+            })
             .unwrap_or(0);
 
         // Drop the proxied SSE body (simulates browser refresh / tab unmount).
@@ -25838,6 +26150,7 @@ mod tests {
                             "status": "running",
                             "userMessageId": "msg-user-1",
                             "assistantMessageId": "msg-assistant-1",
+                            "runId": "remote-run-1",
                         }
                     })
                     .to_string(),
@@ -28689,7 +29002,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
-            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -28758,7 +29071,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
-            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
@@ -32297,7 +32610,7 @@ mod tests {
             ws_count: Arc::new(AtomicUsize::new(1)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
-            active_run_streams: Arc::new(Mutex::new(HashMap::new())),
+            active_run_streams: Arc::new(Mutex::new(RemoteActiveRunRegistry::default())),
             broker_pending: Arc::new(AsyncMutex::new(HashMap::new())),
             broker_tx,
             shutdown_tx: default_shutdown_tx(),
