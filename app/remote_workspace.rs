@@ -8670,6 +8670,25 @@ fn remote_optional_string(value: Option<&Value>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn remote_optional_trimmed_string(value: Option<&Value>) -> Option<String> {
+    remote_optional_string(value).and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn remote_new_chat_title(message: &str, chat_title_override: Option<String>) -> String {
+    chat_title_override.unwrap_or_else(|| {
+        message
+            .lines()
+            .next()
+            .unwrap_or("New chat")
+            .chars()
+            .take(80)
+            .collect()
+    })
+}
+
 fn remote_queued_skill_ids(value: Option<&Value>) -> Value {
     Value::Array(
         value
@@ -8880,6 +8899,7 @@ async fn remote_sidecar_chat_queue(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id = remote_optional_string(payload.get("providerId"));
     let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let chat_title_override = remote_optional_trimmed_string(payload.get("chatTitleOverride"));
     let skill_ids =
         remote_queued_skill_ids(payload.get("skillIds").or_else(|| payload.get("skill_ids")));
     let session_mode = remote_optional_string(payload.get("sessionMode"));
@@ -8892,13 +8912,7 @@ async fn remote_sidecar_chat_queue(
     {
         Some(chat) => chat,
         None => {
-            let title = message
-                .lines()
-                .next()
-                .unwrap_or("New chat")
-                .chars()
-                .take(80)
-                .collect::<String>();
+            let title = remote_new_chat_title(&message, chat_title_override);
             database
                 .insert_chat_with_metadata(&chat_id, &title, "{}")
                 .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
@@ -16516,6 +16530,10 @@ fn remote_plan_requires_initial_dispatch(plan: &foco_store::workspace::PlanRecor
             .any(|attempt| matches!(attempt.status.as_str(), "queued" | "running"))
 }
 
+fn remote_plan_phase_chat_title(plan_title: &str, phase_title: &str) -> String {
+    format!("{plan_title} - {phase_title}")
+}
+
 fn remote_plan_phase_prompt(
     plan: &foco_store::workspace::PlanRecord,
     phase: &foco_store::workspace::PlanPhaseRecord,
@@ -16600,6 +16618,7 @@ async fn remote_sidecar_dispatch_plan_phase(
         State(state.clone()),
         Json(json!({
             "message": prompt,
+            "chatTitleOverride": remote_plan_phase_chat_title(&plan.title, &phase.title),
             "modelId": selection.model_id,
             "providerId": selection.provider_id,
             "thinkingLevel": selection.thinking_level,
@@ -20417,6 +20436,100 @@ mod tests {
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].sequence, 0);
         assert_eq!(messages[2].sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_queue_uses_title_override_for_a_new_chat() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+
+        let queued = remote_sidecar_chat_queue(
+            State(state),
+            Json(json!({
+                "message": "Coordinator prompt must not become the title.",
+                "chatTitleOverride": "  Remote Plan - Implement phase  ",
+                "modelId": "model-1",
+            })),
+        )
+        .await
+        .expect("queue message")
+        .0;
+
+        assert_eq!(queued["chatTitle"], "Remote Plan - Implement phase");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_queue_falls_back_to_the_first_80_message_characters() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let message = format!("{}\nsecond line", "x".repeat(81));
+
+        let queued = remote_sidecar_chat_queue(
+            State(state),
+            Json(json!({
+                "message": message,
+                "chatTitleOverride": "   ",
+                "modelId": "model-1",
+            })),
+        )
+        .await
+        .expect("queue message")
+        .0;
+
+        assert_eq!(queued["chatTitle"], "x".repeat(80));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_queue_does_not_replace_an_existing_chat_title() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_chat("chat-existing", "Existing title")
+            .expect("insert chat");
+        drop(database);
+
+        let queued = remote_sidecar_chat_queue(
+            State(state),
+            Json(json!({
+                "chatId": "chat-existing",
+                "message": "A new queued message.",
+                "chatTitleOverride": "Plan - Phase",
+                "modelId": "model-1",
+            })),
+        )
+        .await
+        .expect("queue message")
+        .0;
+
+        assert_eq!(queued["chatTitle"], "Existing title");
+    }
+
+    #[tokio::test]
+    async fn remote_plan_phase_queue_persists_plan_and_phase_title() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let title = remote_plan_phase_chat_title("远程 Plan", "实施阶段");
+
+        let queued = remote_sidecar_chat_queue(
+            State(state),
+            Json(json!({
+                "message": "You are the Plan Coordinator. This prompt must not become the title.",
+                "chatTitleOverride": title,
+                "modelId": "model-1",
+            })),
+        )
+        .await
+        .expect("queue Plan phase")
+        .0;
+        let chat_id = queued["chatId"].as_str().expect("chat id");
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let chat = database
+            .chat(chat_id)
+            .expect("load chat")
+            .expect("queued chat");
+
+        assert_eq!(chat.title, "远程 Plan - 实施阶段");
     }
 
     #[tokio::test]
