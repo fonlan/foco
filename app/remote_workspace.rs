@@ -27,9 +27,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    ContextBudget, PendingToolCall, RejectedToolCall, build_available_tools_prompt,
-    build_memory_prompt_section, build_project_spec_prompt_section, calculate_context_budget,
-    estimate_text_tokens, plan_tool_execution, rejected_tool_batch,
+    AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId, AgentTaskId,
+    AgentTaskStatus, AgentTaskTransition, AgentTeamId, ContextBudget, PendingToolCall,
+    RejectedToolCall, build_available_tools_prompt, build_memory_prompt_section,
+    build_project_spec_prompt_section, calculate_context_budget, estimate_text_tokens,
+    plan_tool_execution, rejected_tool_batch,
 };
 use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
@@ -39,20 +41,24 @@ use foco_providers::{
     stream_chat_with_capture_observer,
 };
 use foco_store::{
-    config::{RemoteServerProfile, SkillSettings, WorkspaceConfig, WorkspaceLocation},
+    config::{
+        AgentDefinitionSettings, RemoteServerProfile, SkillSettings, WorkspaceConfig,
+        WorkspaceLocation,
+    },
     memory::{
         MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
         NewMemorySource,
     },
     workspace::{
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION, LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
-        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, NewToolCall,
+        AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
+        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentTask, NewAgentTeam,
+        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, PlanPhaseAttemptTrigger,
         RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
-        UpdateLlmRequestOutcome, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -74,6 +80,11 @@ use crate::{
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
     api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
     config_snapshot, config_update_snapshot, estimate_tool_schema_tokens,
+    git_backend::{
+        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, agent_worktree_relative_path, commit_staged_changes,
+        create_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
+        shared_workspace_head_commit_id, stage_git_file,
+    },
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
         PromptHookExecutorRequest, PromptHookFuture,
@@ -12815,7 +12826,7 @@ fn remote_chat_completion_event(
 fn remote_sidecar_subscribe_run_stream(
     run_stream: RemoteActiveRunStream,
     after_sequence: i64,
-) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
         let mut rx = run_stream.tx.subscribe();
         let replay = run_stream.snapshot_after(after_sequence);
@@ -12877,9 +12888,122 @@ fn remote_sidecar_subscribe_run_stream(
     }
 }
 
+#[derive(Clone)]
+struct RemotePlanTaskBinding {
+    task_id: AgentTaskId,
+}
+
+#[derive(Clone)]
+struct RemotePlanWorktree {
+    root_path: PathBuf,
+    base_revision: String,
+    branch: String,
+    phase_id: String,
+}
+
+fn remote_sidecar_resolve_tool_workspace_path(
+    workspace_path: &Path,
+    requested_path: &Path,
+) -> Result<(PathBuf, PathBuf), ApiError> {
+    let workspace_path = fs::canonicalize(workspace_path).map_err(|error| {
+        ApiError::bad_request(format!("remote workspace path cannot be resolved: {error}"))
+    })?;
+    let requested_path = fs::canonicalize(requested_path).map_err(|error| {
+        ApiError::bad_request(format!("toolWorkspacePath cannot be resolved: {error}"))
+    })?;
+    let agent_worktrees_path = workspace_path.join(".foco/agent-worktrees");
+    if requested_path != workspace_path && !requested_path.starts_with(&agent_worktrees_path) {
+        return Err(ApiError::bad_request(
+            "toolWorkspacePath must be the remote workspace or one of its Agent worktrees",
+        ));
+    }
+    Ok((workspace_path, requested_path))
+}
+
+fn remote_sidecar_validate_plan_task_binding(
+    database: &WorkspaceDatabase,
+    plan_task: Option<&RemotePlanTaskBinding>,
+    chat_id: &str,
+    tool_workspace_path: &Path,
+    workspace_path: &Path,
+) -> Result<(), ApiError> {
+    let Some(plan_task) = plan_task else {
+        return Ok(());
+    };
+    let task = database
+        .agent_task(&plan_task.task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "remote Plan Agent task '{}' was not found",
+                plan_task.task_id
+            ))
+        })?;
+    if task.status != AgentTaskStatus::Running {
+        return Err(ApiError::bad_request(format!(
+            "remote Plan Agent task '{}' is not running",
+            task.id
+        )));
+    }
+    let phase = database
+        .plan_phase_for_agent_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "remote Plan phase for Agent task '{}' was not found",
+                task.id
+            ))
+        })?;
+    if phase.implementation_chat_id.as_deref() != Some(chat_id) {
+        return Err(ApiError::bad_request(format!(
+            "remote Plan Agent task '{}' is not bound to chat '{}'",
+            task.id, chat_id
+        )));
+    }
+    let coordinator = database
+        .agent_instance(&task.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "remote Plan Coordinator '{}' was not found",
+                task.owner_instance_id
+            ))
+        })?;
+    if coordinator.execution_workspace_mode != AgentExecutionWorkspaceMode::IsolatedWorktree {
+        return Err(ApiError::bad_request(format!(
+            "remote Plan Coordinator '{}' is not using an isolated worktree",
+            coordinator.id
+        )));
+    }
+    let execution_root = coordinator.execution_root_path.as_deref().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "remote Plan Coordinator '{}' is missing its worktree path",
+            coordinator.id
+        ))
+    })?;
+    let expected_workspace_path =
+        fs::canonicalize(workspace_path.join(execution_root)).map_err(|error| {
+            ApiError::bad_request(format!(
+                "remote Plan Coordinator '{}' worktree cannot be resolved: {error}",
+                coordinator.id
+            ))
+        })?;
+    if expected_workspace_path != tool_workspace_path {
+        return Err(ApiError::bad_request(format!(
+            "remote Plan Agent task '{}' does not own the requested tool workspace",
+            task.id
+        )));
+    }
+    Ok(())
+}
+
 /// Owned state for a remote chat run that outlives any single SSE subscription.
 struct RemoteSidecarChatRunContext {
     state: RemoteSidecarState,
+    /// Tool execution may target an Agent worktree while durable chat/Plan state
+    /// remains anchored in the remote workspace database.
+    tool_state: RemoteSidecarState,
+    plan_task: Option<RemotePlanTaskBinding>,
     run_id: String,
     chat_id: String,
     chat_title: String,
@@ -12899,6 +13023,8 @@ struct RemoteSidecarChatRunContext {
 async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext) {
     let RemoteSidecarChatRunContext {
         state: stream_state,
+        tool_state,
+        plan_task,
         run_id,
         chat_id,
         chat_title,
@@ -12935,6 +13061,19 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     }),
                 );
                 remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+                if let Some(plan_task) = plan_task.as_ref()
+                    && let Err(plan_error) = remote_sidecar_fail_plan_task(
+                        &stream_state,
+                        &plan_task.task_id,
+                        "remote Plan Coordinator could not open its workspace database",
+                    )
+                {
+                    tracing::error!(
+                        task_id = %plan_task.task_id,
+                        error = %plan_error.message,
+                        "failed to close remote Plan task after workspace database open failure"
+                    );
+                }
                 remote_sidecar_finish_active_run(&stream_state, &run_id);
                 // Leave armed so Drop clears queuedRun after this early exit path.
                 drop(cleanup_guard);
@@ -12953,6 +13092,21 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             }),
         );
         remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+        // Do not open a second ordinary workspace connection while this run owns one.
+        drop(database);
+        if let Some(plan_task) = plan_task.as_ref()
+            && let Err(plan_error) = remote_sidecar_fail_plan_task(
+                &stream_state,
+                &plan_task.task_id,
+                "remote Plan Coordinator could not mark its implementation chat queued",
+            )
+        {
+            tracing::error!(
+                task_id = %plan_task.task_id,
+                error = %plan_error.message,
+                "failed to close remote Plan task after queued-run start failure"
+            );
+        }
         remote_sidecar_finish_active_run(&stream_state, &run_id);
         // Leave armed so Drop clears queuedRun after this early exit path.
         drop(cleanup_guard);
@@ -13409,7 +13563,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         }
                         let (broker_event_tx, mut broker_event_rx) = mpsc::unbounded_channel();
                         let execution = remote_sidecar_execute_tool_call(
-                            &stream_state,
+                            &tool_state,
                             &run_stream,
                             &tool_catalog,
                             broker_event_tx,
@@ -13679,36 +13833,476 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         }
     }
     let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
+    // Git operations must not retain the workspace DB connection. The Plan task
+    // lifecycle is persisted in short transactions around the worktree commit.
+    drop(database);
+    if let Some(plan_task) = plan_task.as_ref() {
+        match remote_sidecar_sync_plan_task_after_chat_with_retry(
+            &stream_state,
+            &plan_task.task_id,
+            &assistant_message_id,
+            run_stream.is_cancel_requested(),
+        )
+        .await
+        {
+            Ok(Some(plan)) => remote_sidecar_schedule_plan_continuation(stream_state.clone(), plan),
+            Ok(None) => {}
+            Err(error) => tracing::error!(
+                task_id = %plan_task.task_id,
+                error = %error.message,
+                "failed to synchronize remote Plan phase after Coordinator chat completion"
+            ),
+        }
+    }
     remote_sidecar_finish_active_run(&stream_state, &run_id);
     cleanup_guard.disarm();
 }
 
-async fn remote_sidecar_chat_stream(
-    State(state): State<RemoteSidecarState>,
-    Json(payload): Json<Value>,
-) -> Result<
-    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
-    axum::response::Response,
-> {
-    let chat_id = remote_required_text(payload.get("chatId"), "chatId")?;
+fn remote_sidecar_commit_plan_worktree(
+    worktree_path: &Path,
+    phase_title: &str,
+) -> Result<String, ApiError> {
+    let diff = git_diff_response(worktree_path, None)?;
+    let changed_paths = diff
+        .files
+        .iter()
+        .chain(diff.staged_files.iter())
+        .map(|file| file.path.trim())
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    if changed_paths.is_empty() {
+        return shared_workspace_head_commit_id(worktree_path);
+    }
+    for path in changed_paths {
+        stage_git_file(worktree_path, path)?;
+    }
+    let staged = git_diff_response(worktree_path, None)?;
+    if staged.staged_files.is_empty() {
+        return shared_workspace_head_commit_id(worktree_path);
+    }
+    commit_staged_changes(
+        worktree_path,
+        format!("plan: implement {}", phase_title.trim()),
+    )?;
+    shared_workspace_head_commit_id(worktree_path)
+}
+
+fn remote_sidecar_fail_plan_task(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+    message: &str,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+        .map_err(ApiError::from_workspace_error)?;
+    let task = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!("remote Plan Agent task '{task_id}' was not found"))
+        })?;
+    if matches!(
+        task.status,
+        AgentTaskStatus::Running | AgentTaskStatus::Waiting
+    ) {
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task.id,
+                expected_status: task.status,
+                transition: AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(&json!({ "message": message }).to_string()),
+                interruption_reason: None,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    database
+        .fail_plan_phase_run(&task.id, message)
+        .map_err(ApiError::from_workspace_error)
+        .map(|_| ())
+}
+
+fn remote_sidecar_cancel_plan_task(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+    message: &str,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+        .map_err(ApiError::from_workspace_error)?;
+    let task = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!("remote Plan Agent task '{task_id}' was not found"))
+        })?;
+    if matches!(
+        task.status,
+        AgentTaskStatus::Running | AgentTaskStatus::Waiting
+    ) {
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task.id,
+                expected_status: task.status,
+                transition: AgentTaskTransition::Cancel,
+                result_json: None,
+                error_json: Some(&json!({ "message": message }).to_string()),
+                interruption_reason: None,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    database
+        .cancel_plan_phase_run(&task.id, message)
+        .map_err(ApiError::from_workspace_error)
+        .map(|_| ())
+}
+
+fn remote_sidecar_sync_plan_task_after_chat(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+    assistant_message_id: &str,
+    cancelled: bool,
+) -> Result<Option<foco_store::workspace::PlanRecord>, ApiError> {
+    let (task, assistant_terminal_state, phase, worktree_path) = {
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        let task = database
+            .agent_task(task_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!("remote Plan Agent task '{task_id}' was not found"))
+            })?;
+        if !matches!(
+            task.status,
+            AgentTaskStatus::Running | AgentTaskStatus::Completed
+        ) {
+            return Ok(None);
+        }
+        let assistant_terminal_state = database
+            .message(assistant_message_id)
+            .map_err(ApiError::from_workspace_error)?
+            .and_then(|message| serde_json::from_str::<Value>(&message.metadata_json).ok())
+            .and_then(|metadata| {
+                metadata
+                    .get("streamingState")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+        let phase = database
+            .plan_phase_for_agent_task(task_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote Plan phase for Agent task '{task_id}' was not found"
+                ))
+            })?;
+        if phase.status != "running" {
+            return Ok(None);
+        }
+        let worktree_path = if cancelled || assistant_terminal_state.is_some() {
+            None
+        } else {
+            let instance = database
+                .agent_instance(&task.owner_instance_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "remote Plan Coordinator '{}' was not found",
+                        task.owner_instance_id
+                    ))
+                })?;
+            let worktree_relative_path =
+                instance.execution_root_path.as_deref().ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "remote Plan Coordinator '{}' is missing its worktree path",
+                        instance.id
+                    ))
+                })?;
+            Some(PathBuf::from(&state.workspace_path).join(worktree_relative_path))
+        };
+        (task, assistant_terminal_state, phase, worktree_path)
+    };
+    if task.status == AgentTaskStatus::Completed
+        && (cancelled || assistant_terminal_state.is_some())
+    {
+        return Ok(None);
+    }
+    if cancelled {
+        remote_sidecar_cancel_plan_task(
+            state,
+            task_id,
+            "remote Plan Coordinator chat was cancelled",
+        )?;
+        return Ok(None);
+    }
+    if assistant_terminal_state.is_some() {
+        remote_sidecar_fail_plan_task(state, task_id, "remote Plan Coordinator chat failed")?;
+        return Ok(None);
+    }
+    let worktree_path = worktree_path.ok_or_else(|| {
+        ApiError::internal(format!(
+            "remote Plan Coordinator '{}' has no worktree",
+            task.id
+        ))
+    })?;
+    let commit_id = match remote_sidecar_commit_plan_worktree(&worktree_path, &phase.title) {
+        Ok(commit_id) => commit_id,
+        Err(error) => {
+            remote_sidecar_fail_plan_task(state, task_id, &error.message)?;
+            return Ok(None);
+        }
+    };
+    let plan = {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        if task.status == AgentTaskStatus::Running {
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &task.team_id,
+                    task_id: &task.id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Complete,
+                    result_json: Some("{}"),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .map_err(ApiError::from_workspace_error)?;
+        }
+        database
+            .complete_plan_phase_run(task_id, Some(&commit_id))
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote Plan phase for Agent task '{task_id}' was not found"
+                ))
+            })?
+    };
+    Ok(Some(plan))
+}
+
+async fn remote_sidecar_sync_plan_task_after_chat_with_retry(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+    assistant_message_id: &str,
+    cancelled: bool,
+) -> Result<Option<foco_store::workspace::PlanRecord>, ApiError> {
+    let mut last_error = None;
+    for delay in [
+        Duration::ZERO,
+        Duration::from_millis(100),
+        Duration::from_millis(300),
+    ] {
+        if !delay.is_zero() {
+            sleep(delay).await;
+        }
+        match remote_sidecar_sync_plan_task_after_chat(
+            state,
+            task_id,
+            assistant_message_id,
+            cancelled,
+        ) {
+            Ok(plan) => return Ok(plan),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::internal("remote Plan completion retry did not produce an outcome")
+    }))
+}
+
+fn remote_sidecar_schedule_plan_continuation(
+    state: RemoteSidecarState,
+    plan: foco_store::workspace::PlanRecord,
+) {
+    // Starting a remote chat includes HTTP-handler preparation that is allowed to
+    // be !Send. The Coordinator's background run, however, must stay Send, so
+    // hand the next-phase/final-merge continuation to a blocking runtime worker.
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Handle::current();
+        if let Err(error) = runtime.block_on(remote_sidecar_continue_plan_if_ready(&state, plan)) {
+            tracing::error!(
+                error = %error.message,
+                "failed to continue remote Plan after Coordinator completion"
+            );
+        }
+    });
+}
+
+fn remote_sidecar_plan_worktree(
+    database: &WorkspaceDatabase,
+    workspace_path: &Path,
+    plan: &foco_store::workspace::PlanRecord,
+) -> Result<Option<RemotePlanWorktree>, ApiError> {
+    for phase in plan.phases.iter().rev() {
+        let mut team_ids = phase.agent_team_id.iter().cloned().collect::<Vec<_>>();
+        team_ids.extend(
+            phase
+                .attempts
+                .iter()
+                .rev()
+                .filter_map(|attempt| attempt.agent_team_id.clone()),
+        );
+        for team_id in team_ids {
+            let team_id =
+                AgentTeamId::new(team_id).map_err(|error| ApiError::internal(error.to_string()))?;
+            let Some(team) = database
+                .agent_team(&team_id)
+                .map_err(ApiError::from_workspace_error)?
+            else {
+                continue;
+            };
+            let Some(instance) = database
+                .agent_instance(&team.coordinator_instance_id)
+                .map_err(ApiError::from_workspace_error)?
+            else {
+                continue;
+            };
+            let (Some(root_path), Some(base_revision), Some(branch)) = (
+                instance.execution_root_path.as_deref(),
+                instance.worktree_base_revision.as_deref(),
+                instance.worktree_branch.as_deref(),
+            ) else {
+                continue;
+            };
+            if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+                && instance.worktree_status.as_deref() != Some("deleted")
+            {
+                return Ok(Some(RemotePlanWorktree {
+                    root_path: workspace_path.join(root_path),
+                    base_revision: base_revision.to_string(),
+                    branch: branch.to_string(),
+                    phase_id: phase.id.clone(),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn remote_sidecar_continue_plan_if_ready(
+    state: &RemoteSidecarState,
+    plan: foco_store::workspace::PlanRecord,
+) -> Result<(), ApiError> {
+    match plan.status.as_str() {
+        "ready" => {
+            let resumed = {
+                let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .transition_plan(&plan.id, "resume")
+                    .map_err(ApiError::from_workspace_error)?
+            };
+            if !remote_plan_requires_initial_dispatch(&resumed) {
+                return Ok(());
+            }
+            let phase_id = resumed.active_phase_id.clone();
+            if let Err(error) =
+                remote_sidecar_dispatch_plan_phase(state, resumed.clone(), None, None).await
+            {
+                if let Some(phase_id) = phase_id.as_deref() {
+                    remote_fail_plan_phase_dispatch(state, &resumed.id, phase_id, &error.message);
+                }
+                return Err(error);
+            }
+            Ok(())
+        }
+        "implemented" => remote_sidecar_finalize_plan_worktree(state, &plan).await,
+        _ => Ok(()),
+    }
+}
+
+async fn remote_sidecar_finalize_plan_worktree(
+    state: &RemoteSidecarState,
+    plan: &foco_store::workspace::PlanRecord,
+) -> Result<(), ApiError> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let Some(worktree) = ({
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        remote_sidecar_plan_worktree(&database, &workspace_path, plan)?
+    }) else {
+        return Ok(());
+    };
+
+    match fast_forward_shared_workspace_to_agent_worktree(
+        &workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    ) {
+        Ok(_) => {
+            let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace_path)?;
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
+                .map_err(ApiError::from_workspace_error)?;
+            Ok(())
+        }
+        Err(error) => {
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            if error.message.contains(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE) {
+                database
+                    .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+            } else {
+                database
+                    .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn remote_sidecar_start_chat_run(
+    state: RemoteSidecarState,
+    payload: Value,
+) -> Result<RemoteActiveRunStream, ApiError> {
+    let chat_id = remote_required_text(payload.get("chatId"), "chatId")
+        .map_err(|_| ApiError::bad_request("chatId is required"))?;
     let queued_user_message_id =
-        remote_required_text(payload.get("queuedUserMessageId"), "queuedUserMessageId")?;
-    let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
+        remote_required_text(payload.get("queuedUserMessageId"), "queuedUserMessageId")
+            .map_err(|_| ApiError::bad_request("queuedUserMessageId is required"))?;
+    let model_id = remote_required_text(payload.get("modelId"), "modelId")
+        .map_err(|_| ApiError::bad_request("modelId is required"))?;
     let provider_id =
         remote_optional_string(payload.get("providerId")).unwrap_or_else(|| "default".to_string());
-    let database = sidecar_workspace_database(&state)?;
+    let tool_workspace_path = remote_optional_string(payload.get("toolWorkspacePath"))
+        .unwrap_or_else(|| state.workspace_path.clone());
+    let tool_workspace_path = PathBuf::from(tool_workspace_path);
+    if !tool_workspace_path.is_absolute() {
+        return Err(ApiError::bad_request(
+            "toolWorkspacePath must be the remote workspace or one of its Agent worktrees",
+        ));
+    }
+    let (shared_workspace_path, tool_workspace_path) = remote_sidecar_resolve_tool_workspace_path(
+        Path::new(&state.workspace_path),
+        &tool_workspace_path,
+    )?;
+    let mut tool_state = state.clone();
+    tool_state.workspace_path = tool_workspace_path.display().to_string();
+    let plan_task = remote_optional_string(payload.get("planTaskId"))
+        .map(|task_id| AgentTaskId::new(task_id).map(|task_id| RemotePlanTaskBinding { task_id }))
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(ApiError::from_workspace_error)?;
     let chat = database
         .chat(&chat_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response()
-        })?;
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
     let user_message = database
         .message(&queued_user_message_id)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
-        .ok_or_else(|| {
-            ApiError::bad_request("queued user message was not found").into_response()
-        })?;
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::bad_request("queued user message was not found"))?;
+    remote_sidecar_validate_plan_task_binding(
+        &database,
+        plan_task.as_ref(),
+        &chat_id,
+        &tool_workspace_path,
+        &shared_workspace_path,
+    )?;
     let assistant_message_id = payload
         .get("visibleAssistantMessageId")
         .and_then(Value::as_str)
@@ -13723,7 +14317,8 @@ async fn remote_sidecar_chat_stream(
         })
         .unwrap_or_else(|| unique_id("msg-assistant"));
     let run_id = unique_id("remote-run");
-    let session_mode = remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id)?;
+    let session_mode = remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id)
+        .map_err(|_| ApiError::bad_request("queued user message does not belong to this chat"))?;
     let bundle = state
         .runtime_config
         .lock()
@@ -13733,9 +14328,10 @@ async fn remote_sidecar_chat_stream(
     let tool_catalog =
         match remote_sidecar_tool_catalog(&state, bundle.as_ref(), session_mode.as_deref()).await {
             Ok(catalog) => catalog,
-            Err(response) => return Err(response),
+            Err(_) => return Err(ApiError::internal("failed to prepare remote tool catalog")),
         };
-    let mut database = sidecar_workspace_database(&state)?;
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(ApiError::from_workspace_error)?;
     let initial_prepared = match remote_sidecar_prepare_chat_context(
         &state,
         &database,
@@ -13748,9 +14344,9 @@ async fn remote_sidecar_chat_stream(
         session_mode,
     ) {
         Ok(prepared) => prepared,
-        Err(response) => {
+        Err(_) => {
             let _ = remote_clear_message_queued_run(&mut database, &queued_user_message_id);
-            return Err(response);
+            return Err(ApiError::internal("failed to prepare remote chat context"));
         }
     };
     let initial_provider_request = initial_prepared.provider_request.clone();
@@ -13772,11 +14368,11 @@ async fn remote_sidecar_chat_stream(
     remote_sidecar_set_active_run(&state, run);
     let run_stream =
         remote_sidecar_insert_active_run_stream(&state, run_id.clone(), chat_id.clone());
-    // Subscribe before spawn so the initial client never misses early events.
-    let subscription = remote_sidecar_subscribe_run_stream(run_stream.clone(), -1);
     tokio::spawn(run_remote_sidecar_chat_in_background(
         RemoteSidecarChatRunContext {
             state: state.clone(),
+            tool_state,
+            plan_task,
             run_id,
             chat_id,
             chat_title: chat.title,
@@ -13784,7 +14380,7 @@ async fn remote_sidecar_chat_stream(
             assistant_message_id,
             model_id,
             provider_id,
-            run_stream,
+            run_stream: run_stream.clone(),
             initial_provider_request,
             tool_catalog,
             session_mode,
@@ -13793,6 +14389,20 @@ async fn remote_sidecar_chat_stream(
             initial_runtime_tool_state,
         },
     ));
+    Ok(run_stream)
+}
+
+async fn remote_sidecar_chat_stream(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event, Infallible>>>,
+    axum::response::Response,
+> {
+    let run_stream = remote_sidecar_start_chat_run(state, payload)
+        .await
+        .map_err(ApiError::into_response)?;
+    let subscription = remote_sidecar_subscribe_run_stream(run_stream, -1);
     Ok(Sse::new(subscription).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(10))
@@ -15614,6 +16224,318 @@ async fn remote_sidecar_plans_delete(
     Ok(Json(json!({ "deleted": deleted })))
 }
 
+#[derive(Clone, Debug)]
+struct RemotePlanRunnerSelection {
+    model_id: String,
+    provider_id: String,
+    thinking_level: Option<String>,
+    definition: AgentDefinitionSettings,
+}
+
+fn remote_sidecar_plan_runner_selection(
+    state: &RemoteSidecarState,
+    phase: &foco_store::workspace::PlanPhaseRecord,
+    retry_payload: Option<&Value>,
+) -> Result<RemotePlanRunnerSelection, ApiError> {
+    let bundle = state
+        .runtime_config
+        .lock()
+        .map_err(|_| ApiError::internal("remote sidecar runtime configuration lock is poisoned"))?
+        .clone()
+        .ok_or_else(|| {
+            ApiError::bad_request("remote runtime configuration has not been synchronized")
+        })?;
+    let definition_id = AgentDefinitionId::new("agent-definition-default")
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let definition = bundle
+        .payload
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == definition_id)
+        .cloned()
+        .ok_or_else(|| {
+            ApiError::bad_request("plan runner requires the default agent definition")
+        })?;
+    let requested_model_id = retry_payload
+        .and_then(|payload| payload.get("modelId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let model_id = requested_model_id
+        .map(str::to_string)
+        .or_else(|| {
+            phase
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.model_id.clone())
+        })
+        .unwrap_or_else(|| definition.model_id.clone());
+    let model = bundle
+        .payload
+        .models
+        .iter()
+        .find(|model| model.id == model_id && model.enabled)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("plan runner model is unavailable: {model_id}"))
+        })?;
+    let provider_id = model.active_provider_id.clone().ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "plan runner model '{model_id}' has no active provider route"
+        ))
+    })?;
+    let thinking_level = retry_payload
+        .and_then(|payload| payload.get("thinkingLevel"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            phase
+                .attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.thinking_level.clone())
+        })
+        .or_else(|| definition.model_options.thinking_level.clone());
+    Ok(RemotePlanRunnerSelection {
+        model_id,
+        provider_id,
+        thinking_level,
+        definition,
+    })
+}
+
+fn remote_plan_requires_initial_dispatch(plan: &foco_store::workspace::PlanRecord) -> bool {
+    let Some(phase_id) = plan.active_phase_id.as_deref() else {
+        return false;
+    };
+    let Some(phase) = plan.phases.iter().find(|phase| phase.id == phase_id) else {
+        return false;
+    };
+    phase.status == "running"
+        && phase.agent_task_id.is_none()
+        && !phase
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.status.as_str(), "queued" | "running"))
+}
+
+fn remote_plan_phase_prompt(
+    plan: &foco_store::workspace::PlanRecord,
+    phase: &foco_store::workspace::PlanPhaseRecord,
+) -> String {
+    let steps = phase
+        .steps
+        .iter()
+        .map(|step| {
+            let acceptance = if step.acceptance.is_empty() {
+                String::new()
+            } else {
+                format!("\n验收：{}", step.acceptance.join("；"))
+            };
+            format!("- {}{}{}", step.title, step.detail.as_str(), acceptance)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "你是 Plan 的 Coordinator。请在当前隔离 worktree 中实施以下阶段，使用工具检查、修改并验证代码；完成后总结实际改动与验证结果。\n\nPlan：{}\n{}\n\n阶段：{}\n{}\n\n步骤：\n{}",
+        plan.title, plan.overview, phase.title, phase.summary, steps
+    )
+}
+
+fn remote_fail_plan_phase_dispatch(
+    state: &RemoteSidecarState,
+    plan_id: &str,
+    phase_id: &str,
+    message: &str,
+) {
+    let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state)) else {
+        return;
+    };
+    if let Err(error) = database.fail_plan_phase_start(plan_id, phase_id, message) {
+        tracing::error!(
+            plan_id,
+            phase_id,
+            error = %error,
+            "failed to durably close remote Plan phase dispatch error"
+        );
+    }
+}
+
+async fn remote_sidecar_dispatch_plan_phase(
+    state: &RemoteSidecarState,
+    plan: foco_store::workspace::PlanRecord,
+    attempt_id: Option<String>,
+    retry_payload: Option<&Value>,
+) -> Result<foco_store::workspace::PlanRecord, ApiError> {
+    let phase_id = plan
+        .active_phase_id
+        .as_deref()
+        .ok_or_else(|| ApiError::internal(format!("plan '{}' has no active phase", plan.id)))?;
+    let phase = plan
+        .phases
+        .iter()
+        .find(|phase| phase.id == phase_id)
+        .ok_or_else(|| ApiError::internal(format!("plan phase was not found: {phase_id}")))?;
+    if phase.agent_task_id.is_some() {
+        return Ok(plan);
+    }
+    let selection = remote_sidecar_plan_runner_selection(state, phase, retry_payload)?;
+    let attempt_id = match attempt_id {
+        Some(attempt_id) => attempt_id,
+        None => {
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .begin_plan_phase_attempt(
+                    &plan.id,
+                    &phase.id,
+                    PlanPhaseAttemptTrigger::Initial,
+                    Some(&selection.provider_id),
+                    Some(&selection.model_id),
+                    selection.thinking_level.as_deref(),
+                )
+                .map_err(ApiError::from_workspace_error)?
+                .id
+        }
+    };
+    let prompt = remote_plan_phase_prompt(&plan, phase);
+    let queued = remote_sidecar_chat_queue(
+        State(state.clone()),
+        Json(json!({
+            "message": prompt,
+            "modelId": selection.model_id,
+            "providerId": selection.provider_id,
+            "thinkingLevel": selection.thinking_level,
+        })),
+    )
+    .await
+    .map_err(|response| {
+        ApiError::internal(format!(
+            "failed to queue remote Plan implementation chat: {response:?}"
+        ))
+    })?
+    .0;
+    let chat_id = remote_required_text(queued.get("chatId"), "chatId").map_err(|response| {
+        ApiError::internal(format!("queued Plan chat is invalid: {response:?}"))
+    })?;
+    let user_message_id = remote_required_text(queued.get("userMessageId"), "userMessageId")
+        .map_err(|response| {
+            ApiError::internal(format!("queued Plan chat is invalid: {response:?}"))
+        })?;
+    let assistant_message_id =
+        remote_required_text(queued.get("assistantMessageId"), "assistantMessageId").map_err(
+            |response| ApiError::internal(format!("queued Plan chat is invalid: {response:?}")),
+        )?;
+
+    let team_id = AgentTeamId::new(unique_id("agent-team"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let instance_id = AgentInstanceId::new(unique_id("agent-instance-plan"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let task_id = AgentTaskId::new(unique_id("agent-task"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let worktree = {
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        remote_sidecar_plan_worktree(&database, &workspace_path, &plan)?
+    };
+    let worktree = match worktree {
+        Some(worktree) => worktree,
+        None => {
+            let created = create_agent_worktree(&workspace_path, instance_id.as_str())?;
+            RemotePlanWorktree {
+                root_path: created.root_path,
+                base_revision: created.base_revision,
+                branch: created.branch,
+                phase_id: phase.id.clone(),
+            }
+        }
+    };
+    let worktree_root = agent_worktree_relative_path(&workspace_path, &worktree.root_path)?;
+    let input_json = json!({
+        "planId": plan.id,
+        "phaseId": phase.id,
+        "queuedUserMessageId": user_message_id,
+        "visibleAssistantMessageId": assistant_message_id,
+        "message": prompt,
+    })
+    .to_string();
+    let dispatched_plan = (|| {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        let (team, coordinator) = database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: &chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &selection.definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(&worktree_root),
+                coordinator_worktree_base_revision: Some(&worktree.base_revision),
+                coordinator_worktree_branch: Some(&worktree.branch),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team.id,
+                owner_instance_id: &coordinator.id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: &input_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .attach_plan_phase_attempt_run(&attempt_id, &chat_id, &team_id, &task_id)
+            .map_err(ApiError::from_workspace_error)?;
+        let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal("queued remote Plan Coordinator was not claimable")
+            })?;
+        database
+            .plan(&plan.id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::internal("plan was not found after remote dispatch"))
+    })();
+    let dispatched_plan = match dispatched_plan {
+        Ok(plan) => plan,
+        Err(error) => {
+            remote_fail_plan_phase_dispatch(state, &plan.id, &phase.id, &error.message);
+            return Err(error);
+        }
+    };
+    if let Err(response) = remote_sidecar_start_chat_run(
+        state.clone(),
+        json!({
+            "chatId": chat_id,
+            "queuedUserMessageId": user_message_id,
+            "visibleAssistantMessageId": assistant_message_id,
+            "modelId": selection.model_id,
+            "providerId": selection.provider_id,
+            "thinkingLevel": selection.thinking_level,
+            "toolWorkspacePath": worktree.root_path,
+            "planTaskId": task_id,
+        }),
+    )
+    .await
+    {
+        let error = ApiError::internal(format!(
+            "failed to start remote Plan Coordinator: {response:?}"
+        ));
+        remote_sidecar_fail_plan_task(state, &task_id, &error.message)?;
+        return Err(error);
+    }
+    Ok(dispatched_plan)
+}
+
 async fn remote_sidecar_plans_action(
     State(state): State<RemoteSidecarState>,
     AxumPath(plan_id): AxumPath<String>,
@@ -15623,33 +16545,137 @@ async fn remote_sidecar_plans_action(
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("action is required").into_response())?;
-    if matches!(action.trim(), "start" | "resume") {
-        return Err(ApiError::bad_request(
-            "remote plan start/resume requires execution dispatch and is unavailable through the Store-only sidecar action",
-        )
-        .into_response());
+    if action.trim() == "retry_merge" {
+        let plan = {
+            let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+            database
+                .plan(&plan_id)
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!("plan was not found: {plan_id}")).into_response()
+                })?
+        };
+        if plan.shared_merge_commit_id.is_none() {
+            if plan.status != "implemented" {
+                return Err(ApiError::bad_request(format!(
+                    "plan '{}' is not waiting for merge retry",
+                    plan.id
+                ))
+                .into_response());
+            }
+            remote_sidecar_finalize_plan_worktree(&state, &plan)
+                .await
+                .map_err(ApiError::into_response)?;
+        }
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        let plan = database
+            .plan(&plan_id)
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+            .ok_or_else(|| {
+                ApiError::internal("plan was not found after merge retry").into_response()
+            })?;
+        return Ok(Json(json!({ "plan": plan })));
     }
-    let mut database =
-        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let plan = database
-        .transition_plan(&plan_id, action)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(json!({ "plan": plan })))
+    let plan = {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        database
+            .transition_plan(&plan_id, action)
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+    };
+    if !matches!(action.trim(), "start" | "resume") || !remote_plan_requires_initial_dispatch(&plan)
+    {
+        return Ok(Json(json!({ "plan": plan })));
+    }
+    match remote_sidecar_dispatch_plan_phase(&state, plan.clone(), None, None).await {
+        Ok(plan) => Ok(Json(json!({ "plan": plan }))),
+        Err(error) => {
+            if let Some(phase_id) = plan.active_phase_id.as_deref() {
+                remote_fail_plan_phase_dispatch(&state, &plan.id, phase_id, &error.message);
+            }
+            Err(error.into_response())
+        }
+    }
 }
 
 async fn remote_sidecar_plans_phase_retry(
     State(state): State<RemoteSidecarState>,
     AxumPath((plan_id, phase_id)): AxumPath<(String, String)>,
-    Json(_payload): Json<Value>,
+    Json(payload): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let mut database =
-        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let plan = database
-        .fail_plan_phase_start(&plan_id, &phase_id, "remote phase retry queued on sidecar")
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    Ok(Json(json!({ "plan": plan })))
+    let (attempt_id, plan) = {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        let plan = database
+            .plan(&plan_id)
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("plan was not found: {plan_id}")).into_response()
+            })?;
+        let phase = plan
+            .phases
+            .iter()
+            .find(|phase| phase.id == phase_id)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("plan phase was not found: {phase_id}"))
+                    .into_response()
+            })?;
+        if !matches!(phase.status.as_str(), "failed" | "cancelled") {
+            return Err(
+                ApiError::bad_request(format!("plan phase '{phase_id}' is not retryable"))
+                    .into_response(),
+            );
+        }
+        let selection = remote_sidecar_plan_runner_selection(&state, phase, Some(&payload))
+            .map_err(ApiError::into_response)?;
+        let trigger = if payload
+            .get("modelId")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+            || payload
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        {
+            PlanPhaseAttemptTrigger::ModelOverrideRetry
+        } else {
+            PlanPhaseAttemptTrigger::Retry
+        };
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &plan.id,
+                &phase.id,
+                trigger,
+                Some(&selection.provider_id),
+                Some(&selection.model_id),
+                selection.thinking_level.as_deref(),
+            )
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        database
+            .discard_superseded_plan_phase_derived_effects(
+                &plan.id,
+                &phase.id,
+                &attempt.id,
+                "superseded by remote plan phase retry",
+            )
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        let plan = database
+            .plan(&plan.id)
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+            .ok_or_else(|| ApiError::internal("plan was not found after retry").into_response())?;
+        (attempt.id, plan)
+    };
+    match remote_sidecar_dispatch_plan_phase(&state, plan.clone(), Some(attempt_id), Some(&payload))
+        .await
+    {
+        Ok(plan) => Ok(Json(json!({ "plan": plan }))),
+        Err(error) => {
+            remote_fail_plan_phase_dispatch(&state, &plan.id, &phase_id, &error.message);
+            Err(error.into_response())
+        }
+    }
 }
 
 async fn remote_sidecar_plans_step_action(
@@ -15794,67 +16820,262 @@ async fn remote_sidecar_plans_worktree_cleanup(
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn remote_sidecar_plans_action_rejects_store_only_start_and_resume() {
+    #[test]
+    fn remote_plan_dispatch_only_targets_unbound_running_phase() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        {
-            let mut database =
-                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
-            database
-                .create_plan(foco_store::workspace::NewPlan {
-                    id: "plan-remote-fake-start",
-                    title: "Remote fake start",
-                    overview: "Sidecar start without dispatch.",
-                    status: "ready",
-                    source_chat_id: None,
-                    phases: vec![foco_store::workspace::NewPlanPhase {
-                        id: "plan-remote-fake-start-phase-1",
-                        title: "Phase one",
-                        summary: "Surface running only.",
-                        steps: vec![foco_store::workspace::NewPlanStep {
-                            id: "plan-remote-fake-start-step-1",
-                            title: "Work",
-                            detail: "Needs agent.",
-                            acceptance: vec!["has task after real dispatch".to_string()],
-                        }],
-                    }],
-                })
-                .expect("create plan");
-        }
-        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
-
-        let start_error = remote_sidecar_plans_action(
-            State(state.clone()),
-            AxumPath("plan-remote-fake-start".to_string()),
-            Json(json!({ "action": "start" })),
-        )
-        .await
-        .expect_err("Store-only endpoint must reject start");
-        assert_eq!(start_error.status(), axum::http::StatusCode::BAD_REQUEST);
-
         let mut database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
         database
-            .transition_plan("plan-remote-fake-start", "pause")
-            .expect("pause ready plan");
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-remote-dispatch",
+                title: "Remote dispatch",
+                overview: "Dispatch only a fresh running phase.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "plan-remote-dispatch-phase-1",
+                    title: "Phase one",
+                    summary: "Needs a Coordinator.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "plan-remote-dispatch-step-1",
+                        title: "Work",
+                        detail: "Needs agent.",
+                        acceptance: vec!["has task after dispatch".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        let started = database
+            .transition_plan("plan-remote-dispatch", "start")
+            .expect("start plan");
+        assert!(remote_plan_requires_initial_dispatch(&started));
 
-        let resume_error = remote_sidecar_plans_action(
-            State(state.clone()),
-            AxumPath("plan-remote-fake-start".to_string()),
-            Json(json!({ "action": "resume" })),
+        let phase = &started.phases[0];
+        database
+            .begin_plan_phase_attempt(
+                &started.id,
+                &phase.id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+            )
+            .expect("begin attempt");
+        let with_attempt = database
+            .plan("plan-remote-dispatch")
+            .expect("reload plan")
+            .expect("plan");
+        assert!(!remote_plan_requires_initial_dispatch(&with_attempt));
+    }
+
+    #[test]
+    fn remote_plan_worktree_commit_can_fast_forward_shared_workspace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "tests@example.com"]);
+        git(&["config", "user.name", "Foco Tests"]);
+        fs::write(workspace.path().join("README.md"), "base\n").expect("write base file");
+        fs::write(workspace.path().join(".gitignore"), ".foco/\n")
+            .expect("ignore Foco runtime directory");
+        git(&["add", "README.md", ".gitignore"]);
+        git(&["commit", "-m", "base"]);
+
+        let worktree = create_agent_worktree(workspace.path(), "agent-instance-remote-plan")
+            .expect("create Agent worktree");
+        fs::write(
+            worktree.root_path.join("README.md"),
+            "implemented remotely\n",
         )
-        .await
-        .expect_err("Store-only endpoint must reject resume");
-        assert_eq!(resume_error.status(), axum::http::StatusCode::BAD_REQUEST);
+        .expect("write worktree change");
 
+        let commit_id = remote_sidecar_commit_plan_worktree(&worktree.root_path, "Phase one")
+            .expect("commit worktree change");
+        assert_ne!(commit_id, worktree.base_revision);
+        assert_eq!(
+            remote_sidecar_commit_plan_worktree(&worktree.root_path, "Phase one")
+                .expect("record unchanged worktree HEAD"),
+            commit_id
+        );
+        assert!(
+            remote_sidecar_resolve_tool_workspace_path(
+                workspace.path(),
+                &worktree.root_path.join("../../../.."),
+            )
+            .is_err(),
+            "canonicalization must reject a path that escapes the Agent worktree root"
+        );
+
+        let merged = fast_forward_shared_workspace_to_agent_worktree(
+            workspace.path(),
+            &worktree.root_path,
+            &worktree.base_revision,
+        )
+        .expect("fast-forward remote Plan worktree");
+        assert_eq!(merged.as_deref(), Some(commit_id.as_str()));
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("README.md")).expect("read merged file"),
+            "implemented remotely\n"
+        );
+        assert_eq!(
+            shared_workspace_head_commit_id(workspace.path()).expect("shared HEAD"),
+            commit_id
+        );
+    }
+
+    #[test]
+    fn remote_plan_task_cancellation_closes_task_attempt_and_phase() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        fs::create_dir_all(workspace.path().join(".foco/agent-worktrees/remote-cancel"))
+            .expect("create remote Coordinator worktree");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-remote-cancel",
+                title: "Remote cancellation",
+                overview: "Cancelling the Coordinator must close the Plan lifecycle.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "plan-remote-cancel-phase-1",
+                    title: "Phase one",
+                    summary: "Will be cancelled.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "plan-remote-cancel-step-1",
+                        title: "Work",
+                        detail: "Cancel the Coordinator.",
+                        acceptance: vec!["lifecycle is cancelled".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        let started = database
+            .transition_plan("plan-remote-cancel", "start")
+            .expect("start plan");
+        let phase = &started.phases[0];
+        let attempt = database
+            .begin_plan_phase_attempt(
+                &started.id,
+                &phase.id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider-test"),
+                Some("model-test"),
+                None,
+            )
+            .expect("begin attempt");
+        database
+            .insert_chat("chat-remote-cancel", "Remote cancellation")
+            .expect("insert implementation chat");
+        let team_id = AgentTeamId::new("agent-team-remote-cancel").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-remote-cancel").expect("instance id");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-remote-cancel").expect("definition id"),
+            revision: 1,
+            name: "Remote coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Implement the phase.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-remote-cancel",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(".foco/agent-worktrees/remote-cancel"),
+                coordinator_worktree_base_revision: Some("base-revision"),
+                coordinator_worktree_branch: Some("foco/remote-cancel"),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .expect("create coordinator team");
+        let task_id = AgentTaskId::new("agent-task-remote-cancel").expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue coordinator task");
+        database
+            .attach_plan_phase_attempt_run(&attempt.id, "chat-remote-cancel", &team_id, &task_id)
+            .expect("attach plan attempt");
+        let agent_attempt_id =
+            AgentAttemptId::new("agent-attempt-remote-cancel").expect("agent attempt id");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .expect("claim task")
+            .expect("task claimed");
+        let plan_task = RemotePlanTaskBinding {
+            task_id: task_id.clone(),
+        };
+        let tool_workspace_path =
+            fs::canonicalize(workspace.path().join(".foco/agent-worktrees/remote-cancel"))
+                .expect("canonical remote Coordinator worktree");
+        remote_sidecar_validate_plan_task_binding(
+            &database,
+            Some(&plan_task),
+            "chat-remote-cancel",
+            &tool_workspace_path,
+            workspace.path(),
+        )
+        .expect("valid remote Plan task binding");
+        let error = remote_sidecar_validate_plan_task_binding(
+            &database,
+            Some(&plan_task),
+            "chat-other",
+            &tool_workspace_path,
+            workspace.path(),
+        )
+        .expect_err("unrelated chat must not complete the Plan task");
+        assert!(error.message.contains("is not bound to chat"));
+        drop(database);
+
+        remote_sidecar_cancel_plan_task(&state, &task_id, "remote run was cancelled")
+            .expect("cancel remote Plan task");
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reload workspace database");
         let plan = database
-            .plan("plan-remote-fake-start")
+            .plan("plan-remote-cancel")
             .expect("load plan")
             .expect("plan");
         assert_eq!(plan.status, "paused");
-        assert!(plan.active_phase_id.is_none());
-        assert!(plan.phases[0].agent_task_id.is_none());
-        assert!(plan.phases[0].attempts.is_empty());
+        assert_eq!(plan.phases[0].status, "cancelled");
+        assert_eq!(plan.phases[0].attempts[0].status, "cancelled");
+        assert_eq!(
+            database
+                .agent_task(&task_id)
+                .expect("load task")
+                .expect("task")
+                .status,
+            AgentTaskStatus::Cancelled
+        );
     }
 
     #[test]
@@ -17723,7 +18944,7 @@ mod tests {
             );
             let oversized = format!(
                 "# Project Spec\n\n## Purpose\n\n{}\n",
-                "x".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000)
+                "x".repeat(foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 1_000)
             );
             answer_broker_spec_tool_call(
                 &broker_pending,
@@ -17924,7 +19145,7 @@ mod tests {
             );
             let oversized = format!(
                 "# Project Spec\n\n## Purpose\n\n{}\n",
-                "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+                "y".repeat(foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
             );
             answer_broker_spec_tool_call(
                 &broker_pending,
@@ -17969,7 +19190,9 @@ mod tests {
                     "edits": [{
                         "oldText": format!(
                             "# Project Spec\n\n## Purpose\n\n{}\n",
-                            "y".repeat(WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500)
+                            "y".repeat(
+                                foco_store::workspace::WORKSPACE_SPEC_MAX_MARKDOWN_BYTES + 500
+                            )
                         ),
                         "newText": "# Project Spec\n\n## Purpose\n\nRemote update compacted.\n"
                     }]
@@ -28879,7 +30102,7 @@ mod tests {
             if role == "assistant" {
                 let tool_id = format!("tool-{sequence}");
                 database
-                    .insert_tool_call(NewToolCall {
+                    .insert_tool_call(foco_store::workspace::NewToolCall {
                         id: &tool_id,
                         chat_id: "chat-1",
                         run_id: "run-1",
