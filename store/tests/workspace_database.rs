@@ -2623,6 +2623,12 @@ fn phase_commit_does_not_mark_plan_shared_merged() {
             &task_id,
         )
         .expect("attach phase");
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &task_id,
+        "agent-attempt-plan-shared-merge-marker",
+    );
 
     let completed = database
         .complete_plan_phase_run(&task_id, Some("phase-commit"))
@@ -2698,6 +2704,12 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
             &task_id,
         )
         .expect("attach phase");
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &task_id,
+        "agent-attempt-plan-blocked-merge-complete",
+    );
 
     database
         .set_plan_auto_run_enabled(true)
@@ -3713,7 +3725,7 @@ fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
     assert_eq!(plan.phases[0].status, "running");
     assert_eq!(plan.phases[1].status, "completed");
 
-    let completed_retry = database
+    let still_running = database
         .update_plan_step(
             "plan-retry-earliest-cancelled",
             "plan-retry-earliest-cancelled-step-1",
@@ -3725,6 +3737,16 @@ fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
             },
         )
         .expect("complete retried earliest phase");
+    assert_eq!(still_running.status, "running");
+    assert_eq!(still_running.phases[0].status, "running");
+
+    let completed_retry = database
+        .complete_plan_phase_by_id(
+            "plan-retry-earliest-cancelled",
+            "plan-retry-earliest-cancelled-phase-1",
+            None,
+        )
+        .expect("complete retry lifecycle");
     assert_eq!(completed_retry.status, "implemented");
     assert!(completed_retry.active_phase_id.is_none());
     assert_eq!(completed_retry.phases[0].status, "completed");
@@ -16139,6 +16161,12 @@ fn plan_worktree_audit_lists_unmerged_isolated_plan_worktrees() {
             &task_id,
         )
         .expect("attach phase run");
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &task_id,
+        "agent-attempt-plan-worktree-audit",
+    );
     database
         .complete_plan_phase_run(&task_id, Some("0123456789abcdef0123456789abcdef01234567"))
         .expect("complete phase")

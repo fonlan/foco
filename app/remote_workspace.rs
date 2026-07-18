@@ -8630,6 +8630,57 @@ fn remote_sidecar_runner_still_owns_turn(
     assistant_ok && user_ok
 }
 
+fn remote_sidecar_persist_owned_assistant_message(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    assistant_message_id: &str,
+    queued_user_message_id: &str,
+    content: &str,
+    metadata_json: &str,
+) -> Result<bool, WorkspaceDatabaseError> {
+    if !remote_sidecar_runner_still_owns_turn(
+        database,
+        chat_id,
+        assistant_message_id,
+        queued_user_message_id,
+    ) {
+        return Ok(false);
+    }
+
+    if database.update_existing_message_content(
+        assistant_message_id,
+        chat_id,
+        "assistant",
+        content,
+        metadata_json,
+    )? {
+        return Ok(true);
+    }
+
+    // Re-check after the failed update so edit/delete cannot race a missing-row insert.
+    if !remote_sidecar_runner_still_owns_turn(
+        database,
+        chat_id,
+        assistant_message_id,
+        queued_user_message_id,
+    ) {
+        return Ok(false);
+    }
+    let assistant_sequence = match database.message(assistant_message_id)? {
+        Some(message) => message.sequence,
+        None => database.next_message_sequence_for_chat(chat_id)?,
+    };
+    database.upsert_message_content(NewMessage {
+        id: assistant_message_id,
+        chat_id,
+        role: "assistant",
+        content,
+        sequence: assistant_sequence,
+        metadata_json: Some(metadata_json),
+    })?;
+    Ok(true)
+}
+
 fn remote_mark_message_queued_run_started(
     database: &mut WorkspaceDatabase,
     message_id: &str,
@@ -11582,15 +11633,7 @@ async fn remote_sidecar_run_broker_llm_turn(
 
                 // Final completion: re-check cancel and durable ownership at the
                 // persistence boundary so edit/delete cannot race a late upsert.
-                if run_stream.is_cancel_requested()
-                    || run_stream.is_finished()
-                    || !remote_sidecar_runner_still_owns_turn(
-                        database,
-                        chat_id,
-                        assistant_message_id,
-                        queued_user_message_id,
-                    )
-                {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
                     state.broker_pending.lock().await.remove(broker_request_id);
                     return Err(());
                 }
@@ -11620,48 +11663,27 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "partsSource": "live_sse",
                     "metrics": metrics,
                 });
-                // Prefer UPDATE of an existing streaming placeholder. Only insert when
-                // ownership still holds and the assistant row is genuinely missing.
-                let updated = database
-                    .update_existing_message_content(
-                        assistant_message_id,
-                        chat_id,
-                        "assistant",
-                        text,
-                        &metadata.to_string(),
-                    )
-                    .unwrap_or(false);
-                if !updated {
-                    if !remote_sidecar_runner_still_owns_turn(
-                        database,
-                        chat_id,
-                        assistant_message_id,
-                        queued_user_message_id,
-                    ) {
+                let metadata_json = metadata.to_string();
+                match remote_sidecar_persist_owned_assistant_message(
+                    database,
+                    chat_id,
+                    assistant_message_id,
+                    queued_user_message_id,
+                    text,
+                    &metadata_json,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
                         state.broker_pending.lock().await.remove(broker_request_id);
                         return Err(());
                     }
-                    let assistant_sequence = database
-                        .message(assistant_message_id)
-                        .ok()
-                        .flatten()
-                        .map(|message| message.sequence)
-                        .unwrap_or_else(|| {
-                            database
-                                .next_message_sequence_for_chat(chat_id)
-                                .unwrap_or(0)
-                        });
-                    if database
-                        .upsert_message_content(NewMessage {
-                            id: assistant_message_id,
+                    Err(error) => {
+                        tracing::warn!(
                             chat_id,
-                            role: "assistant",
-                            content: text,
-                            sequence: assistant_sequence,
-                            metadata_json: Some(&metadata.to_string()),
-                        })
-                        .is_err()
-                    {
+                            assistant_message_id,
+                            error = %error,
+                            "failed to persist completed remote assistant message"
+                        );
                         state.broker_pending.lock().await.remove(broker_request_id);
                         return Err(());
                     }
@@ -13790,18 +13812,20 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     "partsSource": "live_sse",
                     "metrics": metrics,
                 });
-                if remote_sidecar_runner_still_owns_turn(
-                    &database,
+                let metadata_json = metadata.to_string();
+                if let Err(error) = remote_sidecar_persist_owned_assistant_message(
+                    &mut database,
                     &chat_id,
                     &assistant_message_id,
                     &queued_user_message_id,
+                    &text,
+                    &metadata_json,
                 ) {
-                    let _ = database.update_existing_message_content(
-                        &assistant_message_id,
-                        &chat_id,
-                        "assistant",
-                        &text,
-                        &metadata.to_string(),
+                    tracing::warn!(
+                        chat_id,
+                        assistant_message_id,
+                        error = %error,
+                        "failed to persist remote assistant after exhausted reasoning-loop recoveries"
                     );
                 }
                 sequence += 1;
@@ -21798,7 +21822,16 @@ mod tests {
                 role: "user",
                 content: "Capture the real SSH sidecar provider wire.",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-ssh",
+                            "assistantMessageId": "msg-assistant-ssh",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         drop(database);
@@ -24002,7 +24035,16 @@ mod tests {
                 role: "user",
                 content: "hello",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (state, broker_rx) =
@@ -24137,7 +24179,16 @@ mod tests {
                 role: "user",
                 content: "read Cargo.toml",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (state, broker_rx) =
@@ -24616,7 +24667,16 @@ mod tests {
                 role: "user",
                 content: "trigger loop then recover",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (state, broker_rx) =
@@ -24937,7 +24997,16 @@ mod tests {
                 role: "user",
                 content: "exhaust recoveries",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (state, broker_rx) =
@@ -25082,7 +25151,16 @@ mod tests {
                 role: "user",
                 content: "loop then tool",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         database
@@ -25382,7 +25460,16 @@ mod tests {
                 role: "user",
                 content: "hello",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "running",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         database
@@ -29862,7 +29949,16 @@ mod tests {
                 role: "user",
                 content: "trigger a conflicting tool batch",
                 sequence: 0,
-                metadata_json: Some("{}"),
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-1",
+                            "assistantMessageId": "msg-assistant-1",
+                        }
+                    })
+                    .to_string(),
+                ),
             })
             .expect("insert user message");
         let (state, broker_rx) =

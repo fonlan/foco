@@ -16561,6 +16561,15 @@ fn run_migrations(
                 !table_exists(&transaction, database_path, "workspace_specs")?
                     || !table_exists(&transaction, database_path, "chat_spec_snapshots")?
             }
+            40 => {
+                !table_exists(&transaction, database_path, "workspace_spec_jobs")?
+                    || table_has_column(
+                        &transaction,
+                        database_path,
+                        "workspace_spec_jobs",
+                        "lease_renewed_at",
+                    )?
+            }
             _ => false,
         };
         if skip_migration {

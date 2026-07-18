@@ -1,6 +1,7 @@
 use std::{
     cmp::Ordering,
     env,
+    ffi::{OsStr, OsString},
     net::SocketAddr,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -37,6 +38,10 @@ const UPDATED_RESTART_READY_TIMEOUT_SECS: u64 = 120;
 /// How long the updated process itself waits for `/api/health` before giving up on the ready marker.
 const UPDATED_RESTART_HEALTH_POLL_TIMEOUT_SECS: u64 = 90;
 const UPDATED_RESTART_HEALTH_POLL_INTERVAL_MS: u64 = 250;
+/// Marker written as soon as the detached macOS helper starts executing.
+const UPDATE_HELPER_STARTED_FILE: &str = "helper-started.txt";
+const UPDATE_HELPER_START_TIMEOUT_SECS: u64 = 5;
+const UPDATE_HELPER_START_POLL_INTERVAL_MS: u64 = 25;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -639,7 +644,7 @@ pub(crate) async fn install_update(state: &AppState) -> Result<UpdateStatusSumma
     if let Ok(mut update_state) = state.update_state.lock() {
         update_state.install_error = None;
     }
-    start_update_helper(&prepared)?;
+    start_update_helper(&prepared).await?;
     request_shutdown_after_update_helper_started(state.app_shutdown_tx.clone());
 
     // Re-read after clearing install_error so the install response does not echo a stale failure.
@@ -1036,9 +1041,9 @@ fn preflight_platform_installation() -> Result<(), ApiError> {
     }
 }
 
-fn start_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), ApiError> {
+async fn start_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), ApiError> {
     if cfg!(target_os = "macos") {
-        start_macos_update_helper(prepared)
+        start_macos_update_helper(prepared).await
     } else if cfg!(windows) {
         start_windows_update_helper(prepared)
     } else {
@@ -1048,7 +1053,7 @@ fn start_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), ApiError>
     }
 }
 
-fn start_macos_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), ApiError> {
+async fn start_macos_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), ApiError> {
     let current_exe = env::current_exe().map_err(|source| {
         ApiError::internal(format!(
             "failed to locate current Foco executable: {source}"
@@ -1070,45 +1075,192 @@ fn start_macos_update_helper(prepared: &PreparedUpdateInstall) -> Result<(), Api
     })?;
     let result_path = updates_root.join(LAST_INSTALL_FAILURE_FILE);
     let ready_path = updates_root.join(UPDATED_RESTART_READY_FILE);
+    let started_path = prepared.update_dir.join(UPDATE_HELPER_STARTED_FILE);
+    match std::fs::remove_file(&started_path) {
+        Ok(()) => {}
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ApiError::internal(format!(
+                "failed to clear previous Foco update helper marker {}: {source}",
+                started_path.display()
+            )));
+        }
+    }
 
-    let mut command = Command::new("/bin/sh");
-    command
-        .arg(&script_path)
-        .env("FOCO_UPDATE_DMG", &prepared.archive_path)
-        .env("FOCO_UPDATE_APP", &app_bundle)
-        .env("FOCO_UPDATE_PID", std::process::id().to_string())
-        .env(
-            "FOCO_UPDATE_LOG",
-            prepared
-                .update_dir
-                .join(format!("apply-{}.log", prepared.version)),
-        )
-        .env("FOCO_UPDATE_RESULT", &result_path)
-        .env("FOCO_UPDATE_READY", &ready_path)
-        .env(
-            "FOCO_UPDATE_READY_TIMEOUT_SECS",
-            UPDATED_RESTART_READY_TIMEOUT_SECS.to_string(),
-        )
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    command.spawn().map_err(|source| {
-        ApiError::internal(format!(
-            "failed to start Foco macOS update helper: {source}"
-        ))
-    })?;
+    let pid = std::process::id();
+    let label = macos_update_helper_label(pid);
+    let launch_args = macos_update_launch_args(MacosUpdateLaunch {
+        app_bundle: &app_bundle,
+        label: &label,
+        pid,
+        prepared,
+        ready_path: &ready_path,
+        result_path: &result_path,
+        script_path: &script_path,
+        started_path: &started_path,
+    });
+    let output = Command::new("/bin/launchctl")
+        .args(&launch_args)
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to submit detached Foco macOS update helper: {source}"
+            ))
+        })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            output.status.to_string()
+        } else {
+            stderr.trim().to_string()
+        };
+        return Err(ApiError::internal(format!(
+            "failed to submit detached Foco macOS update helper: {detail}"
+        )));
+    }
+
+    if let Err(error) = wait_for_macos_update_helper_start(&started_path).await {
+        let remove_output = Command::new("/bin/launchctl")
+            .args(["remove", &label])
+            .output();
+        match remove_output {
+            Ok(remove_output) if !remove_output.status.success() => {
+                tracing::warn!(
+                    label,
+                    stderr = %String::from_utf8_lossy(&remove_output.stderr).trim(),
+                    "failed to remove unacknowledged Foco update helper job"
+                );
+            }
+            Err(source) => {
+                tracing::warn!(
+                    label,
+                    error = %source,
+                    "failed to invoke launchctl for unacknowledged Foco update helper cleanup"
+                );
+            }
+            Ok(_) => {}
+        }
+        return Err(error);
+    }
+
+    tracing::info!(
+        label,
+        "detached Foco macOS update helper acknowledged startup"
+    );
     Ok(())
+}
+
+struct MacosUpdateLaunch<'a> {
+    app_bundle: &'a Path,
+    label: &'a str,
+    pid: u32,
+    prepared: &'a PreparedUpdateInstall,
+    ready_path: &'a Path,
+    result_path: &'a Path,
+    script_path: &'a Path,
+    started_path: &'a Path,
+}
+
+fn macos_update_helper_label(pid: u32) -> String {
+    format!("app.foco.update.{pid}")
+}
+
+fn macos_update_launch_args(launch: MacosUpdateLaunch<'_>) -> Vec<OsString> {
+    let log_path = launch
+        .prepared
+        .update_dir
+        .join(format!("apply-{}.log", launch.prepared.version));
+    let pid = launch.pid.to_string();
+    let ready_timeout_secs = UPDATED_RESTART_READY_TIMEOUT_SECS.to_string();
+    vec![
+        OsString::from("submit"),
+        OsString::from("-l"),
+        OsString::from(launch.label),
+        OsString::from("-o"),
+        OsString::from("/dev/null"),
+        OsString::from("-e"),
+        OsString::from("/dev/null"),
+        OsString::from("--"),
+        OsString::from("/usr/bin/env"),
+        environment_assignment("FOCO_UPDATE_DMG", launch.prepared.archive_path.as_os_str()),
+        environment_assignment("FOCO_UPDATE_APP", launch.app_bundle.as_os_str()),
+        environment_assignment("FOCO_UPDATE_PID", OsStr::new(&pid)),
+        environment_assignment("FOCO_UPDATE_LOG", log_path.as_os_str()),
+        environment_assignment("FOCO_UPDATE_RESULT", launch.result_path.as_os_str()),
+        environment_assignment("FOCO_UPDATE_READY", launch.ready_path.as_os_str()),
+        environment_assignment("FOCO_UPDATE_STARTED", launch.started_path.as_os_str()),
+        environment_assignment("FOCO_UPDATE_JOB_LABEL", OsStr::new(launch.label)),
+        environment_assignment(
+            "FOCO_UPDATE_READY_TIMEOUT_SECS",
+            OsStr::new(&ready_timeout_secs),
+        ),
+        OsString::from("/bin/sh"),
+        launch.script_path.as_os_str().to_os_string(),
+    ]
+}
+
+fn environment_assignment(name: &str, value: &OsStr) -> OsString {
+    let mut assignment = OsString::from(name);
+    assignment.push("=");
+    assignment.push(value);
+    assignment
+}
+
+async fn wait_for_macos_update_helper_start(started_path: &Path) -> Result<(), ApiError> {
+    let deadline =
+        tokio::time::Instant::now() + Duration::from_secs(UPDATE_HELPER_START_TIMEOUT_SECS);
+    loop {
+        match std::fs::read_to_string(started_path) {
+            Ok(_) => {
+                if let Err(source) = std::fs::remove_file(started_path) {
+                    tracing::warn!(
+                        path = %started_path.display(),
+                        error = %source,
+                        "failed to clear Foco update helper startup marker"
+                    );
+                }
+                return Ok(());
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ApiError::internal(format!(
+                    "failed to read Foco update helper startup marker {}: {source}",
+                    started_path.display()
+                )));
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::internal(format!(
+                "detached Foco macOS update helper did not acknowledge startup within {} seconds",
+                UPDATE_HELPER_START_TIMEOUT_SECS
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(UPDATE_HELPER_START_POLL_INTERVAL_MS)).await;
+    }
 }
 
 fn macos_update_script() -> &'static str {
     r#"#!/bin/sh
 set -eu
+: "${FOCO_UPDATE_JOB_LABEL:?}"
+
+volume=""
+cleanup() {
+  if [ -n "$volume" ]; then
+    hdiutil detach "$volume" >/dev/null 2>&1 || true
+  fi
+  /bin/launchctl remove "$FOCO_UPDATE_JOB_LABEL" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 : "${FOCO_UPDATE_DMG:?}"
 : "${FOCO_UPDATE_APP:?}"
 : "${FOCO_UPDATE_PID:?}"
 : "${FOCO_UPDATE_LOG:?}"
 : "${FOCO_UPDATE_RESULT:?}"
 : "${FOCO_UPDATE_READY:?}"
+: "${FOCO_UPDATE_STARTED:?}"
 : "${FOCO_UPDATE_READY_TIMEOUT_SECS:?}"
 
 # Logging must never prevent rollback/relaunch on failure paths.
@@ -1122,6 +1274,13 @@ write_result() {
   mkdir -p "$(dirname "$FOCO_UPDATE_RESULT")" 2>/dev/null || true
   printf '%s\n' "$message" >"$FOCO_UPDATE_RESULT" 2>/dev/null || true
 }
+
+mkdir -p "$(dirname "$FOCO_UPDATE_STARTED")" 2>/dev/null || true
+if ! printf 'pid=%s\n' "$$" >"$FOCO_UPDATE_STARTED"; then
+  write_result "Update failed: detached update helper could not write its startup marker."
+  exit 1
+fi
+echo "detached update helper started; waiting for Foco process $FOCO_UPDATE_PID to exit"
 
 relaunch_app() {
   target="$1"
@@ -1177,6 +1336,7 @@ fail_early() {
 while kill -0 "$FOCO_UPDATE_PID" 2>/dev/null; do
   sleep 1
 done
+echo "Foco process $FOCO_UPDATE_PID exited; applying update"
 
 mount_output="$(hdiutil attach "$FOCO_UPDATE_DMG" -nobrowse -readonly)" || {
   fail_early "could not mount the update disk image"
@@ -1185,7 +1345,6 @@ volume="$(printf '%s\n' "$mount_output" | awk '/\/Volumes\// { sub(/^.*\/Volumes
 if [ -z "$volume" ]; then
   fail_early "could not locate the mounted update volume"
 fi
-trap 'hdiutil detach "$volume" >/dev/null 2>&1 || true' EXIT
 source_app="$(find "$volume" -maxdepth 2 -name "Foco.app" -type d | head -n 1)"
 if [ -z "$source_app" ]; then
   fail_early "Foco.app was not found in the update disk image"
@@ -1250,7 +1409,7 @@ done
 rm -rf "$old_app" 2>/dev/null || true
 rm -f "$FOCO_UPDATE_READY" 2>/dev/null || true
 hdiutil detach "$volume" >/dev/null 2>&1 || true
-trap - EXIT
+volume=""
 "#
 }
 
@@ -1728,6 +1887,69 @@ mod tests {
     }
 
     #[test]
+    fn macos_update_helper_launches_as_independent_launchd_job() {
+        let prepared = PreparedUpdateInstall {
+            version: "v1.2.3".to_string(),
+            asset_name: "Foco-v1.2.3-macos-arm64.dmg".to_string(),
+            asset_download_url: "https://example.test/Foco.dmg".to_string(),
+            update_dir: PathBuf::from("/tmp/Foco Updates/v1.2.3"),
+            archive_path: PathBuf::from("/tmp/Foco Updates/v1.2.3/Foco.dmg"),
+        };
+        let args = macos_update_launch_args(MacosUpdateLaunch {
+            app_bundle: Path::new("/Applications/Foco.app"),
+            label: "app.foco.update.42",
+            pid: 42,
+            prepared: &prepared,
+            ready_path: Path::new("/tmp/Foco Updates/updated-restart-ready.txt"),
+            result_path: Path::new("/tmp/Foco Updates/last-install-failure.txt"),
+            script_path: Path::new("/tmp/Foco Updates/v1.2.3/apply-macos-update.sh"),
+            started_path: Path::new("/tmp/Foco Updates/v1.2.3/helper-started.txt"),
+        });
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            &args[..9],
+            [
+                "submit",
+                "-l",
+                "app.foco.update.42",
+                "-o",
+                "/dev/null",
+                "-e",
+                "/dev/null",
+                "--",
+                "/usr/bin/env",
+            ]
+        );
+        assert!(args.contains(&"FOCO_UPDATE_PID=42".to_string()));
+        assert!(args.contains(&"FOCO_UPDATE_DMG=/tmp/Foco Updates/v1.2.3/Foco.dmg".to_string()));
+        assert!(args.contains(
+            &"FOCO_UPDATE_STARTED=/tmp/Foco Updates/v1.2.3/helper-started.txt".to_string()
+        ));
+        assert!(args.contains(&"FOCO_UPDATE_JOB_LABEL=app.foco.update.42".to_string()));
+        assert_eq!(
+            &args[args.len() - 2..],
+            ["/bin/sh", "/tmp/Foco Updates/v1.2.3/apply-macos-update.sh"]
+        );
+    }
+
+    #[tokio::test]
+    async fn macos_update_helper_start_acknowledgement_is_consumed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join(UPDATE_HELPER_STARTED_FILE);
+        std::fs::write(&marker, "pid=42\n").expect("write helper marker");
+
+        wait_for_macos_update_helper_start(&marker)
+            .await
+            .expect("helper marker should be accepted");
+
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn macos_update_helper_restarts_silently() {
         let script = macos_update_script();
         assert!(script.contains(r#"xattr -dr com.apple.quarantine "$FOCO_UPDATE_APP""#));
@@ -1740,6 +1962,11 @@ mod tests {
         assert!(script.contains("xattr -lr"));
         assert!(script.contains("fail_early"));
         assert!(script.contains("leftover update staging directories"));
+        assert!(script.contains("FOCO_UPDATE_STARTED"));
+        assert!(script.contains("FOCO_UPDATE_JOB_LABEL"));
+        assert!(script.contains("detached update helper started"));
+        assert!(script.contains("trap cleanup EXIT"));
+        assert!(script.contains(r#"/bin/launchctl remove "$FOCO_UPDATE_JOB_LABEL""#));
         // Result marker must not claim rollback before restore succeeds.
         assert!(script.contains(
             r#"write_result "Update failed: $reason. Rolled back to the previous version.""#
@@ -1748,6 +1975,12 @@ mod tests {
         let replace_idx = script
             .find(r#"mv "$new_app" "$FOCO_UPDATE_APP""#)
             .expect("replace step");
+        let acknowledged_idx = script
+            .find(r#">"$FOCO_UPDATE_STARTED""#)
+            .expect("startup acknowledgement");
+        let parent_wait_idx = script
+            .find(r#"while kill -0 "$FOCO_UPDATE_PID""#)
+            .expect("parent wait");
         let launch_idx = script
             .find(r#"open -n "$FOCO_UPDATE_APP" --args --updated-restart"#)
             .expect("launch step");
@@ -1761,6 +1994,7 @@ mod tests {
         assert!(replace_idx < launch_idx);
         assert!(launch_idx < ready_wait_idx);
         assert!(ready_wait_idx < cleanup_idx);
+        assert!(acknowledged_idx < parent_wait_idx);
         // Staging cleanup must not use bare rm under set -e without recovery.
         assert!(!script.contains("rm -rf \"$new_app\" \"$old_app\"\n"));
         assert!(script.contains("leftover update staging directories"));
