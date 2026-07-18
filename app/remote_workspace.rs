@@ -15623,6 +15623,12 @@ async fn remote_sidecar_plans_action(
         .get("action")
         .and_then(Value::as_str)
         .ok_or_else(|| ApiError::bad_request("action is required").into_response())?;
+    if matches!(action.trim(), "start" | "resume") {
+        return Err(ApiError::bad_request(
+            "remote plan start/resume requires execution dispatch and is unavailable through the Store-only sidecar action",
+        )
+        .into_response());
+    }
     let mut database =
         foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
             .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
@@ -15787,6 +15793,69 @@ async fn remote_sidecar_plans_worktree_cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_sidecar_plans_action_rejects_store_only_start_and_resume() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: "plan-remote-fake-start",
+                    title: "Remote fake start",
+                    overview: "Sidecar start without dispatch.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: "plan-remote-fake-start-phase-1",
+                        title: "Phase one",
+                        summary: "Surface running only.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "plan-remote-fake-start-step-1",
+                            title: "Work",
+                            detail: "Needs agent.",
+                            acceptance: vec!["has task after real dispatch".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create plan");
+        }
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+
+        let start_error = remote_sidecar_plans_action(
+            State(state.clone()),
+            AxumPath("plan-remote-fake-start".to_string()),
+            Json(json!({ "action": "start" })),
+        )
+        .await
+        .expect_err("Store-only endpoint must reject start");
+        assert_eq!(start_error.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .transition_plan("plan-remote-fake-start", "pause")
+            .expect("pause ready plan");
+
+        let resume_error = remote_sidecar_plans_action(
+            State(state.clone()),
+            AxumPath("plan-remote-fake-start".to_string()),
+            Json(json!({ "action": "resume" })),
+        )
+        .await
+        .expect_err("Store-only endpoint must reject resume");
+        assert_eq!(resume_error.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        let plan = database
+            .plan("plan-remote-fake-start")
+            .expect("load plan")
+            .expect("plan");
+        assert_eq!(plan.status, "paused");
+        assert!(plan.active_phase_id.is_none());
+        assert!(plan.phases[0].agent_task_id.is_none());
+        assert!(plan.phases[0].attempts.is_empty());
+    }
 
     #[test]
     fn broker_tool_execution_applies_retry_unsafe_budget_before_transport() {

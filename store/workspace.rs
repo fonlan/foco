@@ -2511,13 +2511,28 @@ impl WorkspaceDatabase {
             })
     }
 
+    /// Plan lifecycle actions. Start / pause / resume invariants:
+    ///
+    /// | action | no active execution | active attempt (queued/running) | active agent task (queued/running/waiting) |
+    /// |--------|---------------------|----------------------------------|--------------------------------------------|
+    /// | start  | mark earliest incomplete phase running | InvalidPlan (phase already running) | InvalidPlan (phase already running) |
+    /// | pause  | ready → paused (no phase cancel) | plan → paused; phase/attempt/task unchanged | plan → paused; phase/attempt/task unchanged |
+    /// | resume | start earliest incomplete phase | unpause plan only; keep active_phase_id + identity | unpause plan only; keep active_phase_id + identity |
+    ///
+    /// Pause never cancels the current phase. Resume of an active phase only lifts the
+    /// pause flag — it must not re-enter `start_next_plan_phase`. True conflicts (cancelled
+    /// barrier, completed plan, already-running phase on **start**) still return structured
+    /// `InvalidPlan`. Runtime owns creating chat/team/task/attempt after a successful
+    /// start; Store alone is not a full runner and must not treat a surface-only running
+    /// phase as resumable execution.
     pub fn transition_plan(
         &mut self,
         plan_id: &str,
         action: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         match action {
-            "start" | "resume" => self.start_next_plan_phase(plan_id),
+            "start" => self.start_next_plan_phase(plan_id),
+            "resume" => self.resume_plan(plan_id),
             "pause" => self.pause_plan(plan_id),
             "cancel" => self.cancel_plan(plan_id),
             "mark_complete" => self.mark_plan_complete(plan_id),
@@ -4433,6 +4448,75 @@ impl WorkspaceDatabase {
         // Execution order is a store invariant, not a scheduler convention: a
         // target phase may start only when every earlier phase is completed.
         plan.phases.iter().find(|phase| phase.status != "completed")
+    }
+
+    fn resume_plan(&mut self, plan_id: &str) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' cannot resume while {}", plan.id, plan.status),
+            });
+        }
+
+        // Resume of an already-active phase only lifts plan-level pause. Do not re-enter
+        // start_next_plan_phase, which would treat status=running as a conflict.
+        if self.plan_has_resumable_active_phase(&plan)? {
+            if plan.status == "running" {
+                return Ok(plan);
+            }
+            if plan.status != "paused" {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: format!(
+                        "plan '{}' cannot resume active phase while {}",
+                        plan.id, plan.status
+                    ),
+                });
+            }
+            let now = now_timestamp();
+            self.connection
+                .execute(
+                    "UPDATE plans
+                     SET status = 'running',
+                         pause_requested_at = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![plan.id, now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            return self
+                .plan(plan_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan was not found after resume: {}", plan_id.trim()),
+                });
+        }
+
+        self.start_next_plan_phase(plan_id)
+    }
+
+    /// True when the plan still has non-terminal phase execution that resume must keep:
+    /// active_phase_id points at a running phase with a queued/running attempt or a
+    /// queued/running/waiting agent task.
+    fn plan_has_resumable_active_phase(
+        &self,
+        plan: &PlanRecord,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let Some(active_phase_id) = plan.active_phase_id.as_deref() else {
+            return Ok(false);
+        };
+        let Some(phase) = plan.phases.iter().find(|phase| phase.id == active_phase_id) else {
+            return Ok(false);
+        };
+        if phase.status != "running" {
+            return Ok(false);
+        }
+        if self.phase_has_active_execution(&phase.id)? {
+            return Ok(true);
+        }
+        self.phase_awaits_execution_lifecycle(phase)
     }
 
     fn start_next_plan_phase(

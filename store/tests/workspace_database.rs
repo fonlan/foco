@@ -1827,6 +1827,717 @@ fn plan_phase_run_completion_advances_until_pause() {
 }
 
 #[test]
+fn resume_after_pause_keeps_running_phase_and_execution_identity() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-pause-resume-active",
+            title: "Pause resume active phase",
+            overview: "Resume must unpause without re-starting a running phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-pause-resume-active-phase-1",
+                    title: "Phase one",
+                    summary: "Keep executing after pause.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-pause-resume-active-step-1",
+                        title: "Do work",
+                        detail: "Stay bound to the original task.",
+                        acceptance: vec!["still running".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-pause-resume-active-phase-2",
+                    title: "Phase two",
+                    summary: "Must not start on resume of phase one.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-pause-resume-active-step-2",
+                        title: "Later work",
+                        detail: "Remain pending.",
+                        acceptance: vec!["not started".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+
+    database
+        .transition_plan("plan-pause-resume-active", "start")
+        .expect("start phase");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-pause-resume-active",
+            "plan-pause-resume-active-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-pause-resume-active",
+        "pause-resume-active",
+    );
+    let task_id = AgentTaskId::new("agent-task-pause-resume-active").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-pause-resume-active", &team_id, &task_id)
+        .expect("attach run");
+    assert_eq!(attached.status, "running");
+    assert_eq!(
+        attached.active_phase_id.as_deref(),
+        Some("plan-pause-resume-active-phase-1")
+    );
+    let phase_before = &attached.phases[0];
+    assert_eq!(phase_before.status, "running");
+    assert_eq!(
+        phase_before.agent_task_id.as_deref(),
+        Some("agent-task-pause-resume-active")
+    );
+    assert_eq!(
+        phase_before.implementation_chat_id.as_deref(),
+        Some("chat-pause-resume-active")
+    );
+    assert_eq!(phase_before.attempts.len(), 1);
+    assert_eq!(phase_before.attempts[0].id, attempt.id);
+    assert_eq!(phase_before.attempts[0].status, "running");
+
+    let paused = database
+        .transition_plan("plan-pause-resume-active", "pause")
+        .expect("pause plan");
+    assert_eq!(paused.status, "paused");
+    assert_eq!(
+        paused.active_phase_id.as_deref(),
+        Some("plan-pause-resume-active-phase-1")
+    );
+    assert_eq!(paused.phases[0].status, "running");
+    assert_eq!(
+        paused.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-pause-resume-active")
+    );
+    assert_eq!(paused.phases[0].attempts[0].id, attempt.id);
+    assert_eq!(paused.phases[0].attempts[0].status, "running");
+    assert_eq!(paused.phases[1].status, "pending");
+
+    let resumed = database
+        .transition_plan("plan-pause-resume-active", "resume")
+        .expect("resume must unpause active phase without restart");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-pause-resume-active-phase-1")
+    );
+    assert!(resumed.pause_requested_at.is_none());
+    assert_eq!(resumed.phases[0].status, "running");
+    assert_eq!(
+        resumed.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-pause-resume-active")
+    );
+    assert_eq!(
+        resumed.phases[0].implementation_chat_id.as_deref(),
+        Some("chat-pause-resume-active")
+    );
+    assert_eq!(
+        resumed.phases[0].agent_team_id.as_deref(),
+        Some(team_id.as_str())
+    );
+    assert_eq!(resumed.phases[0].attempts.len(), 1);
+    assert_eq!(resumed.phases[0].attempts[0].id, attempt.id);
+    assert_eq!(resumed.phases[0].attempts[0].status, "running");
+    assert_eq!(
+        resumed.phases[0].attempts[0].agent_task_id.as_deref(),
+        Some("agent-task-pause-resume-active")
+    );
+    assert_eq!(resumed.phases[1].status, "pending");
+    assert!(resumed.phases[1].agent_task_id.is_none());
+}
+
+#[test]
+fn resume_after_pause_keeps_waiting_agent_task_without_restart() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-pause-resume-waiting",
+            title: "Pause resume waiting task",
+            overview: "Waiting agent task still counts as active execution.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-pause-resume-waiting-phase-1",
+                title: "Phase one",
+                summary: "Coordinator waiting on subagent.",
+                steps: vec![NewPlanStep {
+                    id: "plan-pause-resume-waiting-step-1",
+                    title: "Wait",
+                    detail: "Keep task binding.",
+                    acceptance: vec!["waiting preserved".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-pause-resume-waiting", "start")
+        .expect("start");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-pause-resume-waiting",
+            "plan-pause-resume-waiting-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+        )
+        .expect("begin attempt");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-pause-resume-waiting",
+        "pause-resume-waiting",
+    );
+    let task_id = AgentTaskId::new("agent-task-pause-resume-waiting").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    database
+        .attach_plan_phase_attempt_run(&attempt.id, "chat-pause-resume-waiting", &team_id, &task_id)
+        .expect("attach");
+    let worker_id =
+        create_test_agent_worker(&mut database, &team_id, "pause-resume-waiting-worker");
+    let child_task = AgentTaskId::new("agent-task-pause-resume-waiting-child").expect("child");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&instance_id),
+            parent_task_id: Some(&task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue child");
+    let parent_attempt =
+        AgentAttemptId::new("agent-attempt-pause-resume-waiting-parent").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &parent_attempt)
+        .expect("claim parent")
+        .expect("claimed parent");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &task_id,
+            dependency_task_id: &child_task,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-pause-resume-waiting"),
+            deadline_at: None,
+        })
+        .expect("dependency");
+    assert!(
+        database
+            .suspend_running_agent_task_with_wait_dependencies(&team_id, &task_id)
+            .expect("suspend to waiting")
+    );
+
+    database
+        .transition_plan("plan-pause-resume-waiting", "pause")
+        .expect("pause");
+    let resumed = database
+        .transition_plan("plan-pause-resume-waiting", "resume")
+        .expect("resume waiting phase");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-pause-resume-waiting-phase-1")
+    );
+    assert_eq!(
+        resumed.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-pause-resume-waiting")
+    );
+    assert_eq!(resumed.phases[0].attempts[0].id, attempt.id);
+    let task = database
+        .agent_task(&task_id)
+        .expect("task")
+        .expect("task row");
+    assert_eq!(task.status, AgentTaskStatus::Waiting);
+}
+
+#[test]
+fn resume_after_pause_keeps_queued_attempt_without_agent_task() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-pause-resume-queued-attempt",
+            title: "Pause resume queued attempt",
+            overview: "Active attempt without attached task is still resumable.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-pause-resume-queued-attempt-phase-1",
+                title: "Phase one",
+                summary: "Attempt queued before dispatch attaches.",
+                steps: vec![NewPlanStep {
+                    id: "plan-pause-resume-queued-attempt-step-1",
+                    title: "Dispatch",
+                    detail: "Keep attempt id.",
+                    acceptance: vec!["attempt preserved".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-pause-resume-queued-attempt", "start")
+        .expect("start");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-pause-resume-queued-attempt",
+            "plan-pause-resume-queued-attempt-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+        )
+        .expect("begin attempt");
+    assert_eq!(attempt.status, "queued");
+    assert!(attempt.agent_task_id.is_none());
+
+    database
+        .transition_plan("plan-pause-resume-queued-attempt", "pause")
+        .expect("pause");
+    let resumed = database
+        .transition_plan("plan-pause-resume-queued-attempt", "resume")
+        .expect("resume queued attempt phase");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-pause-resume-queued-attempt-phase-1")
+    );
+    assert_eq!(resumed.phases[0].attempts.len(), 1);
+    assert_eq!(resumed.phases[0].attempts[0].id, attempt.id);
+    assert_eq!(resumed.phases[0].attempts[0].status, "queued");
+    assert!(resumed.phases[0].agent_task_id.is_none());
+}
+
+#[test]
+fn resume_after_pause_rejects_surface_running_phase_without_execution_identity() {
+    // A Store-only start is not execution. Resume must preserve the InvalidPlan
+    // boundary rather than silently treating this damaged state as a live phase.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-pause-resume-surface",
+            title: "Surface running pause resume",
+            overview: "Fake start leaves no agent identity.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-pause-resume-surface-phase-1",
+                title: "Phase one",
+                summary: "Only Store transition_plan start.",
+                steps: vec![NewPlanStep {
+                    id: "plan-pause-resume-surface-step-1",
+                    title: "Start",
+                    detail: "No dispatch.",
+                    acceptance: vec!["no identity".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    let started = database
+        .transition_plan("plan-pause-resume-surface", "start")
+        .expect("store-only start");
+    assert_eq!(started.status, "running");
+    assert_eq!(
+        started.active_phase_id.as_deref(),
+        Some("plan-pause-resume-surface-phase-1")
+    );
+    assert_eq!(started.phases[0].status, "running");
+    assert!(started.phases[0].agent_task_id.is_none());
+    assert!(started.phases[0].implementation_chat_id.is_none());
+    assert!(started.phases[0].agent_team_id.is_none());
+    assert!(started.phases[0].attempts.is_empty());
+
+    database
+        .transition_plan("plan-pause-resume-surface", "pause")
+        .expect("pause");
+    let error = database
+        .transition_plan("plan-pause-resume-surface", "resume")
+        .expect_err("surface-only running phase is not resumable execution");
+    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+}
+
+#[test]
+fn store_only_start_is_not_a_resumable_plan_execution() {
+    // Store transitions deliberately do not create chat/team/task/attempt identity.
+    // A remote endpoint must therefore never return this state as a successful start.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-store-only-start",
+            title: "Store only start",
+            overview: "Sidecar-style transition_plan start.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-store-only-start-phase-1",
+                title: "Phase one",
+                summary: "Needs runtime dispatch after Store start.",
+                steps: vec![NewPlanStep {
+                    id: "plan-store-only-start-step-1",
+                    title: "Implement",
+                    detail: "Requires agent task.",
+                    acceptance: vec!["has identity after real start".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+
+    let plan = database
+        .transition_plan("plan-store-only-start", "start")
+        .expect("start");
+    assert_eq!(plan.status, "running");
+    assert_eq!(plan.phases[0].status, "running");
+    assert!(
+        plan.phases[0].agent_task_id.is_none(),
+        "Store start must not invent agent_task_id"
+    );
+    assert!(
+        plan.phases[0].implementation_chat_id.is_none(),
+        "Store start must not invent implementation_chat_id"
+    );
+    assert!(
+        plan.phases[0].agent_team_id.is_none(),
+        "Store start must not invent agent_team_id"
+    );
+    assert!(
+        plan.phases[0].attempts.is_empty(),
+        "Store start must not create plan_phase_attempts"
+    );
+
+    let agent_tasks: i64 = {
+        let connection = Connection::open(database.database_path()).expect("open database");
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_tasks", [], |row| row.get(0))
+            .expect("count agent_tasks")
+    };
+    let agent_teams: i64 = {
+        let connection = Connection::open(database.database_path()).expect("open database");
+        connection
+            .query_row("SELECT COUNT(*) FROM agent_teams", [], |row| row.get(0))
+            .expect("count agent_teams")
+    };
+    let attempts: i64 = {
+        let connection = Connection::open(database.database_path()).expect("open database");
+        connection
+            .query_row("SELECT COUNT(*) FROM plan_phase_attempts", [], |row| {
+                row.get(0)
+            })
+            .expect("count attempts")
+    };
+    assert_eq!(agent_tasks, 0);
+    assert_eq!(agent_teams, 0);
+    assert_eq!(attempts, 0);
+
+    database
+        .transition_plan("plan-store-only-start", "pause")
+        .expect("pause surface-only plan");
+    let error = database
+        .transition_plan("plan-store-only-start", "resume")
+        .expect_err("surface-only plan cannot resume as execution");
+    assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
+}
+
+#[test]
+fn plan_start_pause_resume_state_contract_matrix() {
+    // Documents expected Store outcomes for start/pause/resume across the three
+    // execution postures used by Project Spec (no active execution / active attempt /
+    // active agent task). Runtime dispatch is out of scope for Store.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    // --- No active execution: start marks earliest incomplete running ---
+    database
+        .create_plan(NewPlan {
+            id: "plan-contract-idle",
+            title: "Idle start",
+            overview: "No active execution.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-contract-idle-phase-1",
+                title: "P1",
+                summary: "s",
+                steps: vec![NewPlanStep {
+                    id: "plan-contract-idle-step-1",
+                    title: "s",
+                    detail: "d",
+                    acceptance: vec!["a".to_string()],
+                }],
+            }],
+        })
+        .expect("create idle");
+    let started = database
+        .transition_plan("plan-contract-idle", "start")
+        .expect("start idle");
+    assert_eq!(started.status, "running");
+    assert_eq!(started.phases[0].status, "running");
+    let start_again = database
+        .transition_plan("plan-contract-idle", "start")
+        .expect_err("start while phase running is InvalidPlan");
+    assert!(matches!(
+        start_again,
+        WorkspaceDatabaseError::InvalidPlan { .. }
+    ));
+    assert!(start_again.to_string().contains("is already running"));
+    let paused_idle = database
+        .transition_plan("plan-contract-idle", "pause")
+        .expect("pause surface running");
+    assert_eq!(paused_idle.status, "paused");
+    assert_eq!(paused_idle.phases[0].status, "running");
+    let resume_idle = database
+        .transition_plan("plan-contract-idle", "resume")
+        .expect_err("surface-only running phase is InvalidPlan");
+    assert!(matches!(
+        resume_idle,
+        WorkspaceDatabaseError::InvalidPlan { .. }
+    ));
+
+    // --- Active queued attempt ---
+    database
+        .create_plan(NewPlan {
+            id: "plan-contract-attempt",
+            title: "Attempt active",
+            overview: "Queued attempt.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-contract-attempt-phase-1",
+                title: "P1",
+                summary: "s",
+                steps: vec![NewPlanStep {
+                    id: "plan-contract-attempt-step-1",
+                    title: "s",
+                    detail: "d",
+                    acceptance: vec!["a".to_string()],
+                }],
+            }],
+        })
+        .expect("create attempt plan");
+    database
+        .transition_plan("plan-contract-attempt", "start")
+        .expect("start");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-contract-attempt",
+            "plan-contract-attempt-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+        )
+        .expect("attempt");
+    database
+        .transition_plan("plan-contract-attempt", "pause")
+        .expect("pause attempt plan");
+    let resume_attempt = database
+        .transition_plan("plan-contract-attempt", "resume")
+        .expect("resume attempt plan");
+    assert_eq!(resume_attempt.status, "running");
+    assert_eq!(resume_attempt.phases[0].attempts[0].id, attempt.id);
+    assert_eq!(resume_attempt.phases[0].attempts[0].status, "queued");
+    let start_while_attempt = database
+        .transition_plan("plan-contract-attempt", "start")
+        .expect_err("start while attempt active");
+    assert!(matches!(
+        start_while_attempt,
+        WorkspaceDatabaseError::InvalidPlan { .. }
+    ));
+
+    // --- Active agent task (running) ---
+    database
+        .create_plan(NewPlan {
+            id: "plan-contract-task",
+            title: "Task active",
+            overview: "Running agent task.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-contract-task-phase-1",
+                title: "P1",
+                summary: "s",
+                steps: vec![NewPlanStep {
+                    id: "plan-contract-task-step-1",
+                    title: "s",
+                    detail: "d",
+                    acceptance: vec!["a".to_string()],
+                }],
+            }],
+        })
+        .expect("create task plan");
+    database
+        .transition_plan("plan-contract-task", "start")
+        .expect("start");
+    let task_attempt = database
+        .begin_plan_phase_attempt(
+            "plan-contract-task",
+            "plan-contract-task-phase-1",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+        )
+        .expect("task attempt");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-contract-task", "contract-task");
+    let task_id = AgentTaskId::new("agent-task-contract-task").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    database
+        .attach_plan_phase_attempt_run(&task_attempt.id, "chat-contract-task", &team_id, &task_id)
+        .expect("attach");
+    database
+        .transition_plan("plan-contract-task", "pause")
+        .expect("pause task plan");
+    let resume_task = database
+        .transition_plan("plan-contract-task", "resume")
+        .expect("resume task plan");
+    assert_eq!(resume_task.status, "running");
+    assert_eq!(
+        resume_task.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-contract-task")
+    );
+    assert_eq!(resume_task.phases[0].attempts[0].id, task_attempt.id);
+
+    // Illegal terminal resume remains structured InvalidPlan.
+    database
+        .create_plan(NewPlan {
+            id: "plan-contract-cancelled",
+            title: "Cancelled",
+            overview: "Cannot resume.",
+            status: "cancelled",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-contract-cancelled-phase-1",
+                title: "P1",
+                summary: "s",
+                steps: vec![NewPlanStep {
+                    id: "plan-contract-cancelled-step-1",
+                    title: "s",
+                    detail: "d",
+                    acceptance: vec!["a".to_string()],
+                }],
+            }],
+        })
+        .expect("create cancelled");
+    let resume_cancelled = database
+        .transition_plan("plan-contract-cancelled", "resume")
+        .expect_err("cancelled plan cannot resume");
+    assert!(matches!(
+        resume_cancelled,
+        WorkspaceDatabaseError::InvalidPlan { .. }
+    ));
+}
+
+#[test]
+fn resume_from_paused_plan_without_active_phase_starts_earliest_incomplete_phase() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-resume-no-active-phase",
+            title: "Resume without active phase",
+            overview: "Resume starts only when no phase remains active.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-resume-no-active-phase-1",
+                    title: "First",
+                    summary: "Must start first.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-resume-no-active-phase-step-1",
+                        title: "First step",
+                        detail: "Start on resume.",
+                        acceptance: vec!["first phase starts".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-resume-no-active-phase-2",
+                    title: "Second",
+                    summary: "Must stay pending.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-resume-no-active-phase-step-2",
+                        title: "Second step",
+                        detail: "Do not skip ahead.",
+                        acceptance: vec!["second phase remains pending".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+
+    let paused = database
+        .transition_plan("plan-resume-no-active-phase", "pause")
+        .expect("pause ready plan");
+    assert_eq!(paused.status, "paused");
+    assert!(paused.active_phase_id.is_none());
+    assert_eq!(paused.phases[0].status, "pending");
+
+    let resumed = database
+        .transition_plan("plan-resume-no-active-phase", "resume")
+        .expect("resume starts earliest incomplete phase when no phase is active");
+    assert_eq!(resumed.status, "running");
+    assert_eq!(
+        resumed.active_phase_id.as_deref(),
+        Some("plan-resume-no-active-phase-1")
+    );
+    assert_eq!(resumed.phases[0].status, "running");
+    assert_eq!(resumed.phases[1].status, "pending");
+}
+
+#[test]
 fn phase_commit_does_not_mark_plan_shared_merged() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

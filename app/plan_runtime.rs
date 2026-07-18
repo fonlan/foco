@@ -108,13 +108,16 @@ pub(crate) async fn transition_plan_action(
             )));
         }
     }
-    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let plan = {
         let mut database = open_workspace_database(&workspace.path)?;
         database
             .transition_plan(plan_id, action)
             .map_err(ApiError::from_workspace_error)?
     };
+    if !plan_requires_initial_dispatch(&plan) {
+        return Ok(plan);
+    }
+    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
     let dispatch_plan = plan.clone();
     match dispatch_plan_phase(state, &workspace.id, dispatch_plan, None).await {
         Ok(plan) => Ok(plan),
@@ -123,6 +126,24 @@ pub(crate) async fn transition_plan_action(
             Err(error)
         }
     }
+}
+
+/// A resumed plan with an active attempt or Agent task already owns its execution slot.
+/// Only a freshly started running phase without either identity needs runtime dispatch.
+fn plan_requires_initial_dispatch(plan: &PlanRecord) -> bool {
+    let Some(active_phase_id) = plan.active_phase_id.as_deref() else {
+        return false;
+    };
+    let Some(phase) = plan.phases.iter().find(|phase| phase.id == active_phase_id) else {
+        return false;
+    };
+
+    phase.status == "running"
+        && phase.agent_task_id.is_none()
+        && !phase
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.status.as_str(), "queued" | "running"))
 }
 
 pub(crate) async fn retry_plan_merge(
