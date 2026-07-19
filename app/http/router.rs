@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Request, State, WebSocketUpgrade},
-    http::{HeaderMap, Method, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -687,24 +687,30 @@ async fn remote_workspace_proxy_middleware(
 ) -> Response {
     let path = request.uri().path();
 
-    let (workspace_id, suffix, request) = match proxy_workspace_route_path(path) {
-        Some(suffix) => {
-            let Some(workspace_id) = extract_workspace_id_from_path(path) else {
-                return next.run(request).await;
-            };
-            (workspace_id, suffix.to_string(), request)
-        }
-        None => {
-            let (target, request) = match proxy_global_workspace_route(request).await {
-                Ok(result) => result,
-                Err(response) => return response,
-            };
-            match target {
-                Some((workspace_id, suffix)) => (workspace_id, suffix, request),
-                None => return next.run(request).await,
+    let route_method =
+        crate::http::workspace_route_contract::WorkspaceRouteMethod::from_http_method(
+            request.method().as_str(),
+            is_websocket_request(&request),
+        );
+    let (workspace_id, suffix, request) =
+        match route_method.and_then(|method| proxy_workspace_route_path_for_method(path, method)) {
+            Some(suffix) => {
+                let Some(workspace_id) = extract_workspace_id_from_path(path) else {
+                    return next.run(request).await;
+                };
+                (workspace_id, suffix.to_string(), request)
             }
-        }
-    };
+            None => {
+                let (target, request) = match proxy_global_workspace_route(request).await {
+                    Ok(result) => result,
+                    Err(response) => return response,
+                };
+                match target {
+                    Some((workspace_id, suffix)) => (workspace_id, suffix, request),
+                    None => return next.run(request).await,
+                }
+            }
+        };
 
     if let Err(error) =
         crate::remote_workspace::ensure_remote_workspace_connected(&state, &workspace_id).await
@@ -830,97 +836,83 @@ async fn remote_workspace_proxy_middleware(
 async fn proxy_global_workspace_route(
     request: Request,
 ) -> Result<(Option<(String, String)>, Request), Response> {
-    let path = request.uri().path();
-    let method = request.method();
-
-    if method == Method::GET {
-        let Some(suffix) = (match path {
-            "/api/hooks" => Some("hooks/settings"),
-            "/api/memory" => Some("memory"),
-            "/api/memory/sources" => Some("memory/sources"),
-            "/api/memory/dream/jobs" => Some("memory/dream/jobs"),
-            _ => None,
-        }) else {
-            return Ok((None, request));
-        };
-        let query = request
-            .uri()
-            .query()
-            .map(parse_workspace_route_query)
-            .unwrap_or_default();
-        let Some(workspace_id) = query.get("workspaceId").cloned() else {
-            return Ok((None, request));
-        };
-        if suffix.starts_with("memory")
-            && query
-                .get("scope")
-                .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
-        {
-            return Ok((None, request));
-        }
-        return Ok((Some((workspace_id, suffix.to_string())), request));
-    }
-
-    if method != Method::POST {
-        return Ok((None, request));
-    }
-    let Some(suffix) = (match path {
-        "/api/hooks/workspace" => Some("hooks/settings"),
-        "/api/hooks/import-claude" => Some("hooks/import-claude"),
-        "/api/hooks/test" => Some("hooks/test"),
-        "/api/memory/manual" => Some("memory/manual"),
-        "/api/memory/status" => Some("memory/status"),
-        "/api/memory/enabled" => Some("memory/enabled"),
-        "/api/memory/edit" => Some("memory/edit"),
-        "/api/memory/forget" => Some("memory/forget"),
-        "/api/memory/clear" => Some("memory/clear"),
-        "/api/memory/promote" => Some("memory/promote"),
-        "/api/memory/extraction/retry" => Some("memory/extraction/retry"),
-        "/api/memory/extraction/skip" => Some("memory/extraction/skip"),
-        "/api/memory/dream/run" => Some("memory/dream/run"),
-        _ => None,
-    }) else {
-        return Ok((None, request));
+    use crate::http::workspace_route_contract::{
+        GlobalWorkspaceIdSource, WorkspaceRouteMethod, global_workspace_route_contract,
+        global_workspace_sidecar_suffix,
     };
 
-    let (parts, body) = request.into_parts();
-    let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
-        .await
-        .map_err(|_| {
-            Response::builder()
-                .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(
-                    "failed to read request body for remote workspace routing",
-                ))
-                .expect("valid response")
-        })?;
-    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
-        Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .body(Body::from(
-                "invalid JSON request body for remote workspace routing",
-            ))
-            .expect("valid response")
-    })?;
-    let request = Request::from_parts(parts, Body::from(bytes));
-    let Some(workspace_id) = payload
-        .get("workspaceId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|workspace_id| !workspace_id.is_empty())
-        .map(ToOwned::to_owned)
+    let path = request.uri().path();
+    let Some(method) = WorkspaceRouteMethod::from_http_method(request.method().as_str(), false)
     else {
         return Ok((None, request));
     };
-    if suffix.starts_with("memory")
-        && payload
-            .get("scope")
-            .and_then(Value::as_str)
-            .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
-    {
+    let Some(contract) = global_workspace_route_contract(path, method) else {
         return Ok((None, request));
+    };
+    let Some(sidecar_suffix) = global_workspace_sidecar_suffix(contract, path) else {
+        return Ok((None, request));
+    };
+
+    match contract.workspace_id_source {
+        GlobalWorkspaceIdSource::Query => {
+            let query = request
+                .uri()
+                .query()
+                .map(parse_workspace_route_query)
+                .unwrap_or_default();
+            let Some(workspace_id) = query.get("workspaceId").cloned() else {
+                return Ok((None, request));
+            };
+            if contract.global_memory_scope_stays_local
+                && query
+                    .get("scope")
+                    .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
+            {
+                return Ok((None, request));
+            }
+            Ok((Some((workspace_id, sidecar_suffix.clone())), request))
+        }
+        GlobalWorkspaceIdSource::JsonBody => {
+            let (parts, body) = request.into_parts();
+            let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
+                .await
+                .map_err(|_| {
+                    Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(
+                            "failed to read request body for remote workspace routing",
+                        ))
+                        .expect("valid response")
+                })?;
+            let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
+                Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .body(Body::from(
+                        "invalid JSON request body for remote workspace routing",
+                    ))
+                    .expect("valid response")
+            })?;
+            let request = Request::from_parts(parts, Body::from(bytes));
+            let Some(workspace_id) = payload
+                .get("workspaceId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|workspace_id| !workspace_id.is_empty())
+                .map(ToOwned::to_owned)
+            else {
+                return Ok((None, request));
+            };
+            if contract.global_memory_scope_stays_local
+                && payload
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
+            {
+                return Ok((None, request));
+            }
+            Ok((Some((workspace_id, sidecar_suffix.clone())), request))
+        }
     }
-    Ok((Some((workspace_id, suffix.to_string())), request))
 }
 
 fn parse_workspace_route_query(query: &str) -> std::collections::HashMap<String, String> {
@@ -1016,14 +1008,24 @@ async fn proxy_websocket_upgrade(request: Request, proxy_url: String, token: Str
 /// Intentionally excludes `ai-statistics`: dump detail is served from the main
 /// process audit mirror (`workspace_audit_path` → remote-workspace-audit), not
 /// the sidecar mirror (which always reports detail unavailable).
+#[cfg(test)]
+/// Backward-compatible GET helper used by route tests. Runtime proxying uses
+/// [`proxy_workspace_route_path_for_method`] so a shared prefix alone cannot
+/// route an undeclared method to the remote sidecar.
 pub(crate) fn proxy_workspace_route_path(path: &str) -> Option<&str> {
-    // Match /api/workspaces/{id}/files, /api/workspaces/{id}/git, /api/workspaces/{id}/terminal,
-    // /api/workspaces/{id}/spec, /api/workspaces/{id}/plans, chat/runtime, scheduled tasks.
-    // Do not add ai-statistics here; see middleware docs above.
+    proxy_workspace_route_path_for_method(
+        path,
+        crate::http::workspace_route_contract::WorkspaceRouteMethod::Get,
+    )
+}
+
+pub(crate) fn proxy_workspace_route_path_for_method(
+    path: &str,
+    method: crate::http::workspace_route_contract::WorkspaceRouteMethod,
+) -> Option<&str> {
     let rest = path.strip_prefix("/api/workspaces/")?;
     let after_id = rest.split_once('/')?.1;
-    let prefix = after_id.split('/').next().unwrap_or("");
-    if crate::http::workspace_route_contract::is_remote_workspace_proxy_prefix(prefix) {
+    if crate::http::workspace_route_contract::is_sidecar_workspace_route(path, method) {
         Some(after_id)
     } else {
         None
@@ -1091,7 +1093,7 @@ mod tests {
     #[tokio::test]
     async fn workspace_memory_mutation_routes_to_the_sidecar() {
         let request = Request::builder()
-            .method(Method::POST)
+            .method(axum::http::Method::POST)
             .uri("/api/memory/manual")
             .body(Body::from(
                 r#"{"workspaceId":"remote-workspace","scope":"workspace"}"#,
@@ -1109,9 +1111,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_memory_dream_changes_route_to_the_sidecar_with_the_job_id() {
+        let request = Request::builder()
+            .uri("/api/memory/dream/jobs/dream-job-42/changes?workspaceId=remote-workspace")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(
+            target,
+            Some((
+                "remote-workspace".to_string(),
+                "memory/dream/jobs/dream-job-42/changes".to_string(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_memory_dream_detail_routes_to_the_sidecar_with_the_job_id() {
+        let request = Request::builder()
+            .uri("/api/memory/dream/jobs/dream-job-42?workspaceId=remote-workspace")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(
+            target,
+            Some((
+                "remote-workspace".to_string(),
+                "memory/dream/jobs/dream-job-42".to_string(),
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_memory_dream_routes_require_a_declared_method_and_template() {
+        let wrong_method = Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/memory/dream/jobs/dream-job-42/changes?workspaceId=remote-workspace")
+            .body(Body::empty())
+            .expect("valid request");
+        let (target, _) = proxy_global_workspace_route(wrong_method)
+            .await
+            .expect("route classification");
+        assert_eq!(target, None);
+
+        let wrong_template = Request::builder()
+            .uri("/api/memory/dream/jobs/dream-job-42/changes/unexpected?workspaceId=remote-workspace")
+            .body(Body::empty())
+            .expect("valid request");
+        let (target, _) = proxy_global_workspace_route(wrong_template)
+            .await
+            .expect("route classification");
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
     async fn global_memory_mutation_remains_on_the_main_process() {
         let request = Request::builder()
-            .method(Method::POST)
+            .method(axum::http::Method::POST)
             .uri("/api/memory/manual")
             .body(Body::from(
                 r#"{"workspaceId":"remote-workspace","scope":"global"}"#,

@@ -145,11 +145,10 @@ use crate::runtime::{
     MANUAL_GUIDANCE_SOURCE, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
     QuestionAnswer, QuestionAnswerResponse, QuestionRegistry, QuestionRequest,
     REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
-    ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector, RipgrepStatus,
-    RipgrepToolSummary, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-    chat_run_subscription_stream, default_guidance_source, detect_ripgrep,
-    execute_tool_calls_parallel, image_model_available, insert_agent_event, is_agent_tool_name,
-    open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
+    ReasoningLoopDetector, RipgrepStatus, RipgrepToolSummary, ToolLoopGuard, ToolOutputDeltaEvent,
+    ToolResourceLockRegistry, chat_run_subscription_stream, default_guidance_source,
+    detect_ripgrep, execute_tool_calls_parallel, image_model_available, insert_agent_event,
+    is_agent_tool_name, open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
     reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
     run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
     spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
@@ -160,6 +159,8 @@ pub(crate) use crate::runtime::{
     ripgrep_executable_name, ripgrep_install_dir, select_ripgrep_asset,
     spawn_code_graph_workspace_initialization_if_needed,
 };
+#[cfg(test)]
+use crate::runtime::{ReadOnlyToolProgressDetector, RepeatedToolCallDetector};
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
 mod git_backend;
@@ -2826,8 +2827,7 @@ impl PreparedChatContext {
             let mut first_token_at = None;
             let mut first_token_latency_ms = None;
             let mut seen_tool_call_ids = HashSet::new();
-            let mut repeated_tool_call_detector = RepeatedToolCallDetector::default();
-            let mut read_only_tool_progress_detector = ReadOnlyToolProgressDetector::default();
+            let mut tool_loop_guard = ToolLoopGuard::default();
             let mut executed_tool_calls = Vec::new();
             let mut total_usage = NeutralUsage::default();
             let mut final_usage = None;
@@ -2972,7 +2972,6 @@ impl PreparedChatContext {
             }
 
             let mut turn_index = 0usize;
-            let mut tool_rounds_since_last_compression = 0usize;
             let mut turn_retry_count = 0u32;
             let mut reasoning_loop_recovery_count = 0usize;
 
@@ -4122,7 +4121,7 @@ impl PreparedChatContext {
                                 return;
                             }
 
-                            if tool_rounds_since_last_compression >= MAX_AGENT_TOOL_ROUNDS {
+                            if tool_loop_guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS) {
                                 let recovered = match recover_after_tool_round_cap(
                                     &mut self,
                                     tool_calls,
@@ -4158,7 +4157,7 @@ impl PreparedChatContext {
                                     }
                                 };
                                 if recovered {
-                                    tool_rounds_since_last_compression = 0;
+                                    tool_loop_guard.reset_after_compression();
                                     turn_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
@@ -4236,7 +4235,7 @@ impl PreparedChatContext {
                                 return;
                             }
 
-                            if let Err(message) = repeated_tool_call_detector.check(&tool_calls) {
+                            if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
                                 let event = ChatSseEvent::Error {
                                     message: message.clone(),
                                 };
@@ -4594,7 +4593,7 @@ impl PreparedChatContext {
                             }
 
                             let read_only_progress_action =
-                                read_only_tool_progress_detector.check(&tool_calls);
+                                tool_loop_guard.check_after_execution(&tool_calls);
                             append_tool_state_messages(
                                 &mut self.provider_request.messages,
                                 &mut self.message_source_sequences,
@@ -4606,8 +4605,7 @@ impl PreparedChatContext {
                                 non_empty_string(&turn_reasoning),
                             );
                             executed_tool_calls.extend(next_executed_tool_calls);
-                            tool_rounds_since_last_compression =
-                                tool_rounds_since_last_compression.saturating_add(1);
+                            tool_loop_guard.record_executed_round();
                             match read_only_progress_action {
                                 ReadOnlyToolProgressAction::Continue => {}
                                 ReadOnlyToolProgressAction::Warn(message) => {

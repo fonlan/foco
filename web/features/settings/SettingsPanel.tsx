@@ -1433,13 +1433,18 @@ export function SettingsPanel({
   }, [memoryDreamPage, memoryDreamPageSize]);
 
 
-  const loadMemoryDreamChanges = useCallback(async (jobId: string) => {
+  const loadMemoryDreamChanges = useCallback(async (job: MemoryDreamJobSummary) => {
     setIsLoadingMemoryDreamChanges(true);
     setMemoryDreamError(null);
 
     try {
+      const params = new URLSearchParams();
+      if (job.workspaceId) {
+        params.set("workspaceId", job.workspaceId);
+      }
+      const query = params.size > 0 ? `?${params.toString()}` : "";
       const data = await requestJson<MemoryDreamChangesResponse>(
-        `/api/memory/dream/jobs/${encodeURIComponent(jobId)}/changes`,
+        `/api/memory/dream/jobs/${encodeURIComponent(job.id)}/changes${query}`,
       );
       setMemoryDreamChanges(data.changes);
     } catch (requestError) {
@@ -1637,7 +1642,7 @@ export function SettingsPanel({
       return;
     }
 
-    void loadMemoryDreamChanges(memoryDreamDetailJobId);
+    void loadMemoryDreamChanges(detailJob);
   }, [
     activeSection,
     loadMemoryDreamChanges,

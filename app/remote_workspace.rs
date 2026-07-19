@@ -137,9 +137,8 @@ use crate::{
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
         AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
         ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
-        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
-        ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
-        SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
+        SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
         build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
         image_tool_timeout_ms, materialize_brokered_image_result,
         open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
@@ -170,6 +169,8 @@ use crate::{
     },
     todo_graph_context_message, unique_id, utc_timestamp, workspace_by_id,
 };
+
+pub(crate) mod route_policy;
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
 const SIDECAR_BINARY_NAME: &str = "foco";
@@ -204,38 +205,6 @@ const BROKER_DEFAULT_LLM_REQUEST_KIND: &str = "chat completion";
 const BROKER_CONTEXT_COMPRESSION_REQUEST_KIND: &str = "contextCompression";
 const BROKER_PROMPT_HOOK_REQUEST_KIND: &str = "prompt hook";
 const SIDECAR_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Default)]
-struct RemoteSidecarToolLoopGuard {
-    tool_rounds: usize,
-    repeated_tool_call_detector: RepeatedToolCallDetector,
-    read_only_tool_progress_detector: ReadOnlyToolProgressDetector,
-}
-
-impl RemoteSidecarToolLoopGuard {
-    fn check_before_execution(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
-        self.repeated_tool_call_detector.check(tool_calls)
-    }
-
-    fn reached_round_cap(&self, max_tool_rounds: usize) -> bool {
-        self.tool_rounds >= max_tool_rounds
-    }
-
-    fn record_executed_round(&mut self) {
-        self.tool_rounds = self.tool_rounds.saturating_add(1);
-    }
-
-    fn reset_after_compression(&mut self) {
-        self.tool_rounds = 0;
-    }
-
-    fn check_after_execution(
-        &mut self,
-        tool_calls: &[NeutralToolCall],
-    ) -> ReadOnlyToolProgressAction {
-        self.read_only_tool_progress_detector.check(tool_calls)
-    }
-}
 
 struct RemoteSidecarRuntimeToolState {
     message_source_sequences: Vec<Option<i64>>,
@@ -14410,7 +14379,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut run_metrics = RemoteSidecarRunMetrics::new();
     let mut current_request = initial_provider_request;
     let mut runtime_tool_state = initial_runtime_tool_state;
-    let mut tool_loop_guard = RemoteSidecarToolLoopGuard::default();
+    let mut tool_loop_guard = ToolLoopGuard::default();
     // Accumulates start+completed compression details for this run so final
     // assistant metadata.parts can include history-reload bubbles.
     let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
@@ -21039,7 +21008,7 @@ mod tests {
 
     #[test]
     fn remote_sidecar_tool_loop_uses_shared_round_limit_and_allows_ninth_batch() {
-        let mut guard = RemoteSidecarToolLoopGuard::default();
+        let mut guard = ToolLoopGuard::default();
 
         for round in 1..=MAX_AGENT_TOOL_ROUNDS {
             let tool_call =
@@ -21048,7 +21017,7 @@ mod tests {
             assert!(!guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS));
             guard.record_executed_round();
             if round == 9 {
-                assert_eq!(guard.tool_rounds, 9);
+                assert_eq!(guard.executed_rounds(), 9);
             }
         }
 
@@ -21062,7 +21031,7 @@ mod tests {
 
     #[test]
     fn remote_sidecar_tool_loop_rejects_third_identical_batch() {
-        let mut guard = RemoteSidecarToolLoopGuard::default();
+        let mut guard = ToolLoopGuard::default();
 
         for index in 1..crate::MAX_REPEATED_TOOL_CALL_BATCHES {
             assert!(
@@ -21089,7 +21058,7 @@ mod tests {
 
     #[test]
     fn remote_sidecar_tool_loop_injects_read_only_progress_warning_and_continues() {
-        let mut guard = RemoteSidecarToolLoopGuard::default();
+        let mut guard = ToolLoopGuard::default();
         let mut messages = Vec::new();
         let mut runtime_tool_state =
             test_remote_runtime_tool_state(&messages, 10_000, 10_000, true);
@@ -21115,7 +21084,7 @@ mod tests {
                 .content
                 .contains("consecutive read-only exploration tool batches")
         );
-        assert!(guard.tool_rounds < MAX_AGENT_TOOL_ROUNDS);
+        assert!(guard.executed_rounds() < MAX_AGENT_TOOL_ROUNDS);
 
         let next_tool_calls = [test_remote_tool_call("call-next", "next.rs")];
         assert!(guard.check_before_execution(&next_tool_calls).is_ok());
@@ -21325,7 +21294,7 @@ mod tests {
             test_remote_runtime_tool_state(&messages, 10_000, 10_000, true);
         runtime_tool_state
             .append_runtime_tool_batch(&mut messages, test_remote_tool_batch(0, 1_000));
-        let mut guard = RemoteSidecarToolLoopGuard::default();
+        let mut guard = ToolLoopGuard::default();
         guard.record_executed_round();
         guard.record_executed_round();
         assert!(guard.reached_round_cap(TEST_MAX_TOOL_ROUNDS));
@@ -21341,7 +21310,7 @@ mod tests {
                 .expect("round cap recovery")
         );
         guard.reset_after_compression();
-        assert_eq!(guard.tool_rounds, 0);
+        assert_eq!(guard.executed_rounds(), 0);
         assert!(messages.iter().all(|message| message.tool_calls.is_empty()));
         assert!(
             messages
@@ -33456,6 +33425,14 @@ mod tests {
             "{output}"
         );
         assert!(state.broker_pending.lock().await.is_empty());
+    }
+
+    #[test]
+    fn remote_sidecar_memory_dream_known_gap_returns_not_implemented() {
+        let response =
+            remote_sidecar_memory_unimplemented_response("dream/jobs/dream-job-42/changes");
+
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

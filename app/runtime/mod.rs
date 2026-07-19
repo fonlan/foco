@@ -13,6 +13,7 @@ mod subscriptions;
 mod tool_events;
 mod tool_execution;
 mod tool_locks;
+mod tool_loop;
 mod web_tools;
 pub(crate) use agent_scheduler::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
@@ -86,6 +87,7 @@ pub(crate) use tool_locks::{
     ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
     ToolResourceLockRegistry,
 };
+pub(crate) use tool_loop::ToolLoopGuard;
 pub(crate) use web_tools::{
     execute_web_tool, is_web_tool_name, web_search_enabled, web_tool_timeout_ms,
 };
