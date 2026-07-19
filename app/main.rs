@@ -169,6 +169,7 @@ mod http;
 mod logging;
 mod memory_runtime;
 mod plan_auto_run;
+mod plan_merge;
 mod plan_runtime;
 mod platform;
 mod prompt;

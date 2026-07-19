@@ -21,17 +21,20 @@ use serde_json::Value;
 
 use crate::{
     git_backend::{
-        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE,
-        AgentWorktreeInfo, agent_instance_worktree_path, agent_worktree_committed_diff,
+        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AgentWorktreeInfo, agent_instance_worktree_path,
         commit_staged_changes, delete_agent_worktree,
         fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
         resolve_agent_worktree_path, shared_workspace_head_commit_id, stage_git_file,
     },
     http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
+    plan_merge::{
+        PlanMergeFailureKind, classify_plan_merge_failure, plan_merge_prompt,
+        plan_phase_source_diff,
+    },
     *,
 };
 const PLAN_MERGE_CORRELATION_PREFIX: &str = "plan_merge:";
-const PLAN_MERGE_DIFF_MAX_CHARS: usize = 60_000;
+
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 // ponytail: fixed char cap keeps phase prompts bounded for now; ceiling is rough prompt sizing, upgrade to token-aware summaries if long plans need it.
 const PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS: usize = 12_000;
@@ -613,7 +616,11 @@ async fn dispatch_plan_merge(
     source_instance: &AgentInstanceRecord,
     merge_error: &ApiError,
 ) -> Result<bool, ApiError> {
-    let source_diff = match plan_phase_source_diff(workspace, source_instance) {
+    let root_path = plan_instance_worktree_path(workspace, source_instance);
+    let Some(base_revision) = source_instance.worktree_base_revision.as_deref() else {
+        return Ok(false);
+    };
+    let source_diff = match plan_phase_source_diff(&workspace.path, &root_path, base_revision) {
         Ok(source_diff) => source_diff,
         Err(_) => return Ok(false),
     };
@@ -935,13 +942,11 @@ async fn finalize_plan_worktree(
 }
 
 fn is_shared_workspace_dirty_merge_error(error: &ApiError) -> bool {
-    error.message.contains(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE)
+    classify_plan_merge_failure(error) == PlanMergeFailureKind::SharedWorkspaceDirty
 }
 
 fn is_shared_head_mismatch_merge_error(error: &ApiError) -> bool {
-    error
-        .message
-        .contains(AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE)
+    classify_plan_merge_failure(error) == PlanMergeFailureKind::SharedHeadMismatch
 }
 
 fn is_plan_merge_blocked(plan: &PlanRecord) -> bool {
@@ -1529,67 +1534,6 @@ fn plan_merge_target_for_task(task: &AgentTaskRecord) -> Result<Option<PlanMerge
     }))
 }
 
-fn plan_phase_source_diff(
-    workspace: &WorkspaceConfig,
-    instance: &AgentInstanceRecord,
-) -> Result<String, ApiError> {
-    let root_path = plan_instance_worktree_path(workspace, instance);
-    let diff = git_diff_response(&root_path, None)?;
-    let committed_diff = instance
-        .worktree_base_revision
-        .as_deref()
-        .map(|base_revision| {
-            agent_worktree_committed_diff(&workspace.path, &root_path, base_revision)
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let source = format!(
-        "Committed diff from plan worktree base to HEAD:\n{}\n\nGit status:\n{}\n\nUnstaged diff:\n{}\n\nStaged diff:\n{}",
-        committed_diff.trim_end(),
-        diff.status.trim_end(),
-        diff.diff.trim_end(),
-        diff.staged_diff.trim_end()
-    );
-    Ok(truncate_for_prompt(&source, PLAN_MERGE_DIFF_MAX_CHARS))
-}
-
-fn plan_merge_prompt(
-    plan: &PlanRecord,
-    phase: &PlanPhaseRecord,
-    merge_mode: &str,
-    error_message: &str,
-    source_diff: &str,
-) -> String {
-    let workspace_instruction = if merge_mode == PLAN_MERGE_AUTOMATION_DIRECT_AUTO {
-        "You are running in the shared workspace. Apply the needed merge resolution directly in this workspace. Do not create a git commit; Foco will stage and commit after this task completes."
-    } else {
-        "You are running in a fresh isolated worktree based on the current shared workspace. Recreate the intended phase changes from the source diff. Do not create a git commit; Foco will merge and commit after this task completes."
-    };
-    let mut message = format!(
-        "Resolve this failed automated plan phase merge.\n\n{workspace_instruction}\n\nPlan: {}\n\nOverview:\n{}\n\nPhase {}: {}\n\n{}\n\nMerge failure:\n{}\n\nSource worktree diff:\n```diff\n{}\n```",
-        plan.title,
-        plan.overview,
-        phase.sequence + 1,
-        phase.title,
-        phase.summary,
-        error_message.trim(),
-        source_diff
-    );
-    if !phase.steps.is_empty() {
-        message.push_str("\n\nPhase steps:");
-        for (index, step) in phase.steps.iter().enumerate() {
-            message.push_str(&format!(
-                "\n{}. {}\nDetail: {}",
-                index + 1,
-                step.title,
-                step.detail
-            ));
-        }
-    }
-    message.push_str("\n\nRun the smallest relevant checks and finish with a concise summary.");
-    message
-}
-
 fn commit_direct_plan_merge(
     workspace: &WorkspaceConfig,
     phase: &PlanPhaseRecord,
@@ -1597,20 +1541,6 @@ fn commit_direct_plan_merge(
     commit_workspace_changes(
         &workspace.path,
         format!("plan: resolve merge for {}", phase.title.trim()),
-    )
-}
-
-fn truncate_for_prompt(value: &str, max_bytes: usize) -> String {
-    if value.len() <= max_bytes {
-        return value.to_string();
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!(
-        "{}\n\n[truncated to {max_bytes} bytes for the merge prompt]",
-        &value[..end]
     )
 }
 
@@ -1630,6 +1560,7 @@ fn agent_task_error_message(task: &AgentTaskRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::git_backend::AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE;
     use foco_store::{
         config::{
             AgentDefinitionSettings, AgentModelOptions, ApiProxySettings,
