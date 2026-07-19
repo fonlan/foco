@@ -653,6 +653,112 @@ fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
 }
 
 #[test]
+fn stale_remote_owner_cannot_clear_a_later_turn_queued_run() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-remote-turns", "Remote turns")
+        .expect("chat insert");
+
+    for (user_id, assistant_id, sequence) in [
+        ("user-remote-turn-1", "assistant-remote-turn-1", 0),
+        ("user-remote-turn-2", "assistant-remote-turn-2", 2),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id: user_id,
+                chat_id: "chat-remote-turns",
+                role: "user",
+                content: "continue",
+                sequence,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": user_id,
+                            "assistantMessageId": assistant_id,
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("user insert");
+        database
+            .insert_message(NewMessage {
+                id: assistant_id,
+                chat_id: "chat-remote-turns",
+                role: "assistant",
+                content: "",
+                sequence: sequence + 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("assistant insert");
+    }
+
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-turns",
+                "user-remote-turn-1",
+                "assistant-remote-turn-1",
+                "remote-run-1",
+            )
+            .expect("claim first turn"),
+        RemoteQueuedRunClaimOutcome::Claimed
+    );
+    assert_eq!(
+        database
+            .clear_remote_queued_run_if_owned(
+                "chat-remote-turns",
+                "user-remote-turn-1",
+                "assistant-remote-turn-1",
+                "remote-run-1",
+            )
+            .expect("finish first turn"),
+        RemoteQueuedRunClearOutcome::Cleared
+    );
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-turns",
+                "user-remote-turn-2",
+                "assistant-remote-turn-2",
+                "remote-run-2",
+            )
+            .expect("claim second turn"),
+        RemoteQueuedRunClaimOutcome::Claimed
+    );
+
+    assert_eq!(
+        database
+            .clear_remote_queued_run_if_owned(
+                "chat-remote-turns",
+                "user-remote-turn-1",
+                "assistant-remote-turn-1",
+                "remote-run-1",
+            )
+            .expect("late first-run cleanup"),
+        RemoteQueuedRunClearOutcome::NotOwned
+    );
+    let second_user = database
+        .message("user-remote-turn-2")
+        .expect("second user lookup")
+        .expect("second user message");
+    let metadata: Value =
+        serde_json::from_str(&second_user.metadata_json).expect("second metadata");
+    assert_eq!(
+        metadata["queuedRun"],
+        json!({
+            "status": "running",
+            "userMessageId": "user-remote-turn-2",
+            "assistantMessageId": "assistant-remote-turn-2",
+            "runId": "remote-run-2",
+        })
+    );
+}
+
+#[test]
 fn concurrent_remote_queued_run_claims_choose_one_owner() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

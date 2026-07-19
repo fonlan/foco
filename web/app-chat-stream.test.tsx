@@ -660,6 +660,13 @@ describe("app-chat-stream verification surfaces", () => {
       );
       expect(streamCalls).toHaveLength(2);
     });
+    const streamCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/chat/stream`,
+    );
+    expect(JSON.parse(String(streamCalls[1]?.[1]?.body))).toMatchObject({
+      chatId: remoteChatId,
+      queuedUserMessageId: "queued-user-2",
+    });
     const queueCalls = fetchMock.mock.calls.filter(
       ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/chat/queue`,
     );

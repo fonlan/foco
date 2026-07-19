@@ -25159,6 +25159,176 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_second_turn_starts_after_terminal_deactivation_without_old_owner_cleanup() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        seed_remote_queued_chat(
+            &mut database,
+            "chat-two-turns",
+            "user-turn-1",
+            "assistant-turn-1",
+        );
+        drop(database);
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+
+        let (first_run_id, first_stream) = match remote_sidecar_reserve_active_run(
+            &state,
+            "chat-two-turns".to_string(),
+            "user-turn-1".to_string(),
+            "assistant-turn-1".to_string(),
+            None,
+        )
+        .expect("reserve first turn")
+        {
+            RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
+            RemoteRunReservation::Existing { .. } => panic!("first turn must reserve a new run"),
+        };
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .claim_remote_queued_run(
+                "chat-two-turns",
+                "user-turn-1",
+                "assistant-turn-1",
+                &first_run_id,
+            )
+            .expect("claim first turn");
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: first_run_id.clone(),
+                chat_id: "chat-two-turns".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: "2026-07-19T00:00:00Z".to_string(),
+            },
+        );
+
+        let terminal_stream = remote_sidecar_deactivate_active_run(&state, &first_run_id)
+            .expect("first active registration")
+            .run_stream;
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+        assert!(remote_sidecar_active_run_stream(&state, &first_run_id).is_none());
+        assert_eq!(
+            database
+                .clear_remote_queued_run_if_owned(
+                    "chat-two-turns",
+                    "user-turn-1",
+                    "assistant-turn-1",
+                    &first_run_id,
+                )
+                .expect("clear completed first turn"),
+            foco_store::workspace::RemoteQueuedRunClearOutcome::Cleared
+        );
+        terminal_stream.record(1, json!({ "type": "complete" }));
+        terminal_stream.record(2, json!({ "type": "streamEnd" }));
+        terminal_stream.mark_finished();
+        assert_eq!(first_stream.snapshot_after(-1).len(), 2);
+
+        database
+            .insert_message(NewMessage {
+                id: "user-turn-2",
+                chat_id: "chat-two-turns",
+                role: "user",
+                content: "next task",
+                sequence: 2,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "user-turn-2",
+                            "assistantMessageId": "assistant-turn-2",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert second user");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-turn-2",
+                chat_id: "chat-two-turns",
+                role: "assistant",
+                content: "",
+                sequence: 3,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("insert second assistant");
+        let plan_task_id = AgentTaskId::new("agent-task-two-turns").expect("plan task id");
+        let (second_run_id, second_stream) = match remote_sidecar_reserve_active_run(
+            &state,
+            "chat-two-turns".to_string(),
+            "user-turn-2".to_string(),
+            "assistant-turn-2".to_string(),
+            Some(plan_task_id),
+        )
+        .expect("reserve second turn")
+        {
+            RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
+            RemoteRunReservation::Existing { .. } => panic!("second turn must reserve a new run"),
+        };
+        assert_ne!(first_run_id, second_run_id);
+        database
+            .claim_remote_queued_run(
+                "chat-two-turns",
+                "user-turn-2",
+                "assistant-turn-2",
+                &second_run_id,
+            )
+            .expect("claim second turn");
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: second_run_id.clone(),
+                chat_id: "chat-two-turns".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: "2026-07-19T00:00:01Z".to_string(),
+            },
+        );
+
+        let reconnect = remote_sidecar_chat_run_stream(
+            State(state.clone()),
+            AxumPath(second_run_id.clone()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("second turn reconnect stream");
+        drop(reconnect);
+        let registered_second_stream =
+            remote_sidecar_active_run_stream(&state, &second_run_id).expect("second stream");
+        assert!(Arc::ptr_eq(
+            &second_stream.events,
+            &registered_second_stream.events
+        ));
+
+        assert_eq!(
+            database
+                .clear_remote_queued_run_if_owned(
+                    "chat-two-turns",
+                    "user-turn-1",
+                    "assistant-turn-1",
+                    &first_run_id,
+                )
+                .expect("late first-run cleanup"),
+            foco_store::workspace::RemoteQueuedRunClearOutcome::NotOwned
+        );
+        let second_user = database
+            .message("user-turn-2")
+            .expect("second user lookup")
+            .expect("second user message");
+        let metadata: Value =
+            serde_json::from_str(&second_user.metadata_json).expect("second metadata");
+        assert_eq!(metadata["queuedRun"]["runId"], second_run_id);
+        assert_eq!(metadata["queuedRun"]["status"], "running");
+
+        remote_sidecar_cancel_active_run(&state, &second_run_id, false, true);
+    }
+
+    #[tokio::test]
     async fn remote_run_cleanup_guard_is_idempotent_after_normal_finish() {
         let (state, mut broker_rx) = test_sidecar_state("/tmp/workspace".to_string(), 1);
         let run_stream = remote_sidecar_insert_active_run_stream(
