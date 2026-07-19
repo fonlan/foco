@@ -83,7 +83,7 @@ use crate::{
     config_snapshot, config_update_snapshot, estimate_tool_schema_tokens,
     git_backend::{
         agent_worktree_relative_path, commit_staged_changes, create_agent_worktree,
-        fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
+        delete_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
         shared_workspace_head_commit_id, stage_git_file,
     },
     hooks::{
@@ -106,7 +106,10 @@ use crate::{
     },
     memory_tool_definitions, merge_hook_summaries, neutral_mcp_tool_definition,
     neutral_text_message, neutral_tool_definition,
-    plan_merge::{PlanMergeFailureKind, classify_plan_merge_failure},
+    plan_merge::{
+        PlanMergeFailureKind, classify_plan_merge_failure, plan_merge_prompt,
+        plan_phase_source_diff,
+    },
     plan_runtime::previous_plan_phase_conclusions,
     prompt::{
         ContextUsageInput, LlmContextCompressionMode, active_system_prompt, agents_prompt_messages,
@@ -14694,6 +14697,9 @@ fn remote_sidecar_fail_plan_task(
         .ok_or_else(|| {
             ApiError::internal(format!("remote Plan Agent task '{task_id}' was not found"))
         })?;
+    let phase = database
+        .plan_phase_for_agent_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?;
     if matches!(
         task.status,
         AgentTaskStatus::Running | AgentTaskStatus::Waiting
@@ -14712,8 +14718,13 @@ fn remote_sidecar_fail_plan_task(
     }
     database
         .fail_plan_phase_run(&task.id, message)
-        .map_err(ApiError::from_workspace_error)
-        .map(|_| ())
+        .map_err(ApiError::from_workspace_error)?;
+    if let Some(phase) = phase {
+        database
+            .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
 }
 
 fn remote_sidecar_cancel_plan_task(
@@ -14729,6 +14740,9 @@ fn remote_sidecar_cancel_plan_task(
         .ok_or_else(|| {
             ApiError::internal(format!("remote Plan Agent task '{task_id}' was not found"))
         })?;
+    let phase = database
+        .plan_phase_for_agent_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?;
     if matches!(
         task.status,
         AgentTaskStatus::Running | AgentTaskStatus::Waiting
@@ -14747,8 +14761,106 @@ fn remote_sidecar_cancel_plan_task(
     }
     database
         .cancel_plan_phase_run(&task.id, message)
+        .map_err(ApiError::from_workspace_error)?;
+    if let Some(phase) = phase {
+        database
+            .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
+}
+
+fn remote_sidecar_complete_plan_task_if_running(
+    database: &mut WorkspaceDatabase,
+    task: &foco_store::workspace::AgentTaskRecord,
+) -> Result<(), ApiError> {
+    if task.status != AgentTaskStatus::Running {
+        return Ok(());
+    }
+    database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &task.team_id,
+            task_id: &task.id,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some("{}"),
+            error_json: None,
+            interruption_reason: None,
+        })
         .map_err(ApiError::from_workspace_error)
         .map(|_| ())
+}
+
+fn remote_sidecar_finalize_plan_merge_task(
+    state: &RemoteSidecarState,
+    task: &foco_store::workspace::AgentTaskRecord,
+    phase: &foco_store::workspace::PlanPhaseRecord,
+    task_kind: &RemotePlanTaskKind,
+    worktree: Option<&RemotePlanWorktree>,
+) -> Result<(), ApiError> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let shared_merge_commit_id = match task_kind {
+        RemotePlanTaskKind::Merge {
+            merge_mode: RemotePlanMergeMode::DirectAuto,
+            ..
+        } => remote_sidecar_commit_plan_worktree(&workspace_path, &phase.title)?,
+        RemotePlanTaskKind::Merge {
+            merge_mode: RemotePlanMergeMode::IsolatedAutoOnce,
+            ..
+        } => {
+            let worktree = worktree.ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote isolated merge Coordinator '{}' has no worktree",
+                    task.owner_instance_id
+                ))
+            })?;
+            remote_sidecar_commit_plan_worktree(&worktree.root_path, &phase.title)?;
+            fast_forward_shared_workspace_to_agent_worktree(
+                &workspace_path,
+                &worktree.root_path,
+                &worktree.base_revision,
+            )?;
+            shared_workspace_head_commit_id(&workspace_path)?
+        }
+        RemotePlanTaskKind::LegacyImplementation | RemotePlanTaskKind::Implementation { .. } => {
+            return Err(ApiError::internal(format!(
+                "remote Plan task '{}' is not a merge Coordinator",
+                task.id
+            )));
+        }
+    };
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        remote_sidecar_complete_plan_task_if_running(&mut database, task)?;
+        database
+            .complete_plan_phase_by_id(&phase.plan_id, &phase.id, Some(&shared_merge_commit_id))
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .record_plan_shared_merge_commit(&phase.plan_id, &shared_merge_commit_id)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .confirm_latest_completed_plan_phase_derived_effects(&phase.plan_id, &phase.id)
+            .map_err(ApiError::from_workspace_error)?;
+    }
+
+    if let Some(worktree) = worktree {
+        if let Err(error) = delete_agent_worktree(&workspace_path, &worktree.root_path, true) {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %error.message,
+                "remote Plan merge completed but its isolated worktree could not be removed"
+            );
+        } else {
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .switch_agent_instance_to_shared_workspace(&task.owner_instance_id)
+                .map_err(ApiError::from_workspace_error)?;
+        }
+    }
+    Ok(())
 }
 
 fn remote_sidecar_sync_plan_task_after_chat(
@@ -14757,7 +14869,7 @@ fn remote_sidecar_sync_plan_task_after_chat(
     assistant_message_id: &str,
     cancelled: bool,
 ) -> Result<Option<foco_store::workspace::PlanRecord>, ApiError> {
-    let (task, assistant_terminal_state, phase, worktree_path) = {
+    let (task, task_kind, assistant_terminal_state, phase, worktree) = {
         let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
         let task = database
@@ -14772,6 +14884,7 @@ fn remote_sidecar_sync_plan_task_after_chat(
         ) {
             return Ok(None);
         }
+        let task_kind = remote_plan_task_kind_from_input(&task.input_json)?;
         let assistant_terminal_state = database
             .message(assistant_message_id)
             .map_err(ApiError::from_workspace_error)?
@@ -14793,9 +14906,11 @@ fn remote_sidecar_sync_plan_task_after_chat(
         if phase.status != "running" {
             return Ok(None);
         }
-        let worktree_path = if cancelled || assistant_terminal_state.is_some() {
+        let worktree = if cancelled || assistant_terminal_state.is_some() {
             None
-        } else {
+        } else if task_kind.expected_execution_workspace_mode()
+            == AgentExecutionWorkspaceMode::IsolatedWorktree
+        {
             let instance = database
                 .agent_instance(&task.owner_instance_id)
                 .map_err(ApiError::from_workspace_error)?
@@ -14805,16 +14920,34 @@ fn remote_sidecar_sync_plan_task_after_chat(
                         task.owner_instance_id
                     ))
                 })?;
-            let worktree_relative_path =
-                instance.execution_root_path.as_deref().ok_or_else(|| {
-                    ApiError::internal(format!(
-                        "remote Plan Coordinator '{}' is missing its worktree path",
-                        instance.id
-                    ))
-                })?;
-            Some(PathBuf::from(&state.workspace_path).join(worktree_relative_path))
+            let root_path = instance.execution_root_path.as_deref().ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote Plan Coordinator '{}' is missing its worktree path",
+                    instance.id
+                ))
+            })?;
+            let base_revision = instance.worktree_base_revision.as_deref().ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote Plan Coordinator '{}' is missing its worktree base revision",
+                    instance.id
+                ))
+            })?;
+            let branch = instance.worktree_branch.as_deref().ok_or_else(|| {
+                ApiError::internal(format!(
+                    "remote Plan Coordinator '{}' is missing its worktree branch",
+                    instance.id
+                ))
+            })?;
+            Some(RemotePlanWorktree {
+                root_path: PathBuf::from(&state.workspace_path).join(root_path),
+                base_revision: base_revision.to_string(),
+                branch: branch.to_string(),
+                phase_id: phase.id.clone(),
+            })
+        } else {
+            None
         };
-        (task, assistant_terminal_state, phase, worktree_path)
+        (task, task_kind, assistant_terminal_state, phase, worktree)
     };
     if task.status == AgentTaskStatus::Completed
         && (cancelled || assistant_terminal_state.is_some())
@@ -14833,13 +14966,29 @@ fn remote_sidecar_sync_plan_task_after_chat(
         remote_sidecar_fail_plan_task(state, task_id, "remote Plan Coordinator chat failed")?;
         return Ok(None);
     }
-    let worktree_path = worktree_path.ok_or_else(|| {
+
+    if task_kind.requires_merge_attempt() {
+        if let Err(error) = remote_sidecar_finalize_plan_merge_task(
+            state,
+            &task,
+            &phase,
+            &task_kind,
+            worktree.as_ref(),
+        ) {
+            remote_sidecar_fail_plan_task(state, task_id, &error.message)?;
+        }
+        // A merge coordinator finalizes the Plan itself. Re-running the ordinary
+        // worktree finalizer would reprocess the original source worktree.
+        return Ok(None);
+    }
+
+    let worktree = worktree.ok_or_else(|| {
         ApiError::internal(format!(
             "remote Plan Coordinator '{}' has no worktree",
             task.id
         ))
     })?;
-    let commit_id = match remote_sidecar_commit_plan_worktree(&worktree_path, &phase.title) {
+    let commit_id = match remote_sidecar_commit_plan_worktree(&worktree.root_path, &phase.title) {
         Ok(commit_id) => commit_id,
         Err(error) => {
             remote_sidecar_fail_plan_task(state, task_id, &error.message)?;
@@ -14849,19 +14998,7 @@ fn remote_sidecar_sync_plan_task_after_chat(
     let plan = {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
-        if task.status == AgentTaskStatus::Running {
-            database
-                .update_agent_task_state(AgentTaskStateUpdate {
-                    team_id: &task.team_id,
-                    task_id: &task.id,
-                    expected_status: AgentTaskStatus::Running,
-                    transition: AgentTaskTransition::Complete,
-                    result_json: Some("{}"),
-                    error_json: None,
-                    interruption_reason: None,
-                })
-                .map_err(ApiError::from_workspace_error)?;
-        }
+        remote_sidecar_complete_plan_task_if_running(&mut database, &task)?;
         database
             .complete_plan_phase_run(task_id, Some(&commit_id))
             .map_err(ApiError::from_workspace_error)?
@@ -15019,6 +15156,212 @@ async fn remote_sidecar_continue_plan_if_ready(
     }
 }
 
+async fn remote_sidecar_dispatch_plan_merge(
+    state: &RemoteSidecarState,
+    plan: &foco_store::workspace::PlanRecord,
+    source_worktree: &RemotePlanWorktree,
+    merge_error: &ApiError,
+) -> Result<bool, ApiError> {
+    let phase = plan
+        .phases
+        .iter()
+        .find(|phase| phase.id == source_worktree.phase_id)
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "remote Plan merge phase '{}' was not found",
+                source_worktree.phase_id
+            ))
+        })?;
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let source_diff = plan_phase_source_diff(
+        &workspace_path,
+        &source_worktree.root_path,
+        &source_worktree.base_revision,
+    )?;
+    let bundle = state
+        .runtime_config
+        .lock()
+        .map_err(|_| ApiError::internal("remote sidecar runtime configuration lock is poisoned"))?
+        .clone()
+        .ok_or_else(|| {
+            ApiError::bad_request("remote runtime configuration has not been synchronized")
+        })?;
+    let merge_mode = RemotePlanMergeMode::parse(&bundle.payload.plan.merge_automation_mode)?;
+    let selection = remote_sidecar_plan_runner_selection(state, phase, None)?;
+    {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        if !database
+            .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
+            .map_err(ApiError::from_workspace_error)?
+        {
+            return Ok(false);
+        }
+    }
+
+    let prompt = plan_merge_prompt(
+        plan,
+        phase,
+        match merge_mode {
+            RemotePlanMergeMode::DirectAuto => PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
+            RemotePlanMergeMode::IsolatedAutoOnce => PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+        },
+        &merge_error.message,
+        &source_diff,
+    );
+    let queued = remote_sidecar_chat_queue(
+        State(state.clone()),
+        Json(json!({
+            "message": prompt,
+            "chatTitleOverride": format!("{} - {} (merge)", plan.title, phase.title),
+            "modelId": selection.model_id,
+            "providerId": selection.provider_id,
+            "thinkingLevel": selection.thinking_level,
+        })),
+    )
+    .await
+    .map_err(|response| {
+        ApiError::internal(format!(
+            "failed to queue remote Plan merge chat: {response:?}"
+        ))
+    })?
+    .0;
+    let chat_id = remote_required_text(queued.get("chatId"), "chatId").map_err(|response| {
+        ApiError::internal(format!(
+            "queued remote Plan merge chat is invalid: {response:?}"
+        ))
+    })?;
+    let user_message_id = remote_required_text(queued.get("userMessageId"), "userMessageId")
+        .map_err(|response| {
+            ApiError::internal(format!(
+                "queued remote Plan merge chat is invalid: {response:?}"
+            ))
+        })?;
+    let assistant_message_id =
+        remote_required_text(queued.get("assistantMessageId"), "assistantMessageId").map_err(
+            |response| {
+                ApiError::internal(format!(
+                    "queued remote Plan merge chat is invalid: {response:?}"
+                ))
+            },
+        )?;
+
+    let team_id = AgentTeamId::new(unique_id("agent-team"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let instance_id = AgentInstanceId::new(unique_id("agent-instance-plan-merge"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let task_id = AgentTaskId::new(unique_id("agent-task"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let merge_worktree = match merge_mode {
+        RemotePlanMergeMode::DirectAuto => None,
+        RemotePlanMergeMode::IsolatedAutoOnce => Some(create_agent_worktree(
+            &workspace_path,
+            instance_id.as_str(),
+        )?),
+    };
+    let worktree_root = merge_worktree
+        .as_ref()
+        .map(|worktree| agent_worktree_relative_path(&workspace_path, &worktree.root_path))
+        .transpose()?;
+    let tool_workspace_path = merge_worktree
+        .as_ref()
+        .map(|worktree| worktree.root_path.clone())
+        .unwrap_or_else(|| workspace_path.clone());
+    let input_json = json!({
+        "planId": plan.id,
+        "phaseId": phase.id,
+        "planTaskKind": REMOTE_PLAN_TASK_KIND_MERGE,
+        "planMergeMode": match merge_mode {
+            RemotePlanMergeMode::DirectAuto => PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
+            RemotePlanMergeMode::IsolatedAutoOnce => PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+        },
+        "queuedUserMessageId": user_message_id,
+        "visibleAssistantMessageId": assistant_message_id,
+        "message": prompt,
+    })
+    .to_string();
+    let dispatched = (|| {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        let (team, coordinator) = database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: &chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &selection.definition,
+                coordinator_execution_workspace_mode: merge_mode.execution_workspace_mode(),
+                coordinator_execution_root_path: worktree_root.as_deref(),
+                coordinator_worktree_base_revision: merge_worktree
+                    .as_ref()
+                    .map(|worktree| worktree.base_revision.as_str()),
+                coordinator_worktree_branch: merge_worktree
+                    .as_ref()
+                    .map(|worktree| worktree.branch.as_str()),
+                coordinator_worktree_status: merge_worktree.as_ref().map(|_| "active"),
+                max_concurrent_runs: 1,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team.id,
+                owner_instance_id: &coordinator.id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: &input_json,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .attach_plan_phase_merge_run(&plan.id, &phase.id, &chat_id, &team_id, &task_id)
+            .map_err(ApiError::from_workspace_error)?;
+        let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| {
+                ApiError::internal("queued remote Plan merge Coordinator was not claimable")
+            })?;
+        Ok::<(), ApiError>(())
+    })();
+    if let Err(error) = dispatched {
+        if let Some(worktree) = merge_worktree.as_ref() {
+            let _ = delete_agent_worktree(&workspace_path, &worktree.root_path, true);
+        }
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .discard_plan_phase_derived_effects_for_phase(&plan.id, &phase.id, &error.message)
+            .map_err(ApiError::from_workspace_error)?;
+        return Err(error);
+    }
+    if let Err(response) = remote_sidecar_start_chat_run(
+        state.clone(),
+        json!({
+            "chatId": chat_id,
+            "queuedUserMessageId": user_message_id,
+            "visibleAssistantMessageId": assistant_message_id,
+            "modelId": selection.model_id,
+            "providerId": selection.provider_id,
+            "thinkingLevel": selection.thinking_level,
+            "toolWorkspacePath": tool_workspace_path,
+            "planTaskId": task_id,
+        }),
+    )
+    .await
+    {
+        let error = ApiError::internal(format!(
+            "failed to start remote Plan merge Coordinator: {response:?}"
+        ));
+        remote_sidecar_fail_plan_task(state, &task_id, &error.message)?;
+        return Err(error);
+    }
+    Ok(true)
+}
+
 async fn remote_sidecar_finalize_plan_worktree(
     state: &RemoteSidecarState,
     plan: &foco_store::workspace::PlanRecord,
@@ -15046,23 +15389,72 @@ async fn remote_sidecar_finalize_plan_worktree(
                 .map_err(ApiError::from_workspace_error)?;
             Ok(())
         }
-        Err(error) => {
-            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                .map_err(ApiError::from_workspace_error)?;
-            match classify_plan_merge_failure(&error) {
-                PlanMergeFailureKind::SharedWorkspaceDirty => {
-                    database
-                        .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
-                        .map_err(ApiError::from_workspace_error)?;
-                }
-                PlanMergeFailureKind::SharedHeadMismatch | PlanMergeFailureKind::Other => {
-                    database
-                        .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
-                        .map_err(ApiError::from_workspace_error)?;
+        Err(error) => match classify_plan_merge_failure(&error) {
+            PlanMergeFailureKind::SharedWorkspaceDirty => {
+                let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+                Ok(())
+            }
+            PlanMergeFailureKind::SharedHeadMismatch => {
+                match remote_sidecar_dispatch_plan_merge(state, plan, &worktree, &error).await {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let mut database =
+                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                                .map_err(ApiError::from_workspace_error)?;
+                        database
+                            .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
+                            .map_err(ApiError::from_workspace_error)?;
+                        database
+                            .discard_plan_phase_derived_effects_for_phase(
+                                &plan.id,
+                                &worktree.phase_id,
+                                &error.message,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        Ok(())
+                    }
+                    Err(dispatch_error) => {
+                        let mut database =
+                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                                .map_err(ApiError::from_workspace_error)?;
+                        database
+                            .fail_plan_phase_by_id(
+                                &plan.id,
+                                &worktree.phase_id,
+                                &dispatch_error.message,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        database
+                            .discard_plan_phase_derived_effects_for_phase(
+                                &plan.id,
+                                &worktree.phase_id,
+                                &dispatch_error.message,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        Err(dispatch_error)
+                    }
                 }
             }
-            Ok(())
-        }
+            PlanMergeFailureKind::Other => {
+                let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .discard_plan_phase_derived_effects_for_phase(
+                        &plan.id,
+                        &worktree.phase_id,
+                        &error.message,
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                Ok(())
+            }
+        },
     }
 }
 
@@ -33783,5 +34175,167 @@ mod tests {
         let response = response_rx.recv().await.expect("broker response");
         assert_eq!(response.message_type, "response");
         assert_eq!(response.payload["ok"], true);
+    }
+
+    #[test]
+    fn remote_direct_merge_completion_commits_shared_workspace_and_records_merge_commit() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(workspace.path())
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--initial-branch=main"]);
+        git(&["config", "user.email", "tests@example.com"]);
+        git(&["config", "user.name", "Foco Tests"]);
+        fs::write(workspace.path().join("README.md"), "base\n").expect("write base file");
+        fs::write(workspace.path().join(".gitignore"), ".foco/\n")
+            .expect("ignore Foco runtime directory");
+        git(&["add", "README.md", ".gitignore"]);
+        git(&["commit", "-m", "base"]);
+
+        let plan_id = "plan-remote-direct-merge-completion";
+        let phase_id = "plan-remote-direct-merge-completion-phase";
+        let chat_id = "chat-remote-direct-merge-completion";
+        let team_id =
+            AgentTeamId::new("agent-team-remote-direct-merge-completion").expect("team id");
+        let instance_id = AgentInstanceId::new("agent-instance-remote-direct-merge-completion")
+            .expect("instance id");
+        let task_id =
+            AgentTaskId::new("agent-task-remote-direct-merge-completion").expect("task id");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-remote-direct-merge-completion")
+                .expect("definition id"),
+            revision: 1,
+            name: "Remote merge coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Merge the phase.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        };
+        let (task, phase) = {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: plan_id,
+                    title: "Remote direct merge completion",
+                    overview: "Commit direct merge changes in the shared workspace.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: phase_id,
+                        title: "Merge phase",
+                        summary: "Replay changes on the shared workspace.",
+                        steps: Vec::new(),
+                    }],
+                })
+                .expect("create plan");
+            database
+                .transition_plan(plan_id, "start")
+                .expect("start plan");
+            assert!(
+                database
+                    .try_begin_plan_phase_merge_attempt(
+                        plan_id,
+                        phase_id,
+                        "shared workspace HEAD advanced",
+                    )
+                    .expect("begin merge attempt")
+            );
+            database
+                .insert_chat(chat_id, "Remote direct merge")
+                .expect("chat");
+            database
+                .create_agent_team(NewAgentTeam {
+                    id: &team_id,
+                    chat_id,
+                    coordinator_instance_id: &instance_id,
+                    coordinator_definition: &definition,
+                    coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                    coordinator_execution_root_path: None,
+                    coordinator_worktree_base_revision: None,
+                    coordinator_worktree_branch: None,
+                    coordinator_worktree_status: None,
+                    max_concurrent_runs: 1,
+                })
+                .expect("create team");
+            let input_json = json!({
+                "planTaskKind": REMOTE_PLAN_TASK_KIND_MERGE,
+                "planId": plan_id,
+                "phaseId": phase_id,
+                "planMergeMode": PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
+            })
+            .to_string();
+            database
+                .enqueue_agent_task(NewAgentTask {
+                    id: &task_id,
+                    team_id: &team_id,
+                    owner_instance_id: &instance_id,
+                    origin_instance_id: None,
+                    parent_task_id: None,
+                    input_json: &input_json,
+                })
+                .expect("enqueue task");
+            database
+                .attach_plan_phase_merge_run(plan_id, phase_id, chat_id, &team_id, &task_id)
+                .expect("attach merge run");
+            database
+                .claim_runnable_agent_task(
+                    &team_id,
+                    &task_id,
+                    &AgentAttemptId::new("agent-attempt-remote-direct-merge-completion")
+                        .expect("attempt id"),
+                )
+                .expect("claim task")
+                .expect("task claimed");
+            (
+                database
+                    .agent_task(&task_id)
+                    .expect("task lookup")
+                    .expect("task"),
+                database
+                    .plan_phase_for_agent_task(&task_id)
+                    .expect("phase lookup")
+                    .expect("phase"),
+            )
+        };
+        fs::write(workspace.path().join("README.md"), "merged directly\n")
+            .expect("write direct merge change");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let task_kind = RemotePlanTaskKind::Merge {
+            plan_id: plan_id.to_string(),
+            phase_id: phase_id.to_string(),
+            merge_mode: RemotePlanMergeMode::DirectAuto,
+        };
+
+        remote_sidecar_finalize_plan_merge_task(&state, &task, &phase, &task_kind, None)
+            .expect("finalize direct merge");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let plan = database.plan(plan_id).expect("plan lookup").expect("plan");
+        let completed_task = database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .expect("task");
+        let shared_head = shared_workspace_head_commit_id(workspace.path()).expect("shared HEAD");
+        assert_eq!(
+            plan.shared_merge_commit_id.as_deref(),
+            Some(shared_head.as_str())
+        );
+        assert_eq!(completed_task.status, AgentTaskStatus::Completed);
     }
 }
