@@ -226,7 +226,7 @@ pub(crate) struct GitBranchRequest {
     name: String,
 }
 
-fn resolve_git_request_target(
+pub(crate) fn resolve_git_request_target(
     workspace_path: &Path,
     worktree_path: Option<&str>,
 ) -> Result<PathBuf, ApiError> {

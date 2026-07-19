@@ -272,12 +272,11 @@ pub(crate) const WORKSPACE_ROUTE_CONTRACTS: &[WorkspaceRouteContract] = &[
         "/api/workspaces/{workspace_id}/spec/jobs/{job_id}",
         Delete,
         Some("spec"),
-        None,
+        Some("/api/remote/workspace/spec/jobs/{job_id}"),
         Sidecar,
-        KnownGap,
+        Required,
         None,
-        "currently reaches no sidecar DELETE route",
-        "The local failed-job DELETE contract has no remote sidecar registration."
+        "503 when the remote sidecar is offline"
     ),
     route!(
         "plans-list",
@@ -603,12 +602,11 @@ pub(crate) const WORKSPACE_ROUTE_CONTRACTS: &[WorkspaceRouteContract] = &[
         "/api/workspaces/{workspace_id}/git/commit-message",
         Post,
         Some("git"),
-        None,
+        Some("/api/remote/workspace/git/commit-message"),
         Sidecar,
-        KnownGap,
         Required,
-        "currently reaches no sidecar commit-message route",
-        "Commit-message generation needs brokered LLM access but lacks a remote route."
+        None,
+        "503 when the remote sidecar is offline"
     ),
     route!(
         "terminal-session",
@@ -986,8 +984,6 @@ mod tests {
             .collect();
 
         for required in [
-            "git-commit-message",
-            "spec-job-delete",
             "workspace-hooks-settings",
             "workspace-hooks-save",
             "workspace-memory-list",

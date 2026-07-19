@@ -744,6 +744,13 @@ pub(crate) async fn add_workspace(
     )
 }
 
+fn remote_workspace_logo_cache_path(user_profile_dir: &Path, workspace_id: &str) -> PathBuf {
+    user_profile_dir
+        .join(".foco")
+        .join("remote-workspace-logos")
+        .join(workspace_id)
+}
+
 async fn add_remote_workspace(
     state: AppState,
     request: WorkspacePathRequest,
@@ -808,11 +815,7 @@ async fn add_remote_workspace(
     } else {
         None
     };
-    let local_logo_path = state
-        .user_profile_dir
-        .join(".foco")
-        .join("remote-workspace-logos")
-        .join(&id);
+    let local_logo_path = remote_workspace_logo_cache_path(&state.user_profile_dir, &id);
     if let Some((bytes, kind)) = logo.as_ref() {
         save_workspace_logo_file(&local_logo_path, bytes, *kind)?;
     }
@@ -825,11 +828,7 @@ async fn add_remote_workspace(
         WorkspaceConfig {
             id,
             name: name.to_string(),
-            path: if logo.is_some() {
-                local_logo_path
-            } else {
-                PathBuf::new()
-            },
+            path: local_logo_path,
             location: WorkspaceLocation::Ssh {
                 server_id: server_id.to_string(),
                 remote_path: remote_path.to_string(),
@@ -985,9 +984,7 @@ pub(crate) async fn save_workspace_settings(
                 ApiError::bad_request(format!("workspace was not found: {workspace_id}"))
             })?;
         workspace.name = name.to_string();
-        if !workspace.is_remote() {
-            workspace.path = PathBuf::new();
-        }
+        workspace.path = remote_workspace_logo_cache_path(&state.user_profile_dir, workspace_id);
         workspace.location = WorkspaceLocation::Ssh {
             server_id: server_id.to_string(),
             remote_path,
@@ -1049,8 +1046,23 @@ pub(crate) async fn delete_workspace(
     let mut config = config_update_snapshot(&state).await?;
     let removed = delete_configured_workspace(&mut config, &workspace_id)?;
     let remote_server_id = removed.server_id().map(str::to_string);
+    let remote_logo_cache_path = removed
+        .is_remote()
+        .then(|| removed.path.clone())
+        .filter(|path| !path.as_os_str().is_empty());
 
     save_config(&state, &mut config)?;
+    if let Some(path) = remote_logo_cache_path
+        && let Err(source) = fs::remove_dir_all(&path)
+        && source.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::warn!(
+            workspace_id = %workspace_id,
+            path = %path.display(),
+            error = %source,
+            "failed to remove remote workspace logo cache"
+        );
+    }
     if let Some(server_id) = remote_server_id {
         let _ = state
             .remote_workspace_manager
@@ -1083,7 +1095,13 @@ pub(crate) async fn workspace_logo(
 ) -> Result<Response, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let Some(logo) = workspace_logo_file(&workspace.path)? else {
+    let Some(logo_path) = workspace_logo_storage_path(workspace) else {
+        return Ok(Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(Body::from("workspace logo was not found"))
+            .expect("workspace logo response is valid"));
+    };
+    let Some(logo) = workspace_logo_file(logo_path)? else {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("workspace logo was not found"))
@@ -1112,11 +1130,7 @@ pub(crate) async fn workspace_logo_thumbnail(
 ) -> Result<Response, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let Some(logo_path) = workspace
-        .local_path()
-        .or_else(|| workspace.is_remote().then_some(workspace.path.as_path()))
-        .filter(|path| !path.as_os_str().is_empty())
-    else {
+    let Some(logo_path) = workspace_logo_storage_path(workspace) else {
         return Ok(Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(Body::from("workspace logo was not found"))
@@ -1151,7 +1165,9 @@ pub(crate) async fn save_workspace_logo(
     let bytes = workspace_logo_request_bytes(&request)?;
     let kind = workspace_logo_kind(&bytes)?;
 
-    save_workspace_logo_file(&workspace.path, &bytes, kind)?;
+    let logo_path = workspace_logo_storage_path(workspace)
+        .ok_or_else(|| ApiError::bad_request("workspace logo cache path is unavailable"))?;
+    save_workspace_logo_file(logo_path, &bytes, kind)?;
 
     settings_response(&state, &config).await
 }
@@ -1163,7 +1179,9 @@ pub(crate) async fn clear_workspace_logo(
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
 
-    clear_workspace_logo_file(&workspace.path)?;
+    let logo_path = workspace_logo_storage_path(workspace)
+        .ok_or_else(|| ApiError::bad_request("workspace logo cache path is unavailable"))?;
+    clear_workspace_logo_file(logo_path)?;
 
     settings_response(&state, &config).await
 }

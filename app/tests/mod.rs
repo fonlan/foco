@@ -94,7 +94,7 @@ use crate::http::{
         workspace_spec, workspace_spec_jobs,
     },
     terminal::create_terminal_session,
-    workspaces::{WorkspacePathRequest, add_workspace, workspace_logo_thumbnail},
+    workspaces::{WorkspacePathRequest, add_workspace, delete_workspace, workspace_logo_thumbnail},
 };
 use crate::memory_runtime::scheduler::{
     dispatch_auto_memory_dreams_at, memory_dream_interval_due, reconcile_memory_dream_runs,
@@ -22045,14 +22045,63 @@ async fn add_remote_workspace_with_logo_returns_logo_url() {
                 ))
             })
     );
+    let workspace_id = response_workspace.id.clone();
+    let expected_logo_cache_path = profile_dir
+        .join(".foco")
+        .join("remote-workspace-logos")
+        .join(&workspace_id);
     let config = state.config.lock().expect("config lock");
     let registered_workspace = config
         .workspaces
         .first()
         .expect("new remote workspace first");
-    assert_eq!(registered_workspace.id, response_workspace.id);
+    assert_eq!(registered_workspace.id, workspace_id);
+    assert_eq!(registered_workspace.path, expected_logo_cache_path);
+    assert_ne!(
+        registered_workspace.path,
+        PathBuf::from("/srv/remote-workspace")
+    );
     assert_eq!(config.app.active_workspace_id, registered_workspace.id);
     drop(config);
+
+    let restarted_config: GlobalConfig = serde_json::from_str(
+        &fs::read_to_string(&state.config_file).expect("saved remote workspace config"),
+    )
+    .expect("deserialize saved remote workspace config");
+    let restarted_workspace = restarted_config
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == workspace_id)
+        .expect("remote workspace survives restart");
+    assert_eq!(
+        workspace_logo_storage_path(restarted_workspace),
+        Some(expected_logo_cache_path.as_path())
+    );
+    assert!(
+        workspace_logo_file(&expected_logo_cache_path)
+            .expect("remote logo cache lookup")
+            .is_some(),
+        "restart must retain the local remote-logo cache rather than treating remotePath as storage"
+    );
+
+    let _ = delete_workspace(State(state.clone()), AxumPath(workspace_id.clone()))
+        .await
+        .expect("delete remote workspace");
+    assert!(
+        !expected_logo_cache_path.exists(),
+        "deleting a remote workspace must remove only its local logo cache"
+    );
+    let deleted_config: GlobalConfig = serde_json::from_str(
+        &fs::read_to_string(&state.config_file)
+            .expect("saved config after remote workspace deletion"),
+    )
+    .expect("deserialize config after remote workspace deletion");
+    assert!(
+        deleted_config
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.id != workspace_id)
+    );
 
     remove_dir_if_exists(&existing_workspace_dir);
     remove_dir_if_exists(&profile_dir);

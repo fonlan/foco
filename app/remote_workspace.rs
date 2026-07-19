@@ -22,7 +22,7 @@ use axum::{
         IntoResponse,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{any, get, patch, post, put},
+    routing::{any, delete, get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
@@ -78,13 +78,16 @@ use tungstenite::client::IntoClientRequest;
 
 use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
-    CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, MAX_AGENT_TOOL_ROUNDS, PromptContextSource,
-    api_audit_save_details, append_hook_context_messages, append_pending_tool_state_messages,
-    config_snapshot, config_update_snapshot, estimate_tool_schema_tokens,
+    CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, GIT_COMMIT_MESSAGE_REQUEST_KIND,
+    GIT_COMMIT_MESSAGE_TIMEOUT_MS, GitCommitMessageResponse, GitDiffResponse, GitStatusResponse,
+    MAX_AGENT_TOOL_ROUNDS, PromptContextSource, api_audit_save_details,
+    append_hook_context_messages, append_pending_tool_state_messages, config_snapshot,
+    config_update_snapshot, estimate_tool_schema_tokens,
     git_backend::{
         agent_worktree_relative_path, commit_staged_changes, create_agent_worktree,
-        delete_agent_worktree, fast_forward_shared_workspace_to_agent_worktree, git_diff_response,
-        shared_workspace_head_commit_id, stage_git_file,
+        delete_agent_worktree, discard_git_file, fast_forward_shared_workspace_to_agent_worktree,
+        git_diff_response, git_status_response, shared_workspace_head_commit_id, stage_git_file,
+        unstage_git_file,
     },
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
@@ -92,6 +95,7 @@ use crate::{
     },
     http::{
         chat::{ContextUsageRequest, ContextUsageResponse},
+        git::resolve_git_request_target,
         remote_servers::{normalize_target, select_sidecar_asset},
         spec::{
             SaveWorkspaceSpecRequest, WorkspaceSpecResponse, WorkspaceSpecSettingsRequest,
@@ -182,6 +186,7 @@ const BROKER_ALLOWED_LLM_REQUEST_KINDS: &[&str] = &[
     "chat completion",
     "contextCompression",
     "prompt hook",
+    GIT_COMMIT_MESSAGE_REQUEST_KIND,
     LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
     LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
     LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
@@ -2719,6 +2724,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             post(remote_sidecar_git_commit),
         )
         .route(
+            "/api/remote/workspace/git/commit-message",
+            post(remote_sidecar_git_commit_message),
+        )
+        .route(
             "/api/remote/workspace/git/branches",
             get(remote_sidecar_git_branches),
         )
@@ -2756,6 +2765,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/spec/jobs",
             get(remote_sidecar_spec_jobs),
+        )
+        .route(
+            "/api/remote/workspace/spec/jobs/{job_id}",
+            delete(remote_sidecar_spec_jobs_delete),
         )
         .route(
             "/api/remote/workspace/spec/jobs/{job_id}/retry",
@@ -16703,136 +16716,223 @@ async fn remote_sidecar_git_command(
     state: &RemoteSidecarState,
     args: &[&str],
 ) -> Result<std::process::Output, ApiError> {
-    let ws_path = sidecar_workspace_path(state);
     tokio::process::Command::new("git")
         .args(args)
-        .current_dir(ws_path)
+        .current_dir(sidecar_workspace_path(state))
         .output()
         .await
         .map_err(|source| ApiError::internal(format!("remote git command failed: {source}")))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGitTargetQuery {
+    worktree_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGitDiffQuery {
+    path: Option<String>,
+    worktree_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGitFileRequest {
+    path: String,
+    worktree_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGitCommitRequest {
+    message: String,
+    worktree_path: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteGitGenerateCommitMessageRequest {
+    model_id: String,
+    provider_id: String,
+    worktree_path: Option<String>,
+}
+
+fn remote_sidecar_git_target(
+    state: &RemoteSidecarState,
+    worktree_path: Option<&str>,
+) -> Result<PathBuf, ApiError> {
+    // Use the same canonicalization and registered-worktree authorization as local Git routes.
+    // A remote request may target the shared workspace or a Git worktree explicitly registered
+    // with that repository; arbitrary paths, traversal, and symlink escapes are rejected.
+    resolve_git_request_target(sidecar_workspace_path(state), worktree_path)
+}
+
 async fn remote_sidecar_git_status(
     State(state): State<RemoteSidecarState>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let output = remote_sidecar_git_command(&state, &["status", "--porcelain"])
-        .await
-        .map_err(|e| e.into_response())?;
-    let is_git = output.status.success();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let files: Vec<serde_json::Value> = stdout
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 3 { return None; }
-            let ix = line.as_bytes()[0] as char;
-            let wx = line.as_bytes()[1] as char;
-            let path = line[3..].trim().to_string();
-            if path.is_empty() { return None; }
-            Some(serde_json::json!({ "path": path, "indexStatus": ix.to_string(), "worktreeStatus": wx.to_string() }))
-        })
-        .collect();
-    Ok(Json(serde_json::json!({
-        "isGitRepository": is_git,
-        "status": if is_git { "ok".to_string() } else { "not_a_repository".to_string() },
-        "files": files,
-    })))
+    Query(query): Query<RemoteGitTargetQuery>,
+) -> Result<Json<GitStatusResponse>, axum::response::Response> {
+    let target_path = remote_sidecar_git_target(&state, query.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_status_response(&target_path).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_diff(
     State(state): State<RemoteSidecarState>,
-    Query(query): Query<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let path_filter = query.get("path").map(String::as_str);
-    let mut args = vec!["diff", "--no-color"];
-    if let Some(path) = path_filter.filter(|p| !p.is_empty()) {
-        args.push("--");
-        args.push(path);
-    }
-    let diff = remote_sidecar_git_command(&state, &args)
-        .await
-        .map_err(|e| e.into_response())?;
-    let staged = remote_sidecar_git_command(&state, &["diff", "--cached", "--no-color"])
-        .await
-        .map_err(|e| e.into_response())?;
-    let porcelain = remote_sidecar_git_command(&state, &["status", "--porcelain"])
-        .await
-        .map_err(|e| e.into_response())?;
-    let files: Vec<serde_json::Value> = String::from_utf8_lossy(&porcelain.stdout)
-        .lines()
-        .filter_map(|line| {
-            if line.len() < 3 { return None; }
-            let ix = line.as_bytes()[0] as char;
-            let wx = line.as_bytes()[1] as char;
-            let path = line[3..].trim();
-            if path.is_empty() { return None; }
-            Some(serde_json::json!({ "path": path, "indexStatus": ix.to_string(), "worktreeStatus": wx.to_string() }))
-        })
-        .collect();
-    let staged_files: Vec<serde_json::Value> = files
-        .iter()
-        .filter(|f| {
-            f["indexStatus"]
-                .as_str()
-                .map(|s| s != " " && s != "?")
-                .unwrap_or(false)
-        })
-        .cloned()
-        .collect();
-    Ok(Json(serde_json::json!({
-        "path": path_filter,
-        "status": "ok",
-        "diff": String::from_utf8_lossy(&diff.stdout),
-        "stagedDiff": String::from_utf8_lossy(&staged.stdout),
-        "files": files,
-        "stagedFiles": staged_files,
-    })))
+    Query(query): Query<RemoteGitDiffQuery>,
+) -> Result<Json<GitDiffResponse>, axum::response::Response> {
+    let path = query
+        .path
+        .as_deref()
+        .map(crate::normalize_workspace_relative_path)
+        .transpose()
+        .map_err(IntoResponse::into_response)?;
+    let target_path = remote_sidecar_git_target(&state, query.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_diff_response(&target_path, path).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_stage(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let path = payload.get("path").map(String::as_str).unwrap_or(".");
-    remote_sidecar_git_command(&state, &["add", path])
-        .await
-        .map_err(|e| e.into_response())?;
-    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+    Json(request): Json<RemoteGitFileRequest>,
+) -> Result<Json<GitDiffResponse>, axum::response::Response> {
+    let path = crate::normalize_workspace_relative_path(&request.path)
+        .map_err(IntoResponse::into_response)?;
+    let target_path = remote_sidecar_git_target(&state, request.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    stage_git_file(&target_path, &path).map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_diff_response(&target_path, None).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_unstage(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let path = payload.get("path").map(String::as_str).unwrap_or(".");
-    remote_sidecar_git_command(&state, &["reset", "HEAD", "--", path])
-        .await
-        .map_err(|e| e.into_response())?;
-    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+    Json(request): Json<RemoteGitFileRequest>,
+) -> Result<Json<GitDiffResponse>, axum::response::Response> {
+    let path = crate::normalize_workspace_relative_path(&request.path)
+        .map_err(IntoResponse::into_response)?;
+    let target_path = remote_sidecar_git_target(&state, request.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    unstage_git_file(&target_path, &path).map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_diff_response(&target_path, None).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_discard(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let path = payload.get("path").map(String::as_str).unwrap_or(".");
-    remote_sidecar_git_command(&state, &["checkout", "--", path])
-        .await
-        .map_err(|e| e.into_response())?;
-    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+    Json(request): Json<RemoteGitFileRequest>,
+) -> Result<Json<GitDiffResponse>, axum::response::Response> {
+    let path = crate::normalize_workspace_relative_path(&request.path)
+        .map_err(IntoResponse::into_response)?;
+    let target_path = remote_sidecar_git_target(&state, request.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    discard_git_file(&target_path, &path).map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_diff_response(&target_path, None).map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_commit(
     State(state): State<RemoteSidecarState>,
-    Json(payload): Json<HashMap<String, String>>,
-) -> Result<Json<serde_json::Value>, axum::response::Response> {
-    let message = payload.get("message").map(String::as_str).unwrap_or("");
-    if message.is_empty() {
-        return Err(ApiError::bad_request("commit message must not be empty").into_response());
+    Json(request): Json<RemoteGitCommitRequest>,
+) -> Result<Json<GitDiffResponse>, axum::response::Response> {
+    let target_path = remote_sidecar_git_target(&state, request.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    commit_staged_changes(&target_path, request.message).map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        git_diff_response(&target_path, None).map_err(IntoResponse::into_response)?,
+    ))
+}
+
+async fn remote_sidecar_git_commit_message(
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<RemoteGitGenerateCommitMessageRequest>,
+) -> Result<Json<GitCommitMessageResponse>, axum::response::Response> {
+    let model_id = request.model_id.trim();
+    let provider_id = request.provider_id.trim();
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty").into_response());
     }
-    remote_sidecar_git_command(&state, &["commit", "-m", message])
-        .await
-        .map_err(|e| e.into_response())?;
-    remote_sidecar_git_diff(State(state), Query(HashMap::new())).await
+    if provider_id.is_empty() {
+        return Err(ApiError::bad_request("provider id must not be empty").into_response());
+    }
+
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|config| config.clone())
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "remote sidecar runtime config is unavailable; wait for runtime config sync",
+            )
+            .into_response()
+        })?;
+    let model = bundle
+        .payload
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("model was not found: {model_id}")).into_response()
+        })?;
+    if !model.enabled {
+        return Err(
+            ApiError::bad_request(format!("model '{}' is disabled", model.id)).into_response(),
+        );
+    }
+    let limits = model.limits.as_ref().ok_or_else(|| {
+        ApiError::bad_request(format!("enabled model '{}' is missing limits", model.id))
+            .into_response()
+    })?;
+    if !model.provider_ids.iter().any(|id| id == provider_id) {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' is not associated with model '{}'",
+            provider_id, model.id
+        ))
+        .into_response());
+    }
+    let max_output_tokens = u32::try_from(limits.max_output_tokens).map_err(|_| {
+        ApiError::bad_request(format!(
+            "model '{}' max output tokens exceed u32: {}",
+            model.id, limits.max_output_tokens
+        ))
+        .into_response()
+    })?;
+    let target_path = remote_sidecar_git_target(&state, request.worktree_path.as_deref())
+        .map_err(IntoResponse::into_response)?;
+    let diff = git_diff_response(&target_path, None).map_err(IntoResponse::into_response)?;
+    let broker_request = crate::prepare_git_commit_message_request(
+        &model.id,
+        max_output_tokens,
+        &state.workspace_id,
+        &diff.staged_files,
+        &diff.staged_diff,
+    )
+    .map_err(IntoResponse::into_response)?;
+    let arguments = remote_sidecar_broker_tool_request(
+        &state,
+        provider_id,
+        &model.id,
+        broker_request,
+        None,
+        GIT_COMMIT_MESSAGE_TIMEOUT_MS,
+        GIT_COMMIT_MESSAGE_REQUEST_KIND,
+        "submit_commit_message",
+    )
+    .await
+    .map_err(IntoResponse::into_response)?;
+    Ok(Json(
+        crate::parse_git_commit_message_tool_arguments(arguments)
+            .map_err(IntoResponse::into_response)?,
+    ))
 }
 
 async fn remote_sidecar_git_branches(
@@ -17124,6 +17224,25 @@ async fn remote_sidecar_spec_jobs_retry(
     Ok(Json(json!({ "job": remote_sidecar_spec_job_json(job)? })))
 }
 
+async fn remote_sidecar_spec_jobs_delete(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let deleted = database
+        .delete_failed_workspace_spec_job(&job_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    if !deleted {
+        return Err(
+            ApiError::bad_request("workspace spec job is not failed or was not found")
+                .into_response(),
+        );
+    }
+
+    Ok(Json(json!({ "deleted": true, "jobId": job_id })))
+}
+
 fn remote_sidecar_spec_job_json(
     job: foco_store::workspace::WorkspaceSpecJobRecord,
 ) -> Result<Value, axum::response::Response> {
@@ -17239,7 +17358,7 @@ async fn run_remote_sidecar_spec_job(
     };
 
     let max_output_tokens = prepared.request.max_output_tokens;
-    let content_markdown = remote_sidecar_broker_workspace_spec_tool_request(
+    let content_markdown = remote_sidecar_broker_tool_request(
         state,
         &prepared.provider_id,
         &prepared.model_id,
@@ -17265,7 +17384,7 @@ async fn run_remote_sidecar_spec_job(
                 let model_id = model_id.clone();
                 let chat_id = chat_id.clone();
                 async move {
-                    remote_sidecar_broker_workspace_spec_tool_request(
+                    remote_sidecar_broker_tool_request(
                         state,
                         &provider_id,
                         &model_id,
@@ -17324,7 +17443,7 @@ async fn run_remote_sidecar_spec_update_job(
         return Ok(());
     };
 
-    let tool_arguments = remote_sidecar_broker_workspace_spec_tool_request(
+    let tool_arguments = remote_sidecar_broker_tool_request(
         state,
         &prepared.provider_id,
         &prepared.model_id,
@@ -17356,7 +17475,7 @@ async fn run_remote_sidecar_spec_update_job(
                     let model_id = model_id.clone();
                     let chat_id = chat_id.clone();
                     async move {
-                        remote_sidecar_broker_workspace_spec_tool_request(
+                        remote_sidecar_broker_tool_request(
                             state,
                             &provider_id,
                             &model_id,
@@ -17391,7 +17510,7 @@ async fn run_remote_sidecar_spec_update_job(
     Ok(())
 }
 
-async fn remote_sidecar_broker_workspace_spec_tool_request(
+async fn remote_sidecar_broker_tool_request(
     state: &RemoteSidecarState,
     provider_id: &str,
     model_id: &str,
@@ -17423,12 +17542,12 @@ async fn remote_sidecar_broker_workspace_spec_tool_request(
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 return Err(ApiError::bad_gateway(
-                    "remote broker closed before workspace spec generation completed",
+                    "remote broker closed before tool request completed",
                 ));
             }
             Err(_) => {
                 return Err(ApiError::bad_gateway(
-                    "remote broker timed out while generating workspace spec",
+                    "remote broker timed out while waiting for a tool response",
                 ));
             }
         };
@@ -20886,6 +21005,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_sidecar_git_commit_message_brokers_staged_remote_diff() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let repo = gix::init(workspace.path()).expect("init repository");
+        let mut index = gix::index::File::from_state(
+            gix::index::State::new(repo.object_hash()),
+            repo.index_path(),
+        );
+        index.write(Default::default()).expect("empty index");
+        fs::write(
+            workspace.path().join(".git").join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+        )
+        .expect("test git config");
+        fs::write(workspace.path().join("README.md"), "base\n").expect("base file");
+        stage_git_file(workspace.path(), "README.md").expect("stage base file");
+        commit_staged_changes(workspace.path(), "initial".to_string()).expect("initial commit");
+        fs::write(workspace.path().join("README.md"), "changed\n").expect("changed file");
+        stage_git_file(workspace.path(), "README.md").expect("stage changed file");
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let config = remote_test_config(workspace.path());
+        *state.runtime_config.lock().expect("runtime config") = Some(
+            build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+                .expect("runtime config bundle"),
+        );
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some(GIT_COMMIT_MESSAGE_REQUEST_KIND)
+            );
+            assert_eq!(
+                request.payload.get("providerId").and_then(Value::as_str),
+                Some("provider-1")
+            );
+            assert_eq!(
+                request.payload.get("modelId").and_then(Value::as_str),
+                Some("model-1")
+            );
+            assert!(
+                request.payload["request"]["messages"][1]["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("+changed")),
+                "brokered request must contain the sidecar's staged remote diff"
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &request,
+                "submit_commit_message",
+                json!({ "message": "fix: update remote readme" }),
+            )
+            .await;
+        });
+
+        let response = remote_sidecar_git_commit_message(
+            State(state),
+            Json(RemoteGitGenerateCommitMessageRequest {
+                model_id: "model-1".to_string(),
+                provider_id: "provider-1".to_string(),
+                worktree_path: None,
+            }),
+        )
+        .await
+        .expect("remote commit message response");
+        assert_eq!(response.0.message, "fix: update remote readme");
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_spec_delete_only_removes_failed_job() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        for id in ["failed-job", "queued-job"] {
+            database
+                .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+                    id,
+                    trigger_type: WorkspaceSpecTriggerType::ManualInitial.as_str(),
+                    chat_id: None,
+                    run_id: None,
+                    model_id: None,
+                    base_revision: None,
+                    input_summary_json: Some("{}"),
+                })
+                .expect("insert spec job");
+        }
+        database
+            .mark_workspace_spec_job_failed("failed-job", "expected failure")
+            .expect("mark failed spec job");
+        drop(database);
+
+        let deleted = remote_sidecar_spec_jobs_delete(
+            State(state.clone()),
+            AxumPath("failed-job".to_string()),
+        )
+        .await
+        .expect("delete failed job");
+        assert_eq!(deleted.0, json!({ "deleted": true, "jobId": "failed-job" }));
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        assert!(
+            database
+                .workspace_spec_job("failed-job")
+                .expect("read failed job")
+                .is_none()
+        );
+        assert!(
+            database
+                .workspace_spec_job("queued-job")
+                .expect("read queued job")
+                .is_some()
+        );
+        drop(database);
+
+        let error =
+            remote_sidecar_spec_jobs_delete(State(state), AxumPath("queued-job".to_string()))
+                .await
+                .expect_err("queued job must not be deleted");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
     async fn remote_sidecar_spec_generate_executes_job_via_broker() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let profile = tempfile::tempdir().expect("profile tempdir");
@@ -24270,6 +24514,7 @@ mod tests {
             "prompt hook"
         );
         for request_kind in [
+            GIT_COMMIT_MESSAGE_REQUEST_KIND,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
@@ -24277,7 +24522,7 @@ mod tests {
         ] {
             assert_eq!(
                 broker_llm_request_kind_from_payload(&json!({ "requestKind": request_kind }))
-                    .expect("workspace spec request kind"),
+                    .expect("allowed broker request kind"),
                 request_kind
             );
         }
@@ -24335,6 +24580,7 @@ mod tests {
         for request_kind in [
             BROKER_PROMPT_HOOK_REQUEST_KIND,
             BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+            GIT_COMMIT_MESSAGE_REQUEST_KIND,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
             LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,

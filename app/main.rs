@@ -286,7 +286,8 @@ const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
 // Tool name the model must call to return relevant memories for prompt retrieval.
 const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
 const GIT_COMMIT_MESSAGE_TOOL_NAME: &str = "submit_commit_message";
-const GIT_COMMIT_MESSAGE_TIMEOUT_MS: u64 = 60_000;
+pub(crate) const GIT_COMMIT_MESSAGE_REQUEST_KIND: &str = "git_commit_message_generation";
+pub(crate) const GIT_COMMIT_MESSAGE_TIMEOUT_MS: u64 = 60_000;
 const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
 const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
 const API_AUDIT_CLEANUP_STARTUP_DELAY_SECS: u64 = 30;
@@ -5313,6 +5314,71 @@ fn git_commit_message_tool_definition() -> NeutralToolDefinition {
     }
 }
 
+pub(crate) fn prepare_git_commit_message_request(
+    model_id: &str,
+    max_output_tokens: u32,
+    workspace_id: &str,
+    staged_files: &[GitStatusFileSummary],
+    staged_diff: &str,
+) -> Result<NeutralChatRequest, ApiError> {
+    if staged_files.is_empty() || staged_diff.trim().is_empty() {
+        return Err(ApiError::bad_request("no staged git changes to summarize"));
+    }
+
+    let staged_files_json = serde_json::to_string_pretty(staged_files).map_err(|source| {
+        ApiError::internal(format!("failed to serialize staged git files: {source}"))
+    })?;
+    let staged_diff = if staged_diff.len() > GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS {
+        let truncated = staged_diff
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS)
+            .last()
+            .unwrap_or(0);
+        format!(
+            "{}\n\n[diff truncated to {} UTF-8 bytes for commit message generation]",
+            &staged_diff[..truncated],
+            GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS
+        )
+    } else {
+        staged_diff.to_string()
+    };
+
+    Ok(NeutralChatRequest {
+        model_id: model_id.to_string(),
+        messages: vec![
+            neutral_text_message(
+                NeutralChatRole::System,
+                GIT_COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
+            ),
+            neutral_text_message(
+                NeutralChatRole::User,
+                format!(
+                    "workspaceId: {workspace_id}\n\nStaged files JSON:\n{staged_files_json}\n\nStaged diff:\n{staged_diff}"
+                ),
+            ),
+        ],
+        tools: vec![git_commit_message_tool_definition()],
+        thinking_level: None,
+        max_output_tokens: Some(max_output_tokens.min(GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS)),
+        prompt_cache_key: None,
+        prompt_cache_retention: None,
+    })
+}
+
+pub(crate) fn parse_git_commit_message_tool_arguments(
+    arguments: Value,
+) -> Result<GitCommitMessageResponse, ApiError> {
+    let message = arguments
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .ok_or_else(|| ApiError::internal("generated commit message was empty"))?
+        .to_string();
+    Ok(GitCommitMessageResponse { message })
+}
+
 pub(crate) async fn generate_git_commit_message(
     workspace_path: &Path,
     workspace_id: &str,
@@ -5376,44 +5442,13 @@ pub(crate) async fn generate_git_commit_message(
             ))
         })?
         .min(GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS);
-    let staged_files_json = serde_json::to_string_pretty(staged_files).map_err(|source| {
-        ApiError::internal(format!("failed to serialize staged git files: {source}"))
-    })?;
-    let staged_diff = if staged_diff.len() > GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS {
-        let truncated = staged_diff
-            .char_indices()
-            .map(|(index, _)| index)
-            .take_while(|index| *index <= GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS)
-            .last()
-            .unwrap_or(0);
-        format!(
-            "{}\n\n[diff truncated to {} UTF-8 bytes for commit message generation]",
-            &staged_diff[..truncated],
-            GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS
-        )
-    } else {
-        staged_diff.to_string()
-    };
-    let request = NeutralChatRequest {
-        model_id: model.id.clone(),
-        messages: vec![
-            neutral_text_message(
-                NeutralChatRole::System,
-                GIT_COMMIT_MESSAGE_SYSTEM_PROMPT.to_string(),
-            ),
-            neutral_text_message(
-                NeutralChatRole::User,
-                format!(
-                    "workspaceId: {workspace_id}\n\nStaged files JSON:\n{staged_files_json}\n\nStaged diff:\n{staged_diff}"
-                ),
-            ),
-        ],
-        tools: vec![git_commit_message_tool_definition()],
-        thinking_level: None,
-        max_output_tokens: Some(max_output_tokens),
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-    };
+    let request = prepare_git_commit_message_request(
+        &model.id,
+        max_output_tokens,
+        workspace_id,
+        staged_files,
+        staged_diff,
+    )?;
     let arguments = audited_provider_tool_request(
         workspace_path,
         workspace_id,
@@ -5421,7 +5456,7 @@ pub(crate) async fn generate_git_commit_message(
         provider_id,
         &provider_connection_config(provider)?,
         request,
-        "git_commit_message_generation",
+        GIT_COMMIT_MESSAGE_REQUEST_KIND,
         GIT_COMMIT_MESSAGE_TOOL_NAME,
         "commit message submission tool",
         GIT_COMMIT_MESSAGE_TIMEOUT_MS,
@@ -5429,15 +5464,7 @@ pub(crate) async fn generate_git_commit_message(
         api_audit_save_details(config),
     )
     .await?;
-    let message = arguments
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .ok_or_else(|| ApiError::internal("generated commit message was empty"))?
-        .to_string();
-
-    Ok(GitCommitMessageResponse { message })
+    parse_git_commit_message_tool_arguments(arguments)
 }
 
 pub(crate) async fn audited_provider_text_request(
@@ -7308,11 +7335,18 @@ fn optional_workspace_logo_request_bytes(
     Ok(Some(bytes))
 }
 
+pub(crate) fn workspace_logo_storage_path(workspace: &WorkspaceConfig) -> Option<&Path> {
+    if workspace.is_remote() {
+        // SSH workspaces keep only a local logo cache in `path`; remote source and SQLite paths
+        // are always resolved from `WorkspaceLocation::Ssh::remote_path` by the sidecar.
+        (!workspace.path.as_os_str().is_empty()).then_some(workspace.path.as_path())
+    } else {
+        workspace.local_path()
+    }
+}
+
 pub(crate) fn workspace_logo_url(workspace: &WorkspaceConfig) -> Result<Option<String>, ApiError> {
-    let path = workspace
-        .local_path()
-        .or_else(|| workspace.is_remote().then_some(workspace.path.as_path()));
-    let Some(path) = path.filter(|path| !path.as_os_str().is_empty()) else {
+    let Some(path) = workspace_logo_storage_path(workspace) else {
         return Ok(None);
     };
     Ok(workspace_logo_file(path)?.map(|logo| {
