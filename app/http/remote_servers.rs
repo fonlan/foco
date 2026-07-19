@@ -268,7 +268,13 @@ pub(crate) async fn delete_remote_server(
     }
     save_config(&state, &mut config)?;
     disconnect_remote_server_id(&state, id)?;
-    state.remote_workspace_manager.disconnect_server(id).await?;
+    let workspace_ids = state.remote_workspace_manager.disconnect_server(id).await?;
+    for workspace_id in workspace_ids {
+        state
+            .openai_resp_ws_sessions
+            .invalidate_workspace(&workspace_id)
+            .await;
+    }
     Ok(Json(DeleteRemoteServerResponse {
         deleted,
         references,
@@ -339,10 +345,16 @@ pub(crate) async fn disconnect_remote_server(
     AxumPath(server_id): AxumPath<String>,
 ) -> Result<Json<RemoteServerResponse>, ApiError> {
     disconnect_remote_server_id(&state, &server_id)?;
-    state
+    let workspace_ids = state
         .remote_workspace_manager
         .disconnect_server(&server_id)
         .await?;
+    for workspace_id in workspace_ids {
+        state
+            .openai_resp_ws_sessions
+            .invalidate_workspace(&workspace_id)
+            .await;
+    }
     let config = config_snapshot(&state)?;
     let server = remote_server_by_id(&config, &server_id)?.clone();
     let connected_ids = connected_remote_server_ids(&state)?;

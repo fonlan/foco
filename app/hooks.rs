@@ -1032,6 +1032,7 @@ async fn audited_prompt_hook_stream(
             request.hook_request.clone(),
             request.api_audit_save_details,
             capture.observer(),
+            None,
         ),
     )
     .await

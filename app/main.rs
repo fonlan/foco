@@ -29,8 +29,9 @@ use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefiniti
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, ProviderConfigError,
-    ProviderConnectionConfig, ProviderRequestFailure, ProviderRequestOverride,
+    OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, OpenAiRespWsSessionKey,
+    OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
+    ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
     normalized_proxy_url, parse_provider_kind, stream_chat_with_capture_observer,
 };
 #[cfg(test)]
@@ -422,6 +423,8 @@ pub(crate) struct AppState {
     remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
     remote_server_connections: Arc<Mutex<HashSet<String>>>,
     preview_sessions: crate::runtime::PreviewSessionRegistry,
+    /// Run-scoped OpenAI Responses WebSocket sessions (local + brokered SSH).
+    openai_resp_ws_sessions: Arc<OpenAiRespWsSessionRegistry>,
     #[cfg(all(windows, not(debug_assertions)))]
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
@@ -735,6 +738,7 @@ async fn run_server_until_shutdown(
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
         preview_sessions: crate::runtime::PreviewSessionRegistry::default(),
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
@@ -761,6 +765,7 @@ async fn run_server_until_shutdown(
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
     let remote_workspace_manager = state.remote_workspace_manager.clone();
+    let openai_resp_ws_sessions = state.openai_resp_ws_sessions.clone();
     let user_profile_dir_for_update_ready = state.user_profile_dir.clone();
     let app = crate::http::router::app_router(state);
     let bind_started_at = Instant::now();
@@ -844,6 +849,7 @@ async fn run_server_until_shutdown(
         terminal_shutdown_tx,
         mcp_registry,
         remote_workspace_manager,
+        openai_resp_ws_sessions,
     ))
     .await;
     if let Some(companion_server_task) = companion_server_task {
@@ -1032,6 +1038,7 @@ async fn shutdown_signal(
     terminal_shutdown_tx: broadcast::Sender<()>,
     mcp_registry: Arc<McpRegistry>,
     remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
+    openai_resp_ws_sessions: Arc<OpenAiRespWsSessionRegistry>,
 ) {
     tokio::select! {
         ctrl_c = tokio::signal::ctrl_c() => {
@@ -1052,6 +1059,7 @@ async fn shutdown_signal(
 
     tracing::info!("shutdown requested; closing terminal sessions");
     let _ = terminal_shutdown_tx.send(());
+    openai_resp_ws_sessions.shutdown_all().await;
     if let Err(error) = remote_workspace_manager.disconnect_all().await {
         tracing::warn!(error = %error.message(), "failed to stop remote workspace sessions");
     }
@@ -2204,6 +2212,8 @@ struct PreparedChatContext {
     /// Last chat-completion provider `input_tokens` in this run (memory only).
     /// Used as a second Normal (95%) LLM checkpoint gate when local estimate lags.
     last_chat_completion_input_tokens: Option<u64>,
+    /// Shared OpenAI Responses WebSocket session registry for run-scoped reuse.
+    openai_resp_ws_sessions: Arc<OpenAiRespWsSessionRegistry>,
 }
 
 struct PreparedPromptContext {
@@ -2691,6 +2701,25 @@ fn resolve_active_model_route(
 }
 
 impl PreparedChatContext {
+    /// Run-scoped WebSocket affinity for chat completion (assistant message identity).
+    /// Returns None when the active provider is not WebSocket Responses so callers stay
+    /// protocol-agnostic.
+    pub(crate) fn openai_resp_ws_session_context(&self) -> Option<ProviderWsSessionContext> {
+        if !self.provider_config.kind.uses_websocket() {
+            return None;
+        }
+        Some(ProviderWsSessionContext {
+            registry: Arc::clone(&self.openai_resp_ws_sessions),
+            key: OpenAiRespWsSessionKey::new(
+                self.workspace_id.clone(),
+                self.assistant_message_id.clone(),
+                self.provider_id.clone(),
+                self.model_id.clone(),
+            ),
+            enable_continuation: true,
+        })
+    }
+
     pub(crate) fn refresh_model_route(&mut self) -> Result<(), ApiError> {
         let Some(live_config) = &self.live_config else {
             // Handcrafted unit-test contexts do not have an AppState-backed config. Every
@@ -3278,6 +3307,7 @@ impl PreparedChatContext {
                             turn_request,
                             api_audit_save_details(&self.global_config),
                             turn_capture.observer(),
+                            self.openai_resp_ws_session_context(),
                         ),
                     ) => provider_stream
                         .unwrap_or_else(|_| Err(ProviderRequestFailure {
@@ -4082,7 +4112,10 @@ impl PreparedChatContext {
                                         "stopReason": stop_reason.clone(),
                                     }),
                                 ).await;
-                                for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
+                                self.openai_resp_ws_sessions
+                                    .invalidate_run(&self.workspace_id, &self.assistant_message_id)
+                                    .await;
+                                                                for event in hook_notification_events(&self.assistant_message_id, "SessionEnd", &session_end_summary) {
                                     events.push(captured_event(&event));
                                     yield event;
                                 }
@@ -5112,6 +5145,7 @@ async fn prepare_chat_context_for_output(
         skill_read_root_dirs: prompt_context.skill_read_root_dirs,
         attachment_read_allowlist: prompt_context.attachment_read_allowlist,
         last_chat_completion_input_tokens: None,
+        openai_resp_ws_sessions: state.openai_resp_ws_sessions.clone(),
     })
 }
 
@@ -5866,7 +5900,13 @@ async fn run_provider_stream_for_text(
     let capture_details = observer.is_some();
     let mut stream = timeout(
         Duration::from_millis(timeout_ms),
-        stream_chat_with_capture_observer(provider_config, request, capture_details, observer),
+        stream_chat_with_capture_observer(
+            provider_config,
+            request,
+            capture_details,
+            observer,
+            None,
+        ),
     )
     .await
     .map_err(|_| {
@@ -6011,7 +6051,13 @@ async fn run_provider_stream_for_tool(
     let capture_details = observer.is_some();
     let mut stream = timeout(
         Duration::from_millis(timeout_ms),
-        stream_chat_with_capture_observer(provider_config, request, capture_details, observer),
+        stream_chat_with_capture_observer(
+            provider_config,
+            request,
+            capture_details,
+            observer,
+            None,
+        ),
     )
     .await
     .map_err(|_| {
@@ -6833,6 +6879,10 @@ async fn finish_cancelled_chat_run_with_message(
     executed_tool_calls: &[ExecutedToolCall],
     message: &str,
 ) -> Result<ChatSseEvent, ApiError> {
+    context
+        .openai_resp_ws_sessions
+        .invalidate_run(&context.workspace_id, &context.assistant_message_id)
+        .await;
     let session_end_summary = session_end_hook(
         context,
         "cancelled",

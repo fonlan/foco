@@ -37,8 +37,8 @@ use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    ProviderRequestDumpObserver, ProviderRequestFailure, ProviderWireRequestDump,
-    stream_chat_with_capture_observer,
+    OpenAiRespWsSessionKey, ProviderRequestDumpObserver, ProviderRequestFailure,
+    ProviderWireRequestDump, ProviderWsSessionContext, stream_chat_with_capture_observer,
 };
 use foco_store::{
     config::{
@@ -1459,6 +1459,12 @@ impl RemoteWorkspaceManager {
             // The stale tunnel must be gone before an upgrade can install and launch a
             // replacement. Keep the session-map lock out of this async teardown.
             session.stop().await;
+            // stop() aborts the control task (skips control-loop cleanup); clear any
+            // main-process Provider WebSocket sessions for this workspace before reconnect.
+            state
+                .openai_resp_ws_sessions
+                .invalidate_workspace(workspace_id)
+                .await;
         }
 
         self.set_status(
@@ -1718,7 +1724,7 @@ impl RemoteWorkspaceManager {
         }
     }
 
-    pub(crate) async fn disconnect_server(&self, server_id: &str) -> Result<(), ApiError> {
+    pub(crate) async fn disconnect_server(&self, server_id: &str) -> Result<Vec<String>, ApiError> {
         let removed = {
             let mut sessions = self
                 .sessions
@@ -1733,7 +1739,9 @@ impl RemoteWorkspaceManager {
                 .filter_map(|key| sessions.remove(&key))
                 .collect::<Vec<_>>()
         };
+        let mut workspace_ids = Vec::with_capacity(removed.len());
         for session in removed {
+            workspace_ids.push(session.workspace_id.clone());
             self.set_status(
                 &session.server_id,
                 Some(&session.workspace_id),
@@ -1743,10 +1751,10 @@ impl RemoteWorkspaceManager {
             session.stop().await;
         }
         self.set_status(server_id, None, RemoteConnectionState::Disconnected, None)?;
-        Ok(())
+        Ok(workspace_ids)
     }
 
-    pub(crate) async fn disconnect_all(&self) -> Result<(), ApiError> {
+    pub(crate) async fn disconnect_all(&self) -> Result<Vec<String>, ApiError> {
         let removed = {
             let mut sessions = self
                 .sessions
@@ -1757,7 +1765,9 @@ impl RemoteWorkspaceManager {
                 .map(|(_, session)| session)
                 .collect::<Vec<_>>()
         };
+        let mut workspace_ids = Vec::with_capacity(removed.len());
         for session in removed {
+            workspace_ids.push(session.workspace_id.clone());
             self.set_status(
                 &session.server_id,
                 Some(&session.workspace_id),
@@ -1766,7 +1776,7 @@ impl RemoteWorkspaceManager {
             )?;
             session.stop().await;
         }
-        Ok(())
+        Ok(workspace_ids)
     }
 
     pub(crate) fn server_ids_with_sessions(&self) -> Result<HashSet<String>, ApiError> {
@@ -1912,6 +1922,10 @@ pub(crate) async fn disconnect_remote_workspace(
         .remote_workspace_manager
         .disconnect_workspace(&server_id, &workspace_id)
         .await?;
+    state
+        .openai_resp_ws_sessions
+        .invalidate_workspace(&workspace_id)
+        .await;
     Ok(Json(RemoteWorkspaceSessionResponse {
         session: removed.then(|| RemoteWorkspaceSessionSummary {
             server_id,
@@ -4597,7 +4611,16 @@ async fn connect_control_ws(
                                         }
                                         match envelope.message_type.as_str() {
                                             "heartbeat" => {
-                                                update_remote_active_runs(&active_runs, &envelope.payload);
+                                                let removed_run_ids = update_remote_active_runs(
+                                                    &active_runs,
+                                                    &envelope.payload,
+                                                );
+                                                for run_id in removed_run_ids {
+                                                    state
+                                                        .openai_resp_ws_sessions
+                                                        .invalidate_run(&log_workspace_id, &run_id)
+                                                        .await;
+                                                }
                                                 set_session_status(&status, RemoteConnectionState::Ready, None);
                                             }
                                             "request" => {
@@ -4649,6 +4672,15 @@ async fn connect_control_ws(
                                 }
                             }
                         }
+                    }
+                    // Control connection lost: Provider WebSocket / previous_response_id must not
+                    // be assumed valid across reconnect. Invalidate before retry.
+                    state
+                        .openai_resp_ws_sessions
+                        .invalidate_workspace(&log_workspace_id)
+                        .await;
+                    if let Ok(mut runs) = active_runs.lock() {
+                        runs.clear();
                     }
                 }
                 Err(error) => {
@@ -5157,6 +5189,36 @@ fn broker_llm_audit_status_code(
     observed_http_status.or(error_status).map(i64::from)
 }
 
+/// Provider WebSocket affinity for brokered chat completion.
+/// Uses remote `runId` (never broker RPC request id). One-shot kinds return None.
+fn broker_openai_resp_ws_session_context(
+    state: &AppState,
+    workspace_id: &str,
+    payload: &Value,
+    request_kind: &str,
+    provider_id: &str,
+    model_id: &str,
+    uses_websocket: bool,
+) -> Option<ProviderWsSessionContext> {
+    if !uses_websocket {
+        return None;
+    }
+    // Only ordinary chat completion reuses sessions / previous_response_id.
+    if request_kind != BROKER_DEFAULT_LLM_REQUEST_KIND {
+        return None;
+    }
+    let run_affinity_id = payload
+        .get("runId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(ProviderWsSessionContext {
+        registry: Arc::clone(&state.openai_resp_ws_sessions),
+        key: OpenAiRespWsSessionKey::new(workspace_id, run_affinity_id, provider_id, model_id),
+        enable_continuation: true,
+    })
+}
+
 async fn broker_llm_stream(
     state: &AppState,
     write: &SharedBrokerWsWrite,
@@ -5334,6 +5396,17 @@ async fn broker_llm_stream(
     let mut stream = match if let Some(cancel_rx) = cancel_rx.as_mut() {
         tokio::select! {
             _ = cancel_rx => {
+                if let Some(run_id) = payload
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    state
+                        .openai_resp_ws_sessions
+                        .invalidate_run(workspace_id, run_id)
+                        .await;
+                }
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 audit_events.push(BrokerLlmAuditEvent {
                     event_at: completed_at.clone(),
@@ -5378,6 +5451,15 @@ async fn broker_llm_stream(
                 request,
                 save_details,
                 audit_writer.observer(),
+                broker_openai_resp_ws_session_context(
+                    state,
+                    workspace_id,
+                    &payload,
+                    &request_kind,
+                    provider_id.as_str(),
+                    model_id.as_str(),
+                    provider_config.kind.uses_websocket(),
+                ),
             ) => result,
         }
     } else {
@@ -5386,6 +5468,15 @@ async fn broker_llm_stream(
             request,
             save_details,
             audit_writer.observer(),
+            broker_openai_resp_ws_session_context(
+                state,
+                workspace_id,
+                &payload,
+                &request_kind,
+                provider_id.as_str(),
+                model_id.as_str(),
+                provider_config.kind.uses_websocket(),
+            ),
         )
         .await
     } {
@@ -5466,6 +5557,17 @@ async fn broker_llm_stream(
         let event = match if let Some(cancel_rx) = cancel_rx.as_mut() {
             tokio::select! {
                 _ = cancel_rx => {
+                    if let Some(run_id) = payload
+                        .get("runId")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                    {
+                        state
+                            .openai_resp_ws_sessions
+                            .invalidate_run(workspace_id, run_id)
+                            .await;
+                    }
                     let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                     audit_events.push(BrokerLlmAuditEvent {
                         event_at: completed_at.clone(),
@@ -7210,17 +7312,24 @@ fn remote_active_run_from_value(value: &Value) -> Option<RemoteActiveRunSummary>
 fn update_remote_active_runs(
     active_runs: &Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
     payload: &Value,
-) {
+) -> Vec<String> {
     let Some(runs) = payload.get("activeRuns").and_then(Value::as_array) else {
-        return;
+        return Vec::new();
     };
     let summaries = runs
         .iter()
         .filter_map(remote_active_run_from_value)
         .collect::<Vec<_>>();
-    if let Ok(mut active_runs) = active_runs.lock() {
-        *active_runs = summaries;
-    }
+    let Ok(mut active_runs) = active_runs.lock() else {
+        return Vec::new();
+    };
+    let previous: std::collections::HashSet<String> =
+        active_runs.iter().map(|run| run.run_id.clone()).collect();
+    let next: std::collections::HashSet<String> =
+        summaries.iter().map(|run| run.run_id.clone()).collect();
+    let removed = previous.difference(&next).cloned().collect::<Vec<_>>();
+    *active_runs = summaries;
+    removed
 }
 
 pub(crate) async fn ensure_remote_workspace_connected(

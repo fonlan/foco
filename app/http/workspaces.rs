@@ -1068,6 +1068,12 @@ pub(crate) async fn delete_workspace(
             .remote_workspace_manager
             .disconnect_workspace(&server_id, &removed.id)
             .await;
+        // stop() aborts the control task, so control-loop disconnect cleanup may not run;
+        // always invalidate Provider WS sessions for the removed remote workspace.
+        state
+            .openai_resp_ws_sessions
+            .invalidate_workspace(&removed.id)
+            .await;
     }
     sync_all_mcp_workspaces(&state.mcp_registry, &config)
         .await

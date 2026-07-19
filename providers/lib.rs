@@ -1,4 +1,9 @@
 mod openai_resp_websocket;
+mod openai_resp_ws_session;
+
+pub use openai_resp_ws_session::{
+    OpenAiRespWsSessionKey, OpenAiRespWsSessionRegistry, ProviderWsSessionContext,
+};
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -1021,7 +1026,7 @@ pub async fn stream_chat_with_capture(
     request: NeutralChatRequest,
     capture_details: bool,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
-    stream_chat_with_capture_observer(config, request, capture_details, None).await
+    stream_chat_with_capture_observer(config, request, capture_details, None, None).await
 }
 
 pub async fn stream_chat_with_capture_observer(
@@ -1029,6 +1034,7 @@ pub async fn stream_chat_with_capture_observer(
     request: NeutralChatRequest,
     capture_details: bool,
     request_observer: Option<ProviderRequestDumpObserver>,
+    session_ctx: Option<ProviderWsSessionContext>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
     if config.kind.uses_websocket() {
         return stream_chat_with_capture_observer_websocket(
@@ -1036,9 +1042,12 @@ pub async fn stream_chat_with_capture_observer(
             request,
             capture_details,
             request_observer,
+            session_ctx,
         )
         .await;
     }
+    // HTTP path ignores session_ctx (Responses WebSocket only).
+    let _ = session_ctx;
 
     let client = config
         .genai_client()
@@ -1133,6 +1142,7 @@ async fn stream_chat_with_capture_observer_websocket(
     request: NeutralChatRequest,
     capture_details: bool,
     request_observer: Option<ProviderRequestDumpObserver>,
+    session_ctx: Option<ProviderWsSessionContext>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
     ensure_proxy_compatible_with_kind(config.kind, config.proxy_url.is_some()).map_err(
         |error| ProviderRequestFailure {
@@ -1169,6 +1179,7 @@ async fn stream_chat_with_capture_observer_websocket(
         error_context,
         capture_details,
         request_observer,
+        session_ctx,
     )
     .await
 }
@@ -3012,6 +3023,191 @@ mod tests {
         )));
         assert!(stream.final_response_dump().is_some());
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_session_reuses_connection_and_previous_response_id() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_server = Arc::clone(&accepts);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            accepts_server.fetch_add(1, Ordering::SeqCst);
+            let mut ws = accept_async(stream).await.expect("ws accept");
+
+            // Turn 1: full input, store, no previous_response_id
+            let first = ws.next().await.expect("msg").expect("ok");
+            let text = match first {
+                Message::Text(text) => text.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let create: Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(create["type"], "response.create");
+            assert_eq!(create["store"], true);
+            assert!(create.get("previous_response_id").is_none());
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"A"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_1","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+
+            // Turn 2: same socket, previous_response_id + delta only
+            let second = ws.next().await.expect("msg2").expect("ok");
+            let text2 = match second {
+                Message::Text(text) => text.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let create2: Value = serde_json::from_str(&text2).expect("json");
+            assert_eq!(create2["type"], "response.create");
+            assert_eq!(create2["previous_response_id"], "resp_1");
+            assert_eq!(create2["store"], true);
+            let input = create2["input"].as_array().expect("input array");
+            // Only the new assistant+tool/user tail should be sent; first user already committed.
+            assert!(
+                input.len() < 3,
+                "continuation should send fewer items than full history, got {input:?}"
+            );
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"B"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_2","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+            let _ = ws.close(None).await;
+        });
+
+        let registry = Arc::new(OpenAiRespWsSessionRegistry::new(8));
+        let session = ProviderWsSessionContext {
+            registry: Arc::clone(&registry),
+            key: OpenAiRespWsSessionKey::new("ws", "assistant-1", "prov", "gpt-4.1-mini"),
+            enable_continuation: true,
+        };
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+
+        let request1 = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let mut stream1 =
+            stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
+                .await
+                .expect("stream1");
+        while let Some(event) = stream1.next_event().await {
+            let _ = event.expect("event");
+        }
+        drop(stream1);
+
+        let request2 = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "hi".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::Assistant,
+                    content: "A".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "again".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+        let mut stream2 =
+            stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
+                .await
+                .expect("stream2");
+        let mut saw_b = false;
+        let mut saw_resp2 = false;
+        while let Some(event) = stream2.next_event().await {
+            match event.expect("event") {
+                NeutralChatStreamEvent::TextDelta { delta } if delta == "B" => saw_b = true,
+                NeutralChatStreamEvent::Complete {
+                    response_id: Some(id),
+                    ..
+                } if id == "resp_2" => saw_resp2 = true,
+                _ => {}
+            }
+        }
+        assert!(saw_b && saw_resp2);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "must reuse one WS accept"
+        );
+        // Reused turn must not invent an HTTP 101 status for wire audit.
+        assert_eq!(
+            stream2.http_status(),
+            None,
+            "reused socket turn has no observed HTTP response head this turn"
+        );
+        server.await.expect("server");
+    }
+
+    #[test]
+    fn websocket_protocol_does_not_silently_fallback_to_http_kind() {
+        let ws = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws");
+        let http = parse_provider_kind(OPENAI_RESPONSES_KIND).expect("http");
+        assert!(ws.uses_websocket());
+        assert!(!http.uses_websocket());
+        assert_eq!(ws.adapter_kind(), http.adapter_kind());
+        assert_ne!(ws.as_str(), http.as_str());
     }
 
     #[test]

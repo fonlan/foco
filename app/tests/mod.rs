@@ -23,7 +23,8 @@ use foco_agent::{
     context_compression_trigger_tokens,
 };
 use foco_providers::{
-    OPENAI_CHAT_KIND, ProviderModelRedirect, ProviderRequestOverride, redirected_provider_model_ids,
+    OPENAI_CHAT_KIND, OpenAiRespWsSessionRegistry, ProviderModelRedirect, ProviderRequestOverride,
+    redirected_provider_model_ids,
 };
 use foco_store::{
     config::{
@@ -1038,6 +1039,7 @@ fn test_prepared_chat_context(
         skill_read_root_dirs: Vec::new(),
         attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     }
 }
 
@@ -14346,6 +14348,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         skill_read_root_dirs: Vec::new(),
         attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -16272,6 +16275,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         skill_read_root_dirs: Vec::new(),
         attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -16681,6 +16685,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         skill_read_root_dirs: Vec::new(),
         attachment_read_allowlist: Vec::new(),
         last_chat_completion_input_tokens: None,
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     };
     let outcome = ChatAuditOutcome {
         first_token_at: Some("2026-06-06T09:00:00Z".to_string()),
@@ -31301,6 +31306,7 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
         preview_sessions: crate::runtime::PreviewSessionRegistry::default(),
+        openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     }
 }
 

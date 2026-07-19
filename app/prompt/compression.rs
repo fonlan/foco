@@ -1332,6 +1332,7 @@ async fn llm_context_compression_summary_once(
             request,
             capture_details,
             observer,
+            None,
         ),
     )
     .await
