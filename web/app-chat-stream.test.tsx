@@ -1897,6 +1897,197 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("routes consecutive reasoning-loop recoveries to the latest assistant bubble", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const durableAssistantId = "message-assistant-stream";
+    const recoveryText = "repeated reasoning loop, check and continue";
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "first loop reasoning",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        content: recoveryText,
+        id: "reasoning-loop-1",
+        interruptedAssistantId: durableAssistantId,
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1000,
+        },
+        parts: [],
+        source: "reasoningLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "first recovery answer",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        toolCall: {
+          id: "call-after-first-recovery",
+          input: {},
+          isError: false,
+          name: "first_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const firstRecoveryAnswer = await screen.findByText("first recovery answer");
+    const firstRecoveryAnswerRow = firstRecoveryAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(firstRecoveryAnswerRow).not.toBeNull();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).getByText(/first_tool/),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "second loop reasoning",
+        type: "reasoningDelta",
+      });
+      enqueueChatStreamEvent({
+        content: recoveryText,
+        id: "reasoning-loop-2",
+        interruptedAssistantId: durableAssistantId,
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1500,
+        },
+        parts: [],
+        source: "reasoningLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "second recovery answer",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        toolCall: {
+          id: "call-after-second-recovery",
+          input: {},
+          isError: false,
+          name: "second_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const secondRecoveryAnswer = await screen.findByText("second recovery answer");
+    const secondRecoveryAnswerRow = secondRecoveryAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(secondRecoveryAnswerRow).not.toBeNull();
+    expect(secondRecoveryAnswerRow).not.toBe(firstRecoveryAnswerRow);
+
+    const recoveryBubbles = screen.getAllByText(recoveryText);
+    expect(recoveryBubbles).toHaveLength(2);
+    const firstRecoveryRow = recoveryBubbles[0].closest(".message-row") as HTMLElement;
+    const secondRecoveryRow = recoveryBubbles[1].closest(".message-row") as HTMLElement;
+    expect(firstRecoveryRow.className).toContain("message-row-user");
+    expect(secondRecoveryRow.className).toContain("message-row-user");
+
+    const initialReasoningRow = screen
+      .getByText("first loop reasoning")
+      .closest(".message-row") as HTMLElement;
+    expect(initialReasoningRow).not.toBe(firstRecoveryAnswerRow);
+    expect(initialReasoningRow).not.toBe(secondRecoveryAnswerRow);
+
+    // Order: interrupted assistant → recovery user → first recovery assistant →
+    // recovery user → latest assistant.
+    expect(
+      initialReasoningRow.compareDocumentPosition(recoveryBubbles[0]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recoveryBubbles[0].compareDocumentPosition(firstRecoveryAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      firstRecoveryAnswer.compareDocumentPosition(recoveryBubbles[1]) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recoveryBubbles[1].compareDocumentPosition(secondRecoveryAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // Second recovery content only lands on the newest assistant bubble.
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).getByText(/second_tool/),
+    ).toBeInTheDocument();
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText("first recovery answer"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText(/first_tool/),
+    ).not.toBeInTheDocument();
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText("first loop reasoning"),
+    ).not.toBeInTheDocument();
+
+    // Older assistant bubbles must not absorb second-recovery events.
+    expect(
+      within(initialReasoningRow).queryByText("second recovery answer"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(initialReasoningRow).queryByText(/second_tool/),
+    ).not.toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).queryByText("second recovery answer"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).queryByText(/second_tool/),
+    ).not.toBeInTheDocument();
+    // First recovery content stays on its own bubble.
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).getByText("first recovery answer"),
+    ).toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).getByText(/first_tool/),
+    ).toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).getByText("second loop reasoning"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("expands history userInterruption parts into stable non-editable user bubbles", async () => {
     appTestState.chatMessagesResponsesByChatKey = {
       "workspace-1/chat-1": {

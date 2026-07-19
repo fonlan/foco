@@ -9431,11 +9431,9 @@ export function App() {
     let assistantMessageId = `active-assistant-${activeRun.runId}`;
     const placeholderAssistantMessageId = assistantMessageId;
     let currentAssistantMessageId = assistantMessageId;
-    // Once a guidance message is applied, the backend keeps emitting subsequent
-    // stream events under the original (now-interrupted) assistant message id,
-    // but they belong to the new post-guidance bubble. Tracking the interrupted
-    // id lets us route those events to `currentAssistantMessageId` instead of
-    // the stale bubble that the event id would otherwise match.
+    // After guidance, the backend keeps emitting events under the durable
+    // interrupted assistant id. Map that id to the latest visible bubble so
+    // consecutive recoveries do not re-route to an earlier segment.
     let interruptedAssistantMessageId: string | null = null;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
@@ -9952,7 +9950,12 @@ export function App() {
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
-          interruptedAssistantMessageId = previousAssistantId;
+          // Prefer durable interrupted id from the event so consecutive
+          // recoveries keep remapping backend event ids to the newest bubble.
+          interruptedAssistantMessageId = routingInterruptedAssistantMessageId(
+            previousAssistantId,
+            streamEvent.interruptedAssistantId,
+          );
           liveAssistantDraft = "";
           liveAssistantDraftReasoning = "";
           lastLiveContextUsageRefreshAtMs = Date.now();
@@ -10371,8 +10374,8 @@ export function App() {
     );
     let assistantMessageId = localAssistantId;
     let currentAssistantMessageId = localAssistantId;
-    // See subscribeActiveChatRun: post-guidance events keep carrying the
-    // interrupted assistant message id but must target the new bubble.
+    // See subscribeActiveChatRun: post-guidance events keep carrying the durable
+    // interrupted assistant id and must target the latest visible bubble.
     let interruptedAssistantMessageId: string | null = null;
     let requestChatId = request.chatId;
     const pendingChatId =
@@ -11069,7 +11072,12 @@ export function App() {
           const previousAssistantId = currentAssistantMessageId;
           const guidanceAssistantId = `${streamEvent.id}-assistant`;
           currentAssistantMessageId = guidanceAssistantId;
-          interruptedAssistantMessageId = previousAssistantId;
+          // Prefer durable interrupted id from the event so consecutive
+          // recoveries keep remapping backend event ids to the newest bubble.
+          interruptedAssistantMessageId = routingInterruptedAssistantMessageId(
+            previousAssistantId,
+            streamEvent.interruptedAssistantId,
+          );
           liveAssistantDraft = "";
           liveAssistantDraftReasoning = "";
           lastLiveContextUsageRefreshAtMs = Date.now();
@@ -15101,6 +15109,20 @@ function messageHasToolCall(message: ShellMessage, toolCallId: string) {
         (part) => part.type === "toolCall" && part.toolCall.id === toolCallId,
       ))
   );
+}
+
+/**
+ * Backend stream events after guidance keep the durable interrupted assistant
+ * id. Prefer that contract field for routing aliases so consecutive recoveries
+ * do not alias the previous temporary guidance bubble id. When the field is
+ * absent (manual guidance / older events), fall back to the previous visible
+ * segment id.
+ */
+export function routingInterruptedAssistantMessageId(
+  previousVisibleAssistantId: string,
+  interruptedAssistantId?: string | null,
+): string {
+  return interruptedAssistantId ?? previousVisibleAssistantId;
 }
 
 function isEmptyStreamingAssistantMessage(message: ShellMessage) {
