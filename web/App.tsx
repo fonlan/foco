@@ -2015,6 +2015,23 @@ export function App() {
       runningChatKeys,
     ],
   );
+  // Derive Agent tab spinner from live/cached team snapshot; no copied React state.
+  const agentInstanceIsRunning = useCallback(
+    (workspaceId: string, chatId: string, instanceId: string): boolean => {
+      const chatKey = chatRunKey(workspaceId, chatId);
+      const snapshot =
+        (agentTeamSnapshotChatKeyRef.current === chatKey ? agentTeamSnapshot : null) ??
+        agentTeamSnapshotCacheRef.current.get(chatKey) ??
+        null;
+      if (!snapshot) {
+        return false;
+      }
+      return snapshot.instances.some(
+        (instance) => instance.id === instanceId && instance.status === "running",
+      );
+    },
+    [agentTeamSnapshot],
+  );
   const activeChatSessionStatus = activeChatKey
     ? chatSessionStatusFor(activeChatKey)
     : { activeRun: null, kind: "idle" as const };
@@ -12766,6 +12783,7 @@ export function App() {
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <MainTabBar
                     activeTab={activeMainTab}
+                    agentInstanceIsRunning={agentInstanceIsRunning}
                     chatSessionStatusFor={chatSessionVisualStatusFor}
                     onCloseTab={closeMainTab}
                     onCloseTabs={closeMainTabs}
@@ -13564,6 +13582,7 @@ function QuestionDialog({
 
 function MainTabBar({
   activeTab,
+  agentInstanceIsRunning,
   chatSessionStatusFor,
   onCloseTab,
   onCloseTabs,
@@ -13571,6 +13590,11 @@ function MainTabBar({
   tabs,
 }: {
   activeTab: ActiveMainTab;
+  agentInstanceIsRunning: (
+    workspaceId: string,
+    chatId: string,
+    instanceId: string,
+  ) => boolean;
   chatSessionStatusFor: (chatKey: string) => ChatSessionStatus;
   onCloseTab: (tab: MainTabSummary) => void;
   onCloseTabs: (scope: MainTabCloseScope, anchorTab: MainTabSummary) => void;
@@ -13912,8 +13936,12 @@ function MainTabBar({
           tabs.map((tab) => {
             const isActive = mainTabMatches(activeTab, tab);
             const isRunning =
-              tab.type === "chat" &&
-              chatSessionStatusFor(chatRunKey(tab.workspaceId, tab.chatId)).kind === "running";
+              tab.type === "chat"
+                ? chatSessionStatusFor(chatRunKey(tab.workspaceId, tab.chatId)).kind ===
+                  "running"
+                : tab.type === "agent"
+                  ? agentInstanceIsRunning(tab.workspaceId, tab.chatId, tab.instanceId)
+                  : false;
             const title =
               tab.type === "htmlPreview"
                 ? t("{name} · Preview", { name: tab.name })
@@ -13962,7 +13990,13 @@ function MainTabBar({
                       <Bot aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
                     ) : null}
                     {isRunning ? (
-                      <span aria-label={t("Chat is running")} className="inline-flex shrink-0" role="status">
+                      <span
+                        aria-label={t(
+                          tab.type === "agent" ? "Agent is running" : "Chat is running",
+                        )}
+                        className="inline-flex shrink-0"
+                        role="status"
+                      >
                         <LoaderCircle
                           aria-hidden="true"
                           className="chat-tab-running-spinner size-3.5 animate-spin text-teal-700"

@@ -658,10 +658,19 @@ describe("app agents verification surfaces", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Open agent Worker" }));
 
-    expect(await screen.findByRole("tab", { name: /Worker/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
+    const workerTab = await screen.findByRole("tab", { name: /Worker/ });
+    expect(workerTab).toHaveAttribute("aria-selected", "true");
+    const workerTabScope = workerTab.parentElement;
+    expect(workerTabScope).not.toBeNull();
+    const workerRunningStatus = within(workerTabScope as HTMLElement).getByRole("status", {
+      name: "Agent is running",
+    });
+    expect(workerRunningStatus.querySelector(".chat-tab-running-spinner")).not.toBeNull();
+    expect(workerRunningStatus.querySelector(".chat-tab-running-spinner")).toHaveClass(
+      "animate-spin",
     );
+    // Only the running Worker instance tab shows the agent spinner.
+    expect(screen.getAllByRole("status", { name: "Agent is running" })).toHaveLength(1);
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
     expect(await screen.findByText("Found the issue in the workspace notes.")).toBeInTheDocument();
     expect(await screen.findByText("Inspection complete.")).toBeInTheDocument();
@@ -789,6 +798,15 @@ describe("app agents verification surfaces", () => {
         ),
       ).toBe(true);
     });
+    const workerTab = await screen.findByRole("tab", { name: /Worker/ });
+    const workerTabScope = workerTab.parentElement;
+    expect(workerTabScope).not.toBeNull();
+    // Default fixture keeps Worker active (non-running); no main-tab agent spinner.
+    expect(
+      within(workerTabScope as HTMLElement).queryByRole("status", {
+        name: "Agent is running",
+      }),
+    ).toBeNull();
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
     expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Inspection complete.")).toBeInTheDocument();

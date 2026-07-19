@@ -152,6 +152,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Scroll chat tabs left": "向左滚动会话标签",
     "Scroll chat tabs right": "向右滚动会话标签",
     "Chat is running": "会话运行中",
+    "Agent is running": "智能体运行中",
     "No chats": "暂无聊天",
     "No open chats": "暂无打开的会话",
     "Loading workspaces...": "正在加载工作区...",
