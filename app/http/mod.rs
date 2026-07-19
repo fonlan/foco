@@ -15,4 +15,5 @@ pub mod skill_store;
 pub mod spec;
 pub mod terminal;
 pub mod update;
+pub mod workspace_route_contract;
 pub mod workspaces;

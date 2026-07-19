@@ -901,22 +901,10 @@ pub(crate) fn proxy_workspace_route_path(path: &str) -> Option<&str> {
     let rest = path.strip_prefix("/api/workspaces/")?;
     let after_id = rest.split_once('/')?.1;
     let prefix = after_id.split('/').next().unwrap_or("");
-    match prefix {
-        "files"
-        | "git"
-        | "terminal"
-        | "spec"
-        | "plans"
-        | "code-graph"
-        | "graph"
-        | "chats"
-        | "chat"
-        | "context-usage"
-        | "agent-team"
-        | "agent-tasks"
-        | "scheduled-tasks"
-        | "scheduled-task-runs" => Some(after_id),
-        _ => None,
+    if crate::http::workspace_route_contract::is_remote_workspace_proxy_prefix(prefix) {
+        Some(after_id)
+    } else {
+        None
     }
 }
 
