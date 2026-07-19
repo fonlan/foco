@@ -173,6 +173,7 @@ mod plan_merge;
 mod plan_runtime;
 mod platform;
 mod prompt;
+mod provider_retry;
 mod remote_workspace;
 mod runtime;
 mod scheduled_tasks;
@@ -6771,28 +6772,7 @@ fn should_retry_provider_stream_error(
     attempt_count: u32,
     max_attempts: u32,
 ) -> bool {
-    if attempt_count >= max_attempts {
-        return false;
-    }
-
-    match error {
-        ProviderConfigError::Connection { status_code, .. } => {
-            status_code.is_none_or(is_retryable_provider_status)
-        }
-        ProviderConfigError::EmptyBaseUrl
-        | ProviderConfigError::EmptyProxyUrl
-        | ProviderConfigError::InvalidBaseUrl { .. }
-        | ProviderConfigError::InvalidProxyUrl { .. }
-        | ProviderConfigError::InvalidRequest(_)
-        | ProviderConfigError::MissingRequiredField(_)
-        | ProviderConfigError::MissingApiKey
-        | ProviderConfigError::UnsupportedKind(_)
-        | ProviderConfigError::UnsupportedProxyKind(_) => false,
-    }
-}
-
-fn is_retryable_provider_status(status_code: u16) -> bool {
-    matches!(status_code, 408 | 409 | 429 | 500..=599)
+    crate::provider_retry::should_retry_provider_stream_error(error, attempt_count, max_attempts)
 }
 
 fn cancelled_audit_outcome(started_at: Instant, _message: &str) -> ChatAuditOutcome {

@@ -1250,6 +1250,10 @@ struct PreStreamFailureInfo {
     diagnostic: String,
 }
 
+pub(crate) fn pre_stream_failure_user_message(message: &str) -> String {
+    parse_pre_stream_failure(message).user_message
+}
+
 fn is_workspace_database_concurrency_error_message(message: &str) -> bool {
     message.contains("workspace database concurrency limit reached")
 }

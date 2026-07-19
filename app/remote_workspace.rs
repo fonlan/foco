@@ -56,10 +56,10 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
         MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
         NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        PlanPhaseAttemptTrigger, RewriteChatFromUserMessage, TerminalSessionRecord,
-        TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        PlanPhaseAttemptTrigger, RemotePreStreamFailureClosureOutcome, RewriteChatFromUserMessage,
+        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -128,6 +128,10 @@ use crate::{
         should_trigger_normal_llm_context_compression, tool_prompt_infos,
         truncate_workspace_spec_markdown_for_prompt,
     },
+    provider_retry::{
+        is_retryable_provider_status, is_retryable_provider_stream_error,
+        should_retry_remote_broker_failure,
+    },
     runtime::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
@@ -137,8 +141,9 @@ use crate::{
         ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
         SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
         build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
-        image_tool_timeout_ms, materialize_brokered_image_result, reasoning_loop_guard_message,
-        run_post_tool_hooks, web_tool_timeout_ms,
+        image_tool_timeout_ms, materialize_brokered_image_result,
+        open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
+        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -5462,13 +5467,15 @@ async fn broker_llm_stream(
                 },
                 &audit_events,
             );
-            let _ = send_broker_llm_error(
+            let _ = send_broker_llm_error_with_retry(
                 write,
                 id,
                 "provider_error",
                 message,
                 provider_id.as_str(),
                 model_id.as_str(),
+                is_retryable_provider_stream_error(&failure.error),
+                status_code,
             )
             .await;
             return;
@@ -5480,6 +5487,8 @@ async fn broker_llm_stream(
     let mut final_usage: Option<NeutralUsage> = None;
     let mut final_tool_calls = Vec::<NeutralToolCall>::new();
     let mut final_text = String::new();
+    let mut saw_text_delta = false;
+    let mut completed_with_unstreamed_text = false;
     let mut first_token_at: Option<String> = None;
     let mut first_token_latency_ms: Option<i64> = None;
     // Completion is stream-semantic, not dump presence: details-off never builds final_response_dump.
@@ -5534,6 +5543,8 @@ async fn broker_llm_stream(
             Some(Err(e)) => {
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let message = format!("{e}");
+                let error_status = e.status_code();
+                let retryable = error_status.is_none_or(is_retryable_provider_status);
                 audit_events.push(BrokerLlmAuditEvent {
                     event_at: completed_at.clone(),
                     event_type: "error".to_string(),
@@ -5576,13 +5587,15 @@ async fn broker_llm_stream(
                     },
                     &audit_events,
                 );
-                let _ = send_broker_llm_error(
+                let _ = send_broker_llm_error_with_retry(
                     write,
                     id,
                     "stream_error",
                     message,
                     provider_id.as_str(),
                     model_id.as_str(),
+                    retryable,
+                    error_status,
                 )
                 .await;
                 return;
@@ -5591,6 +5604,7 @@ async fn broker_llm_stream(
         };
         match event {
             NeutralChatStreamEvent::TextDelta { delta } => {
+                saw_text_delta = true;
                 final_text.push_str(&delta);
                 sequence += 1;
                 if first_token_at.is_none() {
@@ -5787,6 +5801,7 @@ async fn broker_llm_stream(
                 response_id: _,
             } => {
                 saw_complete = true;
+                completed_with_unstreamed_text = !text.trim().is_empty() && !saw_text_delta;
                 // Prefer stream deltas when present; use Complete text only as a full-body fallback.
                 if final_text.is_empty() && !text.trim().is_empty() {
                     final_text = text;
@@ -5844,13 +5859,15 @@ async fn broker_llm_stream(
                     },
                     &audit_events,
                 );
-                let _ = send_broker_llm_error(
+                let _ = send_broker_llm_error_with_retry(
                     write,
                     id,
                     "stream_error",
                     message,
                     provider_id.as_str(),
                     model_id.as_str(),
+                    true,
+                    None,
                 )
                 .await;
                 return;
@@ -5880,10 +5897,29 @@ async fn broker_llm_stream(
                 })
         });
     let completed = saw_complete;
+    let retryable_completion_failure = if completed_with_unstreamed_text {
+        Some((
+            "stream_incomplete",
+            "provider completed without streaming assistant text deltas",
+        ))
+    } else if completed && final_text.trim().is_empty() && final_tool_calls.is_empty() {
+        Some((
+            "empty_completion",
+            "provider completed without assistant text or tool calls",
+        ))
+    } else {
+        None
+    };
     let prompt_hook_tool_call_failure = request_kind == BROKER_PROMPT_HOOK_REQUEST_KIND
         && completed
         && !final_tool_calls.is_empty();
-    if prompt_hook_tool_call_failure {
+    if let Some((code, message)) = retryable_completion_failure {
+        audit_events.push(BrokerLlmAuditEvent {
+            event_at: completed_at.clone(),
+            event_type: "error".to_string(),
+            normalized_event: json!({ "type": "error", "code": code, "message": message }),
+        });
+    } else if prompt_hook_tool_call_failure {
         audit_events.push(BrokerLlmAuditEvent {
             event_at: completed_at.clone(),
             event_type: "error".to_string(),
@@ -5897,11 +5933,11 @@ async fn broker_llm_stream(
     finish_broker_llm_audit(
         Some(&audit_writer),
         BrokerLlmAuditOutcome {
-            final_state: broker_llm_final_state(
-                &request_kind,
-                completed,
-                !final_tool_calls.is_empty(),
-            ),
+            final_state: if retryable_completion_failure.is_some() {
+                "failed"
+            } else {
+                broker_llm_final_state(&request_kind, completed, !final_tool_calls.is_empty())
+            },
             first_token_at: first_token_at.as_deref(),
             completed_at: &completed_at,
             usage: final_usage.as_ref(),
@@ -5914,13 +5950,32 @@ async fn broker_llm_stream(
     );
 
     if !completed {
-        let _ = send_broker_llm_error(
+        let _ = send_broker_llm_error_with_retry(
             write,
             id,
             "stream_interrupted",
             "provider stream ended without Complete",
             provider_id.as_str(),
             model_id.as_str(),
+            true,
+            broker_llm_audit_status_code(stream.http_status(), None)
+                .and_then(|status| u16::try_from(status).ok()),
+        )
+        .await;
+        return;
+    }
+
+    if let Some((code, message)) = retryable_completion_failure {
+        let _ = send_broker_llm_error_with_retry(
+            write,
+            id,
+            code,
+            message,
+            provider_id.as_str(),
+            model_id.as_str(),
+            true,
+            broker_llm_audit_status_code(stream.http_status(), None)
+                .and_then(|status| u16::try_from(status).ok()),
         )
         .await;
         return;
@@ -6669,6 +6724,29 @@ async fn send_broker_llm_error(
     provider_id: &str,
     model_id: &str,
 ) -> Result<(), ()> {
+    send_broker_llm_error_with_retry(
+        write,
+        request_id,
+        code,
+        message,
+        provider_id,
+        model_id,
+        false,
+        None,
+    )
+    .await
+}
+
+async fn send_broker_llm_error_with_retry(
+    write: &SharedBrokerWsWrite,
+    request_id: &str,
+    code: impl Into<String>,
+    message: impl Into<String>,
+    provider_id: &str,
+    model_id: &str,
+    retryable: bool,
+    status_code: Option<u16>,
+) -> Result<(), ()> {
     let envelope = ControlEnvelope {
         version: 1,
         message_type: "error".to_string(),
@@ -6677,7 +6755,8 @@ async fn send_broker_llm_error(
         payload: json!({
             "code": code.into(),
             "message": message.into(),
-            "retryable": false,
+            "retryable": retryable,
+            "statusCode": status_code,
             "providerId": provider_id,
             "modelId": model_id,
         }),
@@ -9715,6 +9794,7 @@ fn add_remote_usage_tokens(total: &mut Option<i64>, next: Option<i64>) {
     }
 }
 
+#[derive(Clone)]
 struct RemoteSidecarRunMetrics {
     started_at: Instant,
     request_started_at: String,
@@ -11571,6 +11651,19 @@ async fn remote_sidecar_workspace_mcp_registry(
     Ok(mcp_registry)
 }
 
+fn remote_sidecar_llm_request_retry_count(state: &RemoteSidecarState) -> u32 {
+    state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|bundle| {
+            bundle
+                .as_ref()
+                .map(|bundle| bundle.payload.app.llm_request_retry_count)
+        })
+        .unwrap_or(foco_store::config::DEFAULT_LLM_REQUEST_RETRY_COUNT)
+}
+
 fn remote_sidecar_runtime_global_config(
     state: &RemoteSidecarState,
 ) -> Result<foco_store::config::GlobalConfig, String> {
@@ -12179,6 +12272,9 @@ enum RemoteSidecarBrokerLlmTurnOutcome {
         /// Provider-reported input tokens for this chat-completion turn only.
         turn_input_tokens: Option<i64>,
     },
+    Retry {
+        message: String,
+    },
     ReasoningLoopInterrupted {
         message: String,
         resolved_provider_id: String,
@@ -12269,27 +12365,9 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "failed",
                     json!({ "error": { "message": message } }),
                 );
-                let _ = with_sidecar_workspace_database(state, |database| {
-                    database.clear_remote_queued_run_if_owned(
-                        chat_id,
-                        queued_user_message_id,
-                        assistant_message_id,
-                        run_id,
-                    )
+                return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                    message: message.to_string(),
                 });
-                let _ = remote_sidecar_deactivate_active_run(state, run_id);
-                *sequence += 1;
-                run_stream.record(
-                    *sequence,
-                    json!({
-                        "type": "error",
-                        "message": message,
-                    }),
-                );
-                *sequence += 1;
-                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
-                run_stream.mark_finished();
-                return Err(());
             }
             Err(_) => {
                 if run_stream.is_cancel_requested() || run_stream.is_finished() {
@@ -12315,27 +12393,9 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "failed",
                     json!({ "error": { "message": message } }),
                 );
-                let _ = with_sidecar_workspace_database(state, |database| {
-                    database.clear_remote_queued_run_if_owned(
-                        chat_id,
-                        queued_user_message_id,
-                        assistant_message_id,
-                        run_id,
-                    )
+                return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                    message: message.to_string(),
                 });
-                let _ = remote_sidecar_deactivate_active_run(state, run_id);
-                *sequence += 1;
-                run_stream.record(
-                    *sequence,
-                    json!({
-                        "type": "error",
-                        "message": message,
-                    }),
-                );
-                *sequence += 1;
-                run_stream.record(*sequence, json!({ "type": "streamEnd" }));
-                run_stream.mark_finished();
-                return Err(());
             }
         };
         resolved_provider_id =
@@ -12695,6 +12755,21 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("remote broker unavailable");
+                let code = envelope
+                    .payload
+                    .get("code")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let retryable = should_retry_remote_broker_failure(
+                    code,
+                    envelope
+                        .payload
+                        .get("retryable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    0,
+                    1,
+                );
                 let error_provider_id =
                     remote_broker_resolved_provider_id(&envelope.payload, &resolved_provider_id);
                 let audit_outcome =
@@ -12714,6 +12789,12 @@ async fn remote_sidecar_run_broker_llm_turn(
                     audit_outcome.final_state,
                     Value::Null,
                 );
+                if retryable {
+                    state.broker_pending.lock().await.remove(broker_request_id);
+                    return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                        message: message.to_string(),
+                    });
+                }
                 let _ = with_sidecar_workspace_database(state, |database| {
                     database.clear_remote_queued_run_if_owned(
                         chat_id,
@@ -12754,7 +12835,7 @@ impl PromptHookExecutor for RemoteSidecarPromptHookExecutor {
 }
 
 fn persist_remote_prompt_hook_audit(
-    database: &mut WorkspaceDatabase,
+    state: &RemoteSidecarState,
     request: &PromptHookExecutorRequest,
     request_id: &str,
     provider_id: &str,
@@ -12765,21 +12846,24 @@ fn persist_remote_prompt_hook_audit(
     let Some(chat_id) = request.chat_id.as_deref() else {
         return;
     };
-    let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let _ = persist_sidecar_llm_audit_for_kind(
-        database,
-        &request.workspace_id,
-        chat_id,
-        request_id,
-        BROKER_PROMPT_HOOK_REQUEST_KIND,
-        provider_id,
-        &request.hook_request.model_id,
-        metrics,
-        &completed_at,
-        metrics.total_latency_ms(),
-        final_state,
-        response_body,
-    );
+    let _ = with_sidecar_workspace_database(state, |database| {
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let _ = persist_sidecar_llm_audit_for_kind(
+            database,
+            &request.workspace_id,
+            chat_id,
+            request_id,
+            BROKER_PROMPT_HOOK_REQUEST_KIND,
+            provider_id,
+            &request.hook_request.model_id,
+            metrics,
+            &completed_at,
+            metrics.total_latency_ms(),
+            final_state,
+            response_body,
+        );
+        Ok(())
+    });
 }
 
 async fn remote_sidecar_run_broker_prompt_hook(
@@ -12795,10 +12879,6 @@ async fn remote_sidecar_run_broker_prompt_hook(
         .run_id
         .as_deref()
         .and_then(|run_id| remote_sidecar_active_run_stream(state, run_id));
-    let mut database =
-        WorkspaceDatabase::open_or_create(&request.workspace_path).map_err(|source| {
-            format!("failed to open workspace database for prompt hook audit: {source}")
-        })?;
     let mut metrics = RemoteSidecarRunMetrics::new();
     let timeout_duration = Duration::from_millis(request.timeout_ms);
     if run_stream
@@ -12807,7 +12887,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
     {
         let message = "prompt hook was cancelled".to_string();
         persist_remote_prompt_hook_audit(
-            &mut database,
+            state,
             &request,
             &broker_request_id,
             provider_id,
@@ -12844,7 +12924,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
         Ok(Err(_)) => {
             let message = "prompt hook failed: remote broker is unavailable".to_string();
             persist_remote_prompt_hook_audit(
-                &mut database,
+                state,
                 &request,
                 &broker_request_id,
                 provider_id,
@@ -12860,7 +12940,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
         Err(_) => {
             let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
             persist_remote_prompt_hook_audit(
-                &mut database,
+                state,
                 &request,
                 &broker_request_id,
                 provider_id,
@@ -12885,7 +12965,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
         {
             let message = "prompt hook was cancelled".to_string();
             persist_remote_prompt_hook_audit(
-                &mut database,
+                state,
                 &request,
                 &broker_request_id,
                 resolved_provider_id.as_str(),
@@ -12907,7 +12987,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
                 let message =
                     "prompt hook failed: remote broker closed before completion".to_string();
                 persist_remote_prompt_hook_audit(
-                    &mut database,
+                    state,
                     &request,
                     &broker_request_id,
                     resolved_provider_id.as_str(),
@@ -12923,7 +13003,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
             Err(_) => {
                 let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
                 persist_remote_prompt_hook_audit(
-                    &mut database,
+                    state,
                     &request,
                     &broker_request_id,
                     resolved_provider_id.as_str(),
@@ -12995,7 +13075,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
                 if saw_tool_call || !response_tool_calls.is_empty() {
                     let message = "prompt hook completed with unsupported tool calls".to_string();
                     persist_remote_prompt_hook_audit(
-                        &mut database,
+                        state,
                         &request,
                         &audit_request_id,
                         resolved_provider_id.as_str(),
@@ -13009,7 +13089,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
                     return Err(message);
                 }
                 persist_remote_prompt_hook_audit(
-                    &mut database,
+                    state,
                     &request,
                     &audit_request_id,
                     resolved_provider_id.as_str(),
@@ -13052,7 +13132,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
                     format!("prompt hook failed: {broker_message}")
                 };
                 persist_remote_prompt_hook_audit(
-                    &mut database,
+                    state,
                     &request,
                     &broker_request_id,
                     resolved_provider_id.as_str(),
@@ -14337,6 +14417,8 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut flushed_text_len = 0usize;
     let mut flushed_reasoning_len = 0usize;
     let mut reasoning_loop_recovery_count = 0usize;
+    let max_provider_retries = remote_sidecar_llm_request_retry_count(&stream_state);
+    let mut provider_retry_count = 0u32;
     remote_sidecar_record_run_event(
         &run_stream,
         sequence,
@@ -14546,6 +14628,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         });
         let turn_text_start = text.len();
         let turn_reasoning_start = reasoning.len();
+        let attempt_run_metrics = run_metrics.clone();
         let llm_turn = remote_sidecar_run_broker_llm_turn(
             &stream_state,
             &run_stream,
@@ -14579,6 +14662,53 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         let turn_text = remote_sidecar_current_turn_output(&text, turn_text_start);
         let turn_reasoning = remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
         match llm_turn {
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message })
+                if provider_retry_count < max_provider_retries =>
+            {
+                provider_retry_count = provider_retry_count.saturating_add(1);
+                text.truncate(turn_text_start);
+                reasoning.truncate(turn_reasoning_start);
+                run_metrics = attempt_run_metrics;
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({
+                        "type": "streamReset",
+                        "assistantMessageId": assistant_message_id,
+                        "reason": message,
+                        "text": text,
+                        "reasoning": (!reasoning.is_empty()).then_some(reasoning.as_str()),
+                        "toolCalls": [],
+                    }),
+                );
+                continue;
+            }
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message }) => {
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({ "type": "error", "message": message }),
+                );
+                sequence += 1;
+                remote_sidecar_record_run_event(
+                    &run_stream,
+                    sequence,
+                    json!({ "type": "streamEnd" }),
+                );
+                let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        &chat_id,
+                        &queued_user_message_id,
+                        &assistant_message_id,
+                        &run_id,
+                    )
+                });
+                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                cleanup_guard.disarm();
+                break;
+            }
             Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                 tool_calls: None,
                 resolved_provider_id,
@@ -15945,30 +16075,115 @@ fn remote_sidecar_fail_reserved_start(
     plan_task: Option<&RemotePlanTaskBinding>,
     message: &str,
 ) {
-    remote_sidecar_record_run_event(
-        run_stream,
-        0,
-        json!({ "type": "error", "message": message }),
-    );
-    remote_sidecar_record_run_event(run_stream, 1, json!({ "type": "streamEnd" }));
-    if let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state)) {
-        let _ = database.clear_remote_queued_run_if_owned(
-            chat_id,
-            queued_user_message_id,
-            assistant_message_id,
-            run_id,
-        );
-    }
-    if let Some(plan_task) = plan_task {
-        if let Err(error) = remote_sidecar_fail_plan_task(state, &plan_task.task_id, message) {
-            tracing::error!(
-                task_id = %plan_task.task_id,
-                error = %error.message,
-                "failed to close remote Plan task after chat startup failure"
-            );
+    let database_busy = message.contains("workspace_database_busy")
+        || message.contains("workspace database concurrency limit reached");
+    let user_message = pre_stream_failure_user_message(message);
+    let failure_code = if database_busy {
+        "workspace_database_busy"
+    } else {
+        "pre_stream_error"
+    };
+    let assistant_metadata = json!({
+        "streamingState": "failed",
+        "runFailure": {
+            "code": failure_code,
+            "stage": "pre_stream_prepare",
+            "retryable": database_busy,
+            "message": user_message,
+        },
+        "parts": [{ "type": "error", "text": user_message }],
+        "partsVersion": 5,
+        "partsSource": "pre_stream_failure",
+    })
+    .to_string();
+    let state = state.clone();
+    let run_id = run_id.to_string();
+    let run_stream = run_stream.clone();
+    let chat_id = chat_id.to_string();
+    let queued_user_message_id = queued_user_message_id.to_string();
+    let assistant_message_id = assistant_message_id.to_string();
+    let plan_task_id = plan_task.map(|task| task.task_id.clone());
+    tokio::spawn(async move {
+        let started_at = Instant::now();
+        let mut retry_delay = Duration::from_millis(500);
+        loop {
+            let workspace_path = sidecar_workspace_path(&state).to_path_buf();
+            let chat_id_for_close = chat_id.clone();
+            let queued_user_message_id_for_close = queued_user_message_id.clone();
+            let assistant_message_id_for_close = assistant_message_id.clone();
+            let run_id_for_close = run_id.clone();
+            let user_message_for_close = user_message.clone();
+            let assistant_metadata_for_close = assistant_metadata.clone();
+            let closure = tokio::task::spawn_blocking(move || {
+                let mut database = WorkspaceDatabase::open_or_create_critical(&workspace_path)?;
+                database.close_remote_pre_stream_failure_if_owned(
+                    &chat_id_for_close,
+                    &queued_user_message_id_for_close,
+                    &assistant_message_id_for_close,
+                    &run_id_for_close,
+                    &user_message_for_close,
+                    &assistant_metadata_for_close,
+                )
+            })
+            .await;
+            match closure {
+                Ok(Ok(RemotePreStreamFailureClosureOutcome::Applied)) => break,
+                Ok(Ok(RemotePreStreamFailureClosureOutcome::NotOwned)) => {
+                    tracing::info!(
+                        chat_id,
+                        run_id,
+                        "remote pre-stream failure no longer owns the queued run"
+                    );
+                    remote_sidecar_finish_active_run(&state, &run_id);
+                    return;
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        chat_id,
+                        run_id,
+                        error = %error,
+                        "remote pre-stream failure closure is waiting to retry durable persistence"
+                    );
+                }
+                Err(error) => {
+                    tracing::error!(
+                        chat_id,
+                        run_id,
+                        error = %error,
+                        "remote pre-stream failure closure worker stopped unexpectedly"
+                    );
+                    return;
+                }
+            }
+            if started_at.elapsed() >= Duration::from_secs(120) {
+                tracing::error!(
+                    chat_id,
+                    run_id,
+                    "remote pre-stream failure could not be persisted before retry deadline"
+                );
+                return;
+            }
+            sleep(retry_delay).await;
+            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
         }
-    }
-    remote_sidecar_finish_active_run(state, run_id);
+        remote_sidecar_record_run_event(
+            &run_stream,
+            0,
+            json!({ "type": "error", "message": user_message }),
+        );
+        remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
+        if let Some(plan_task_id) = plan_task_id {
+            if let Err(error) = remote_sidecar_fail_plan_task(&state, &plan_task_id, &user_message)
+            {
+                tracing::error!(
+                    task_id = %plan_task_id,
+                    error = %error.message,
+                    "failed to close remote Plan task after chat startup failure"
+                );
+            }
+        }
+        remote_sidecar_finish_active_run(&state, &run_id);
+    });
 }
 
 async fn remote_sidecar_start_chat_run(
@@ -16007,8 +16222,12 @@ async fn remote_sidecar_start_chat_run(
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let (chat_title, assistant_message_id, session_mode, plan_task) = {
-        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-            .map_err(ApiError::from_workspace_error)?;
+        let (_startup_cancel_tx, startup_cancel_rx) = watch::channel(false);
+        let database = open_workspace_database_ordinary_with_pre_stream_retry(
+            sidecar_workspace_path(&state),
+            startup_cancel_rx,
+        )
+        .await?;
         let chat = database
             .chat(&chat_id)
             .map_err(ApiError::from_workspace_error)?
@@ -16067,23 +16286,34 @@ async fn remote_sidecar_start_chat_run(
         RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
     };
 
-    let claim_result = (|| {
-        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))?;
-        database.claim_remote_queued_run(
+    let claim_result = async {
+        let mut database = open_workspace_database_ordinary_with_pre_stream_retry(
+            sidecar_workspace_path(&state),
+            run_stream.subscribe_cancel(),
+        )
+        .await?;
+        database
+            .claim_remote_queued_run(
+                &chat_id,
+                &queued_user_message_id,
+                &assistant_message_id,
+                &run_id,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        Ok::<(), ApiError>(())
+    }
+    .await;
+    if let Err(error) = claim_result {
+        remote_sidecar_fail_reserved_start(
+            &state,
+            &run_id,
+            &run_stream,
             &chat_id,
             &queued_user_message_id,
             &assistant_message_id,
-            &run_id,
-        )
-    })();
-    if let Err(error) = claim_result {
-        remote_sidecar_record_run_event(
-            &run_stream,
-            0,
-            json!({ "type": "error", "message": error.to_string() }),
+            plan_task.as_ref(),
+            &error.message,
         );
-        remote_sidecar_record_run_event(&run_stream, 1, json!({ "type": "streamEnd" }));
-        remote_sidecar_finish_active_run(&state, &run_id);
         return Ok(run_stream);
     }
 
@@ -16120,7 +16350,12 @@ async fn remote_sidecar_start_chat_run(
             }
         };
     let initial_prepared = {
-        let database = match WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state)) {
+        let database = match open_workspace_database_ordinary_with_pre_stream_retry(
+            sidecar_workspace_path(&state),
+            run_stream.subscribe_cancel(),
+        )
+        .await
+        {
             Ok(database) => database,
             Err(error) => {
                 remote_sidecar_fail_reserved_start(
@@ -16131,7 +16366,7 @@ async fn remote_sidecar_start_chat_run(
                     &queued_user_message_id,
                     &assistant_message_id,
                     plan_task.as_ref(),
-                    &error.to_string(),
+                    &error.message,
                 );
                 return Ok(run_stream);
             }
@@ -25606,6 +25841,174 @@ mod tests {
         drop(reconnect);
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 1);
         remote_sidecar_cancel_active_run(&state, &run_id, false, true);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_retries_broker_failure_with_stream_reset_and_restores_attempt_snapshot()
+    {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        seed_remote_queued_chat(&mut database, "chat-1", "msg-user-1", "msg-assistant-1");
+        drop(database);
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let first_request = loop {
+                let envelope = broker_rx.recv().await.expect("first broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let first_id = first_request.id.clone().expect("first request id");
+            let first_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&first_id)
+                .cloned()
+                .expect("first pending response channel");
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(first_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "discard this attempt",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send first attempt text");
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(first_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "code": "provider_stream_error",
+                        "message": "temporary upstream failure",
+                        "retryable": true,
+                        "statusCode": 503,
+                    }),
+                    timestamp: None,
+                })
+                .expect("send retryable broker error");
+
+            let second_request = loop {
+                let envelope = broker_rx.recv().await.expect("second broker request");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    break envelope;
+                }
+            };
+            let second_id = second_request.id.clone().expect("second request id");
+            let second_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&second_id)
+                .cloned()
+                .expect("second pending response channel");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(second_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": "recovered response",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send recovered text");
+            second_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(second_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 4, "outputTokens": 2 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send recovered completion");
+            (first_id, second_id)
+        });
+
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(5),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("retrying SSE body should finish")
+        .expect("SSE bytes");
+        let (first_broker_request_id, second_broker_request_id) =
+            broker.await.expect("broker task");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"streamReset\""));
+        assert!(text.contains("temporary upstream failure"));
+        assert!(text.contains("recovered response"));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(!text.contains("\"type\":\"error\""));
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        assert_eq!(assistant.content, "recovered response");
+        assert!(
+            !assistant.content.contains("discard this attempt"),
+            "failed-attempt text must not survive retry"
+        );
+        let user = database
+            .message("msg-user-1")
+            .expect("user lookup")
+            .expect("user message");
+        let user_metadata: Value =
+            serde_json::from_str(&user.metadata_json).expect("user metadata");
+        assert!(user_metadata.get("queuedRun").is_none());
+        assert_eq!(
+            database
+                .llm_request(&first_broker_request_id)
+                .expect("first audit lookup")
+                .expect("first audit")
+                .final_state,
+            "failed"
+        );
+        assert_eq!(
+            database
+                .llm_request(&second_broker_request_id)
+                .expect("second audit lookup")
+                .expect("second audit")
+                .final_state,
+            "succeeded"
+        );
     }
 
     #[tokio::test]

@@ -36,16 +36,16 @@ use foco_store::{
         NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
         PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
         PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
-        RegisterAgentTaskWaitDependencies, RemoteQueuedRunClaimOutcome,
-        RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
-        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        llm_request_audit_count_sql_for_tests,
+        RegisterAgentTaskWaitDependencies, RemotePreStreamFailureClosureOutcome,
+        RemoteQueuedRunClaimOutcome, RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -650,6 +650,75 @@ fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
             .expect("owner clear"),
         RemoteQueuedRunClearOutcome::Cleared
     );
+}
+
+#[test]
+fn remote_pre_stream_failure_persists_assistant_and_clears_owned_queue_atomically() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-remote-pre-stream", "Remote pre-stream")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-remote-pre-stream",
+            chat_id: "chat-remote-pre-stream",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(
+                &json!({
+                    "keep": "metadata",
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "user-remote-pre-stream",
+                        "assistantMessageId": "assistant-remote-pre-stream",
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .expect("user insert");
+    let assistant_metadata = json!({
+        "streamingState": "failed",
+        "parts": [{ "type": "error", "text": "database busy" }],
+        "partsSource": "pre_stream_failure",
+    })
+    .to_string();
+    assert_eq!(
+        database
+            .close_remote_pre_stream_failure_if_owned(
+                "chat-remote-pre-stream",
+                "user-remote-pre-stream",
+                "assistant-remote-pre-stream",
+                "remote-run-owner",
+                "Reply has not started: workspace database is busy. Please retry.",
+                &assistant_metadata,
+            )
+            .expect("close owned pre-stream failure"),
+        RemotePreStreamFailureClosureOutcome::Applied
+    );
+
+    let user = database
+        .message("user-remote-pre-stream")
+        .expect("user lookup")
+        .expect("user message");
+    let user_metadata: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
+    assert_eq!(user_metadata["keep"], "metadata");
+    assert!(user_metadata.get("queuedRun").is_none());
+    let assistant = database
+        .message("assistant-remote-pre-stream")
+        .expect("assistant lookup")
+        .expect("materialized assistant");
+    assert_eq!(
+        assistant.content,
+        "Reply has not started: workspace database is busy. Please retry."
+    );
+    assert_eq!(assistant.sequence, 1);
+    let persisted_metadata: Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata");
+    assert_eq!(persisted_metadata["streamingState"], "failed");
 }
 
 #[test]

@@ -554,6 +554,14 @@ pub enum RemoteQueuedRunClearOutcome {
     NotOwned,
 }
 
+/// Result of atomically persisting a remote pre-stream assistant failure and
+/// clearing the corresponding owned queued run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RemotePreStreamFailureClosureOutcome {
+    Applied,
+    NotOwned,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanPhaseAttemptTrigger {
     Initial,
@@ -5757,6 +5765,149 @@ impl WorkspaceDatabase {
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
         Ok(RemoteQueuedRunClearOutcome::Cleared)
+    }
+
+    /// Close a remote run before the first provider event in one transaction.
+    ///
+    /// The owner tuple prevents an old runner from overwriting a newer queued
+    /// turn. A missing assistant placeholder is materialized at the queued
+    /// user's next sequence so a durable retry failure remains visible.
+    pub fn close_remote_pre_stream_failure_if_owned(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+        assistant_content: &str,
+        assistant_metadata_json: &str,
+    ) -> Result<RemotePreStreamFailureClosureOutcome, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(user) = message_from_transaction(&transaction, &database_path, user_message_id)?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemotePreStreamFailureClosureOutcome::NotOwned);
+        };
+        if user.chat_id != chat_id || user.role != "user" {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemotePreStreamFailureClosureOutcome::NotOwned);
+        }
+        let mut user_metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let Some(queued_run) = user_metadata
+            .get(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object)
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemotePreStreamFailureClosureOutcome::NotOwned);
+        };
+        let matches_identity = queued_run
+            .get("userMessageId")
+            .or_else(|| queued_run.get("user_message_id"))
+            .and_then(Value::as_str)
+            == Some(user_message_id)
+            && queued_run
+                .get("assistantMessageId")
+                .or_else(|| queued_run.get("assistant_message_id"))
+                .and_then(Value::as_str)
+                == Some(assistant_message_id);
+        let matches_owner = queued_run
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "running")
+            && matches_identity
+            && queued_run.get("runId").and_then(Value::as_str) == Some(run_id);
+        let is_unclaimed_current_run = queued_run
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "queued")
+            && matches_identity
+            && queued_run.get("runId").is_none();
+        if !(matches_owner || is_unclaimed_current_run) {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemotePreStreamFailureClosureOutcome::NotOwned);
+        }
+
+        match message_from_transaction(&transaction, &database_path, assistant_message_id)? {
+            Some(assistant) => {
+                if assistant.chat_id != chat_id || assistant.role != "assistant" {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "remote pre-stream failure assistant identity was replaced"
+                            .to_string(),
+                    });
+                }
+                transaction
+                    .execute(
+                        "UPDATE messages
+                         SET content = ?1, metadata_json = ?2
+                         WHERE id = ?3 AND chat_id = ?4 AND role = 'assistant'",
+                        params![
+                            assistant_content,
+                            assistant_metadata_json,
+                            assistant_message_id,
+                            chat_id
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+            None => {
+                let assistant_sequence = user.sequence.checked_add(1).ok_or_else(|| {
+                    WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: "remote pre-stream failure assistant sequence overflowed"
+                            .to_string(),
+                    }
+                })?;
+                transaction
+                    .execute(
+                        "INSERT INTO messages (
+                            id, chat_id, role, content, sequence, created_at, metadata_json
+                         ) VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6)",
+                        params![
+                            assistant_message_id,
+                            chat_id,
+                            assistant_content,
+                            assistant_sequence,
+                            now,
+                            assistant_metadata_json
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+        }
+
+        user_metadata.remove(QUEUED_MESSAGE_METADATA_KEY);
+        let user_metadata_json = serde_json::to_string(&user_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("user message metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![user_metadata_json, user_message_id, chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE chats SET updated_at = ?1 WHERE id = ?2",
+                params![now, chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(RemotePreStreamFailureClosureOutcome::Applied)
     }
 
     pub fn mark_chat_queued_run_started(
