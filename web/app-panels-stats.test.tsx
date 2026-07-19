@@ -4885,6 +4885,72 @@ describe("app-panels-stats verification surfaces", () => {
     expect(within(dialog).queryByText('"cancelled"')).not.toBeInTheDocument();
   });
 
+  it("renders provider_websocket_request_v1 create frame and connection reuse", async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              requestBody: {
+                connectionReused: true,
+                createFrame: JSON.stringify({
+                  type: "response.create",
+                  model: "gpt-test",
+                }),
+                createFrameEncoding: "utf8",
+                frameSent: true,
+                format: "provider_websocket_request_v1",
+                headers: {
+                  authorization: ["********"],
+                },
+                url: "wss://api.example.test/v1/responses",
+                version: 1,
+              },
+              requestDetailStatus: "captured",
+              responseBody: {
+                ...aiStatisticsDetail.request.responseBody,
+                http: null,
+              },
+              statusCode: null,
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "View request details" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    expect(within(dialog).getByText("WebSocket")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("wss://api.example.test/v1/responses"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("Connection reused")).toBeInTheDocument();
+    expect(within(dialog).getByText("Frame sent")).toBeInTheDocument();
+    expect(within(dialog).getAllByText("Yes").length).toBeGreaterThanOrEqual(2);
+    expect(within(dialog).getByText("response.create frame")).toBeInTheDocument();
+    expect(within(dialog).getByText('"response.create"')).toBeInTheDocument();
+    expect(within(dialog).queryByText("HTTP method")).not.toBeInTheDocument();
+  });
+
   it("loads saved API request audit column settings", async () => {
     const { unmount } = renderApp();
 

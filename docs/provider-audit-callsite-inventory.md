@@ -4,7 +4,7 @@
 
 | 路径 | 调用/写入 | 分类 | 当前状态 |
 | --- | --- | --- | --- |
-| `app/main.rs` agent turn | `stream_chat_with_capture_observer`、running/outcome audit | 主聊天、多轮工具调用、provider retry | 每个 attempt 先插入空详情 running 行，observers 即时捕获 `provider_request_v1` 与真实 response head，Complete/失败/取消写 `provider_final_response_v1`（未捕获则为 NULL）。不再写 run-level `{text,reasoning,...}` / `{error}` / `{cancelled}` 到 `response_body_json`。 |
+| `app/main.rs` agent turn | `stream_chat_with_capture_observer`、running/outcome audit | 主聊天、多轮工具调用、provider retry | 每个 attempt 先插入空详情 running 行，observers 即时捕获 HTTP `provider_request_v1` 或 WebSocket `provider_websocket_request_v1` 与真实 response/handshake head，Complete/失败/取消写 `provider_final_response_v1`（未捕获则为 NULL）。不再写 run-level `{text,reasoning,...}` / `{error}` / `{cancelled}` 到 `response_body_json`。 |
 | `app/main.rs` audited text/tool helpers | `stream_chat_with_capture_observer` | 标题、Memory、Workspace Spec、Git commit message、模型探测等内部请求 | 每个 retry 独立审计行，不再用 Neutral request 作为详情。模型探测保留独立 requestKind 与主统计排除契约。 |
 | `app/prompt/compression.rs` | `stream_chat_with_capture_observer` | LLM context compression | running 行先创建，真实 request observer 回写，成功/失败保存最终 envelope；snapshot 与 fallback 语义保持。 |
 | `app/hooks.rs` | `stream_chat_with_capture_observer` | Prompt Hook | running request detail 初始为空，observer 回写真实 request；成功、建流失败、超时和流中断保存最终 envelope。 |
@@ -13,7 +13,7 @@
 
 Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 sidecar SQLite 共用）：
 
-- 写入白名单：`request_body_json` 非空仅 `provider_request_v1` version 1；`response_body_json` 非空仅 `provider_final_response_v1` version 1。
+- 写入白名单：`request_body_json` 非空仅 `provider_request_v1` 或 `provider_websocket_request_v1` version 1；`response_body_json` 非空仅 `provider_final_response_v1` version 1。
 - `merge_audit_detail_for_update`：真实 v1 可覆盖 NULL/非 v1；已有有效 v1 不被 NULL/legacy/normalized/重复 finish 覆盖。
 - `open_or_create` 幂等清理非 v1 详情为 NULL（不伪造转 v1）；缺 detail 列的迁移 stub 跳过；并发写锁 busy 时 best-effort 跳过，下次 open 再试。
 - 详情关闭：`save_request_response_details=false` 时 request/response detail 为 NULL（不再保留 compact `{cancelled}` 正文）。
@@ -32,6 +32,7 @@ Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 s
 - `providers/lib.rs::tests::captures_finalized_requests_for_four_primary_adapters`：真实本地 HTTP 覆盖 OpenAI Chat、OpenAI Responses、Anthropic、Gemini；逐请求比较 observer dump 与服务端实际 method/path/body，校验 Request headers 仅 Authorization 星号化、其它最终 HeaderMap 值保留、最终 adapter 映射和每个 attempt 只发送一次。
 - `providers/lib.rs::tests::captures_final_wire_request_and_only_final_response`, `captures_http_response_head_for_non_success_stream` 与 `connection_failure_before_http_response_does_not_fabricate_response_head`：固定 2xx streaming、非 2xx、收到 response 后失败以及连接建立前失败的可用性边界；真实 status/version/response headers 在 body 消费前捕获，Request/Response 均仅 Authorization 星号化，连接类失败不得伪造 HTTP head。
 - `providers/lib.rs` status 聚焦：`http_status_preserves_non_default_success_status_without_detail_dumps`（201 且详情关闭 dump 仍 None）、`http_status_is_captured_without_detail_dumps`（502）、`http_status_survives_stream_decode_failure_after_response_head`、`connection_failure_http_status_is_none_without_response`。
+- `providers/lib.rs` WebSocket 审计：`websocket_stream_maps_to_neutral_events_and_closes_cleanly` 断言 `provider_websocket_request_v1`（wss/ws URL、`response.create` frame、`frameSent=true`、Authorization 脱敏、handshake 101）；`websocket_observer_notified_only_after_create_frame_sent_with_frame_sent_true` 断言 Upgrade 收到真实 Bearer 且 observer 仅在 send 成功后收到 `frameSent=true` dump；`websocket_handshake_http_rejection_preserves_status_code` 断言 401 upgrade 保留 status 且 `frameSent=false`；`websocket_session_reuses_connection_and_previous_response_id` 断言复用 turn `connectionReused=true`、无 handshake、不伪造 `http_status`/HTTP head。
 - `app/tests/mod.rs::main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire`：真实主聊天生产路径贯穿 mock provider → 双 observers → SQLite `llm_requests` → AI statistics detail handler；仅 1 条 turn 审计、无 `run-` summary row；新记录为 `provider_request_v1` / `provider_final_response_v1`、chunk-only sentinel 不落库。
 - `app/tests/mod.rs::main_chat_details_disabled_send_once_without_request_or_response_dump`：详情关闭时仍只发送一次，成功审计统计保留，但 request/response detail 为 `NULL`。
 - `app/remote_workspace.rs::remote_ssh_sidecar_chat_turn_persists_real_wire_to_profile_audit_mirror`：真实 `WorkspaceLocation::Ssh` + `remote_sidecar_chat_stream` → control WS → mock provider → 主进程 `profile/.foco/remote-workspace-audit` list/detail；sidecar mirror detail 恒 NULL；同一 broker id 全链路一致；SQLite/list/detail 同一真实 `statusCode`。

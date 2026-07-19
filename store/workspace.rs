@@ -17988,7 +17988,10 @@ fn prune_non_v1_llm_audit_details_once(
             WHERE request_body_json IS NOT NULL
               AND (
                 json_valid(request_body_json) = 0
-                OR COALESCE(json_extract(request_body_json, '$.format'), '') <> 'provider_request_v1'
+                OR COALESCE(json_extract(request_body_json, '$.format'), '') NOT IN (
+                  'provider_request_v1',
+                  'provider_websocket_request_v1'
+                )
                 OR COALESCE(json_extract(request_body_json, '$.version'), 0) <> 1
               );
 
@@ -18136,7 +18139,13 @@ fn validate_audit_detail_format(
     let format = parsed.get("format").and_then(Value::as_str);
     let version = parsed.get("version").and_then(Value::as_u64);
     let ok = match field {
-        "request_body_json" => format == Some("provider_request_v1") && version == Some(1),
+        "request_body_json" => {
+            matches!(
+                (format, version),
+                (Some("provider_request_v1"), Some(1))
+                    | (Some("provider_websocket_request_v1"), Some(1))
+            )
+        }
         "response_body_json" => format == Some("provider_final_response_v1") && version == Some(1),
         _ => false,
     };
@@ -18159,6 +18168,9 @@ fn redact_audit_json(value: &str, field: &'static str) -> Result<String, Workspa
     match (field, format, version) {
         ("request_body_json", Some("provider_request_v1"), Some(1)) => {
             redact_provider_request_envelope(&mut parsed)
+        }
+        ("request_body_json", Some("provider_websocket_request_v1"), Some(1)) => {
+            redact_provider_websocket_request_envelope(&mut parsed)
         }
         ("response_body_json", Some("provider_final_response_v1"), Some(1)) => {
             redact_provider_response_envelope(&mut parsed)
@@ -18186,6 +18198,32 @@ fn redact_provider_request_envelope(value: &mut Value) {
     if let (Some(object), Some(mut headers)) = (value.as_object_mut(), headers) {
         mask_provider_authorization_header(&mut headers);
         object.insert("headers".to_string(), headers);
+    }
+}
+
+fn redact_provider_websocket_request_envelope(value: &mut Value) {
+    let headers = value
+        .as_object_mut()
+        .and_then(|object| object.remove("headers"));
+    let handshake_headers = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("handshake"))
+        .and_then(Value::as_object_mut)
+        .and_then(|handshake| handshake.remove("headers"));
+    redact_json_value(value);
+    if let (Some(object), Some(mut headers)) = (value.as_object_mut(), headers) {
+        mask_provider_authorization_header(&mut headers);
+        object.insert("headers".to_string(), headers);
+    }
+    if let (Some(handshake), Some(mut headers)) = (
+        value
+            .as_object_mut()
+            .and_then(|object| object.get_mut("handshake"))
+            .and_then(Value::as_object_mut),
+        handshake_headers,
+    ) {
+        mask_provider_authorization_header(&mut headers);
+        handshake.insert("headers".to_string(), headers);
     }
 }
 

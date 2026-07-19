@@ -2264,6 +2264,30 @@ export type ProviderWireRequestDump = {
   version: number;
 };
 
+export type ProviderWebSocketHandshakeDump = {
+  headers: ProviderHttpHeadersDump;
+  status: number;
+  version: string;
+};
+
+/** Real OpenAI Responses WebSocket request dump (`response.create` frame). */
+export type ProviderWebSocketRequestDump = {
+  connectionReused: boolean;
+  createFrame?: string;
+  createFrameEncoding?: string;
+  /** True only after response.create was written to the socket. */
+  frameSent?: boolean;
+  format: "provider_websocket_request_v1";
+  handshake?: ProviderWebSocketHandshakeDump | null;
+  headers: ProviderHttpHeadersDump;
+  url: string;
+  version: number;
+};
+
+export type ProviderAuditRequestDump =
+  | ProviderWireRequestDump
+  | ProviderWebSocketRequestDump;
+
 export type ProviderHttpResponseHeadDump = {
   headers: ProviderHttpHeadersDump;
   status: number;
@@ -2308,7 +2332,7 @@ export type AiRequestAuditDetail = AiRequestAuditSummary & {
     | "partial"
     | "pending"
     | "unavailable";
-  requestBody: JsonValue | ProviderWireRequestDump | null;
+  requestBody: JsonValue | ProviderAuditRequestDump | null;
   responseBody: JsonValue | ProviderFinalResponseDump | null;
 };
 

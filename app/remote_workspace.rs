@@ -37,8 +37,9 @@ use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OpenAiRespWsSessionKey, ProviderRequestDumpObserver, ProviderRequestFailure,
-    ProviderWireRequestDump, ProviderWsSessionContext, stream_chat_with_capture_observer,
+    OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderRequestDumpObserver,
+    ProviderRequestFailure, ProviderWireRequestDump, ProviderWsSessionContext,
+    stream_chat_with_capture_observer,
 };
 use foco_store::{
     config::{
@@ -4956,7 +4957,7 @@ impl BrokerLlmAuditWriter {
     fn observer(&self) -> Option<ProviderRequestDumpObserver> {
         self.save_details.then(|| {
             let writer = self.clone();
-            Arc::new(move |dump: &ProviderWireRequestDump| {
+            Arc::new(move |dump: &ProviderAuditRequestDump| {
                 if let Err(error) = writer.persist_request_dump(dump) {
                     tracing::warn!(
                         workspace_id = %writer.context.workspace_id,
@@ -4981,7 +4982,7 @@ impl BrokerLlmAuditWriter {
         self.write_with_retry("start", || self.open_ensured_database().map(|_| ()))
     }
 
-    fn persist_request_dump(&self, dump: &ProviderWireRequestDump) -> Result<(), ApiError> {
+    fn persist_request_dump(&self, dump: &ProviderAuditRequestDump) -> Result<(), ApiError> {
         let Some(request_body_json) = self.detail_capture().request_json(Some(dump))? else {
             return Ok(());
         };
@@ -24075,23 +24076,32 @@ mod tests {
             "2026-07-13T00:00:00Z",
             true,
         );
-        let first_request = foco_providers::ProviderWireRequestDump {
-            format: "provider_request_v1".to_string(),
-            version: 1,
-            method: "POST".to_string(),
-            url: "https://provider.test/v1/chat".to_string(),
-            headers: BTreeMap::new(),
-            body: Some(r#"{"model":"first"}"#.to_string()),
-            body_encoding: Some("utf8".to_string()),
-        };
+        let first_request = foco_providers::ProviderAuditRequestDump::from_http(
+            foco_providers::ProviderWireRequestDump {
+                format: "provider_request_v1".to_string(),
+                version: 1,
+                method: "POST".to_string(),
+                url: "https://provider.test/v1/chat".to_string(),
+                headers: BTreeMap::new(),
+                body: Some(r#"{"model":"first"}"#.to_string()),
+                body_encoding: Some("utf8".to_string()),
+            },
+        );
         writer
             .persist_request_dump(&first_request)
             .expect("request observer self-heals a missing start row");
         writer
-            .persist_request_dump(&foco_providers::ProviderWireRequestDump {
-                body: Some(r#"{"model":"second"}"#.to_string()),
-                ..first_request
-            })
+            .persist_request_dump(&foco_providers::ProviderAuditRequestDump::from_http(
+                foco_providers::ProviderWireRequestDump {
+                    format: "provider_request_v1".to_string(),
+                    version: 1,
+                    method: "POST".to_string(),
+                    url: "https://provider.test/v1/chat".to_string(),
+                    headers: BTreeMap::new(),
+                    body: Some(r#"{"model":"second"}"#.to_string()),
+                    body_encoding: Some("utf8".to_string()),
+                },
+            ))
             .expect("duplicate observer notification");
 
         let response_body_json = serde_json::to_string(
@@ -24211,15 +24221,17 @@ mod tests {
             broker_llm_audit_writer_for_test(&context, "provider-1", "model-1", None, started_at);
         let capture = ProviderAuditCapture::new(workspace.path(), "remote-run-1", true);
         let request_body_json = capture
-            .request_json(Some(&foco_providers::ProviderWireRequestDump {
-                format: "provider_request_v1".to_string(),
-                version: 1,
-                method: "POST".to_string(),
-                url: "https://provider.test/v1/chat".to_string(),
-                headers: BTreeMap::new(),
-                body: Some(r#"{"model":"model-1"}"#.to_string()),
-                body_encoding: Some("utf8".to_string()),
-            }))
+            .request_json(Some(&foco_providers::ProviderAuditRequestDump::from_http(
+                foco_providers::ProviderWireRequestDump {
+                    format: "provider_request_v1".to_string(),
+                    version: 1,
+                    method: "POST".to_string(),
+                    url: "https://provider.test/v1/chat".to_string(),
+                    headers: BTreeMap::new(),
+                    body: Some(r#"{"model":"model-1"}"#.to_string()),
+                    body_encoding: Some("utf8".to_string()),
+                },
+            )))
             .expect("serialize request")
             .expect("request detail");
         WorkspaceDatabase::open_or_create(workspace.path())

@@ -31,6 +31,8 @@ use serde_json::{Map, Value};
 pub const PROVIDER_WIRE_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_WIRE_REQUEST_DUMP_FORMAT: &str = "provider_request_v1";
+pub const PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT: &str = "provider_websocket_request_v1";
+pub const PROVIDER_WEBSOCKET_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v1";
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
 pub(crate) const MASKED_AUTHORIZATION_VALUE: &str = "********";
@@ -52,6 +54,96 @@ pub struct ProviderWireRequestDump {
     pub body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub body_encoding: Option<String>,
+}
+
+/// Real WebSocket wire request dump for `openai-responses-websocket`.
+///
+/// Not an HTTP POST body: captures the derived `ws`/`wss` URL, handshake headers,
+/// the `response.create` client frame, whether this turn reused a live socket, and
+/// optional upgrade handshake metadata observed on this turn only.
+///
+/// `frame_sent` is true only after the client successfully wrote `response.create`
+/// to the socket. Pre-send connect failures may still persist a dump with
+/// `frame_sent=false` for diagnostics; do not treat those as observed wire frames.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWebSocketRequestDump {
+    pub format: String,
+    pub version: u32,
+    pub url: String,
+    pub headers: ProviderHttpHeadersDump,
+    /// Serialized `response.create` client event (UTF-8 JSON), credentials redacted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_frame: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub create_frame_encoding: Option<String>,
+    /// True only after `response.create` was successfully written to the socket.
+    /// Missing on historical rows defaults to true (those dumps were produced for
+    /// completed turns that intended real-wire semantics).
+    #[serde(default = "default_true")]
+    pub frame_sent: bool,
+    pub connection_reused: bool,
+    /// Present only when this turn performed a WebSocket upgrade (not on reuse).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub handshake: Option<ProviderWebSocketHandshakeDump>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderWebSocketHandshakeDump {
+    pub status: u16,
+    pub version: String,
+    pub headers: ProviderHttpHeadersDump,
+}
+
+/// Versioned request detail accepted in `llm_requests.request_body_json`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProviderAuditRequestDump {
+    WebSocket(ProviderWebSocketRequestDump),
+    Http(ProviderWireRequestDump),
+}
+
+impl ProviderAuditRequestDump {
+    pub fn format(&self) -> &str {
+        match self {
+            Self::Http(dump) => dump.format.as_str(),
+            Self::WebSocket(dump) => dump.format.as_str(),
+        }
+    }
+
+    pub fn from_http(dump: ProviderWireRequestDump) -> Self {
+        Self::Http(dump)
+    }
+
+    pub fn from_websocket(dump: ProviderWebSocketRequestDump) -> Self {
+        Self::WebSocket(dump)
+    }
+
+    pub fn as_http(&self) -> Option<&ProviderWireRequestDump> {
+        match self {
+            Self::Http(dump) => Some(dump),
+            Self::WebSocket(_) => None,
+        }
+    }
+
+    pub fn as_websocket(&self) -> Option<&ProviderWebSocketRequestDump> {
+        match self {
+            Self::WebSocket(dump) => Some(dump),
+            Self::Http(_) => None,
+        }
+    }
+
+    pub fn into_http(self) -> Option<ProviderWireRequestDump> {
+        match self {
+            Self::Http(dump) => Some(dump),
+            Self::WebSocket(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -867,7 +959,7 @@ pub struct NeutralUsage {
 #[derive(Debug)]
 pub struct ProviderRequestFailure {
     pub error: ProviderConfigError,
-    pub request_dump: Option<ProviderWireRequestDump>,
+    pub request_dump: Option<ProviderAuditRequestDump>,
 }
 
 impl ProviderRequestFailure {
@@ -890,7 +982,7 @@ type GenaiChatEventStream =
 pub struct NeutralChatStream {
     pub(crate) stream: GenaiChatEventStream,
     pub(crate) error_context: ProviderErrorContext,
-    pub(crate) wire_request_dump: Option<ProviderWireRequestDump>,
+    pub(crate) wire_request_dump: Option<ProviderAuditRequestDump>,
     /// Always captured when a real HTTP Response is observed; independent of detail dumps.
     pub(crate) response_status: Arc<Mutex<Option<u16>>>,
     /// Full head dump (version/headers) only when `capture_details` is enabled.
@@ -900,7 +992,7 @@ pub struct NeutralChatStream {
 }
 
 impl NeutralChatStream {
-    pub fn wire_request_dump(&self) -> Option<&ProviderWireRequestDump> {
+    pub fn wire_request_dump(&self) -> Option<&ProviderAuditRequestDump> {
         self.wire_request_dump.as_ref()
     }
 
@@ -1010,7 +1102,7 @@ impl NeutralChatStream {
     }
 }
 
-pub type ProviderRequestDumpObserver = Arc<dyn Fn(&ProviderWireRequestDump) + Send + Sync>;
+pub type ProviderRequestDumpObserver = Arc<dyn Fn(&ProviderAuditRequestDump) + Send + Sync>;
 
 pub async fn stream_chat(
     config: &ProviderConnectionConfig,
@@ -1082,7 +1174,7 @@ pub async fn stream_chat_with_capture_observer(
     let observer = if capture_details || request_observer.is_some() {
         let captured_request = captured_request.clone();
         Some(Arc::new(move |request: &Request| {
-            let dump = provider_wire_request_dump(request);
+            let dump = ProviderAuditRequestDump::from_http(provider_wire_request_dump(request));
             if let Some(request_observer) = request_observer.as_ref() {
                 request_observer(&dump);
             }
@@ -1812,8 +1904,8 @@ fn insert_nested_body_override(
 }
 
 fn take_captured_request_dump(
-    captured_request: &Option<Arc<Mutex<Option<ProviderWireRequestDump>>>>,
-) -> Option<ProviderWireRequestDump> {
+    captured_request: &Option<Arc<Mutex<Option<ProviderAuditRequestDump>>>>,
+) -> Option<ProviderAuditRequestDump> {
     captured_request
         .as_ref()
         .and_then(|captured_request| captured_request.lock().ok()?.take())
@@ -2455,6 +2547,8 @@ mod tests {
         let dump = stream
             .wire_request_dump()
             .expect("adapter wire request dump")
+            .as_http()
+            .expect("http request dump")
             .clone();
         while stream.next_event().await.is_some() {}
 
@@ -2998,7 +3092,34 @@ mod tests {
         let mut stream = stream_chat_with_capture(&config, request, true)
             .await
             .expect("stream");
-        assert!(stream.wire_request_dump().is_some());
+        let wire = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_websocket()
+            .expect("websocket request dump");
+        assert_eq!(wire.format, PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT);
+        assert_eq!(wire.version, PROVIDER_WEBSOCKET_REQUEST_DUMP_VERSION);
+        assert!(wire.url.starts_with("ws://"));
+        assert!(wire.url.ends_with("/v1/responses"));
+        assert!(!wire.connection_reused);
+        assert!(wire.frame_sent, "successful stream must record frame_sent");
+        assert!(
+            wire.create_frame
+                .as_deref()
+                .is_some_and(|frame| frame.contains("\"type\":\"response.create\""))
+        );
+        assert_eq!(
+            wire.headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .and_then(|(_, values)| values.first())
+                .map(String::as_str),
+            Some(MASKED_AUTHORIZATION_VALUE)
+        );
+        assert_eq!(
+            wire.handshake.as_ref().map(|handshake| handshake.status),
+            Some(101)
+        );
         assert_eq!(stream.http_status(), Some(101));
 
         let mut events = Vec::new();
@@ -3021,7 +3142,10 @@ mod tests {
                 ..
             } if text == "Hello" && id == "resp_ws"
         )));
-        assert!(stream.final_response_dump().is_some());
+        let final_dump = stream.final_response_dump().expect("final response");
+        let final_json = serde_json::to_value(final_dump).expect("final json");
+        assert_eq!(final_json["format"], "provider_final_response_v1");
+        assert_eq!(final_json["http"]["status"], 101);
         server.await.expect("server");
     }
 
@@ -3127,6 +3251,16 @@ mod tests {
             stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
                 .await
                 .expect("stream1");
+        let wire1 = stream1
+            .wire_request_dump()
+            .expect("turn1 wire dump")
+            .as_websocket()
+            .expect("websocket dump");
+        assert!(!wire1.connection_reused);
+        assert_eq!(
+            wire1.handshake.as_ref().map(|handshake| handshake.status),
+            Some(101)
+        );
         while let Some(event) = stream1.next_event().await {
             let _ = event.expect("event");
         }
@@ -3173,6 +3307,17 @@ mod tests {
             stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
                 .await
                 .expect("stream2");
+        let wire2 = stream2
+            .wire_request_dump()
+            .expect("turn2 wire dump")
+            .as_websocket()
+            .expect("websocket dump");
+        assert_eq!(wire2.format, PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT);
+        assert!(wire2.connection_reused);
+        assert!(
+            wire2.handshake.is_none(),
+            "reused turn must not invent handshake metadata"
+        );
         let mut saw_b = false;
         let mut saw_resp2 = false;
         while let Some(event) = stream2.next_event().await {
@@ -3197,6 +3342,213 @@ mod tests {
             None,
             "reused socket turn has no observed HTTP response head this turn"
         );
+        let final2 = stream2.final_response_dump().expect("final2");
+        let final2_json = serde_json::to_value(final2).expect("final2 json");
+        assert_eq!(final2_json["format"], "provider_final_response_v1");
+        assert!(
+            final2_json.get("http").is_none() || final2_json["http"].is_null(),
+            "must not fabricate HTTP head on reused connection"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_observer_notified_only_after_create_frame_sent_with_frame_sent_true() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{
+            accept_hdr_async,
+            tungstenite::{
+                Message,
+                handshake::server::{Request, Response},
+            },
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let saw_bearer = Arc::new(AtomicUsize::new(0));
+        let saw_bearer_server = Arc::clone(&saw_bearer);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
+                let auth = req
+                    .headers()
+                    .get("Authorization")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("");
+                assert_eq!(
+                    auth, "Bearer test-key",
+                    "upgrade must receive real API key once"
+                );
+                saw_bearer_server.fetch_add(1, Ordering::SeqCst);
+                Ok(response)
+            })
+            .await
+            .expect("ws accept");
+            let first = ws.next().await.expect("msg").expect("ok");
+            match first {
+                Message::Text(text) => {
+                    let create: Value = serde_json::from_str(&text).expect("json");
+                    assert_eq!(create["type"], "response.create");
+                }
+                other => panic!("expected text, got {other:?}"),
+            }
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"ok"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_auth","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+            let _ = ws.close(None).await;
+        });
+
+        let observer_calls = Arc::new(Mutex::new(Vec::<ProviderAuditRequestDump>::new()));
+        let observer_slot = Arc::clone(&observer_calls);
+        let observer: ProviderRequestDumpObserver = Arc::new(move |dump| {
+            observer_slot
+                .lock()
+                .expect("observer lock")
+                .push(dump.clone());
+        });
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let mut stream =
+            stream_chat_with_capture_observer(&config, request, true, Some(observer), None)
+                .await
+                .expect("stream");
+        let dumps = observer_calls.lock().expect("lock").clone();
+        assert_eq!(dumps.len(), 1, "observer once after create frame is sent");
+        let wire = dumps[0].as_websocket().expect("ws dump");
+        assert!(wire.frame_sent, "successful send must mark frame_sent");
+        assert_eq!(
+            wire.headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .and_then(|(_, values)| values.first())
+                .map(String::as_str),
+            Some(MASKED_AUTHORIZATION_VALUE)
+        );
+        assert!(
+            !wire
+                .headers
+                .values()
+                .flatten()
+                .any(|value| value.contains("test-key"))
+        );
+        while let Some(event) = stream.next_event().await {
+            let _ = event.expect("event");
+        }
+        assert_eq!(
+            saw_bearer.load(Ordering::SeqCst),
+            1,
+            "provider upgrade must see Authorization exactly once"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_handshake_http_rejection_preserves_status_code() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut buf = [0u8; 1024];
+            let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+            let response =
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            stream.write_all(response).await.expect("write 401");
+        });
+
+        let observer_calls = Arc::new(Mutex::new(Vec::<ProviderAuditRequestDump>::new()));
+        let observer_slot = Arc::clone(&observer_calls);
+        let observer: ProviderRequestDumpObserver = Arc::new(move |dump| {
+            observer_slot
+                .lock()
+                .expect("observer lock")
+                .push(dump.clone());
+        });
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let failure =
+            match stream_chat_with_capture_observer(&config, request, true, Some(observer), None)
+                .await
+            {
+                Ok(_) => panic!("handshake 401 must fail"),
+                Err(error) => error,
+            };
+        match &failure.error {
+            ProviderConfigError::Connection { status_code, .. } => {
+                assert_eq!(*status_code, Some(401), "must keep real upgrade status");
+            }
+            other => panic!("expected Connection error, got {other:?}"),
+        }
+        let dumps = observer_calls.lock().expect("lock").clone();
+        assert_eq!(dumps.len(), 1, "failure still notifies for diagnostics");
+        let wire = dumps[0].as_websocket().expect("ws dump");
+        assert!(
+            !wire.frame_sent,
+            "connect failure must not claim create frame was sent"
+        );
+        let dump_on_failure = failure.request_dump.expect("request dump");
+        assert!(!dump_on_failure.as_websocket().expect("ws").frame_sent);
         server.await.expect("server");
     }
 
@@ -4209,6 +4561,8 @@ mod tests {
         let dump = stream
             .wire_request_dump()
             .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
             .clone();
         assert_eq!(dump.method, "POST");
         assert!(dump.url.ends_with("/v1/chat/completions"));

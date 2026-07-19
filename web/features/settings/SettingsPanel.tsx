@@ -10709,6 +10709,13 @@ export function SettingsPanel({
                         placeholder={selectedProviderKind?.defaultBaseUrl ?? ""}
                         value={providerForm.baseUrl}
                       />
+                      {providerUsesWebsocket ? (
+                        <p className="text-xs text-stone-600">
+                          {t(
+                            "OpenAI Responses WebSocket reuses this HTTP Base URL only. Foco derives the WebSocket endpoint by converting the full Responses URL scheme (http→ws, https→wss). Prefer this protocol for long tool chains; API proxy is disabled in this release and there is no silent HTTP fallback.",
+                          )}
+                        </p>
+                      ) : null}
                       <label className="block">
                         <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                           {t("API key")}

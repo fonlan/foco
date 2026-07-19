@@ -9332,6 +9332,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() 
     insert_request(&mut database, "request-cancelled");
     insert_request(&mut database, "request-legacy-text");
     insert_request(&mut database, "request-valid-v1");
+    insert_request(&mut database, "request-valid-websocket-v1");
 
     let reject = database.update_llm_request_body("request-1", Some(r#"{"text":"legacy"}"#));
     assert!(reject.is_err(), "non-v1 request body must be rejected");
@@ -9387,6 +9388,11 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() 
             "request-valid-v1",
             r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{"authorization":["********"]},"body":null}"#,
             r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":{"status":200,"version":"HTTP/1.1","headers":{"authorization":["********"],"x-multi":["a","b"]}}}"#,
+        );
+        plant(
+            "request-valid-websocket-v1",
+            r#"{"format":"provider_websocket_request_v1","version":1,"url":"wss://example.test/v1/responses","headers":{"authorization":["********"]},"createFrame":"{\"type\":\"response.create\"}","createFrameEncoding":"utf8","frameSent":true,"connectionReused":false,"handshake":{"status":101,"version":"HTTP/1.1","headers":{"upgrade":["websocket"]}}}"#,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":"resp_ws","error":null,"http":{"status":101,"version":"HTTP/1.1","headers":{}}}"#,
         );
         connection
             .execute(
@@ -9449,6 +9455,30 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() 
         valid_response["http"]["headers"]["x-multi"],
         json!(["a", "b"])
     );
+    let valid_ws = database
+        .llm_request("request-valid-websocket-v1")
+        .expect("valid websocket read")
+        .expect("valid websocket request");
+    let valid_ws_request: serde_json::Value = serde_json::from_str(
+        valid_ws
+            .request_body_json
+            .as_deref()
+            .expect("kept ws request"),
+    )
+    .expect("parse kept ws request");
+    assert_eq!(valid_ws_request["format"], "provider_websocket_request_v1");
+    assert_eq!(valid_ws_request["connectionReused"], false);
+    assert_eq!(valid_ws_request["url"], "wss://example.test/v1/responses");
+    assert_eq!(valid_ws_request["headers"]["authorization"][0], "********");
+    let valid_ws_response: serde_json::Value = serde_json::from_str(
+        valid_ws
+            .response_body_json
+            .as_deref()
+            .expect("kept ws response"),
+    )
+    .expect("parse kept ws response");
+    assert_eq!(valid_ws_response["format"], "provider_final_response_v1");
+    assert_eq!(valid_ws_response["http"]["status"], 101);
     let cleanup_marker: String = Connection::open(database.database_path())
         .expect("open marker database")
         .query_row(

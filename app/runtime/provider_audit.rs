@@ -4,8 +4,8 @@ use std::{
 };
 
 use foco_providers::{
-    ProviderFinalResponseDump, ProviderRequestDumpObserver, ProviderRequestFailure,
-    ProviderWireRequestDump,
+    ProviderAuditRequestDump, ProviderFinalResponseDump, ProviderRequestDumpObserver,
+    ProviderRequestFailure,
 };
 use foco_store::workspace::WorkspaceDatabase;
 use serde::Serialize;
@@ -35,7 +35,7 @@ impl ProviderAuditCapture {
     pub(crate) fn observer(&self) -> Option<ProviderRequestDumpObserver> {
         self.save_details.then(|| {
             let capture = self.clone();
-            Arc::new(move |dump: &ProviderWireRequestDump| {
+            Arc::new(move |dump: &ProviderAuditRequestDump| {
                 if let Err(error) = capture.persist_request_dump(dump) {
                     tracing::warn!(
                         request_id = %capture.request_id,
@@ -59,7 +59,7 @@ impl ProviderAuditCapture {
 
     pub(crate) fn request_json(
         &self,
-        dump: Option<&ProviderWireRequestDump>,
+        dump: Option<&ProviderAuditRequestDump>,
     ) -> Result<Option<String>, ApiError> {
         self.serialize_detail(dump)
     }
@@ -93,7 +93,7 @@ impl ProviderAuditCapture {
         self.response_json(Some(&dump))
     }
 
-    fn persist_request_dump(&self, dump: &ProviderWireRequestDump) -> Result<(), ApiError> {
+    fn persist_request_dump(&self, dump: &ProviderAuditRequestDump) -> Result<(), ApiError> {
         let Some(request_json) = self.request_json(Some(dump))? else {
             return Ok(());
         };

@@ -12388,7 +12388,12 @@ fn parse_audit_detail_value(value: Option<&str>) -> Option<Value> {
         let format = parsed.get("format").and_then(Value::as_str)?;
         let version = parsed.get("version").and_then(Value::as_u64)?;
         match (format, version) {
-            ("provider_request_v1" | "provider_final_response_v1", 1) => Some(parsed),
+            (
+                "provider_request_v1"
+                | "provider_websocket_request_v1"
+                | "provider_final_response_v1",
+                1,
+            ) => Some(parsed),
             // Non-v1 history is not re-emitted; Detail API reports malformed/unavailable instead.
             _ => None,
         }
@@ -12402,7 +12407,10 @@ fn audit_request_detail_status(
 ) -> &'static str {
     match (raw, parsed) {
         (Some(_), Some(Value::Object(value)))
-            if value.get("format").and_then(Value::as_str) == Some("provider_request_v1") =>
+            if matches!(
+                value.get("format").and_then(Value::as_str),
+                Some("provider_request_v1" | "provider_websocket_request_v1")
+            ) =>
         {
             "captured"
         }

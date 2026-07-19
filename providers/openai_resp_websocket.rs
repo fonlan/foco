@@ -22,11 +22,12 @@ use crate::openai_resp_ws_session::{
     continuation_fingerprint, tools_fingerprint_json,
 };
 use crate::{
-    MASKED_AUTHORIZATION_VALUE, NeutralChatStream, PROVIDER_WIRE_REQUEST_DUMP_FORMAT,
-    PROVIDER_WIRE_REQUEST_DUMP_VERSION, ProviderConfigError, ProviderConnectionConfig,
-    ProviderErrorContext, ProviderHttpHeadersDump, ProviderHttpResponseHeadDump,
-    ProviderRequestDumpObserver, ProviderRequestFailure, ProviderWireRequestDump,
-    ProviderWsSessionContext, redact_json_body_credentials, websocket_url_from_responses_http_url,
+    MASKED_AUTHORIZATION_VALUE, NeutralChatStream, PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT,
+    PROVIDER_WEBSOCKET_REQUEST_DUMP_VERSION, ProviderAuditRequestDump, ProviderConfigError,
+    ProviderConnectionConfig, ProviderErrorContext, ProviderHttpHeadersDump,
+    ProviderHttpResponseHeadDump, ProviderRequestDumpObserver, ProviderRequestFailure,
+    ProviderWebSocketHandshakeDump, ProviderWebSocketRequestDump, ProviderWsSessionContext,
+    redact_json_body_credentials, websocket_url_from_responses_http_url,
 };
 
 pub(crate) async fn stream_chat_openai_resp_websocket(
@@ -89,25 +90,59 @@ async fn stream_ephemeral(
         &error_context,
     )
     .await?;
-    let (ws_url, wire_request_dump, create_payload) =
-        prepared_wire(&prepared, capture_details, request_observer.as_ref())?;
-    let (write, read, handshake_status, response_status, response_head) = connect_websocket(
-        &ws_url,
-        &prepared,
-        &error_context,
-        wire_request_dump.as_ref(),
-        capture_details,
-    )
-    .await?;
+    let (ws_url, create_payload) = prepared_wire(&prepared)?;
+    // Pre-send dump for connect-failure diagnostics (frame_sent=false; observer only on failure).
+    let pre_send_dump = (capture_details || request_observer.is_some()).then(|| {
+        ProviderAuditRequestDump::from_websocket(websocket_wire_request_dump(
+            &ws_url,
+            &prepared,
+            &create_payload,
+            false,
+            None,
+            config.api_key.as_deref(),
+            false,
+        ))
+    });
+
+    let (write, read, handshake_status, response_status, response_head, handshake) =
+        match connect_websocket(
+            &ws_url,
+            &prepared,
+            &error_context,
+            pre_send_dump.as_ref(),
+            capture_details,
+            config.api_key.as_deref(),
+        )
+        .await
+        {
+            Ok(parts) => parts,
+            Err(mut error) => {
+                if let Some(dump) = pre_send_dump {
+                    if let Some(observer) = request_observer.as_ref() {
+                        observer(&dump);
+                    }
+                    if capture_details {
+                        error.request_dump = Some(dump);
+                    }
+                }
+                return Err(error);
+            }
+        };
 
     run_create_stream(
         write,
         read,
+        &ws_url,
+        &prepared,
         create_payload,
         model,
         &options,
         error_context,
-        wire_request_dump,
+        false,
+        handshake,
+        config.api_key.as_deref(),
+        capture_details,
+        request_observer.as_ref(),
         response_status,
         response_head,
         handshake_status,
@@ -196,20 +231,32 @@ async fn stream_with_session(
         }
     };
 
-    let (ws_url, wire_request_dump, create_payload) =
-        match prepared_wire(&prepared, capture_details, request_observer.as_ref()) {
-            Ok(parts) => parts,
-            Err(error) => {
-                turn.commit_failure().await;
-                if let Some(conn) = existing_connection {
-                    turn.return_connection(Some(conn), false).await;
-                }
-                turn.finish().await;
-                return Err(error);
+    let (ws_url, create_payload) = match prepared_wire(&prepared) {
+        Ok(parts) => parts,
+        Err(error) => {
+            turn.commit_failure().await;
+            if let Some(conn) = existing_connection {
+                turn.return_connection(Some(conn), false).await;
             }
-        };
+            turn.finish().await;
+            return Err(error);
+        }
+    };
 
-    let (write, read, handshake_status, response_status, response_head, connected_at) =
+    let connection_reused = existing_connection.is_some();
+    let pre_send_dump = (capture_details || request_observer.is_some()).then(|| {
+        ProviderAuditRequestDump::from_websocket(websocket_wire_request_dump(
+            &ws_url,
+            &prepared,
+            &create_payload,
+            connection_reused,
+            None,
+            config.api_key.as_deref(),
+            false,
+        ))
+    });
+
+    let (write, read, handshake_status, response_status, response_head, handshake, connected_at) =
         match existing_connection {
             Some(LiveWsConnection {
                 write,
@@ -229,6 +276,7 @@ async fn stream_with_session(
                     established_status,
                     response_status,
                     response_head,
+                    None,
                     connected_at,
                 )
             }
@@ -237,36 +285,60 @@ async fn stream_with_session(
                     &ws_url,
                     &prepared,
                     &error_context,
-                    wire_request_dump.as_ref(),
+                    pre_send_dump.as_ref(),
                     capture_details,
+                    config.api_key.as_deref(),
                 )
                 .await
                 {
-                    Ok((write, read, handshake_status, response_status, response_head)) => (
+                    Ok((
                         write,
                         read,
                         handshake_status,
                         response_status,
                         response_head,
+                        handshake,
+                    )) => (
+                        write,
+                        read,
+                        handshake_status,
+                        response_status,
+                        response_head,
+                        handshake,
                         std::time::Instant::now(),
                     ),
-                    Err(error) => {
+                    Err(mut error) => {
                         turn.commit_failure().await;
                         turn.finish().await;
+                        if let Some(dump) = pre_send_dump {
+                            if let Some(observer) = request_observer.as_ref() {
+                                observer(&dump);
+                            }
+                            if capture_details {
+                                error.request_dump = Some(dump);
+                            }
+                        }
                         return Err(error);
                     }
                 }
             }
         };
 
+    // Observer is notified only after response.create is successfully written (inside run_create_stream).
     run_create_stream(
         write,
         read,
+        &ws_url,
+        &prepared,
         create_payload,
         model,
         &options,
         error_context,
-        wire_request_dump,
+        connection_reused,
+        handshake,
+        config.api_key.as_deref(),
+        capture_details,
+        request_observer.as_ref(),
         response_status,
         response_head,
         handshake_status,
@@ -321,42 +393,65 @@ async fn prepare_request_async(
 
 fn prepared_wire(
     prepared: &PreparedChatStreamRequest,
-    capture_details: bool,
-    request_observer: Option<&ProviderRequestDumpObserver>,
-) -> Result<(String, Option<ProviderWireRequestDump>, serde_json::Value), ProviderRequestFailure> {
+) -> Result<(String, serde_json::Value), ProviderRequestFailure> {
     let ws_url = websocket_url_from_responses_http_url(&prepared.url).map_err(|error| {
         ProviderRequestFailure {
             error,
             request_dump: None,
         }
     })?;
-
     let create_payload = openai_resp_websocket_create_payload(prepared.payload.clone());
-    let wire_request_dump = if capture_details || request_observer.is_some() {
-        Some(websocket_wire_request_dump(
-            &ws_url,
-            prepared,
-            &create_payload,
-        ))
-    } else {
-        None
-    };
+    Ok((ws_url, create_payload))
+}
 
-    if let Some(dump) = wire_request_dump.as_ref()
-        && let Some(observer) = request_observer
-    {
-        observer(dump);
+fn build_websocket_request_dump(
+    ws_url: &str,
+    prepared: &PreparedChatStreamRequest,
+    create_payload: &serde_json::Value,
+    connection_reused: bool,
+    handshake: Option<ProviderWebSocketHandshakeDump>,
+    api_key: Option<&str>,
+    frame_sent: bool,
+    capture_details: bool,
+    request_observer: Option<&ProviderRequestDumpObserver>,
+    notify: bool,
+) -> Option<ProviderAuditRequestDump> {
+    if !capture_details && request_observer.is_none() {
+        return None;
     }
+    let dump = ProviderAuditRequestDump::from_websocket(websocket_wire_request_dump(
+        ws_url,
+        prepared,
+        create_payload,
+        connection_reused,
+        handshake,
+        api_key,
+        frame_sent,
+    ));
+    if notify {
+        if let Some(observer) = request_observer {
+            observer(&dump);
+        }
+    }
+    // Only keep dump on the stream / failure path when detail capture is enabled.
+    capture_details.then_some(dump)
+}
 
-    Ok((ws_url, wire_request_dump, create_payload))
+/// Extract real HTTP status from a failed WebSocket upgrade (401/429/5xx), if present.
+fn websocket_connect_status_code(error: &tokio_tungstenite::tungstenite::Error) -> Option<u16> {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => Some(response.status().as_u16()),
+        _ => None,
+    }
 }
 
 async fn connect_websocket(
     ws_url: &str,
     prepared: &PreparedChatStreamRequest,
     error_context: &ProviderErrorContext,
-    wire_request_dump: Option<&ProviderWireRequestDump>,
+    wire_request_dump: Option<&ProviderAuditRequestDump>,
     capture_details: bool,
+    api_key: Option<&str>,
 ) -> Result<
     (
         OpenAiRespWsWrite,
@@ -364,6 +459,7 @@ async fn connect_websocket(
         u16,
         Arc<Mutex<Option<u16>>>,
         Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
+        Option<ProviderWebSocketHandshakeDump>,
     ),
     ProviderRequestFailure,
 > {
@@ -377,6 +473,7 @@ async fn connect_websocket(
             request_dump: wire_request_dump.cloned(),
         })?;
 
+    let mut has_authorization = false;
     for (name, value) in prepared.headers.iter() {
         if name.eq_ignore_ascii_case("host")
             || name.eq_ignore_ascii_case("connection")
@@ -385,6 +482,9 @@ async fn connect_websocket(
             || name.eq_ignore_ascii_case("sec-websocket-version")
         {
             continue;
+        }
+        if name.eq_ignore_ascii_case("authorization") {
+            has_authorization = true;
         }
         let header_name: HeaderName = name.parse().map_err(|source| ProviderRequestFailure {
             error: ProviderConfigError::InvalidRequest(format!(
@@ -401,41 +501,65 @@ async fn connect_websocket(
             })?;
         request.headers_mut().insert(header_name, header_value);
     }
+    if !has_authorization && let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
+        let header_value =
+            HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|source| {
+                ProviderRequestFailure {
+                    error: ProviderConfigError::InvalidRequest(format!(
+                        "invalid WebSocket authorization header: {source}"
+                    )),
+                    request_dump: wire_request_dump.cloned(),
+                }
+            })?;
+        request
+            .headers_mut()
+            .insert(HeaderName::from_static("authorization"), header_value);
+    }
 
-    let (ws_stream, response) =
-        connect_async(request)
-            .await
-            .map_err(|source| ProviderRequestFailure {
+    let (ws_stream, response) = match connect_async(request).await {
+        Ok(parts) => parts,
+        Err(source) => {
+            let status_code = websocket_connect_status_code(&source);
+            return Err(ProviderRequestFailure {
                 error: ProviderConfigError::Connection {
                     message: format!("{error_context}: WebSocket connect failed: {source}"),
-                    status_code: None,
+                    status_code,
                 },
                 request_dump: wire_request_dump.cloned(),
-            })?;
+            });
+        }
+    };
 
     let handshake_status = response.status().as_u16();
+    let handshake_headers =
+        response
+            .headers()
+            .iter()
+            .fold(ProviderHttpHeadersDump::new(), |mut map, (name, value)| {
+                let entry = map.entry(name.as_str().to_string()).or_default();
+                if name.as_str().eq_ignore_ascii_case("authorization") {
+                    entry.push(MASKED_AUTHORIZATION_VALUE.to_string());
+                } else {
+                    entry.push(
+                        value
+                            .to_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|_| "[NON_UTF8]".to_string()),
+                    );
+                }
+                map
+            });
+    let handshake = ProviderWebSocketHandshakeDump {
+        status: handshake_status,
+        version: "HTTP/1.1".to_string(),
+        headers: handshake_headers.clone(),
+    };
     let response_status = Arc::new(Mutex::new(Some(handshake_status)));
     let response_head = capture_details.then(|| {
         Arc::new(Mutex::new(Some(ProviderHttpResponseHeadDump {
             status: handshake_status,
             version: "HTTP/1.1".to_string(),
-            headers: response.headers().iter().fold(
-                ProviderHttpHeadersDump::new(),
-                |mut map, (name, value)| {
-                    let entry = map.entry(name.as_str().to_string()).or_default();
-                    if name.as_str().eq_ignore_ascii_case("authorization") {
-                        entry.push(MASKED_AUTHORIZATION_VALUE.to_string());
-                    } else {
-                        entry.push(
-                            value
-                                .to_str()
-                                .map(str::to_string)
-                                .unwrap_or_else(|_| "[NON_UTF8]".to_string()),
-                        );
-                    }
-                    map
-                },
-            ),
+            headers: handshake_headers,
         })))
     });
 
@@ -446,17 +570,24 @@ async fn connect_websocket(
         handshake_status,
         response_status,
         response_head,
+        Some(handshake),
     ))
 }
 
 async fn run_create_stream(
     mut write: OpenAiRespWsWrite,
     read: OpenAiRespWsRead,
+    ws_url: &str,
+    prepared: &PreparedChatStreamRequest,
     create_payload: serde_json::Value,
     model: genai::ModelIden,
     options: &ChatOptions,
     error_context: ProviderErrorContext,
-    wire_request_dump: Option<ProviderWireRequestDump>,
+    connection_reused: bool,
+    handshake: Option<ProviderWebSocketHandshakeDump>,
+    api_key: Option<&str>,
+    capture_details: bool,
+    request_observer: Option<&ProviderRequestDumpObserver>,
     response_status: Arc<Mutex<Option<u16>>>,
     response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
     handshake_status: u16,
@@ -473,7 +604,18 @@ async fn run_create_stream(
             error: ProviderConfigError::InvalidRequest(format!(
                 "failed to serialize response.create: {source}"
             )),
-            request_dump: wire_request_dump.clone(),
+            request_dump: build_websocket_request_dump(
+                ws_url,
+                prepared,
+                &create_payload,
+                connection_reused,
+                handshake.clone(),
+                api_key,
+                false,
+                capture_details,
+                request_observer,
+                false,
+            ),
         })?;
 
     if let Err(source) = write.send(Message::Text(create_text.into())).await {
@@ -482,6 +624,19 @@ async fn run_create_stream(
             turn.return_connection(None, false).await;
             turn.finish().await;
         }
+        // Frame never left the client; dump is diagnostic only (frame_sent=false).
+        let wire_request_dump = build_websocket_request_dump(
+            ws_url,
+            prepared,
+            &create_payload,
+            connection_reused,
+            handshake,
+            api_key,
+            false,
+            capture_details,
+            request_observer,
+            true,
+        );
         // Only report an HTTP status when this turn actually observed a handshake.
         let status_code = response_status.lock().ok().and_then(|slot| *slot);
         return Err(ProviderRequestFailure {
@@ -492,6 +647,20 @@ async fn run_create_stream(
             request_dump: wire_request_dump,
         });
     }
+
+    // Real wire: response.create was written successfully.
+    let wire_request_dump = build_websocket_request_dump(
+        ws_url,
+        prepared,
+        &create_payload,
+        connection_reused,
+        handshake,
+        api_key,
+        true,
+        capture_details,
+        request_observer,
+        true,
+    );
 
     let mut decoder = OpenAIRespEventDecoder::from_chat_options(model, options);
     let stream_error_context = error_context.with_phase("reading provider stream");
@@ -840,8 +1009,12 @@ fn websocket_wire_request_dump(
     ws_url: &str,
     prepared: &PreparedChatStreamRequest,
     create_payload: &serde_json::Value,
-) -> ProviderWireRequestDump {
-    let body = serde_json::to_string(create_payload)
+    connection_reused: bool,
+    handshake: Option<ProviderWebSocketHandshakeDump>,
+    api_key: Option<&str>,
+    frame_sent: bool,
+) -> ProviderWebSocketRequestDump {
+    let create_frame = serde_json::to_string(create_payload)
         .map(|body| redact_json_body_credentials(&body))
         .ok();
 
@@ -854,15 +1027,28 @@ fn websocket_wire_request_dump(
             entry.push(value.clone());
         }
     }
+    // genai prepare may leave Authorization to the HTTP send path; surface the
+    // same credential boundary for WebSocket wire audit (always masked).
+    let has_authorization = headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"));
+    if !has_authorization && api_key.is_some() {
+        headers.insert(
+            "authorization".to_string(),
+            vec![MASKED_AUTHORIZATION_VALUE.to_string()],
+        );
+    }
 
-    let body_encoding = body.as_ref().map(|_| "utf8".to_string());
-    ProviderWireRequestDump {
-        format: PROVIDER_WIRE_REQUEST_DUMP_FORMAT.to_string(),
-        version: PROVIDER_WIRE_REQUEST_DUMP_VERSION,
-        method: "WEBSOCKET".to_string(),
+    let create_frame_encoding = create_frame.as_ref().map(|_| "utf8".to_string());
+    ProviderWebSocketRequestDump {
+        format: PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT.to_string(),
+        version: PROVIDER_WEBSOCKET_REQUEST_DUMP_VERSION,
         url: ws_url.to_string(),
         headers,
-        body,
-        body_encoding,
+        create_frame,
+        create_frame_encoding,
+        frame_sent,
+        connection_reused,
+        handshake,
     }
 }

@@ -38,7 +38,9 @@ import type {
   AiStatsFilterState,
   AppLanguageId,
   JsonValue,
+  ProviderAuditRequestDump,
   ProviderFinalResponseDump,
+  ProviderWebSocketRequestDump,
   ProviderWireRequestDump,
   SettingsResponse,
   Translate,
@@ -1072,10 +1074,10 @@ function ProviderRequestDetail({
   copied: boolean;
   detailStatus: NonNullable<AiRequestAuditDetail["requestDetailStatus"]>;
   onCopy: (text: string) => void;
-  requestBody: JsonValue | ProviderWireRequestDump | null;
+  requestBody: JsonValue | ProviderAuditRequestDump | null;
 }) {
   const { t } = useI18n();
-  if (!isProviderWireRequestDump(requestBody)) {
+  if (!isProviderAuditRequestDump(requestBody)) {
     return (
       <AuditDetailCard
         notice={
@@ -1088,6 +1090,56 @@ function ProviderRequestDetail({
         noticeTone={requestBody === null ? "neutral" : "warning"}
         title={t("Request body")}
       />
+    );
+  }
+
+  if (isProviderWebSocketRequestDump(requestBody)) {
+    const frameValue = parseProviderBody(requestBody.createFrame);
+    const frameSent = requestBody.frameSent !== false;
+    return (
+      <AuditDetailCard title={t("Actual provider request")}>
+        <div className="grid gap-3 sm:grid-cols-2">
+          <AuditMeta label={t("Transport")} value="WebSocket" />
+          <AuditMeta label={t("Provider URL")} value={requestBody.url} />
+          <AuditMeta
+            label={t("Connection reused")}
+            value={requestBody.connectionReused ? t("Yes") : t("No")}
+          />
+          <AuditMeta
+            label={t("Frame sent")}
+            value={frameSent ? t("Yes") : t("No (pre-send)")}
+          />
+          {requestBody.handshake ? (
+            <AuditMeta
+              label={t("Handshake status")}
+              value={String(requestBody.handshake.status)}
+            />
+          ) : null}
+        </div>
+        <AuditJsonBlock
+          copied={false}
+          label={t("Request headers")}
+          onCopy={() => onCopy(auditJsonText(requestBody.headers))}
+          size="headers"
+          value={requestBody.headers}
+        />
+        {requestBody.handshake ? (
+          <AuditJsonBlock
+            copied={false}
+            label={t("Handshake headers")}
+            onCopy={() => onCopy(auditJsonText(requestBody.handshake?.headers ?? null))}
+            size="headers"
+            value={requestBody.handshake.headers}
+          />
+        ) : null}
+        <AuditJsonBlock
+          copied={copied}
+          label={t("response.create frame")}
+          onCopy={() => onCopy(requestBody.createFrame ?? "")}
+          size="body"
+          value={frameValue}
+        />
+      </AuditDetailCard>
     );
   }
 
@@ -1234,9 +1286,21 @@ function AuditDetailCard({
 }
 
 function isProviderWireRequestDump(
-  value: JsonValue | ProviderWireRequestDump | null,
+  value: JsonValue | ProviderAuditRequestDump | null,
 ): value is ProviderWireRequestDump {
   return isJsonObject(value) && value.format === "provider_request_v1";
+}
+
+function isProviderWebSocketRequestDump(
+  value: JsonValue | ProviderAuditRequestDump | null,
+): value is ProviderWebSocketRequestDump {
+  return isJsonObject(value) && value.format === "provider_websocket_request_v1";
+}
+
+function isProviderAuditRequestDump(
+  value: JsonValue | ProviderAuditRequestDump | null,
+): value is ProviderAuditRequestDump {
+  return isProviderWireRequestDump(value) || isProviderWebSocketRequestDump(value);
 }
 
 function isProviderFinalResponseDump(
