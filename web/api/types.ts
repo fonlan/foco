@@ -702,6 +702,9 @@ export type ChatStreamEvent =
     chatId: string;
     userMessageId: string;
     assistantMessageId: string;
+    // Backend active-run registry id. This stays stable across provider retries and tool follow-ups.
+    runId?: string;
+    // Legacy logical-run id for local streams. Never use per-attempt ids from streamAttemptStart.
     llmRequestId?: string;
     memoriesUsed: ChatMemoryUsedSummary[];
   }

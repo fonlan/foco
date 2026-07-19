@@ -10784,7 +10784,10 @@ export function App() {
             streamEvent.memoriesUsed,
           );
           setChatRunning(currentRunningChatKey, true);
-          activeRunId = streamEvent.llmRequestId ?? activeRunId;
+          // `runId` is the stable active-run identity. `llmRequestId` remains
+          // a legacy fallback for local streams that predate `runId`; provider
+          // attempts never update this value after the start event.
+          activeRunId = activeRunIdFromStartEvent(streamEvent) ?? activeRunId;
           setActiveRunInfoForChatKey(currentRunningChatKey, {
             acceptingGuidance: activeRunId !== null,
             chatId: streamEvent.chatId,
@@ -16224,7 +16227,16 @@ function readSseFrames(
   return remaining;
 }
 
-function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
+export function activeRunIdFromStartEvent(event: {
+  runId?: string;
+  llmRequestId?: string;
+}): string | null {
+  // Remote `runId` remains stable for the whole chat run. The legacy local
+  // start field is a fallback only; individual provider attempts never reach here.
+  return event.runId ?? event.llmRequestId ?? null;
+}
+
+export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
   if (!isObjectRecord(value) || typeof value.type !== "string") {
     return null;
   }
@@ -16241,6 +16253,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "assistantMessageId",
       "assistant_message_id",
     );
+    const runId = optionalStringField(value, "runId", "run_id");
     const llmRequestId = optionalStringField(
       value,
       "llmRequestId",
@@ -16254,6 +16267,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       !chatId ||
       !userMessageId ||
       !assistantMessageId ||
+      runId === null ||
       llmRequestId === null ||
       memoriesUsed === false
     ) {
@@ -16265,6 +16279,7 @@ function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       chatId,
       userMessageId,
       assistantMessageId,
+      runId,
       llmRequestId,
       memoriesUsed,
     };

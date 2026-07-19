@@ -1,7 +1,24 @@
 import { describe, expect, it } from "vitest";
 
-import { chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
+
+describe("remote start run identity", () => {
+  it("prefers the stable remote runId over a provider request id", () => {
+    const event = parseChatStreamEvent({
+      assistantMessageId: "assistant-1",
+      chatId: "chat-1",
+      llmRequestId: "broker-request-2",
+      memoriesUsed: [],
+      runId: "remote-run-1",
+      type: "start",
+      userMessageId: "user-1",
+    });
+
+    expect(event).toMatchObject({ type: "start", runId: "remote-run-1" });
+    expect(activeRunIdFromStartEvent(event ?? {})).toBe("remote-run-1");
+  });
+});
 
 function message(id: string): ShellMessage {
   return {

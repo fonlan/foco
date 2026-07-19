@@ -3069,15 +3069,26 @@ fn remote_sidecar_cancel_broker_request_id(state: &RemoteSidecarState, broker_re
     let _ = state.broker_tx.send(cancel);
 }
 
+/// Remove a run from the registry and heartbeat before terminal SSE is emitted.
+/// The caller keeps the returned stream alive long enough to deliver its terminal
+/// events, then marks it finished so existing subscribers can complete normally.
+fn remote_sidecar_deactivate_active_run(
+    state: &RemoteSidecarState,
+    run_id: &str,
+) -> Option<RemoteActiveRunRegistration> {
+    let registration = remote_sidecar_remove_active_run_stream(state, run_id);
+    remote_sidecar_remove_active_run(state, run_id);
+    registration
+}
+
 /// Normal completion/error path owned by the background runner after durable
-/// assistant/metrics/run_events/queuedRun writes. Marks finished and removes the
-/// active run once; does not send broker cancel (turn already terminal).
+/// assistant/metrics/run_events/queuedRun writes. This remains the terminal
+/// fallback when no terminal SSE needs to be delivered after deactivation.
 fn remote_sidecar_finish_active_run(state: &RemoteSidecarState, run_id: &str) {
-    if let Some(registration) = remote_sidecar_remove_active_run_stream(state, run_id) {
+    if let Some(registration) = remote_sidecar_deactivate_active_run(state, run_id) {
         registration.run_stream.mark_finished();
         let _ = registration.run_stream.try_commit_cleanup();
     }
-    remote_sidecar_remove_active_run(state, run_id);
 }
 
 /// Explicit cancel, edit/delete invalidation, or abnormal runner abort.
@@ -3089,12 +3100,31 @@ fn remote_sidecar_cancel_active_run(
     emit_events: bool,
     remove_pending: bool,
 ) {
-    let run_stream = remote_sidecar_remove_active_run_stream(state, run_id)
-        .map(|registration| registration.run_stream);
-    let Some(run_stream) = run_stream else {
-        remote_sidecar_remove_active_run(state, run_id);
+    let Some(registration) = remote_sidecar_deactivate_active_run(state, run_id) else {
         return;
     };
+    let run_stream = registration.run_stream;
+
+    // A terminal cancel must not leave durable queuedRun visible after the
+    // heartbeat stops advertising the run. The owner tuple prevents a late
+    // cancellation from clearing a newer run for the same chat.
+    if let Ok(mut database) =
+        WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))
+    {
+        if let Err(error) = database.clear_remote_queued_run_if_owned(
+            &run_stream.chat_id,
+            &registration.queued_user_message_id,
+            &registration.assistant_message_id,
+            run_id,
+        ) {
+            tracing::warn!(
+                error = %error,
+                chat_id = %run_stream.chat_id,
+                run_id,
+                "failed to clear owned remote queuedRun before cancellation terminal event"
+            );
+        }
+    }
 
     // Wake the background runner even if another path already cleaned up.
     run_stream.request_cancel();
@@ -3113,7 +3143,7 @@ fn remote_sidecar_cancel_active_run(
     }
 
     if emit_events {
-        // Safe to record after map removal: clone still holds the stream.
+        // Safe to record after registry removal: this clone remains subscribed.
         let mut sequence = run_stream.last_sequence();
         sequence += 1;
         run_stream.record(
@@ -3127,7 +3157,6 @@ fn remote_sidecar_cancel_active_run(
         run_stream.record(sequence, json!({ "type": "streamEnd" }));
     }
     run_stream.mark_finished();
-    remote_sidecar_remove_active_run(state, run_id);
 }
 
 struct RemoteRunCleanupGuard {
@@ -11758,6 +11787,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "failed",
                     json!({ "error": { "message": message } }),
                 );
+                let _ = with_sidecar_workspace_database(state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        chat_id,
+                        queued_user_message_id,
+                        assistant_message_id,
+                        run_id,
+                    )
+                });
+                let _ = remote_sidecar_deactivate_active_run(state, run_id);
                 *sequence += 1;
                 run_stream.record(
                     *sequence,
@@ -11768,6 +11806,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                run_stream.mark_finished();
                 return Err(());
             }
             Err(_) => {
@@ -11794,6 +11833,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                     "failed",
                     json!({ "error": { "message": message } }),
                 );
+                let _ = with_sidecar_workspace_database(state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        chat_id,
+                        queued_user_message_id,
+                        assistant_message_id,
+                        run_id,
+                    )
+                });
+                let _ = remote_sidecar_deactivate_active_run(state, run_id);
                 *sequence += 1;
                 run_stream.record(
                     *sequence,
@@ -11804,6 +11852,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                run_stream.mark_finished();
                 return Err(());
             }
         };
@@ -12138,10 +12187,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                         payload_json: &completion_payload.to_string(),
                     })
                 });
+                // The durable assistant, audit, run event, and queuedRun are now final.
+                // Remove the externally visible run before terminal SSE so a reload or
+                // heartbeat cannot reattach to a completed remote conversation.
+                let _ = remote_sidecar_deactivate_active_run(state, run_id);
                 *sequence += 1;
                 run_stream.record(*sequence, completion_payload);
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                run_stream.mark_finished();
                 return Ok(RemoteSidecarBrokerLlmTurnOutcome::Completed {
                     tool_calls: None,
                     resolved_provider_id: response_provider_id,
@@ -12178,6 +12232,15 @@ async fn remote_sidecar_run_broker_llm_turn(
                     audit_outcome.final_state,
                     Value::Null,
                 );
+                let _ = with_sidecar_workspace_database(state, |database| {
+                    database.clear_remote_queued_run_if_owned(
+                        chat_id,
+                        queued_user_message_id,
+                        assistant_message_id,
+                        run_id,
+                    )
+                });
+                let _ = remote_sidecar_deactivate_active_run(state, run_id);
                 *sequence += 1;
                 run_stream.record(
                     *sequence,
@@ -12188,6 +12251,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
                 *sequence += 1;
                 run_stream.record(*sequence, json!({ "type": "streamEnd" }));
+                run_stream.mark_finished();
                 return Err(());
             }
             _ => {}
@@ -13227,6 +13291,22 @@ fn remote_project_spec_message(
     ))
 }
 
+fn remote_chat_start_event(
+    chat_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    run_id: &str,
+) -> Value {
+    json!({
+        "type": "start",
+        "chatId": chat_id,
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "runId": run_id,
+        "memoriesUsed": [],
+    })
+}
+
 fn remote_chat_completion_event(
     chat_id: &str,
     assistant_message_id: &str,
@@ -13530,13 +13610,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     remote_sidecar_record_run_event(
         &run_stream,
         sequence,
-        json!({
-            "type": "start",
-            "chatId": chat_id,
-            "userMessageId": queued_user_message_id,
-            "assistantMessageId": assistant_message_id,
-            "memoriesUsed": [],
-        }),
+        remote_chat_start_event(
+            &chat_id,
+            &queued_user_message_id,
+            &assistant_message_id,
+            &run_id,
+        ),
     );
     sequence += 1;
     remote_sidecar_record_run_event(
@@ -23738,12 +23817,17 @@ mod tests {
         let run_stream =
             remote_sidecar_active_run_stream(&state, &run_id).expect("run stream still active");
         let replay = run_stream.snapshot_after(-1);
+        let start_event = replay
+            .iter()
+            .find(|(_, event)| event.get("type").and_then(Value::as_str) == Some("start"))
+            .map(|(_, event)| event)
+            .expect("background runner should record a start event");
+        assert_eq!(start_event["runId"], run_id);
         assert!(
             replay.iter().any(|(_, event)| {
-                event.get("type").and_then(Value::as_str) == Some("start")
-                    || event.get("type").and_then(Value::as_str) == Some("connecting")
+                event.get("type").and_then(Value::as_str) == Some("connecting")
             }),
-            "background runner should have recorded start/connecting events"
+            "background runner should record a connecting event"
         );
 
         // Shared reconnect path must accept the still-active run id.
@@ -25027,6 +25111,51 @@ mod tests {
 
         remote_sidecar_clear_chat_run_streams(&state, "chat-1");
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn remote_chat_start_event_uses_the_stable_remote_run_id() {
+        let event = remote_chat_start_event(
+            "chat-1",
+            "user-1",
+            "assistant-1",
+            "remote-run-stable",
+        );
+
+        assert_eq!(event["runId"], "remote-run-stable");
+    }
+
+    #[test]
+    fn remote_run_deactivation_hides_the_run_before_its_terminal_stream_events() {
+        let (state, _) = test_sidecar_state("/tmp/workspace".to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+        remote_sidecar_set_active_run(
+            &state,
+            RemoteActiveRunSummary {
+                run_id: "remote-run-1".to_string(),
+                chat_id: "chat-1".to_string(),
+                last_sequence: Some(0),
+                accepting_guidance: true,
+                broker_status: "connected".to_string(),
+                updated_at: "2026-07-19T00:00:00Z".to_string(),
+            },
+        );
+
+        let registration = remote_sidecar_deactivate_active_run(&state, "remote-run-1")
+            .expect("active registration");
+        assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
+        assert_eq!(state.active_run_count.load(Ordering::Relaxed), 0);
+        assert!(!run_stream.is_finished());
+
+        registration
+            .run_stream
+            .record(1, json!({ "type": "streamEnd" }));
+        registration.run_stream.mark_finished();
+        assert!(run_stream.is_finished());
     }
 
     #[tokio::test]
