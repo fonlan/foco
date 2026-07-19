@@ -136,7 +136,14 @@ function configureRemoteChat() {
 }
 
 describe("app-chat-stream verification surfaces", () => {
-  beforeEach(resetAppTestEnvironment);
+  beforeEach(() => {
+    resetAppTestEnvironment();
+    delete (
+      globalThis as {
+        __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+      }
+    ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
+  });
 
   it("edits a persisted user message, confirms truncation, and starts one replacement stream", async () => {
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
@@ -2465,6 +2472,389 @@ describe("app-chat-stream verification surfaces", () => {
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  // Regression: bubble-visible stream events must paint on the active tab without a
+  // tab switch (cache write alone is not enough when setMessages was deferred).
+  // Hold deferStreamAuxiliaryUpdate so a mistaken re-wrap of bubble updates via that
+  // helper never flushes — sync getByText must still pass. Does not intercept a bare
+  // startTransition(() => setMessagesForChatKey(...)) call outside the helper.
+  function installHeldStreamAuxiliaryUpdateScheduler() {
+    const pending: Array<() => void> = [];
+    const globalWithHook = globalThis as {
+      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+    };
+    globalWithHook.__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__ = (update) => {
+      pending.push(update);
+    };
+    return {
+      flush() {
+        const queued = pending.splice(0, pending.length);
+        for (const update of queued) {
+          update();
+        }
+      },
+      uninstall() {
+        delete globalWithHook.__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
+      },
+    };
+  }
+
+  it("renders toolCall and toolResult on the active tab without switching tabs", async () => {
+    const auxiliaryScheduler = installHeldStreamAuxiliaryUpdateScheduler();
+    try {
+      renderApp();
+      await userEvent.click(await screen.findByText("Tool run"));
+      await userEvent.type(
+        await screen.findByPlaceholderText(defaultComposerPlaceholder),
+        "inspect files",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+      const assistantMessageId = "message-assistant-stream";
+      // Interleave high-frequency deltas with a sparse bubble event so deferred
+      // message updates (startTransition) would lag behind the 32ms text flush path.
+      await act(async () => {
+        for (let index = 0; index < 12; index += 1) {
+          enqueueChatStreamEvent({
+            assistantMessageId,
+            delta: `chunk-${index} `,
+            type: "textDelta",
+          });
+          enqueueChatStreamEvent({
+            assistantMessageId,
+            delta: `think-${index} `,
+            type: "reasoningDelta",
+          });
+        }
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          toolCall: {
+            id: "call-live-read",
+            input: { path: "README.md" },
+            isError: false,
+            name: "read_file",
+            output: null,
+            status: "running",
+          },
+          type: "toolCall",
+        });
+      });
+
+      // Sync DOM assert while auxiliary updates stay held — no tab switch / reload.
+      const toolLabel = screen.getByText("Read");
+      const assistantRow = toolLabel.closest(".message-row") as HTMLElement | null;
+      expect(assistantRow).not.toBeNull();
+      expect(within(assistantRow as HTMLElement).getByText("running")).toBeInTheDocument();
+
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          isError: false,
+          output: { content: "# README" },
+          toolCallId: "call-live-read",
+          type: "toolResult",
+        });
+      });
+
+      expect(
+        within(assistantRow as HTMLElement).queryByText("running"),
+      ).not.toBeInTheDocument();
+      expect(within(assistantRow as HTMLElement).getByText("completed")).toBeInTheDocument();
+      expect(screen.getAllByText("Read")).toHaveLength(1);
+    } finally {
+      await act(async () => {
+        auxiliaryScheduler.flush();
+      });
+      auxiliaryScheduler.uninstall();
+      await act(async () => {
+        appTestState.activeChatStreamController?.close();
+      });
+    }
+  });
+
+  it("renders contextCompression on the active tab during continuous text deltas", async () => {
+    const auxiliaryScheduler = installHeldStreamAuxiliaryUpdateScheduler();
+    try {
+      renderApp();
+      await userEvent.click(await screen.findByText("Tool run"));
+      await userEvent.type(
+        await screen.findByPlaceholderText(defaultComposerPlaceholder),
+        "keep streaming",
+      );
+      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+      await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+      const assistantMessageId = "message-assistant-stream";
+      await act(async () => {
+        for (let index = 0; index < 8; index += 1) {
+          enqueueChatStreamEvent({
+            assistantMessageId,
+            delta: `delta-${index} `,
+            type: "textDelta",
+          });
+        }
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          kind: "llm",
+          status: "start",
+          type: "contextCompression",
+          detail: {
+            kind: "llm",
+            originalTokenCount: 9000,
+            providerId: "openai",
+            modelId: "gpt-test",
+            startedAt: "2026-07-19T12:00:00Z",
+            status: "start",
+          },
+        });
+      });
+
+      expect(screen.getByText("Context compression")).toBeInTheDocument();
+      expect(screen.getByText("Compressing")).toBeInTheDocument();
+      expect(screen.getByText("Context compression in progress")).toBeInTheDocument();
+      expect(screen.getAllByText("Context compression")).toHaveLength(1);
+
+      await act(async () => {
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          kind: "llm",
+          snapshotId: "live-compress-1",
+          status: "completed",
+          type: "contextCompression",
+          detail: {
+            kind: "llm",
+            snapshotId: "live-compress-1",
+            originalTokenCount: 9000,
+            summaryTokenCount: 1200,
+            providerId: "openai",
+            modelId: "gpt-test",
+            startedAt: "2026-07-19T12:00:00Z",
+            completedAt: "2026-07-19T12:00:02Z",
+            status: "completed",
+          },
+        });
+      });
+
+      expect(screen.getByText("Compressed")).toBeInTheDocument();
+      expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    } finally {
+      await act(async () => {
+        auxiliaryScheduler.flush();
+      });
+      auxiliaryScheduler.uninstall();
+      await act(async () => {
+        appTestState.activeChatStreamController?.close();
+      });
+    }
+  });
+
+  it("renders tool and compression events on GET active-run reattach without switching tabs", async () => {
+    const auxiliaryScheduler = installHeldStreamAuxiliaryUpdateScheduler();
+    try {
+      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [],
+                reasoning: null,
+                status: "streaming",
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        return mockFetch(input, init);
+      });
+      vi.stubGlobal("fetch", fetchMock);
+      window.history.replaceState(null, "", "/workspace-1/chat-1");
+      renderApp();
+
+      await waitFor(() => {
+        expect(
+          fetchMock.mock.calls.some(
+            ([url]) =>
+              typeof url === "string" &&
+              url ===
+                "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=0",
+          ),
+        ).toBe(true);
+      });
+      await waitFor(() =>
+        expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      );
+
+      const assistantMessageId = "message-assistant-stream";
+      await act(async () => {
+        for (let index = 0; index < 6; index += 1) {
+          enqueueChatStreamEventForRun("request-stream", {
+            assistantMessageId,
+            delta: `reattach-${index} `,
+            type: "textDelta",
+          });
+        }
+        enqueueChatStreamEventForRun("request-stream", {
+          assistantMessageId,
+          toolCall: {
+            id: "call-reattach-read",
+            input: { path: "src/main.rs" },
+            isError: false,
+            name: "read_file",
+            output: null,
+            status: "running",
+          },
+          type: "toolCall",
+        });
+        enqueueChatStreamEventForRun("request-stream", {
+          assistantMessageId,
+          kind: "rule",
+          status: "start",
+          type: "contextCompression",
+          detail: {
+            kind: "rule",
+            originalTokenCount: 1500,
+            providerId: "openai",
+            modelId: "gpt-test",
+            startedAt: "2026-07-19T13:00:00Z",
+            status: "start",
+          },
+        });
+      });
+
+      expect(screen.getByText("Read")).toBeInTheDocument();
+      const reattachToolLabel = screen.getByText("Read");
+      const reattachAssistantRow = reattachToolLabel.closest(
+        ".message-row",
+      ) as HTMLElement | null;
+      expect(reattachAssistantRow).not.toBeNull();
+      expect(
+        within(reattachAssistantRow as HTMLElement).getByText("running"),
+      ).toBeInTheDocument();
+      expect(screen.getByText("Context compression")).toBeInTheDocument();
+      expect(screen.getByText("Compressing")).toBeInTheDocument();
+
+      await act(async () => {
+        enqueueChatStreamEventForRun("request-stream", {
+          assistantMessageId,
+          isError: false,
+          output: { content: "fn main() {}" },
+          toolCallId: "call-reattach-read",
+          type: "toolResult",
+        });
+      });
+
+      expect(
+        within(reattachAssistantRow as HTMLElement).queryByText("running"),
+      ).not.toBeInTheDocument();
+      expect(
+        within(reattachAssistantRow as HTMLElement).getByText("completed"),
+      ).toBeInTheDocument();
+    } finally {
+      await act(async () => {
+        auxiliaryScheduler.flush();
+      });
+      auxiliaryScheduler.uninstall();
+      await act(async () => {
+        appTestState.chatStreamControllers.get("request-stream")?.close();
+      });
+    }
+  });
+
+  it("keeps background chat bubble events out of the active tab until switched", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "background work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+    );
+
+    await userEvent.click(await screen.findByText("Second chat"));
+    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-background-read",
+          input: { path: "hidden.md" },
+          isError: false,
+          name: "read_file",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: { content: "secret" },
+        toolCallId: "call-background-read",
+        type: "toolResult",
+      });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          kind: "llm",
+          originalTokenCount: 2000,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-19T14:00:00Z",
+          status: "start",
+        },
+      });
+    });
+
+    // Background stream updates cache only — active tab stays on Second chat.
+    expect(screen.getByText("Second answer.")).toBeInTheDocument();
+    expect(screen.queryByText("Read")).not.toBeInTheDocument();
+    expect(screen.queryByText("Context compression")).not.toBeInTheDocument();
+
+    const chatTabList = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(within(chatTabList).getByText("Tool run"));
+
+    const backgroundToolLabel = await screen.findByText("Read");
+    const backgroundAssistantRow = backgroundToolLabel.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(backgroundAssistantRow).not.toBeNull();
+    expect(
+      within(backgroundAssistantRow as HTMLElement).getByText("completed"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Context compression")).toBeInTheDocument();
+    expect(screen.getAllByText("Read")).toHaveLength(1);
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    expect(screen.queryByText("Second answer.")).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
     });
   });
 

@@ -1179,6 +1179,15 @@ function gitTargetRequestBody<T extends Record<string, unknown>>(
 // already updated, so tool/context/memory parts only appear after a tab switch.
 // Bubble-visible stream events must call setMessagesForChatKey at normal priority.
 function deferStreamAuxiliaryUpdate(update: () => void) {
+  const testScheduler = (
+    globalThis as {
+      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+    }
+  ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
+  if (typeof testScheduler === "function") {
+    testScheduler(update);
+    return;
+  }
   // ponytail: transition is enough for sparse usage/stats; add a real queue only
   // if profiler shows auxiliary panel storms.
   startTransition(update);
