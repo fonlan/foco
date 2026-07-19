@@ -1168,6 +1168,7 @@ export const aiStatistics = {
       statusCode: 200,
       thinkingLevel: "high",
       totalLatencyMs: 2000,
+      transport: "http",
       workspaceId: "workspace-1",
       workspaceName: "Default",
     },

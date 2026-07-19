@@ -25,17 +25,17 @@ use foco_store::{
     },
     workspace::{
         AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, LlmRequestAuditFilters,
-        LlmRequestRecord, LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
-        MessageMetadataMutation, NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry,
-        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-        NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-        NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
-        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
-        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
-        PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
+        LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRollupFilters,
+        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
+        NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry, NewAgentContextSnapshot,
+        NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
+        NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
+        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
+        NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
+        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch,
+        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
         RegisterAgentTaskWaitDependencies, RemotePreStreamFailureClosureOutcome,
         RemoteQueuedRunClaimOutcome, RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage,
         ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
@@ -11445,6 +11445,9 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     assert_eq!(filtered_rows[0].id, "request-1");
     assert_eq!(filtered_rows[0].reasoning_tokens, Some(3));
     assert_eq!(filtered_rows[0].cache_ratio, Some(0.4));
+    assert_eq!(filtered_rows[0].transport, LlmRequestTransport::Http);
+    assert_eq!(all_rows[0].transport, LlmRequestTransport::Unknown);
+    assert_eq!(all_rows[1].transport, LlmRequestTransport::Http);
     assert_eq!(
         database
             .llm_request_audit_count(LlmRequestAuditFilters {
@@ -11464,6 +11467,216 @@ fn audits_mocked_llm_request_response_and_stream_events() {
             })
             .expect("filtered audit count"),
         1
+    );
+}
+
+#[test]
+fn llm_request_audit_rows_derive_transport_from_request_body_wire() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    // Insertable wire (write whitelist) + expected transport.
+    let insertable = [
+        (
+            "transport-http",
+            Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            ),
+            LlmRequestTransport::Http,
+        ),
+        (
+            "transport-ws-format",
+            Some(
+                r#"{"format":"provider_websocket_request_v1","version":1,"url":"wss://example.test/v1/responses","headers":{},"createFrame":"{}","frameSent":true,"connectionReused":false}"#,
+            ),
+            LlmRequestTransport::Websocket,
+        ),
+        (
+            "transport-ws-method",
+            Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"WEBSOCKET","url":"wss://example.test","headers":{},"body":null}"#,
+            ),
+            LlmRequestTransport::Websocket,
+        ),
+        (
+            "transport-ws-method-case",
+            Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"websocket","url":"wss://example.test","headers":{},"body":null}"#,
+            ),
+            LlmRequestTransport::Websocket,
+        ),
+        ("transport-null", None, LlmRequestTransport::Unknown),
+    ];
+
+    // Historical / non-whitelist bodies planted after insert (NULL detail first).
+    let planted = [
+        ("transport-empty", "   ", LlmRequestTransport::Unknown),
+        (
+            "transport-invalid-json",
+            "{not-json",
+            LlmRequestTransport::Unknown,
+        ),
+        (
+            "transport-unsupported",
+            r#"{"format":"legacy_text_v1","version":1}"#,
+            LlmRequestTransport::Unknown,
+        ),
+        (
+            "transport-wrong-version",
+            r#"{"format":"provider_request_v1","version":2,"method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            LlmRequestTransport::Unknown,
+        ),
+        // SQLite coerces JSON true/1.0 to numeric 1; list+detail must still be unknown.
+        (
+            "transport-version-bool",
+            r#"{"format":"provider_request_v1","version":true,"method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            LlmRequestTransport::Unknown,
+        ),
+        (
+            "transport-version-real",
+            r#"{"format":"provider_request_v1","version":1.0,"method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            LlmRequestTransport::Unknown,
+        ),
+        (
+            "transport-version-exp",
+            r#"{"format":"provider_websocket_request_v1","version":1e0,"url":"wss://example.test","headers":{},"createFrame":"{}","frameSent":true,"connectionReused":false}"#,
+            LlmRequestTransport::Unknown,
+        ),
+        (
+            "transport-version-string",
+            r#"{"format":"provider_request_v1","version":"1","method":"POST","url":"https://example.test","headers":{},"body":null}"#,
+            LlmRequestTransport::Unknown,
+        ),
+    ];
+
+    let mut index = 0usize;
+    for (id, body, expected) in &insertable {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                // Provider kind must not influence transport classification.
+                provider_id: "openai-responses-websocket",
+                model_id: "gpt-test",
+                thinking_level: None,
+                request_started_at: &format!("2026-07-19T10:00:{index:02}.000Z"),
+                first_token_at: None,
+                completed_at: Some(&format!("2026-07-19T10:00:{index:02}.100Z")),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: *body,
+                response_body_json: None,
+            })
+            .unwrap_or_else(|error| panic!("insert {id}: {error}"));
+        assert_eq!(
+            LlmRequestTransport::from_request_body_json(*body),
+            *expected,
+            "rust helper for {id}"
+        );
+        index += 1;
+    }
+
+    for (id, body, expected) in &planted {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "chat completion",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "openai-responses-websocket",
+                model_id: "gpt-test",
+                thinking_level: None,
+                request_started_at: &format!("2026-07-19T10:00:{index:02}.000Z"),
+                first_token_at: None,
+                completed_at: Some(&format!("2026-07-19T10:00:{index:02}.100Z")),
+                input_tokens: Some(1),
+                output_tokens: Some(1),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state: "succeeded",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .unwrap_or_else(|error| panic!("insert shell {id}: {error}"));
+        assert_eq!(
+            LlmRequestTransport::from_request_body_json(Some(body)),
+            *expected,
+            "rust helper for planted {id}"
+        );
+        index += 1;
+    }
+
+    {
+        let connection = Connection::open(database.database_path()).expect("open db");
+        for (id, body, _) in &planted {
+            connection
+                .execute(
+                    "UPDATE llm_requests SET request_body_json = ?2 WHERE id = ?1",
+                    params![id, body],
+                )
+                .unwrap_or_else(|error| panic!("plant {id}: {error}"));
+        }
+    }
+
+    let rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            limit: Some(100),
+            offset: Some(0),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("audit rows");
+    let by_id: std::collections::HashMap<_, _> =
+        rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+
+    for (id, _body, expected) in &insertable {
+        let row = by_id.get(*id).unwrap_or_else(|| panic!("missing row {id}"));
+        assert_eq!(row.transport, *expected, "sql derived transport for {id}");
+        assert_eq!(row.provider_id, "openai-responses-websocket");
+    }
+    for (id, _body, expected) in &planted {
+        let row = by_id.get(*id).unwrap_or_else(|| panic!("missing row {id}"));
+        assert_eq!(row.transport, *expected, "sql derived transport for {id}");
+    }
+
+    let rows_sql = llm_request_audit_rows_sql_for_tests(LlmRequestAuditFilters::default());
+    assert!(
+        rows_sql.contains("provider_websocket_request_v1"),
+        "list SQL should classify websocket wire format"
+    );
+    assert!(
+        rows_sql.contains("AS transport"),
+        "list SQL should expose derived transport column"
+    );
+    assert!(
+        rows_sql.contains("json_type(request_body_json, '$.version') = 'integer'"),
+        "list SQL must require integer JSON version so true/1.0 stay unknown"
+    );
+    // Derived CASE may reference request_body_json; the SELECT list must not project it.
+    assert!(
+        !rows_sql.contains("request_body_json AS") && !rows_sql.contains(", request_body_json"),
+        "list SQL must not project request_body_json into the result set"
     );
 }
 

@@ -1098,6 +1098,61 @@ pub struct LlmRequestUsageRollupFilters<'a> {
     pub bucket_before: Option<&'a str>,
 }
 
+/// Wire-derived LLM transport for a single `llm_requests` audit row.
+///
+/// Derived only from versioned `request_body_json` (never from current Provider config).
+/// `http` = ordinary `provider_request_v1`; `websocket` = `provider_websocket_request_v1`
+/// or compatible `provider_request_v1` with `method=WEBSOCKET`; anything else is `unknown`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LlmRequestTransport {
+    Http,
+    Websocket,
+    #[default]
+    Unknown,
+}
+
+impl LlmRequestTransport {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Websocket => "websocket",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn parse(value: &str) -> Self {
+        match value {
+            "http" => Self::Http,
+            "websocket" => Self::Websocket,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Classify transport from a stored versioned request dump (same rules as SQL CASE).
+    pub fn from_request_body_json(raw: Option<&str>) -> Self {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Self::Unknown;
+        };
+        let Ok(parsed) = serde_json::from_str::<Value>(raw) else {
+            return Self::Unknown;
+        };
+        let format = parsed.get("format").and_then(Value::as_str);
+        let version = parsed.get("version").and_then(Value::as_u64);
+        match (format, version) {
+            (Some("provider_websocket_request_v1"), Some(1)) => Self::Websocket,
+            (Some("provider_request_v1"), Some(1)) => {
+                let method = parsed.get("method").and_then(Value::as_str).unwrap_or("");
+                if method.eq_ignore_ascii_case("WEBSOCKET") {
+                    Self::Websocket
+                } else {
+                    Self::Http
+                }
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct LlmRequestAuditRow {
     pub id: String,
@@ -1122,6 +1177,8 @@ pub struct LlmRequestAuditRow {
     pub final_state: String,
     pub invalidated_at: Option<String>,
     pub invalidated_reason: Option<String>,
+    /// Derived from `request_body_json` wire; never from live Provider settings.
+    pub transport: LlmRequestTransport,
 }
 
 #[derive(Clone, Debug, Default)]

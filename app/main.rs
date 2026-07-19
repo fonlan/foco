@@ -62,11 +62,11 @@ use foco_store::{
         LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
         LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
         LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsRecord,
-        LlmRequestRecord, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-        NewPromptContextInjection, NewToolCall, NewToolResult, PromptContextInjectionRecord,
-        RewriteChatFromUserMessage, TodoGraphRecord, TodoGraphTask, ToolCallCountRecord,
-        ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
+        LlmRequestRecord, LlmRequestTransport, MessageMetadataMutation, MessageRecord,
+        MessageRoleCountRecord, NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent,
+        NewMessage, NewPromptContextInjection, NewToolCall, NewToolResult,
+        PromptContextInjectionRecord, RewriteChatFromUserMessage, TodoGraphRecord, TodoGraphTask,
+        ToolCallCountRecord, ToolCallWithResultRecord, UpdateLlmRequestOutcome, WorkspaceDatabase,
         WorkspaceDatabaseError, WorkspaceSpecPromptPlan, WorkspaceSpecSettings,
         workspace_database_path,
     },
@@ -1664,6 +1664,8 @@ struct AiRequestAuditSummary {
     final_state: String,
     invalidated_at: Option<String>,
     invalidated_reason: Option<String>,
+    /// Wire-derived transport: `http` | `websocket` | `unknown`.
+    transport: &'static str,
 }
 
 #[derive(Serialize)]
@@ -1693,6 +1695,8 @@ struct AiRequestAuditDetail {
     final_state: String,
     invalidated_at: Option<String>,
     invalidated_reason: Option<String>,
+    /// Wire-derived transport: `http` | `websocket` | `unknown` (same rules as list).
+    transport: &'static str,
     request_detail_status: &'static str,
     response_detail_status: &'static str,
     request_body: Option<Value>,
@@ -8918,6 +8922,7 @@ fn ai_request_audit_summary(
         final_state: row.final_state,
         invalidated_at: row.invalidated_at,
         invalidated_reason: row.invalidated_reason,
+        transport: row.transport.as_str(),
     }
 }
 
@@ -8938,6 +8943,8 @@ fn ai_request_audit_detail(
         request.response_body_json.as_deref(),
         response_detail.as_ref(),
     );
+    let transport =
+        LlmRequestTransport::from_request_body_json(request.request_body_json.as_deref()).as_str();
     Ok(AiRequestAuditDetail {
         id: request.id,
         workspace_id: workspace.id.clone(),
@@ -8966,6 +8973,7 @@ fn ai_request_audit_detail(
         final_state: request.final_state,
         invalidated_at: request.invalidated_at,
         invalidated_reason: request.invalidated_reason,
+        transport,
         request_detail_status,
         response_detail_status,
         request_body: request_detail,

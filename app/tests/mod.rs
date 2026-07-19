@@ -26260,6 +26260,329 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
 }
 
 #[tokio::test]
+async fn ai_statistics_list_and_detail_expose_wire_derived_transport() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-ai-stats-transport-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-ai-stats-transport-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = GlobalConfig::first_run(workspace_dir.clone());
+    config.providers.push(ProviderSettings {
+        id: "provider".to_string(),
+        name: "Provider".to_string(),
+        kind: OPENAI_CHAT_KIND.to_string(),
+        enabled: true,
+        base_url: None,
+        api_key: None,
+        auto_sync_models: false,
+        model_sync_filter_regex: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+        api_proxy: ApiProxySettings::default(),
+    });
+    config.models.push(ModelSettings {
+        id: "model".to_string(),
+        display_name: "Model".to_string(),
+        enabled: true,
+        provider_ids: vec!["provider".to_string()],
+        active_provider_id: Some("provider".to_string()),
+        thinking_level: None,
+        system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+        metadata_key: None,
+        metadata_source_url: None,
+        metadata_refreshed_at: None,
+        limits: None,
+        input_modalities: vec!["text".to_string()],
+        output_modalities: vec!["text".to_string()],
+    });
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+
+    let http_body = r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":null}"#;
+    let ws_body = r#"{"format":"provider_websocket_request_v1","version":1,"url":"wss://example.test/v1/responses","headers":{},"createFrame":"{}","frameSent":true,"connectionReused":false}"#;
+    let response_body = r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#;
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-transport", "Transport audit")
+            .expect("chat insert");
+        for (id, started_at, request_body) in [
+            ("transport-http", "2026-07-19T12:00:00Z", Some(http_body)),
+            ("transport-ws", "2026-07-19T12:01:00Z", Some(ws_body)),
+            ("transport-unknown", "2026-07-19T12:02:00Z", None),
+        ] {
+            database
+                .insert_llm_request(NewLlmRequest {
+                    id,
+                    workspace_id: &workspace_id,
+                    chat_id: Some("chat-transport"),
+                    request_kind: "chat completion",
+                    agent_team_id: None,
+                    agent_instance_id: None,
+                    agent_task_id: None,
+                    agent_attempt_id: None,
+                    provider_id: "provider",
+                    model_id: "model",
+                    thinking_level: None,
+                    request_started_at: started_at,
+                    first_token_at: None,
+                    completed_at: Some(started_at),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    first_token_latency_ms: None,
+                    total_latency_ms: Some(10),
+                    status_code: Some(200),
+                    final_state: "succeeded",
+                    request_body_json: request_body,
+                    response_body_json: Some(response_body),
+                })
+                .expect("llm request insert");
+        }
+    }
+
+    let Json(stats) = crate::http::chat::ai_statistics(
+        State(state.clone()),
+        Query(AiStatisticsQuery {
+            workspace_id: Some(workspace_id.clone()),
+            request_id: None,
+            request_ids: None,
+            chat_id: None,
+            request_kind: None,
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: Some(1),
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("ai statistics list");
+
+    assert_eq!(stats.total_count, 3);
+    assert_eq!(stats.requests.len(), 3);
+    let list_by_id: std::collections::HashMap<_, _> = stats
+        .requests
+        .iter()
+        .map(|row| (row.id.as_str(), row.transport))
+        .collect();
+    assert_eq!(list_by_id.get("transport-http"), Some(&"http"));
+    assert_eq!(list_by_id.get("transport-ws"), Some(&"websocket"));
+    assert_eq!(list_by_id.get("transport-unknown"), Some(&"unknown"));
+
+    for (id, expected) in [
+        ("transport-http", "http"),
+        ("transport-ws", "websocket"),
+        ("transport-unknown", "unknown"),
+    ] {
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state.clone()),
+            AxumPath((workspace_id.clone(), id.to_string())),
+        )
+        .await
+        .expect("ai statistics detail");
+        assert_eq!(
+            detail.request.transport, expected,
+            "detail transport for {id}"
+        );
+        assert_eq!(detail.request.id, id);
+        assert_eq!(detail.request.request_kind, "chat completion");
+        assert_eq!(detail.request.status_code, Some(200));
+        if expected == "http" {
+            assert_eq!(detail.request.request_detail_status, "captured");
+            assert_eq!(
+                detail
+                    .request
+                    .request_body
+                    .as_ref()
+                    .and_then(|value| value.get("format"))
+                    .and_then(Value::as_str),
+                Some("provider_request_v1")
+            );
+        } else if expected == "websocket" {
+            assert_eq!(detail.request.request_detail_status, "captured");
+            assert_eq!(
+                detail
+                    .request
+                    .request_body
+                    .as_ref()
+                    .and_then(|value| value.get("format"))
+                    .and_then(Value::as_str),
+                Some("provider_websocket_request_v1")
+            );
+        } else {
+            assert_eq!(detail.request.request_detail_status, "unavailable");
+            assert!(detail.request.request_body.is_none());
+        }
+    }
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn remote_ai_statistics_list_and_detail_derive_transport_from_ssh_audit_mirror() {
+    // SSH list/detail both resolve workspace_audit_path → main-process mirror (not sidecar).
+    let profile = tempfile::tempdir().expect("temp profile");
+    let workspace_dir = profile.path().join("workspace");
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(profile.path().join(".foco")).expect("config directory");
+
+    let mut config = prompt_test_config(workspace_dir);
+    config
+        .remote_servers
+        .push(foco_store::config::RemoteServerProfile {
+            id: "srv".to_string(),
+            name: "Server".to_string(),
+            host_alias: "server".to_string(),
+            ..foco_store::config::RemoteServerProfile::default()
+        });
+    config.workspaces.push(WorkspaceConfig {
+        id: "remote".to_string(),
+        name: "Remote".to_string(),
+        path: PathBuf::new(),
+        location: WorkspaceLocation::Ssh {
+            server_id: "srv".to_string(),
+            remote_path: "/srv/project".to_string(),
+        },
+        pinned: false,
+        terminal_shell: DEFAULT_TERMINAL_SHELL.to_string(),
+        common_commands: Vec::new(),
+    });
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let http_body = r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":null}"#;
+    let ws_body = r#"{"format":"provider_websocket_request_v1","version":1,"url":"wss://example.test/v1/responses","headers":{},"createFrame":"{}","frameSent":true,"connectionReused":false}"#;
+    let method_ws_body = r#"{"format":"provider_request_v1","version":1,"method":"WEBSOCKET","url":"wss://example.test","headers":{},"body":null}"#;
+    let response_body = r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#;
+
+    let remote_workspace = state
+        .config
+        .lock()
+        .expect("config")
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.id == "remote")
+        .expect("remote workspace")
+        .clone();
+    let audit_path =
+        crate::remote_workspace::workspace_audit_path(profile.path(), &remote_workspace)
+            .expect("ssh audit path");
+    assert!(
+        audit_path
+            .to_string_lossy()
+            .contains("remote-workspace-audit"),
+        "audit path should be under profile remote-workspace-audit: {}",
+        audit_path.display()
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit db");
+        database
+            .insert_chat("chat-remote-transport", "Remote transport")
+            .expect("chat insert");
+        for (id, started_at, request_body) in [
+            ("remote-http", "2026-07-19T13:00:00Z", Some(http_body)),
+            ("remote-ws-format", "2026-07-19T13:01:00Z", Some(ws_body)),
+            (
+                "remote-ws-method",
+                "2026-07-19T13:02:00Z",
+                Some(method_ws_body),
+            ),
+            ("remote-unknown", "2026-07-19T13:03:00Z", None),
+        ] {
+            database
+                .insert_llm_request(NewLlmRequest {
+                    id,
+                    workspace_id: "remote",
+                    chat_id: Some("chat-remote-transport"),
+                    request_kind: "chat completion",
+                    agent_team_id: None,
+                    agent_instance_id: None,
+                    agent_task_id: None,
+                    agent_attempt_id: None,
+                    provider_id: "provider",
+                    model_id: "model",
+                    thinking_level: None,
+                    request_started_at: started_at,
+                    first_token_at: None,
+                    completed_at: Some(started_at),
+                    input_tokens: Some(1),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                    reasoning_tokens: None,
+                    first_token_latency_ms: None,
+                    total_latency_ms: Some(10),
+                    status_code: Some(200),
+                    final_state: "succeeded",
+                    request_body_json: request_body,
+                    response_body_json: Some(response_body),
+                })
+                .expect("llm request insert");
+        }
+    }
+
+    let Json(stats) = crate::http::chat::ai_statistics(
+        State(state.clone()),
+        Query(AiStatisticsQuery {
+            workspace_id: Some("remote".to_string()),
+            request_id: None,
+            request_ids: None,
+            chat_id: None,
+            request_kind: None,
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: Some(1),
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("remote ai statistics list");
+
+    let list_by_id: std::collections::HashMap<_, _> = stats
+        .requests
+        .iter()
+        .map(|row| (row.id.as_str(), row.transport))
+        .collect();
+    assert_eq!(list_by_id.get("remote-http"), Some(&"http"));
+    assert_eq!(list_by_id.get("remote-ws-format"), Some(&"websocket"));
+    assert_eq!(list_by_id.get("remote-ws-method"), Some(&"websocket"));
+    assert_eq!(list_by_id.get("remote-unknown"), Some(&"unknown"));
+
+    for (id, expected) in [
+        ("remote-http", "http"),
+        ("remote-ws-format", "websocket"),
+        ("remote-ws-method", "websocket"),
+        ("remote-unknown", "unknown"),
+    ] {
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state.clone()),
+            AxumPath(("remote".to_string(), id.to_string())),
+        )
+        .await
+        .expect("remote ai statistics detail");
+        assert_eq!(
+            detail.request.transport, expected,
+            "detail transport for {id}"
+        );
+        assert_eq!(detail.request.id, id);
+        assert_eq!(detail.request.request_kind, "chat completion");
+        assert_eq!(detail.request.status_code, Some(200));
+    }
+}
+
+#[tokio::test]
 async fn ai_statistics_merges_request_kind_breakdown_across_workspace_audit_sources() {
     fn request<'a>(
         id: &'a str,

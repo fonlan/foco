@@ -2225,6 +2225,9 @@ export type HookHandlerFormState = {
 
 // AI Statistics types
 
+/** Wire-derived LLM transport for audit list/detail (never from live Provider config). */
+export type AiRequestTransport = "http" | "websocket" | "unknown";
+
 export type AiRequestAuditSummary = {
   id: string;
   workspaceId: string;
@@ -2250,6 +2253,8 @@ export type AiRequestAuditSummary = {
   finalState: string;
   invalidatedAt: string | null;
   invalidatedReason: string | null;
+  /** Derived from versioned request_body_json wire. */
+  transport: AiRequestTransport;
 };
 
 export type ProviderHttpHeadersDump = Record<string, string | string[]>;

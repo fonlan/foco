@@ -54,20 +54,20 @@ pub use workspace_records::{
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
     LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsForAssistantRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestUsageRecord, LlmRequestUsageRollupFilters,
-    MessageMetadataMutation, MessageRecord, MessageRoleCountRecord, NewAgentContextEntry,
-    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
-    NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex,
-    NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot,
-    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase,
-    NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection, NewRunEvent,
-    NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
-    NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
-    PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
-    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-    PreStreamFailureMaterialization, PromptContextInjectionRecord,
-    RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
+    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRecord,
+    LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
+    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
+    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
+    NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
+    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection,
+    PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
+    PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
+    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
+    PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
     ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
     ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
@@ -9214,15 +9214,7 @@ impl WorkspaceDatabase {
     ) -> Result<Vec<LlmRequestAuditRow>, WorkspaceDatabaseError> {
         let limit = filters.limit.unwrap_or(200).max(1);
         let offset = filters.offset.unwrap_or(0).max(0);
-        let mut query = String::from(
-            "SELECT
-                id, workspace_id, chat_id, request_kind, provider_id, model_id, thinking_level,
-                request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
-                cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
-                first_token_latency_ms, total_latency_ms, status_code, final_state,
-                invalidated_at, invalidated_reason
-             FROM llm_requests",
-        );
+        let mut query = llm_request_audit_rows_select_sql();
         let mut query_params = Vec::new();
         append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
         query.push_str(" ORDER BY request_started_at DESC, id DESC LIMIT ? OFFSET ?");
@@ -9234,6 +9226,7 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params_from_iter(query_params), |row| {
+                let transport_raw: String = row.get(22)?;
                 Ok(LlmRequestAuditRow {
                     id: row.get(0)?,
                     workspace_id: row.get(1)?,
@@ -9257,6 +9250,7 @@ impl WorkspaceDatabase {
                     final_state: row.get(19)?,
                     invalidated_at: row.get(20)?,
                     invalidated_reason: row.get(21)?,
+                    transport: LlmRequestTransport::parse(&transport_raw),
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -16658,18 +16652,48 @@ fn append_llm_request_audit_where_clause(
     );
 }
 
-/// Builds production LLM audit SELECT SQL for EXPLAIN QUERY PLAN regression tests.
-#[doc(hidden)]
-pub fn llm_request_audit_rows_sql_for_tests(filters: LlmRequestAuditFilters<'_>) -> String {
-    let mut query = String::from(
+/// Read-only CASE that classifies transport from versioned request wire only.
+/// Must stay aligned with [`LlmRequestTransport::from_request_body_json`].
+/// Does not select or return detail body content.
+///
+/// `json_type(..., '$.version') = 'integer'` is required so SQLite does not treat JSON
+/// `true` / `1.0` as version 1 (those must stay `unknown`, matching Rust `as_u64()`).
+const LLM_REQUEST_TRANSPORT_SQL: &str = "CASE
+                WHEN request_body_json IS NULL OR TRIM(request_body_json) = '' THEN 'unknown'
+                WHEN json_valid(request_body_json) = 0 THEN 'unknown'
+                WHEN json_type(request_body_json, '$.version') = 'integer'
+                     AND json_extract(request_body_json, '$.version') = 1
+                     AND json_extract(request_body_json, '$.format') = 'provider_websocket_request_v1'
+                  THEN 'websocket'
+                WHEN json_type(request_body_json, '$.version') = 'integer'
+                     AND json_extract(request_body_json, '$.version') = 1
+                     AND json_extract(request_body_json, '$.format') = 'provider_request_v1'
+                     AND upper(COALESCE(json_extract(request_body_json, '$.method'), '')) = 'WEBSOCKET'
+                  THEN 'websocket'
+                WHEN json_type(request_body_json, '$.version') = 'integer'
+                     AND json_extract(request_body_json, '$.version') = 1
+                     AND json_extract(request_body_json, '$.format') = 'provider_request_v1'
+                  THEN 'http'
+                ELSE 'unknown'
+             END";
+
+fn llm_request_audit_rows_select_sql() -> String {
+    format!(
         "SELECT
                 id, workspace_id, chat_id, request_kind, provider_id, model_id, thinking_level,
                 request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
-                invalidated_at, invalidated_reason
-             FROM llm_requests",
-    );
+                invalidated_at, invalidated_reason,
+                {LLM_REQUEST_TRANSPORT_SQL} AS transport
+             FROM llm_requests"
+    )
+}
+
+/// Builds production LLM audit SELECT SQL for EXPLAIN QUERY PLAN regression tests.
+#[doc(hidden)]
+pub fn llm_request_audit_rows_sql_for_tests(filters: LlmRequestAuditFilters<'_>) -> String {
+    let mut query = llm_request_audit_rows_select_sql();
     let mut query_params = Vec::new();
     append_llm_request_audit_where_clause(&mut query, &mut query_params, filters);
     query.push_str(" ORDER BY request_started_at DESC, id DESC LIMIT ? OFFSET ?");
