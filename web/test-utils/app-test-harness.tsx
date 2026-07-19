@@ -351,31 +351,43 @@ export const settings = {
       defaultBaseUrl: "https://api.openai.com/v1",
       kind: "openai-chat",
       label: "OpenAI Chat",
+      usesWebsocket: false,
     },
     {
       defaultBaseUrl: "https://api.openai.com/v1",
       kind: "openai-responses",
       label: "OpenAI Responses",
+      usesWebsocket: false,
+    },
+    {
+      defaultBaseUrl: "https://api.openai.com/v1",
+      kind: "openai-responses-websocket",
+      label: "OpenAI Responses WebSocket",
+      usesWebsocket: true,
     },
     {
       defaultBaseUrl: "https://api.anthropic.com/v1",
       kind: "anthropic",
       label: "Anthropic",
+      usesWebsocket: false,
     },
     {
       defaultBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
       kind: "gemini",
       label: "Gemini",
+      usesWebsocket: false,
     },
     {
       defaultBaseUrl: "https://api.x.ai/v1",
       kind: "xai",
       label: "xAI",
+      usesWebsocket: false,
     },
     {
       defaultBaseUrl: "https://api.deepseek.com/v1",
       kind: "deepseek",
       label: "DeepSeek",
+      usesWebsocket: false,
     },
   ],
   providers: [

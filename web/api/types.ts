@@ -1476,6 +1476,7 @@ type ProviderKindSummary = {
   kind: string;
   label: string;
   defaultBaseUrl: string;
+  usesWebsocket?: boolean;
 };
 
 type ApiProxyTypeSummary = {

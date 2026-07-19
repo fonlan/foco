@@ -13,8 +13,8 @@ use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
     NeutralChatRequest, NeutralChatRole, ProviderConfigError, ProviderConnectionConfig,
-    ProviderModelRedirect, fetch_provider_model_ids, normalized_base_url, parse_provider_kind,
-    test_provider_connection, validate_model_redirects,
+    ProviderModelRedirect, ensure_proxy_compatible_with_kind, fetch_provider_model_ids,
+    normalized_base_url, parse_provider_kind, test_provider_connection, validate_model_redirects,
 };
 use foco_store::{
     config::{
@@ -623,6 +623,7 @@ pub(crate) struct ProviderKindSummary {
     pub(crate) kind: &'static str,
     pub(crate) label: &'static str,
     pub(crate) default_base_url: &'static str,
+    pub(crate) uses_websocket: bool,
 }
 
 #[derive(Serialize)]
@@ -1892,6 +1893,8 @@ pub(crate) async fn save_manual_provider(
         .map(|provider| provider.api_proxy.clone())
         .unwrap_or_default();
     let api_proxy = normalize_api_proxy_settings(&current_api_proxy, request.api_proxy.as_ref())?;
+    ensure_proxy_compatible_with_kind(provider_kind, api_proxy.enabled)
+        .map_err(|source| ApiError::bad_request(source.to_string()))?;
     for request_override in &request.request_overrides {
         request_override
             .validate()

@@ -240,6 +240,7 @@ pub(crate) async fn settings_response(
                 kind: kind.as_str(),
                 label: kind.label(),
                 default_base_url: kind.default_base_url(),
+                uses_websocket: kind.uses_websocket(),
             })
             .collect(),
         thinking_levels: vec![

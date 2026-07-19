@@ -6,7 +6,8 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use foco_providers::{
-    DEFAULT_OPENAI_BASE_URL, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, normalized_base_url,
+    DEFAULT_OPENAI_BASE_URL, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND,
+    OPENAI_RESPONSES_WEBSOCKET_KIND, normalized_base_url,
 };
 use foco_store::config::{GlobalConfig, ModelSettings, ProviderSettings};
 use foco_tools::IMAGE_GEN_TOOL;
@@ -523,7 +524,9 @@ fn output_extension(output_format: &str) -> &'static str {
 }
 
 fn openai_image_provider_supported(provider: &ProviderSettings) -> bool {
-    provider.kind == OPENAI_CHAT_KIND || provider.kind == OPENAI_RESPONSES_KIND
+    provider.kind == OPENAI_CHAT_KIND
+        || provider.kind == OPENAI_RESPONSES_KIND
+        || provider.kind == OPENAI_RESPONSES_WEBSOCKET_KIND
 }
 
 fn openai_image_base_url(provider: &ProviderSettings) -> Result<String, String> {

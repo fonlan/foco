@@ -203,6 +203,7 @@ type SettingsFilePickerRequest = {
 };
 
 const OPENAI_RESPONSES_PROVIDER_KIND = "openai-responses";
+const OPENAI_RESPONSES_WEBSOCKET_PROVIDER_KIND = "openai-responses-websocket";
 
 const MODEL_DEVELOPERS = [
   "deepseek",
@@ -249,7 +250,11 @@ const PROVIDER_SERVICE_PRESETS: ProviderServicePreset[] = [
   {
     id: "openai",
     label: "OpenAI",
-    kindIds: [OPENAI_RESPONSES_PROVIDER_KIND, "openai-chat"],
+    kindIds: [
+      OPENAI_RESPONSES_PROVIDER_KIND,
+      OPENAI_RESPONSES_WEBSOCKET_PROVIDER_KIND,
+      "openai-chat",
+    ],
     defaultKindId: OPENAI_RESPONSES_PROVIDER_KIND,
   },
   {
@@ -939,6 +944,7 @@ export function SettingsPanel({
   const selectedProviderKind = providerKinds.find(
     (kind) => kind.kind === providerForm.kind,
   );
+  const providerUsesWebsocket = selectedProviderKind?.usesWebsocket === true;
   const providerServices = useMemo(
     () => providerServicesForKinds(providerKinds),
     [providerKinds],
@@ -2086,10 +2092,13 @@ export function SettingsPanel({
   }
 
   function updateProviderProtocol(kind: string) {
+    const nextKind = providerKinds.find((item) => item.kind === kind);
     setProviderForm((current) => ({
       ...current,
       kind,
       serviceId: providerServiceIdForKind(kind) || current.serviceId,
+      // First-release WebSocket transport does not support API proxy tunneling.
+      apiProxyEnabled: nextKind?.usesWebsocket ? false : current.apiProxyEnabled,
     }));
   }
 
@@ -10833,12 +10842,20 @@ export function SettingsPanel({
                             ok={providerForm.apiProxyEnabled}
                           />
                         </div>
+                        {providerUsesWebsocket ? (
+                          <p className="mt-3 text-xs text-stone-600">
+                            {t(
+                              "AI API proxy is not supported for the OpenAI Responses WebSocket protocol in this release.",
+                            )}
+                          </p>
+                        ) : null}
                         <div className="mt-3 grid gap-3">
                           <label className="inline-flex items-center gap-2 text-sm font-semibold text-stone-700">
                             <input
                               aria-label={t("Enable AI API proxy")}
                               checked={providerForm.apiProxyEnabled}
                               className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                              disabled={providerUsesWebsocket}
                               onChange={(event) =>
                                 setProviderForm((current) => ({
                                   ...current,
@@ -10855,7 +10872,8 @@ export function SettingsPanel({
                                 {t("Proxy type")}
                               </span>
                               <select
-                                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+                                disabled={providerUsesWebsocket}
                                 onChange={(event) =>
                                   setProviderForm((current) => ({
                                     ...current,
@@ -10875,6 +10893,7 @@ export function SettingsPanel({
                               </select>
                             </label>
                             <TextField
+                              disabled={providerUsesWebsocket}
                               label={t("Proxy server")}
                               onChange={(value) =>
                                 setProviderForm((current) => ({
@@ -13552,6 +13571,7 @@ function SettingsNavButton({
 
 function TextField({
   autoComplete = "off",
+  disabled = false,
   inputMode,
   label,
   onChange,
@@ -13560,6 +13580,7 @@ function TextField({
   value,
 }: {
   autoComplete?: string;
+  disabled?: boolean;
   inputMode?: "numeric";
   label: string;
   onChange: (value: string) => void;
@@ -13574,7 +13595,8 @@ function TextField({
       </span>
       <input
         autoComplete={autoComplete}
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+        disabled={disabled}
         inputMode={inputMode}
         name={label.toLowerCase().replace(/\s+/g, "-")}
         onChange={(event) => onChange(event.target.value)}

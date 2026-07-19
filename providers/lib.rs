@@ -27,6 +27,8 @@ pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
 const MASKED_AUTHORIZATION_VALUE: &str = "********";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
+pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
+pub const OPENAI_RESPONSES_WEBSOCKET_KIND: &str = "openai-responses-websocket";
 
 pub type ProviderHttpHeadersDump = BTreeMap<String, Vec<String>>;
 
@@ -126,7 +128,6 @@ impl ProviderFinalResponseDump {
     }
 }
 
-pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
 pub const GEMINI_KIND: &str = "gemini";
 pub const ANTHROPIC_KIND: &str = "anthropic";
 pub const FIREWORKS_KIND: &str = "fireworks";
@@ -162,6 +163,9 @@ pub struct ProviderKind {
     adapter_kind: AdapterKind,
     default_base_url: &'static str,
     requires_api_key: bool,
+    /// When true, chat/completions use the WebSocket Responses transport.
+    /// Model listing and other HTTP endpoints still use the HTTP `base_url`.
+    uses_websocket: bool,
 }
 
 impl ProviderKind {
@@ -185,6 +189,10 @@ impl ProviderKind {
         self.requires_api_key
     }
 
+    pub fn uses_websocket(self) -> bool {
+        self.uses_websocket
+    }
+
     fn adapter_label(self) -> &'static str {
         self.adapter_kind.as_str()
     }
@@ -198,6 +206,7 @@ macro_rules! provider_kind {
             adapter_kind: AdapterKind::$adapter_kind,
             default_base_url: $base_url,
             requires_api_key: true,
+            uses_websocket: false,
         }
     };
     ($kind:ident, $label:literal, $adapter_kind:ident, $base_url:expr, no_api_key) => {
@@ -207,6 +216,17 @@ macro_rules! provider_kind {
             adapter_kind: AdapterKind::$adapter_kind,
             default_base_url: $base_url,
             requires_api_key: false,
+            uses_websocket: false,
+        }
+    };
+    ($kind:ident, $label:literal, $adapter_kind:ident, $base_url:expr, websocket) => {
+        ProviderKind {
+            kind: $kind,
+            label: $label,
+            adapter_kind: AdapterKind::$adapter_kind,
+            default_base_url: $base_url,
+            requires_api_key: true,
+            uses_websocket: true,
         }
     };
 }
@@ -223,6 +243,13 @@ pub const SUPPORTED_PROVIDER_KINDS: &[ProviderKind] = &[
         "OpenAI Responses",
         OpenAIResp,
         DEFAULT_OPENAI_BASE_URL
+    ),
+    provider_kind!(
+        OPENAI_RESPONSES_WEBSOCKET_KIND,
+        "OpenAI Responses WebSocket",
+        OpenAIResp,
+        DEFAULT_OPENAI_BASE_URL,
+        websocket
     ),
     provider_kind!(
         GEMINI_KIND,
@@ -555,6 +582,7 @@ impl ProviderConnectionConfig {
     }
 
     pub fn genai_client(&self) -> Result<Client, ProviderConfigError> {
+        ensure_proxy_compatible_with_kind(self.kind, self.proxy_url.is_some())?;
         let auth = self.auth_data()?;
         let resolver_auth = auth.clone();
         let endpoint = self.custom_endpoint()?;
@@ -1091,6 +1119,98 @@ pub fn parse_provider_kind(value: &str) -> Result<ProviderKind, ProviderConfigEr
         .copied()
         .find(|kind| kind.as_str() == value)
         .ok_or_else(|| ProviderConfigError::UnsupportedKind(value.to_string()))
+}
+
+/// Reject API proxy when the provider kind uses the WebSocket Responses transport.
+/// First release does not implement proxy tunneling for WebSocket.
+pub fn ensure_proxy_compatible_with_kind(
+    kind: ProviderKind,
+    proxy_enabled: bool,
+) -> Result<(), ProviderConfigError> {
+    if proxy_enabled && kind.uses_websocket() {
+        return Err(ProviderConfigError::UnsupportedProxyForWebSocket {
+            kind: kind.as_str().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Build the full HTTP OpenAI Responses URL the adapter would call from an HTTP API base.
+/// Example: `https://gateway.example/v1/` → `https://gateway.example/v1/responses`
+pub fn openai_responses_http_url_from_base(base_url: &str) -> Result<String, ProviderConfigError> {
+    let normalized = normalized_base_url(base_url)?;
+    let mut url =
+        reqwest::Url::parse(&normalized).map_err(|source| ProviderConfigError::InvalidBaseUrl {
+            value: base_url.to_string(),
+            source: source.to_string(),
+        })?;
+    if url.host_str().is_none() {
+        return Err(ProviderConfigError::InvalidBaseUrl {
+            value: base_url.to_string(),
+            source: "host is required".to_string(),
+        });
+    }
+    {
+        let mut segments =
+            url.path_segments_mut()
+                .map_err(|_| ProviderConfigError::InvalidBaseUrl {
+                    value: base_url.to_string(),
+                    source: "base URL cannot be used as a path base".to_string(),
+                })?;
+        segments.pop_if_empty();
+        segments.push("responses");
+    }
+    Ok(url.to_string())
+}
+
+/// Derive a WebSocket endpoint from a complete OpenAI Responses HTTP URL.
+/// Only `http→ws` and `https→wss` are allowed; host, port, path, and query are preserved.
+pub fn websocket_url_from_responses_http_url(
+    http_url: &str,
+) -> Result<String, ProviderConfigError> {
+    let trimmed = http_url.trim();
+    if trimmed.is_empty() {
+        return Err(ProviderConfigError::InvalidBaseUrl {
+            value: http_url.to_string(),
+            source: "Responses HTTP URL must not be empty".to_string(),
+        });
+    }
+    let mut url =
+        reqwest::Url::parse(trimmed).map_err(|source| ProviderConfigError::InvalidBaseUrl {
+            value: trimmed.to_string(),
+            source: source.to_string(),
+        })?;
+    if url.host_str().is_none() {
+        return Err(ProviderConfigError::InvalidBaseUrl {
+            value: trimmed.to_string(),
+            source: "host is required".to_string(),
+        });
+    }
+    let ws_scheme = match url.scheme() {
+        "http" => "ws",
+        "https" => "wss",
+        other => {
+            return Err(ProviderConfigError::InvalidBaseUrl {
+                value: trimmed.to_string(),
+                source: format!(
+                    "WebSocket URL must be derived from http or https Responses URL, got '{other}'"
+                ),
+            });
+        }
+    };
+    url.set_scheme(ws_scheme).map_err(|()| ProviderConfigError::InvalidBaseUrl {
+        value: trimmed.to_string(),
+        source: format!("failed to convert scheme to '{ws_scheme}'"),
+    })?;
+    Ok(url.to_string())
+}
+
+/// HTTP `base_url` → full Responses HTTP URL → WebSocket endpoint.
+pub fn openai_responses_websocket_url_from_base(
+    base_url: &str,
+) -> Result<String, ProviderConfigError> {
+    let http_url = openai_responses_http_url_from_base(base_url)?;
+    websocket_url_from_responses_http_url(&http_url)
 }
 
 pub fn normalized_proxy_url(proxy_type: &str, value: &str) -> Result<String, ProviderConfigError> {
@@ -1964,6 +2084,10 @@ pub enum ProviderConfigError {
     MissingApiKey,
     UnsupportedKind(String),
     UnsupportedProxyKind(String),
+    /// API proxy is not supported for WebSocket Responses transport in the first release.
+    UnsupportedProxyForWebSocket {
+        kind: String,
+    },
 }
 
 impl ProviderConfigError {
@@ -1978,7 +2102,8 @@ impl ProviderConfigError {
             | Self::MissingRequiredField(_)
             | Self::MissingApiKey
             | Self::UnsupportedKind(_)
-            | Self::UnsupportedProxyKind(_) => None,
+            | Self::UnsupportedProxyKind(_)
+            | Self::UnsupportedProxyForWebSocket { .. } => None,
         }
     }
 
@@ -2029,6 +2154,10 @@ impl fmt::Display for ProviderConfigError {
             Self::UnsupportedProxyKind(kind) => write!(
                 formatter,
                 "unsupported AI API proxy type '{kind}'; expected '{HTTP_PROXY_KIND}' or '{SOCKS_PROXY_KIND}'"
+            ),
+            Self::UnsupportedProxyForWebSocket { kind } => write!(
+                formatter,
+                "AI API proxy is not supported for WebSocket provider kind '{kind}'; disable the proxy or use an HTTP Responses protocol"
             ),
         }
     }
@@ -2559,6 +2688,16 @@ mod tests {
                 .adapter_kind(),
             AdapterKind::OpenAIResp
         );
+        let websocket_kind =
+            parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("responses websocket kind");
+        assert_eq!(websocket_kind.adapter_kind(), AdapterKind::OpenAIResp);
+        assert!(websocket_kind.uses_websocket());
+        assert!(!parse_provider_kind(OPENAI_RESPONSES_KIND)
+            .expect("responses kind")
+            .uses_websocket());
+        assert!(!parse_provider_kind(OPENAI_CHAT_KIND)
+            .expect("chat kind")
+            .uses_websocket());
         assert_eq!(
             parse_provider_kind(ANTHROPIC_KIND)
                 .expect("anthropic kind")
@@ -2583,6 +2722,120 @@ mod tests {
                 .adapter_kind(),
             AdapterKind::DeepSeek
         );
+    }
+
+    #[test]
+    fn openai_responses_websocket_kind_is_catalogued_with_shared_adapter() {
+        let kinds = supported_provider_kinds()
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&OPENAI_RESPONSES_KIND));
+        assert!(kinds.contains(&OPENAI_RESPONSES_WEBSOCKET_KIND));
+        assert!(kinds.contains(&OPENAI_CHAT_KIND));
+        assert_eq!(
+            parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND)
+                .expect("ws kind")
+                .default_base_url(),
+            DEFAULT_OPENAI_BASE_URL
+        );
+    }
+
+    #[test]
+    fn derives_websocket_url_from_adapter_responses_http_url_not_base_root() {
+        let http_url =
+            openai_responses_http_url_from_base("https://gateway.example/v1/").expect("http url");
+        assert_eq!(http_url, "https://gateway.example/v1/responses");
+        assert_eq!(
+            websocket_url_from_responses_http_url(&http_url).expect("ws url"),
+            "wss://gateway.example/v1/responses"
+        );
+        assert_eq!(
+            openai_responses_websocket_url_from_base("http://localhost:8080/v1")
+                .expect("local ws"),
+            "ws://localhost:8080/v1/responses"
+        );
+        assert_eq!(
+            openai_responses_websocket_url_from_base(
+                "https://gateway.example:8443/custom/v1/?api-version=2024-01"
+            )
+            .expect("preserves port path query"),
+            "wss://gateway.example:8443/custom/v1/responses?api-version=2024-01"
+        );
+    }
+
+    #[test]
+    fn rejects_non_http_responses_urls_for_websocket_derivation() {
+        let relative = websocket_url_from_responses_http_url("/v1/responses")
+            .expect_err("relative should fail");
+        assert!(relative.to_string().contains("invalid"));
+        let other_scheme = websocket_url_from_responses_http_url("ftp://example.com/v1/responses")
+            .expect_err("ftp should fail");
+        assert!(other_scheme.to_string().contains("http or https"));
+        let already_ws = websocket_url_from_responses_http_url("wss://example.com/v1/responses")
+            .expect_err("ws input should fail");
+        assert!(already_ws.to_string().contains("http or https"));
+    }
+
+    #[test]
+    fn rejects_api_proxy_for_websocket_provider_kind() {
+        let kind = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind");
+        ensure_proxy_compatible_with_kind(kind, false).expect("proxy off is ok");
+        let error = ensure_proxy_compatible_with_kind(kind, true).expect_err("proxy on fails");
+        assert!(matches!(
+            error,
+            ProviderConfigError::UnsupportedProxyForWebSocket { .. }
+        ));
+        ensure_proxy_compatible_with_kind(
+            parse_provider_kind(OPENAI_RESPONSES_KIND).expect("http responses"),
+            true,
+        )
+        .expect("http responses allows proxy");
+
+        let config = ProviderConnectionConfig {
+            kind,
+            base_url: Some(DEFAULT_OPENAI_BASE_URL.to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let client_error = config.genai_client().expect_err("proxy + websocket client");
+        assert!(matches!(
+            client_error,
+            ProviderConfigError::UnsupportedProxyForWebSocket { .. }
+        ));
+    }
+
+    #[test]
+    fn websocket_kind_keeps_http_models_base_and_response_create_wire_contract() {
+        let kind = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind");
+        let base = "https://gateway.example/v1/";
+        let config = ProviderConnectionConfig {
+            kind,
+            base_url: Some(base.to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        // Model list continues to use the HTTP base_url / OpenAIResp adapter path.
+        assert_eq!(
+            config.diagnostic_endpoint_url().expect("http endpoint"),
+            "https://gateway.example/v1/"
+        );
+        assert_eq!(kind.adapter_kind(), AdapterKind::OpenAIResp);
+
+        let ws_url = openai_responses_websocket_url_from_base(base).expect("ws endpoint");
+        assert_eq!(ws_url, "wss://gateway.example/v1/responses");
+        // Minimal response.create envelope sent after WebSocket handshake.
+        let create = serde_json::json!({
+            "type": "response.create",
+            "model": "gpt-4o-mini",
+            "input": [{ "role": "user", "content": "ping" }],
+        });
+        assert_eq!(create["type"], "response.create");
+        assert_eq!(create["model"], "gpt-4o-mini");
     }
 
     #[test]

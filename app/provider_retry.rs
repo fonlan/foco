@@ -17,7 +17,8 @@ pub(crate) fn is_retryable_provider_stream_error(error: &ProviderConfigError) ->
         | ProviderConfigError::MissingRequiredField(_)
         | ProviderConfigError::MissingApiKey
         | ProviderConfigError::UnsupportedKind(_)
-        | ProviderConfigError::UnsupportedProxyKind(_) => false,
+        | ProviderConfigError::UnsupportedProxyKind(_)
+        | ProviderConfigError::UnsupportedProxyForWebSocket { .. } => false,
     }
 }
 

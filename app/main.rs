@@ -29,9 +29,9 @@ use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefiniti
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OPENAI_RESPONSES_KIND, ProviderConfigError, ProviderConnectionConfig, ProviderRequestFailure,
-    ProviderRequestOverride, normalized_proxy_url, parse_provider_kind,
-    stream_chat_with_capture_observer,
+    OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, ProviderConfigError,
+    ProviderConnectionConfig, ProviderRequestFailure, ProviderRequestOverride, normalized_proxy_url,
+    parse_provider_kind, stream_chat_with_capture_observer,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -8290,10 +8290,11 @@ fn validate_model_provider_references(
 
 fn model_supports_thinking(model: &ModelSettings, config: &GlobalConfig) -> bool {
     let has_responses_provider = model.provider_ids.iter().any(|provider_id| {
-        config
-            .providers
-            .iter()
-            .any(|provider| provider.id == *provider_id && provider.kind == OPENAI_RESPONSES_KIND)
+        config.providers.iter().any(|provider| {
+            provider.id == *provider_id
+                && (provider.kind == OPENAI_RESPONSES_KIND
+                    || provider.kind == OPENAI_RESPONSES_WEBSOCKET_KIND)
+        })
     });
     let id = model.id.to_ascii_lowercase();
 

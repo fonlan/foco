@@ -529,10 +529,11 @@ impl GlobalConfig {
             validate_id(config_path, "provider.id", &provider.id)?;
             require_non_empty(config_path, "provider.name", &provider.name)?;
             require_non_empty(config_path, "provider.kind", &provider.kind)?;
-            parse_provider_kind(&provider.kind).map_err(|source| ConfigError::Validation {
-                path: config_path.map(Path::to_path_buf),
-                message: source.to_string(),
-            })?;
+            let provider_kind =
+                parse_provider_kind(&provider.kind).map_err(|source| ConfigError::Validation {
+                    path: config_path.map(Path::to_path_buf),
+                    message: source.to_string(),
+                })?;
             if let Some(base_url) = &provider.base_url {
                 normalized_base_url(base_url).map_err(|source| ConfigError::Validation {
                     path: config_path.map(Path::to_path_buf),
@@ -540,6 +541,14 @@ impl GlobalConfig {
                 })?;
             }
             validate_api_proxy_settings(config_path, "provider.api_proxy", &provider.api_proxy)?;
+            foco_providers::ensure_proxy_compatible_with_kind(
+                provider_kind,
+                provider.api_proxy.enabled,
+            )
+            .map_err(|source| ConfigError::Validation {
+                path: config_path.map(Path::to_path_buf),
+                message: source.to_string(),
+            })?;
             for request_override in &provider.request_overrides {
                 request_override
                     .validate()
@@ -4030,6 +4039,81 @@ mod tests {
             .expect_err("plain password hash should fail");
 
         assert!(error.to_string().contains("password_hash must use sha256"));
+    }
+
+    #[test]
+    fn load_rejects_api_proxy_for_openai_responses_websocket() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "openai-ws".to_string(),
+            name: "OpenAI WS".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_WEBSOCKET_KIND.to_string(),
+            enabled: true,
+            base_url: Some("https://api.openai.com/v1/".to_string()),
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: ApiProxySettings {
+                enabled: true,
+                proxy_type: HTTP_PROXY_KIND.to_string(),
+                url: "http://127.0.0.1:7890".to_string(),
+            },
+        });
+
+        let error = save_global_config(&paths.config_file, &config)
+            .expect_err("websocket + proxy should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("AI API proxy is not supported for WebSocket provider kind")
+        );
+    }
+
+    #[test]
+    fn load_round_trips_openai_responses_websocket_without_proxy() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+        let mut config = GlobalConfig::first_run(paths.workspace_dir);
+        config.providers.push(ProviderSettings {
+            id: "openai-ws".to_string(),
+            name: "OpenAI WS".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_WEBSOCKET_KIND.to_string(),
+            enabled: true,
+            base_url: Some("https://api.openai.com/v1/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: ApiProxySettings::default(),
+        });
+
+        save_global_config(&paths.config_file, &config).expect("save websocket provider");
+        let loaded = load_global_config(&paths.config_file).expect("reload config");
+        let provider = loaded
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai-ws")
+            .expect("websocket provider");
+        assert_eq!(
+            provider.kind,
+            foco_providers::OPENAI_RESPONSES_WEBSOCKET_KIND
+        );
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://api.openai.com/v1/")
+        );
+        assert!(!provider.api_proxy.enabled);
     }
 
     #[test]

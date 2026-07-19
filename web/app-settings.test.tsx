@@ -1348,6 +1348,34 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
   });
 
+  it("keeps a single base URL and disables proxy for OpenAI Responses WebSocket", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
+
+    await userEvent.click(screen.getByRole("checkbox", { name: "Enable AI API proxy" }));
+    expect(screen.getByRole("checkbox", { name: "Enable AI API proxy" })).toBeChecked();
+
+    await userEvent.selectOptions(
+      screen.getByLabelText("Protocol"),
+      "openai-responses-websocket",
+    );
+
+    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses-websocket");
+    expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.openai.com/v1");
+    expect(screen.queryByLabelText("WebSocket URL")).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "Enable AI API proxy" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Enable AI API proxy" })).toBeDisabled();
+    expect(
+      screen.getByText(
+        "AI API proxy is not supported for the OpenAI Responses WebSocket protocol in this release.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("keeps custom provider base URL when changing protocol", async () => {
     renderApp();
 
