@@ -63,6 +63,10 @@ import {
   requestKindBadgeClass,
   requestKindLabel,
 } from "./request-kind";
+import {
+  formatProviderTransportSuffix,
+  requestTransportLabel,
+} from "./request-transport";
 import { useAiStatisticsData } from "./use-ai-statistics-data";
 
 const DualLineChartCard = lazy(() =>
@@ -287,16 +291,30 @@ export function ApiStatsPanel({
       cellClassName: "min-w-[13rem] px-4 py-3 font-mono text-xs text-stone-700",
       id: "providerModel",
       label: t("Provider / model"),
-      render: (request) => (
-        <div className="space-y-1">
-          <div className="truncate font-medium text-stone-800">
-            {providerLabels.get(request.providerId) ?? request.providerId}
+      render: (request) => {
+        const providerName =
+          providerLabels.get(request.providerId) ?? request.providerId;
+        const transportSuffix = formatProviderTransportSuffix(
+          request.transport,
+          t,
+        );
+        return (
+          <div className="space-y-1">
+            <div
+              className="truncate font-medium text-stone-800"
+              title={`${providerName}${transportSuffix}`}
+            >
+              <span>{providerName}</span>
+              <span className="font-normal text-stone-500">
+                {transportSuffix}
+              </span>
+            </div>
+            <div className="truncate text-stone-500">
+              {modelLabels.get(request.modelId) ?? request.modelId}
+            </div>
           </div>
-          <div className="truncate text-stone-500">
-            {modelLabels.get(request.modelId) ?? request.modelId}
-          </div>
-        </div>
-      ),
+        );
+      },
     },
     {
       cellClassName: "px-4 py-3 text-stone-700",
@@ -995,6 +1013,10 @@ function AiRequestDetailDialog({
                   value={requestKindLabel(request.requestKind, t)}
                 />
                 <AuditMeta
+                  label={t("Transport")}
+                  value={requestTransportLabel(request.transport, t)}
+                />
+                <AuditMeta
                   label={t("Thinking level")}
                   value={request.thinkingLevel ?? t("Default")}
                 />
@@ -1099,7 +1121,10 @@ function ProviderRequestDetail({
     return (
       <AuditDetailCard title={t("Actual provider request")}>
         <div className="grid gap-3 sm:grid-cols-2">
-          <AuditMeta label={t("Transport")} value="WebSocket" />
+          <AuditMeta
+            label={t("Transport")}
+            value={requestTransportLabel("websocket", t)}
+          />
           <AuditMeta label={t("Provider URL")} value={requestBody.url} />
           <AuditMeta
             label={t("Connection reused")}

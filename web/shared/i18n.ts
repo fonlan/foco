@@ -119,6 +119,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Disable memory {fact}": "Disable memory {fact}",
     "Memory enabled update returned no memory.": "Memory enabled update returned no memory.",
     "Delete provider {name}": "Delete provider {name}",
+    "Unknown transport": "Unknown",
+    "({transport})": "({transport})",
   },
   "zh-CN": {
     "Local workspace": "本地工作区",
@@ -706,6 +708,9 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Started before": "开始时间不晚于",
     "Request time": "请求时间",
     "Provider / model": "供应商/模型",
+    "Unknown transport": "未知",
+    "({transport})": "（{transport}）",
+    WebSocket: "WebSocket",
     Duration: "耗时",
     Provider: "供应商",
     Channel: "渠道",

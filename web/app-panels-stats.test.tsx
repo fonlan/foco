@@ -3943,7 +3943,9 @@ describe("app-panels-stats verification surfaces", () => {
     await waitFor(() =>
       expect(within(table).getByText("OpenAI")).toBeInTheDocument(),
     );
+    expect(within(table).getByText("(HTTP)")).toBeInTheDocument();
     expect(within(table).getByText("GPT Test")).toBeInTheDocument();
+    expect(within(table).queryByText("GPT Test(HTTP)")).not.toBeInTheDocument();
     expect(
       screen.getByRole("navigation", { name: "Request audit pagination" }),
     ).toBeInTheDocument();
@@ -3971,6 +3973,10 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(dialog).getByText("Final provider response"),
     ).toBeInTheDocument();
+    const transportMeta = within(dialog)
+      .getByText("Transport")
+      .parentElement as HTMLElement;
+    expect(within(transportMeta).getByText("HTTP")).toBeInTheDocument();
     expect(within(dialog).getByText("POST")).toBeInTheDocument();
     expect(
       within(dialog).getByText("https://api.example.test/v1/responses"),
@@ -4902,6 +4908,7 @@ describe("app-panels-stats verification surfaces", () => {
             ...aiStatisticsDetail,
             request: {
               ...aiStatisticsDetail.request,
+              transport: "websocket",
               requestBody: {
                 connectionReused: true,
                 createFrame: JSON.stringify({
@@ -4935,11 +4942,20 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(
       (await screen.findAllByRole("button", { name: "API details" }))[0],
     );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "View request details" })).toBeInTheDocument(),
+    );
     await userEvent.click(
       screen.getByRole("button", { name: "View request details" }),
     );
     const dialog = await screen.findByRole("dialog", { name: "Request details" });
-    expect(within(dialog).getByText("WebSocket")).toBeInTheDocument();
+    // Overview + wire request card both surface Transport=WebSocket.
+    expect(within(dialog).getAllByText("WebSocket").length).toBeGreaterThanOrEqual(
+      2,
+    );
+    expect(within(dialog).getAllByText("Transport").length).toBeGreaterThanOrEqual(
+      2,
+    );
     expect(
       within(dialog).getByText("wss://api.example.test/v1/responses"),
     ).toBeInTheDocument();
@@ -4958,7 +4974,9 @@ describe("app-panels-stats verification surfaces", () => {
       (await screen.findAllByRole("button", { name: "API details" }))[0],
     );
     const table = await screen.findByRole("table");
-    expect(within(table).getByText("OpenAI")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(table).getByText("OpenAI")).toBeInTheDocument(),
+    );
 
     await userEvent.click(screen.getByText("Columns"));
     await userEvent.click(
