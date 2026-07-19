@@ -1575,6 +1575,308 @@ describe("app-settings verification surfaces", () => {
     );
   });
 
+  it("lists only Spec-eligible generation models in the Spec model dropdown", async () => {
+    const disabledModel: ConfiguredModelSummary = {
+      ...appTestState.settingsResponse.configuredModels[0]!,
+      displayName: "Disabled Model",
+      enabled: false,
+      id: "disabled-model",
+    };
+    const providerlessModel: ConfiguredModelSummary = {
+      ...appTestState.settingsResponse.configuredModels[0]!,
+      activeProviderId: null,
+      displayName: "Providerless Model",
+      id: "providerless-model",
+    };
+    const disabledProviderModel: ConfiguredModelSummary = {
+      ...appTestState.settingsResponse.configuredModels[0]!,
+      activeProviderId: "disabled-provider",
+      displayName: "Disabled Provider Model",
+      id: "disabled-provider-model",
+      providerIds: ["disabled-provider"],
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [
+        ...appTestState.settingsResponse.configuredModels,
+        disabledModel,
+        providerlessModel,
+        disabledProviderModel,
+      ],
+      providers: [
+        ...appTestState.settingsResponse.providers,
+        {
+          ...appTestState.settingsResponse.providers[0]!,
+          enabled: false,
+          id: "disabled-provider",
+          name: "Disabled Provider",
+        },
+      ],
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    await waitFor(() => {
+      expect(within(modelSelect).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
+    });
+    const optionLabels = within(modelSelect)
+      .getAllByRole("option")
+      .map((option) => option.textContent);
+
+    expect(optionLabels).toContain("Automatic");
+    expect(optionLabels).toContain("GPT Test");
+    expect(optionLabels).not.toContain("Disabled Model");
+    expect(optionLabels).not.toContain("Providerless Model");
+    expect(optionLabels).not.toContain("Disabled Provider Model");
+  });
+
+  it("keeps an unavailable historical Spec generation model selected with an explicit label", async () => {
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [
+        ...appTestState.settingsResponse.configuredModels,
+        {
+          ...appTestState.settingsResponse.configuredModels[0]!,
+          displayName: "Disabled Model",
+          enabled: false,
+          id: "disabled-model",
+        },
+      ],
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        generationModelId: "disabled-model",
+      },
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    await waitFor(() => {
+      expect(modelSelect).toHaveValue("disabled-model");
+    });
+    expect(
+      within(modelSelect).getByRole("option", {
+        name: "Model unavailable: Disabled Model",
+      }),
+    ).toBeInTheDocument();
+    expect(modelSelect).not.toHaveValue("");
+    expect(within(modelSelect).getByRole("option", { name: "Automatic" })).toBeInTheDocument();
+  });
+
+  it("keeps Spec save errors when Spec job history reloads and rolls back failed saves", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const originalFetch = mockFetch;
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/spec" && init?.method === "POST") {
+        return jsonResponse(
+          {
+            error:
+              "spec.generation_model_id references missing, disabled, or providerless model 'broken-model'",
+          },
+          { status: 400 },
+        );
+      }
+      return originalFetch(input, init);
+    });
+
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [
+        ...appTestState.settingsResponse.configuredModels,
+        {
+          ...appTestState.settingsResponse.configuredModels[0]!,
+          displayName: "Broken Model",
+          id: "broken-model",
+        },
+      ],
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        autoEnabled: true,
+        generationModelId: null,
+      },
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    expect(modelSelect).toHaveValue("");
+
+    await userEvent.selectOptions(modelSelect, "broken-model");
+
+    const saveError = await screen.findByText(
+      /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
+    );
+    expect(saveError).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("");
+    });
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh Spec job history" }));
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/settings/spec/jobs?")),
+      ).toBe(true);
+    });
+
+    expect(
+      screen.getByText(
+        /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
+      ),
+    ).toBeInTheDocument();
+    expect(appTestState.settingsResponse.spec.generationModelId).toBeNull();
+  });
+
+  it("serializes Spec saves latest-wins and clears a prior save error after success", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const originalFetch = mockFetch;
+    const firstSaveGate = deferred<Response>();
+    let postCount = 0;
+    const postBodies: Array<Record<string, unknown>> = [];
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/spec" && init?.method === "POST") {
+        postCount += 1;
+        const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
+        postBodies.push(body);
+        if (postCount === 1) {
+          await firstSaveGate.promise;
+          return jsonResponse({ error: "first Spec save failed" }, { status: 400 });
+        }
+        return originalFetch(input, init);
+      }
+      return originalFetch(input, init);
+    });
+
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        autoEnabled: true,
+        generationModelId: null,
+      },
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    expect(modelSelect).toHaveValue("");
+
+    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
+    await waitFor(() => {
+      expect(postCount).toBe(1);
+    });
+
+    await userEvent.selectOptions(modelSelect, "gpt-test");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    });
+    // Second save stays queued until the first request finishes.
+    expect(postCount).toBe(1);
+
+    firstSaveGate.resolve(undefined as unknown as Response);
+    await waitFor(() => {
+      expect(postCount).toBe(2);
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    });
+    await waitFor(() => {
+      expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
+    });
+
+    expect(postBodies[0]).toEqual({
+      autoEnabled: false,
+      generationModelId: null,
+      llmTimeoutMs: 120000,
+    });
+    expect(postBodies[1]).toEqual({
+      autoEnabled: false,
+      generationModelId: "gpt-test",
+      llmTimeoutMs: 120000,
+    });
+    expect(screen.queryByText("first Spec save failed")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Enable Auto Spec")).not.toBeChecked();
+  });
+
+  it("does not let a stale settings GET overwrite a newer Spec save", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const originalFetch = mockFetch;
+    let holdNextSettingsGet = false;
+    const staleGetGate = deferred<void>();
+    let staleSnapshot: typeof appTestState.settingsResponse | null = null;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      const method = String(init?.method ?? "GET").toUpperCase();
+      if (path === "/api/settings" && method === "GET" && holdNextSettingsGet) {
+        holdNextSettingsGet = false;
+        staleSnapshot = {
+          ...appTestState.settingsResponse,
+          configuredModels: [...appTestState.settingsResponse.configuredModels],
+          spec: { ...appTestState.settingsResponse.spec },
+        };
+        await staleGetGate.promise;
+        return jsonResponse(staleSnapshot);
+      }
+      return originalFetch(input, init);
+    });
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    expect(await screen.findByText("General settings")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Reload general settings")).not.toBeDisabled();
+    });
+
+    holdNextSettingsGet = true;
+    await userEvent.click(screen.getByRole("button", { name: "Reload general settings" }));
+    await waitFor(() => {
+      expect(staleSnapshot).not.toBeNull();
+    });
+
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    await waitFor(() => {
+      expect(within(modelSelect).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
+    });
+    await userEvent.selectOptions(modelSelect, "gpt-test");
+    await waitFor(() => {
+      expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    });
+
+    staleGetGate.resolve();
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    expect(staleSnapshot?.spec.generationModelId).not.toBe("gpt-test");
+  });
+
   it("saves memory settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

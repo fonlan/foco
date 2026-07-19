@@ -258,6 +258,23 @@ export const settings = {
       { label: "Isolated worktree, auto-merge once", value: "isolated_auto_once" },
     ],
   },
+  webSearch: {
+    enabled: false,
+    activeProvider: "tavily",
+    providers: [
+      { provider: "tavily", label: "Tavily", hasApiKey: false },
+      { provider: "brave", label: "Brave", hasApiKey: false },
+    ],
+    apiProxy: {
+      enabled: false,
+      proxyType: "http",
+      supportedTypes: [
+        { label: "HTTP", proxyType: "http" },
+        { label: "SOCKS", proxyType: "socks" },
+      ],
+      url: "",
+    },
+  },
   spec: {
     autoEnabled: true,
     generationModelId: null as string | null,

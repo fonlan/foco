@@ -573,7 +573,14 @@ export function SettingsPanel({
   const [isSavingWebSearch, setIsSavingWebSearch] = useState(false);
   const [isSavingPromptSettings, setIsSavingPromptSettings] = useState(false);
   const [isSavingSpecSettings, setIsSavingSpecSettings] = useState(false);
-  const specAutoSaveRequestIdRef = useRef(0);
+  const [specSettingsSaveError, setSpecSettingsSaveError] = useState<string | null>(
+    null,
+  );
+  const confirmedSpecSettingsRef = useRef<SpecSettingsFormState>(emptySpecSettingsForm());
+  const pendingSpecSettingsSaveRef = useRef<SpecSettingsFormState | null>(null);
+  const isSpecSettingsSaveInFlightRef = useRef(false);
+  const specSettingsFormRef = useRef<SpecSettingsFormState>(emptySpecSettingsForm());
+  const specSettingsMutationGenerationRef = useRef(0);
   const [specJobs, setSpecJobs] = useState<SettingsWorkspaceSpecJobSummary[]>([]);
   const [specJobsPage, setSpecJobsPage] = useState(1);
   const [specJobsPageSize, setSpecJobsPageSize] = useState(20);
@@ -581,6 +588,7 @@ export function SettingsPanel({
   const [specJobsTotalPages, setSpecJobsTotalPages] = useState(0);
   const [showRetryableSpecJobsOnly, setShowRetryableSpecJobsOnly] = useState(true);
   const [isLoadingSpecJobs, setIsLoadingSpecJobs] = useState(false);
+  const [specJobsError, setSpecJobsError] = useState<string | null>(null);
   const [specJobOperations, setSpecJobOperations] = useState<
     Partial<Record<string, "retry" | "delete">>
   >({});
@@ -877,6 +885,23 @@ export function SettingsPanel({
     () => configuredModelsByName.filter((model) => model.enabled),
     [configuredModelsByName],
   );
+  const specEligibleGenerationModels = useMemo(
+    () =>
+      configuredModelsByName.filter((model) =>
+        isSpecEligibleGenerationModel(model, providers),
+      ),
+    [configuredModelsByName, providers],
+  );
+  const selectedSpecGenerationModel =
+    configuredModels.find(
+      (model) => model.id === specSettingsForm.generationModelId,
+    ) ?? null;
+  const isSelectedSpecGenerationModelUnavailable = Boolean(
+    specSettingsForm.generationModelId &&
+      !specEligibleGenerationModels.some(
+        (model) => model.id === specSettingsForm.generationModelId,
+      ),
+  );
   const passwordInputValue =
     generalForm.password ||
     (settings?.general.webServer.passwordEnabled && !isEditingGeneralPassword
@@ -1076,12 +1101,26 @@ export function SettingsPanel({
     });
   }
 
+  function applySpecSettingsForm(nextForm: SpecSettingsFormState) {
+    specSettingsFormRef.current = nextForm;
+    setSpecSettingsForm(nextForm);
+  }
+
+  function hasSpecSettingsLocalIntent(): boolean {
+    return (
+      isSpecSettingsSaveInFlightRef.current ||
+      pendingSpecSettingsSaveRef.current !== null ||
+      !specSettingsFormsEqual(
+        specSettingsFormRef.current,
+        confirmedSpecSettingsRef.current,
+      )
+    );
+  }
+
   function syncSpecSettingsForm(data: SettingsResponse) {
-    setSpecSettingsForm({
-      autoEnabled: data.spec.autoEnabled,
-      generationModelId: data.spec.generationModelId ?? "",
-      llmTimeoutMs: String(data.spec.llmTimeoutMs),
-    });
+    const nextForm = specSettingsFormFromResponse(data);
+    confirmedSpecSettingsRef.current = nextForm;
+    applySpecSettingsForm(nextForm);
   }
 
   function syncPlanSettingsForm(data: SettingsResponse) {
@@ -1142,6 +1181,7 @@ export function SettingsPanel({
   const loadSettings = useCallback(async () => {
     const requestId = settingsLoadRequestIdRef.current + 1;
     settingsLoadRequestIdRef.current = requestId;
+    const specMutationGenerationAtStart = specSettingsMutationGenerationRef.current;
     setIsLoadingSettings(true);
     setError(null);
 
@@ -1158,7 +1198,15 @@ export function SettingsPanel({
       syncGeneralForm(data);
       syncWebSearchForm(data);
       syncPromptSettingsForm(data);
-      syncSpecSettingsForm(data);
+      // Skip Spec form when the user has local edits / in-flight saves, or when a
+      // Spec mutation happened after this GET started (stale snapshot).
+      if (
+        specSettingsMutationGenerationRef.current ===
+          specMutationGenerationAtStart &&
+        !hasSpecSettingsLocalIntent()
+      ) {
+        syncSpecSettingsForm(data);
+      }
       syncPlanSettingsForm(data);
       syncMemorySettingsForm(data);
       syncSkillsForm(data);
@@ -1479,7 +1527,7 @@ export function SettingsPanel({
 
   const loadSpecJobs = useCallback(async () => {
     setIsLoadingSpecJobs(true);
-    setError(null);
+    setSpecJobsError(null);
 
     try {
       const params = new URLSearchParams({
@@ -1504,13 +1552,15 @@ export function SettingsPanel({
       setSpecJobsTotalCount(data.totalCount);
       setSpecJobsTotalPages(data.totalPages);
       if (data.errors.length > 0) {
-        setError(data.errors.map((item) => `${item.workspaceName}: ${item.error}`).join("; "));
+        setSpecJobsError(
+          data.errors.map((item) => `${item.workspaceName}: ${item.error}`).join("; "),
+        );
       }
     } catch (requestError) {
       setSpecJobs([]);
       setSpecJobsTotalCount(0);
       setSpecJobsTotalPages(0);
-      setError(errorMessage(requestError));
+      setSpecJobsError(errorMessage(requestError));
     } finally {
       setIsLoadingSpecJobs(false);
     }
@@ -2522,11 +2572,23 @@ export function SettingsPanel({
     }
   }
 
-  async function saveSpecSettingsSnapshot(nextForm: SpecSettingsFormState) {
-    const requestId = ++specAutoSaveRequestIdRef.current;
-    setIsSavingSpecSettings(true);
-    setError(null);
+  async function flushSpecSettingsSaveQueue() {
+    if (isSpecSettingsSaveInFlightRef.current) {
+      return;
+    }
 
+    const nextForm = pendingSpecSettingsSaveRef.current;
+    if (!nextForm) {
+      setIsSavingSpecSettings(false);
+      return;
+    }
+
+    pendingSpecSettingsSaveRef.current = null;
+    isSpecSettingsSaveInFlightRef.current = true;
+    setIsSavingSpecSettings(true);
+    setSpecSettingsSaveError(null);
+
+    let saveSucceeded = false;
     try {
       const data = await requestJson<SettingsResponse>("/api/settings/spec", {
         body: JSON.stringify({
@@ -2540,27 +2602,43 @@ export function SettingsPanel({
         headers: { "Content-Type": "application/json" },
         method: "POST",
       });
-      if (requestId !== specAutoSaveRequestIdRef.current) {
-        return;
-      }
+      const confirmed = specSettingsFormFromResponse(data);
+      confirmedSpecSettingsRef.current = confirmed;
       setSettings(data);
       onSettingsChange(data);
-      syncSpecSettingsForm(data);
-      await loadSpecJobs();
+      // Preserve newer queued saves and mid-save draft edits (e.g. timeout typing).
+      if (
+        !pendingSpecSettingsSaveRef.current &&
+        specSettingsFormsEqual(specSettingsFormRef.current, nextForm)
+      ) {
+        applySpecSettingsForm(confirmed);
+      }
+      saveSucceeded = true;
     } catch (requestError) {
-      if (requestId === specAutoSaveRequestIdRef.current) {
-        setError(errorMessage(requestError));
+      if (!pendingSpecSettingsSaveRef.current) {
+        if (specSettingsFormsEqual(specSettingsFormRef.current, nextForm)) {
+          applySpecSettingsForm(confirmedSpecSettingsRef.current);
+        }
+        setSpecSettingsSaveError(errorMessage(requestError));
       }
     } finally {
-      if (requestId === specAutoSaveRequestIdRef.current) {
+      isSpecSettingsSaveInFlightRef.current = false;
+      if (pendingSpecSettingsSaveRef.current) {
+        void flushSpecSettingsSaveQueue();
+      } else {
         setIsSavingSpecSettings(false);
+        if (saveSucceeded) {
+          void loadSpecJobs();
+        }
       }
     }
   }
 
   function queueSpecSettingsSave(nextForm: SpecSettingsFormState) {
-    setSpecSettingsForm(nextForm);
-    void saveSpecSettingsSnapshot(nextForm);
+    applySpecSettingsForm(nextForm);
+    pendingSpecSettingsSaveRef.current = nextForm;
+    specSettingsMutationGenerationRef.current += 1;
+    void flushSpecSettingsSaveQueue();
   }
 
   async function retrySpecJob(workspaceId: string, jobId: string) {
@@ -2573,7 +2651,7 @@ export function SettingsPanel({
       ...current,
       [operationKey]: "retry",
     }));
-    setError(null);
+    setSpecJobsError(null);
 
     try {
       await requestJson<RetryWorkspaceSpecJobResponse>(
@@ -2582,7 +2660,7 @@ export function SettingsPanel({
       );
       await loadSpecJobs();
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      setSpecJobsError(errorMessage(requestError));
     } finally {
       specJobOperationKeysRef.current.delete(operationKey);
       setSpecJobOperations((current) => {
@@ -2610,7 +2688,7 @@ export function SettingsPanel({
       ...current,
       [operationKey]: "delete",
     }));
-    setError(null);
+    setSpecJobsError(null);
 
     try {
       await requestJson<DeleteFailedWorkspaceSpecJobResponse>(
@@ -2619,7 +2697,7 @@ export function SettingsPanel({
       );
       await loadSpecJobs();
     } catch (requestError) {
-      setError(errorMessage(requestError));
+      setSpecJobsError(errorMessage(requestError));
     } finally {
       specJobOperationKeysRef.current.delete(operationKey);
       setSpecJobOperations((current) => {
@@ -6525,6 +6603,11 @@ export function SettingsPanel({
                     </span>
                   ) : null}
                 </div>
+                {specSettingsSaveError ? (
+                  <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                    {specSettingsSaveError}
+                  </div>
+                ) : null}
                 <div className="mt-4 grid gap-3">
                   <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
                     <legend className="px-1 text-xs font-semibold text-stone-600">
@@ -6546,10 +6629,9 @@ export function SettingsPanel({
                         <input
                           checked={specSettingsForm.autoEnabled}
                           className="size-4 accent-teal-700"
-                          disabled={isSavingSpecSettings}
                           onChange={(event) =>
                             queueSpecSettingsSave({
-                              ...specSettingsForm,
+                              ...specSettingsFormRef.current,
                               autoEnabled: event.target.checked,
                             })
                           }
@@ -6564,22 +6646,30 @@ export function SettingsPanel({
                         </span>
                         <select
                           aria-label={t("Spec generation model")}
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100"
-                          disabled={isSavingSpecSettings}
+                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
                           onChange={(event) =>
                             queueSpecSettingsSave({
-                              ...specSettingsForm,
+                              ...specSettingsFormRef.current,
                               generationModelId: event.target.value,
                             })
                           }
                           value={specSettingsForm.generationModelId}
                         >
                           <option value="">{t("Automatic")}</option>
-                          {configuredModelsByName.map((model) => (
+                          {specEligibleGenerationModels.map((model) => (
                             <option key={model.id} value={model.id}>
                               {model.displayName}
                             </option>
                           ))}
+                          {isSelectedSpecGenerationModelUnavailable ? (
+                            <option value={specSettingsForm.generationModelId}>
+                              {t("Model unavailable: {name}", {
+                                name:
+                                  selectedSpecGenerationModel?.displayName ||
+                                  specSettingsForm.generationModelId,
+                              })}
+                            </option>
+                          ) : null}
                         </select>
                       </label>
                     </div>
@@ -6597,31 +6687,32 @@ export function SettingsPanel({
                           onBlur={() => {
                             try {
                               requiredPositiveInteger(
-                                specSettingsForm.llmTimeoutMs,
+                                specSettingsFormRef.current.llmTimeoutMs,
                                 t("Spec LLM timeout ms"),
                               );
-                              void saveSpecSettingsSnapshot(specSettingsForm);
+                              queueSpecSettingsSave(specSettingsFormRef.current);
                             } catch (validationError) {
-                              setError(errorMessage(validationError));
+                              setSpecSettingsSaveError(errorMessage(validationError));
                             }
                           }}
-                          onChange={(event) =>
-                            setSpecSettingsForm((current) => ({
-                              ...current,
+                          onChange={(event) => {
+                            const nextForm = {
+                              ...specSettingsFormRef.current,
                               llmTimeoutMs: event.target.value,
-                            }))
-                          }
+                            };
+                            applySpecSettingsForm(nextForm);
+                          }}
                           onKeyDown={(event) => {
                             if (event.key === "Enter") {
                               event.preventDefault();
                               try {
                                 requiredPositiveInteger(
-                                  specSettingsForm.llmTimeoutMs,
+                                  specSettingsFormRef.current.llmTimeoutMs,
                                   t("Spec LLM timeout ms"),
                                 );
-                                void saveSpecSettingsSnapshot(specSettingsForm);
+                                queueSpecSettingsSave(specSettingsFormRef.current);
                               } catch (validationError) {
-                                setError(errorMessage(validationError));
+                                setSpecSettingsSaveError(errorMessage(validationError));
                               }
                             }
                           }}
@@ -6673,6 +6764,12 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
+
+                {specJobsError ? (
+                  <div className="border-b border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
+                    {specJobsError}
+                  </div>
+                ) : null}
 
                 <div className="panel-scroll overflow-x-auto" onWheel={handleSettingsTableWheel}>
                   <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
@@ -13880,6 +13977,41 @@ function emptySpecSettingsForm(): SpecSettingsFormState {
     generationModelId: "",
     llmTimeoutMs: "120000",
   };
+}
+
+function specSettingsFormFromResponse(data: SettingsResponse): SpecSettingsFormState {
+  return {
+    autoEnabled: data.spec.autoEnabled,
+    generationModelId: data.spec.generationModelId ?? "",
+    llmTimeoutMs: String(data.spec.llmTimeoutMs),
+  };
+}
+
+function specSettingsFormsEqual(
+  left: SpecSettingsFormState,
+  right: SpecSettingsFormState,
+): boolean {
+  return (
+    left.autoEnabled === right.autoEnabled &&
+    left.generationModelId === right.generationModelId &&
+    left.llmTimeoutMs === right.llmTimeoutMs
+  );
+}
+
+/** Matches backend validate_spec_settings: enabled + active provider enabled. */
+function isSpecEligibleGenerationModel(
+  model: ConfiguredModelSummary,
+  providers: readonly ConfiguredProviderSummary[],
+): boolean {
+  if (!model.enabled) {
+    return false;
+  }
+  const activeProviderId = model.activeProviderId;
+  if (!activeProviderId) {
+    return false;
+  }
+  const provider = providers.find((item) => item.id === activeProviderId);
+  return provider?.enabled === true;
 }
 
 function normalizedSystemPromptSummaries(
