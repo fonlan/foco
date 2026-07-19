@@ -4,7 +4,7 @@ import { act, fireEvent, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ConfiguredSkillSummary } from "./api/types";
+import type { ConfiguredSkillSummary, WorkspaceSummary } from "./api/types";
 import {
   activeMemory,
   aiStatistics,
@@ -578,6 +578,96 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await screen.findByRole("status", { name: "Context usage 33%" }),
     ).toHaveTextContent("33%");
+  });
+
+  it("sends a second remote message normally after a delayed terminal active-run snapshot", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const { chatKey } = configureRemoteChat();
+    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    renderApp();
+
+    const composer = await screen.findByPlaceholderText(
+      `Ask Foco anything about Remote project...`,
+    );
+    await userEvent.type(composer, "first remote task");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "remote-assistant-1",
+        chatId: remoteChatId,
+        memoriesUsed: [],
+        runId: "remote-run-1",
+        type: "start",
+        userMessageId: "remote-user-1",
+      });
+    });
+
+    const lateActiveRun = {
+      acceptingGuidance: true,
+      chatId: remoteChatId,
+      lastSequence: 8,
+      runId: "remote-run-1",
+      workspaceId: remoteWorkspaceId,
+    };
+    const workspaceSummaries =
+      appTestState.workspaceResponseWorkspaces as WorkspaceSummary[];
+    appTestState.workspaceResponseWorkspaces = workspaceSummaries.map(
+      (workspaceSummary) =>
+        workspaceSummary.id === remoteWorkspaceId
+          ? {
+            ...workspaceSummary,
+            chats: workspaceSummary.chats.map((chat) =>
+              chat.id === remoteChatId ? { ...chat, activeRun: lateActiveRun } : chat,
+            ),
+          }
+          : workspaceSummary,
+    );
+    appTestState.chatMessagesResponsesByChatKey[chatKey] = {
+      ...appTestState.chatMessagesResponsesByChatKey[chatKey],
+      activeRun: lateActiveRun,
+    } as typeof chatMessages;
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "remote-assistant-1",
+        chatId: remoteChatId,
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "model-1",
+          outputTokens: 1,
+          providerId: "provider-1",
+          totalLatencyMs: 100,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "First remote answer.",
+        type: "complete",
+      });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+    });
+
+    await userEvent.type(composer, "second remote task");
+    const sendButton = await screen.findByRole("button", { name: "Send message" });
+    expect(sendButton).toBeEnabled();
+    await userEvent.click(sendButton);
+
+    await waitFor(() => {
+      const streamCalls = fetchMock.mock.calls.filter(
+        ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/chat/stream`,
+      );
+      expect(streamCalls).toHaveLength(2);
+    });
+    const queueCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/chat/queue`,
+    );
+    const guidanceCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/chat/guidance`,
+    );
+    expect(queueCalls).toHaveLength(2);
+    expect(guidanceCalls).toHaveLength(0);
   });
 
   it("refreshes terminal context usage after a remote stream error", async () => {

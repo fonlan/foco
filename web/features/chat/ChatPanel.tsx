@@ -392,7 +392,8 @@ function ChatPanelComponent({
     [selectedSkillSet, skillQuery, skills],
   );
   const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
-  const runningButtonSendsMessage = isSendingMessage && hasComposerDraft;
+  const runningButtonSendsMessage =
+    isSendingMessage && hasComposerDraft && canGuideActiveRun;
   const runningButtonLabel = runningButtonSendsMessage
     ? t("Send guidance")
     : t("Cancel run");
@@ -785,8 +786,7 @@ function ChatPanelComponent({
   function handleRunningRunButtonClick(
     event: ReactMouseEvent<HTMLButtonElement>,
   ) {
-    const hasDraft = Boolean(draftMessage.trim() || draftAttachments.length);
-    if (!hasDraft) {
+    if (!runningButtonSendsMessage) {
       onCancelRun();
       return;
     }

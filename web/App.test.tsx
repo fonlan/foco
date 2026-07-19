@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 describe("remote start run identity", () => {
@@ -17,6 +17,47 @@ describe("remote start run identity", () => {
 
     expect(event).toMatchObject({ type: "start", runId: "remote-run-1" });
     expect(activeRunIdFromStartEvent(event ?? {})).toBe("remote-run-1");
+  });
+});
+
+describe("remote run terminal identity", () => {
+  const activeRun: ActiveRunInfo = {
+    acceptingGuidance: true,
+    chatId: "chat-1",
+    chatKey: "workspace-1:chat-1",
+    runId: "remote-run-1",
+    workspaceId: "workspace-1",
+  };
+
+  it("keeps a delayed activeRun snapshot inert after the same run completed", () => {
+    const delayedSnapshot = {
+      acceptingGuidance: true,
+      chatId: "chat-1",
+      lastSequence: 8,
+      runId: "remote-run-1",
+      workspaceId: "workspace-1",
+    };
+
+    expect(isTerminalActiveRun(delayedSnapshot, "remote-run-1")).toBe(true);
+    expect(
+      deriveChatSessionStatus({
+        activeChatKey: "workspace-1:chat-1",
+        activeRunInfoByChatKey: {},
+        chatKey: "workspace-1:chat-1",
+        failedChatKeySet: new Set(),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        runningChatKeys: new Set(),
+        terminalRunId: "remote-run-1",
+        workspaceActiveRun: delayedSnapshot,
+      }),
+    ).toEqual({ activeRun: null, kind: "open" });
+  });
+
+  it("only permits guidance for a stable, current run identity", () => {
+    expect(isGuidableActiveRun(activeRun, true)).toBe(true);
+    expect(isGuidableActiveRun(activeRun, false)).toBe(false);
+    expect(isGuidableActiveRun({ ...activeRun, acceptingGuidance: false }, true)).toBe(false);
+    expect(isGuidableActiveRun({ ...activeRun, runId: null }, true)).toBe(false);
   });
 });
 

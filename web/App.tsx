@@ -896,8 +896,27 @@ type ChatSessionStatusInput = {
   runningChatKeys: Set<string>;
   scheduledChatKey?: string | null;
   scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
+  terminalRunId?: string | null;
   workspaceActiveRun?: ActiveChatRunSummary | null;
 };
+
+export function isTerminalActiveRun(
+  activeRun: ActiveChatRunSummary | null | undefined,
+  terminalRunId: string | null | undefined,
+): boolean {
+  return Boolean(activeRun?.runId && terminalRunId && activeRun.runId === terminalRunId);
+}
+
+export function isGuidableActiveRun(
+  runInfo: ActiveRunInfo | null | undefined,
+  isRunning: boolean,
+): runInfo is ActiveRunInfo & { runId: string } {
+  return Boolean(
+    isRunning &&
+      runInfo?.runId &&
+      runInfo.acceptingGuidance,
+  );
+}
 
 export function deriveChatSessionStatus({
   activeChatKey,
@@ -909,20 +928,27 @@ export function deriveChatSessionStatus({
   runningChatKeys,
   scheduledChatKey = null,
   scheduledStatus = null,
+  terminalRunId = null,
   workspaceActiveRun = null,
 }: ChatSessionStatusInput): ChatSessionStatus {
   const statusChatKeys = scheduledChatKey && scheduledChatKey !== chatKey
     ? [chatKey, scheduledChatKey]
     : [chatKey];
+  const operationalWorkspaceActiveRun = isTerminalActiveRun(
+    workspaceActiveRun,
+    terminalRunId,
+  )
+    ? null
+    : workspaceActiveRun;
   const activeRun =
     statusChatKeys
       .map((statusChatKey) => activeRunInfoByChatKey[statusChatKey] ?? null)
       .find((runInfo): runInfo is ActiveRunInfo => runInfo !== null) ??
-    workspaceActiveRun;
+    operationalWorkspaceActiveRun;
   // persistedRunning is tab/sidebar lifecycle only — never invents activeRun for cancel/guidance.
   const isRunning =
     statusChatKeys.some((statusChatKey) => runningChatKeys.has(statusChatKey)) ||
-    workspaceActiveRun !== null ||
+    operationalWorkspaceActiveRun !== null ||
     persistedRunning;
   const isScheduled = scheduledStatus === "queued" || scheduledStatus === "starting";
   const isOpen = statusChatKeys.some(
@@ -1672,6 +1698,10 @@ export function App() {
   const restoredPendingQuestionIdsRef = useRef<Set<string>>(new Set());
   const isCheckingPendingQuestionsRef = useRef(false);
   const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
+  // A completed run may briefly reappear in a delayed workspace/messages response.
+  // Keep only the terminal identity, not a mirrored running flag, so a different
+  // subsequent run can start normally while the old snapshot stays inert.
+  const terminalRunIdByChatKeyRef = useRef<Map<string, string>>(new Map());
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
   >({});
@@ -1934,6 +1964,7 @@ export function App() {
         runningChatKeys,
         scheduledChatKey: options.scheduledChatKey,
         scheduledStatus: options.scheduledStatus,
+        terminalRunId: terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
         workspaceActiveRun: options.workspaceActiveRun ?? null,
       }),
     [
@@ -1971,6 +2002,7 @@ export function App() {
         runningChatKeys,
         scheduledChatKey: options.scheduledChatKey,
         scheduledStatus: options.scheduledStatus,
+        terminalRunId: terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
         workspaceActiveRun: options.workspaceActiveRun ?? null,
       });
     },
@@ -5701,7 +5733,11 @@ export function App() {
     }
   }
 
-  function clearWorkspaceChatActiveRun(workspaceId: string, chatId: string) {
+  function clearWorkspaceChatActiveRun(
+    workspaceId: string,
+    chatId: string,
+    expectedRunId: string | null = null,
+  ) {
     setWorkspaces((current) => {
       let changed = false;
       const nextWorkspaces = current.map((workspace) => {
@@ -5711,7 +5747,11 @@ export function App() {
 
         let workspaceChanged = false;
         const nextChats = workspace.chats.map((chat) => {
-          if (chat.id !== chatId || chat.activeRun === null) {
+          if (
+            chat.id !== chatId ||
+            chat.activeRun === null ||
+            (expectedRunId !== null && chat.activeRun.runId !== expectedRunId)
+          ) {
             return chat;
           }
 
@@ -5729,6 +5769,45 @@ export function App() {
 
       return changed ? nextWorkspaces : current;
     });
+  }
+
+  function startChatRun(chatKey: string, runId: string | null): boolean {
+    if (!runId) {
+      return true;
+    }
+
+    const terminalRunId = terminalRunIdByChatKeyRef.current.get(chatKey);
+    if (terminalRunId === runId) {
+      return false;
+    }
+
+    if (terminalRunId !== undefined) {
+      terminalRunIdByChatKeyRef.current.delete(chatKey);
+    }
+    return true;
+  }
+
+  function finishChatRun(
+    chatKey: string,
+    runId: string | null,
+    workspaceId: string,
+    chatId: string | null,
+  ): boolean {
+    const currentRun = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
+    if (runId && currentRun?.runId && currentRun.runId !== runId) {
+      return false;
+    }
+
+    if (runId) {
+      terminalRunIdByChatKeyRef.current.set(chatKey, runId);
+    }
+    setChatRunning(chatKey, false);
+    setActiveRunInfoForChatKey(chatKey, null);
+    clearLiveChatStatistics(chatKey);
+    if (chatId) {
+      clearWorkspaceChatActiveRun(workspaceId, chatId, runId);
+    }
+    return true;
   }
 
   function updateQueuedRunRequestsForChatKey(
@@ -6216,7 +6295,16 @@ export function App() {
       const normalizedMessages = expandMessagesWithUserInterruptions(
         data.messages.map(normalizeChatMessageSummary),
       );
-      const activeRun = normalizeActiveChatRunSummary(data.activeRun);
+      const reportedActiveRun = normalizeActiveChatRunSummary(data.activeRun);
+      const activeRun = isTerminalActiveRun(
+        reportedActiveRun,
+        terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
+      )
+        ? null
+        : reportedActiveRun;
+      if (reportedActiveRun && activeRun === null) {
+        clearWorkspaceChatActiveRun(workspaceId, chatId, reportedActiveRun.runId);
+      }
       const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
       const localRunInfo = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
       const hasLocalActiveRun =
@@ -8405,9 +8493,10 @@ export function App() {
       runInfo.chatKey !== requestChatKey ||
       runInfo.workspaceId !== request.workspaceId ||
       runInfo.chatId !== request.chatId ||
-      !runInfo.runId ||
-      !runInfo.acceptingGuidance ||
-      !runningChatKeysRef.current.has(requestChatKey)
+      !isGuidableActiveRun(
+        runInfo,
+        runningChatKeysRef.current.has(requestChatKey),
+      )
     ) {
       return null;
     }
@@ -9321,6 +9410,14 @@ export function App() {
     isReconnect = false,
   ) {
     const chatKey = chatRunKey(activeRun.workspaceId, activeRun.chatId);
+    if (!startChatRun(chatKey, activeRun.runId)) {
+      clearWorkspaceChatActiveRun(
+        activeRun.workspaceId,
+        activeRun.chatId,
+        activeRun.runId,
+      );
+      return;
+    }
     const existingAbortController = activeRunAbortByChatKeyRef.current.get(chatKey);
     if (existingAbortController) {
       const existingRunId = activeRunInfoByChatKeyRef.current[chatKey]?.runId;
@@ -9621,10 +9718,12 @@ export function App() {
             status: response.status,
             workspaceId: activeRun.workspaceId,
           });
-          setChatRunning(chatKey, false);
-          setActiveRunInfoForChatKey(chatKey, null);
-          clearLiveChatStatistics(chatKey);
-          clearWorkspaceChatActiveRun(activeRun.workspaceId, activeRun.chatId);
+          finishChatRun(
+            chatKey,
+            activeRun.runId,
+            activeRun.workspaceId,
+            activeRun.chatId,
+          );
           await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
           return;
         }
@@ -9655,6 +9754,9 @@ export function App() {
         }
 
         if (streamEvent.type === "start") {
+          if (!startChatRun(chatKey, activeRun.runId)) {
+            return;
+          }
           const previousAssistantMessageId = currentAssistantMessageId;
           const startsNewAssistantBubble =
             previousAssistantMessageId !== streamEvent.assistantMessageId &&
@@ -9888,8 +9990,7 @@ export function App() {
           void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
           void refreshWorkspaces();
           setChatRunFailed(chatKey, false);
-          setChatRunning(chatKey, false);
-          setActiveRunInfoForChatKey(chatKey, null);
+          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -10105,6 +10206,7 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
           refreshTerminalContextUsage();
           refreshActiveAgentTeamSnapshot(activeRun.workspaceId, activeRun.chatId);
           void refreshMessagesAfterSpecJobSettles(
@@ -10123,9 +10225,8 @@ export function App() {
             workspaceId: activeRun.workspaceId,
           });
           finishLiveReasoningDuration();
-          stopLiveReasoningDuration();
           setChatRunFailed(chatKey, true);
-          setChatRunning(chatKey, false);
+          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
           setError(streamEvent.message);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -10192,10 +10293,12 @@ export function App() {
           });
           void subscribeActiveChatRun(activeRunWithCurrentSequence(), true);
         } else {
-          setChatRunning(chatKey, false);
-          setActiveRunInfoForChatKey(chatKey, null);
-          clearLiveChatStatistics(chatKey);
-          clearWorkspaceChatActiveRun(activeRun.workspaceId, activeRun.chatId);
+          finishChatRun(
+            chatKey,
+            activeRun.runId,
+            activeRun.workspaceId,
+            activeRun.chatId,
+          );
         }
       }
     }
@@ -10659,6 +10762,14 @@ export function App() {
             request.workspaceId,
             streamEvent.chatId,
           );
+          // `runId` is the stable active-run identity. `llmRequestId` remains
+          // a legacy fallback for local streams that predate `runId`; provider
+          // attempts never update this value after the start event.
+          const startedRunId = activeRunIdFromStartEvent(streamEvent) ?? activeRunId;
+          if (!startChatRun(currentRunningChatKey, startedRunId)) {
+            return;
+          }
+          activeRunId = startedRunId;
           setChatRunFailed(currentRunningChatKey, false);
           if (pendingChatId) {
             replacePendingChatTab(
@@ -10784,10 +10895,6 @@ export function App() {
             streamEvent.memoriesUsed,
           );
           setChatRunning(currentRunningChatKey, true);
-          // `runId` is the stable active-run identity. `llmRequestId` remains
-          // a legacy fallback for local streams that predate `runId`; provider
-          // attempts never update this value after the start event.
-          activeRunId = activeRunIdFromStartEvent(streamEvent) ?? activeRunId;
           setActiveRunInfoForChatKey(currentRunningChatKey, {
             acceptingGuidance: activeRunId !== null,
             chatId: streamEvent.chatId,
@@ -11000,13 +11107,17 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: liveStatisticsUsage,
           });
-          setActiveRunInfoForChatKey(runMessagesKey, null);
+          finishChatRun(
+            runMessagesKey,
+            activeRunId,
+            request.workspaceId,
+            requestChatId,
+          );
           if (requestChatId) {
             void loadChatStatistics(request.workspaceId, requestChatId);
           }
           void refreshWorkspaces();
           setChatRunFailed(runMessagesKey, false);
-          setChatRunning(runMessagesKey, false);
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -11231,6 +11342,12 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          finishChatRun(
+            currentRunningChatKey,
+            activeRunId,
+            request.workspaceId,
+            requestChatId,
+          );
           refreshTerminalContextUsage();
           if (requestChatId) {
             refreshActiveAgentTeamSnapshot(request.workspaceId, requestChatId);
@@ -11248,7 +11365,12 @@ export function App() {
           stopLiveReasoningDuration();
           streamHadError = true;
           setChatRunFailed(runMessagesKey, true);
-          setChatRunning(currentRunningChatKey, false);
+          finishChatRun(
+            currentRunningChatKey,
+            activeRunId,
+            request.workspaceId,
+            requestChatId,
+          );
           setError(streamEvent.message);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -11300,9 +11422,12 @@ export function App() {
         abortController
       ) {
         activeRunAbortByChatKeyRef.current.delete(currentRunningChatKey);
-        setChatRunning(currentRunningChatKey, false);
-        setActiveRunInfoForChatKey(currentRunningChatKey, null);
-        clearLiveChatStatistics(currentRunningChatKey);
+        finishChatRun(
+          currentRunningChatKey,
+          activeRunId,
+          request.workspaceId,
+          requestChatId,
+        );
       }
     }
 
@@ -12744,11 +12869,10 @@ export function App() {
                   availableModels={availableModels}
                   branchError={branchError}
                   chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
-                  canGuideActiveRun={
-                    activeRunInfo?.chatKey === activeChatKey &&
-                    activeRunInfo.runId !== null &&
-                    activeRunInfo.acceptingGuidance
-                  }
+                  canGuideActiveRun={isGuidableActiveRun(
+                    activeRunInfo?.chatKey === activeChatKey ? activeRunInfo : null,
+                    activeChatKey !== null && runningChatKeys.has(activeChatKey),
+                  )}
                   draftAttachments={draftAttachments}
                   draftMessage={draftMessage}
                   draftUnsupportedAttachmentMessage={unsupportedDraftAttachmentMessage}
@@ -16227,13 +16351,14 @@ function readSseFrames(
   return remaining;
 }
 
-export function activeRunIdFromStartEvent(event: {
-  runId?: string;
-  llmRequestId?: string;
-}): string | null {
+export function activeRunIdFromStartEvent(event: unknown): string | null {
+  const value = isObjectRecord(event) ? event : {};
+  const runId = typeof value.runId === "string" ? value.runId : null;
+  const llmRequestId =
+    typeof value.llmRequestId === "string" ? value.llmRequestId : null;
   // Remote `runId` remains stable for the whole chat run. The legacy local
   // start field is a fallback only; individual provider attempts never reach here.
-  return event.runId ?? event.llmRequestId ?? null;
+  return runId ?? llmRequestId;
 }
 
 export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
