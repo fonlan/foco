@@ -5932,6 +5932,15 @@ fn plan_phase_merge_attempt_can_begin_once() {
         .expect("plan lookup")
         .expect("plan");
     assert_eq!(plan.phases[0].merge_attempt_count, 1);
+    let attempt = plan.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("durable merge attempt");
+    assert_eq!(attempt.status, "queued");
+    assert!(attempt.implementation_chat_id.is_none());
+    assert!(attempt.agent_team_id.is_none());
+    assert!(attempt.agent_task_id.is_none());
     assert_eq!(
         plan.phases[0].error_message.as_deref(),
         Some("first merge failure")
@@ -17626,6 +17635,19 @@ fn attach_test_plan_merge_run(
             .try_begin_plan_phase_merge_attempt(plan_id, phase_id, "shared workspace HEAD changed")
             .expect("record merge attempt")
     );
+
+    // Older local/manual merge runs record the once-only counter but have no durable
+    // `merge_auto` attempt. Keep their lifecycle tests representative of that state.
+    let connection = Connection::open(database.database_path()).expect("legacy merge connection");
+    let removed = connection
+        .execute(
+            "DELETE FROM plan_phase_attempts
+             WHERE plan_id = ?1 AND phase_id = ?2 AND trigger = 'merge_auto'",
+            params![plan_id, phase_id],
+        )
+        .expect("remove durable merge attempt for legacy fixture");
+    assert_eq!(removed, 1, "seed legacy merge fixture");
+    drop(connection);
 
     let (merge_team_id, merge_instance_id) = create_test_agent_team(
         database,

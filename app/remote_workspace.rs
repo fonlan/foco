@@ -34338,4 +34338,431 @@ mod tests {
         );
         assert_eq!(completed_task.status, AgentTaskStatus::Completed);
     }
+
+    fn remote_plan_merge_test_definition(suffix: &str) -> AgentDefinitionSettings {
+        AgentDefinitionSettings {
+            id: AgentDefinitionId::new(format!("agent-definition-{suffix}"))
+                .expect("definition id"),
+            revision: 1,
+            name: format!("Remote Plan {suffix}"),
+            description: String::new(),
+            provider_id: "provider-1".to_string(),
+            model_id: "model-1".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Complete the Plan phase.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        }
+    }
+
+    fn remote_plan_merge_test_git(workspace: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(workspace)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("git stdout")
+            .trim()
+            .to_string()
+    }
+
+    fn setup_remote_plan_merge_fixture(
+        workspace: &Path,
+        suffix: &str,
+        advance_shared_head: bool,
+    ) -> (
+        foco_store::workspace::PlanRecord,
+        RemotePlanWorktree,
+        String,
+    ) {
+        remote_plan_merge_test_git(workspace, &["init", "--initial-branch=main"]);
+        remote_plan_merge_test_git(workspace, &["config", "user.email", "tests@example.com"]);
+        remote_plan_merge_test_git(workspace, &["config", "user.name", "Foco Tests"]);
+        fs::write(workspace.join("README.md"), "base\n").expect("write base file");
+        fs::write(workspace.join(".gitignore"), ".foco/\n").expect("ignore Foco runtime");
+        remote_plan_merge_test_git(workspace, &["add", "README.md", ".gitignore"]);
+        remote_plan_merge_test_git(workspace, &["commit", "-m", "base"]);
+
+        let plan_id = format!("plan-remote-merge-{suffix}");
+        let phase_id = format!("plan-remote-merge-{suffix}-phase");
+        let chat_id = format!("chat-remote-merge-{suffix}");
+        let team_id =
+            AgentTeamId::new(format!("agent-team-remote-merge-{suffix}")).expect("team id");
+        let instance_id = AgentInstanceId::new(format!("agent-instance-remote-merge-{suffix}"))
+            .expect("instance id");
+        let task_id =
+            AgentTaskId::new(format!("agent-task-remote-merge-{suffix}")).expect("task id");
+        let worktree = create_agent_worktree(workspace, instance_id.as_str()).expect("worktree");
+        fs::write(
+            worktree.root_path.join("phase-change.txt"),
+            "source Plan change\n",
+        )
+        .expect("write source Plan change");
+        remote_plan_merge_test_git(&worktree.root_path, &["add", "phase-change.txt"]);
+        remote_plan_merge_test_git(&worktree.root_path, &["commit", "-m", "Plan source change"]);
+        if advance_shared_head {
+            fs::write(workspace.join("shared-head.txt"), "shared change\n")
+                .expect("write shared change");
+            remote_plan_merge_test_git(workspace, &["add", "shared-head.txt"]);
+            remote_plan_merge_test_git(workspace, &["commit", "-m", "advance shared head"]);
+        }
+        let shared_head = shared_workspace_head_commit_id(workspace).expect("shared head");
+        let worktree_root = agent_worktree_relative_path(workspace, &worktree.root_path)
+            .expect("relative source worktree");
+        let definition = remote_plan_merge_test_definition(suffix);
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace).expect("workspace database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: &plan_id,
+                title: "Remote merge fixture",
+                overview: "Exercise remote Plan merge finalization.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: &phase_id,
+                    title: "Implementation",
+                    summary: "Create the source change.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: &format!("plan-remote-merge-{suffix}-step"),
+                        title: "Apply source change",
+                        detail: "The implementation Coordinator completes this step.",
+                        acceptance: vec!["source change is committed".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(&plan_id, "start")
+            .expect("start plan");
+        database
+            .begin_plan_phase_attempt(
+                &plan_id,
+                &phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider-1"),
+                Some("model-1"),
+                None,
+            )
+            .expect("begin phase attempt");
+        database
+            .insert_chat(&chat_id, "Remote implementation")
+            .expect("chat");
+        database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: &chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
+                coordinator_execution_root_path: Some(&worktree_root),
+                coordinator_worktree_base_revision: Some(&worktree.base_revision),
+                coordinator_worktree_branch: Some(&worktree.branch),
+                coordinator_worktree_status: Some("active"),
+                max_concurrent_runs: 1,
+            })
+            .expect("implementation team");
+        let input_json = json!({
+            "planTaskKind": REMOTE_PLAN_TASK_KIND_IMPLEMENTATION,
+            "planId": plan_id,
+            "phaseId": phase_id,
+        })
+        .to_string();
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: &input_json,
+            })
+            .expect("enqueue implementation task");
+        database
+            .attach_plan_phase_run(&plan_id, &phase_id, &chat_id, &team_id, &task_id)
+            .expect("attach implementation task");
+        database
+            .claim_runnable_agent_task(
+                &team_id,
+                &task_id,
+                &AgentAttemptId::new(format!("agent-attempt-remote-merge-{suffix}"))
+                    .expect("attempt id"),
+            )
+            .expect("claim implementation task")
+            .expect("implementation task claimed");
+        assert!(
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Complete,
+                    result_json: Some("{}"),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("complete implementation task")
+        );
+        database
+            .complete_plan_phase_run(&task_id, Some("source-commit"))
+            .expect("complete implementation phase")
+            .expect("plan after implementation completion");
+        let plan = database
+            .complete_plan_phase_by_id(&plan_id, &phase_id, Some("source-commit"))
+            .expect("settle implementation phase");
+        assert_eq!(plan.status, "implemented");
+
+        (
+            plan,
+            RemotePlanWorktree {
+                root_path: worktree.root_path,
+                base_revision: worktree.base_revision,
+                branch: worktree.branch,
+                phase_id,
+            },
+            shared_head,
+        )
+    }
+
+    fn remote_plan_merge_test_state(
+        workspace: &Path,
+        mode: &str,
+    ) -> (RemoteSidecarState, mpsc::UnboundedReceiver<ControlEnvelope>) {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let (state, broker_rx) = test_sidecar_state(workspace.display().to_string(), 1);
+        let config = {
+            let mut config = remote_test_config(workspace);
+            config.plan.merge_automation_mode = mode.to_string();
+            config
+                .agent_definitions
+                .push(remote_plan_merge_test_definition("default"));
+            config
+        };
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+        let broker = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+        (state, broker)
+    }
+
+    #[tokio::test]
+    async fn remote_finalize_head_mismatch_dispatches_direct_merge_with_source_diff() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, _source_worktree, _shared_head) =
+            setup_remote_plan_merge_fixture(workspace.path(), "direct-dispatch", true);
+        let (state, _broker) =
+            remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
+
+        remote_sidecar_finalize_plan_worktree(&state, &plan)
+            .await
+            .expect("finalize source worktree");
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
+        let phase = &refreshed.phases[0];
+        let task_id = AgentTaskId::new(phase.agent_task_id.clone().expect("merge task id"))
+            .expect("merge task id format");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .expect("task");
+        let team = database
+            .agent_team(&task.team_id)
+            .expect("team lookup")
+            .expect("team");
+        let coordinator = database
+            .agent_instance(&team.coordinator_instance_id)
+            .expect("Coordinator lookup")
+            .expect("Coordinator");
+        let merge_attempt = phase
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_auto")
+            .expect("durable merge attempt");
+
+        assert_eq!(refreshed.status, "running");
+        assert_eq!(phase.status, "running");
+        assert!(refreshed.shared_merge_commit_id.is_none());
+        assert_eq!(task.status, AgentTaskStatus::Running);
+        assert_eq!(merge_attempt.status, "running");
+        assert_eq!(
+            merge_attempt.implementation_chat_id,
+            phase.implementation_chat_id
+        );
+        assert_eq!(
+            merge_attempt.agent_team_id.as_deref(),
+            Some(task.team_id.as_str())
+        );
+        assert_eq!(
+            merge_attempt.agent_task_id.as_deref(),
+            Some(task_id.as_str())
+        );
+        assert!(merge_attempt.started_at.is_some());
+        assert_eq!(
+            coordinator.execution_workspace_mode,
+            AgentExecutionWorkspaceMode::Shared
+        );
+        assert!(coordinator.execution_root_path.is_none());
+        assert!(coordinator.worktree_base_revision.is_none());
+        assert_eq!(
+            task.input_json.contains(PLAN_MERGE_AUTOMATION_DIRECT_AUTO),
+            true
+        );
+        assert!(task.input_json.contains("phase-change.txt"));
+        assert!(task.input_json.contains("source Plan change"));
+    }
+
+    #[tokio::test]
+    async fn remote_finalize_head_mismatch_dispatches_isolated_merge_from_current_shared_head() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, source_worktree, shared_head) =
+            setup_remote_plan_merge_fixture(workspace.path(), "isolated-dispatch", true);
+        let (state, _broker) = remote_plan_merge_test_state(
+            workspace.path(),
+            PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
+        );
+
+        remote_sidecar_finalize_plan_worktree(&state, &plan)
+            .await
+            .expect("finalize source worktree");
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
+        let phase = &refreshed.phases[0];
+        let task_id = AgentTaskId::new(phase.agent_task_id.clone().expect("merge task id"))
+            .expect("merge task id format");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .expect("task");
+        let team = database
+            .agent_team(&task.team_id)
+            .expect("team lookup")
+            .expect("team");
+        let coordinator = database
+            .agent_instance(&team.coordinator_instance_id)
+            .expect("Coordinator lookup")
+            .expect("Coordinator");
+        let merge_attempt = phase
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_auto")
+            .expect("durable merge attempt");
+        let source_worktree_root =
+            agent_worktree_relative_path(workspace.path(), &source_worktree.root_path)
+                .expect("relative source worktree");
+
+        assert_eq!(refreshed.status, "running");
+        assert_eq!(phase.status, "running");
+        assert!(refreshed.shared_merge_commit_id.is_none());
+        assert_eq!(task.status, AgentTaskStatus::Running);
+        assert_eq!(merge_attempt.status, "running");
+        assert_eq!(
+            merge_attempt.implementation_chat_id,
+            phase.implementation_chat_id
+        );
+        assert_eq!(
+            merge_attempt.agent_team_id.as_deref(),
+            Some(task.team_id.as_str())
+        );
+        assert_eq!(
+            merge_attempt.agent_task_id.as_deref(),
+            Some(task_id.as_str())
+        );
+        assert!(merge_attempt.started_at.is_some());
+        assert_eq!(
+            coordinator.execution_workspace_mode,
+            AgentExecutionWorkspaceMode::IsolatedWorktree
+        );
+        assert_ne!(
+            coordinator.execution_root_path.as_deref(),
+            Some(source_worktree_root.as_str())
+        );
+        assert_eq!(
+            coordinator.worktree_base_revision.as_deref(),
+            Some(shared_head.as_str())
+        );
+        assert_eq!(
+            task.input_json
+                .contains(PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE),
+            true
+        );
+        assert!(task.input_json.contains("phase-change.txt"));
+    }
+
+    #[tokio::test]
+    async fn remote_finalize_keeps_dirty_shared_workspace_merge_blocked_without_merge_task() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, _source_worktree, _shared_head) =
+            setup_remote_plan_merge_fixture(workspace.path(), "dirty-blocked", false);
+        fs::write(workspace.path().join("uncommitted.txt"), "dirty\n")
+            .expect("write uncommitted shared change");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+
+        remote_sidecar_finalize_plan_worktree(&state, &plan)
+            .await
+            .expect("finalize source worktree");
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
+        let phase = &refreshed.phases[0];
+        assert_eq!(refreshed.status, "implemented");
+        assert_eq!(phase.status, "completed");
+        assert!(refreshed.shared_merge_commit_id.is_none());
+        assert!(
+            phase
+                .attempts
+                .iter()
+                .all(|attempt| attempt.trigger != "merge_auto")
+        );
+        assert!(phase.error_message.as_deref().is_some_and(|message| {
+            message.contains(crate::git_backend::AGENT_WORKTREE_SHARED_DIRTY_MESSAGE)
+        }));
+    }
+
+    #[tokio::test]
+    async fn remote_finalize_head_mismatch_only_dispatches_one_automatic_merge_attempt() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, _source_worktree, _shared_head) =
+            setup_remote_plan_merge_fixture(workspace.path(), "one-attempt", true);
+        let (state, _broker) =
+            remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
+
+        remote_sidecar_finalize_plan_worktree(&state, &plan)
+            .await
+            .expect("first finalize");
+        let first = {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database.plan(&plan.id).expect("plan lookup").expect("plan")
+        };
+        remote_sidecar_finalize_plan_worktree(&state, &first)
+            .await
+            .expect("second finalize");
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
+        let merge_tasks = refreshed.phases[0]
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.trigger == "merge_auto")
+            .count();
+        assert_eq!(merge_tasks, 1);
+        assert_eq!(refreshed.status, "running");
+        assert_eq!(refreshed.phases[0].status, "running");
+        assert!(refreshed.shared_merge_commit_id.is_none());
+    }
 }

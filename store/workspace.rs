@@ -3281,7 +3281,40 @@ impl WorkspaceDatabase {
             });
         }
         let now = now_timestamp();
-        self.connection
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'running',
+                     implementation_chat_id = ?3,
+                     agent_team_id = ?4,
+                     agent_task_id = ?5,
+                     started_at = COALESCE(started_at, ?6),
+                     updated_at = ?6
+                 WHERE id = (
+                     SELECT id FROM plan_phase_attempts
+                     WHERE plan_id = ?1
+                       AND phase_id = ?2
+                       AND trigger = 'merge_auto'
+                       AND status = 'queued'
+                     ORDER BY sequence DESC
+                     LIMIT 1
+                 )",
+                params![
+                    plan.id.as_str(),
+                    phase.id.as_str(),
+                    implementation_chat_id.trim(),
+                    agent_team_id.as_str(),
+                    agent_task_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plan_phases
                  SET status = 'running',
@@ -3301,8 +3334,8 @@ impl WorkspaceDatabase {
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plans
                  SET status = 'running',
@@ -3313,7 +3346,10 @@ impl WorkspaceDatabase {
                  WHERE id = ?1",
                 params![plan.id.as_str(), phase.id.as_str(), now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
         self.plan(plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
                 message: format!(
@@ -4431,8 +4467,12 @@ impl WorkspaceDatabase {
     ) -> Result<bool, WorkspaceDatabaseError> {
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         let now = now_timestamp();
-        let updated = self
+        let database_path = self.database_path.clone();
+        let transaction = self
             .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let updated = transaction
             .execute(
                 "UPDATE plan_phases
                  SET merge_attempt_count = merge_attempt_count + 1,
@@ -4446,8 +4486,45 @@ impl WorkspaceDatabase {
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        Ok(updated == 1)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated == 0 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1",
+                params![phase.id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let attempt_id = format!("plan-phase-attempt-{}-{sequence}", phase.id);
+        transaction
+            .execute(
+                "INSERT INTO plan_phase_attempts (
+                    id, plan_id, phase_id, sequence, trigger, status,
+                    error_message, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7)",
+                params![
+                    attempt_id,
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    sequence,
+                    PlanPhaseAttemptTrigger::MergeAuto.as_str(),
+                    error_message.trim(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     pub fn fail_plan_phase_start(
