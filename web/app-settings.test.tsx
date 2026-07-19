@@ -1646,6 +1646,12 @@ describe("app-settings verification surfaces", () => {
           enabled: false,
           id: "disabled-model",
         },
+        {
+          ...appTestState.settingsResponse.configuredModels[0]!,
+          activeProviderId: null,
+          displayName: "Providerless Model",
+          id: "providerless-model",
+        },
       ],
       spec: {
         ...appTestState.settingsResponse.spec,
@@ -1670,11 +1676,56 @@ describe("app-settings verification surfaces", () => {
     ).toBeInTheDocument();
     expect(modelSelect).not.toHaveValue("");
     expect(within(modelSelect).getByRole("option", { name: "Automatic" })).toBeInTheDocument();
+    // Historical disabled stays selected; other ineligible models stay off the option list.
+    expect(
+      within(modelSelect).queryByRole("option", { name: "Providerless Model" }),
+    ).toBeNull();
+    expect(
+      within(modelSelect).queryByRole("option", {
+        name: "Model unavailable: Providerless Model",
+      }),
+    ).toBeNull();
+  });
+
+  it("shows a historical providerless Spec generation model as unavailable", async () => {
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [
+        ...appTestState.settingsResponse.configuredModels,
+        {
+          ...appTestState.settingsResponse.configuredModels[0]!,
+          activeProviderId: null,
+          displayName: "Providerless Model",
+          id: "providerless-model",
+        },
+      ],
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        generationModelId: "providerless-model",
+      },
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    await waitFor(() => {
+      expect(modelSelect).toHaveValue("providerless-model");
+    });
+    expect(
+      within(modelSelect).getByRole("option", {
+        name: "Model unavailable: Providerless Model",
+      }),
+    ).toBeInTheDocument();
   });
 
   it("keeps Spec save errors when Spec job history reloads and rolls back failed saves", async () => {
     const fetchMock = vi.mocked(fetch);
     const originalFetch = mockFetch;
+    let jobsFetchCount = 0;
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input);
       if (path === "/api/settings/spec" && init?.method === "POST") {
@@ -1685,6 +1736,245 @@ describe("app-settings verification surfaces", () => {
           },
           { status: 400 },
         );
+      }
+      if (path.startsWith("/api/settings/spec/jobs?")) {
+        jobsFetchCount += 1;
+      }
+      return originalFetch(input, init);
+    });
+
+    // Keep a running job so the Spec section registers the 3s poll interval.
+    appTestState.settingsSpecJobsResponse = [
+      {
+        ...appTestState.settingsSpecJobsResponse[1]!,
+        job: {
+          ...appTestState.settingsSpecJobsResponse[1]!.job,
+          status: "running",
+        },
+      },
+    ];
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [
+        ...appTestState.settingsResponse.configuredModels,
+        {
+          ...appTestState.settingsResponse.configuredModels[0]!,
+          displayName: "Broken Model",
+          id: "broken-model",
+        },
+      ],
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        autoEnabled: true,
+        generationModelId: null,
+        generationSystemPrompt: "Do not clear this generation prompt",
+        updateSystemPrompt: "Do not clear this update prompt",
+      },
+    };
+
+    let specPoll: (() => void) | null = null;
+    const originalSetInterval = window.setInterval.bind(window);
+    vi.spyOn(window, "setInterval").mockImplementation((
+      ...args: Parameters<typeof window.setInterval>
+    ) => {
+      const [handler, timeout] = args;
+      if (timeout === 3000 && typeof handler === "function") {
+        specPoll = () => handler();
+        return 8400 as unknown as ReturnType<typeof window.setInterval>;
+      }
+      return (originalSetInterval as (...intervalArgs: unknown[]) => unknown)(
+        ...args,
+      ) as ReturnType<typeof window.setInterval>;
+    });
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    expect(modelSelect).toHaveValue("");
+
+    await userEvent.selectOptions(modelSelect, "broken-model");
+
+    const saveError = await screen.findByText(
+      /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
+    );
+    expect(saveError).toBeInTheDocument();
+    // Failed save must not leave a pseudo-persisted selection in the form.
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("");
+    });
+    expect(appTestState.settingsResponse.spec.generationModelId).toBeNull();
+    expect(appTestState.settingsResponse.spec.generationSystemPrompt).toBe(
+      "Do not clear this generation prompt",
+    );
+    expect(appTestState.settingsResponse.spec.updateSystemPrompt).toBe(
+      "Do not clear this update prompt",
+    );
+
+    const jobsBeforePoll = jobsFetchCount;
+    await waitFor(() => expect(specPoll).not.toBeNull());
+    const poll = specPoll as (() => void) | null;
+    if (!poll) {
+      throw new Error("Expected Spec job history polling interval to be registered");
+    }
+    await act(async () => {
+      poll();
+    });
+    await waitFor(() => {
+      expect(jobsFetchCount).toBeGreaterThan(jobsBeforePoll);
+    });
+
+    // Jobs polling must not clear the automation save error.
+    expect(
+      screen.getByText(
+        /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Spec generation model")).toHaveValue("");
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh Spec job history" }));
+    await waitFor(() => {
+      expect(jobsFetchCount).toBeGreaterThan(jobsBeforePoll + 1);
+    });
+    expect(
+      screen.getByText(
+        /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("serializes Spec saves with latest-wins coalescing (A→B→C drops B)", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const originalFetch = mockFetch;
+    const firstSaveGate = deferred<Response>();
+    let postCount = 0;
+    const postBodies: Array<Record<string, unknown>> = [];
+    const postStartOrder: number[] = [];
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/spec" && init?.method === "POST") {
+        postCount += 1;
+        const startedAt = postCount;
+        postStartOrder.push(startedAt);
+        const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
+        postBodies.push(body);
+        if (startedAt === 1) {
+          await firstSaveGate.promise;
+        }
+        return originalFetch(input, init);
+      }
+      return originalFetch(input, init);
+    });
+
+    const altModel: ConfiguredModelSummary = {
+      ...appTestState.settingsResponse.configuredModels[0]!,
+      displayName: "GPT Alt",
+      id: "gpt-alt",
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: [...appTestState.settingsResponse.configuredModels, altModel],
+      spec: {
+        ...appTestState.settingsResponse.spec,
+        autoEnabled: true,
+        generationModelId: null,
+        generationSystemPrompt: "Keep generation prompt across automation saves",
+        updateSystemPrompt: "Keep update prompt across automation saves",
+      },
+    };
+
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+
+    const modelSelect = await screen.findByLabelText("Spec generation model");
+    expect(modelSelect).toHaveValue("");
+    await waitFor(() => {
+      expect(within(modelSelect).getByRole("option", { name: "GPT Alt" })).toBeInTheDocument();
+    });
+
+    // Request A: toggle Auto Spec off while the POST is held open.
+    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
+    await waitFor(() => {
+      expect(postCount).toBe(1);
+    });
+
+    // Pending B then C while A is still in flight — only the latest pending snapshot (C) may ship.
+    await userEvent.selectOptions(modelSelect, "gpt-alt");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-alt");
+    });
+    expect(postCount).toBe(1);
+
+    await userEvent.selectOptions(modelSelect, "gpt-test");
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    });
+    expect(postCount).toBe(1);
+
+    firstSaveGate.resolve(undefined as unknown as Response);
+    await waitFor(() => {
+      expect(postCount).toBe(2);
+    });
+    await waitFor(() => {
+      expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
+    });
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    });
+
+    // Serial order: only A then C. Intermediate B (gpt-alt) must never be POSTed.
+    expect(postStartOrder).toEqual([1, 2]);
+    expect(postBodies).toHaveLength(2);
+    expect(postBodies[0]).toEqual({
+      autoEnabled: false,
+      generationModelId: null,
+      llmTimeoutMs: 120000,
+    });
+    expect(postBodies[1]).toEqual({
+      autoEnabled: false,
+      generationModelId: "gpt-test",
+      llmTimeoutMs: 120000,
+    });
+    expect(postBodies.some((body) => body.generationModelId === "gpt-alt")).toBe(false);
+    for (const body of postBodies) {
+      expect(body).not.toHaveProperty("generationSystemPrompt");
+      expect(body).not.toHaveProperty("updateSystemPrompt");
+    }
+    expect(appTestState.settingsResponse.spec.generationSystemPrompt).toBe(
+      "Keep generation prompt across automation saves",
+    );
+    expect(appTestState.settingsResponse.spec.updateSystemPrompt).toBe(
+      "Keep update prompt across automation saves",
+    );
+    expect(screen.getByLabelText("Enable Auto Spec")).not.toBeChecked();
+  });
+
+  it("clears a visible Spec save error after a later successful save", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const originalFetch = mockFetch;
+    let failNextSpecSave = true;
+    const secondSaveGate = deferred<Response>();
+    let postCount = 0;
+
+    fetchMock.mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/settings/spec" && init?.method === "POST") {
+        postCount += 1;
+        if (failNextSpecSave) {
+          failNextSpecSave = false;
+          return jsonResponse({ error: "first Spec save failed" }, { status: 400 });
+        }
+        // Hold the recovery save open so we can assert the prior error stays
+        // until success settles (not merely until the next attempt starts).
+        await secondSaveGate.promise;
+        return originalFetch(input, init);
       }
       return originalFetch(input, init);
     });
@@ -1703,6 +1993,8 @@ describe("app-settings verification surfaces", () => {
         ...appTestState.settingsResponse.spec,
         autoEnabled: true,
         generationModelId: null,
+        generationSystemPrompt: "Preserve generation prompt after error recovery",
+        updateSystemPrompt: "Preserve update prompt after error recovery",
       },
     };
 
@@ -1715,106 +2007,38 @@ describe("app-settings verification surfaces", () => {
     const modelSelect = await screen.findByLabelText("Spec generation model");
     expect(modelSelect).toHaveValue("");
 
+    // Let a failed save settle with no pending follow-up so the error is actually rendered.
     await userEvent.selectOptions(modelSelect, "broken-model");
-
-    const saveError = await screen.findByText(
-      /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
-    );
-    expect(saveError).toBeInTheDocument();
+    expect(await screen.findByText("first Spec save failed")).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.getByLabelText("Spec generation model")).toHaveValue("");
     });
-
-    await userEvent.click(screen.getByRole("button", { name: "Refresh Spec job history" }));
-    await waitFor(() => {
-      expect(
-        fetchMock.mock.calls.some(([url]) => String(url).startsWith("/api/settings/spec/jobs?")),
-      ).toBe(true);
-    });
-
-    expect(
-      screen.getByText(
-        /spec\.generation_model_id references missing, disabled, or providerless model 'broken-model'/,
-      ),
-    ).toBeInTheDocument();
     expect(appTestState.settingsResponse.spec.generationModelId).toBeNull();
-  });
-
-  it("serializes Spec saves latest-wins and clears a prior save error after success", async () => {
-    const fetchMock = vi.mocked(fetch);
-    const originalFetch = mockFetch;
-    const firstSaveGate = deferred<Response>();
-    let postCount = 0;
-    const postBodies: Array<Record<string, unknown>> = [];
-
-    fetchMock.mockImplementation(async (input, init) => {
-      const path = String(input);
-      if (path === "/api/settings/spec" && init?.method === "POST") {
-        postCount += 1;
-        const body = JSON.parse(String(init.body ?? "{}")) as Record<string, unknown>;
-        postBodies.push(body);
-        if (postCount === 1) {
-          await firstSaveGate.promise;
-          return jsonResponse({ error: "first Spec save failed" }, { status: 400 });
-        }
-        return originalFetch(input, init);
-      }
-      return originalFetch(input, init);
-    });
-
-    appTestState.settingsResponse = {
-      ...appTestState.settingsResponse,
-      spec: {
-        ...appTestState.settingsResponse.spec,
-        autoEnabled: true,
-        generationModelId: null,
-      },
-    };
-
-    renderApp();
-
-    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
-    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
-
-    const modelSelect = await screen.findByLabelText("Spec generation model");
-    expect(modelSelect).toHaveValue("");
-
-    await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
-    await waitFor(() => {
-      expect(postCount).toBe(1);
-    });
-
-    await userEvent.selectOptions(modelSelect, "gpt-test");
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
-    // Second save stays queued until the first request finishes.
     expect(postCount).toBe(1);
 
-    firstSaveGate.resolve(undefined as unknown as Response);
+    // Start a recovery save but keep it in flight: the prior error must remain.
+    await userEvent.selectOptions(screen.getByLabelText("Spec generation model"), "gpt-test");
     await waitFor(() => {
       expect(postCount).toBe(2);
     });
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
+    expect(screen.getByText("first Spec save failed")).toBeInTheDocument();
+    expect(appTestState.settingsResponse.spec.generationModelId).toBeNull();
+
+    // Only after the later save succeeds may the visible save error clear.
+    secondSaveGate.resolve(undefined as unknown as Response);
     await waitFor(() => {
       expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
     });
-
-    expect(postBodies[0]).toEqual({
-      autoEnabled: false,
-      generationModelId: null,
-      llmTimeoutMs: 120000,
-    });
-    expect(postBodies[1]).toEqual({
-      autoEnabled: false,
-      generationModelId: "gpt-test",
-      llmTimeoutMs: 120000,
+    await waitFor(() => {
+      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
     });
     expect(screen.queryByText("first Spec save failed")).not.toBeInTheDocument();
-    expect(screen.getByLabelText("Enable Auto Spec")).not.toBeChecked();
+    expect(appTestState.settingsResponse.spec.generationSystemPrompt).toBe(
+      "Preserve generation prompt after error recovery",
+    );
+    expect(appTestState.settingsResponse.spec.updateSystemPrompt).toBe(
+      "Preserve update prompt after error recovery",
+    );
   });
 
   it("does not let a stale settings GET overwrite a newer Spec save", async () => {
@@ -1822,18 +2046,19 @@ describe("app-settings verification surfaces", () => {
     const originalFetch = mockFetch;
     let holdNextSettingsGet = false;
     const staleGetGate = deferred<void>();
-    let staleSnapshot: typeof appTestState.settingsResponse | null = null;
+    let staleGenerationModelId: string | null | undefined;
 
     fetchMock.mockImplementation(async (input, init) => {
       const path = String(input);
       const method = String(init?.method ?? "GET").toUpperCase();
       if (path === "/api/settings" && method === "GET" && holdNextSettingsGet) {
         holdNextSettingsGet = false;
-        staleSnapshot = {
+        const staleSnapshot = {
           ...appTestState.settingsResponse,
           configuredModels: [...appTestState.settingsResponse.configuredModels],
           spec: { ...appTestState.settingsResponse.spec },
         };
+        staleGenerationModelId = staleSnapshot.spec.generationModelId;
         await staleGetGate.promise;
         return jsonResponse(staleSnapshot);
       }
@@ -1851,7 +2076,7 @@ describe("app-settings verification surfaces", () => {
     holdNextSettingsGet = true;
     await userEvent.click(screen.getByRole("button", { name: "Reload general settings" }));
     await waitFor(() => {
-      expect(staleSnapshot).not.toBeNull();
+      expect(staleGenerationModelId).toBeDefined();
     });
 
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
@@ -1874,7 +2099,7 @@ describe("app-settings verification surfaces", () => {
       await Promise.resolve();
     });
     expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    expect(staleSnapshot?.spec.generationModelId).not.toBe("gpt-test");
+    expect(staleGenerationModelId).not.toBe("gpt-test");
   });
 
   it("saves memory settings", async () => {

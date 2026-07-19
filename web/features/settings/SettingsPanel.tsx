@@ -2586,7 +2586,8 @@ export function SettingsPanel({
     pendingSpecSettingsSaveRef.current = null;
     isSpecSettingsSaveInFlightRef.current = true;
     setIsSavingSpecSettings(true);
-    setSpecSettingsSaveError(null);
+    // Keep any prior save error visible until this request succeeds so a
+    // pending/in-flight retry cannot hide a still-unconfirmed failure.
 
     let saveSucceeded = false;
     try {
@@ -2613,6 +2614,7 @@ export function SettingsPanel({
       ) {
         applySpecSettingsForm(confirmed);
       }
+      setSpecSettingsSaveError(null);
       saveSucceeded = true;
     } catch (requestError) {
       if (!pendingSpecSettingsSaveRef.current) {
