@@ -3944,8 +3944,16 @@ describe("app-panels-stats verification surfaces", () => {
       expect(within(table).getByText("OpenAI")).toBeInTheDocument(),
     );
     expect(within(table).getByText("(HTTP)")).toBeInTheDocument();
-    expect(within(table).getByText("GPT Test")).toBeInTheDocument();
+    const modelLine = within(table).getByText("GPT Test");
+    expect(modelLine).toBeInTheDocument();
+    expect(modelLine.textContent).toBe("GPT Test");
+    expect(modelLine.textContent).not.toMatch(/HTTP|WebSocket|Unknown/);
     expect(within(table).queryByText("GPT Test(HTTP)")).not.toBeInTheDocument();
+    // Provider title includes transport; Request type stays requestKind.
+    expect(
+      within(table).getByText("OpenAI").closest("div")?.getAttribute("title"),
+    ).toBe("OpenAI(HTTP)");
+    expect(within(table).getByText("Chat completion")).toBeInTheDocument();
     expect(
       screen.getByRole("navigation", { name: "Request audit pagination" }),
     ).toBeInTheDocument();
@@ -4308,6 +4316,155 @@ describe("app-panels-stats verification surfaces", () => {
       "bg-stone-100",
       "text-stone-600",
     );
+  });
+
+  it("shows wire-derived transport only after the provider name in request audit", async () => {
+    const requests = (
+      [
+        ["req-http", "http"],
+        ["req-ws", "websocket"],
+        ["req-unknown", "unknown"],
+      ] as const
+    ).map(([id, transport]) => ({
+      ...aiStatistics.requests[0],
+      id,
+      transport,
+    }));
+
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            page: 1,
+            requests,
+            totalCount: requests.length,
+            totalPages: 1,
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    const table = await screen.findByRole("table");
+    await waitFor(() =>
+      expect(within(table).getAllByText("OpenAI")).toHaveLength(3),
+    );
+
+    expect(within(table).getByText("(HTTP)")).toBeInTheDocument();
+    expect(within(table).getByText("(WebSocket)")).toBeInTheDocument();
+    expect(within(table).getByText("(Unknown)")).toBeInTheDocument();
+
+    const providerTitles = within(table)
+      .getAllByText("OpenAI")
+      .map((node) => node.closest("div")?.getAttribute("title"));
+    expect(providerTitles).toEqual(
+      expect.arrayContaining([
+        "OpenAI(HTTP)",
+        "OpenAI(WebSocket)",
+        "OpenAI(Unknown)",
+      ]),
+    );
+
+    const modelLines = within(table).getAllByText("GPT Test");
+    expect(modelLines).toHaveLength(3);
+    for (const modelLine of modelLines) {
+      expect(modelLine.textContent).toBe("GPT Test");
+      expect(modelLine.textContent).not.toMatch(/HTTP|WebSocket|Unknown/);
+    }
+    for (const suffix of ["(HTTP)", "(WebSocket)", "(Unknown)"]) {
+      expect(
+        within(table).queryByText(`GPT Test${suffix}`),
+      ).not.toBeInTheDocument();
+    }
+
+    // Request type continues to mean requestKind; no transport filter control.
+    expect(within(table).getAllByText("Chat completion")).toHaveLength(3);
+    expect(
+      screen.queryByRole("combobox", { name: /transport/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Request type" }),
+    ).toBeInTheDocument();
+  });
+
+  it("localizes provider-row transport suffixes for zh-CN", async () => {
+    const zhSettings = {
+      ...settings,
+      general: { ...settings.general, language: "zh-CN" },
+    };
+    const requests = (
+      [
+        ["req-http", "http"],
+        ["req-ws", "websocket"],
+        ["req-unknown", "unknown"],
+      ] as const
+    ).map(([id, transport]) => ({
+      ...aiStatistics.requests[0],
+      id,
+      transport,
+    }));
+
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/settings") {
+        return Promise.resolve(jsonResponse(zhSettings));
+      }
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            page: 1,
+            requests,
+            totalCount: requests.length,
+            totalPages: 1,
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API 详情" }))[0],
+    );
+    const table = await screen.findByRole("table");
+    await waitFor(() =>
+      expect(within(table).getAllByText("OpenAI")).toHaveLength(3),
+    );
+
+    expect(within(table).getByText("（HTTP）")).toBeInTheDocument();
+    expect(within(table).getByText("（WebSocket）")).toBeInTheDocument();
+    expect(within(table).getByText("（未知）")).toBeInTheDocument();
+
+    const modelLines = within(table).getAllByText("GPT Test");
+    expect(modelLines).toHaveLength(3);
+    for (const modelLine of modelLines) {
+      expect(modelLine.textContent).toBe("GPT Test");
+      expect(modelLine.textContent).not.toMatch(/HTTP|WebSocket|未知/);
+    }
   });
 
   it("forwards vertical request audit wheel input with a non-passive listener", async () => {
