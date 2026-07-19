@@ -130,12 +130,12 @@ pub(crate) struct AgentTranscriptQuery {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentTranscriptResponse {
-    items: Vec<AgentTranscriptItemView>,
-    page: usize,
-    page_size: usize,
-    total_count: usize,
-    total_pages: usize,
-    has_more: bool,
+    pub(crate) items: Vec<AgentTranscriptItemView>,
+    pub(crate) page: usize,
+    pub(crate) page_size: usize,
+    pub(crate) total_count: usize,
+    pub(crate) total_pages: usize,
+    pub(crate) has_more: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -422,10 +422,11 @@ pub(crate) async fn enable_agent_team(
     )?;
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
-        &state,
-        &workspace_id,
         &database,
         &team_id,
+        &state
+            .tool_resource_locks
+            .blocking_owners(&workspace_id, &[workspace_mutation_lock()]),
     )?))
 }
 
@@ -442,10 +443,11 @@ pub(crate) async fn agent_team_snapshot(
         .map_err(ApiError::from_workspace_error)?
         .ok_or_else(|| ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")))?;
     Ok(Json(agent_team_snapshot_from_database(
-        &state,
-        &workspace_id,
         &database,
         &team.id,
+        &state
+            .tool_resource_locks
+            .blocking_owners(&workspace_id, &[workspace_mutation_lock()]),
     )?))
 }
 
@@ -632,10 +634,11 @@ pub(crate) async fn create_agent_instances(
     }
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
-        &state,
-        &workspace_id,
         &database,
         &team.id,
+        &state
+            .tool_resource_locks
+            .blocking_owners(&workspace_id, &[workspace_mutation_lock()]),
     )?))
 }
 
@@ -783,8 +786,13 @@ pub(crate) async fn agent_runtime_action(
         }
     }
     state.agent_scheduler.wake()?;
-    let mut snapshot =
-        agent_team_snapshot_from_database(&state, &workspace_id, &database, &team.id)?;
+    let mut snapshot = agent_team_snapshot_from_database(
+        &database,
+        &team.id,
+        &state
+            .tool_resource_locks
+            .blocking_owners(&workspace_id, &[workspace_mutation_lock()]),
+    )?;
     snapshot.worktree_action = worktree_action;
     Ok(Json(snapshot))
 }
@@ -1190,10 +1198,11 @@ pub(crate) async fn agent_task_action(
     }
     state.agent_scheduler.wake()?;
     Ok(Json(agent_team_snapshot_from_database(
-        &state,
-        &workspace_id,
         &database,
         &task.team_id,
+        &state
+            .tool_resource_locks
+            .blocking_owners(&workspace_id, &[workspace_mutation_lock()]),
     )?))
 }
 
@@ -1201,11 +1210,10 @@ fn active_chat_run_not_found(error: &ApiError, run_id: &str) -> bool {
     error.message == format!("active chat run was not found: {run_id}")
 }
 
-fn agent_team_snapshot_from_database(
-    state: &AppState,
-    workspace_id: &str,
+pub(crate) fn agent_team_snapshot_from_database(
     database: &WorkspaceDatabase,
     team_id: &AgentTeamId,
+    mutation_lease_owner_snapshots: &[ToolResourceLockOwnerSnapshot],
 ) -> Result<AgentTeamSnapshotResponse, ApiError> {
     let team = database
         .agent_team(team_id)
@@ -1287,10 +1295,9 @@ fn agent_team_snapshot_from_database(
         .into_iter()
         .map(AgentEventView::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    let mutation_lease_owners = state
-        .tool_resource_locks
-        .blocking_owners(workspace_id, &[workspace_mutation_lock()])
-        .into_iter()
+    let mutation_lease_owners = mutation_lease_owner_snapshots
+        .iter()
+        .cloned()
         .map(AgentMutationLeaseOwnerView::from)
         .collect::<Vec<_>>();
     let observability =

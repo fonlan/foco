@@ -27,11 +27,11 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition, AgentTeamId, ContextBudget, PendingToolCall,
-    RejectedToolCall, build_available_tools_prompt, build_memory_prompt_section,
-    build_project_spec_prompt_section, calculate_context_budget, estimate_text_tokens,
-    plan_tool_execution, rejected_tool_batch,
+    AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
+    AgentInstanceStatus, AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId,
+    AgentTeamStatus, ContextBudget, PendingToolCall, RejectedToolCall, TeamActivationRequest,
+    build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
+    calculate_context_budget, estimate_text_tokens, plan_tool_execution, rejected_tool_batch,
 };
 use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
@@ -54,10 +54,10 @@ use foco_store::{
         AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
-        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentTask, NewAgentTeam,
-        NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent, PlanPhaseAttemptTrigger,
-        RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
-        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
+        NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
+        PlanPhaseAttemptTrigger, RewriteChatFromUserMessage, TerminalSessionRecord,
+        TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
         WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
@@ -129,13 +129,16 @@ use crate::{
         truncate_workspace_spec_markdown_for_prompt,
     },
     runtime::{
-        BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
-        QuestionRegistry, REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT,
-        ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, ReasoningLoopDetector,
-        RepeatedToolCallDetector, SidecarRuntimeConfigBundle, ToolOutputDeltaEvent,
-        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
-        execute_tool, execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
-        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
+        AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
+        AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+        AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
+        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
+        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
+        ReadOnlyToolProgressDetector, ReasoningLoopDetector, RepeatedToolCallDetector,
+        SidecarRuntimeConfigBundle, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
+        image_tool_timeout_ms, materialize_brokered_image_result, reasoning_loop_guard_message,
+        run_post_tool_hooks, web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -2632,19 +2635,19 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/agent-team",
-            get(remote_sidecar_agent_no_team),
+            get(remote_sidecar_agent_team_snapshot),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/agent-team/enable",
-            post(remote_sidecar_passthrough_unavailable),
+            post(remote_sidecar_enable_agent_team),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/agent-team/action",
-            post(remote_sidecar_passthrough_unavailable),
+            post(remote_sidecar_agent_runtime_action),
         )
         .route(
             "/api/remote/workspace/chats/{chat_id}/agent-team/instances/create",
-            post(remote_sidecar_passthrough_unavailable),
+            post(remote_sidecar_create_agent_instances),
         )
         .route(
             "/api/remote/workspace/chat/queue",
@@ -2673,6 +2676,14 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/context-usage",
             post(remote_sidecar_context_usage),
+        )
+        .route(
+            "/api/remote/workspace/agent-team/instances/{instance_id}/transcript",
+            get(remote_sidecar_agent_instance_transcript),
+        )
+        .route(
+            "/api/remote/workspace/agent-tasks/{task_id}/action",
+            post(remote_sidecar_agent_task_action),
         )
         .route(
             "/api/remote/workspace/agent-team/{*path}",
@@ -8733,123 +8744,541 @@ async fn remote_sidecar_chat_todo_graph(
     };
     Ok(Json(response))
 }
-async fn remote_sidecar_agent_no_team(
+
+fn remote_sidecar_agent_snapshot_value(
+    database: &WorkspaceDatabase,
+    chat_id: &str,
+) -> Result<Value, axum::response::Response> {
+    let team = database
+        .agent_team_for_chat(chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")).into_response()
+        })?;
+    let snapshot = crate::http::agents::agent_team_snapshot_from_database(database, &team.id, &[])
+        .map_err(ApiError::into_response)?;
+    serde_json::to_value(snapshot).map_err(|error| {
+        ApiError::internal(format!("serialize Agent team snapshot: {error}")).into_response()
+    })
+}
+
+async fn remote_sidecar_agent_team_snapshot(
     State(state): State<RemoteSidecarState>,
     AxumPath(chat_id): AxumPath<String>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let active_run = state
-        .active_runs
+    let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    Ok(Json(remote_sidecar_agent_snapshot_value(
+        &database, &chat_id,
+    )?))
+}
+
+async fn remote_sidecar_enable_agent_team(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+    Json(request): Json<TeamActivationRequest>,
+) -> Result<Json<Value>, axum::response::Response> {
+    if state
+        .active_run_streams
         .lock()
-        .ok()
-        .and_then(|runs| runs.iter().find(|run| run.chat_id == chat_id).cloned());
-    let now = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let team_id = format!("remote-agent-team-{chat_id}");
-    let instance_id = format!("remote-agent-instance-{chat_id}");
-    let task_status = if active_run.is_some() {
-        "running"
-    } else {
-        "completed"
-    };
-    let instance_status = if active_run.is_some() {
-        "running"
-    } else {
-        "idle"
-    };
-    let task = active_run.as_ref().map(|run| {
-        json!({
-            "id": format!("remote-agent-task-{}", run.run_id),
-            "teamId": team_id,
-            "ownerInstanceId": instance_id,
-            "originInstanceId": null,
-            "parentTaskId": null,
-            "sequence": 0,
-            "status": task_status,
-            "input": {
-                "message": "Remote workspace chat run",
-                "remote": true,
-                "runId": run.run_id,
-            },
-            "result": null,
-            "error": null,
-            "attempts": [],
-            "createdAt": run.updated_at,
-            "updatedAt": run.updated_at,
-            "startedAt": run.updated_at,
-            "completedAt": null,
+        .map_err(|_| {
+            ApiError::internal("remote active run registry lock is poisoned").into_response()
+        })?
+        .by_chat_id
+        .contains_key(&chat_id)
+    {
+        return Err(ApiError::bad_request(
+            "cannot enable an Agent team while the chat has an active run",
+        )
+        .into_response());
+    }
+    let config = remote_sidecar_runtime_global_config(&state)
+        .map_err(|error| ApiError::bad_request(error).into_response())?;
+    let definition = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == request.coordinator_definition_id);
+    request
+        .validate_definition(definition.is_some())
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let definition = definition.ok_or_else(|| {
+        ApiError::bad_request("Coordinator Agent definition was not found").into_response()
+    })?;
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    if database
+        .chat(&chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .is_none()
+    {
+        return Err(
+            ApiError::bad_request(format!("chat was not found: {chat_id}")).into_response(),
+        );
+    }
+    if database
+        .agent_team_for_chat(&chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .is_some()
+    {
+        return Err(
+            ApiError::bad_request(format!("chat '{chat_id}' already has an Agent team"))
+                .into_response(),
+        );
+    }
+    let team_id = AgentTeamId::new(unique_id("agent-team"))
+        .map_err(|error| ApiError::internal(error.to_string()).into_response())?;
+    let instance_id = AgentInstanceId::new(unique_id("agent-instance"))
+        .map_err(|error| ApiError::internal(error.to_string()).into_response())?;
+    database
+        .create_agent_team(NewAgentTeam {
+            id: &team_id,
+            chat_id: &chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: definition,
+            coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: crate::DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS,
         })
-    });
-    Ok(Json(json!({
-        "team": {
-            "id": team_id,
-            "chatId": chat_id,
-            "coordinatorInstanceId": instance_id,
-            "status": "active",
-            "maxConcurrentRuns": 1,
-            "createdAt": now,
-            "updatedAt": active_run.as_ref().map(|run| run.updated_at.clone()).unwrap_or_else(|| now.clone()),
-        },
-        "workload": {
-            "queuedTasks": 0,
-            "runningTasks": if active_run.is_some() { 1 } else { 0 },
-            "waitingTasks": 0,
-        },
-        "observability": {
-            "queueLength": 0,
-            "queueWaitMs": { "count": 0, "max": null, "average": null },
-            "runDurationMs": { "count": 0, "max": null, "average": null },
-            "schedulerLatencyMs": { "count": 0, "max": null, "average": null },
-            "mutationLeaseWaitMs": { "count": 0, "max": null, "average": null },
-            "failedTasks": 0,
-            "cancelledTasks": 0,
-            "interruptedTasks": 0,
-            "failuresByType": [],
-        },
-        "instances": [{
-            "id": instance_id,
-            "teamId": team_id,
-            "definitionId": "agent-definition-default",
-            "definitionRevision": 1,
-            "definitionSnapshot": {
-                "id": "agent-definition-default",
-                "revision": 1,
-                "name": "Remote coordinator",
-                "description": "Read-only snapshot for remote workspace chat runs.",
-                "providerId": "remote",
-                "modelId": "remote",
-                "modelOptions": {},
-                "allowedTools": [],
-                "maxInstances": 1,
-                "allowedExecutionWorkspaceModes": ["shared"],
-                "permissions": {
-                    "canCreateInstances": false,
-                    "canDelegate": false,
-                    "allowedAgentDefinitionIds": [],
-                },
-            },
-            "role": "coordinator",
-            "status": instance_status,
-            "nextTaskSequence": 1,
-            "contextGeneration": 0,
-            "lastScheduledAt": active_run.as_ref().map(|run| run.updated_at.clone()),
-            "executionWorkspaceMode": "shared",
-            "executionRootPath": null,
-            "worktreeBaseRevision": null,
-            "worktreeBranch": null,
-            "worktreeStatus": null,
-            "createdAt": now,
-            "updatedAt": active_run.as_ref().map(|run| run.updated_at.clone()).unwrap_or_else(|| now.clone()),
-        }],
-        "tasks": task.into_iter().collect::<Vec<_>>(),
-        "dependencies": [],
-        "messages": [],
-        "events": [],
-        "runEvents": [],
-        "mutationLeaseOwners": [],
-        "worktreeAction": {
-            "kind": "unavailable",
-            "message": "Remote sidecar exposes a read-only Agent snapshot; Agent team actions are unavailable.",
-        },
-    })))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    crate::runtime::insert_agent_event(
+        &mut database,
+        &team_id,
+        "team_created",
+        Some(&instance_id),
+        None,
+        None,
+        json!({ "coordinatorDefinitionId": definition.id }),
+    )
+    .map_err(ApiError::into_response)?;
+    Ok(Json(remote_sidecar_agent_snapshot_value(
+        &database, &chat_id,
+    )?))
+}
+
+fn remote_agent_required_u32(
+    payload: &Value,
+    field: &str,
+) -> Result<u32, axum::response::Response> {
+    payload
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("{field} must be a non-negative integer")).into_response()
+        })
+}
+
+async fn remote_sidecar_create_agent_instances(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let definition_id = remote_required_text(payload.get("definitionId"), "definitionId")
+        .and_then(|value| {
+            AgentDefinitionId::new(value)
+                .map_err(|error| ApiError::bad_request(error.to_string()).into_response())
+        })?;
+    let count = remote_agent_required_u32(&payload, "count")?;
+    let max_instances_per_team = remote_agent_required_u32(&payload, "maxInstancesPerTeam")?;
+    let max_instances_for_definition =
+        remote_agent_required_u32(&payload, "maxInstancesForDefinition")?;
+    let execution_workspace_mode = payload
+        .get("executionWorkspaceMode")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| {
+            ApiError::bad_request(format!("invalid executionWorkspaceMode: {error}"))
+                .into_response()
+        })?
+        .unwrap_or(AgentExecutionWorkspaceMode::Shared);
+    if count == 0 || count > AGENT_MAX_CREATE_INSTANCES_PER_REQUEST {
+        return Err(ApiError::bad_request(format!(
+            "count must be between 1 and {AGENT_MAX_CREATE_INSTANCES_PER_REQUEST}"
+        ))
+        .into_response());
+    }
+    if i64::from(max_instances_per_team) > AGENT_MAX_INSTANCES_PER_TEAM
+        || count > max_instances_per_team
+        || count > max_instances_for_definition
+    {
+        return Err(
+            ApiError::bad_request("requested Agent instance count exceeds its limits")
+                .into_response(),
+        );
+    }
+    let config = remote_sidecar_runtime_global_config(&state)
+        .map_err(|error| ApiError::bad_request(error).into_response())?;
+    let definition = config
+        .agent_definitions
+        .iter()
+        .find(|definition| definition.id == definition_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent definition '{definition_id}' was not found"))
+                .into_response()
+        })?;
+    if max_instances_for_definition > definition.max_instances
+        || !definition
+            .allowed_execution_workspace_modes
+            .contains(&execution_workspace_mode)
+    {
+        return Err(ApiError::bad_request(
+            "Agent definition does not allow the requested instance configuration",
+        )
+        .into_response());
+    }
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let team = database
+        .agent_team_for_chat(&chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")).into_response()
+        })?;
+    let instance_ids = (0..count)
+        .map(|_| AgentInstanceId::new(unique_id("agent-instance")))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::internal(error.to_string()).into_response())?;
+    let worktrees = match execution_workspace_mode {
+        AgentExecutionWorkspaceMode::Shared => Vec::new(),
+        AgentExecutionWorkspaceMode::IsolatedWorktree => instance_ids
+            .iter()
+            .map(|id| create_agent_worktree(&workspace_path, id.as_str()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ApiError::into_response)?,
+    };
+    let worktree_root_paths = worktrees
+        .iter()
+        .map(|worktree| agent_worktree_relative_path(&workspace_path, &worktree.root_path))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ApiError::into_response)?;
+    let instances = instance_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let worktree = worktrees.get(index);
+            let root_path = worktree_root_paths.get(index);
+            NewAgentInstance {
+                id,
+                team_id: &team.id,
+                definition,
+                role: AgentRole::Worker,
+                execution_workspace_mode,
+                execution_root_path: root_path.map(String::as_str),
+                worktree_base_revision: worktree.map(|worktree| worktree.base_revision.as_str()),
+                worktree_branch: worktree.map(|worktree| worktree.branch.as_str()),
+                worktree_status: worktree.map(|_| "active"),
+            }
+        })
+        .collect::<Vec<_>>();
+    let created = match database.create_agent_instances_with_limits(
+        &instances,
+        i64::from(max_instances_per_team),
+        i64::from(max_instances_for_definition),
+    ) {
+        Ok(created) => created,
+        Err(error) => {
+            for worktree in &worktrees {
+                let _ = delete_agent_worktree(&workspace_path, &worktree.root_path, true);
+            }
+            return Err(ApiError::from_workspace_error(error).into_response());
+        }
+    };
+    for instance in &created {
+        crate::runtime::insert_agent_event(
+            &mut database,
+            &team.id,
+            "instance_created",
+            Some(&instance.id),
+            None,
+            None,
+            json!({ "createdBy": "user", "definitionId": instance.definition_id }),
+        )
+        .map_err(ApiError::into_response)?;
+    }
+    Ok(Json(remote_sidecar_agent_snapshot_value(
+        &database, &chat_id,
+    )?))
+}
+
+async fn remote_sidecar_agent_runtime_action(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(chat_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let scope = remote_required_text(payload.get("scope"), "scope")?;
+    let action = remote_required_text(payload.get("action"), "action")?;
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let team = database
+        .agent_team_for_chat(&chat_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("chat '{chat_id}' has no Agent team")).into_response()
+        })?;
+    match scope.as_str() {
+        "team" => {
+            let status = match action.as_str() {
+                "pause" => AgentTeamStatus::Paused,
+                "resume" => AgentTeamStatus::Active,
+                "drain" => AgentTeamStatus::Draining,
+                "stop" => AgentTeamStatus::Stopped,
+                _ => {
+                    return Err(
+                        ApiError::bad_request("invalid Agent team runtime action").into_response()
+                    );
+                }
+            };
+            database
+                .transition_agent_team_status(&team.id, status)
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+            crate::runtime::insert_agent_event(
+                &mut database,
+                &team.id,
+                "team_status_changed",
+                None,
+                None,
+                None,
+                json!({ "status": status }),
+            )
+            .map_err(ApiError::into_response)?;
+        }
+        "instance" => {
+            let instance_id = remote_required_text(payload.get("instanceId"), "instanceId")
+                .and_then(|value| {
+                    AgentInstanceId::new(value)
+                        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())
+                })?;
+            let instance = database
+                .agent_instance(&instance_id)
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!("Agent instance '{instance_id}' was not found"))
+                        .into_response()
+                })?;
+            if instance.team_id != team.id {
+                return Err(ApiError::bad_request(
+                    "Agent instance does not belong to this chat team",
+                )
+                .into_response());
+            }
+            match action.as_str() {
+                "pause" | "resume" | "drain" | "stop" => {
+                    let status = match action.as_str() {
+                        "pause" => AgentInstanceStatus::Paused,
+                        "resume" => AgentInstanceStatus::Idle,
+                        "drain" => AgentInstanceStatus::Draining,
+                        "stop" => AgentInstanceStatus::Stopped,
+                        _ => unreachable!(),
+                    };
+                    database
+                        .transition_agent_instance_status(&instance.id, status)
+                        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+                }
+                "reset_context" => {
+                    database
+                        .reset_agent_instance_context(&instance.id)
+                        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+                }
+                "delete" => {
+                    if instance.execution_workspace_mode
+                        == AgentExecutionWorkspaceMode::IsolatedWorktree
+                        && instance.worktree_status.as_deref() != Some("deleted")
+                    {
+                        return Err(ApiError::bad_request("delete Agent instance with isolated worktree requires worktree_delete first").into_response());
+                    }
+                    database
+                        .delete_agent_instance(&instance.id)
+                        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+                }
+                _ => {
+                    return Err(ApiError::bad_request(
+                        "invalid remote Agent instance runtime action",
+                    )
+                    .into_response());
+                }
+            }
+        }
+        _ => return Err(ApiError::bad_request("scope must be team or instance").into_response()),
+    }
+    Ok(Json(remote_sidecar_agent_snapshot_value(
+        &database, &chat_id,
+    )?))
+}
+
+async fn remote_sidecar_agent_task_action(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(task_id): AxumPath<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let task_id = AgentTaskId::new(task_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let action = remote_required_text(payload.get("action"), "action")?;
+    let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let task = database
+        .agent_task(&task_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent task '{task_id}' was not found")).into_response()
+        })?;
+    match action.as_str() {
+        "transfer" if task.status == AgentTaskStatus::Queued => {
+            let target_instance_id =
+                remote_required_text(payload.get("targetInstanceId"), "targetInstanceId")
+                    .and_then(|value| {
+                        AgentInstanceId::new(value).map_err(|error| {
+                            ApiError::bad_request(error.to_string()).into_response()
+                        })
+                    })?;
+            let target = database
+                .agent_instance(&target_instance_id)
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+                .ok_or_else(|| {
+                    ApiError::bad_request(format!(
+                        "Agent instance '{target_instance_id}' was not found"
+                    ))
+                    .into_response()
+                })?;
+            if target.team_id != task.team_id {
+                return Err(ApiError::bad_request(
+                    "Agent task transfer target belongs to another team",
+                )
+                .into_response());
+            }
+            database
+                .transfer_queued_agent_task_with_limits(
+                    &task.team_id,
+                    &task.id,
+                    &target.id,
+                    AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+                    AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+                    AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+                )
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+                .ok_or_else(|| {
+                    ApiError::bad_request("Agent task changed state before transfer")
+                        .into_response()
+                })?;
+        }
+        "cancel"
+            if matches!(
+                task.status,
+                AgentTaskStatus::Queued | AgentTaskStatus::Waiting
+            ) =>
+        {
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &task.team_id,
+                    task_id: &task.id,
+                    expected_status: task.status,
+                    transition: AgentTaskTransition::Cancel,
+                    result_json: None,
+                    error_json: Some(r#"{"message":"cancelled explicitly"}"#),
+                    interruption_reason: None,
+                })
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        }
+        "retry"
+            if matches!(
+                task.status,
+                AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted
+            ) =>
+        {
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &task.team_id,
+                    task_id: &task.id,
+                    expected_status: task.status,
+                    transition: AgentTaskTransition::Retry,
+                    result_json: None,
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+        }
+        "cancel" if task.status == AgentTaskStatus::Running => {
+            return Err(ApiError::bad_request(
+                "running remote Agent task cancellation requires the remote Agent runner",
+            )
+            .into_response());
+        }
+        _ => {
+            return Err(ApiError::bad_request(format!(
+                "Agent task '{}' cannot apply action '{}' while {}",
+                task.id,
+                action,
+                task.status.as_str()
+            ))
+            .into_response());
+        }
+    }
+    let team = database
+        .agent_team(&task.team_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent team '{}' was not found", task.team_id))
+                .into_response()
+        })?;
+    Ok(Json(remote_sidecar_agent_snapshot_value(
+        &database,
+        &team.chat_id,
+    )?))
+}
+
+async fn remote_sidecar_agent_instance_transcript(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(instance_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let instance_id = AgentInstanceId::new(instance_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let instance = database
+        .agent_instance(&instance_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent instance '{instance_id}' was not found"))
+                .into_response()
+        })?;
+    let team = database
+        .agent_team(&instance.team_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Agent team '{}' was not found", instance.team_id))
+                .into_response()
+        })?;
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("pageSize")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(25)
+        .clamp(1, 100);
+    let items = crate::http::agents::agent_instance_transcript_items(&database, &team, &instance)
+        .map_err(ApiError::into_response)?;
+    let total_count = items.len();
+    let total_pages = total_count.div_ceil(page_size).max(1);
+    let offset = (page - 1).saturating_mul(page_size);
+    let response = crate::http::agents::AgentTranscriptResponse {
+        items: items.into_iter().skip(offset).take(page_size).collect(),
+        page,
+        page_size,
+        total_count,
+        total_pages,
+        has_more: page < total_pages,
+    };
+    serde_json::to_value(response).map(Json).map_err(|error| {
+        ApiError::internal(format!("serialize Agent transcript: {error}")).into_response()
+    })
 }
 
 fn remote_required_text(
