@@ -4,7 +4,7 @@ use axum::{
     Router,
     body::Body,
     extract::{DefaultBodyLimit, FromRequestParts, Request, State, WebSocketUpgrade},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -687,14 +687,24 @@ async fn remote_workspace_proxy_middleware(
 ) -> Response {
     let path = request.uri().path();
 
-    // Only proxy specific workspace-scoped route prefixes
-    let Some(suffix) = proxy_workspace_route_path(path) else {
-        return next.run(request).await;
+    let (workspace_id, suffix, request) = match proxy_workspace_route_path(path) {
+        Some(suffix) => {
+            let Some(workspace_id) = extract_workspace_id_from_path(path) else {
+                return next.run(request).await;
+            };
+            (workspace_id, suffix.to_string(), request)
+        }
+        None => {
+            let (target, request) = match proxy_global_workspace_route(request).await {
+                Ok(result) => result,
+                Err(response) => return response,
+            };
+            match target {
+                Some((workspace_id, suffix)) => (workspace_id, suffix, request),
+                None => return next.run(request).await,
+            }
+        }
     };
-    let Some(workspace_id) = extract_workspace_id_from_path(path) else {
-        return next.run(request).await;
-    };
-    let suffix = suffix.to_string();
 
     if let Err(error) =
         crate::remote_workspace::ensure_remote_workspace_connected(&state, &workspace_id).await
@@ -807,6 +817,118 @@ async fn remote_workspace_proxy_middleware(
             .body(Body::from(format!("sidecar proxy failed: {source}")))
             .expect("valid error response"),
     }
+}
+
+/// Resolve the few workspace-scoped APIs whose public URL predates remote
+/// workspaces and therefore carries `workspaceId` in a query string or JSON
+/// body instead of in `/api/workspaces/{id}/...`.
+///
+/// Global Memory intentionally remains local: only workspace/chat scopes are
+/// eligible for sidecar routing. Rebuilding the request after inspecting the
+/// JSON body keeps downstream handlers and proxy forwarding byte-for-byte
+/// compatible with the normal route path.
+async fn proxy_global_workspace_route(
+    request: Request,
+) -> Result<(Option<(String, String)>, Request), Response> {
+    let path = request.uri().path();
+    let method = request.method();
+
+    if method == Method::GET {
+        let Some(suffix) = (match path {
+            "/api/hooks" => Some("hooks/settings"),
+            "/api/memory" => Some("memory"),
+            "/api/memory/sources" => Some("memory/sources"),
+            "/api/memory/dream/jobs" => Some("memory/dream/jobs"),
+            _ => None,
+        }) else {
+            return Ok((None, request));
+        };
+        let query = request
+            .uri()
+            .query()
+            .map(parse_workspace_route_query)
+            .unwrap_or_default();
+        let Some(workspace_id) = query.get("workspaceId").cloned() else {
+            return Ok((None, request));
+        };
+        if suffix.starts_with("memory")
+            && query
+                .get("scope")
+                .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
+        {
+            return Ok((None, request));
+        }
+        return Ok((Some((workspace_id, suffix.to_string())), request));
+    }
+
+    if method != Method::POST {
+        return Ok((None, request));
+    }
+    let Some(suffix) = (match path {
+        "/api/hooks/workspace" => Some("hooks/settings"),
+        "/api/hooks/import-claude" => Some("hooks/import-claude"),
+        "/api/hooks/test" => Some("hooks/test"),
+        "/api/memory/manual" => Some("memory/manual"),
+        "/api/memory/status" => Some("memory/status"),
+        "/api/memory/enabled" => Some("memory/enabled"),
+        "/api/memory/edit" => Some("memory/edit"),
+        "/api/memory/forget" => Some("memory/forget"),
+        "/api/memory/clear" => Some("memory/clear"),
+        "/api/memory/promote" => Some("memory/promote"),
+        "/api/memory/extraction/retry" => Some("memory/extraction/retry"),
+        "/api/memory/extraction/skip" => Some("memory/extraction/skip"),
+        "/api/memory/dream/run" => Some("memory/dream/run"),
+        _ => None,
+    }) else {
+        return Ok((None, request));
+    };
+
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, 10 * 1024 * 1024)
+        .await
+        .map_err(|_| {
+            Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .body(Body::from(
+                    "failed to read request body for remote workspace routing",
+                ))
+                .expect("valid response")
+        })?;
+    let payload: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(
+                "invalid JSON request body for remote workspace routing",
+            ))
+            .expect("valid response")
+    })?;
+    let request = Request::from_parts(parts, Body::from(bytes));
+    let Some(workspace_id) = payload
+        .get("workspaceId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        .map(ToOwned::to_owned)
+    else {
+        return Ok((None, request));
+    };
+    if suffix.starts_with("memory")
+        && payload
+            .get("scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("global"))
+    {
+        return Ok((None, request));
+    }
+    Ok((Some((workspace_id, suffix.to_string())), request))
+}
+
+fn parse_workspace_route_query(query: &str) -> std::collections::HashMap<String, String> {
+    query
+        .split('&')
+        .filter_map(|entry| entry.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
 }
 
 fn normalize_remote_context_usage_request(
@@ -943,4 +1065,63 @@ async fn log_http_request(request: axum::extract::Request, next: middleware::Nex
         "HTTP request completed"
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn global_hook_settings_route_uses_the_workspace_id_query_parameter() {
+        let request = Request::builder()
+            .uri("/api/hooks?workspaceId=remote-workspace")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(
+            target,
+            Some(("remote-workspace".to_string(), "hooks/settings".to_string(),))
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_memory_mutation_routes_to_the_sidecar() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/memory/manual")
+            .body(Body::from(
+                r#"{"workspaceId":"remote-workspace","scope":"workspace"}"#,
+            ))
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(
+            target,
+            Some(("remote-workspace".to_string(), "memory/manual".to_string(),))
+        );
+    }
+
+    #[tokio::test]
+    async fn global_memory_mutation_remains_on_the_main_process() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/memory/manual")
+            .body(Body::from(
+                r#"{"workspaceId":"remote-workspace","scope":"global"}"#,
+            ))
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(target, None);
+    }
 }

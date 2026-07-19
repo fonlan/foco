@@ -2570,6 +2570,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             post(remote_sidecar_memory_manual),
         )
         .route(
+            "/api/remote/workspace/memory/{*path}",
+            get(remote_sidecar_memory_get).post(remote_sidecar_memory_mutation),
+        )
+        .route(
             "/api/remote/workspace/skills/install",
             post(remote_sidecar_skill_install),
         )
@@ -2580,6 +2584,14 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         .route(
             "/api/remote/workspace/hooks/settings",
             get(remote_sidecar_hooks_settings).post(remote_sidecar_hooks_save),
+        )
+        .route(
+            "/api/remote/workspace/hooks/import-claude",
+            post(remote_sidecar_import_claude_hooks),
+        )
+        .route(
+            "/api/remote/workspace/hooks/test",
+            post(remote_sidecar_test_hooks),
         )
         .route(
             "/api/remote/workspace/hooks/runs",
@@ -11117,6 +11129,29 @@ async fn remote_sidecar_workspace_mcp_registry(
     Ok(mcp_registry)
 }
 
+fn remote_sidecar_runtime_global_config(
+    state: &RemoteSidecarState,
+) -> Result<foco_store::config::GlobalConfig, String> {
+    let workspace_path = PathBuf::from(&state.workspace_path);
+    let bundle = state
+        .runtime_config
+        .lock()
+        .map_err(|_| "remote sidecar runtime config lock is poisoned".to_string())?
+        .clone();
+    let mut global_config = foco_store::config::GlobalConfig::first_run(workspace_path);
+    if let Some(bundle) = bundle {
+        global_config.agent_definitions = bundle.payload.agent_definitions;
+        global_config.prompts = bundle.payload.prompts;
+        global_config.models = bundle.payload.models;
+        global_config.hooks = bundle.payload.hooks;
+        global_config.mcp = bundle.payload.mcp;
+        global_config.memory = bundle.payload.memory;
+        global_config.spec = bundle.payload.spec;
+        global_config.plan = bundle.payload.plan;
+    }
+    Ok(global_config)
+}
+
 async fn remote_sidecar_hook_environment(
     state: &RemoteSidecarState,
     workspace_mcp_registry: Option<Arc<McpRegistry>>,
@@ -16157,8 +16192,8 @@ async fn remote_sidecar_memory_list(
         .clamp(1, 200);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let query_text = query.get("query").map(String::as_str);
-    let database = MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
-        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
     let total_count = database
         .count_facts_for_scope(chat_id.as_deref(), status, None, query_text)
         .map_err(|e| ApiError::from_memory_error(e).into_response())?;
@@ -16220,8 +16255,8 @@ async fn remote_sidecar_memory_manual(
     if scope == MemoryScope::Chat && chat_id.is_none() {
         return Err(ApiError::bad_request("chat memory requires chatId").into_response());
     }
-    let mut database = MemoryDatabase::open_or_create_workspace(sidecar_workspace_path(&state))
-        .map_err(|e| ApiError::from_memory_error(e).into_response())?;
+    let mut database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
     let source_id = unique_id("remote-memory-source");
     let memory_id = unique_id("remote-memory-fact");
     database
@@ -16257,6 +16292,52 @@ async fn remote_sidecar_memory_manual(
         .fact(&memory_id)
         .map_err(|e| ApiError::from_memory_error(e).into_response())?;
     Ok(Json(json!({ "memory": memory })))
+}
+
+async fn remote_sidecar_memory_get(
+    State(state): State<RemoteSidecarState>,
+    AxumPath(path): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, axum::response::Response> {
+    if path == "sources" {
+        let scope = MemoryScope::parse(query.get("scope").map(String::as_str).unwrap_or(""))
+            .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+        if scope == MemoryScope::Global {
+            return Err(
+                ApiError::bad_request("global memory stays in the local broker").into_response(),
+            );
+        }
+        let memory_id = query
+            .get("memoryId")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|memory_id| !memory_id.is_empty())
+            .ok_or_else(|| ApiError::bad_request("memoryId must not be empty").into_response())?;
+        let database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+            .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+        let sources = database
+            .sources_for_fact(memory_id)
+            .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+        return Ok(Json(json!({ "sources": sources })));
+    }
+
+    Err(remote_sidecar_memory_unimplemented_response(&path))
+}
+
+async fn remote_sidecar_memory_mutation(
+    AxumPath(path): AxumPath<String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    Err(remote_sidecar_memory_unimplemented_response(&path))
+}
+
+fn remote_sidecar_memory_unimplemented_response(path: &str) -> axum::response::Response {
+    ApiError::from_status_message(
+        StatusCode::NOT_IMPLEMENTED,
+        format!(
+            "remote workspace Memory endpoint is not implemented on the sidecar: {path}; the request was not sent to the main-process workspace database"
+        ),
+    )
+    .into_response()
 }
 
 async fn remote_sidecar_skill_install(
@@ -16319,15 +16400,40 @@ async fn remote_sidecar_skills_discover(
 async fn remote_sidecar_hooks_settings(
     State(state): State<RemoteSidecarState>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    let config = foco_store::config::load_workspace_hook_config(sidecar_workspace_path(&state))
-        .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
+    let workspace_path = sidecar_workspace_path(&state);
+    let workspace_config = foco_store::config::load_workspace_hook_config(workspace_path)
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let (_, _, global_hooks, _, _) = remote_sidecar_hook_environment(&state, None)
+        .await
+        .map_err(|error| ApiError::bad_gateway(error).into_response())?;
+    let effective = crate::hooks::effective_hook_summaries(&global_hooks, workspace_path)
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let recent_runs = WorkspaceDatabase::open_or_create(workspace_path)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .hook_runs(50)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .into_iter()
+        .filter(|record| record.workspace_id == state.workspace_id)
+        .map(crate::hook_run_summary_row)
+        .collect::<Vec<_>>();
+
     Ok(Json(json!({
+        "supportedEvents": foco_store::config::SUPPORTED_HOOK_EVENTS,
+        "unsupportedEvents": foco_store::config::UNSUPPORTED_HOOK_EVENTS,
+        "global": {
+            "source": "global",
+            "path": "brokered://global-hook-config",
+            "workspaceId": Value::Null,
+            "config": global_hooks,
+        },
         "workspace": {
             "source": "workspace",
-            "path": foco_store::config::workspace_hook_config_path(sidecar_workspace_path(&state)).display().to_string(),
+            "path": foco_store::config::workspace_hook_config_path(workspace_path).display().to_string(),
             "workspaceId": state.workspace_id,
-            "config": config,
-        }
+            "config": workspace_config,
+        },
+        "effective": effective,
+        "recentRuns": recent_runs,
     })))
 }
 
@@ -16336,18 +16442,139 @@ async fn remote_sidecar_hooks_save(
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, axum::response::Response> {
     let config_value = payload.get("config").cloned().unwrap_or(payload);
-    let config: foco_store::config::HookConfig = serde_json::from_value(config_value)
-        .map_err(|e| ApiError::bad_request(format!("invalid hook config: {e}")).into_response())?;
-    foco_store::config::save_workspace_hook_config(sidecar_workspace_path(&state), &config)
-        .map_err(|e| ApiError::bad_request(e.to_string()).into_response())?;
-    Ok(Json(json!({
-        "workspace": {
-            "source": "workspace",
-            "path": foco_store::config::workspace_hook_config_path(sidecar_workspace_path(&state)).display().to_string(),
-            "workspaceId": state.workspace_id,
-            "config": config,
+    let workspace_config: foco_store::config::HookConfig = serde_json::from_value(config_value)
+        .map_err(|error| {
+            ApiError::bad_request(format!("invalid hook config: {error}")).into_response()
+        })?;
+    let (_, _, _, mut validation_config, _) =
+        remote_sidecar_hook_environment(&state, None)
+            .await
+            .map_err(|error| ApiError::bad_gateway(error).into_response())?;
+    validation_config.hooks = workspace_config.clone();
+    validation_config
+        .validate(Some(&foco_store::config::workspace_hook_config_path(
+            sidecar_workspace_path(&state),
+        )))
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    foco_store::config::save_workspace_hook_config(
+        sidecar_workspace_path(&state),
+        &workspace_config,
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    remote_sidecar_hooks_settings(State(state)).await
+}
+
+async fn remote_sidecar_import_claude_hooks(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, axum::response::Response> {
+    if payload
+        .get("target")
+        .and_then(Value::as_str)
+        .is_some_and(|target| target.trim() != "workspace")
+    {
+        return Err(ApiError::bad_request(
+            "remote Claude Hook import only supports target=workspace",
+        )
+        .into_response());
+    }
+    if let Some(workspace_id) = payload.get("workspaceId").and_then(Value::as_str)
+        && workspace_id.trim() != state.workspace_id
+    {
+        return Err(ApiError::bad_request(
+            "workspaceId does not match the connected remote workspace",
+        )
+        .into_response());
+    }
+
+    let workspace_path = sidecar_workspace_path(&state);
+    let source_paths = crate::claude_hook_settings_paths(workspace_path);
+    let save_path = foco_store::config::workspace_hook_config_path(workspace_path);
+    let (imported, imported_files, mut validation_errors) =
+        crate::import_claude_hook_config(&source_paths).map_err(|error| error.into_response())?;
+    if imported_files.is_empty() {
+        validation_errors.push(format!(
+            "no Claude hook settings were found under {}",
+            workspace_path.join(".claude").display()
+        ));
+    }
+    if validation_errors.is_empty() {
+        let (_, _, _, mut validation_config, _) = remote_sidecar_hook_environment(&state, None)
+            .await
+            .map_err(|error| ApiError::bad_gateway(error).into_response())?;
+        validation_config.hooks = imported.clone();
+        if let Err(error) = validation_config.validate(Some(&save_path)) {
+            validation_errors.push(error.to_string());
         }
+    }
+    if validation_errors.is_empty() {
+        foco_store::config::save_workspace_hook_config(workspace_path, &imported)
+            .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    }
+
+    Ok(Json(json!({
+        "saved": validation_errors.is_empty(),
+        "target": "workspace",
+        "path": save_path.display().to_string(),
+        "importedFiles": imported_files,
+        "validationErrors": validation_errors,
+        "config": imported,
     })))
+}
+
+async fn remote_sidecar_test_hooks(
+    State(state): State<RemoteSidecarState>,
+    Json(payload): Json<Value>,
+) -> Result<Json<crate::hooks::HookRunSummary>, axum::response::Response> {
+    let event = payload
+        .get("event")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|event| !event.is_empty())
+        .ok_or_else(|| ApiError::bad_request("hook event must not be empty").into_response())?;
+    if foco_store::config::UNSUPPORTED_HOOK_EVENTS.contains(&event) {
+        return Err(ApiError::bad_request(format!(
+            "{event} is a Claude Code hook event that Foco does not support yet"
+        ))
+        .into_response());
+    }
+    if !foco_store::config::SUPPORTED_HOOK_EVENTS.contains(&event) {
+        return Err(ApiError::bad_request(format!(
+            "{event} is unsupported; expected one of {}",
+            foco_store::config::SUPPORTED_HOOK_EVENTS.join(", ")
+        ))
+        .into_response());
+    }
+    let (_, hook_runtime, global_hooks, global_config, retry_count) =
+        remote_sidecar_hook_environment(&state, None)
+            .await
+            .map_err(|error| ApiError::bad_gateway(error).into_response())?;
+    let summary = hook_runtime
+        .run_hooks(HookRunRequest {
+            global_config: &global_hooks,
+            api_audit_save_details: api_audit_save_details(&global_config),
+            workspace_id: &state.workspace_id,
+            workspace_path: sidecar_workspace_path(&state),
+            event,
+            match_value: payload
+                .get("matchValue")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned),
+            chat_id: None,
+            run_id: None,
+            session_id: None,
+            tool_call_id: None,
+            model_id: payload.get("modelId").and_then(Value::as_str),
+            provider_id: payload.get("providerId").and_then(Value::as_str),
+            provider_config: None,
+            llm_request_retry_count: retry_count,
+            permission_mode: None,
+            payload: payload.get("payload").cloned().unwrap_or_else(|| json!({})),
+        })
+        .await;
+    Ok(Json(summary))
 }
 
 async fn remote_sidecar_hook_runs(
