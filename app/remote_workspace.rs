@@ -7854,14 +7854,13 @@ fn remote_message_summary(
     } else {
         remote_chat_parts_with_attachments(&message.content, reasoning, &attachments)
     };
-    json!({
+    let mut summary = json!({
         "id": message.id,
         "role": message.role,
         "content": message.content,
         "createdAt": message.created_at,
         "reasoning": reasoning,
         "sessionMode": metadata.get("sessionMode").or_else(|| metadata.get("session_mode")),
-        "runConfig": run_config,
         "pendingMode": metadata.get("pendingMode"),
         "queuedRun": queued_run,
         "toolCalls": tool_calls,
@@ -7870,7 +7869,11 @@ fn remote_message_summary(
         "memoriesUsed": [],
         "extractedMemories": [],
         "specUpdates": [],
-    })
+    });
+    if let Some(run_config) = run_config {
+        summary["runConfig"] = run_config;
+    }
+    summary
 }
 
 fn remote_tool_call_summary(tool_call: &foco_store::workspace::ToolCallWithResultRecord) -> Value {
@@ -8446,7 +8449,6 @@ async fn remote_sidecar_chat_messages(
         },
         "activeRun": remote_chat_active_run(&state, &chat_id),
         "pendingQuestion": null,
-        "latestResponseUsage": null,
     })))
 }
 
@@ -20129,6 +20131,309 @@ mod tests {
             .expect("insert assistant placeholder");
     }
 
+    struct LocalWorkspaceFixture {
+        workspace: tempfile::TempDir,
+        profile: tempfile::TempDir,
+    }
+
+    impl LocalWorkspaceFixture {
+        fn new() -> Self {
+            Self {
+                workspace: tempfile::tempdir().expect("local workspace tempdir"),
+                profile: tempfile::tempdir().expect("local profile tempdir"),
+            }
+        }
+    }
+
+    struct RemoteSidecarFixture {
+        workspace: tempfile::TempDir,
+        state: RemoteSidecarState,
+    }
+
+    impl RemoteSidecarFixture {
+        fn new() -> Self {
+            let workspace = tempfile::tempdir().expect("remote workspace tempdir");
+            let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+            Self { workspace, state }
+        }
+    }
+
+    trait ContractWorkspaceFixture {
+        fn workspace_path(&self) -> &Path;
+        fn chat_messages_router(&self) -> Router;
+        fn chat_messages_path(&self, chat_id: &str) -> String;
+    }
+
+    impl ContractWorkspaceFixture for LocalWorkspaceFixture {
+        fn workspace_path(&self) -> &Path {
+            self.workspace.path()
+        }
+
+        fn chat_messages_router(&self) -> Router {
+            let mut config =
+                foco_store::config::GlobalConfig::first_run(self.workspace.path().to_path_buf());
+            config.workspaces.push(WorkspaceConfig {
+                id: "local-contract".to_string(),
+                name: "Local contract".to_string(),
+                path: self.workspace.path().to_path_buf(),
+                location: WorkspaceLocation::Local,
+                pinned: false,
+                terminal_shell: "/bin/sh".to_string(),
+                common_commands: Vec::new(),
+            });
+            let state = crate::tests::test_app_state(config, self.profile.path().to_path_buf());
+            Router::new()
+                .route(
+                    "/api/workspaces/{workspace_id}/chats/{chat_id}/messages",
+                    get(crate::http::chat::chat_messages),
+                )
+                .with_state(state)
+        }
+
+        fn chat_messages_path(&self, chat_id: &str) -> String {
+            format!("/api/workspaces/local-contract/chats/{chat_id}/messages")
+        }
+    }
+
+    impl ContractWorkspaceFixture for RemoteSidecarFixture {
+        fn workspace_path(&self) -> &Path {
+            self.workspace.path()
+        }
+
+        fn chat_messages_router(&self) -> Router {
+            Router::new()
+                .route(
+                    "/api/remote/workspace/chats/{chat_id}/messages",
+                    get(remote_sidecar_chat_messages),
+                )
+                .with_state(self.state.clone())
+        }
+
+        fn chat_messages_path(&self, chat_id: &str) -> String {
+            format!("/api/remote/workspace/chats/{chat_id}/messages")
+        }
+    }
+
+    fn seed_dual_backend_terminal_chat_contract(
+        fixture: &impl ContractWorkspaceFixture,
+        chat_id: &str,
+    ) {
+        let mut database = WorkspaceDatabase::open_or_create(fixture.workspace_path())
+            .expect("open fixture database");
+        database
+            .insert_chat_with_metadata(chat_id, "Contract chat", "{}")
+            .expect("insert contract chat");
+        for (id, role, content, sequence, metadata_json) in [
+            ("msg-user-1", "user", "first turn", 0, "{}"),
+            (
+                "msg-assistant-1",
+                "assistant",
+                "first answer",
+                1,
+                r#"{"streamingState":"completed","parts":[{"type":"text","text":"first answer"}]}"#,
+            ),
+            ("msg-user-2", "user", "second turn", 2, "{}"),
+            (
+                "msg-assistant-2",
+                "assistant",
+                "second answer",
+                3,
+                r#"{"streamingState":"completed","parts":[{"type":"text","text":"second answer"}]}"#,
+            ),
+        ] {
+            database
+                .insert_message(NewMessage {
+                    id,
+                    chat_id,
+                    role,
+                    content,
+                    sequence,
+                    metadata_json: Some(metadata_json),
+                })
+                .expect("insert contract message");
+        }
+        database
+            .set_chat_queued_run(
+                chat_id,
+                &json!({
+                    "status": "queued",
+                    "userMessageId": "msg-user-2",
+                    "assistantMessageId": "msg-assistant-2",
+                    "assistantSequence": 3,
+                })
+                .to_string(),
+            )
+            .expect("queue second turn");
+        database
+            .mark_chat_queued_run_started(chat_id, "msg-user-2", "msg-assistant-2", 3)
+            .expect("start second turn");
+        database
+            .clear_chat_queued_run(chat_id, "msg-user-2")
+            .expect("finish second turn");
+    }
+
+    async fn dual_backend_http_response(router: Router, path: &str) -> (u16, Value) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind contract test server");
+        let address = listener.local_addr().expect("contract test address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("serve contract test route");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{address}{path}"))
+            .send()
+            .await
+            .expect("request contract route");
+        let status = response.status().as_u16();
+        let body = response.json().await.expect("contract route JSON");
+        server.abort();
+        (status, body)
+    }
+
+    async fn dual_backend_contract_snapshot(
+        fixture: &impl ContractWorkspaceFixture,
+        chat_id: &str,
+    ) -> Value {
+        let (http_status, body) = dual_backend_http_response(
+            fixture.chat_messages_router(),
+            &fixture.chat_messages_path(chat_id),
+        )
+        .await;
+        let database = WorkspaceDatabase::open_or_create(fixture.workspace_path())
+            .expect("open fixture database");
+        let chat = database
+            .chat(chat_id)
+            .expect("load contract chat")
+            .expect("contract chat exists");
+        let chat_metadata = serde_json::from_str::<Value>(&chat.metadata_json)
+            .expect("contract chat metadata must be JSON");
+        let second_assistant = database
+            .message("msg-assistant-2")
+            .expect("load terminal assistant")
+            .expect("terminal assistant exists");
+        let assistant_metadata = serde_json::from_str::<Value>(&second_assistant.metadata_json)
+            .expect("terminal assistant metadata must be JSON");
+
+        json!({
+            "httpStatus": http_status,
+            "body": body,
+            "sqlite": {
+                "queuedRun": chat_metadata.get("queuedRun").cloned().unwrap_or(Value::Null),
+                "secondAssistant": {
+                    "streamingState": assistant_metadata.get("streamingState").cloned().unwrap_or(Value::Null),
+                    "parts": assistant_metadata.get("parts").cloned().unwrap_or(Value::Null),
+                },
+            },
+        })
+    }
+
+    fn normalize_dual_backend_contract(value: &Value, workspace_path: &Path) -> Value {
+        const TIMESTAMP_FIELDS: &[&str] = &[
+            "createdAt",
+            "updatedAt",
+            "startedAt",
+            "completedAt",
+            "timestamp",
+        ];
+        const PATH_FIELDS: &[&str] = &["workspacePath", "worktreePath", "remotePath"];
+
+        match value {
+            Value::Array(values) => Value::Array(
+                values
+                    .iter()
+                    .map(|value| normalize_dual_backend_contract(value, workspace_path))
+                    .collect(),
+            ),
+            Value::Object(values) => Value::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        let normalized = if TIMESTAMP_FIELDS.contains(&key.as_str()) {
+                            Value::String("<timestamp>".to_string())
+                        } else if PATH_FIELDS.contains(&key.as_str()) {
+                            normalize_dual_backend_contract_path(value, workspace_path)
+                        } else {
+                            normalize_dual_backend_contract(value, workspace_path)
+                        };
+                        (key.clone(), normalized)
+                    })
+                    .collect(),
+            ),
+            _ => value.clone(),
+        }
+    }
+
+    fn normalize_dual_backend_contract_path(value: &Value, workspace_path: &Path) -> Value {
+        let Some(path) = value.as_str() else {
+            return value.clone();
+        };
+        let Ok(relative) = Path::new(path).strip_prefix(workspace_path) else {
+            return value.clone();
+        };
+        if relative.as_os_str().is_empty() {
+            Value::String("<workspace>".to_string())
+        } else {
+            Value::String(format!("<workspace>/{}", relative.display()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dual_backend_fixture_contract_matches_chat_messages_routes_and_terminal_state() {
+        let local = LocalWorkspaceFixture::new();
+        let remote = RemoteSidecarFixture::new();
+
+        seed_dual_backend_terminal_chat_contract(&local, "chat-contract");
+        seed_dual_backend_terminal_chat_contract(&remote, "chat-contract");
+
+        let local_contract = normalize_dual_backend_contract(
+            &dual_backend_contract_snapshot(&local, "chat-contract").await,
+            local.workspace_path(),
+        );
+        let remote_contract = normalize_dual_backend_contract(
+            &dual_backend_contract_snapshot(&remote, "chat-contract").await,
+            remote.workspace_path(),
+        );
+
+        assert_eq!(local_contract, remote_contract);
+        assert_eq!(local_contract["httpStatus"], StatusCode::OK.as_u16());
+        assert_eq!(local_contract["sqlite"]["queuedRun"], Value::Null);
+        assert_eq!(
+            local_contract["sqlite"]["secondAssistant"]["streamingState"],
+            "completed"
+        );
+        assert_eq!(
+            local_contract["body"]["messages"][3]["content"],
+            "second answer"
+        );
+    }
+
+    #[test]
+    fn dual_backend_contract_normalization_only_changes_known_path_and_timestamp_fields() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let sibling = format!("{}-other/file.rs", workspace.path().display());
+        let source = json!({
+            "id": "business-id-must-not-be-ignored",
+            "createdAt": "2026-07-19T00:00:00Z",
+            "workspacePath": workspace.path().join("src/lib.rs").display().to_string(),
+            "content": format!("business content includes {} exactly", workspace.path().display()),
+            "siblingPath": sibling,
+        });
+
+        assert_eq!(
+            normalize_dual_backend_contract(&source, workspace.path()),
+            json!({
+                "id": "business-id-must-not-be-ignored",
+                "createdAt": "<timestamp>",
+                "workspacePath": "<workspace>/src/lib.rs",
+                "content": format!("business content includes {} exactly", workspace.path().display()),
+                "siblingPath": format!("{}-other/file.rs", workspace.path().display()),
+            })
+        );
+    }
+
     #[tokio::test]
     async fn remote_sidecar_chat_statistics_reuses_local_aggregation_and_brokered_global_memory() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -26184,6 +26489,17 @@ mod tests {
                 ),
             })
             .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("insert assistant placeholder");
+        drop(database);
         let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
         let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
@@ -26421,6 +26737,17 @@ mod tests {
                 ),
             })
             .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("insert assistant placeholder");
+        drop(database);
         let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
         let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
