@@ -827,6 +827,71 @@ describe("app-chat-stream verification surfaces", () => {
       appTestState.activeChatStreamController?.close();
     });
   });
+
+  it("does not re-lock after a native scrollbar drag moves away from the bottom", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+
+    const messageList = document.querySelector(".message-list");
+    if (!(messageList instanceof HTMLElement)) {
+      throw new Error("Expected message list");
+    }
+
+    let scrollHeight = 1000;
+    const clientHeight = 500;
+    let scrollTop = 0;
+    Object.defineProperties(messageList, {
+      clientHeight: { configurable: true, get: () => clientHeight },
+      scrollHeight: { configurable: true, get: () => scrollHeight },
+      scrollTop: {
+        configurable: true,
+        get: () => scrollTop,
+        set: (value) => {
+          scrollTop = Math.min(value, Math.max(0, scrollHeight - clientHeight));
+        },
+      },
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "First lock chunk. ",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("First lock chunk.")).toBeInTheDocument();
+    await waitFor(() => expect(messageList.scrollTop).toBe(500));
+
+    // Browser scrollbar drags may emit only a scroll event, without wheel or
+    // pointer events on the message list.
+    scrollTop = 350;
+    fireEvent.scroll(messageList);
+
+    scrollHeight = 1080;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Second unlocked chunk.",
+        type: "textDelta",
+      });
+    });
+
+    expect(
+      await screen.findByText("First lock chunk. Second unlocked chunk."),
+    ).toBeInTheDocument();
+    await waitFor(() => expect(messageList.scrollTop).toBe(350));
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("batches adjacent text deltas before flushing them to the bubble", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));

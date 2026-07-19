@@ -689,8 +689,12 @@ function ChatPanelComponent({
     const isAtBottom =
       element.scrollHeight - nextScrollTop - element.clientHeight <=
       CHAT_BOTTOM_LOCK_THRESHOLD_PX;
-    if (isAtBottom || userMessageScrollIntentRef.current) {
-      shouldLockMessageScrollRef.current = isAtBottom;
+    if (isAtBottom) {
+      shouldLockMessageScrollRef.current = true;
+    } else if (scrollTopDecreased || userMessageScrollIntentRef.current) {
+      // Native scrollbar drags can emit only `scroll`; actual upward movement
+      // away from the bottom is therefore sufficient evidence to unlock.
+      shouldLockMessageScrollRef.current = false;
     }
     userMessageScrollIntentRef.current = false;
 
