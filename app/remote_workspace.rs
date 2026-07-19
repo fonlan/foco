@@ -2462,27 +2462,6 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let options = RemoteSidecarOptions::parse(args)?;
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0))).await?;
     let port = listener.local_addr()?.port();
-    let bootstrap = RemoteSidecarBootstrap {
-        version: REMOTE_SIDECAR_BOOTSTRAP_VERSION,
-        sidecar_version: env!("CARGO_PKG_VERSION").to_string(),
-        target: options.target.clone(),
-        build_id: current_sidecar_build_id()?,
-        workspace_id: options.workspace_id.clone(),
-        workspace_path: options.workspace_path.clone(),
-        server_id: options.server_id.clone(),
-        port,
-        token: options.token.clone(),
-        capabilities: RemoteSidecarCapabilities {
-            http_proxy: true,
-            control_broker: true,
-            terminal_pty: true,
-            git: true,
-            code_graph: true,
-            workspace_database: true,
-            runtime_config_sync: true,
-        },
-    };
-    println!("{}", serde_json::to_string(&bootstrap)?);
 
     let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(256);
     let shutdown_tx = default_shutdown_tx();
@@ -2490,7 +2469,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let active_run_count = Arc::new(AtomicUsize::new(0));
     let active_runs = Arc::new(Mutex::new(Vec::new()));
     let state = RemoteSidecarState {
-        token: options.token,
+        token: options.token.clone(),
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         user_profile_dir: resolve_remote_sidecar_user_profile_dir(),
@@ -2507,6 +2486,8 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     };
 
     let heartbeat_state = state.clone();
+    // Build the router before printing bootstrap. Route-registration panics must
+    // fail the process before main reads a readiness line and opens the tunnel.
     let app = Router::new()
         .route(CONTROL_WS_PATH, get(remote_control_ws))
         .route("/api/remote/health", get(remote_sidecar_health))
@@ -2674,12 +2655,11 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             "/api/remote/workspace/agent-tasks/{task_id}/action",
             post(remote_sidecar_agent_task_action),
         )
+        // axum 0.8 rejects sibling `{*path}` catch-alls under the same prefix as
+        // parameterized routes like `{task_id}/action`. Only the concrete action
+        // route is implemented; other agent-task paths 404.
         .route(
             "/api/remote/workspace/agent-team/{*path}",
-            any(remote_sidecar_passthrough_unavailable),
-        )
-        .route(
-            "/api/remote/workspace/agent-tasks/{*path}",
             any(remote_sidecar_passthrough_unavailable),
         )
         .route(
@@ -2815,6 +2795,30 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             sidecar_bearer_auth,
         ))
         .with_state(state);
+
+    // Publish readiness only after the router is fully constructed so main never
+    // tunnels to a process that already panicked during route registration.
+    let bootstrap = RemoteSidecarBootstrap {
+        version: REMOTE_SIDECAR_BOOTSTRAP_VERSION,
+        sidecar_version: env!("CARGO_PKG_VERSION").to_string(),
+        target: options.target.clone(),
+        build_id: current_sidecar_build_id()?,
+        workspace_id: options.workspace_id.clone(),
+        workspace_path: options.workspace_path.clone(),
+        server_id: options.server_id.clone(),
+        port,
+        token: options.token.clone(),
+        capabilities: RemoteSidecarCapabilities {
+            http_proxy: true,
+            control_broker: true,
+            terminal_pty: true,
+            git: true,
+            code_graph: true,
+            workspace_database: true,
+            runtime_config_sync: true,
+        },
+    };
+    println!("{}", serde_json::to_string(&bootstrap)?);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     {
