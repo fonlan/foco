@@ -1305,6 +1305,7 @@ dependencies = [
 name = "foco-providers"
 version = "0.1.53"
 dependencies = [
+ "async-stream",
  "base64",
  "futures-util",
  "genai",
@@ -1312,6 +1313,8 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
+ "tungstenite",
 ]
 
 [[package]]
@@ -1470,7 +1473,7 @@ dependencies = [
 [[package]]
 name = "genai"
 version = "0.6.4"
-source = "git+https://github.com/fonlan/rust-genai.git?rev=5db8a1aefd0f60a4386b416d892ea57da987704a#5db8a1aefd0f60a4386b416d892ea57da987704a"
+source = "git+https://github.com/fonlan/rust-genai.git?rev=bcd5c2e0f68793bbc1af18ffa2fa2c4792fbeeb5#bcd5c2e0f68793bbc1af18ffa2fa2c4792fbeeb5"
 dependencies = [
  "base64",
  "bytes",
@@ -1921,7 +1924,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -5337,8 +5340,12 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -5740,6 +5747,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.4",
+ "rustls",
+ "rustls-pki-types",
  "sha1 0.10.6",
  "thiserror 2.0.18",
 ]
@@ -6083,6 +6092,24 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.9",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

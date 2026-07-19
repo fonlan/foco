@@ -30,8 +30,8 @@ use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, ProviderConfigError,
-    ProviderConnectionConfig, ProviderRequestFailure, ProviderRequestOverride, normalized_proxy_url,
-    parse_provider_kind, stream_chat_with_capture_observer,
+    ProviderConnectionConfig, ProviderRequestFailure, ProviderRequestOverride,
+    normalized_proxy_url, parse_provider_kind, stream_chat_with_capture_observer,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;

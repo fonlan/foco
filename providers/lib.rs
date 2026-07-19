@@ -1,11 +1,14 @@
+mod openai_resp_websocket;
+
 use std::{
     collections::{BTreeMap, HashSet},
     fmt,
+    pin::Pin,
     sync::{Arc, Mutex},
 };
 
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{Stream, StreamExt};
 use genai::{
     Client, Headers, WebConfig,
     adapter::AdapterKind,
@@ -25,7 +28,7 @@ pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_WIRE_REQUEST_DUMP_FORMAT: &str = "provider_request_v1";
 pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v1";
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
-const MASKED_AUTHORIZATION_VALUE: &str = "********";
+pub(crate) const MASKED_AUTHORIZATION_VALUE: &str = "********";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
 pub const OPENAI_RESPONSES_WEBSOCKET_KIND: &str = "openai-responses-websocket";
@@ -876,16 +879,19 @@ impl fmt::Display for ProviderRequestFailure {
 
 impl std::error::Error for ProviderRequestFailure {}
 
+type GenaiChatEventStream =
+    Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, genai::Error>> + Send>>;
+
 pub struct NeutralChatStream {
-    stream: genai::chat::ChatStream,
-    error_context: ProviderErrorContext,
-    wire_request_dump: Option<ProviderWireRequestDump>,
+    pub(crate) stream: GenaiChatEventStream,
+    pub(crate) error_context: ProviderErrorContext,
+    pub(crate) wire_request_dump: Option<ProviderWireRequestDump>,
     /// Always captured when a real HTTP Response is observed; independent of detail dumps.
-    response_status: Arc<Mutex<Option<u16>>>,
+    pub(crate) response_status: Arc<Mutex<Option<u16>>>,
     /// Full head dump (version/headers) only when `capture_details` is enabled.
-    response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
-    saw_response_event: bool,
-    final_response_dump: Option<ProviderFinalResponseDump>,
+    pub(crate) response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
+    pub(crate) saw_response_event: bool,
+    pub(crate) final_response_dump: Option<ProviderFinalResponseDump>,
 }
 
 impl NeutralChatStream {
@@ -1024,6 +1030,16 @@ pub async fn stream_chat_with_capture_observer(
     capture_details: bool,
     request_observer: Option<ProviderRequestDumpObserver>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    if config.kind.uses_websocket() {
+        return stream_chat_with_capture_observer_websocket(
+            config,
+            request,
+            capture_details,
+            request_observer,
+        )
+        .await;
+    }
+
     let client = config
         .genai_client()
         .map_err(|error| ProviderRequestFailure {
@@ -1102,7 +1118,7 @@ pub async fn stream_chat_with_capture_observer(
     let wire_request_dump = take_captured_request_dump(&captured_request);
 
     Ok(NeutralChatStream {
-        stream: response.stream,
+        stream: Box::pin(response.stream),
         error_context: error_context.with_phase("reading provider stream"),
         wire_request_dump,
         response_status: captured_response_status,
@@ -1110,6 +1126,51 @@ pub async fn stream_chat_with_capture_observer(
         saw_response_event: false,
         final_response_dump: None,
     })
+}
+
+async fn stream_chat_with_capture_observer_websocket(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    capture_details: bool,
+    request_observer: Option<ProviderRequestDumpObserver>,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    ensure_proxy_compatible_with_kind(config.kind, config.proxy_url.is_some()).map_err(
+        |error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        },
+    )?;
+    let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let error_context = config
+        .provider_error_context("opening provider stream", upstream_model_id)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
+    let options = genai_chat_options(config, &request).map_err(|error| ProviderRequestFailure {
+        error,
+        request_dump: None,
+    })?;
+    let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
+    openai_resp_websocket::stream_chat_openai_resp_websocket(
+        config,
+        chat_request,
+        options,
+        model,
+        error_context,
+        capture_details,
+        request_observer,
+    )
+    .await
 }
 
 pub fn parse_provider_kind(value: &str) -> Result<ProviderKind, ProviderConfigError> {
@@ -1198,10 +1259,11 @@ pub fn websocket_url_from_responses_http_url(
             });
         }
     };
-    url.set_scheme(ws_scheme).map_err(|()| ProviderConfigError::InvalidBaseUrl {
-        value: trimmed.to_string(),
-        source: format!("failed to convert scheme to '{ws_scheme}'"),
-    })?;
+    url.set_scheme(ws_scheme)
+        .map_err(|()| ProviderConfigError::InvalidBaseUrl {
+            value: trimmed.to_string(),
+            source: format!("failed to convert scheme to '{ws_scheme}'"),
+        })?;
     Ok(url.to_string())
 }
 
@@ -1829,7 +1891,7 @@ fn redact_url_credentials(url: &reqwest::Url) -> String {
     redacted.to_string()
 }
 
-fn redact_json_body_credentials(body: &str) -> String {
+pub(crate) fn redact_json_body_credentials(body: &str) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(body) else {
         return body.to_string();
     };
@@ -2004,7 +2066,8 @@ fn neutral_usage(usage: &Usage) -> NeutralUsage {
             .map(i64::from),
     }
 }
-struct ProviderErrorContext {
+#[derive(Clone)]
+pub(crate) struct ProviderErrorContext {
     phase: &'static str,
     model_id: String,
     adapter: &'static str,
@@ -2023,7 +2086,7 @@ impl ProviderErrorContext {
         }
     }
 
-    fn with_phase(&self, phase: &'static str) -> Self {
+    pub(crate) fn with_phase(&self, phase: &'static str) -> Self {
         Self {
             phase,
             model_id: self.model_id.clone(),
@@ -2107,7 +2170,10 @@ impl ProviderConfigError {
         }
     }
 
-    fn from_genai_error_with_context(source: genai::Error, context: &ProviderErrorContext) -> Self {
+    pub(crate) fn from_genai_error_with_context(
+        source: genai::Error,
+        context: &ProviderErrorContext,
+    ) -> Self {
         let status_code = genai_error_status_code(&source).map(|status| status.as_u16());
 
         Self::Connection {
@@ -2692,12 +2758,16 @@ mod tests {
             parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("responses websocket kind");
         assert_eq!(websocket_kind.adapter_kind(), AdapterKind::OpenAIResp);
         assert!(websocket_kind.uses_websocket());
-        assert!(!parse_provider_kind(OPENAI_RESPONSES_KIND)
-            .expect("responses kind")
-            .uses_websocket());
-        assert!(!parse_provider_kind(OPENAI_CHAT_KIND)
-            .expect("chat kind")
-            .uses_websocket());
+        assert!(
+            !parse_provider_kind(OPENAI_RESPONSES_KIND)
+                .expect("responses kind")
+                .uses_websocket()
+        );
+        assert!(
+            !parse_provider_kind(OPENAI_CHAT_KIND)
+                .expect("chat kind")
+                .uses_websocket()
+        );
         assert_eq!(
             parse_provider_kind(ANTHROPIC_KIND)
                 .expect("anthropic kind")
@@ -2751,8 +2821,7 @@ mod tests {
             "wss://gateway.example/v1/responses"
         );
         assert_eq!(
-            openai_responses_websocket_url_from_base("http://localhost:8080/v1")
-                .expect("local ws"),
+            openai_responses_websocket_url_from_base("http://localhost:8080/v1").expect("local ws"),
             "ws://localhost:8080/v1/responses"
         );
         assert_eq!(
@@ -2775,6 +2844,174 @@ mod tests {
         let already_ws = websocket_url_from_responses_http_url("wss://example.com/v1/responses")
             .expect_err("ws input should fail");
         assert!(already_ws.to_string().contains("http or https"));
+    }
+
+    #[tokio::test]
+    async fn websocket_prepare_payload_matches_http_responses_minus_stream_fields() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some("https://gateway.example/v1/".to_string()),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![
+                NeutralChatMessage {
+                    role: NeutralChatRole::System,
+                    content: "sys".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::Developer,
+                    content: "dev".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "hi".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: Some(128),
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let client = config.genai_client().expect("client");
+        let chat_request =
+            genai_chat_request_for_adapter(&request, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options(&config, &request).expect("options");
+        let model = genai::ModelIden::new(config.kind.adapter_kind(), "gpt-4.1-mini");
+        let prepared = client
+            .prepare_chat_stream_request(model, chat_request, Some(&options))
+            .await
+            .expect("prepare");
+
+        assert_eq!(prepared.url, "https://gateway.example/v1/responses");
+        assert_eq!(prepared.payload["stream"], true);
+        assert_eq!(prepared.payload["model"], "gpt-4.1-mini");
+        assert_eq!(prepared.payload["instructions"], "sys");
+        assert!(prepared.payload["input"].as_array().is_some());
+
+        let ws_payload =
+            genai::adapter::openai_resp_websocket_create_payload(prepared.payload.clone());
+        assert_eq!(ws_payload["type"], "response.create");
+        assert!(ws_payload.get("stream").is_none());
+        assert!(ws_payload.get("background").is_none());
+
+        let mut http_body = prepared.payload.as_object().cloned().expect("object");
+        http_body.remove("stream");
+        http_body.remove("background");
+        let mut ws_body = ws_payload.as_object().cloned().expect("object");
+        ws_body.remove("type");
+        assert_eq!(http_body, ws_body);
+
+        assert_eq!(
+            websocket_url_from_responses_http_url(&prepared.url).expect("ws url"),
+            "wss://gateway.example/v1/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_stream_maps_to_neutral_events_and_closes_cleanly() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("ws accept");
+            let first = ws.next().await.expect("msg").expect("ok");
+            let text = match first {
+                Message::Text(text) => text.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let create: Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(create["type"], "response.create");
+            assert!(create.get("stream").is_none());
+
+            for frame in [
+                r#"{"type":"response.output_text.delta","delta":"Hello"}"#,
+                r#"{"type":"response.completed","response":{"id":"resp_ws","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#,
+            ] {
+                ws.send(Message::Text(frame.into())).await.expect("send");
+            }
+            let _ = ws.close(None).await;
+        });
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("stream");
+        assert!(stream.wire_request_dump().is_some());
+        assert_eq!(stream.http_status(), Some(101));
+
+        let mut events = Vec::new();
+        while let Some(event) = stream.next_event().await {
+            events.push(event.expect("event"));
+        }
+
+        assert!(matches!(
+            events.first(),
+            Some(NeutralChatStreamEvent::Start)
+        ));
+        assert!(events.iter().any(
+            |event| matches!(event, NeutralChatStreamEvent::TextDelta { delta } if delta == "Hello")
+        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            NeutralChatStreamEvent::Complete {
+                text,
+                response_id: Some(id),
+                ..
+            } if text == "Hello" && id == "resp_ws"
+        )));
+        assert!(stream.final_response_dump().is_some());
+        server.await.expect("server");
     }
 
     #[test]

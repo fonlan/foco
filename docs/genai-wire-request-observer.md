@@ -8,7 +8,7 @@ Foco depends on a long-lived `genai` fork for two maintained capabilities: API a
 - Foco fork: `fonlan/rust-genai`
 - Upstream baseline: `genai 0.6.4`, commit `bb38ad7d6c2c3bc86ecc84fd6f97a10ad7803e6d`
 - Patch branch: `foco/request-observer-0.6.4`
-- Pinned patch commit: `5db8a1aefd0f60a4386b416d892ea57da987704a`
+- Pinned patch commit: `bcd5c2e0f68793bbc1af18ffa2fa2c4792fbeeb5`
 
 The root `Cargo.toml` pins the fork by the full commit SHA. Do not replace the `rev` with a floating branch or tag. The fork is a Foco-maintained patchset and its observer and Developer-role patches are not planned for upstream submission.
 
@@ -43,6 +43,16 @@ The observers must not serialize the adapter request twice, send a duplicate req
 | DNS, TLS, connect, or proxy failure before an HTTP response | Available when the request was prepared | Unavailable; Foco must not synthesize status, version, or headers |
 
 Foco's provider layer owns Authorization masking, existing URL/body credential redaction, and the versioned `ProviderWireRequestDump` / `ProviderFinalResponseDump` envelopes. Neither observer promises visibility into headers inserted or rewritten by transport/proxy code after its boundary.
+
+
+## OpenAI Responses prepare + transport-neutral decoder
+
+In addition to the HTTP observers, the fork exposes helpers so Foco can drive OpenAI Responses over WebSocket without duplicating adapter serialization:
+
+- `Client::prepare_chat_stream_request` returns the finalized HTTP URL, headers, and Responses JSON body after model mapping, tools, reasoning, request overrides, and auth overrides — the same payload that `exec_chat_stream` would send. Existing `exec_chat_stream` / `exec_chat_stream_observed_with_response` remain compatible.
+- `adapter::OpenAIRespEventDecoder` is a transport-neutral JSON event state machine shared by the SSE `OpenAIRespStreamer` and host WebSocket transports. Callers feed SSE `data:` lines or WebSocket text frames into `decode_json_to_chat_event`; terminal `response.completed` / `failed` / `incomplete`, top-level `error`, and EOF without a terminal event are handled uniformly.
+- `adapter::openai_resp_websocket_create_payload` converts an HTTP Responses body into a WebSocket `response.create` client event by removing `stream` / `background` and setting `type: "response.create"`.
+- WebSocket URL derivation (scheme-only `http→ws` / `https→wss`) and the tungstenite connection remain Foco provider-layer concerns; genai does not add a WebSocket dependency.
 
 ## Developer role adapter contract
 
@@ -79,7 +89,7 @@ Adapter behavior must be asserted from the actual finalized request rather than 
 When upgrading genai:
 
 1. Fetch the latest upstream history into the fork and identify the exact upstream release commit to use as the new baseline.
-2. Create a version-specific maintenance branch from that upstream commit. Reapply or cherry-pick only the Foco patchset: prepared-request observer, response-head observer, first-class Developer role, and the explicit adapter native/fallback mappings. Resolve conflicts explicitly at the final request-build/send and response-established/pre-body boundaries and at each adapter's role serialization boundary.
+2. Create a version-specific maintenance branch from that upstream commit. Reapply or cherry-pick only the Foco patchset: prepared-request observer, response-head observer, first-class Developer role, the explicit adapter native/fallback mappings, OpenAI Responses prepare_chat_stream_request, transport-neutral OpenAIRespEventDecoder, and openai_resp_websocket_create_payload. Resolve conflicts explicitly at the final request-build/send and response-established/pre-body boundaries and at each adapter's role serialization boundary.
 3. Verify every streaming adapter still passes through both observed boundaries after model mapping, provider payload construction, `extra_body`, request overrides, and adapter-specific headers are applied. Separately verify Developer remains native only for OpenAI Chat/Responses and continues to use the documented semantic fallback for every other adapter.
 4. In the fork, run formatting plus the local observer HTTP/SSE fixtures. They must prove that captured request data equals what the server receives, response heads are captured for successful/non-2xx/pre-decode-failure paths, and the server receives exactly one request.
 5. Push the validated patch commit to `fonlan/rust-genai` before changing Foco. Record its full 40-character SHA.
