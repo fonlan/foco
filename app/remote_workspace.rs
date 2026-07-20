@@ -4076,6 +4076,195 @@ async fn stop_stale_remote_sidecars(
 /// `$HOME/.foco/sidecars/`.
 const REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT: usize = 2;
 
+/// Single machine-readable summary line prefix emitted by the retain shell script.
+/// Format: `FOCO_SIDECAR_RETAIN_V1 status=<s> scanned=<n> kept=<n> deleted=<n> failed=<n>`
+/// Status/count fields only — never paths, tokens, credentials, or workspace content.
+const REMOTE_SIDECAR_RETAIN_SUMMARY_PREFIX: &str = "FOCO_SIDECAR_RETAIN_V1";
+
+/// Bounded digit length for summary count fields (reject unbounded/overflowing tokens).
+const REMOTE_SIDECAR_RETAIN_COUNT_MAX_DIGITS: usize = 10;
+
+/// Structured outcome of managed remote sidecar version-directory retention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteSidecarRetainStatus {
+    /// Retain loop finished; at least one directory deleted; zero delete failures.
+    Ok,
+    /// No candidate deletions needed (missing root, empty scan, or all kept).
+    Noop,
+    /// Init (empty current / mktemp) or sort failure; deletions not reliably attempted.
+    SetupFailed,
+    /// At least one candidate `rm -rf` failed.
+    PartialFailure,
+}
+
+impl RemoteSidecarRetainStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Noop => "noop",
+            Self::SetupFailed => "setup_failed",
+            Self::PartialFailure => "partial_failure",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "ok" => Some(Self::Ok),
+            "noop" => Some(Self::Noop),
+            "setup_failed" => Some(Self::SetupFailed),
+            "partial_failure" => Some(Self::PartialFailure),
+            _ => None,
+        }
+    }
+
+    /// Info-loggable success: full success or nothing to delete.
+    fn is_success(self) -> bool {
+        matches!(self, Self::Ok | Self::Noop)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteSidecarRetainResult {
+    status: RemoteSidecarRetainStatus,
+    scanned: u64,
+    kept: u64,
+    deleted: u64,
+    failed: u64,
+}
+
+/// Parse a bounded, versioned retain summary from remote command stdout.
+///
+/// Exactly one `FOCO_SIDECAR_RETAIN_V1` line is required. Fields are status + counts only.
+/// Parse failures are cleanup diagnostics failures, not connection failures.
+fn parse_remote_sidecar_retain_summary(
+    output: &str,
+) -> Result<RemoteSidecarRetainResult, &'static str> {
+    let mut found: Option<&str> = None;
+    for line in output.lines() {
+        let line = line.trim();
+        if !line.starts_with(REMOTE_SIDECAR_RETAIN_SUMMARY_PREFIX) {
+            continue;
+        }
+        if found.is_some() {
+            return Err("multiple retain summary lines");
+        }
+        found = Some(line);
+    }
+    let line = found.ok_or("missing retain summary line")?;
+    let rest = line
+        .get(REMOTE_SIDECAR_RETAIN_SUMMARY_PREFIX.len()..)
+        .ok_or("missing retain summary prefix")?
+        .trim_start();
+    if rest.is_empty() {
+        return Err("empty retain summary fields");
+    }
+
+    let mut status = None;
+    let mut scanned = None;
+    let mut kept = None;
+    let mut deleted = None;
+    let mut failed = None;
+
+    for token in rest.split_whitespace() {
+        let Some((key, value)) = token.split_once('=') else {
+            return Err("invalid retain summary field");
+        };
+        if value.is_empty() {
+            return Err("empty retain summary value");
+        }
+        match key {
+            "status" => {
+                if status
+                    .replace(
+                        RemoteSidecarRetainStatus::parse(value).ok_or("unknown retain status")?,
+                    )
+                    .is_some()
+                {
+                    return Err("duplicate status");
+                }
+            }
+            "scanned" => {
+                if scanned
+                    .replace(parse_remote_sidecar_retain_count(value)?)
+                    .is_some()
+                {
+                    return Err("duplicate scanned");
+                }
+            }
+            "kept" => {
+                if kept
+                    .replace(parse_remote_sidecar_retain_count(value)?)
+                    .is_some()
+                {
+                    return Err("duplicate kept");
+                }
+            }
+            "deleted" => {
+                if deleted
+                    .replace(parse_remote_sidecar_retain_count(value)?)
+                    .is_some()
+                {
+                    return Err("duplicate deleted");
+                }
+            }
+            "failed" => {
+                if failed
+                    .replace(parse_remote_sidecar_retain_count(value)?)
+                    .is_some()
+                {
+                    return Err("duplicate failed");
+                }
+            }
+            _ => return Err("unknown retain summary field"),
+        }
+    }
+
+    let result = RemoteSidecarRetainResult {
+        status: status.ok_or("missing status")?,
+        scanned: scanned.ok_or("missing scanned")?,
+        kept: kept.ok_or("missing kept")?,
+        deleted: deleted.ok_or("missing deleted")?,
+        failed: failed.ok_or("missing failed")?,
+    };
+    validate_remote_sidecar_retain_result(&result)?;
+    Ok(result)
+}
+
+fn parse_remote_sidecar_retain_count(value: &str) -> Result<u64, &'static str> {
+    if value.is_empty()
+        || value.len() > REMOTE_SIDECAR_RETAIN_COUNT_MAX_DIGITS
+        || !value.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err("invalid retain count");
+    }
+    if value.len() > 1 && value.starts_with('0') {
+        return Err("invalid retain count");
+    }
+    value.parse::<u64>().map_err(|_| "invalid retain count")
+}
+
+fn validate_remote_sidecar_retain_result(
+    result: &RemoteSidecarRetainResult,
+) -> Result<(), &'static str> {
+    if result.kept > result.scanned
+        || result.deleted.saturating_add(result.failed) > result.scanned - result.kept
+    {
+        return Err("retain counts exceed scanned candidates");
+    }
+
+    match result.status {
+        RemoteSidecarRetainStatus::Ok if result.failed == 0 && result.deleted > 0 => Ok(()),
+        RemoteSidecarRetainStatus::Noop if result.failed == 0 && result.deleted == 0 => Ok(()),
+        RemoteSidecarRetainStatus::SetupFailed
+            if result.kept == 0 && result.deleted == 0 && result.failed == 0 =>
+        {
+            Ok(())
+        }
+        RemoteSidecarRetainStatus::PartialFailure if result.failed > 0 => Ok(()),
+        _ => Err("retain status/count inconsistency"),
+    }
+}
+
 /// Direct version-directory candidates for the pure retain policy (tests + shell parity).
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4153,57 +4342,80 @@ fn should_run_managed_remote_sidecar_version_cleanup(
 /// version directory plus one recent historical version under `$HOME/.foco/sidecars`.
 ///
 /// Only real direct child directories are considered; symlinks and non-directories are skipped.
-/// Deletion failures are ignored and the script always exits 0.
+/// Emits exactly one `FOCO_SIDECAR_RETAIN_V1` summary (status + counts only) on every safe
+/// exit path. Always exits 0 so a Ready connection is never failed by cleanup.
 fn remote_managed_sidecar_version_retain_script(
     current_version: &str,
     retain_count: usize,
 ) -> String {
     // Policy parity with `select_remote_sidecar_version_dirs_to_remove`.
-    // Name filter mirrors `is_safe_remote_sidecar_version_dir_name` (no whitespace/control
-    // chars) so TSV mtime/name fields cannot shift.
+    // Name filter mirrors `is_safe_remote_sidecar_version_dir_name`: only ASCII alnum +
+    // `.-_+`, so no shell control characters or ambiguous TSV fields reach deletion.
     format!(
         r#"set +e
 # Foco managed remote sidecar version retain (best-effort; always exit 0).
+# Prints exactly one FOCO_SIDECAR_RETAIN_V1 summary (status + counts; no paths).
+emit_summary() {{
+  printf 'FOCO_SIDECAR_RETAIN_V1 status=%s scanned=%s kept=%s deleted=%s failed=%s\n' \
+    "$1" "$2" "$3" "$4" "$5"
+}}
+is_safe_name() {{
+  case "$1" in
+    ''|'.'|'..'|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*) return 1 ;;
+  esac
+  return 0
+}}
 root="$HOME/.foco/sidecars"
 current={current_version}
 retain={retain_count}
-[ -n "$current" ] || exit 0
-[ -d "$root" ] || exit 0
+scanned=0
+kept=0
+deleted=0
+failed=0
+[ -n "$current" ] || {{ emit_summary setup_failed 0 0 0 0; exit 0; }}
+[ -d "$root" ] || {{ emit_summary noop 0 0 0 0; exit 0; }}
 if [ "$retain" -gt 0 ] 2>/dev/null; then
   keep_other=$((retain - 1))
 else
   keep_other=0
 fi
 tmp="$(mktemp 2>/dev/null || true)"
-[ -n "$tmp" ] || exit 0
+[ -n "$tmp" ] || {{ emit_summary setup_failed 0 0 0 0; exit 0; }}
 trap 'rm -f -- "$tmp"' EXIT HUP INT TERM
-: > "$tmp"
+if ! : > "$tmp"; then
+  rm -f -- "$tmp" 2>/dev/null || true
+  trap - EXIT HUP INT TERM
+  emit_summary setup_failed 0 0 0 0
+  exit 0
+fi
 for path in "$root"/*; do
   [ -e "$path" ] || [ -L "$path" ] || continue
   name="${{path##*/}}"
-  case "$name" in
-    ''|'.'|'..'|*'/'*|*'\\'*|*[[:space:]]*|*[[:cntrl:]]*) continue ;;
-  esac
+  is_safe_name "$name" || continue
   # Do not follow symlinks; only real direct child directories are candidates.
   [ -L "$path" ] && continue
   [ -d "$path" ] || continue
   # Always protect the successful current version (even if it is not newest by mtime).
   [ "$name" = "$current" ] && continue
   mtime="$(stat -c %Y -- "$path" 2>/dev/null || stat -f %m -- "$path" 2>/dev/null || printf '0')"
-  printf '%s\t%s\n' "$mtime" "$name" >> "$tmp"
+  if ! printf '%s\t%s\n' "$mtime" "$name" >> "$tmp"; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    trap - EXIT HUP INT TERM
+    emit_summary setup_failed "$scanned" 0 0 0
+    exit 0
+  fi
+  scanned=$((scanned + 1))
 done
 # If sort fails, skip deletions rather than acting on an empty/unordered list.
 if ! LC_ALL=C sort -t "$(printf '\t')" -k1,1nr -k2,2 -o "$tmp" "$tmp" 2>/dev/null; then
   rm -f -- "$tmp" 2>/dev/null || true
   trap - EXIT HUP INT TERM
+  emit_summary setup_failed "$scanned" 0 0 0
   exit 0
 fi
-kept=0
 while IFS="$(printf '\t')" read -r mtime name; do
   [ -n "$name" ] || continue
-  case "$name" in
-    ''|'.'|'..'|*'/'*|*'\\'*|*[[:space:]]*|*[[:cntrl:]]*) continue ;;
-  esac
+  is_safe_name "$name" || continue
   if [ "$kept" -lt "$keep_other" ]; then
     kept=$((kept + 1))
     continue
@@ -4211,10 +4423,21 @@ while IFS="$(printf '\t')" read -r mtime name; do
   victim="$root/$name"
   [ -L "$victim" ] && continue
   [ -d "$victim" ] || continue
-  rm -rf -- "$victim" 2>/dev/null || true
+  if rm -rf -- "$victim" 2>/dev/null; then
+    deleted=$((deleted + 1))
+  else
+    failed=$((failed + 1))
+  fi
 done < "$tmp"
 rm -f -- "$tmp" 2>/dev/null || true
 trap - EXIT HUP INT TERM
+if [ "$failed" -gt 0 ]; then
+  emit_summary partial_failure "$scanned" "$kept" "$deleted" "$failed"
+elif [ "$deleted" -eq 0 ]; then
+  emit_summary noop "$scanned" "$kept" "$deleted" "$failed"
+else
+  emit_summary ok "$scanned" "$kept" "$deleted" "$failed"
+fi
 exit 0
 "#,
         current_version = shell_quote(current_version),
@@ -4224,6 +4447,9 @@ exit 0
 
 /// Best-effort prune of older Foco-managed remote sidecar version directories after a
 /// successful connect. Custom `focoCommand` is a no-op. Failures are logged only.
+///
+/// Success is determined from the parsed `FOCO_SIDECAR_RETAIN_V1` summary, not SSH exit
+/// status alone. Cleanup never removes a Ready session or verified sidecar cache.
 async fn maybe_cleanup_stale_managed_remote_sidecar_versions(
     server: &RemoteServerProfile,
     server_id: &str,
@@ -4233,39 +4459,69 @@ async fn maybe_cleanup_stale_managed_remote_sidecar_versions(
     if !should_run_managed_remote_sidecar_version_cleanup(sidecar_command) {
         return;
     }
-    let current_version = sidecar_command
+    let Some(current_version) = sidecar_command
         .managed_install_version
         .as_deref()
-        .expect("managed_install_version present when cleanup should run");
+        .filter(|version| is_safe_remote_sidecar_version_dir_name(version))
+    else {
+        return;
+    };
 
     let script = remote_managed_sidecar_version_retain_script(
         current_version,
         REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
     );
     match run_ssh_output(server, &script, server_id, Some(workspace_id)).await {
-        Ok(output) if output.success() => {
-            tracing::info!(
-                server_id = %server_id,
-                workspace_id = %workspace_id,
-                current_version,
-                retain_count = REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
-                "managed remote sidecar version cleanup completed"
-            );
-        }
         Ok(output) => {
-            tracing::warn!(
-                server_id = %server_id,
-                workspace_id = %workspace_id,
-                current_version,
-                detail = %output_text(&output),
-                "managed remote sidecar version cleanup returned non-zero (best-effort)"
-            );
+            let stdout = output.stdout_lossy();
+            match parse_remote_sidecar_retain_summary(&stdout) {
+                Ok(result) if output.success() && result.status.is_success() => {
+                    tracing::info!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        current_version,
+                        status = result.status.as_str(),
+                        scanned = result.scanned,
+                        kept = result.kept,
+                        deleted = result.deleted,
+                        failed = result.failed,
+                        retain_count = REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+                        "managed remote sidecar version cleanup completed"
+                    );
+                }
+                Ok(result) => {
+                    tracing::warn!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        current_version,
+                        status = result.status.as_str(),
+                        scanned = result.scanned,
+                        kept = result.kept,
+                        deleted = result.deleted,
+                        failed = result.failed,
+                        exit_success = output.success(),
+                        "managed remote sidecar version cleanup reported failure (best-effort)"
+                    );
+                }
+                Err(parse_error) => {
+                    tracing::warn!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        current_version,
+                        status = "invalid_summary",
+                        parse_error,
+                        exit_success = output.success(),
+                        "managed remote sidecar version cleanup summary invalid (best-effort)"
+                    );
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(
                 server_id = %server_id,
                 workspace_id = %workspace_id,
                 current_version,
+                status = "ssh_error",
                 error = %error.message(),
                 "managed remote sidecar version cleanup failed (best-effort)"
             );
@@ -23244,10 +23500,26 @@ mod tests {
         assert!(script.contains("[ \"$name\" = \"$current\" ] && continue"));
         assert!(script.contains("[ -L \"$path\" ] && continue"));
         assert!(script.contains("[ -d \"$path\" ] || continue"));
-        assert!(script.contains("rm -rf -- \"$victim\" 2>/dev/null || true"));
+        assert!(script.contains("if rm -rf -- \"$victim\" 2>/dev/null; then"));
+        assert!(script.contains("deleted=$((deleted + 1))"));
+        assert!(script.contains("failed=$((failed + 1))"));
+        assert!(
+            script.contains(
+                "FOCO_SIDECAR_RETAIN_V1 status=%s scanned=%s kept=%s deleted=%s failed=%s"
+            )
+        );
+        assert!(script.contains("emit_summary ok"));
+        assert!(script.contains("emit_summary noop"));
+        assert!(script.contains("emit_summary setup_failed"));
+        assert!(script.contains("emit_summary partial_failure"));
         assert!(script.contains("exit 0"));
         assert!(script.contains("set +e"));
-        assert!(script.contains("*[[:space:]]*|*[[:cntrl:]]*"));
+        assert!(script.contains("is_safe_name()"));
+        assert!(
+            script.contains(
+                "*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-]*)"
+            )
+        );
         assert!(script.contains("If sort fails, skip deletions"));
         // Must not reuse process cleanup (stop_stale_remote_sidecars).
         assert!(!script.contains("--remote-sidecar"));
@@ -23256,6 +23528,249 @@ mod tests {
         let quoted = shell_quote("1.2.3-beta'x");
         let dangerous = remote_managed_sidecar_version_retain_script("1.2.3-beta'x", 2);
         assert!(dangerous.contains(&format!("current={quoted}")));
+        // Structured summary must not embed paths or credentials.
+        assert!(!script.contains("token="));
+        assert!(!script.contains("password"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_managed_sidecar_version_retain_script_prunes_real_version_dirs() {
+        let home = tempfile::tempdir().expect("temporary HOME");
+        let root = home.path().join(".foco/sidecars");
+        fs::create_dir_all(&root).expect("sidecar root");
+
+        let current = root.join("1.0.0");
+        let oldest = root.join("0.8.0");
+        let older = root.join("0.9.0");
+        let newest = root.join("1.1.0");
+        let unsafe_name = root.join("unsafe$name");
+        for directory in [&current, &oldest, &older, &newest, &unsafe_name] {
+            fs::create_dir(directory).expect("version directory");
+        }
+        fs::write(root.join("not-a-directory"), "ignored").expect("non-directory entry");
+        let symlink = root.join("symlink-version");
+        std::os::unix::fs::symlink(&current, &symlink).expect("version symlink");
+
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        for (directory, seconds) in [(&current, 10), (&oldest, 20), (&older, 30), (&newest, 40)] {
+            fs::File::open(directory)
+                .expect("open version directory")
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(base + std::time::Duration::from_secs(seconds)),
+                )
+                .expect("set version directory mtime");
+        }
+
+        let script = remote_managed_sidecar_version_retain_script(
+            "1.0.0",
+            REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+        );
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&script)
+            .env("HOME", home.path())
+            .output()
+            .expect("execute retain script");
+        assert!(
+            output.status.success(),
+            "retain script failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let stdout = String::from_utf8(output.stdout).expect("retain script stdout");
+        assert_eq!(stdout.lines().count(), 1);
+        assert_eq!(
+            parse_remote_sidecar_retain_summary(&stdout).expect("retain summary"),
+            RemoteSidecarRetainResult {
+                status: RemoteSidecarRetainStatus::Ok,
+                scanned: 3,
+                kept: 1,
+                deleted: 2,
+                failed: 0,
+            }
+        );
+        assert!(current.is_dir(), "current version must remain");
+        assert!(newest.is_dir(), "newest historical version must remain");
+        assert!(!oldest.exists(), "oldest historical version must be pruned");
+        assert!(!older.exists(), "older historical version must be pruned");
+        assert!(unsafe_name.is_dir(), "unsafe version name must be skipped");
+        assert!(root.join("not-a-directory").is_file());
+        assert!(
+            fs::symlink_metadata(&symlink)
+                .expect("symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_managed_sidecar_version_retain_script_reports_delete_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = tempfile::tempdir().expect("temporary HOME");
+        let root = home.path().join(".foco/sidecars");
+        fs::create_dir_all(&root).expect("sidecar root");
+        for name in ["1.0.0", "0.8.0", "0.9.0", "1.1.0"] {
+            fs::create_dir(root.join(name)).expect("version directory");
+        }
+
+        let base = std::time::SystemTime::UNIX_EPOCH;
+        for (name, seconds) in [("1.0.0", 10), ("0.8.0", 20), ("0.9.0", 30), ("1.1.0", 40)] {
+            fs::File::open(root.join(name))
+                .expect("open version directory")
+                .set_times(
+                    fs::FileTimes::new()
+                        .set_modified(base + std::time::Duration::from_secs(seconds)),
+                )
+                .expect("set version directory mtime");
+        }
+
+        let bin = home.path().join("bin");
+        fs::create_dir(&bin).expect("wrapper directory");
+        let rm_wrapper = bin.join("rm");
+        fs::write(
+            &rm_wrapper,
+            "#!/bin/sh\n[ \"${3##*/}\" = \"0.8.0\" ] && exit 1\nexec /bin/rm \"$@\"\n",
+        )
+        .expect("write rm wrapper");
+        let mut permissions = fs::metadata(&rm_wrapper)
+            .expect("rm wrapper metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&rm_wrapper, permissions).expect("make rm wrapper executable");
+
+        let path = std::env::var_os("PATH").expect("PATH");
+        let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(&path)))
+            .expect("wrapper PATH");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_managed_sidecar_version_retain_script(
+                "1.0.0",
+                REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+            ))
+            .env("HOME", home.path())
+            .env("PATH", path)
+            .output()
+            .expect("execute retain script");
+
+        assert!(output.status.success(), "cleanup remains best-effort");
+        assert_eq!(
+            parse_remote_sidecar_retain_summary(&String::from_utf8(output.stdout).expect("stdout"))
+                .expect("retain summary"),
+            RemoteSidecarRetainResult {
+                status: RemoteSidecarRetainStatus::PartialFailure,
+                scanned: 3,
+                kept: 1,
+                deleted: 1,
+                failed: 1,
+            }
+        );
+        assert!(root.join("0.8.0").is_dir(), "failed victim must remain");
+        assert!(!root.join("0.9.0").exists(), "other victim must be deleted");
+    }
+
+    #[test]
+    fn parse_remote_sidecar_retain_summary_accepts_valid_statuses() {
+        let ok = parse_remote_sidecar_retain_summary(
+            "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=4 kept=1 deleted=3 failed=0\n",
+        )
+        .expect("ok summary");
+        assert_eq!(ok.status, RemoteSidecarRetainStatus::Ok);
+        assert_eq!((ok.scanned, ok.kept, ok.deleted, ok.failed), (4, 1, 3, 0));
+        assert!(ok.status.is_success());
+
+        let noop = parse_remote_sidecar_retain_summary(
+            "noise\nFOCO_SIDECAR_RETAIN_V1 status=noop scanned=1 kept=1 deleted=0 failed=0\n",
+        )
+        .expect("noop summary");
+        assert_eq!(noop.status, RemoteSidecarRetainStatus::Noop);
+        assert!(noop.status.is_success());
+
+        let setup = parse_remote_sidecar_retain_summary(
+            "FOCO_SIDECAR_RETAIN_V1 status=setup_failed scanned=2 kept=0 deleted=0 failed=0",
+        )
+        .expect("setup_failed summary");
+        assert_eq!(setup.status, RemoteSidecarRetainStatus::SetupFailed);
+        assert!(!setup.status.is_success());
+
+        let partial = parse_remote_sidecar_retain_summary(
+            "FOCO_SIDECAR_RETAIN_V1 status=partial_failure scanned=5 kept=1 deleted=2 failed=1",
+        )
+        .expect("partial summary");
+        assert_eq!(partial.status, RemoteSidecarRetainStatus::PartialFailure);
+        assert_eq!(partial.failed, 1);
+        assert!(!partial.status.is_success());
+    }
+
+    #[test]
+    fn parse_remote_sidecar_retain_summary_rejects_invalid_payloads() {
+        assert!(parse_remote_sidecar_retain_summary("").is_err());
+        assert!(parse_remote_sidecar_retain_summary("no summary here").is_err());
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=1 kept=0 deleted=1 failed=0\n\
+             FOCO_SIDECAR_RETAIN_V1 status=noop scanned=0 kept=0 deleted=0 failed=0\n"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=weird scanned=0 kept=0 deleted=0 failed=0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=1 kept=0 deleted=1 failed=0 path=/tmp/x"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=-1 kept=0 deleted=1 failed=0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=01 kept=0 deleted=1 failed=0"
+            )
+            .is_err()
+        );
+        // status/count consistency
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=1 kept=0 deleted=0 failed=0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=partial_failure scanned=1 kept=0 deleted=0 failed=0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=1 kept=0 deleted=1 failed=1"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=0 kept=0 deleted=1 failed=0"
+            )
+            .is_err()
+        );
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V1 status=setup_failed scanned=1 kept=1 deleted=0 failed=0"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -29687,7 +30202,7 @@ mod tests {
                 max_output_tokens: Some(1024),
                 prompt_cache_key: None,
                 prompt_cache_retention: None,
-            agent_correlation: None,
+                agent_correlation: None,
             },
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_path_buf(),
