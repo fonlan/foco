@@ -185,6 +185,7 @@ mod remote_workspace;
 mod runtime;
 mod scheduled_tasks;
 mod settings_runtime;
+mod single_instance;
 mod skills;
 mod spec_runtime;
 mod ssh_client;
