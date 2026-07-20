@@ -1071,7 +1071,57 @@ describe("app agents verification surfaces", () => {
     expect(screen.queryByText("n/a")).not.toBeInTheDocument();
   });
 
-  it("restores cached Worker transcript immediately when switching back while refresh is deferred", async () => {
+  it("restores cached guidance-split Worker transcript immediately when switching back while refresh is deferred", async () => {
+    const guidanceSplitTranscript: AgentTranscriptResponse = {
+      ...agentTranscriptResponse,
+      items: [
+        {
+          ...agentTranscriptResponse.items[0]!,
+          content: "Worker, inspect the current task.",
+          id: "task:agent-task-1:input",
+          metrics: null,
+          parts: [],
+          role: "user" as const,
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "Before guidance.",
+          id: "task:agent-task-1:run:before-guidance:5",
+          parts: [{ type: "text", text: "Before guidance." }],
+          role: "assistant" as const,
+          status: null,
+        },
+        {
+          ...agentTranscriptResponse.items[0]!,
+          author: "Main agent",
+          content: "Continue with the summary.",
+          id: "message:agent-message-guidance-1",
+          kind: "Message",
+          metrics: null,
+          parts: [],
+          role: "user" as const,
+          status: null,
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "After guidance.",
+          id: "task:agent-task-1:run:after-guidance:5",
+          parts: [{ type: "text", text: "After guidance." }],
+          role: "assistant" as const,
+          status: "streaming",
+          taskStatus: "running",
+        },
+      ],
+    };
+    const assertGuidanceTimeline = () => {
+      const transcriptText = agentTranscriptPanelMessageList().textContent ?? "";
+      const beforeIndex = transcriptText.indexOf("Before guidance.");
+      const guidanceIndex = transcriptText.indexOf("Continue with the summary.");
+      const afterIndex = transcriptText.indexOf("After guidance.");
+      expect(beforeIndex).toBeGreaterThanOrEqual(0);
+      expect(guidanceIndex).toBeGreaterThan(beforeIndex);
+      expect(afterIndex).toBeGreaterThan(guidanceIndex);
+    };
     const snapshotRefreshGate = deferred<void>();
     const transcriptRefreshGate = deferred<void>();
     let deferBackgroundRefresh = false;
@@ -1096,7 +1146,7 @@ describe("app agents verification surfaces", () => {
           if (deferBackgroundRefresh && transcriptRequestCount > 1) {
             await transcriptRefreshGate.promise;
           }
-          return jsonResponse(agentTranscriptResponse);
+          return jsonResponse(guidanceSplitTranscript);
         }
         return mockFetch(input, init);
       }),
@@ -1108,9 +1158,7 @@ describe("app agents verification surfaces", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
 
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
-    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
-    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
-    expect(screen.getByText("Read")).toBeInTheDocument();
+    assertGuidanceTimeline();
 
     deferBackgroundRefresh = true;
     const snapshotCountAfterOpen = snapshotRequestCount;
@@ -1123,9 +1171,7 @@ describe("app agents verification surfaces", () => {
     await userEvent.click(await screen.findByRole("tab", { name: /Worker/ }));
 
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
-    expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
-    expect(screen.getByText("Inspection complete.")).toBeInTheDocument();
-    expect(screen.getByText("Read")).toBeInTheDocument();
+    assertGuidanceTimeline();
     expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
 
     const transcriptPanel = screen
@@ -1142,6 +1188,7 @@ describe("app agents verification surfaces", () => {
     });
 
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+    assertGuidanceTimeline();
     expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1151,6 +1198,7 @@ describe("app agents verification surfaces", () => {
 
     await waitFor(() => {
       expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
+      assertGuidanceTimeline();
     });
   });
 

@@ -153,7 +153,7 @@ pub(crate) struct AgentTranscriptItemView {
     pub(crate) status: Option<AgentTranscriptItemStatus>,
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) enum AgentTranscriptRole {
     Assistant,
@@ -1350,57 +1350,92 @@ pub(crate) fn agent_instance_transcript_items(
         .filter_map(|message| message.related_task_id.clone())
         .collect::<HashSet<_>>();
 
-    let mut items = Vec::new();
+    let mut timeline_items = Vec::new();
+    let mut guidance_by_message_id = HashMap::<String, AgentGuidanceBoundary>::new();
     for task in tasks
         .iter()
         .filter(|task| task.owner_instance_id == instance.id)
     {
         let input = parse_json_value(&task.input_json, "Agent task input")?;
         if !incoming_message_task_ids.contains(&task.id) {
-            items.push(AgentTranscriptItemView {
-                id: format!("task:{}:input", task.id),
-                author: agent_instance_display_name(
-                    team,
-                    &instances_by_id,
-                    task.origin_instance_id.as_ref(),
-                ),
-                role: AgentTranscriptRole::User,
-                kind: "Task input".to_string(),
-                created_at: task.created_at.clone(),
-                task_status: Some(task.status),
-                content: agent_task_input_content(&input),
-                parts: Vec::new(),
-                metrics: None,
-                status: None,
-            });
+            timeline_items.push(AgentTranscriptTimelineItem::plain(
+                AgentTranscriptItemView {
+                    id: format!("task:{}:input", task.id),
+                    author: agent_instance_display_name(
+                        team,
+                        &instances_by_id,
+                        task.origin_instance_id.as_ref(),
+                    ),
+                    role: AgentTranscriptRole::User,
+                    kind: "Task input".to_string(),
+                    created_at: task.created_at.clone(),
+                    task_status: Some(task.status),
+                    content: agent_task_input_content(&input),
+                    parts: Vec::new(),
+                    metrics: None,
+                    status: None,
+                },
+                task.sequence,
+            ));
         }
 
         let events = database
             .run_events_for_run(task.id.as_str())
             .map_err(ApiError::from_workspace_error)?;
-        if let Some(run_item) = agent_task_run_transcript_item(
+        let run_items = agent_task_run_transcript_timeline_items(
             task,
             &events,
             &instance.definition_snapshot.name,
             &utc_timestamp(),
-        )? {
-            items.push(run_item);
-        } else if let Some(output) = agent_task_output_content(task)? {
-            items.push(AgentTranscriptItemView {
-                id: format!("task:{}:output", task.id),
-                author: instance.definition_snapshot.name.clone(),
-                role: AgentTranscriptRole::Assistant,
-                kind: output.kind,
-                created_at: task
-                    .completed_at
-                    .clone()
-                    .unwrap_or_else(|| task.updated_at.clone()),
-                task_status: Some(task.status),
-                content: output.content,
-                parts: Vec::new(),
-                metrics: None,
-                status: None,
+        )?;
+        timeline_items.extend(run_items);
+
+        for guidance in agent_task_guidance_boundaries(&events)? {
+            if guidance.source == "agentMessage" {
+                guidance_by_message_id.insert(guidance.id.clone(), guidance);
+                continue;
+            }
+            timeline_items.push(AgentTranscriptTimelineItem {
+                view: AgentTranscriptItemView {
+                    id: format!("task:{}:guidance:{}", task.id, guidance.sequence),
+                    author: "Main agent".to_string(),
+                    role: AgentTranscriptRole::User,
+                    kind: "Guidance".to_string(),
+                    created_at: guidance.created_at.clone(),
+                    task_status: Some(task.status),
+                    content: redact_agent_text_or_json(&guidance.content),
+                    parts: Vec::new(),
+                    metrics: None,
+                    status: None,
+                },
+                sort_created_at: guidance.created_at.clone(),
+                task_sequence: task.sequence,
+                event_sequence: guidance.sequence,
+                position: AgentTranscriptTimelinePosition::Guidance,
             });
+        }
+
+        if run_items_is_empty_for_task(&timeline_items, task) {
+            if let Some(output) = agent_task_output_content(task)? {
+                timeline_items.push(AgentTranscriptTimelineItem::plain(
+                    AgentTranscriptItemView {
+                        id: format!("task:{}:output", task.id),
+                        author: instance.definition_snapshot.name.clone(),
+                        role: AgentTranscriptRole::Assistant,
+                        kind: output.kind,
+                        created_at: task
+                            .completed_at
+                            .clone()
+                            .unwrap_or_else(|| task.updated_at.clone()),
+                        task_status: Some(task.status),
+                        content: output.content,
+                        parts: Vec::new(),
+                        metrics: None,
+                        status: None,
+                    },
+                    task.sequence,
+                ));
+            }
         }
     }
 
@@ -1416,38 +1451,69 @@ pub(crate) fn agent_instance_transcript_items(
             .as_ref()
             .and_then(|task_id| tasks_by_id.get(task_id))
             .map(|task| task.status);
-        items.push(AgentTranscriptItemView {
-            id: format!("message:{}", message.id),
-            author: if is_outgoing {
-                instance.definition_snapshot.name.clone()
-            } else {
-                agent_instance_display_name(
-                    team,
-                    &instances_by_id,
-                    message.sender_instance_id.as_ref(),
-                )
+        let related_task_sequence = message
+            .related_task_id
+            .as_ref()
+            .and_then(|task_id| tasks_by_id.get(task_id))
+            .map(|task| task.sequence)
+            .unwrap_or(i64::MAX);
+        let guidance = (!is_outgoing)
+            .then(|| guidance_by_message_id.get(message.id.as_str()))
+            .flatten();
+        timeline_items.push(AgentTranscriptTimelineItem {
+            view: AgentTranscriptItemView {
+                id: format!("message:{}", message.id),
+                author: if is_outgoing {
+                    instance.definition_snapshot.name.clone()
+                } else {
+                    agent_instance_display_name(
+                        team,
+                        &instances_by_id,
+                        message.sender_instance_id.as_ref(),
+                    )
+                },
+                role: if is_outgoing {
+                    AgentTranscriptRole::Assistant
+                } else {
+                    AgentTranscriptRole::User
+                },
+                kind: if message.kind == foco_agent::AgentMessageKind::Reply {
+                    "Reply".to_string()
+                } else {
+                    "Message".to_string()
+                },
+                created_at: message.created_at.clone(),
+                task_status: related_task_status,
+                content: redact_agent_text_or_json(&message.content),
+                parts: Vec::new(),
+                metrics: None,
+                status: None,
             },
-            role: if is_outgoing {
-                AgentTranscriptRole::Assistant
-            } else {
-                AgentTranscriptRole::User
-            },
-            kind: if message.kind == foco_agent::AgentMessageKind::Reply {
-                "Reply".to_string()
-            } else {
-                "Message".to_string()
-            },
-            created_at: message.created_at,
-            task_status: related_task_status,
-            content: redact_agent_text_or_json(&message.content),
-            parts: Vec::new(),
-            metrics: None,
-            status: None,
+            sort_created_at: guidance
+                .map(|boundary| boundary.created_at.clone())
+                .unwrap_or_else(|| message.created_at.clone()),
+            task_sequence: related_task_sequence,
+            event_sequence: guidance
+                .map(|boundary| boundary.sequence)
+                .unwrap_or(message.sequence),
+            position: guidance
+                .map(|_| AgentTranscriptTimelinePosition::Guidance)
+                .unwrap_or(AgentTranscriptTimelinePosition::Plain),
         });
     }
 
-    items.sort_by(compare_agent_transcript_items);
-    Ok(items)
+    timeline_items.sort_by(compare_agent_transcript_timeline_items);
+    Ok(timeline_items.into_iter().map(|item| item.view).collect())
+}
+
+fn run_items_is_empty_for_task(
+    timeline_items: &[AgentTranscriptTimelineItem],
+    task: &AgentTaskRecord,
+) -> bool {
+    !timeline_items.iter().any(|item| {
+        item.view.role == AgentTranscriptRole::Assistant
+            && item.view.id.starts_with(&format!("task:{}:run", task.id))
+    })
 }
 
 struct AgentTaskOutputContent {
@@ -1455,31 +1521,97 @@ struct AgentTaskOutputContent {
     content: String,
 }
 
+#[derive(Clone)]
+struct AgentGuidanceBoundary {
+    id: String,
+    source: String,
+    content: String,
+    created_at: String,
+    sequence: i64,
+}
+
+struct AgentTranscriptTimelineItem {
+    view: AgentTranscriptItemView,
+    sort_created_at: String,
+    task_sequence: i64,
+    event_sequence: i64,
+    position: AgentTranscriptTimelinePosition,
+}
+
+impl AgentTranscriptTimelineItem {
+    fn plain(view: AgentTranscriptItemView, task_sequence: i64) -> Self {
+        Self {
+            sort_created_at: view.created_at.clone(),
+            view,
+            task_sequence,
+            event_sequence: i64::MIN,
+            position: AgentTranscriptTimelinePosition::Plain,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum AgentTranscriptTimelinePosition {
+    Assistant,
+    Guidance,
+    AfterGuidance,
+    Plain,
+}
+
+#[cfg(test)]
+pub(crate) fn agent_task_run_transcript_items(
+    task: &AgentTaskRecord,
+    events: &[RunEventRecord],
+    author: &str,
+    now: &str,
+) -> Result<Vec<AgentTranscriptItemView>, ApiError> {
+    Ok(
+        agent_task_run_transcript_timeline_items(task, events, author, now)?
+            .into_iter()
+            .map(|item| item.view)
+            .collect(),
+    )
+}
+
+#[cfg(test)]
 pub(crate) fn agent_task_run_transcript_item(
     task: &AgentTaskRecord,
     events: &[RunEventRecord],
     author: &str,
     now: &str,
 ) -> Result<Option<AgentTranscriptItemView>, ApiError> {
+    let mut items = agent_task_run_transcript_items(task, events, author, now)?;
+    Ok((items.len() == 1).then(|| items.remove(0)))
+}
+
+fn agent_task_run_transcript_timeline_items(
+    task: &AgentTaskRecord,
+    events: &[RunEventRecord],
+    author: &str,
+    now: &str,
+) -> Result<Vec<AgentTranscriptTimelineItem>, ApiError> {
     if events.is_empty() {
         if task.status != AgentTaskStatus::Running {
-            return Ok(None);
+            return Ok(Vec::new());
         }
-        return Ok(Some(AgentTranscriptItemView {
-            id: format!("task:{}:run", task.id),
-            author: author.to_string(),
-            role: AgentTranscriptRole::Assistant,
-            kind: "Task run".to_string(),
-            created_at: task
-                .started_at
-                .clone()
-                .unwrap_or_else(|| task.updated_at.clone()),
-            task_status: Some(task.status),
-            content: String::new(),
-            parts: Vec::new(),
-            metrics: None,
-            status: Some(AgentTranscriptItemStatus::Streaming),
-        }));
+        return Ok(vec![AgentTranscriptTimelineItem::plain(
+            AgentTranscriptItemView {
+                id: format!("task:{}:run", task.id),
+                author: author.to_string(),
+                role: AgentTranscriptRole::Assistant,
+                kind: "Task run".to_string(),
+                created_at: task
+                    .started_at
+                    .clone()
+                    .unwrap_or_else(|| task.updated_at.clone()),
+                task_status: Some(task.status),
+                content: String::new(),
+                parts: Vec::new(),
+                metrics: None,
+                status: Some(AgentTranscriptItemStatus::Streaming),
+            },
+            task.sequence,
+        )]);
     }
 
     let mut sorted_events = events.to_vec();
@@ -1489,12 +1621,17 @@ pub(crate) fn agent_task_run_transcript_item(
             .then(left.created_at.cmp(&right.created_at))
             .then(left.id.cmp(&right.id))
     });
-    let mut content = String::new();
-    let mut parts = Vec::new();
-    let mut metrics = None;
-    let mut status =
-        (task.status == AgentTaskStatus::Running).then_some(AgentTranscriptItemStatus::Streaming);
-    let mut reasoning_started_at = None::<String>;
+    let Some(first_event) = sorted_events.first() else {
+        return Ok(Vec::new());
+    };
+    let mut segment = AgentRunTranscriptSegment::new(
+        agent_run_transcript_segment_id(task, first_event.sequence),
+        first_event.created_at.clone(),
+        first_event.sequence,
+        task.status == AgentTaskStatus::Running,
+    );
+    let mut segments = Vec::new();
+    let mut has_guidance = false;
 
     for event in &sorted_events {
         let payload = parse_json_value(&event.payload_json, "Agent run event payload")?;
@@ -1502,48 +1639,44 @@ pub(crate) fn agent_task_run_transcript_item(
             string_json_field(&payload, "type", "type").unwrap_or(event.event_type.as_str());
         match event_type {
             "textDelta" | "text_delta" => {
-                finish_agent_reasoning_part(
-                    &mut parts,
-                    &mut reasoning_started_at,
-                    &event.created_at,
-                    &payload,
-                );
+                segment.finish_reasoning(&event.created_at, &payload);
                 if let Some(delta) = string_json_field(&payload, "delta", "delta") {
-                    content.push_str(delta);
-                    push_text_part(&mut parts, delta);
-                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                    segment.content.push_str(delta);
+                    push_text_part(&mut segment.parts, delta);
+                    segment
+                        .status
+                        .get_or_insert(AgentTranscriptItemStatus::Streaming);
                 }
             }
             "reasoningDelta" | "reasoning_delta" => {
                 if let Some(delta) = string_json_field(&payload, "delta", "delta") {
-                    if reasoning_started_at.is_none() {
-                        reasoning_started_at = Some(event.created_at.clone());
+                    if segment.reasoning_started_at.is_none() {
+                        segment.reasoning_started_at = Some(event.created_at.clone());
                     }
-                    push_reasoning_part(&mut parts, delta);
-                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                    push_reasoning_part(&mut segment.parts, delta);
+                    segment
+                        .status
+                        .get_or_insert(AgentTranscriptItemStatus::Streaming);
                 }
             }
             "toolCall" | "tool_call" => {
-                finish_agent_reasoning_part(
-                    &mut parts,
-                    &mut reasoning_started_at,
-                    &event.created_at,
-                    &payload,
-                );
+                segment.finish_reasoning(&event.created_at, &payload);
                 if let Some(tool_call) = payload
                     .get("toolCall")
                     .or_else(|| payload.get("tool_call"))
                     .and_then(agent_tool_call_summary_from_value)
                 {
-                    upsert_agent_tool_call_part(&mut parts, tool_call);
-                    status.get_or_insert(AgentTranscriptItemStatus::Streaming);
+                    upsert_agent_tool_call_part(&mut segment.parts, tool_call);
+                    segment
+                        .status
+                        .get_or_insert(AgentTranscriptItemStatus::Streaming);
                 }
             }
             "toolResult" | "tool_result" => {
                 let tool_call_id = string_json_field(&payload, "toolCallId", "tool_call_id");
                 if let (Some(tool_call_id), Some(output)) = (tool_call_id, payload.get("output")) {
                     apply_agent_tool_result_to_parts(
-                        &mut parts,
+                        &mut segment.parts,
                         tool_call_id,
                         redact_agent_json(output.clone()),
                         bool_json_field(&payload, "isError", "is_error").unwrap_or(false),
@@ -1559,17 +1692,21 @@ pub(crate) fn agent_task_run_transcript_item(
                 if let (Some(tool_call_id), Some(stream)) = (tool_call_id, stream)
                     && matches!(stream, "stdout" | "stderr")
                 {
-                    apply_agent_tool_output_delta_to_parts(&mut parts, tool_call_id, stream, delta);
+                    apply_agent_tool_output_delta_to_parts(
+                        &mut segment.parts,
+                        tool_call_id,
+                        stream,
+                        delta,
+                    );
                 }
             }
             "streamReset" | "stream_reset" => {
-                // Drop failed-attempt active timing so retries do not inherit it.
-                reasoning_started_at = None;
-                content = string_json_field(&payload, "text", "text")
+                segment.reasoning_started_at = None;
+                segment.content = string_json_field(&payload, "text", "text")
                     .unwrap_or_default()
                     .to_string();
-                parts = parts_from_agent_run_snapshot(
-                    &content,
+                segment.parts = parts_from_agent_run_snapshot(
+                    &segment.content,
                     nullable_string_json_field(&payload, "reasoning", "reasoning"),
                     payload
                         .get("toolCalls")
@@ -1580,61 +1717,187 @@ pub(crate) fn agent_task_run_transcript_item(
                         .filter_map(agent_tool_call_summary_from_value)
                         .collect(),
                 );
-                status = Some(AgentTranscriptItemStatus::Streaming);
+                segment.status = Some(AgentTranscriptItemStatus::Streaming);
+            }
+            "guidanceApplied" | "guidance_applied" => {
+                has_guidance = true;
+                segment.finish_reasoning(&event.created_at, &payload);
+                segment.metrics = guidance_interrupted_assistant_metrics(&payload);
+                if matches!(segment.status, Some(AgentTranscriptItemStatus::Streaming)) {
+                    segment.status = None;
+                }
+                if segment.has_boundary_content() {
+                    segments.push(segment);
+                }
+                segment = AgentRunTranscriptSegment::new(
+                    agent_run_transcript_segment_id(task, event.sequence),
+                    event.created_at.clone(),
+                    event.sequence,
+                    task.status == AgentTaskStatus::Running,
+                );
+                segment.position = AgentTranscriptTimelinePosition::AfterGuidance;
             }
             "complete" | "completion" => {
-                finish_agent_reasoning_part(
-                    &mut parts,
-                    &mut reasoning_started_at,
-                    &event.created_at,
-                    &payload,
-                );
-                let final_text = string_json_field(&payload, "text", "text").unwrap_or(&content);
+                segment.finish_reasoning(&event.created_at, &payload);
+                let final_text =
+                    string_json_field(&payload, "text", "text").unwrap_or(&segment.content);
                 append_missing_reasoning(
-                    &mut parts,
+                    &mut segment.parts,
                     nullable_string_json_field(&payload, "reasoning", "reasoning"),
                 );
-                // complete may only carry final reasoning text without prior deltas.
                 apply_reasoning_part_duration(
-                    &mut parts,
+                    &mut segment.parts,
                     agent_event_reasoning_duration_ms(&payload),
                 );
-                append_missing_text(&mut parts, &content, final_text);
-                content = final_text.to_string();
-                metrics = payload.get("metrics").and_then(|value| {
+                append_missing_text(&mut segment.parts, &segment.content, final_text);
+                segment.content = final_text.to_string();
+                segment.metrics = payload.get("metrics").and_then(|value| {
                     serde_json::from_value::<ChatReplyMetrics>(value.clone()).ok()
                 });
-                status = None;
+                segment.status = None;
             }
             "error" => {
-                finish_agent_reasoning_part(
-                    &mut parts,
-                    &mut reasoning_started_at,
-                    &event.created_at,
-                    &payload,
-                );
+                segment.finish_reasoning(&event.created_at, &payload);
                 push_error_part(
-                    &mut parts,
+                    &mut segment.parts,
                     string_json_field(&payload, "message", "message").unwrap_or("Unknown error"),
                 );
-                status = Some(AgentTranscriptItemStatus::Error);
+                segment.status = Some(AgentTranscriptItemStatus::Error);
             }
             _ => {}
         }
     }
 
-    if let Some(started_at) = reasoning_started_at.take() {
+    segment.finish_open_reasoning(task, now, &sorted_events);
+    apply_agent_task_terminal_fallback(&mut segment, task)?;
+    if segment.has_display_content(task.status) {
+        segments.push(segment);
+    }
+
+    let mut timeline_items = segments
+        .into_iter()
+        .filter_map(|segment| segment.into_timeline_item(task, author))
+        .collect::<Vec<_>>();
+    if !has_guidance && timeline_items.len() == 1 {
+        timeline_items[0].view.id = format!("task:{}:run", task.id);
+    }
+    Ok(timeline_items)
+}
+
+fn agent_run_transcript_segment_id(task: &AgentTaskRecord, event_sequence: i64) -> String {
+    format!("task:{}:run:segment:{event_sequence}", task.id)
+}
+
+struct AgentRunTranscriptSegment {
+    id: String,
+    created_at: String,
+    event_sequence: i64,
+    position: AgentTranscriptTimelinePosition,
+    content: String,
+    parts: Vec<ChatMessagePart>,
+    metrics: Option<ChatReplyMetrics>,
+    status: Option<AgentTranscriptItemStatus>,
+    reasoning_started_at: Option<String>,
+}
+
+impl AgentRunTranscriptSegment {
+    fn new(id: String, created_at: String, event_sequence: i64, is_running: bool) -> Self {
+        Self {
+            id,
+            created_at,
+            event_sequence,
+            position: AgentTranscriptTimelinePosition::Assistant,
+            content: String::new(),
+            parts: Vec::new(),
+            metrics: None,
+            status: is_running.then_some(AgentTranscriptItemStatus::Streaming),
+            reasoning_started_at: None,
+        }
+    }
+
+    fn finish_reasoning(&mut self, ended_at: &str, payload: &Value) {
+        finish_agent_reasoning_part(
+            &mut self.parts,
+            &mut self.reasoning_started_at,
+            ended_at,
+            payload,
+        );
+    }
+
+    fn finish_open_reasoning(
+        &mut self,
+        task: &AgentTaskRecord,
+        now: &str,
+        events: &[RunEventRecord],
+    ) {
+        let Some(started_at) = self.reasoning_started_at.take() else {
+            return;
+        };
         let ended_at = if task.status == AgentTaskStatus::Running {
             now
         } else {
-            sorted_events
+            events
                 .last()
                 .map(|event| event.created_at.as_str())
                 .unwrap_or(started_at.as_str())
         };
-        finish_reasoning_part_duration(&mut parts, &started_at, ended_at);
+        finish_reasoning_part_duration(&mut self.parts, &started_at, ended_at);
     }
 
+    fn has_boundary_content(&self) -> bool {
+        !self.parts.is_empty() || !self.content.is_empty() || self.metrics.is_some()
+    }
+
+    fn has_display_content(&self, task_status: AgentTaskStatus) -> bool {
+        !self.parts.is_empty()
+            || !self.content.is_empty()
+            || self.metrics.is_some()
+            || self.status.is_some()
+            || task_status == AgentTaskStatus::Running
+    }
+
+    fn into_timeline_item(
+        self,
+        task: &AgentTaskRecord,
+        author: &str,
+    ) -> Option<AgentTranscriptTimelineItem> {
+        let kind = match self.status {
+            Some(AgentTranscriptItemStatus::Streaming) => "Task run",
+            Some(AgentTranscriptItemStatus::Error) => "Task error",
+            None => "Task result",
+        };
+        Some(AgentTranscriptTimelineItem {
+            view: AgentTranscriptItemView {
+                id: self.id,
+                author: author.to_string(),
+                role: AgentTranscriptRole::Assistant,
+                kind: kind.to_string(),
+                created_at: self.created_at.clone(),
+                task_status: Some(task.status),
+                content: self.content,
+                parts: self.parts,
+                metrics: self.metrics,
+                status: self.status,
+            },
+            sort_created_at: self.created_at,
+            task_sequence: task.sequence,
+            event_sequence: self.event_sequence,
+            position: self.position,
+        })
+    }
+}
+
+fn guidance_interrupted_assistant_metrics(payload: &Value) -> Option<ChatReplyMetrics> {
+    payload
+        .get("interruptedAssistantMetrics")
+        .or_else(|| payload.get("interrupted_assistant_metrics"))
+        .and_then(|metrics| serde_json::from_value::<ChatReplyMetrics>(metrics.clone()).ok())
+}
+
+fn apply_agent_task_terminal_fallback(
+    segment: &mut AgentRunTranscriptSegment,
+    task: &AgentTaskRecord,
+) -> Result<(), ApiError> {
     let terminal_output = if task.status == AgentTaskStatus::Running {
         None
     } else {
@@ -1642,49 +1905,73 @@ pub(crate) fn agent_task_run_transcript_item(
     };
     match terminal_output.as_ref().map(|output| output.kind.as_str()) {
         Some("Task error")
-            if !parts
+            if !segment
+                .parts
                 .iter()
                 .any(|part| matches!(part, ChatMessagePart::Error { .. })) =>
         {
             if let Some(output) = terminal_output {
-                push_error_part(&mut parts, &output.content);
-                status = Some(AgentTranscriptItemStatus::Error);
+                push_error_part(&mut segment.parts, &output.content);
+                segment.status = Some(AgentTranscriptItemStatus::Error);
             }
         }
-        Some("Task result") if content.is_empty() => {
+        Some("Task result") if segment.content.is_empty() => {
             if let Some(output) = terminal_output {
-                content = output.content;
-                push_text_part(&mut parts, &content);
+                segment.content = output.content;
+                push_text_part(&mut segment.parts, &segment.content);
             }
         }
         _ => {}
     }
+    Ok(())
+}
 
-    if parts.is_empty() && content.is_empty() && task.status != AgentTaskStatus::Running {
-        return Ok(None);
-    }
-
-    Ok(Some(AgentTranscriptItemView {
-        id: format!("task:{}:run", task.id),
-        author: author.to_string(),
-        role: AgentTranscriptRole::Assistant,
-        kind: match status {
-            Some(AgentTranscriptItemStatus::Streaming) => "Task run",
-            Some(AgentTranscriptItemStatus::Error) => "Task error",
-            None => "Task result",
+fn agent_task_guidance_boundaries(
+    events: &[RunEventRecord],
+) -> Result<Vec<AgentGuidanceBoundary>, ApiError> {
+    let mut boundaries = Vec::new();
+    for event in events {
+        let payload = parse_json_value(&event.payload_json, "Agent run event payload")?;
+        let event_type =
+            string_json_field(&payload, "type", "type").unwrap_or(event.event_type.as_str());
+        if !matches!(event_type, "guidanceApplied" | "guidance_applied") {
+            continue;
         }
-        .to_string(),
-        created_at: sorted_events
-            .first()
-            .map(|event| event.created_at.clone())
-            .or_else(|| task.started_at.clone())
-            .unwrap_or_else(|| task.updated_at.clone()),
-        task_status: Some(task.status),
-        content,
-        parts,
-        metrics,
-        status,
-    }))
+        let (Some(id), Some(content)) = (
+            string_json_field(&payload, "id", "id"),
+            string_json_field(&payload, "content", "content"),
+        ) else {
+            continue;
+        };
+        boundaries.push(AgentGuidanceBoundary {
+            id: id.to_string(),
+            source: string_json_field(&payload, "source", "source")
+                .unwrap_or(MANUAL_GUIDANCE_SOURCE)
+                .to_string(),
+            content: content.to_string(),
+            created_at: event.created_at.clone(),
+            sequence: event.sequence,
+        });
+    }
+    boundaries.sort_by(|left, right| {
+        left.sequence
+            .cmp(&right.sequence)
+            .then(left.created_at.cmp(&right.created_at))
+            .then(left.id.cmp(&right.id))
+    });
+    Ok(boundaries)
+}
+
+fn compare_agent_transcript_timeline_items(
+    left: &AgentTranscriptTimelineItem,
+    right: &AgentTranscriptTimelineItem,
+) -> std::cmp::Ordering {
+    left.sort_created_at
+        .cmp(&right.sort_created_at)
+        .then(left.task_sequence.cmp(&right.task_sequence))
+        .then(left.event_sequence.cmp(&right.event_sequence))
+        .then(left.position.cmp(&right.position))
+        .then(left.view.id.cmp(&right.view.id))
 }
 
 fn agent_event_reasoning_duration_ms(payload: &Value) -> Option<i64> {
@@ -1760,15 +2047,6 @@ fn agent_instance_display_name(
             }
         })
         .unwrap_or_else(|| instance_id.to_string())
-}
-
-fn compare_agent_transcript_items(
-    left: &AgentTranscriptItemView,
-    right: &AgentTranscriptItemView,
-) -> std::cmp::Ordering {
-    left.created_at
-        .cmp(&right.created_at)
-        .then(left.id.cmp(&right.id))
 }
 
 fn agent_tool_call_summary_from_value(value: &Value) -> Option<ChatToolCallSummary> {

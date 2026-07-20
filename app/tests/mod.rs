@@ -392,7 +392,10 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         json!({ "type": "toolCall", "toolCall": { "id": "tool-1", "name": "read_file", "status": "running", "input": { "path": "notes.md" }, "output": null, "isError": false } }),
         json!({ "type": "toolOutputDelta", "toolCallId": "tool-1", "stream": "stdout", "delta": "chunk" }),
         json!({ "type": "toolResult", "toolCallId": "tool-1", "output": { "content": "done" }, "isError": false, "startedAt": "2026-07-03T08:00:00Z", "completedAt": "2026-07-03T08:00:01Z" }),
-        json!({ "type": "complete", "text": "Read. Done.", "reasoning": "Think. More.", "metrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 10, "firstTokenLatencyMs": 1, "outputTokens": 2, "llmRequestIds": ["request-1"] } }),
+        json!({ "type": "guidanceApplied", "id": "agent-message-transcript-input", "content": "Continue with the summary.", "source": "agentMessage", "interruptedAssistantMetrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 5, "firstTokenLatencyMs": 1, "outputTokens": 1, "llmRequestIds": ["request-interrupted"] } }),
+        json!({ "type": "reasoningDelta", "delta": "Resume. " }),
+        json!({ "type": "guidanceApplied", "id": "guidance-reasoning-loop", "content": "repeated reasoning loop, check and continue", "source": "reasoningLoopGuard" }),
+        json!({ "type": "complete", "text": "Resume. Done.", "reasoning": "Resume. More.", "metrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 10, "firstTokenLatencyMs": 1, "outputTokens": 2, "llmRequestIds": ["request-1"] } }),
     ]
     .into_iter()
     .enumerate()
@@ -454,31 +457,66 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         .expect("worker");
     let items = crate::http::agents::agent_instance_transcript_items(&database, &team, &worker)
         .expect("transcript");
-    let run_item = items
+    let first_segment = items
         .iter()
-        .find(|item| item.id == "task:agent-task-transcript-run:run")
-        .expect("run item");
-    assert_eq!(run_item.content, "Read. Done.");
+        .find(|item| item.id == "task:agent-task-transcript-run:run:segment:0")
+        .expect("first run segment");
+    let interim_segment = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-run:run:segment:5")
+        .expect("interim run segment");
+    let resumed_segment = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-run:run:segment:7")
+        .expect("resumed run segment");
+    let virtual_guidance = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-run:guidance:7")
+        .expect("virtual guidance");
+    let transcript_ids = items
+        .iter()
+        .filter(|item| {
+            item.id.starts_with("task:agent-task-transcript-run:run")
+                || item.id == "message:agent-message-transcript-input"
+                || item.id == "task:agent-task-transcript-run:guidance:7"
+        })
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        transcript_ids,
+        vec![
+            "task:agent-task-transcript-run:run:segment:0",
+            "message:agent-message-transcript-input",
+            "task:agent-task-transcript-run:run:segment:5",
+            "task:agent-task-transcript-run:guidance:7",
+            "task:agent-task-transcript-run:run:segment:7",
+        ]
+    );
+    assert_eq!(first_segment.content, "Read. ");
+    assert!(first_segment.status.is_none());
     assert!(matches!(
-        &run_item.parts[0],
+        &first_segment.parts[0],
         ChatMessagePart::Reasoning {
             text,
             duration_ms: Some(1500)
         } if text == "Think. "
     ));
     let serialized_reasoning =
-        serde_json::to_value(&run_item.parts[0]).expect("serialize reasoning part");
+        serde_json::to_value(&first_segment.parts[0]).expect("serialize reasoning part");
     assert_eq!(serialized_reasoning["duration_ms"], json!(1500));
     assert_eq!(serialized_reasoning["type"], json!("reasoning"));
-    assert!(matches!(run_item.parts[1], ChatMessagePart::Text { .. }));
-    let tool_call = match &run_item.parts[2] {
+    assert!(matches!(
+        first_segment.parts[1],
+        ChatMessagePart::Text { .. }
+    ));
+    let tool_call = match &first_segment.parts[2] {
         ChatMessagePart::ToolCall { tool_call } => tool_call,
         other => panic!("expected tool call part, got {other:?}"),
     };
     assert_eq!(tool_call.name, "read_file");
     assert_eq!(tool_call.status, "completed");
     let serialized_tool_part =
-        serde_json::to_value(&run_item.parts[2]).expect("serialize tool part");
+        serde_json::to_value(&first_segment.parts[2]).expect("serialize tool part");
     assert_eq!(serialized_tool_part["toolCall"]["name"], json!("read_file"));
     assert!(serialized_tool_part.get("tool_call").is_none());
     let legacy_tool_part: ChatMessagePart = serde_json::from_value(json!({
@@ -492,7 +530,30 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         json!("done")
     );
     assert_eq!(
-        run_item.metrics.as_ref().expect("metrics").output_tokens,
+        first_segment
+            .metrics
+            .as_ref()
+            .expect("interrupted metrics")
+            .output_tokens,
+        Some(1)
+    );
+    assert!(interim_segment.status.is_none());
+    assert!(matches!(
+        &interim_segment.parts[0],
+        ChatMessagePart::Reasoning { text, .. } if text == "Resume. "
+    ));
+    assert_eq!(
+        virtual_guidance.content,
+        "repeated reasoning loop, check and continue"
+    );
+    assert_eq!(resumed_segment.content, "Resume. Done.");
+    assert!(resumed_segment.status.is_none());
+    assert_eq!(
+        resumed_segment
+            .metrics
+            .as_ref()
+            .expect("final metrics")
+            .output_tokens,
         Some(2)
     );
     let failed_input = items
@@ -826,6 +887,207 @@ fn agent_task_run_transcript_item_rebuilds_reasoning_durations() {
             ..
         }
     ));
+}
+
+#[test]
+fn agent_task_run_transcript_items_split_guidance_and_keep_only_latest_segment_streaming() {
+    use crate::http::agents::agent_task_run_transcript_items;
+
+    let items = agent_task_run_transcript_items(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "Before guidance." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "guidanceApplied",
+                json!({
+                    "type": "guidanceApplied",
+                    "id": "guidance-reasoning-loop",
+                    "content": "check and continue",
+                    "source": "reasoningLoopGuard"
+                }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:02Z",
+                "reasoningDelta",
+                json!({ "type": "reasoningDelta", "delta": "After guidance." }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:03Z",
+    )
+    .expect("split transcript items");
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0].id,
+        "task:agent-task-reasoning-duration:run:segment:0"
+    );
+    assert_eq!(items[0].content, "Before guidance.");
+    assert!(items[0].status.is_none());
+    assert_eq!(
+        items[1].id,
+        "task:agent-task-reasoning-duration:run:segment:1"
+    );
+    assert!(matches!(
+        items[1].status,
+        Some(crate::http::agents::AgentTranscriptItemStatus::Streaming)
+    ));
+    assert!(matches!(
+        &items[1].parts[0],
+        ChatMessagePart::Reasoning {
+            text,
+            duration_ms: Some(1000)
+        } if text == "After guidance."
+    ));
+}
+
+#[test]
+fn agent_task_run_transcript_items_skip_empty_segment_before_guidance() {
+    use crate::http::agents::agent_task_run_transcript_items;
+
+    let items = agent_task_run_transcript_items(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "guidanceApplied",
+                json!({
+                    "type": "guidanceApplied",
+                    "id": "guidance-before-output",
+                    "content": "Start with this instruction.",
+                    "source": "agentMessage"
+                }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "After guidance." }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:02Z",
+    )
+    .expect("transcript items");
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].id,
+        "task:agent-task-reasoning-duration:run:segment:0"
+    );
+    assert_eq!(items[0].content, "After guidance.");
+    assert!(matches!(
+        items[0].status,
+        Some(crate::http::agents::AgentTranscriptItemStatus::Streaming)
+    ));
+}
+
+#[test]
+fn agent_task_run_transcript_items_keep_segment_ids_stable_across_multiple_guidance_boundaries() {
+    use crate::http::agents::agent_task_run_transcript_items;
+
+    let items = agent_task_run_transcript_items(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "First segment." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "guidanceApplied",
+                json!({ "type": "guidanceApplied", "id": "guidance-1", "content": "Continue.", "source": "agentMessage" }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:02Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "Second segment." }),
+            ),
+            sample_run_event(
+                3,
+                "2026-07-03T08:00:03Z",
+                "guidanceApplied",
+                json!({ "type": "guidanceApplied", "id": "guidance-2", "content": "Keep going.", "source": "agentMessage" }),
+            ),
+            sample_run_event(
+                4,
+                "2026-07-03T08:00:04Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "Third segment." }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:05Z",
+    )
+    .expect("transcript items");
+
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "task:agent-task-reasoning-duration:run:segment:0",
+            "task:agent-task-reasoning-duration:run:segment:1",
+            "task:agent-task-reasoning-duration:run:segment:3",
+        ]
+    );
+    assert!(items[..2].iter().all(|item| item.status.is_none()));
+    assert!(matches!(
+        items[2].status,
+        Some(crate::http::agents::AgentTranscriptItemStatus::Streaming)
+    ));
+}
+
+#[test]
+fn agent_task_run_transcript_items_preserve_error_before_guidance() {
+    use crate::http::agents::agent_task_run_transcript_items;
+
+    let items = agent_task_run_transcript_items(
+        &sample_agent_task_record(foco_agent::AgentTaskStatus::Running),
+        &[
+            sample_run_event(
+                0,
+                "2026-07-03T08:00:00Z",
+                "error",
+                json!({ "type": "error", "message": "Interrupted failure." }),
+            ),
+            sample_run_event(
+                1,
+                "2026-07-03T08:00:01Z",
+                "guidanceApplied",
+                json!({ "type": "guidanceApplied", "id": "guidance-after-error", "content": "Recover.", "source": "agentMessage" }),
+            ),
+            sample_run_event(
+                2,
+                "2026-07-03T08:00:02Z",
+                "textDelta",
+                json!({ "type": "textDelta", "delta": "Recovered." }),
+            ),
+        ],
+        "Worker",
+        "2026-07-03T08:00:03Z",
+    )
+    .expect("transcript items");
+
+    assert!(matches!(
+        items[0].status,
+        Some(crate::http::agents::AgentTranscriptItemStatus::Error)
+    ));
+    assert!(matches!(items[0].parts[0], ChatMessagePart::Error { .. }));
 }
 
 struct FixtureAgentRunTask {
