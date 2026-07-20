@@ -23816,7 +23816,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn remote_managed_sidecar_version_retain_script_prunes_real_version_dirs() {
+    fn remote_managed_sidecar_version_retain_script_keeps_current_and_newest_history() {
         let home = tempfile::tempdir().expect("temporary HOME");
         let root = home.path().join(".foco/sidecars");
         fs::create_dir_all(&root).expect("sidecar root");
@@ -23825,13 +23825,9 @@ mod tests {
         let oldest = root.join("0.8.0");
         let older = root.join("0.9.0");
         let newest = root.join("1.1.0");
-        let unsafe_name = root.join("unsafe$name");
-        for directory in [&current, &oldest, &older, &newest, &unsafe_name] {
+        for directory in [&current, &oldest, &older, &newest] {
             fs::create_dir(directory).expect("version directory");
         }
-        fs::write(root.join("not-a-directory"), "ignored").expect("non-directory entry");
-        let symlink = root.join("symlink-version");
-        std::os::unix::fs::symlink(&current, &symlink).expect("version symlink");
 
         let base = std::time::SystemTime::UNIX_EPOCH;
         for (directory, seconds) in [(&current, 10), (&oldest, 20), (&older, 30), (&newest, 40)] {
@@ -23876,13 +23872,64 @@ mod tests {
         assert!(newest.is_dir(), "newest historical version must remain");
         assert!(!oldest.exists(), "oldest historical version must be pruned");
         assert!(!older.exists(), "older historical version must be pruned");
-        assert!(unsafe_name.is_dir(), "unsafe version name must be skipped");
-        assert!(root.join("not-a-directory").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_managed_sidecar_retain_script_skips_non_candidates_and_symlinks() {
+        let home = tempfile::tempdir().expect("temporary HOME");
+        let root = home.path().join(".foco/sidecars");
+        fs::create_dir_all(&root).expect("sidecar root");
+        fs::create_dir(root.join("1.0.0")).expect("current version directory");
+        fs::create_dir(root.join("0.9.0")).expect("retained historical version directory");
+
+        let unsafe_name = root.join("unsafe$name");
+        fs::create_dir(&unsafe_name).expect("unsafe version directory");
+        let non_directory = root.join("not-a-directory");
+        fs::write(&non_directory, "ignored").expect("non-directory entry");
+        let external_target = home.path().join("outside-sidecars-root");
+        fs::create_dir(&external_target).expect("external symlink target");
+        let external_sentinel = external_target.join("must-remain");
+        fs::write(&external_sentinel, "sentinel").expect("external sentinel");
+        let symlink = root.join("symlink-version");
+        std::os::unix::fs::symlink(&external_target, &symlink).expect("version symlink");
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_managed_sidecar_version_retain_script(
+                "1.0.0",
+                REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+            ))
+            .env("HOME", home.path())
+            .output()
+            .expect("execute retain script");
+        assert!(output.status.success(), "cleanup remains best-effort");
+        assert_eq!(
+            parse_remote_sidecar_retain_summary(&String::from_utf8(output.stdout).expect("stdout"))
+                .expect("retain summary"),
+            RemoteSidecarRetainResult {
+                status: RemoteSidecarRetainStatus::Noop,
+                scanned: 1,
+                kept: 1,
+                deleted: 0,
+                failed: 0,
+            }
+        );
+        assert!(unsafe_name.is_dir(), "unsafe name must not be a candidate");
+        assert!(
+            non_directory.is_file(),
+            "non-directory must not be a candidate"
+        );
         assert!(
             fs::symlink_metadata(&symlink)
                 .expect("symlink metadata")
                 .file_type()
-                .is_symlink()
+                .is_symlink(),
+            "symlink itself must remain"
+        );
+        assert!(
+            external_sentinel.is_file(),
+            "symlink target must remain untouched"
         );
     }
 
@@ -23990,6 +24037,12 @@ mod tests {
     fn parse_remote_sidecar_retain_summary_rejects_invalid_payloads() {
         assert!(parse_remote_sidecar_retain_summary("").is_err());
         assert!(parse_remote_sidecar_retain_summary("no summary here").is_err());
+        assert!(
+            parse_remote_sidecar_retain_summary(
+                "FOCO_SIDECAR_RETAIN_V2 status=ok scanned=1 kept=0 deleted=1 failed=0"
+            )
+            .is_err()
+        );
         assert!(
             parse_remote_sidecar_retain_summary(
                 "FOCO_SIDECAR_RETAIN_V1 status=ok scanned=1 kept=0 deleted=1 failed=0\n\

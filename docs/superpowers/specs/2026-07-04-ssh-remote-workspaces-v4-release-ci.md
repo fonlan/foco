@@ -80,7 +80,8 @@ Version-directory retain policy:
 - Retain count: **2** total — always protect the currently started managed version directory, then keep one additional recent historical version directory (newest by mtime; equal mtimes break ties by name ascending).
 - Candidates: real directories only; skip symlinks and non-directories; unsafe directory names are skipped.
 - Trigger: only Foco-managed install paths (`managed_install_version` set). Custom `focoCommand` **does not** run this cleanup.
-- Failure mode: best-effort — log warning/diagnostics only; never block opening the workspace or downgrade a successful Ready session.
+- Diagnostics and concurrency: each cleanup wave records a bounded structured outcome with only safe aggregate counts, never remote paths, commands, or credentials. Concurrent Ready connections for the same server and current managed version coalesce within one Foco process and reuse that outcome. The in-memory flight is released after the wave, so a later connection can recheck and retry failures; separate Foco processes are not coordinated.
+- Failure mode: best-effort — partial deletion, remote-command, or summary-validation failures log warning/diagnostics only; they never block opening the workspace or downgrade a successful Ready session.
 
 ### Local automatic-update asset retain (desktop main process)
 
