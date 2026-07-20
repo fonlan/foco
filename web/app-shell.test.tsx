@@ -1183,6 +1183,49 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps managed command errors out of the success summary", async () => {
+    const failedCommandMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = failedCommandMessages.messages[1];
+    const failedToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { background: true, command: "server" },
+      isError: true,
+      name: "run_command",
+      output: { error: "managed command was not found" },
+    };
+    assistantMessage.toolCalls = [failedToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: failedToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...failedCommandMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    const summary = await screen.findByLabelText("Run (run_command)");
+    await userEvent.click(summary);
+
+    const assistantBubble = summary.closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(within(assistantBubble).getByText("managed command was not found")).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Background process started, no output yet")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Entire process tree terminated")).not.toBeInTheDocument();
+  });
+
   it("shows successful read_file content without the JSON view", async () => {
     const readFileChatMessages = JSON.parse(JSON.stringify(chatMessages));
     const assistantMessage = readFileChatMessages.messages[1];
@@ -1575,6 +1618,146 @@ describe("app-shell verification surfaces", () => {
 
     expect(runCommandSummary?.querySelector("svg.lucide-terminal")).toBeInTheDocument();
     expect(unknownSummary?.querySelector("svg.lucide-wrench")).toBeInTheDocument();
+  });
+
+  it("renders managed command lifecycle, incremental chunks, and raw protocol fields", async () => {
+    const managedCommandMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = managedCommandMessages.messages[1];
+    const backgroundStart = {
+      ...assistantMessage.toolCalls[0],
+      id: "tool-background-start",
+      input: {
+        args: ["--watch"],
+        background: true,
+        backgroundTimeoutMs: null,
+        command: "server",
+        cwd: ".",
+        timeoutMs: null,
+      },
+      name: "run_command",
+      output: {
+        chunks: [],
+        nextCursor: 0,
+        pid: 4242,
+        processId: "process-demo",
+        startedAt: Date.now() - 2_000,
+        status: "running",
+      },
+    };
+    const outputPoll = {
+      ...assistantMessage.toolCalls[0],
+      id: "tool-command-output",
+      input: { cursor: 4, processId: "process-demo", timeoutMs: 10_000, waitMs: 100 },
+      name: "get_command_output",
+      output: {
+        chunks: [
+          { cursor: 20, stream: "stdout", text: "ready\n" },
+          { cursor: 21, stream: "stderr", text: "warning\n" },
+        ],
+        availableFromCursor: 20,
+        cursorExpired: true,
+        fromCursor: 4,
+        hasMore: true,
+        nextCursor: 21,
+        pid: 4242,
+        processId: "process-demo",
+        startedAt: Date.now() - 2_000,
+        status: "running",
+      },
+    };
+    const stoppedCommand = {
+      ...assistantMessage.toolCalls[0],
+      id: "tool-stop-command",
+      input: { processId: "process-demo", timeoutMs: 10_000 },
+      name: "stop_command",
+      output: {
+        exitCode: null,
+        pid: 4242,
+        processId: "process-demo",
+        status: "stopped",
+        terminationReason: "explicit_stop",
+      },
+    };
+    const stopRequestedCommand = {
+      ...stoppedCommand,
+      id: "tool-stop-requested",
+      output: {
+        ...stoppedCommand.output,
+        status: "running",
+      },
+    };
+    assistantMessage.toolCalls = [
+      backgroundStart,
+      outputPoll,
+      stoppedCommand,
+      stopRequestedCommand,
+    ];
+    assistantMessage.parts = assistantMessage.parts.flatMap((part: { type: string }) =>
+      part.type === "toolCall"
+        ? [
+            { ...part, toolCall: backgroundStart },
+            { ...part, toolCall: outputPoll },
+            { ...part, toolCall: stoppedCommand },
+            { ...part, toolCall: stopRequestedCommand },
+          ]
+        : [part],
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...managedCommandMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    const startSummary = await screen.findByLabelText("Run (run_command)");
+    const outputSummary = await screen.findByLabelText("Command Output (get_command_output)");
+    const stopSummaries = await screen.findAllByLabelText("Stop Command (stop_command)");
+    const [stopSummary, stopRequestedSummary] = stopSummaries;
+    if (!stopSummary || !stopRequestedSummary) {
+      throw new Error("Expected both terminal and pending stop command cards");
+    }
+
+    const startStatus = within(startSummary).getByText("Background running");
+    expect(startStatus).toHaveClass("bg-amber-50", "text-amber-800");
+    expect(outputSummary).toHaveTextContent("Background running");
+    expect(stopSummary).toHaveTextContent("Stopped");
+
+    await userEvent.click(startSummary);
+    expect(await screen.findByText("Background process started, no output yet")).toBeInTheDocument();
+
+    await userEvent.click(outputSummary);
+    expect(await screen.findByText("Earlier output was removed from the retained buffer.")).toBeInTheDocument();
+    expect(await screen.findByText("cursor 20–21")).toBeInTheDocument();
+    expect(await screen.findByText("ready")).toBeInTheDocument();
+    expect(await screen.findByText("warning")).toBeInTheDocument();
+    expect(await screen.findByText(/More output is available; continue with nextCursor 21/)).toBeInTheDocument();
+
+    await userEvent.click(stopSummary);
+    expect(await screen.findByText("Entire process tree terminated")).toBeInTheDocument();
+
+    await userEvent.click(stopRequestedSummary);
+    expect(await screen.findByText("Process tree termination requested")).toBeInTheDocument();
+
+    const outputBubble = outputSummary.closest(".tool-call-block") as HTMLElement | null;
+    if (!outputBubble) {
+      throw new Error("Expected managed command tool block");
+    }
+    await userEvent.click(within(outputBubble).getByRole("button", { name: "Raw" }));
+    expect(within(outputBubble).getByText("Input")).toBeInTheDocument();
+    expect(
+      within(outputBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" && Boolean(element.textContent?.includes('"cursorExpired": true')),
+      ),
+    ).toBeInTheDocument();
   });
 
   it("localizes completed tool status and uses success color", async () => {

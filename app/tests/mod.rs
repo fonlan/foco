@@ -5604,6 +5604,89 @@ fn compress_runtime_tool_state_keeps_recent_batches_verbatim() {
 }
 
 #[test]
+fn runtime_tool_state_compression_preserves_managed_command_handles() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-command-handle-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut context = test_prepared_chat_context(
+        workspace_dir.clone(),
+        vec![neutral_text_message(
+            NeutralChatRole::System,
+            "system".to_string(),
+        )],
+        vec![None],
+        vec![PromptContextSource::ReservedPrompt],
+        80,
+    );
+    context.active_tool_start_index = context.provider_request.messages.len();
+    context
+        .global_config
+        .app
+        .runtime_tool_state_compression_enabled = true;
+
+    for batch_index in 0..4 {
+        let call_id = format!("command-{batch_index}");
+        let tool_calls = vec![NeutralToolCall {
+            call_id: call_id.clone(),
+            name: "get_command_output".to_string(),
+            arguments: json!({
+                "processId": "process-demo",
+                "cursor": batch_index,
+                "waitMs": 500,
+                "timeoutMs": 10000,
+            }),
+            thought_signatures: None,
+        }];
+        let tool_results = vec![ExecutedToolCall {
+            id: call_id,
+            name: "get_command_output".to_string(),
+            input: tool_calls[0].arguments.clone(),
+            output: json!({
+                "processId": "process-demo",
+                "pid": 1234,
+                "status": "running",
+                "nextCursor": batch_index + 1,
+                "hasMore": false,
+                "chunks": [{
+                    "cursor": batch_index + 1,
+                    "stream": "stdout",
+                    "text": "log line ".repeat(800),
+                }],
+            }),
+            is_error: false,
+            started_at: "2026-07-20T09:00:00Z".to_string(),
+            completed_at: "2026-07-20T09:00:01Z".to_string(),
+        }];
+        append_tool_state_messages(
+            &mut context.provider_request.messages,
+            &mut context.message_source_sequences,
+            &mut context.message_context_sources,
+            &mut context.next_runtime_tool_batch_index,
+            tool_calls,
+            &tool_results,
+            String::new(),
+            None,
+        );
+    }
+
+    assert!(
+        compress_runtime_tool_state_if_needed(&mut context, true).expect("runtime compression")
+    );
+    let snapshot = context
+        .provider_request
+        .messages
+        .iter()
+        .find(|message| message.role == NeutralChatRole::User)
+        .expect("runtime snapshot");
+    assert!(snapshot.content.contains("\"processId\":\"process-demo\""));
+    assert!(snapshot.content.contains("\"status\":\"running\""));
+    assert!(snapshot.content.contains("\"nextCursor\":1"));
+    assert!(snapshot.content.contains("\"chunkSummary\""));
+    assert!(!snapshot.content.contains("log line log line"));
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn compress_runtime_tool_state_stops_after_three_successes() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-runtime-tool-compress-cap-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

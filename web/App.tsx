@@ -15517,6 +15517,13 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
     return compactToolJson(input);
   }
 
+  if (toolCall.name === "get_command_output" || toolCall.name === "stop_command") {
+    const processId = textField(input, "processId");
+    if (processId) {
+      return compactToolText(processId);
+    }
+  }
+
   if (toolCall.name === "run_command") {
     const command = textField(input, "command");
     const args = stringArrayField(input, "args") ?? [];

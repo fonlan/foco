@@ -118,6 +118,8 @@ const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
   open: Globe,
   read_file: FileText,
   read_spec: FileText,
+  get_command_output: RefreshCw,
+  stop_command: X,
   run_command: Terminal,
   screenshot: Globe,
   search_query: Search,
@@ -2580,6 +2582,241 @@ function commandOutputText(output: JsonValue | null) {
   return parts.length ? parts.join("\n") : null;
 }
 
+type ManagedCommandChunk = {
+  cursor: number | null;
+  stream: "stdout" | "stderr";
+  text: string;
+};
+
+type ManagedCommandPresentation = {
+  availableFromCursor: number | null;
+  chunks: ManagedCommandChunk[];
+  command: string | null;
+  cwd: string | null;
+  cursorExpired: boolean;
+  endedAt: number | null;
+  exitCode: number | null;
+  fromCursor: number | null;
+  hasMore: boolean;
+  isBackgroundStart: boolean;
+  nextCursor: number | null;
+  pid: number | null;
+  processId: string | null;
+  startedAt: number | null;
+  status: string | null;
+  terminationReason: string | null;
+};
+
+function managedCommandPresentation(
+  toolCall: ChatToolCallSummary,
+  input: JsonValue,
+): ManagedCommandPresentation | null {
+  const inputRecord = isJsonRecord(input) ? input : null;
+  const output = isJsonRecord(toolCall.output) ? toolCall.output : null;
+  const isBackgroundStart =
+    toolCall.name === "run_command" && inputRecord?.background === true;
+  const isManagedTool =
+    isBackgroundStart ||
+    toolCall.name === "get_command_output" ||
+    toolCall.name === "stop_command" ||
+    typeof output?.processId === "string";
+  if (!isManagedTool) {
+    return null;
+  }
+
+  const chunks = Array.isArray(output?.chunks)
+    ? output.chunks.flatMap((chunk): ManagedCommandChunk[] => {
+      if (!isJsonRecord(chunk)) {
+        return [];
+      }
+      const stream = chunk.stream;
+      const text = chunk.text;
+      if ((stream !== "stdout" && stream !== "stderr") || typeof text !== "string") {
+        return [];
+      }
+      return [{
+        cursor: finiteNumber(chunk.cursor),
+        stream,
+        text,
+      }];
+    })
+    : [];
+
+  return {
+    availableFromCursor: finiteNumber(output?.availableFromCursor),
+    chunks,
+    command: inputRecord ? nonEmptyText(inputRecord.command) : null,
+    cwd: inputRecord ? nonEmptyText(inputRecord.cwd) : null,
+    cursorExpired: output?.cursorExpired === true,
+    endedAt: timestampMilliseconds(output?.endedAt),
+    exitCode: finiteNumber(output?.exitCode),
+    fromCursor: finiteNumber(output?.fromCursor),
+    hasMore: output?.hasMore === true,
+    isBackgroundStart,
+    nextCursor: finiteNumber(output?.nextCursor),
+    pid: finiteNumber(output?.pid),
+    processId:
+      nonEmptyText(output?.processId) ?? (inputRecord ? nonEmptyText(inputRecord.processId) : null),
+    startedAt: timestampMilliseconds(output?.startedAt),
+    status: nonEmptyText(output?.status),
+    terminationReason: nonEmptyText(output?.terminationReason),
+  };
+}
+
+function finiteNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function timestampMilliseconds(value: unknown) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    return Number.isNaN(parsed) ? null : parsed;
+  }
+  return null;
+}
+
+function managedCommandDuration(startedAt: number | null, endedAt: number | null) {
+  if (startedAt === null) {
+    return null;
+  }
+  const elapsed = Math.max(0, (endedAt ?? Date.now()) - startedAt);
+  if (elapsed < 1_000) {
+    return `${elapsed}ms`;
+  }
+  if (elapsed < 60_000) {
+    return `${(elapsed / 1_000).toFixed(elapsed < 10_000 ? 1 : 0)}s`;
+  }
+  return `${Math.floor(elapsed / 60_000)}m ${Math.floor((elapsed % 60_000) / 1_000)}s`;
+}
+
+function managedCommandStatusLabel(presentation: ManagedCommandPresentation, t: Translate) {
+  switch (presentation.status) {
+    case "running":
+      return t("Background running");
+    case "exited":
+      return presentation.exitCode === null
+        ? t("Exited")
+        : t("Exited · code {code}", { code: presentation.exitCode });
+    case "stopped":
+      return t("Stopped");
+    case "timed_out":
+      return t("Timed out");
+    case "failed":
+      return t("Failed to start");
+    default:
+      return null;
+  }
+}
+
+function managedCommandStatusClass(status: string | null) {
+  switch (status) {
+    case "running":
+      return "border-amber-200 bg-amber-50 text-amber-800";
+    case "exited":
+      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    case "stopped":
+    case "timed_out":
+      return "border-stone-200 bg-stone-100 text-stone-600";
+    case "failed":
+      return "border-rose-200 bg-rose-50 text-rose-700";
+    default:
+      return "border-stone-200 bg-stone-50 text-stone-600";
+  }
+}
+
+function CommandChunkLog({ chunks }: { chunks: ManagedCommandChunk[] }) {
+  if (!chunks.length) {
+    return null;
+  }
+
+  return (
+    <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}>
+      {chunks.map((chunk, index) => (
+        <div className="mb-2 last:mb-0" key={`${chunk.cursor ?? "unknown"}-${index}`}>
+          <span className={chunk.stream === "stderr" ? "text-rose-700" : "text-teal-700"}>
+            [{chunk.stream}{chunk.cursor === null ? "" : ` · ${chunk.cursor}`}]
+          </span>
+          <pre className="whitespace-pre-wrap break-words">{chunk.text}</pre>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ManagedCommandSummary({
+  presentation,
+  toolName,
+  t,
+}: {
+  presentation: ManagedCommandPresentation;
+  toolName: string;
+  t: Translate;
+}) {
+  const statusLabel = managedCommandStatusLabel(presentation, t);
+  const duration = managedCommandDuration(presentation.startedAt, presentation.endedAt);
+  const cursorRangeStart = presentation.cursorExpired
+    ? presentation.availableFromCursor ?? presentation.fromCursor
+    : presentation.fromCursor;
+  const cursorRange =
+    cursorRangeStart === null
+      ? null
+      : presentation.nextCursor === null
+        ? String(cursorRangeStart)
+        : `${cursorRangeStart}–${presentation.nextCursor}`;
+  const terminal = presentation.status !== null && presentation.status !== "running";
+
+  return (
+    <div className="grid min-w-0 gap-2">
+      <div className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation.status)}`}>
+        {statusLabel ? <span className="font-semibold">{statusLabel}</span> : null}
+        {presentation.processId ? <span className="font-mono">{presentation.processId}</span> : null}
+        {presentation.pid !== null ? <span>PID {presentation.pid}</span> : null}
+        {duration ? <span>{duration}</span> : null}
+        {presentation.terminationReason ? <span>{presentation.terminationReason}</span> : null}
+      </div>
+      {presentation.command ? (
+        <div className="min-w-0 font-mono text-[11px] text-stone-600">
+          {presentation.command}{presentation.cwd ? ` · cwd: ${presentation.cwd}` : ""}
+        </div>
+      ) : null}
+      {toolName === "get_command_output" && cursorRange ? (
+        <div className="font-mono text-[11px] text-stone-500">cursor {cursorRange}</div>
+      ) : null}
+      {presentation.cursorExpired ? (
+        <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+          {t("Earlier output was removed from the retained buffer.")}
+        </div>
+      ) : null}
+      <CommandChunkLog chunks={presentation.chunks} />
+      {!presentation.chunks.length && presentation.isBackgroundStart ? (
+        <div className="font-mono text-[11px] text-stone-500">{t("Background process started, no output yet")}</div>
+      ) : null}
+      {!presentation.chunks.length && toolName === "get_command_output" ? (
+        <div className="font-mono text-[11px] text-stone-500">
+          {terminal ? t("Process ended, no more output") : t("Still running, no new output")}
+        </div>
+      ) : null}
+      {presentation.hasMore ? (
+        <div className="font-mono text-[11px] text-amber-800">
+          {t("More output is available; continue with nextCursor {cursor}.", {
+            cursor: presentation.nextCursor ?? "-",
+          })}
+        </div>
+      ) : null}
+      {toolName === "stop_command" ? (
+        <div className="font-mono text-[11px] text-stone-500">
+          {presentation.status === "stopped"
+            ? t("Entire process tree terminated")
+            : t("Process tree termination requested")}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function successfulSpecMarkdown(toolCall: ChatToolCallSummary) {
   if (
     (toolCall.name !== "read_spec" && toolCall.name !== "update_spec") ||
@@ -2724,15 +2961,22 @@ function CompactToolCallView({
   input,
   liveOutputText,
   toolCall,
+  t,
 }: {
   compactJson: (value: JsonValue) => string;
   diff: CompactReplacementDiff | null;
   input: JsonValue;
   liveOutputText: string | null;
   toolCall: ChatToolCallSummary;
+  t: Translate;
 }) {
   if (diff) {
     return <CompactReplacementDiffBlock diff={diff} />;
+  }
+
+  const managedCommand = toolCall.isError ? null : managedCommandPresentation(toolCall, input);
+  if (managedCommand) {
+    return <ManagedCommandSummary presentation={managedCommand} t={t} toolName={toolCall.name} />;
   }
 
   const specMarkdown = successfulSpecMarkdown(toolCall);
@@ -2898,6 +3142,17 @@ function ToolCallBlock({
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
+  const managedCommand = managedCommandPresentation(toolCall, input);
+  const managedStatusLabel = managedCommand ? managedCommandStatusLabel(managedCommand, t) : null;
+  const summaryStatusLabel =
+    !toolCall.isError && managedStatusLabel ? managedStatusLabel : toolStatusText(toolCall, t);
+  const summaryStatusClass = toolCall.isError
+    ? "bg-rose-50 text-rose-700"
+    : managedCommand && managedStatusLabel
+      ? managedCommandStatusClass(managedCommand.status)
+      : toolCall.status === "completed"
+        ? "bg-emerald-50 text-emerald-700"
+        : "bg-stone-100 text-stone-600";
   const generatedImages = toolCall.isError
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
@@ -2962,14 +3217,9 @@ function ToolCallBlock({
             </span>
           ) : null}
           <span
-            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${toolCall.isError
-                ? "bg-rose-50 text-rose-700"
-                : toolCall.status === "completed"
-                  ? "bg-emerald-50 text-emerald-700"
-                  : "bg-stone-100 text-stone-600"
-              }`}
+            className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${summaryStatusClass}`}
           >
-            {toolStatusText(toolCall, t)}
+            {summaryStatusLabel}
           </span>
         </summary>
         <div className="mt-2 grid gap-2 text-xs text-stone-600">
@@ -2999,6 +3249,7 @@ function ToolCallBlock({
               diff={compactReplacementDiff}
               input={input}
               liveOutputText={liveOutputText}
+              t={t}
               toolCall={toolCall}
             />
           ) : (

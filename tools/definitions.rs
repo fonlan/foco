@@ -1011,7 +1011,7 @@ fn ask_question_definition() -> ToolDefinition {
 fn run_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUN_COMMAND_TOOL,
-        description: "Run a local command in the active workspace without invoking a shell. Recursive scans must stay inside the workspace.",
+        description: "Run a local command in the active workspace without invoking a shell. Recursive scans must stay inside the workspace. Set background=true to start a managed background process and receive a stable processId immediately. Keep that processId as structured state: call get_command_output with its nextCursor to read only new retained stdout/stderr (use waitMs for a bounded long-poll), and call stop_command to terminate the complete process tree when the process is no longer needed. Background output is bounded and retained only in memory; do not expect it to survive an application or sidecar restart.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1051,7 +1051,7 @@ fn run_command_definition() -> ToolDefinition {
 fn get_command_output_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_COMMAND_OUTPUT_TOOL,
-        description: "Read retained incremental stdout and stderr for a managed background command. Reuse nextCursor as cursor for the next non-consuming read.",
+        description: "Read retained incremental stdout and stderr for a managed background command. Reuse nextCursor as cursor for the next non-consuming read so prior logs are not repeated in context; null starts at the earliest retained output. waitMs is a bounded long-poll that returns early when output arrives or the process exits. A cursorExpired response means earlier output was evicted from the bounded in-memory buffer. Stop long-running processes explicitly with stop_command when they are no longer needed.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1070,7 +1070,7 @@ fn get_command_output_definition() -> ToolDefinition {
 fn stop_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: STOP_COMMAND_TOOL,
-        description: "Request managed termination of a background command process tree. The command's retained output remains readable afterwards.",
+        description: "Request managed termination of a background command process tree. Use this explicitly for long-running processes that are no longer needed; retained output remains readable afterwards through get_command_output until the bounded in-memory record is cleaned up.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

@@ -1977,6 +1977,11 @@ fn compact_json_for_runtime_tool_summary(value: &Value) -> String {
             "endLine",
             "command",
             "args",
+            "background",
+            "backgroundTimeoutMs",
+            "processId",
+            "cursor",
+            "nextCursor",
             "query",
             "symbol",
             "symbolId",
@@ -2025,6 +2030,10 @@ fn compact_large_json_value(value: &Value) -> Value {
 fn compact_tool_output_for_runtime_summary(tool_name: &str, content: &str) -> String {
     match serde_json::from_str::<Value>(content) {
         Ok(Value::Object(map)) => {
+            if let Some(compact) = compact_managed_command_output(tool_name, &map) {
+                return compact.to_string();
+            }
+
             let mut compact = serde_json::Map::new();
             for key in [
                 "path",
@@ -2065,6 +2074,60 @@ fn compact_tool_output_for_runtime_summary(tool_name: &str, content: &str) -> St
         }
         _ => truncate_for_context_snapshot(content),
     }
+}
+
+/// Keep managed-command handles and pagination state usable after runtime-tool compression
+/// without replaying the command's historical log buffer into later model turns.
+fn compact_managed_command_output(
+    tool_name: &str,
+    map: &serde_json::Map<String, Value>,
+) -> Option<Value> {
+    let is_managed_command =
+        matches!(tool_name, "get_command_output" | "stop_command") || map.contains_key("processId");
+    if !is_managed_command {
+        return None;
+    }
+
+    let mut compact = serde_json::Map::new();
+    for key in [
+        "processId",
+        "pid",
+        "status",
+        "startedAt",
+        "endedAt",
+        "exitCode",
+        "success",
+        "terminationReason",
+        "fromCursor",
+        "availableFromCursor",
+        "nextCursor",
+        "cursorExpired",
+        "hasMore",
+        "outputTruncated",
+        "retainedOutputBytes",
+    ] {
+        if let Some(value) = map.get(key) {
+            compact.insert(key.to_string(), compact_large_json_value(value));
+        }
+    }
+
+    if let Some(chunks) = map.get("chunks").and_then(Value::as_array) {
+        let streams = chunks
+            .iter()
+            .filter_map(|chunk| chunk.get("stream").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        let last_cursor = chunks.last().and_then(|chunk| chunk.get("cursor")).cloned();
+        compact.insert(
+            "chunkSummary".to_string(),
+            json!({
+                "count": chunks.len(),
+                "streams": streams,
+                "lastCursor": last_cursor,
+            }),
+        );
+    }
+
+    (!compact.is_empty()).then_some(Value::Object(compact))
 }
 
 pub(crate) fn active_compression_snapshots(

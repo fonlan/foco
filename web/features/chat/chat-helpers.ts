@@ -55,6 +55,8 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   },
   read_file: { en: "Read", "zh-CN": "读取" },
   read_spec: { en: "Read Spec", "zh-CN": "读取 Spec" },
+  get_command_output: { en: "Command Output", "zh-CN": "命令输出" },
+  stop_command: { en: "Stop Command", "zh-CN": "停止命令" },
   run_command: { en: "Run", "zh-CN": "运行" },
   search_text: { en: "Grep", "zh-CN": "搜索" },
   sleep: { en: "Sleep", "zh-CN": "等待" },
