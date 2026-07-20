@@ -37,6 +37,7 @@ static WORKSPACE_DATABASE_GATES: LazyLock<Mutex<HashMap<PathBuf, WorkspaceDataba
 struct WorkspaceDatabaseGate {
     total: Arc<CountingSemaphore>,
     ordinary: Arc<CountingSemaphore>,
+    holders: Arc<Mutex<WorkspaceDatabaseHolderLedger>>,
 }
 
 impl WorkspaceDatabaseGate {
@@ -44,7 +45,88 @@ impl WorkspaceDatabaseGate {
         Self {
             total: Arc::new(CountingSemaphore::new(WORKSPACE_DATABASE_TOTAL_CAPACITY)),
             ordinary: Arc::new(CountingSemaphore::new(WORKSPACE_DATABASE_ORDINARY_CAPACITY)),
+            holders: Arc::new(Mutex::new(WorkspaceDatabaseHolderLedger::default())),
         }
+    }
+
+    fn register_holder(
+        &self,
+        resource: &'static str,
+        gate_kind: WorkspaceDatabaseGateKind,
+        acquired_at: Instant,
+        caller: &'static Location<'static>,
+    ) -> WorkspaceDatabaseHolderRegistration {
+        let mut ledger = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let holder_id = ledger.next_holder_id;
+        ledger.next_holder_id = ledger.next_holder_id.wrapping_add(1);
+        ledger.holders.insert(
+            holder_id,
+            WorkspaceDatabaseHolder {
+                resource,
+                gate_kind,
+                acquired_at,
+                caller,
+            },
+        );
+        WorkspaceDatabaseHolderRegistration {
+            holders: Arc::clone(&self.holders),
+            holder_id,
+        }
+    }
+
+    fn active_holder_summary(&self) -> String {
+        let ledger = self
+            .holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut holders = ledger.holders.iter().collect::<Vec<_>>();
+        holders.sort_by_key(|(holder_id, _)| *holder_id);
+        holders
+            .into_iter()
+            .take(WORKSPACE_DATABASE_TOTAL_CAPACITY)
+            .map(|(_, holder)| {
+                format!(
+                    "resource={},gate={},held_ms={},source={}:{}",
+                    holder.resource,
+                    holder.gate_kind.as_str(),
+                    holder.acquired_at.elapsed().as_millis(),
+                    holder.caller.file(),
+                    holder.caller.line(),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+}
+
+#[derive(Default)]
+struct WorkspaceDatabaseHolderLedger {
+    next_holder_id: u64,
+    holders: HashMap<u64, WorkspaceDatabaseHolder>,
+}
+
+struct WorkspaceDatabaseHolder {
+    resource: &'static str,
+    gate_kind: WorkspaceDatabaseGateKind,
+    acquired_at: Instant,
+    caller: &'static Location<'static>,
+}
+
+struct WorkspaceDatabaseHolderRegistration {
+    holders: Arc<Mutex<WorkspaceDatabaseHolderLedger>>,
+    holder_id: u64,
+}
+
+impl Drop for WorkspaceDatabaseHolderRegistration {
+    fn drop(&mut self) {
+        self.holders
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .holders
+            .remove(&self.holder_id);
     }
 }
 
@@ -175,6 +257,7 @@ struct WorkspaceDatabasePermits {
 /// across provider HTTP, Hook HTTP/MCP, sleep, or a full Agent run.
 pub struct WorkspaceDatabaseHandle {
     database: Option<WorkspaceDatabase>,
+    holder: Option<WorkspaceDatabaseHolderRegistration>,
     _permits: Option<WorkspaceDatabasePermits>,
     workspace_path: PathBuf,
     gate_kind: WorkspaceDatabaseGateKind,
@@ -224,6 +307,9 @@ impl Drop for WorkspaceDatabaseHandle {
                 "workspace database permit held longer than expected"
             );
         }
+        // Remove the holder before releasing permits so a timeout snapshot never
+        // attributes a permit to a handle that is already being torn down.
+        self.holder.take();
         // Release permits before closing the SQLite connection so waiters are not
         // blocked behind a slow connection teardown.
         self._permits.take();
@@ -260,11 +346,16 @@ fn open_workspace_database_with_gate(
     gate_kind: WorkspaceDatabaseGateKind,
     caller: &'static Location<'static>,
 ) -> Result<WorkspaceDatabaseHandle, WorkspaceDatabaseError> {
-    let (key, permits) = acquire_workspace_database_permits(workspace_path, gate_kind)?;
+    let (key, gate, permits) = acquire_workspace_database_permits(workspace_path, gate_kind)?;
     let acquired_at = Instant::now();
+    // Register before opening SQLite so permit contention can be attributed even
+    // when migrations or connection setup take unexpectedly long. If opening
+    // fails, this local registration drops with the permits.
+    let holder = gate.register_holder("database", gate_kind, acquired_at, caller);
     let database = WorkspaceDatabase::open_or_create_ungated(workspace_path)?;
     Ok(WorkspaceDatabaseHandle {
         database: Some(database),
+        holder: Some(holder),
         _permits: Some(permits),
         workspace_path: key,
         gate_kind,
@@ -280,6 +371,7 @@ fn open_workspace_database_with_gate(
 /// provider/network awaits.
 pub struct WorkspaceMemoryDatabaseHandle {
     database: Option<MemoryDatabase>,
+    holder: Option<WorkspaceDatabaseHolderRegistration>,
     _permits: Option<WorkspaceDatabasePermits>,
     workspace_path: PathBuf,
     gate_kind: WorkspaceDatabaseGateKind,
@@ -329,6 +421,9 @@ impl Drop for WorkspaceMemoryDatabaseHandle {
                 "workspace memory database permit held longer than expected"
             );
         }
+        // Remove the holder before releasing permits so a timeout snapshot never
+        // attributes a permit to a handle that is already being torn down.
+        self.holder.take();
         // Release permits before closing the SQLite connection so waiters are not
         // blocked behind a slow connection teardown.
         self._permits.take();
@@ -416,17 +511,17 @@ fn open_workspace_memory_database_with_gate(
 ) -> Result<WorkspaceMemoryDatabaseHandle, MemoryDatabaseError> {
     // Ensure workspace schema exists first under the same gate; Memory tables live
     // in the same SQLite file and require migrations via WorkspaceDatabase.
-    let (key, permits) = acquire_workspace_database_permits(workspace_path, gate_kind).map_err(
-        |error| match error {
+    let (key, gate, permits) = acquire_workspace_database_permits(workspace_path, gate_kind)
+        .map_err(|error| match error {
             WorkspaceDatabaseError::ConcurrencyLimit { message } => {
                 MemoryDatabaseError::ConcurrencyLimit { message }
             }
             other => MemoryDatabaseError::InvalidMemoryInput {
                 message: other.to_string(),
             },
-        },
-    )?;
+        })?;
     let acquired_at = Instant::now();
+    let holder = gate.register_holder("memory", gate_kind, acquired_at, caller);
     // Workspace migrations must run before Memory schema is readable. Open
     // workspace DB first (same file), drop it, then open Memory view.
     WorkspaceDatabase::open_or_create_ungated(workspace_path).map_err(|error| match error {
@@ -447,6 +542,7 @@ fn open_workspace_memory_database_with_gate(
     )?;
     Ok(WorkspaceMemoryDatabaseHandle {
         database: Some(database),
+        holder: Some(holder),
         _permits: Some(permits),
         workspace_path: key,
         gate_kind,
@@ -458,7 +554,7 @@ fn open_workspace_memory_database_with_gate(
 fn acquire_workspace_database_permits(
     workspace_path: &Path,
     gate_kind: WorkspaceDatabaseGateKind,
-) -> Result<(PathBuf, WorkspaceDatabasePermits), WorkspaceDatabaseError> {
+) -> Result<(PathBuf, WorkspaceDatabaseGate, WorkspaceDatabasePermits), WorkspaceDatabaseError> {
     let key =
         std::fs::canonicalize(workspace_path).unwrap_or_else(|_| workspace_path.to_path_buf());
     let gate = {
@@ -497,6 +593,7 @@ fn acquire_workspace_database_permits(
     )?;
     Ok((
         key,
+        gate,
         WorkspaceDatabasePermits {
             _total: total,
             _ordinary: ordinary,
@@ -518,6 +615,7 @@ fn acquire_workspace_database_gate_slot(
     }
 
     let waited = started_at.elapsed();
+    let holder_summary = gate.active_holder_summary();
     tracing::warn!(
         workspace = %key.display(),
         gate = gate_kind.as_str(),
@@ -527,11 +625,12 @@ fn acquire_workspace_database_gate_slot(
         total_available = gate.total.available_permits(),
         ordinary_capacity = WORKSPACE_DATABASE_ORDINARY_CAPACITY,
         ordinary_available = gate.ordinary.available_permits(),
+        holders = %holder_summary,
         "workspace database permit acquisition timed out"
     );
     Err(WorkspaceDatabaseError::ConcurrencyLimit {
         message: format!(
-            "workspace database concurrency limit reached for {} after {} ms (gate={}, slot={}, total={}/{}, ordinary={}/{})",
+            "workspace database concurrency limit reached for {} after {} ms (gate={}, slot={}, total={}/{}, ordinary={}/{}, holders=[{}])",
             key.display(),
             waited.as_millis(),
             gate_kind.as_str(),
@@ -540,6 +639,7 @@ fn acquire_workspace_database_gate_slot(
             WORKSPACE_DATABASE_TOTAL_CAPACITY,
             gate.ordinary.available_permits(),
             WORKSPACE_DATABASE_ORDINARY_CAPACITY,
+            holder_summary,
         ),
     })
 }
@@ -574,6 +674,14 @@ mod tests {
         );
         assert!(message.contains("gate=ordinary"), "{message}");
         assert!(message.contains("ordinary=0/2"), "{message}");
+        assert!(
+            message.contains("holders=[resource=database,gate=ordinary,held_ms="),
+            "{message}"
+        );
+        assert!(
+            message.contains("source=store/workspace_gate.rs:"),
+            "{message}"
+        );
 
         let critical_started = Instant::now();
         let critical =
@@ -585,6 +693,83 @@ mod tests {
         drop(critical);
         drop(gate_1);
         drop(gate_2);
+    }
+
+    #[test]
+    fn holder_ledger_reports_timeout_source_and_removes_dropped_handles() {
+        let workspace = tempdir().expect("workspace");
+        let handle = open_workspace_database(workspace.path()).expect("workspace database");
+        let key = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let gate = WORKSPACE_DATABASE_GATES
+            .lock()
+            .expect("gate registry")
+            .get(&key)
+            .expect("workspace gate")
+            .clone();
+        let active_summary = gate.active_holder_summary();
+        assert!(
+            active_summary.contains("resource=database,gate=ordinary,held_ms="),
+            "{active_summary}"
+        );
+        assert!(
+            active_summary.contains("source=store/workspace_gate.rs:"),
+            "{active_summary}"
+        );
+
+        let first = gate
+            .ordinary
+            .acquire_until(Instant::now(), Duration::from_secs(1))
+            .expect("synthetic permit");
+        let error = match acquire_workspace_database_gate_slot(
+            &key,
+            &gate,
+            Arc::clone(&gate.ordinary),
+            WorkspaceDatabaseGateKind::Ordinary,
+            "ordinary",
+            Instant::now(),
+            Duration::ZERO,
+        ) {
+            Ok(_) => panic!("saturated gate must time out"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("holders=[resource=database"), "{message}");
+        assert!(message.contains("held_ms="), "{message}");
+        assert!(
+            message.contains("source=store/workspace_gate.rs:"),
+            "{message}"
+        );
+
+        drop(first);
+        drop(handle);
+        assert!(
+            gate.active_holder_summary().is_empty(),
+            "dropped handle must be removed from the holder ledger"
+        );
+    }
+
+    #[test]
+    fn failed_database_open_does_not_leave_holder_recorded() {
+        let workspace = tempdir().expect("workspace");
+        let file_path = workspace.path().join("not-a-workspace-directory");
+        std::fs::write(&file_path, "not a directory").expect("write file");
+
+        assert!(
+            open_workspace_database(&file_path).is_err(),
+            "file path must fail database opening"
+        );
+
+        let key = std::fs::canonicalize(&file_path).expect("canonical file path");
+        let gate = WORKSPACE_DATABASE_GATES
+            .lock()
+            .expect("gate registry")
+            .get(&key)
+            .expect("gate created for failed open")
+            .clone();
+        assert!(
+            gate.active_holder_summary().is_empty(),
+            "failed open must not leave a holder ledger entry"
+        );
     }
 
     #[test]
@@ -609,6 +794,14 @@ mod tests {
         let message = error.to_string();
         assert!(
             message.contains("workspace database concurrency limit reached"),
+            "{message}"
+        );
+        assert!(
+            message.contains("resource=database,gate=ordinary"),
+            "{message}"
+        );
+        assert!(
+            message.contains("resource=memory,gate=ordinary"),
             "{message}"
         );
 

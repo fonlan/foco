@@ -1539,10 +1539,12 @@ mod tests {
         HOOK_HANDLER_COMMAND, HOOK_HANDLER_HTTP, HOOK_HANDLER_PROMPT, HookMatcherGroup,
     };
     use serde_json::json;
+    use std::{sync::Arc, time::Instant};
     use tempfile::TempDir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
+        sync::Barrier,
     };
 
     fn hook_request<'a>(
@@ -1614,6 +1616,49 @@ mod tests {
                     is_error: false,
                 })
             })
+        }
+    }
+
+    struct BlockingPromptExecutor {
+        entered_provider_wait: Arc<Barrier>,
+        release_provider_wait: Arc<Barrier>,
+    }
+
+    impl PromptHookExecutor for BlockingPromptExecutor {
+        fn execute(&self, _request: PromptHookExecutorRequest) -> PromptHookFuture {
+            let entered_provider_wait = Arc::clone(&self.entered_provider_wait);
+            let release_provider_wait = Arc::clone(&self.release_provider_wait);
+            Box::pin(async move {
+                entered_provider_wait.wait().await;
+                release_provider_wait.wait().await;
+                Ok(HookExecution {
+                    exit_code: Some(0),
+                    output_json: None,
+                    stdout: "{}".to_string(),
+                    stderr: String::new(),
+                    is_error: false,
+                })
+            })
+        }
+    }
+
+    fn prompt_handler(prompt: impl Into<String>) -> HookHandler {
+        HookHandler {
+            enabled: true,
+            handler_type: HOOK_HANDLER_PROMPT.to_string(),
+            if_filter: None,
+            command: None,
+            args: Vec::new(),
+            shell: None,
+            url: None,
+            server_id: None,
+            tool_name: None,
+            prompt: Some(prompt.into()),
+            timeout: Some(5_000),
+            async_hook: false,
+            async_rewake: false,
+            status_message: None,
+            input: None,
         }
     }
 
@@ -1693,6 +1738,95 @@ mod tests {
             vec!["broker context".to_string()]
         );
         assert!(summary.errors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_start_prompt_hooks_release_ordinary_gate_while_provider_waits() {
+        let workspace = TempDir::new().expect("workspace");
+        let mut config = HookConfig {
+            audit_enabled: true,
+            ..HookConfig::default()
+        };
+        config.hooks.insert(
+            "SessionStart".to_string(),
+            vec![HookMatcherGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![prompt_handler("Wait for provider completion.")],
+            }],
+        );
+
+        let entered_provider_wait = Arc::new(Barrier::new(3));
+        let release_provider_wait = Arc::new(Barrier::new(3));
+        let runtime = HookRuntime::with_prompt_executor(
+            Arc::new(McpRegistry::default()),
+            Arc::new(BlockingPromptExecutor {
+                entered_provider_wait: Arc::clone(&entered_provider_wait),
+                release_provider_wait: Arc::clone(&release_provider_wait),
+            }),
+        );
+
+        let first_runtime = runtime.clone();
+        let first_config = config.clone();
+        let first_workspace_path = workspace.path().to_path_buf();
+        let first = tokio::spawn(async move {
+            let mut request = hook_request(
+                &first_config,
+                &first_workspace_path,
+                "SessionStart",
+                json!({ "session": "first" }),
+            );
+            request.chat_id = None;
+            request.run_id = None;
+            request.tool_call_id = None;
+            first_runtime.run_hooks(request).await
+        });
+        let second_runtime = runtime.clone();
+        let second_config = config.clone();
+        let second_workspace_path = workspace.path().to_path_buf();
+        let second = tokio::spawn(async move {
+            let mut request = hook_request(
+                &second_config,
+                &second_workspace_path,
+                "SessionStart",
+                json!({ "session": "second" }),
+            );
+            request.chat_id = None;
+            request.run_id = None;
+            request.tool_call_id = None;
+            second_runtime.run_hooks(request).await
+        });
+
+        // Both hooks are blocked at their provider await. A third ordinary DB
+        // operation must still acquire promptly because no hook handle spans it.
+        entered_provider_wait.wait().await;
+        let short_open_started = Instant::now();
+        drop(
+            WorkspaceDatabase::open_or_create(workspace.path())
+                .expect("ordinary open while SessionStart hooks await provider"),
+        );
+        assert!(
+            short_open_started.elapsed() < Duration::from_secs(1),
+            "ordinary DB open waited while SessionStart hooks were at the provider boundary"
+        );
+
+        release_provider_wait.wait().await;
+        let first_summary = first.await.expect("first SessionStart task");
+        let second_summary = second.await.expect("second SessionStart task");
+        assert!(first_summary.errors.is_empty(), "{first_summary:?}");
+        assert!(second_summary.errors.is_empty(), "{second_summary:?}");
+
+        let runs = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("hook audit database")
+            .hook_runs(10)
+            .expect("hook audit rows");
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.event == "SessionStart")
+                .count(),
+            2,
+            "both completed SessionStart prompt hooks must persist gated audit rows"
+        );
     }
 
     #[test]
