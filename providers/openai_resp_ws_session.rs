@@ -728,7 +728,10 @@ pub fn chat_options_fingerprint_json(options: &ChatOptions) -> String {
         Ok(value) => value,
         Err(_) => return "{}".to_string(),
     };
-    if let Some(extra_headers) = value.get_mut("extra_headers").and_then(|v| v.as_object_mut()) {
+    if let Some(extra_headers) = value
+        .get_mut("extra_headers")
+        .and_then(|v| v.as_object_mut())
+    {
         for name in crate::AGENT_VOLATILE_HEADER_NAMES {
             let key = name.to_ascii_lowercase();
             let victims: Vec<String> = extra_headers
@@ -1024,30 +1027,21 @@ mod tests {
             ("session-id".to_string(), "chat-1".to_string()),
             ("thread-id".to_string(), "chat-1".to_string()),
             ("originator".to_string(), "foco".to_string()),
-            (
-                "x-client-request-id".to_string(),
-                "req-turn-1".to_string(),
-            ),
+            ("x-client-request-id".to_string(), "req-turn-1".to_string()),
             ("x-foco-run-id".to_string(), "run-1".to_string()),
         ]));
         let next_turn = ChatOptions::default().with_extra_headers(Headers::from(vec![
             ("session-id".to_string(), "chat-1".to_string()),
             ("thread-id".to_string(), "chat-1".to_string()),
             ("originator".to_string(), "foco".to_string()),
-            (
-                "x-client-request-id".to_string(),
-                "req-turn-2".to_string(),
-            ),
+            ("x-client-request-id".to_string(), "req-turn-2".to_string()),
             ("x-foco-run-id".to_string(), "run-2".to_string()),
         ]));
         let session_changed = ChatOptions::default().with_extra_headers(Headers::from(vec![
             ("session-id".to_string(), "other-session".to_string()),
             ("thread-id".to_string(), "chat-1".to_string()),
             ("originator".to_string(), "foco".to_string()),
-            (
-                "x-client-request-id".to_string(),
-                "req-turn-1".to_string(),
-            ),
+            ("x-client-request-id".to_string(), "req-turn-1".to_string()),
         ]));
 
         assert_eq!(

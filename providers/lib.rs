@@ -891,10 +891,8 @@ pub const AGENT_HEADER_USER_AGENT: &str = "User-Agent";
 pub const AGENT_HEADER_VERSION: &str = "version";
 
 /// Headers that must not affect OpenAI Responses WebSocket continuation fingerprints.
-pub const AGENT_VOLATILE_HEADER_NAMES: &[&str] = &[
-    AGENT_HEADER_CLIENT_REQUEST_ID,
-    AGENT_HEADER_FOCO_RUN_ID,
-];
+pub const AGENT_VOLATILE_HEADER_NAMES: &[&str] =
+    &[AGENT_HEADER_CLIENT_REQUEST_ID, AGENT_HEADER_FOCO_RUN_ID];
 
 impl AgentRequestCorrelation {
     pub fn new(
@@ -1038,7 +1036,10 @@ pub fn resolve_agent_session_thread_ids(
     if chat_id.is_empty() {
         return (String::new(), String::new());
     }
-    if let Some(plan_id) = plan_id_for_chat.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(plan_id) = plan_id_for_chat
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return (plan_id.to_string(), chat_id.to_string());
     }
     if let Some(plan_id) = plan_id_for_parent_chat
@@ -2376,9 +2377,7 @@ fn extract_single_json_fenced_block(text: &str) -> Option<&str> {
 
     let after_open = &text[3..];
     let newline_idx = after_open.find('\n')?;
-    let lang = after_open[..newline_idx]
-        .trim()
-        .trim_end_matches('\r');
+    let lang = after_open[..newline_idx].trim().trim_end_matches('\r');
     if !lang.is_empty() && !lang.eq_ignore_ascii_case("json") {
         return None;
     }
@@ -3281,7 +3280,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let client = config.genai_client().expect("client");
@@ -3372,7 +3371,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let mut stream = stream_chat_with_capture(&config, request, true)
@@ -3532,7 +3531,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
         let mut stream1 =
             stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
@@ -3589,7 +3588,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
         let mut stream2 =
             stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
@@ -3728,7 +3727,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let mut stream =
@@ -4137,7 +4136,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let failure =
@@ -4501,22 +4500,14 @@ mod tests {
     #[test]
     fn recover_model_json_from_text_does_not_repair_invalid_json_syntax() {
         // Single quotes, trailing commas, and unquoted keys are not repaired.
-        assert_eq!(
-            recover_model_json_from_text("{'path': 'note.txt'}"),
-            None
-        );
+        assert_eq!(recover_model_json_from_text("{'path': 'note.txt'}"), None);
         assert_eq!(
             recover_model_json_from_text(r#"{"path": "note.txt",}"#),
             None
         );
+        assert_eq!(recover_model_json_from_text(r#"{path: "note.txt"}"#), None);
         assert_eq!(
-            recover_model_json_from_text(r#"{path: "note.txt"}"#),
-            None
-        );
-        assert_eq!(
-            normalized_tool_arguments(&Value::String(
-                r#"{"path": "note.txt",}"#.to_string()
-            )),
+            normalized_tool_arguments(&Value::String(r#"{"path": "note.txt",}"#.to_string())),
             Value::String(r#"{"path": "note.txt",}"#.to_string())
         );
     }
@@ -4535,9 +4526,8 @@ mod tests {
         );
 
         // Two encoding layers (JSON string of object text) fully unwrap.
-        let double = Value::String(
-            serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encode"),
-        );
+        let double =
+            Value::String(serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encode"));
         assert_eq!(normalized_tool_arguments(&double), leaf);
         assert_eq!(
             recover_model_json_from_text(double.as_str().expect("double is string")),
@@ -4746,7 +4736,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -4773,7 +4763,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         genai_chat_request(&request).expect("reasoning-only assistant message should convert");
@@ -4804,7 +4794,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -4887,7 +4877,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let result = genai_chat_request(&request);
@@ -4935,7 +4925,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
-        agent_correlation: None,
+            agent_correlation: None,
         };
 
         let result = genai_chat_request(&request);
@@ -5299,10 +5289,7 @@ mod tests {
         );
     }
 
-    fn dump_header_first(
-        headers: &ProviderHttpHeadersDump,
-        name: &str,
-    ) -> Option<String> {
+    fn dump_header_first(headers: &ProviderHttpHeadersDump, name: &str) -> Option<String> {
         headers
             .iter()
             .find(|(key, _)| key.eq_ignore_ascii_case(name))

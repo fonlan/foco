@@ -12,6 +12,10 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 
+use crate::provider_agent_headers::{
+    attach_agent_request_correlation, resolve_provider_session_thread_for_chat,
+    resolve_provider_session_thread_with_database,
+};
 use axum::{
     Json,
     http::{HeaderMap, StatusCode, header},
@@ -32,11 +36,8 @@ use foco_providers::{
     OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, OpenAiRespWsSessionKey,
     OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
     ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
-    normalized_proxy_url, parse_provider_kind, stream_chat_with_capture_observer,
-};
-use crate::provider_agent_headers::{
-    attach_agent_request_correlation, resolve_provider_session_thread_for_chat,
-    resolve_provider_session_thread_with_database,
+    normalized_proxy_url, parse_provider_kind, recover_model_json_from_text,
+    stream_chat_with_capture_observer,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -45,11 +46,11 @@ use foco_store::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
         HookConfig, LoadedGlobalConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
-        ModelLimits, ModelSettings, PromptSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
-        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
-        SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
-        SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
-        WorkspaceLocation, default_agent_execution_workspace_modes,
+        ModelLimits, ModelSettings, PromptSettings, ProviderSettings,
+        SUPPORTED_AGENT_THINKING_LEVELS, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
+        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
+        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
+        WorkspaceConfig, WorkspaceLocation, default_agent_execution_workspace_modes,
         default_terminal_shell_for_current_platform, load_global_config,
         load_or_create_global_config_at_paths, save_global_config,
         validate_agent_definition_tool_references,
@@ -2819,9 +2820,15 @@ impl PreparedChatContext {
             .plan_phase_provenance
             .as_ref()
             .map(|provenance| provenance.plan_id.as_str());
-        if let Some(plan_id) = plan_id_hint.map(str::trim).filter(|value| !value.is_empty()) {
-            let (session_id, thread_id) =
-                foco_providers::resolve_agent_session_thread_ids(&self.chat_id, Some(plan_id), None);
+        if let Some(plan_id) = plan_id_hint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let (session_id, thread_id) = foco_providers::resolve_agent_session_thread_ids(
+                &self.chat_id,
+                Some(plan_id),
+                None,
+            );
             self.provider_session_id = session_id;
             self.provider_thread_id = thread_id;
             return Ok(());
@@ -6164,9 +6171,7 @@ async fn run_provider_stream_for_text(
                     )
                     .with_stream_final_response(capture, &stream));
                 }
-                if output_text.is_empty() && !text.is_empty() {
-                    output_text.push_str(&text);
-                }
+                append_complete_stream_text(&mut output_text, &text);
                 if let Some(usage) = usage {
                     final_usage = Some(usage);
                 }
@@ -6211,6 +6216,7 @@ async fn run_provider_stream_for_tool(
     capture: &ProviderAuditCapture,
 ) -> Result<AuditedToolStreamOutcome, AuditedProviderError> {
     let started_at = Instant::now();
+    let request_tool_count = request.tools.len();
     let observer = capture.observer();
     let capture_details = observer.is_some();
     let mut stream = timeout(
@@ -6306,9 +6312,10 @@ async fn run_provider_stream_for_tool(
                     }
                     tool_arguments = Some(tool_call.arguments);
                 }
-                if !text.trim().is_empty() {
-                    output_text.push_str(&text);
-                }
+                // Provider normalizers often emit both TextDelta and Complete.text with the
+                // same payload. Match run_provider_stream_for_text: only use Complete when
+                // no deltas were collected, so text-JSON fallback is not duplicated.
+                append_complete_stream_text(&mut output_text, &text);
                 if let Some(usage) = usage {
                     final_usage = Some(usage);
                 }
@@ -6325,18 +6332,34 @@ async fn run_provider_stream_for_tool(
         }
     }
 
-    let tool_arguments = tool_arguments.ok_or_else(|| {
-        let text = output_text.trim();
-        let error = if text.is_empty() {
-            AuditedProviderError::new(format!("{request_kind} did not call {tool_label}"), None)
-        } else {
-            AuditedProviderError::new(
-                format!("{request_kind} returned text instead of {tool_label}: {text}"),
-                None,
-            )
-        };
-        error.with_stream_final_response(capture, &stream)
-    })?;
+    let tool_arguments = match resolve_audited_single_tool_arguments(
+        tool_arguments,
+        &output_text,
+        request_tool_count,
+    ) {
+        Some(ResolvedAuditedToolArguments::FromToolCall(arguments)) => arguments,
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(arguments)) => {
+            tracing::debug!(
+                request_kind,
+                expected_tool_name,
+                text_json_fallback = true,
+                "recovered single-tool arguments from model text JSON"
+            );
+            arguments
+        }
+        None => {
+            let text = output_text.trim();
+            let error = if text.is_empty() {
+                AuditedProviderError::new(format!("{request_kind} did not call {tool_label}"), None)
+            } else {
+                AuditedProviderError::new(
+                    format!("{request_kind} returned text instead of {tool_label}: {text}"),
+                    None,
+                )
+            };
+            return Err(error.with_stream_final_response(capture, &stream));
+        }
+    };
 
     Ok(AuditedToolStreamOutcome {
         tool_arguments,
@@ -6348,6 +6371,41 @@ async fn run_provider_stream_for_tool(
             .response_json(stream.final_response_dump())
             .unwrap_or(None),
     })
+}
+
+/// How single-tool structured arguments were obtained after stream collection.
+#[derive(Debug, Clone, PartialEq)]
+enum ResolvedAuditedToolArguments {
+    FromToolCall(Value),
+    FromTextJsonFallback(Value),
+}
+
+/// Prefer real ToolCall arguments. When none are present and the request exposes exactly one
+/// tool, attempt conservative plain-text JSON recovery. Returns `None` when neither path yields
+/// arguments (caller builds the existing error messages / retry behavior).
+fn resolve_audited_single_tool_arguments(
+    tool_call_arguments: Option<Value>,
+    output_text: &str,
+    request_tool_count: usize,
+) -> Option<ResolvedAuditedToolArguments> {
+    if let Some(arguments) = tool_call_arguments {
+        return Some(ResolvedAuditedToolArguments::FromToolCall(arguments));
+    }
+    if request_tool_count != 1 {
+        return None;
+    }
+    let recovered = recover_model_json_from_text(output_text.trim())?;
+    Some(ResolvedAuditedToolArguments::FromTextJsonFallback(
+        recovered,
+    ))
+}
+
+/// Append `Complete.text` only when no `TextDelta` content was collected.
+/// Provider normalizers often repeat the full assistant text on Complete.
+fn append_complete_stream_text(output_text: &mut String, complete_text: &str) {
+    if output_text.is_empty() && !complete_text.is_empty() {
+        output_text.push_str(complete_text);
+    }
 }
 
 fn persist_audited_provider_events(

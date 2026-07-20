@@ -106,8 +106,8 @@ use crate::memory_runtime::{
     llm_memory_retrieval_candidates, memory_extraction_existing_memory_candidates,
     memory_extraction_provider_request, memory_extraction_target_status, memory_prompt_search,
     memory_prompt_search_terms, memory_retrieval_query_text, neutral_messages_from_record,
-    parse_memory_extraction_output, resolve_prompt_context_memory, should_queue_memory_extraction,
-    store_extracted_memory_facts, validate_extracted_memory_facts,
+    parse_memory_extraction_output, parse_memory_retrieval_output, resolve_prompt_context_memory,
+    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
@@ -122,9 +122,10 @@ use crate::runtime::{
 };
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 use crate::spec_runtime::{
-    WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
+    WorkspaceSpecUpdateOutput, WorkspaceSpecUpdateQueueDecision, WorkspaceSpecUpdateSpecState,
     apply_workspace_spec_job_output, apply_workspace_spec_update_job_output,
-    prepare_workspace_spec_job, prepare_workspace_spec_update_job, queue_workspace_spec_update_job,
+    parse_workspace_spec_update_output, prepare_workspace_spec_job,
+    prepare_workspace_spec_update_job, queue_workspace_spec_update_job,
     recover_workspace_spec_queue_for_test, run_workspace_spec_job_with_lease_heartbeat_interval,
     workspace_spec_running_job_is_stale, workspace_spec_update_queue_decision,
 };
@@ -31138,6 +31139,161 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
     assert_eq!(
         error.message,
         "model availability test timed out after 1 ms"
+    );
+}
+
+#[test]
+fn resolve_audited_single_tool_arguments_prefers_real_tool_call() {
+    let tool_call_args = json!({"updateNeeded": false, "edits": null});
+    let text_json = r#"{"updateNeeded":true,"edits":[{"oldText":"a","newText":"b"}]}"#;
+
+    let resolved =
+        resolve_audited_single_tool_arguments(Some(tool_call_args.clone()), text_json, 1)
+            .expect("tool call should resolve");
+
+    assert_eq!(
+        resolved,
+        ResolvedAuditedToolArguments::FromToolCall(tool_call_args)
+    );
+}
+
+#[test]
+fn resolve_audited_single_tool_arguments_recovers_plain_text_json_for_single_tool() {
+    let text = r#"{"facts":[]}"#;
+    let resolved =
+        resolve_audited_single_tool_arguments(None, text, 1).expect("text JSON should recover");
+
+    assert_eq!(
+        resolved,
+        ResolvedAuditedToolArguments::FromTextJsonFallback(json!({"facts": []}))
+    );
+}
+
+#[test]
+fn resolve_audited_single_tool_arguments_recovers_fenced_json_for_single_tool() {
+    let text = "```json\n{\"factKeys\":[\"a\"]}\n```";
+    let resolved =
+        resolve_audited_single_tool_arguments(None, text, 1).expect("fenced JSON should recover");
+
+    assert_eq!(
+        resolved,
+        ResolvedAuditedToolArguments::FromTextJsonFallback(json!({"factKeys": ["a"]}))
+    );
+}
+
+#[test]
+fn resolve_audited_single_tool_arguments_rejects_non_single_tool_or_invalid_text() {
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, r#"{"facts":[]}"#, 0),
+        None
+    );
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, r#"{"facts":[]}"#, 2),
+        None
+    );
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, "Here is the result:\n{\"facts\":[]}", 1),
+        None
+    );
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, "{'facts': []}", 1),
+        None
+    );
+    assert_eq!(resolve_audited_single_tool_arguments(None, "", 1), None);
+    assert_eq!(resolve_audited_single_tool_arguments(None, "   ", 1), None);
+}
+
+#[test]
+fn audited_tool_stream_text_does_not_duplicate_complete_after_text_deltas() {
+    // Provider streams commonly emit TextDelta("...") then Complete { text: "..." }
+    // with the same payload. run_provider_stream_for_tool must not concatenate both.
+    let payload = r#"{"facts":[]}"#;
+    let mut output_text = String::new();
+    output_text.push_str(payload);
+    append_complete_stream_text(&mut output_text, payload);
+
+    let resolved = resolve_audited_single_tool_arguments(None, &output_text, 1)
+        .expect("delta-only collection should recover plain JSON");
+    assert_eq!(
+        resolved,
+        ResolvedAuditedToolArguments::FromTextJsonFallback(json!({"facts": []}))
+    );
+    assert_eq!(output_text, payload);
+
+    // Complete-only (no deltas) still works under the same merge rule.
+    let mut complete_only = String::new();
+    append_complete_stream_text(&mut complete_only, payload);
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, &complete_only, 1),
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(json!({
+            "facts": []
+        })))
+    );
+
+    // Naive unconditional append of Complete.text would break recovery.
+    let duplicated = format!("{payload}{payload}");
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, &duplicated, 1),
+        None,
+        "duplicated stream text must not be treated as recoverable JSON"
+    );
+}
+
+#[test]
+fn audited_single_tool_text_json_fallback_feeds_memory_and_spec_parsers() {
+    // Plain-text recovery succeeds once; callers do not need a second LLM request.
+    let memory_text = r#"{"facts":[]}"#;
+    let memory_args = match resolve_audited_single_tool_arguments(None, memory_text, 1) {
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(value)) => value,
+        other => panic!("expected memory text fallback, got {other:?}"),
+    };
+    let memory_output =
+        parse_memory_extraction_output(memory_args).expect("empty facts extraction is valid");
+    assert!(memory_output.facts.is_empty());
+
+    let retrieval_text = "```json\n{\"factKeys\":[\"pref-concise\"]}\n```";
+    let retrieval_args = match resolve_audited_single_tool_arguments(None, retrieval_text, 1) {
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(value)) => value,
+        other => panic!("expected retrieval text fallback, got {other:?}"),
+    };
+    let retrieval_output =
+        parse_memory_retrieval_output(retrieval_args).expect("retrieval JSON is valid");
+    assert_eq!(retrieval_output.fact_keys, vec!["pref-concise".to_string()]);
+
+    let spec_text = r#"{"updateNeeded":false,"edits":null}"#;
+    let spec_args = match resolve_audited_single_tool_arguments(None, spec_text, 1) {
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(value)) => value,
+        other => panic!("expected spec text fallback, got {other:?}"),
+    };
+    let base = "# Spec\n\n## Purpose\n\nKeep things simple.\n";
+    let spec_output = parse_workspace_spec_update_output(spec_args, base)
+        .expect("no-op spec update from text JSON");
+    assert_eq!(spec_output, WorkspaceSpecUpdateOutput::NoUpdateNeeded);
+
+    // Structural recovery is not business validation: missing/unknown fields still fail.
+    let malformed = match resolve_audited_single_tool_arguments(
+        None,
+        r#"{"facts":[{"scope":"chat","kind":"preference","fact":"x","confidence":0.8,"evidenceReferences":[]}]}"#,
+        1,
+    ) {
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(value)) => value,
+        other => panic!("expected recoverable but invalid extraction shape, got {other:?}"),
+    };
+    let error = parse_memory_extraction_output(malformed)
+        .expect_err("missing relationCandidates must still fail");
+    assert!(error.message.contains("malformed memory extraction JSON"));
+
+    let invalid_spec = match resolve_audited_single_tool_arguments(
+        None,
+        r#"{"updateNeeded":true,"edits":[{"oldText":"missing","newText":"x"}]}"#,
+        1,
+    ) {
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(value)) => value,
+        other => panic!("expected recoverable but invalid spec edit, got {other:?}"),
+    };
+    assert!(
+        parse_workspace_spec_update_output(invalid_spec, base).is_err(),
+        "invalid Spec edit oldText must still be rejected"
     );
 }
 
