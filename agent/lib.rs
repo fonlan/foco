@@ -1,4 +1,4 @@
-use std::{fmt, str::FromStr};
+use std::{collections::HashMap, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -859,6 +859,7 @@ const CONTEXT_COMPRESSION_TRIGGER_NUMERATOR: u64 = 4;
 const CONTEXT_COMPRESSION_TRIGGER_DENOMINATOR: u64 = 5;
 pub const WRITE_FILE_TOOL_NAME: &str = "write_file";
 pub const EDIT_FILE_TOOL_NAME: &str = "edit_file";
+pub const APPLY_PATCH_TOOL_NAME: &str = "apply_patch";
 const READ_FILE_TOOL_NAME: &str = "read_file";
 const FIND_FILES_TOOL_NAME: &str = "find_files";
 const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
@@ -1483,10 +1484,12 @@ pub fn plan_tool_execution(
             Err(error) => return Err(error),
         };
         analyzed_calls.push(AnalyzedToolCall {
-            requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name),
+            requires_sequential_execution: tool_call_requires_sequential_execution(&tool_call.name)
+                || (tool_call.name == APPLY_PATCH_TOOL_NAME
+                    && apply_patch_marker_paths(tool_call).is_none()),
             locks,
             file_write_kind: file_write_kind(&tool_call.name),
-            file_display_path: file_display_path(tool_call),
+            file_display_paths: file_display_paths(tool_call),
         });
     }
 
@@ -1577,6 +1580,7 @@ pub fn tool_resource_locks(
             resource: ToolResource::File(required_path(tool_call)?),
             access: ToolResourceAccess::Write,
         }],
+        APPLY_PATCH_TOOL_NAME => apply_patch_resource_locks(tool_call),
         FIND_FILES_TOOL_NAME
         | SEARCH_TEXT_TOOL_NAME
         | GRAPH_FIND_SYMBOLS_TOOL_NAME
@@ -1674,7 +1678,10 @@ pub fn tool_resource_locks(
 }
 
 fn tool_requires_workspace_mutation_lease(tool_name: &str) -> bool {
-    matches!(tool_name, WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME)
+    matches!(
+        tool_name,
+        WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME | APPLY_PATCH_TOOL_NAME
+    )
 }
 
 pub fn tool_effect(tool_name: &str) -> ToolEffect {
@@ -1700,6 +1707,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | "sleep" => ToolEffect::ReadOnly,
         WRITE_FILE_TOOL_NAME
         | EDIT_FILE_TOOL_NAME
+        | APPLY_PATCH_TOOL_NAME
         | CREATE_TODO_GRAPH_TOOL_NAME
         | UPDATE_TODO_GRAPH_TOOL_NAME
         | CREATE_PLAN_TOOL_NAME
@@ -1731,6 +1739,7 @@ pub fn tool_resource_locks_conflict(first: &ToolResourceLock, second: &ToolResou
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FileWriteKind {
     ReplaceExact,
+    PatchEdit,
     LineRangeOrFull,
 }
 
@@ -1739,7 +1748,16 @@ struct AnalyzedToolCall {
     requires_sequential_execution: bool,
     locks: Vec<ToolResourceLock>,
     file_write_kind: Option<FileWriteKind>,
-    file_display_path: Option<String>,
+    file_display_paths: HashMap<String, String>,
+}
+
+impl AnalyzedToolCall {
+    fn display_path_for_resource(&self, resource: &ToolResource) -> Option<String> {
+        let ToolResource::File(path) = resource else {
+            return None;
+        };
+        self.file_display_paths.get(path).cloned()
+    }
 }
 
 fn push_parallel_group_before_orderable_workspace_file_conflict(
@@ -1790,8 +1808,15 @@ fn is_orderable_workspace_file_conflict(
     matches!(
         (&first_lock.resource, &second_lock.resource),
         (ToolResource::File(_), ToolResource::File(_))
-    ) && first_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
-        && second_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+    ) && is_contextual_file_edit(first_analysis.file_write_kind)
+        && is_contextual_file_edit(second_analysis.file_write_kind)
+}
+
+fn is_contextual_file_edit(kind: Option<FileWriteKind>) -> bool {
+    matches!(
+        kind,
+        Some(FileWriteKind::ReplaceExact | FileWriteKind::PatchEdit)
+    )
 }
 
 fn is_workspace_file_resource(resource: &ToolResource) -> bool {
@@ -1835,12 +1860,10 @@ fn reject_conflicting_parallel_tool_calls(
             {
                 if let ToolResource::File(path) = &first_lock.resource {
                     let display_path = first_analysis
-                        .file_display_path
-                        .as_ref()
-                        .unwrap_or(path)
-                        .clone();
-                    if first_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
-                        && second_analysis.file_write_kind == Some(FileWriteKind::ReplaceExact)
+                        .display_path_for_resource(&first_lock.resource)
+                        .unwrap_or_else(|| path.clone());
+                    if is_contextual_file_edit(first_analysis.file_write_kind)
+                        && is_contextual_file_edit(second_analysis.file_write_kind)
                     {
                         continue;
                     }
@@ -1850,18 +1873,16 @@ fn reject_conflicting_parallel_tool_calls(
                             first_analysis.file_write_kind,
                             second_analysis.file_write_kind,
                         ) {
-                            (
-                                Some(FileWriteKind::ReplaceExact),
-                                Some(FileWriteKind::LineRangeOrFull),
-                            )
-                            | (
-                                Some(FileWriteKind::LineRangeOrFull),
-                                Some(FileWriteKind::ReplaceExact),
-                            ) => ToolConflictError::MixedFileWriteMethods {
-                                path: display_path,
-                                first_call_id: first_call.id.clone(),
-                                second_call_id: second_call.id.clone(),
-                            },
+                            (Some(FileWriteKind::LineRangeOrFull), Some(kind))
+                            | (Some(kind), Some(FileWriteKind::LineRangeOrFull))
+                                if is_contextual_file_edit(Some(kind)) =>
+                            {
+                                ToolConflictError::MixedFileWriteMethods {
+                                    path: display_path,
+                                    first_call_id: first_call.id.clone(),
+                                    second_call_id: second_call.id.clone(),
+                                }
+                            }
                             _ => ToolConflictError::SameFileWrite {
                                 path: display_path,
                                 first_call_id: first_call.id.clone(),
@@ -1883,10 +1904,7 @@ fn reject_conflicting_parallel_tool_calls(
 
             return Err(ToolConflictError::ResourceConflict {
                 resource: first_lock.resource.clone(),
-                display_path: match &first_lock.resource {
-                    ToolResource::File(_) => first_analysis.file_display_path.clone(),
-                    _ => None,
-                },
+                display_path: first_analysis.display_path_for_resource(&first_lock.resource),
                 first_call_id: first_call.id.clone(),
                 first_access: first_lock.access,
                 second_call_id: second_call.id.clone(),
@@ -1917,6 +1935,7 @@ fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
 fn file_write_kind(tool_name: &str) -> Option<FileWriteKind> {
     match tool_name {
         EDIT_FILE_TOOL_NAME => Some(FileWriteKind::ReplaceExact),
+        APPLY_PATCH_TOOL_NAME => Some(FileWriteKind::PatchEdit),
         WRITE_FILE_TOOL_NAME => Some(FileWriteKind::LineRangeOrFull),
         _ => None,
     }
@@ -1934,19 +1953,107 @@ fn required_path(tool_call: &PendingToolCall) -> Result<String, ToolConflictErro
         })
 }
 
-fn file_display_path(tool_call: &PendingToolCall) -> Option<String> {
-    if !matches!(
-        tool_call.name.as_str(),
-        READ_FILE_TOOL_NAME | WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME
-    ) {
+fn apply_patch_resource_locks(tool_call: &PendingToolCall) -> Vec<ToolResourceLock> {
+    match apply_patch_marker_paths(tool_call) {
+        Some(paths) => paths
+            .into_iter()
+            .map(|path| ToolResourceLock {
+                resource: ToolResource::File(normalize_workspace_path_key(&path)),
+                access: ToolResourceAccess::Write,
+            })
+            .collect(),
+        // Invalid marker syntax must not silently become an empty lock set. The actual tool
+        // parser will return the detailed patch error after this conservative serial fallback.
+        None => vec![ToolResourceLock {
+            resource: ToolResource::WorkspaceFiles,
+            access: ToolResourceAccess::Write,
+        }],
+    }
+}
+
+/// Extracts only the resource markers needed for scheduling. It deliberately does not parse
+/// hunks or reproduce the apply algorithm; malformed or ambiguous documents return `None`.
+fn apply_patch_marker_paths(tool_call: &PendingToolCall) -> Option<Vec<String>> {
+    let patch = tool_call.arguments.get("patch")?.as_str()?;
+    let mut lines = patch.lines();
+    if lines.next()?.trim_end_matches('\r') != "*** Begin Patch" {
         return None;
     }
 
-    tool_call
-        .arguments
-        .get("path")
-        .and_then(Value::as_str)
-        .map(normalize_workspace_path_display)
+    let mut paths = Vec::new();
+    let mut active_update_path = None;
+    let mut ended = false;
+    for raw_line in lines {
+        let line = raw_line.trim_end_matches('\r');
+        if line == "*** End Patch" {
+            ended = true;
+            break;
+        }
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            push_apply_patch_marker_path(&mut paths, path)?;
+            active_update_path = None;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            push_apply_patch_marker_path(&mut paths, path)?;
+            active_update_path = None;
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            push_apply_patch_marker_path(&mut paths, path)?;
+            active_update_path = Some(path.trim());
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("*** Move to: ") {
+            active_update_path?;
+            push_apply_patch_marker_path(&mut paths, path)?;
+            continue;
+        }
+        if line.starts_with("*** ") {
+            return None;
+        }
+    }
+
+    (ended && !paths.is_empty()).then_some(paths)
+}
+
+fn push_apply_patch_marker_path(paths: &mut Vec<String>, raw_path: &str) -> Option<()> {
+    let path = raw_path.trim();
+    if path.is_empty() || path.contains('\0') {
+        return None;
+    }
+    let display_path = normalize_workspace_path_display(path);
+    if display_path.is_empty() || display_path == "." {
+        return None;
+    }
+    if !paths.iter().any(|existing| existing == &display_path) {
+        paths.push(display_path);
+    }
+    Some(())
+}
+
+fn file_display_paths(tool_call: &PendingToolCall) -> HashMap<String, String> {
+    let paths = if tool_call.name == APPLY_PATCH_TOOL_NAME {
+        apply_patch_marker_paths(tool_call).unwrap_or_default()
+    } else if matches!(
+        tool_call.name.as_str(),
+        READ_FILE_TOOL_NAME | WRITE_FILE_TOOL_NAME | EDIT_FILE_TOOL_NAME
+    ) {
+        tool_call
+            .arguments
+            .get("path")
+            .and_then(Value::as_str)
+            .map(normalize_workspace_path_display)
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    paths
+        .into_iter()
+        .map(|path| (normalize_workspace_path_key(&path), path))
+        .collect()
 }
 
 fn required_process_id(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
@@ -3237,6 +3344,92 @@ mod tests {
                         call_indices: vec![1],
                     },
                 ]
+            }
+        );
+    }
+
+    #[test]
+    fn apply_patch_locks_each_marked_path_and_the_workspace_mutation_lease() {
+        let locks = tool_resource_locks(&test_tool_call(
+            APPLY_PATCH_TOOL_NAME,
+            json!({
+                "patch": "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n*** Add File: src/added.rs\n*** Delete File: src/deleted.rs\n*** End Patch"
+            }),
+        ))
+        .expect("patch locks");
+
+        assert_eq!(
+            locks,
+            vec![
+                ToolResourceLock {
+                    resource: ToolResource::File("src/old.rs".to_string()),
+                    access: ToolResourceAccess::Write,
+                },
+                ToolResourceLock {
+                    resource: ToolResource::File("src/new.rs".to_string()),
+                    access: ToolResourceAccess::Write,
+                },
+                ToolResourceLock {
+                    resource: ToolResource::File("src/added.rs".to_string()),
+                    access: ToolResourceAccess::Write,
+                },
+                ToolResourceLock {
+                    resource: ToolResource::File("src/deleted.rs".to_string()),
+                    access: ToolResourceAccess::Write,
+                },
+                ToolResourceLock {
+                    resource: ToolResource::WorkspaceMutationLease,
+                    access: ToolResourceAccess::Exclusive,
+                },
+            ]
+        );
+        assert_eq!(
+            tool_effect(APPLY_PATCH_TOOL_NAME),
+            ToolEffect::WorkspaceMutation
+        );
+        assert_eq!(
+            tool_effect(APPLY_PATCH_TOOL_NAME).retry_safety(),
+            ToolRetrySafety::RetryUnsafe
+        );
+    }
+
+    #[test]
+    fn plans_patch_and_edit_for_the_same_file_in_order_but_rejects_write_file_mixing() {
+        let patch = "*** Begin Patch\n*** Update File: src/main.rs\n@@\n-old\n+new\n*** End Patch";
+        let contextual_calls = vec![
+            test_tool_call(APPLY_PATCH_TOOL_NAME, json!({ "patch": patch })),
+            test_tool_call(EDIT_FILE_TOOL_NAME, json!({ "path": "src/main.rs" })),
+        ];
+
+        assert_eq!(
+            plan_tool_execution(&contextual_calls).expect("ordered contextual edits"),
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ]
+            }
+        );
+
+        let conflicting_calls = vec![
+            test_tool_call(APPLY_PATCH_TOOL_NAME, json!({ "patch": patch })),
+            test_tool_call(
+                WRITE_FILE_TOOL_NAME,
+                json!({ "path": "src/main.rs", "content": "replacement" }),
+            ),
+        ];
+        assert_eq!(
+            plan_tool_execution(&conflicting_calls).expect_err("mixed patch/write conflict"),
+            ToolConflictError::MixedFileWriteMethods {
+                path: "src/main.rs".to_string(),
+                first_call_id: format!("call-{APPLY_PATCH_TOOL_NAME}"),
+                second_call_id: format!("call-{WRITE_FILE_TOOL_NAME}"),
             }
         );
     }

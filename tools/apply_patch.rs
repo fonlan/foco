@@ -12,6 +12,7 @@ use std::{
     fs::{self, FileType},
     io,
     path::{Component, Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -19,8 +20,8 @@ use serde_json::{Value, json};
 
 use crate::errors::tool_timeout_ms;
 use crate::{
-    DEFAULT_APPLY_PATCH_TIMEOUT_MS, ToolRuntimeError, decode_text_file, encode_text_file,
-    parse_arguments,
+    DEFAULT_APPLY_PATCH_TIMEOUT_MS, ToolCancellationToken, ToolRuntimeError, decode_text_file,
+    encode_text_file, parse_arguments,
 };
 
 const MAX_PATCH_BYTES: usize = 2 * 1024 * 1024;
@@ -276,12 +277,23 @@ pub(crate) fn parse_patch(patch: &str) -> Result<Vec<PatchHunk>, PatchParseError
     Ok(hunks)
 }
 
+#[cfg(test)]
 pub(crate) fn apply_patch(
     workspace_path: &Path,
     arguments: Value,
 ) -> Result<Value, ToolRuntimeError> {
+    apply_patch_with_cancellation(workspace_path, arguments, None)
+}
+
+pub(crate) fn apply_patch_with_cancellation(
+    workspace_path: &Path,
+    arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
+) -> Result<Value, ToolRuntimeError> {
     let request: ApplyPatchInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_APPLY_PATCH_TIMEOUT_MS)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    ensure_apply_patch_active(cancellation_token, deadline, timeout_ms)?;
     let hunks = parse_patch(&request.patch)
         .map_err(|error| ToolRuntimeError::InvalidArguments(error.to_string()))?;
     if hunks.is_empty() {
@@ -296,6 +308,8 @@ pub(crate) fn apply_patch(
     })?;
     let mut affected = AffectedPaths::default();
     for hunk in &hunks {
+        // Preserve any prior hunk effects, but stop before the next mutation if the run ended.
+        ensure_apply_patch_active(cancellation_token, deadline, timeout_ms)?;
         apply_hunk(&workspace, hunk, &mut affected)?;
     }
 
@@ -306,6 +320,22 @@ pub(crate) fn apply_patch(
         "deleted": affected.deleted,
         "timeoutMs": timeout_ms,
     }))
+}
+
+fn ensure_apply_patch_active(
+    cancellation_token: Option<&ToolCancellationToken>,
+    deadline: Instant,
+    timeout_ms: u64,
+) -> Result<(), ToolRuntimeError> {
+    if cancellation_token.is_some_and(ToolCancellationToken::is_cancelled) {
+        return Err(ToolRuntimeError::Cancelled);
+    }
+    if Instant::now() >= deadline {
+        return Err(ToolRuntimeError::InvalidArguments(format!(
+            "apply_patch timed out after {timeout_ms} ms"
+        )));
+    }
+    Ok(())
 }
 
 fn unwrap_heredoc<'a>(lines: &'a [&'a str]) -> Result<&'a [&'a str], PatchParseError> {

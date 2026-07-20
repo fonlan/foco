@@ -26,6 +26,7 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   agent_transfer_task: { en: "Transfer Task", "zh-CN": "转交任务" },
   agent_wait_tasks: { en: "Wait Tasks", "zh-CN": "等待任务" },
   ask_question: { en: "Ask", "zh-CN": "询问" },
+  apply_patch: { en: "Patch", "zh-CN": "修补" },
   create_plan: { en: "Create Plan", "zh-CN": "创建计划" },
   create_todo_graph: { en: "Create Todos", "zh-CN": "创建待办" },
   update_todo_graph: { en: "Update Todos", "zh-CN": "更新待办" },

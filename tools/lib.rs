@@ -506,7 +506,11 @@ fn execute_builtin_tool_inner(
         }
         WRITE_FILE_TOOL => file_tools::write_file(workspace_path, arguments),
         EDIT_FILE_TOOL => file_tools::edit_file(workspace_path, arguments),
-        APPLY_PATCH_TOOL => apply_patch::apply_patch(workspace_path, arguments),
+        APPLY_PATCH_TOOL => apply_patch::apply_patch_with_cancellation(
+            workspace_path,
+            arguments,
+            cancellation_token,
+        ),
         CREATE_TODO_GRAPH_TOOL => {
             todo_tools::create_todo_graph(workspace_path, context.chat_id, arguments)
         }

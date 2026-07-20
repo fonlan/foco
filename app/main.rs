@@ -32,12 +32,13 @@ use foco_agent::{
 use foco_mcp::{McpRegistry, McpServerDefinition, McpServerState, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
-    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
+    NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
     OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, OpenAiRespWsSessionKey,
     OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
     ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
     normalized_proxy_url, parse_provider_kind, recover_model_json_from_text,
     stream_chat_with_capture_observer, stream_chat_with_capture_observer_runtime_options,
+    upstream_provider_model_id,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -8312,6 +8313,34 @@ pub(crate) fn provider_connection_config(
         request_overrides: provider.request_overrides.clone(),
         model_redirects: provider.model_redirects.clone(),
     })
+}
+
+/// Returns whether the run-scoped `apply_patch` tool may be exposed for this model route.
+///
+/// This intentionally keys off Foco's exact provider kind rather than the shared genai adapter:
+/// OpenAI-compatible third parties must never inherit the Codex-compatible tool surface.
+pub(crate) fn apply_patch_available_for_model(
+    config: &GlobalConfig,
+    model_id: &str,
+) -> Result<bool, ApiError> {
+    let (model, provider) = config
+        .resolve_active_model_provider(model_id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let provider_kind = parse_provider_kind(&provider.kind)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if !matches!(
+        provider_kind.as_str(),
+        OPENAI_CHAT_KIND | OPENAI_RESPONSES_KIND | OPENAI_RESPONSES_WEBSOCKET_KIND
+    ) {
+        return Ok(false);
+    }
+
+    let upstream_model_id = upstream_provider_model_id(&model.id, &provider.model_redirects)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(upstream_model_id
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("gpt-"))
 }
 
 fn normalize_model_provider_ids(

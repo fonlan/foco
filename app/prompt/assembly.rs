@@ -261,6 +261,9 @@ pub(crate) async fn prepare_prompt_context(
     let web_search_available = web_search_enabled(&config.web_search);
     let mut builtin_tool_definitions =
         builtin_tool_definitions_for_runtime(ripgrep_available, web_search_available);
+    if !apply_patch_available_for_model(config, &model.id)? {
+        builtin_tool_definitions.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
+    }
     let mut memory_tool_definitions = if config.memory.enabled {
         memory_tool_definitions()
     } else {

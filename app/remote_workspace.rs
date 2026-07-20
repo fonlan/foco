@@ -5446,7 +5446,8 @@ async fn handle_broker_request(
                 broker_ask_question(state, &write, &id, request.payload).await;
             }
             "tools.discover" => {
-                broker_remote_tool_discovery(state, &write, workspace_id, &id).await;
+                broker_remote_tool_discovery(state, &write, workspace_id, &id, request.payload)
+                    .await;
             }
             "mcp.execute" => {
                 broker_mcp_execute(state, &write, workspace_id, &id, request.payload).await;
@@ -7290,6 +7291,7 @@ async fn broker_remote_tool_discovery(
     write: &SharedBrokerWsWrite,
     workspace_id: &str,
     id: &str,
+    payload: Value,
 ) {
     let config = match config_snapshot(state) {
         Ok(config) => config,
@@ -7297,6 +7299,19 @@ async fn broker_remote_tool_discovery(
             let _ = send_broker_error(write, Some(id), "internal_error", error.message()).await;
             return;
         }
+    };
+    let apply_patch_available = match payload.get("modelId").and_then(Value::as_str) {
+        Some(model_id) if !model_id.trim().is_empty() => {
+            match crate::apply_patch_available_for_model(&config, model_id) {
+                Ok(available) => available,
+                Err(error) => {
+                    let _ =
+                        send_broker_error(write, Some(id), "bad_request", error.message()).await;
+                    return;
+                }
+            }
+        }
+        _ => false,
     };
     let workspace = match workspace_by_id(&config, workspace_id) {
         Ok(workspace) => workspace,
@@ -7326,6 +7341,7 @@ async fn broker_remote_tool_discovery(
         payload: json!({
             "status": "ok",
             "webSearchAvailable": crate::runtime::web_search_enabled(&config.web_search),
+            "applyPatchAvailable": apply_patch_available,
             "mcpTools": mcp_tools,
         }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
@@ -10842,6 +10858,7 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
 #[derive(Default)]
 struct RemoteBrokerToolDiscovery {
     web_search_available: bool,
+    apply_patch_available: bool,
     local_mcp_tools: Vec<McpToolDefinition>,
 }
 
@@ -10885,6 +10902,7 @@ fn remote_sidecar_session_mode(
 
 async fn remote_sidecar_broker_tool_discovery(
     state: &RemoteSidecarState,
+    model_id: Option<&str>,
 ) -> Result<RemoteBrokerToolDiscovery, axum::response::Response> {
     #[cfg(test)]
     if state.ws_count.load(Ordering::Relaxed) == 0 || state.broker_tx.receiver_count() == 0 {
@@ -10895,7 +10913,7 @@ async fn remote_sidecar_broker_tool_discovery(
         state,
         &request_id,
         "tools.discover",
-        json!({ "workspaceId": state.workspace_id }),
+        json!({ "workspaceId": state.workspace_id, "modelId": model_id }),
     )
     .await?;
     let response = timeout(BROKER_REQUEST_TIMEOUT, response_rx.recv())
@@ -10920,6 +10938,11 @@ async fn remote_sidecar_broker_tool_discovery(
         web_search_available: response
             .payload
             .get("webSearchAvailable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        apply_patch_available: response
+            .payload
+            .get("applyPatchAvailable")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         local_mcp_tools,
@@ -10948,7 +10971,16 @@ async fn remote_sidecar_tool_catalog(
     bundle: Option<&SidecarRuntimeConfigBundle>,
     session_mode: Option<&str>,
 ) -> Result<Arc<RemoteToolCatalog>, axum::response::Response> {
-    let discovery = match remote_sidecar_broker_tool_discovery(state).await {
+    remote_sidecar_tool_catalog_for_model(state, bundle, session_mode, None).await
+}
+
+async fn remote_sidecar_tool_catalog_for_model(
+    state: &RemoteSidecarState,
+    bundle: Option<&SidecarRuntimeConfigBundle>,
+    session_mode: Option<&str>,
+    model_id: Option<&str>,
+) -> Result<Arc<RemoteToolCatalog>, axum::response::Response> {
+    let discovery = match remote_sidecar_broker_tool_discovery(state, model_id).await {
         Ok(discovery) => discovery,
         Err(response) => {
             tracing::warn!(
@@ -11000,6 +11032,9 @@ async fn build_remote_tool_catalog(
             .into_iter()
             .filter(|tool| !tool.name.starts_with("agent_"))
             .collect::<Vec<_>>();
+    if !discovery.apply_patch_available {
+        builtin_tools.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
+    }
     let mut memory_tools = if bundle.is_some_and(|bundle| bundle.payload.memory.enabled) {
         memory_tool_definitions()
     } else {
@@ -11508,8 +11543,13 @@ async fn remote_sidecar_provider_request(
         .lock()
         .ok()
         .and_then(|config| config.clone());
-    let tool_catalog =
-        remote_sidecar_tool_catalog(state, bundle.as_ref(), session_mode.as_deref()).await?;
+    let tool_catalog = remote_sidecar_tool_catalog_for_model(
+        state,
+        bundle.as_ref(),
+        session_mode.as_deref(),
+        Some(model_id),
+    )
+    .await?;
     Ok(remote_sidecar_prepare_chat_context(
         state,
         database,
@@ -17196,23 +17236,29 @@ async fn remote_sidecar_start_chat_run(
         .lock()
         .ok()
         .and_then(|config| config.clone());
-    let tool_catalog =
-        match remote_sidecar_tool_catalog(&state, bundle.as_ref(), session_mode.as_deref()).await {
-            Ok(catalog) => catalog,
-            Err(_) => {
-                remote_sidecar_fail_reserved_start(
-                    &state,
-                    &run_id,
-                    &run_stream,
-                    &chat_id,
-                    &queued_user_message_id,
-                    &assistant_message_id,
-                    plan_task.as_ref(),
-                    "failed to prepare remote tool catalog",
-                );
-                return Ok(run_stream);
-            }
-        };
+    let tool_catalog = match remote_sidecar_tool_catalog_for_model(
+        &state,
+        bundle.as_ref(),
+        session_mode.as_deref(),
+        Some(&model_id),
+    )
+    .await
+    {
+        Ok(catalog) => catalog,
+        Err(_) => {
+            remote_sidecar_fail_reserved_start(
+                &state,
+                &run_id,
+                &run_stream,
+                &chat_id,
+                &queued_user_message_id,
+                &assistant_message_id,
+                plan_task.as_ref(),
+                "failed to prepare remote tool catalog",
+            );
+            return Ok(run_stream);
+        }
+    };
     let initial_prepared = {
         let database = match open_workspace_database_ordinary_with_pre_stream_retry(
             sidecar_workspace_path(&state),
@@ -17401,7 +17447,9 @@ async fn remote_sidecar_context_usage(
                 .into_response()
         })?
         .clone();
-    let tool_catalog = remote_sidecar_tool_catalog(&state, bundle.as_ref(), None).await?;
+    let tool_catalog =
+        remote_sidecar_tool_catalog_for_model(&state, bundle.as_ref(), None, Some(&model_id))
+            .await?;
     let database = sidecar_workspace_database(&state)?;
     database
         .chat(&chat_id)
@@ -21830,8 +21878,13 @@ mod tests {
             .lock()
             .ok()
             .and_then(|config| config.clone());
-        let tool_catalog =
-            remote_sidecar_tool_catalog(state, bundle.as_ref(), session_mode.as_deref()).await?;
+        let tool_catalog = remote_sidecar_tool_catalog_for_model(
+            state,
+            bundle.as_ref(),
+            session_mode.as_deref(),
+            Some(model_id),
+        )
+        .await?;
         remote_sidecar_prepare_chat_context(
             state,
             database,

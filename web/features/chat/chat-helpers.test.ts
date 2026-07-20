@@ -11,6 +11,8 @@ describe("chat display helpers", () => {
     expect(toolDisplayName("get_command_output", "zh-CN")).toBe("命令输出");
     expect(toolDisplayName("stop_command", "en")).toBe("Stop Command");
     expect(toolDisplayName("stop_command", "zh-CN")).toBe("停止命令");
+    expect(toolDisplayName("apply_patch", "en")).toBe("Patch");
+    expect(toolDisplayName("apply_patch", "zh-CN")).toBe("修补");
     expect(toolDisplayName("agent_list", "en")).toBe("List Agents");
     expect(toolDisplayName("agent_list", "zh-CN")).toBe("列出智能体");
     expect(toolDisplayName("update_todo_graph", "zh-CN")).toBe("更新待办");
