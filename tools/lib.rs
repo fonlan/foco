@@ -52,6 +52,8 @@ pub const IMAGE_GEN_TOOL: &str = "image_gen";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
+pub const GET_COMMAND_OUTPUT_TOOL: &str = "get_command_output";
+pub const STOP_COMMAND_TOOL: &str = "stop_command";
 pub const SLEEP_TOOL: &str = "sleep";
 pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
 pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
@@ -113,6 +115,7 @@ const DEFAULT_IMAGE_GEN_TOOL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_TODO_GRAPH_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_PLAN_TOOL_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SPEC_TOOL_TIMEOUT_MS: u64 = 10_000;
@@ -123,6 +126,7 @@ const MAX_COMMAND_PIPE_MESSAGES_PER_DRAIN: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+static BACKGROUND_COMMAND_REGISTRY: OnceLock<BackgroundCommandRegistry> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -206,6 +210,11 @@ pub fn set_ripgrep_path(path: Option<PathBuf>) {
     let state = RIPGREP_PATH.get_or_init(|| Mutex::new(None));
     let mut current = state.lock().expect("ripgrep path lock poisoned");
     *current = path;
+}
+
+/// Returns the host-local registry used by the built-in managed command tools.
+pub fn background_command_registry() -> &'static BackgroundCommandRegistry {
+    BACKGROUND_COMMAND_REGISTRY.get_or_init(BackgroundCommandRegistry::new)
 }
 
 pub fn execute_builtin_tool(
@@ -458,6 +467,8 @@ fn execute_builtin_tool_inner(
         RUN_COMMAND_TOOL => {
             command_tools::run_command(workspace_path, arguments, cancellation_token, output_sink)
         }
+        GET_COMMAND_OUTPUT_TOOL => command_tools::get_command_output(workspace_path, arguments),
+        STOP_COMMAND_TOOL => command_tools::stop_command(workspace_path, arguments),
         SLEEP_TOOL => command_tools::sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
@@ -4015,6 +4026,160 @@ mod tests {
                 .expect("stderr")
                 .contains("not a git repository")
         );
+    }
+
+    #[test]
+    fn managed_command_tools_expose_strict_start_read_and_stop_contracts() {
+        let definitions = builtin_tool_definitions();
+        let run_command = definitions
+            .iter()
+            .find(|definition| definition.name == RUN_COMMAND_TOOL)
+            .expect("run_command definition");
+        let required = run_command.input_schema["required"]
+            .as_array()
+            .expect("run_command required fields");
+
+        assert!(run_command.strict);
+        assert!(required.contains(&json!("background")));
+        assert!(required.contains(&json!("backgroundTimeoutMs")));
+
+        for tool_name in [GET_COMMAND_OUTPUT_TOOL, STOP_COMMAND_TOOL] {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.name == tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} definition"));
+            assert!(definition.strict);
+            assert_eq!(definition.input_schema["additionalProperties"], false);
+            assert!(
+                definition.input_schema["required"]
+                    .as_array()
+                    .expect("required fields")
+                    .contains(&json!("processId"))
+            );
+        }
+    }
+
+    #[test]
+    fn managed_background_command_returns_a_reusable_handle_and_idempotent_stop() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+        let started = Instant::now();
+        let launch = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": command,
+                "args": ["--ignored", "--exact", "tests::timeout_child_process"],
+                "cwd": null,
+                "timeoutMs": null,
+                "background": true,
+                "backgroundTimeoutMs": null
+            }),
+        );
+
+        assert!(!launch.is_error, "{:?}", launch.output);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(launch.output["processId"].as_str().is_some());
+        assert!(launch.output["pid"].as_u64().is_some());
+        assert!(launch.output["startedAt"].as_u64().is_some());
+        assert!(launch.output["chunks"].is_array());
+        assert!(launch.output["nextCursor"].as_u64().is_some());
+        assert!(launch.output["hasMore"].is_boolean());
+
+        let process_id = launch.output["processId"]
+            .as_str()
+            .expect("process id")
+            .to_string();
+        let cursor = launch.output["nextCursor"].as_u64();
+        let read = execute_builtin_tool(
+            workspace.path(),
+            GET_COMMAND_OUTPUT_TOOL,
+            json!({
+                "processId": process_id,
+                "cursor": cursor,
+                "waitMs": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!read.is_error, "{:?}", read.output);
+        assert_eq!(read.output["fromCursor"], json!(cursor));
+        assert!(read.output["availableFromCursor"].as_u64().is_some());
+        assert!(read.output["cursorExpired"].is_boolean());
+        assert!(read.output["retainedOutputBytes"].as_u64().is_some());
+
+        let first_stop = execute_builtin_tool(
+            workspace.path(),
+            STOP_COMMAND_TOOL,
+            json!({ "processId": process_id, "timeoutMs": null }),
+        );
+        assert!(!first_stop.is_error, "{:?}", first_stop.output);
+        let second_stop = execute_builtin_tool(
+            workspace.path(),
+            STOP_COMMAND_TOOL,
+            json!({ "processId": first_stop.output["processId"], "timeoutMs": null }),
+        );
+        assert!(!second_stop.is_error, "{:?}", second_stop.output);
+    }
+
+    #[test]
+    fn managed_command_hides_cross_workspace_handle_existence() {
+        let owner_workspace = tempfile::tempdir().expect("owner workspace");
+        let other_workspace = tempfile::tempdir().expect("other workspace");
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+        let launch = execute_builtin_tool(
+            owner_workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": command,
+                "args": ["--ignored", "--exact", "tests::timeout_child_process"],
+                "cwd": null,
+                "timeoutMs": null,
+                "background": true,
+                "backgroundTimeoutMs": null
+            }),
+        );
+        assert!(!launch.is_error, "{:?}", launch.output);
+        let process_id = launch.output["processId"]
+            .as_str()
+            .expect("process id")
+            .to_string();
+
+        let foreign = execute_builtin_tool(
+            other_workspace.path(),
+            GET_COMMAND_OUTPUT_TOOL,
+            json!({
+                "processId": process_id,
+                "cursor": null,
+                "waitMs": null,
+                "timeoutMs": null
+            }),
+        );
+        let missing = execute_builtin_tool(
+            other_workspace.path(),
+            GET_COMMAND_OUTPUT_TOOL,
+            json!({
+                "processId": "command-does-not-exist",
+                "cursor": null,
+                "waitMs": null,
+                "timeoutMs": null
+            }),
+        );
+        let stop = execute_builtin_tool(
+            owner_workspace.path(),
+            STOP_COMMAND_TOOL,
+            json!({ "processId": launch.output["processId"], "timeoutMs": null }),
+        );
+
+        assert!(foreign.is_error, "{:?}", foreign.output);
+        assert!(missing.is_error, "{:?}", missing.output);
+        assert_eq!(foreign.output["error"], missing.output["error"]);
+        assert!(!stop.is_error, "{:?}", stop.output);
     }
 
     #[test]

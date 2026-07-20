@@ -2,12 +2,12 @@ use serde_json::{Value, json};
 
 use crate::{
     ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL,
-    FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL,
-    GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL,
-    GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL,
-    READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolDefinition,
-    UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL,
-    WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    FIND_FILES_TOOL, GET_COMMAND_OUTPUT_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
+    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
+    READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
+    STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -38,6 +38,8 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         update_spec_definition(),
         ask_question_definition(),
         run_command_definition(),
+        get_command_output_definition(),
+        stop_command_definition(),
         sleep_definition(),
     ]
 }
@@ -1029,10 +1031,54 @@ fn run_command_definition() -> ToolDefinition {
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
-                    "description": "Optional command timeout in milliseconds. Defaults to 60000."
+                    "description": "Optional command timeout in milliseconds for foreground execution. Defaults to 60000."
+                },
+                "background": {
+                    "type": ["boolean", "null"],
+                    "description": "When true, start a managed background process and return its processId without waiting for completion. Null or false keeps foreground behavior."
+                },
+                "backgroundTimeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional maximum lifetime for a managed background process in milliseconds. Null leaves its lifetime unbounded."
                 }
             },
-            "required": ["command", "args", "cwd", "timeoutMs"]
+            "required": ["command", "args", "cwd", "timeoutMs", "background", "backgroundTimeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn get_command_output_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GET_COMMAND_OUTPUT_TOOL,
+        description: "Read retained incremental stdout and stderr for a managed background command. Reuse nextCursor as cursor for the next non-consuming read.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "processId": { "type": "string", "description": "Stable process handle returned by run_command with background true." },
+                "cursor": { "type": ["integer", "null"], "description": "Previous nextCursor. Null reads from the earliest retained output." },
+                "waitMs": { "type": ["integer", "null"], "description": "Optional bounded long-poll duration. Returns early when output arrives or the process exits." },
+                "timeoutMs": { "type": ["integer", "null"], "description": "Optional tool deadline in milliseconds. Defaults to 10000." }
+            },
+            "required": ["processId", "cursor", "waitMs", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn stop_command_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: STOP_COMMAND_TOOL,
+        description: "Request managed termination of a background command process tree. The command's retained output remains readable afterwards.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "processId": { "type": "string", "description": "Stable process handle returned by run_command with background true." },
+                "timeoutMs": { "type": ["integer", "null"], "description": "Optional tool deadline in milliseconds. Defaults to 10000." }
+            },
+            "required": ["processId", "timeoutMs"]
         }),
         strict: true,
     }

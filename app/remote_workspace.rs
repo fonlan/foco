@@ -7510,7 +7510,7 @@ pub(crate) fn classify_tool_route(tool_name: &str) -> ToolRoute {
         // workspace file operations
         "read_file" | "find_files" | "search_text" | "write_file" | "edit_file"
         // workspace shell
-        | "run_command"
+        | "run_command" | "get_command_output" | "stop_command"
         // code graph
         | "graph_find_symbols" | "graph_find_callers" | "graph_find_callees"
         | "graph_find_references" | "graph_related_files" | "graph_explore"
@@ -7582,6 +7582,8 @@ mod routing_tests {
             "write_file",
             "edit_file",
             "run_command",
+            "get_command_output",
+            "stop_command",
             "graph_find_symbols",
             "graph_find_callers",
             "graph_find_callees",

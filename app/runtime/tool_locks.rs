@@ -244,6 +244,7 @@ fn tool_resource_sort_key(resource: &ToolResource) -> String {
         ToolResource::Plan => "plan".to_string(),
         ToolResource::ProjectSpec => "project-spec".to_string(),
         ToolResource::Memory(scope) => format!("memory:{scope}"),
+        ToolResource::CommandProcess(process_id) => format!("command-process:{process_id}"),
         ToolResource::ExternalTool(tool_name) => format!("external:{tool_name}"),
     }
 }

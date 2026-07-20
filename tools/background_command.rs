@@ -27,6 +27,9 @@ pub const MAX_BACKGROUND_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 /// How long terminal command records remain queryable.
 pub const BACKGROUND_COMMAND_RETENTION: Duration = Duration::from_secs(30 * 60);
 const OUTPUT_READ_BUFFER_BYTES: usize = 8 * 1024;
+// Keep one serialized chunk below the tool response budget even if every byte is JSON-escaped.
+const MAX_OUTPUT_CHUNK_BYTES: usize = 4 * 1024;
+const MAX_OUTPUT_CHUNK_NEWLINES: usize = 1_999;
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(500);
 #[cfg(windows)]
@@ -294,11 +297,6 @@ impl OutputRingBuffer {
             return Ok(());
         }
 
-        self.next_cursor = self
-            .next_cursor
-            .checked_add(1)
-            .ok_or(BackgroundCommandError::CursorExhausted)?;
-        let cursor = self.next_cursor;
         let retained_slice = if bytes.len() > max_bytes {
             self.dropped_bytes = self.dropped_bytes.saturating_add(bytes.len() - max_bytes);
             &bytes[bytes.len() - max_bytes..]
@@ -306,20 +304,30 @@ impl OutputRingBuffer {
             bytes
         };
 
-        while self.retained_bytes.saturating_add(retained_slice.len()) > max_bytes {
-            let Some(evicted) = self.chunks.pop_front() else {
-                break;
-            };
-            self.retained_bytes = self.retained_bytes.saturating_sub(evicted.bytes.len());
-            self.dropped_bytes = self.dropped_bytes.saturating_add(evicted.bytes.len());
-        }
+        let mut remaining = retained_slice;
+        while !remaining.is_empty() {
+            let chunk_end = output_chunk_end(remaining);
+            let chunk_bytes = &remaining[..chunk_end];
+            while self.retained_bytes.saturating_add(chunk_bytes.len()) > max_bytes {
+                let Some(evicted) = self.chunks.pop_front() else {
+                    break;
+                };
+                self.retained_bytes = self.retained_bytes.saturating_sub(evicted.bytes.len());
+                self.dropped_bytes = self.dropped_bytes.saturating_add(evicted.bytes.len());
+            }
 
-        self.retained_bytes = self.retained_bytes.saturating_add(retained_slice.len());
-        self.chunks.push_back(BackgroundCommandOutputChunk {
-            cursor,
-            stream,
-            bytes: retained_slice.to_vec(),
-        });
+            self.next_cursor = self
+                .next_cursor
+                .checked_add(1)
+                .ok_or(BackgroundCommandError::CursorExhausted)?;
+            self.retained_bytes = self.retained_bytes.saturating_add(chunk_bytes.len());
+            self.chunks.push_back(BackgroundCommandOutputChunk {
+                cursor: self.next_cursor,
+                stream,
+                bytes: chunk_bytes.to_vec(),
+            });
+            remaining = &remaining[chunk_end..];
+        }
         Ok(())
     }
 
@@ -345,6 +353,20 @@ impl OutputRingBuffer {
             output_truncated: self.dropped_bytes > 0,
         }
     }
+}
+
+fn output_chunk_end(bytes: &[u8]) -> usize {
+    let byte_limit = bytes.len().min(MAX_OUTPUT_CHUNK_BYTES);
+    let mut newlines = 0usize;
+    for (index, byte) in bytes.iter().take(byte_limit).enumerate() {
+        if *byte == b'\n' {
+            newlines = newlines.saturating_add(1);
+            if newlines > MAX_OUTPUT_CHUNK_NEWLINES {
+                return index;
+            }
+        }
+    }
+    byte_limit
 }
 
 impl BackgroundCommandRegistry {
@@ -1066,7 +1088,7 @@ mod tests {
     fn registry_prunes_terminal_records_after_the_configured_retention() {
         let workspace = tempfile::tempdir().expect("workspace");
         let registry = BackgroundCommandRegistry::with_limits(BackgroundCommandLimits {
-            completed_retention: Duration::from_millis(10),
+            completed_retention: Duration::from_millis(100),
             ..BackgroundCommandLimits::default()
         });
         let command = registry
@@ -1074,7 +1096,7 @@ mod tests {
             .expect("start command");
         let _ = wait_for_terminal(&registry, &command.command_id);
 
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(150));
         registry.prune_completed();
         let result = registry.command(&command.command_id);
 

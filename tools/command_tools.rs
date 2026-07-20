@@ -2,16 +2,19 @@ use std::{
     env, fs,
     path::{Component, Path, PathBuf},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::{
-    COMMAND_WAIT_POLL_MS, CommandOutputLimits, DEFAULT_RUN_COMMAND_TIMEOUT_MS,
+    BackgroundCommandOutput, BackgroundCommandOutputStream, BackgroundCommandRegistry,
+    BackgroundCommandRequest, BackgroundCommandSnapshot, BackgroundCommandStatus,
+    BackgroundCommandTermination, COMMAND_WAIT_POLL_MS, CommandOutputLimits,
+    DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS, DEFAULT_RUN_COMMAND_TIMEOUT_MS,
     DEFAULT_SLEEP_TIMEOUT_MS, MAX_COMMAND_CAPTURE_BYTES_PER_STREAM, ToolCancellationToken,
-    ToolOutputSink,
+    ToolOutputSink, background_command_registry,
     errors::{ToolRuntimeError, tool_timeout_ms},
     limited_output_text, parse_arguments, relative_workspace_path, resolve_workspace_path,
     run_command_with_timeout,
@@ -24,7 +27,6 @@ pub(crate) fn run_command(
     output_sink: Option<&dyn ToolOutputSink>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
-    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
     let command = request.command.trim();
     let args = request.args.unwrap_or_default();
     let cwd = match request.cwd.as_deref() {
@@ -53,6 +55,31 @@ pub(crate) fn run_command(
 
     reject_privacy_sensitive_recursive_scan(workspace_path, command, &args)?;
 
+    if request.background.unwrap_or(false) {
+        let timeout = background_timeout(request.background_timeout_ms)?;
+        let registry = background_command_registry();
+        let snapshot = registry
+            .start(BackgroundCommandRequest {
+                workspace_path: workspace_path.to_path_buf(),
+                cwd,
+                command: command.to_string(),
+                args,
+                owner_chat_id: None,
+                owner_run_id: None,
+                timeout,
+            })
+            .map_err(background_start_error)?;
+
+        // Give immediate spawn failures a tiny chance to settle without turning long commands
+        // back into synchronous tool calls.
+        thread::sleep(Duration::from_millis(COMMAND_WAIT_POLL_MS));
+        let snapshot = registry
+            .command(&snapshot.command_id)
+            .map_err(background_command_error)?;
+        return background_command_response(registry, snapshot, None, false);
+    }
+
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
     let output = run_command_with_timeout(
         command,
         &args,
@@ -94,6 +121,256 @@ pub(crate) fn run_command(
         result["retryUnsafe"] = Value::Bool(true);
     }
     Ok(result)
+}
+
+pub(crate) fn get_command_output(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GetCommandOutputInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
+    let registry = background_command_registry();
+    let started = Instant::now();
+    let wait_ms = request
+        .wait_ms
+        .unwrap_or(0)
+        .min(timeout_ms.saturating_sub(1));
+
+    loop {
+        let snapshot = owned_command_snapshot(registry, workspace_path, &request.process_id)?;
+        let output = registry
+            .output_after(&request.process_id, request.cursor)
+            .map_err(background_command_error)?;
+        if !output.chunks.is_empty()
+            || snapshot.status.is_terminal()
+            || started.elapsed() >= Duration::from_millis(wait_ms)
+        {
+            return command_output_response(snapshot, output, request.cursor);
+        }
+        thread::sleep(
+            Duration::from_millis(COMMAND_WAIT_POLL_MS)
+                .min(Duration::from_millis(wait_ms).saturating_sub(started.elapsed())),
+        );
+    }
+}
+
+pub(crate) fn stop_command(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: StopCommandInput = parse_arguments(arguments)?;
+    let _timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
+    let registry = background_command_registry();
+    owned_command_snapshot(registry, workspace_path, &request.process_id)?;
+    let snapshot = registry
+        .stop(&request.process_id)
+        .map_err(background_command_error)?;
+    background_command_response(registry, snapshot, None, true)
+}
+
+fn background_command_response(
+    registry: &BackgroundCommandRegistry,
+    snapshot: BackgroundCommandSnapshot,
+    cursor: Option<u64>,
+    include_cursor_range: bool,
+) -> Result<Value, ToolRuntimeError> {
+    let output = registry
+        .output_after(&snapshot.command_id, cursor)
+        .map_err(background_command_error)?;
+    let mut result = command_output_response(snapshot, output, cursor)?;
+    if !include_cursor_range {
+        let object = result.as_object_mut().ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+        })?;
+        object.remove("fromCursor");
+        object.remove("availableFromCursor");
+        object.remove("cursorExpired");
+        object.remove("retainedOutputBytes");
+    }
+    Ok(result)
+}
+
+fn command_output_response(
+    snapshot: BackgroundCommandSnapshot,
+    output: BackgroundCommandOutput,
+    requested_cursor: Option<u64>,
+) -> Result<Value, ToolRuntimeError> {
+    let available_from_cursor = output.earliest_cursor.unwrap_or(output.next_cursor);
+    let from_cursor = requested_cursor.unwrap_or(available_from_cursor);
+    let cursor_before_output = requested_cursor.unwrap_or(available_from_cursor.saturating_sub(1));
+    let response_base = json!({
+        "processId": snapshot.command_id,
+        "pid": snapshot.pid,
+        "status": background_status_name(snapshot.status),
+        "startedAt": unix_millis(snapshot.started_at),
+        "endedAt": snapshot.ended_at.map(unix_millis),
+        "exitCode": snapshot.exit_code,
+        "success": background_success(&snapshot),
+        "terminationReason": snapshot.termination.map(background_termination_name),
+        "fromCursor": from_cursor,
+        "availableFromCursor": available_from_cursor,
+        "cursorExpired": output.cursor_expired,
+        "retainedOutputBytes": snapshot.retained_output_bytes,
+        "outputTruncated": output.output_truncated,
+    });
+    let (chunks, next_cursor, has_more) =
+        limited_chunks(&response_base, &output, cursor_before_output)?;
+    let mut result = response_base;
+    let object = result.as_object_mut().ok_or_else(|| {
+        ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+    })?;
+    object.insert("chunks".to_string(), Value::Array(chunks));
+    object.insert("nextCursor".to_string(), json!(next_cursor));
+    object.insert("hasMore".to_string(), json!(has_more));
+    Ok(result)
+}
+
+fn limited_chunks(
+    response_base: &Value,
+    output: &BackgroundCommandOutput,
+    cursor_before_output: u64,
+) -> Result<(Vec<Value>, u64, bool), ToolRuntimeError> {
+    let mut chunks = Vec::new();
+    let mut next_cursor = cursor_before_output;
+    let mut text_lines = 0usize;
+
+    for (index, chunk) in output.chunks.iter().enumerate() {
+        let text = String::from_utf8_lossy(&chunk.bytes).into_owned();
+        let chunk_lines = text_line_count(&text);
+        let next_lines = text_lines.saturating_add(chunk_lines);
+        let candidate = json!({
+            "cursor": chunk.cursor,
+            "stream": match chunk.stream {
+                BackgroundCommandOutputStream::Stdout => "stdout",
+                BackgroundCommandOutputStream::Stderr => "stderr",
+            },
+            "text": text,
+        });
+        let mut candidate_chunks = chunks.clone();
+        candidate_chunks.push(candidate);
+        let candidate_next_cursor = chunk.cursor;
+        let candidate_has_more = index + 1 < output.chunks.len();
+        let mut candidate_response = response_base.clone();
+        let candidate_object = candidate_response.as_object_mut().ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+        })?;
+        candidate_object.insert("chunks".to_string(), Value::Array(candidate_chunks));
+        candidate_object.insert("nextCursor".to_string(), json!(candidate_next_cursor));
+        candidate_object.insert("hasMore".to_string(), json!(candidate_has_more));
+        let serialized_bytes =
+            crate::output_budget::measure_tool_execution(&crate::ToolExecution {
+                output: candidate_response.clone(),
+                is_error: false,
+            })
+            .map_err(|source| {
+                ToolRuntimeError::InvalidArguments(format!(
+                    "failed to measure managed command output: {source}"
+                ))
+            })?
+            .serialized_bytes;
+        if serialized_bytes > crate::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            || next_lines > crate::output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
+        {
+            break;
+        }
+
+        chunks = candidate_response["chunks"]
+            .as_array()
+            .cloned()
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+            })?;
+        next_cursor = candidate_next_cursor;
+        text_lines = next_lines;
+    }
+
+    let has_more = chunks.len() < output.chunks.len();
+    Ok((chunks, next_cursor, has_more))
+}
+
+fn text_line_count(text: &str) -> usize {
+    if text.is_empty() {
+        0
+    } else {
+        text.bytes()
+            .filter(|byte| *byte == b'\n')
+            .count()
+            .saturating_add(1)
+    }
+}
+
+fn owned_command_snapshot(
+    registry: &BackgroundCommandRegistry,
+    workspace_path: &Path,
+    process_id: &str,
+) -> Result<BackgroundCommandSnapshot, ToolRuntimeError> {
+    let snapshot = registry
+        .command(process_id)
+        .map_err(background_command_error)?;
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+    if snapshot.workspace_path != workspace {
+        return Err(managed_command_not_found_error());
+    }
+    Ok(snapshot)
+}
+
+fn background_timeout(timeout_ms: Option<u64>) -> Result<Option<Duration>, ToolRuntimeError> {
+    match timeout_ms {
+        None => Ok(None),
+        Some(0) => Err(ToolRuntimeError::InvalidArguments(
+            "backgroundTimeoutMs must be greater than zero when provided".to_string(),
+        )),
+        Some(timeout_ms) => Ok(Some(Duration::from_millis(timeout_ms))),
+    }
+}
+
+fn background_start_error(error: crate::BackgroundCommandError) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(format!("failed to start managed command: {error}"))
+}
+
+fn background_command_error(_error: crate::BackgroundCommandError) -> ToolRuntimeError {
+    managed_command_not_found_error()
+}
+
+fn managed_command_not_found_error() -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments("managed command was not found".to_string())
+}
+
+fn background_status_name(status: BackgroundCommandStatus) -> &'static str {
+    match status {
+        BackgroundCommandStatus::Running => "running",
+        BackgroundCommandStatus::Exited => "exited",
+        BackgroundCommandStatus::Stopped => "stopped",
+        BackgroundCommandStatus::TimedOut => "timed_out",
+        BackgroundCommandStatus::Failed => "failed",
+    }
+}
+
+fn background_termination_name(termination: BackgroundCommandTermination) -> &'static str {
+    match termination {
+        BackgroundCommandTermination::ExplicitStop => "explicit_stop",
+        BackgroundCommandTermination::Timeout => "timeout",
+        BackgroundCommandTermination::HostShutdown => "host_shutdown",
+    }
+}
+
+fn background_success(snapshot: &BackgroundCommandSnapshot) -> Option<bool> {
+    match snapshot.status {
+        BackgroundCommandStatus::Running => None,
+        BackgroundCommandStatus::Exited => Some(snapshot.exit_code == Some(0)),
+        BackgroundCommandStatus::Stopped
+        | BackgroundCommandStatus::TimedOut
+        | BackgroundCommandStatus::Failed => Some(false),
+    }
+}
+
+fn unix_millis(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 pub(crate) fn sleep_tool(
@@ -144,6 +421,24 @@ pub(crate) struct RunCommandInput {
     pub(crate) args: Option<Vec<String>>,
     pub(crate) cwd: Option<String>,
     pub(crate) timeout_ms: Option<u64>,
+    pub(crate) background: Option<bool>,
+    pub(crate) background_timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetCommandOutputInput {
+    process_id: String,
+    cursor: Option<u64>,
+    wait_ms: Option<u64>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StopCommandInput {
+    process_id: String,
+    timeout_ms: Option<u64>,
 }
 
 fn reject_privacy_sensitive_recursive_scan(
@@ -422,4 +717,89 @@ fn home_dir() -> Option<PathBuf> {
 struct SleepInput {
     duration_ms: u64,
     timeout_ms: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paginated_command_output_keeps_the_first_unreturned_chunk_reachable() {
+        let output = BackgroundCommandOutput {
+            command_id: "command-test".to_string(),
+            chunks: vec![
+                crate::BackgroundCommandOutputChunk {
+                    cursor: 1,
+                    stream: BackgroundCommandOutputStream::Stdout,
+                    bytes: vec![1; 4 * 1024],
+                },
+                crate::BackgroundCommandOutputChunk {
+                    cursor: 2,
+                    stream: BackgroundCommandOutputStream::Stderr,
+                    bytes: vec![2; 4 * 1024],
+                },
+                crate::BackgroundCommandOutputChunk {
+                    cursor: 3,
+                    stream: BackgroundCommandOutputStream::Stdout,
+                    bytes: vec![3; 4 * 1024],
+                },
+            ],
+            next_cursor: 3,
+            earliest_cursor: Some(1),
+            cursor_expired: false,
+            output_truncated: false,
+        };
+
+        let first = command_output_response(test_snapshot(), output.clone(), None)
+            .expect("first command output response");
+        assert_eq!(first["chunks"].as_array().expect("chunks").len(), 2);
+        assert_eq!(first["chunks"][1]["cursor"], 2);
+        assert_eq!(first["nextCursor"], 2);
+        assert_eq!(first["hasMore"], true);
+        assert!(
+            crate::output_budget::measure_tool_execution(&crate::ToolExecution {
+                output: first.clone(),
+                is_error: false,
+            })
+            .expect("measure first response")
+            .serialized_bytes
+                <= crate::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+
+        let after_cursor = first["nextCursor"].as_u64().expect("next cursor");
+        let remaining = BackgroundCommandOutput {
+            chunks: output
+                .chunks
+                .into_iter()
+                .filter(|chunk| chunk.cursor > after_cursor)
+                .collect(),
+            ..output
+        };
+        let second = command_output_response(test_snapshot(), remaining, Some(after_cursor))
+            .expect("second command output response");
+        assert_eq!(second["chunks"][0]["cursor"], 3);
+        assert_eq!(second["nextCursor"], 3);
+        assert_eq!(second["hasMore"], false);
+    }
+
+    fn test_snapshot() -> BackgroundCommandSnapshot {
+        BackgroundCommandSnapshot {
+            command_id: "command-test".to_string(),
+            pid: 1,
+            workspace_path: PathBuf::from("/workspace"),
+            cwd: PathBuf::from("/workspace"),
+            command: "test".to_string(),
+            args: Vec::new(),
+            owner_chat_id: None,
+            owner_run_id: None,
+            started_at: SystemTime::UNIX_EPOCH,
+            ended_at: None,
+            status: BackgroundCommandStatus::Running,
+            exit_code: None,
+            termination: None,
+            error: None,
+            retained_output_bytes: 8 * 1024,
+            dropped_output_bytes: 0,
+        }
+    }
 }

@@ -863,6 +863,8 @@ const READ_FILE_TOOL_NAME: &str = "read_file";
 const FIND_FILES_TOOL_NAME: &str = "find_files";
 const SEARCH_TEXT_TOOL_NAME: &str = "search_text";
 const RUN_COMMAND_TOOL_NAME: &str = "run_command";
+const GET_COMMAND_OUTPUT_TOOL_NAME: &str = "get_command_output";
+const STOP_COMMAND_TOOL_NAME: &str = "stop_command";
 const GRAPH_FIND_SYMBOLS_TOOL_NAME: &str = "graph_find_symbols";
 const GRAPH_FIND_CALLERS_TOOL_NAME: &str = "graph_find_callers";
 const GRAPH_FIND_CALLEES_TOOL_NAME: &str = "graph_find_callees";
@@ -1002,6 +1004,7 @@ pub enum ToolResource {
     Plan,
     ProjectSpec,
     Memory(String),
+    CommandProcess(String),
     ExternalTool(String),
 }
 
@@ -1632,6 +1635,14 @@ pub fn tool_resource_locks(
             resource: ToolResource::ExternalTool(tool_call.name.clone()),
             access: ToolResourceAccess::Read,
         }],
+        GET_COMMAND_OUTPUT_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::CommandProcess(required_process_id(tool_call)?),
+            access: ToolResourceAccess::Read,
+        }],
+        STOP_COMMAND_TOOL_NAME => vec![ToolResourceLock {
+            resource: ToolResource::CommandProcess(required_process_id(tool_call)?),
+            access: ToolResourceAccess::Exclusive,
+        }],
         ASK_QUESTION_TOOL_NAME | "sleep" => Vec::new(),
         name if name.starts_with(MCP_TOOL_NAME_PREFIX) => vec![ToolResourceLock {
             resource: ToolResource::ExternalTool(name.to_string()),
@@ -1683,6 +1694,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | MEMORY_SEARCH_TOOL_NAME
         | WEB_SEARCH_TOOL_NAME
         | WEB_FETCH_TOOL_NAME
+        | GET_COMMAND_OUTPUT_TOOL_NAME
         | AGENT_LIST_TOOL_NAME
         | AGENT_GET_TASK_TOOL_NAME
         | "sleep" => ToolEffect::ReadOnly,
@@ -1697,6 +1709,7 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | UPDATE_SPEC_TOOL_NAME
         | MEMORY_WRITE_TOOL_NAME => ToolEffect::WorkspaceMutation,
         RUN_COMMAND_TOOL_NAME
+        | STOP_COMMAND_TOOL_NAME
         | IMAGE_GEN_TOOL_NAME
         | AGENT_SEND_MESSAGE_TOOL_NAME
         | AGENT_DELEGATE_TASK_TOOL_NAME
@@ -1890,6 +1903,7 @@ fn tool_call_requires_sequential_execution(tool_name: &str) -> bool {
         tool_name,
         ASK_QUESTION_TOOL_NAME
             | RUN_COMMAND_TOOL_NAME
+            | STOP_COMMAND_TOOL_NAME
             | CREATE_TODO_GRAPH_TOOL_NAME
             | UPDATE_TODO_GRAPH_TOOL_NAME
             | CREATE_PLAN_TOOL_NAME
@@ -1935,6 +1949,20 @@ fn file_display_path(tool_call: &PendingToolCall) -> Option<String> {
         .map(normalize_workspace_path_display)
 }
 
+fn required_process_id(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
+    tool_call
+        .arguments
+        .get("processId")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|process_id| !process_id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ToolConflictError::MissingScope {
+            tool_name: tool_call.name.clone(),
+            call_id: tool_call.id.clone(),
+        })
+}
+
 fn memory_scope_key(tool_call: &PendingToolCall) -> Result<String, ToolConflictError> {
     let scope = tool_call
         .arguments
@@ -1966,6 +1994,9 @@ fn resources_overlap(first: &ToolResource, second: &ToolResource) -> bool {
         (ToolResource::ProjectSpec, ToolResource::ProjectSpec) => true,
         (ToolResource::Memory(first), ToolResource::Memory(second)) => {
             first == second || first == "all" || second == "all"
+        }
+        (ToolResource::CommandProcess(first), ToolResource::CommandProcess(second)) => {
+            first == second
         }
         (ToolResource::ExternalTool(first), ToolResource::ExternalTool(second)) => first == second,
         _ => false,
@@ -2092,6 +2123,7 @@ impl fmt::Display for ToolResource {
             Self::Plan => write!(formatter, "workspace plans"),
             Self::ProjectSpec => write!(formatter, "project spec"),
             Self::Memory(scope) => write!(formatter, "memory scope '{scope}'"),
+            Self::CommandProcess(process_id) => write!(formatter, "managed command '{process_id}'"),
             Self::ExternalTool(tool_name) => write!(formatter, "external tool '{tool_name}'"),
         }
     }
@@ -2227,13 +2259,70 @@ mod tests {
         );
         assert_eq!(tool_effect("future_tool"), ToolEffect::ExternalOrUnknown);
         assert_eq!(
+            tool_effect(GET_COMMAND_OUTPUT_TOOL_NAME),
+            ToolEffect::ReadOnly
+        );
+        assert_eq!(
+            tool_effect(STOP_COMMAND_TOOL_NAME),
+            ToolEffect::ExternalOrUnknown
+        );
+        assert_eq!(
             tool_effect(READ_FILE_TOOL_NAME).retry_safety(),
             ToolRetrySafety::RetrySafe
+        );
+        assert_eq!(
+            tool_effect(GET_COMMAND_OUTPUT_TOOL_NAME).retry_safety(),
+            ToolRetrySafety::RetrySafe
+        );
+        assert_eq!(
+            tool_effect(STOP_COMMAND_TOOL_NAME).retry_safety(),
+            ToolRetrySafety::RetryUnsafe
         );
         assert_eq!(
             tool_effect(AGENT_SEND_MESSAGE_TOOL_NAME).retry_safety(),
             ToolRetrySafety::RetryUnsafe
         );
+    }
+
+    #[test]
+    fn command_process_locks_serialize_stop_against_output_reads() {
+        let output = tool_resource_locks(&test_tool_call(
+            GET_COMMAND_OUTPUT_TOOL_NAME,
+            json!({ "processId": "command-0001" }),
+        ))
+        .expect("output locks");
+        let stop = tool_resource_locks(&test_tool_call(
+            STOP_COMMAND_TOOL_NAME,
+            json!({ "processId": "command-0001" }),
+        ))
+        .expect("stop locks");
+        let other_output = tool_resource_locks(&test_tool_call(
+            GET_COMMAND_OUTPUT_TOOL_NAME,
+            json!({ "processId": "command-0002" }),
+        ))
+        .expect("other output locks");
+
+        assert_eq!(
+            output,
+            vec![ToolResourceLock {
+                resource: ToolResource::CommandProcess("command-0001".to_string()),
+                access: ToolResourceAccess::Read,
+            }]
+        );
+        assert!(stop.iter().any(|lock| {
+            lock.resource == ToolResource::CommandProcess("command-0001".to_string())
+                && lock.access == ToolResourceAccess::Exclusive
+        }));
+        assert!(stop.iter().any(|lock| {
+            lock.resource == ToolResource::WorkspaceMutationLease
+                && lock.access == ToolResourceAccess::Exclusive
+        }));
+        assert!(tool_resource_locks_conflict(&output[0], &stop[0]));
+        assert!(!tool_resource_locks_conflict(&output[0], &other_output[0]));
+        assert!(matches!(
+            tool_resource_locks(&test_tool_call(GET_COMMAND_OUTPUT_TOOL_NAME, json!({}))),
+            Err(ToolConflictError::MissingScope { .. })
+        ));
     }
 
     #[test]
