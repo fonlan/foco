@@ -2386,6 +2386,9 @@ pub(crate) async fn chat_messages(
         database
             .materialize_missing_pre_stream_failure_messages(chat_id)
             .map_err(ApiError::from_workspace_error)?;
+        database
+            .materialize_missing_terminal_failure_messages(chat_id)
+            .map_err(ApiError::from_workspace_error)?;
     }
 
     let chat = database

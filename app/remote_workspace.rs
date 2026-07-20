@@ -3299,6 +3299,44 @@ fn remote_sidecar_record_run_event(
     run_stream.record(sequence, payload);
 }
 
+/// Keep the error-recovery evidence in the remote workspace database before it
+/// is exposed on the ephemeral SSE stream. This is intentionally limited to
+/// start/error events; other event replay remains memory-backed.
+fn remote_sidecar_record_durable_run_event(
+    state: &RemoteSidecarState,
+    run_stream: &RemoteActiveRunStream,
+    chat_id: &str,
+    run_id: &str,
+    sequence: i64,
+    payload: Value,
+) {
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("message");
+    let payload_json = payload.to_string();
+    if let Err(error) = with_sidecar_workspace_database(state, |database| {
+        database.insert_run_event(NewRunEvent {
+            id: &unique_id("run-event"),
+            chat_id,
+            run_id,
+            sequence,
+            event_type,
+            payload_json: &payload_json,
+        })
+    }) {
+        tracing::warn!(
+            chat_id,
+            run_id,
+            sequence,
+            event_type,
+            error = %error,
+            "failed to persist remote run event used for terminal-failure recovery"
+        );
+    }
+    remote_sidecar_record_run_event(run_stream, sequence, payload);
+}
+
 fn remote_sidecar_snapshot_run_events(
     run_stream: &RemoteActiveRunStream,
     last_yielded_sequence: &mut i64,
@@ -9176,9 +9214,15 @@ async fn remote_sidecar_chat_messages(
         .and_then(|value| value.parse::<i64>().ok());
     let is_latest_page = before.is_none();
     let mut database = sidecar_workspace_database(&state)?;
-    // Pre-stream heal only on the latest page (same as local chat_messages).
+    // Historical terminal repairs only run on the latest page (same as local
+    // chat_messages); beforeSequence pagination must not rescan the full chat.
     if is_latest_page {
-        let _ = database.materialize_missing_pre_stream_failure_messages(&chat_id);
+        database
+            .materialize_missing_pre_stream_failure_messages(&chat_id)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+        database
+            .materialize_missing_terminal_failure_messages(&chat_id)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
     }
     let chat = database
         .chat(&chat_id)
@@ -15303,8 +15347,11 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut reasoning_loop_recovery_count = 0usize;
     let max_provider_retries = remote_sidecar_llm_request_retry_count(&stream_state);
     let mut provider_retry_count = 0u32;
-    remote_sidecar_record_run_event(
+    remote_sidecar_record_durable_run_event(
+        &stream_state,
         &run_stream,
+        &chat_id,
+        &run_id,
         sequence,
         remote_chat_start_event(
             &chat_id,
@@ -15588,9 +15635,68 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 continue;
             }
             Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message }) => {
+                let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
+                let remaining_reasoning = reasoning
+                    .get(flushed_reasoning_len..)
+                    .unwrap_or(reasoning.as_str());
+                let mut parts = remote_chat_parts_with_context_compression(
+                    remaining_text,
+                    (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
+                    &run_compression_events,
+                    &content_parts_prefix,
+                );
+                parts.push(json!({ "type": "error", "text": message }));
+                let metadata = json!({
+                    "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                    "parts": parts,
+                    "partsVersion": 5,
+                    "partsSource": "live_sse",
+                    "streamingState": "failed",
+                    "runFailure": {
+                        "code": "provider_retry_exhausted",
+                        "stage": "stream",
+                        "retryable": false,
+                        "runId": run_id,
+                        "message": message,
+                    },
+                    "metrics": remote_chat_metrics(
+                        &model_id,
+                        &provider_id,
+                        &run_metrics,
+                        run_metrics.total_latency_ms(),
+                    ),
+                });
+                match with_sidecar_workspace_database(&stream_state, |database| {
+                    remote_sidecar_persist_owned_assistant_message(
+                        database,
+                        &chat_id,
+                        &assistant_message_id,
+                        &queued_user_message_id,
+                        &run_id,
+                        &text,
+                        &metadata.to_string(),
+                    )
+                }) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // The user edited/deleted this turn or another run owns it;
+                        // do not append stale terminal SSE to the replacement turn.
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        break;
+                    }
+                    Err(error) => tracing::warn!(
+                        chat_id,
+                        assistant_message_id,
+                        error = %error,
+                        "failed to persist remote terminal assistant error"
+                    ),
+                }
                 sequence += 1;
-                remote_sidecar_record_run_event(
+                remote_sidecar_record_durable_run_event(
+                    &stream_state,
                     &run_stream,
+                    &chat_id,
+                    &run_id,
                     sequence,
                     json!({ "type": "error", "message": message }),
                 );
@@ -16060,20 +16166,30 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 let total_latency_ms = run_metrics.total_latency_ms();
                 let metrics =
                     remote_chat_metrics(&model_id, &provider_id, &run_metrics, total_latency_ms);
+                let mut parts = remote_chat_parts_with_context_compression(
+                    remaining_text,
+                    (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
+                    &run_compression_events,
+                    &content_parts_prefix,
+                );
+                parts.push(json!({ "type": "error", "text": message }));
                 let metadata = json!({
                     "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
-                    "parts": remote_chat_parts_with_context_compression(
-                        remaining_text,
-                        (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
-                        &run_compression_events,
-                        &content_parts_prefix,
-                    ),
+                    "parts": parts,
                     "partsVersion": 5,
                     "partsSource": "live_sse",
+                    "streamingState": "failed",
+                    "runFailure": {
+                        "code": "reasoning_loop_recovery_exhausted",
+                        "stage": "stream",
+                        "retryable": false,
+                        "runId": run_id,
+                        "message": message,
+                    },
                     "metrics": metrics,
                 });
                 let metadata_json = metadata.to_string();
-                if let Err(error) = with_sidecar_workspace_database(&stream_state, |database| {
+                match with_sidecar_workspace_database(&stream_state, |database| {
                     remote_sidecar_persist_owned_assistant_message(
                         database,
                         &chat_id,
@@ -16083,18 +16199,27 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         &text,
                         &metadata_json,
                     )
-                    .map(|_| ())
                 }) {
-                    tracing::warn!(
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // The user edited/deleted this turn or another run owns it;
+                        // do not append stale terminal SSE to the replacement turn.
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        break;
+                    }
+                    Err(error) => tracing::warn!(
                         chat_id,
                         assistant_message_id,
                         error = %error,
                         "failed to persist remote assistant after exhausted reasoning-loop recoveries"
-                    );
+                    ),
                 }
                 sequence += 1;
-                remote_sidecar_record_run_event(
+                remote_sidecar_record_durable_run_event(
+                    &stream_state,
                     &run_stream,
+                    &chat_id,
+                    &run_id,
                     sequence,
                     json!({
                         "type": "error",
@@ -33405,6 +33530,140 @@ mod tests {
             .filter(|part| part.get("type").and_then(Value::as_str) == Some("contextCompression"))
             .count();
         assert_eq!(compression_count, 1);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_chat_messages_materializes_terminal_failure_from_run_events() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let chat_id = "chat-terminal-history";
+        let user_id = "user-terminal-history";
+        let assistant_id = "assistant-terminal-history";
+        let team_id = AgentTeamId::new("agent-team-terminal-history").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-terminal-history").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-terminal-history").expect("task id");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-terminal-history").expect("definition id"),
+            revision: 1,
+            name: "Terminal history coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Repair persisted terminal failure.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        };
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata(chat_id, "Remote terminal history", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: user_id,
+                chat_id,
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert user");
+        database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id,
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            })
+            .expect("create team");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: &json!({
+                    "queuedUserMessageId": user_id,
+                    "visibleAssistantMessageId": assistant_id,
+                    "visibleAssistantSequence": 1,
+                })
+                .to_string(),
+            })
+            .expect("enqueue task");
+        let attempt_id = AgentAttemptId::new("agent-attempt-terminal-history").expect("attempt id");
+        database
+            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .expect("claim task")
+            .expect("task claimed");
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(r#"{"message":"provider stream failed"}"#),
+                interruption_reason: None,
+            })
+            .expect("fail task");
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-terminal-history-start",
+                chat_id,
+                run_id: "remote-run-terminal-history",
+                sequence: 0,
+                event_type: "start",
+                payload_json: &json!({ "assistantMessageId": assistant_id }).to_string(),
+            })
+            .expect("start event");
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-terminal-history-error",
+                chat_id,
+                run_id: "remote-run-terminal-history",
+                sequence: 1,
+                event_type: "error",
+                payload_json: r#"{"message":"provider stream failed"}"#,
+            })
+            .expect("error event");
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let response = remote_sidecar_chat_messages(
+            State(state),
+            AxumPath(chat_id.to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("chat messages")
+        .0;
+        let messages = response["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["id"], assistant_id);
+        assert_eq!(messages[1]["parts"][0]["type"], "error");
+        assert_eq!(messages[1]["parts"][0]["text"], "provider stream failed");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message(assistant_id)
+            .expect("assistant lookup")
+            .expect("assistant persisted");
+        let metadata: Value = serde_json::from_str(&assistant.metadata_json).expect("metadata");
+        assert_eq!(metadata["streamingState"], "failed");
+        assert_eq!(
+            metadata["runFailure"]["runId"],
+            "remote-run-terminal-history"
+        );
     }
 
     #[tokio::test]

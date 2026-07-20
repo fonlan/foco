@@ -15059,6 +15059,285 @@ fn materialize_missing_pre_stream_failure_is_concurrent_idempotent() {
     assert_eq!(assistant.sequence, 1);
 }
 
+#[test]
+fn materialize_missing_terminal_failure_repairs_only_verified_failed_runs() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let chat_id = "chat-terminal-heal";
+    let (team_id, coordinator_id) = create_test_agent_team(&mut database, chat_id, "terminal-heal");
+
+    for (id, content, sequence) in [
+        ("user-terminal-existing", "existing", 0),
+        ("user-terminal-missing", "missing", 2),
+        ("user-terminal-success", "success", 4),
+        ("user-terminal-cancel", "cancel", 6),
+        ("user-terminal-conflict", "conflict", 8),
+    ] {
+        database
+            .insert_message(NewMessage {
+                id,
+                chat_id,
+                role: "user",
+                content,
+                sequence,
+                metadata_json: None,
+            })
+            .expect("user");
+    }
+    database
+        .insert_message(NewMessage {
+            id: "assistant-terminal-existing",
+            chat_id,
+            role: "assistant",
+            content: "partial answer",
+            sequence: 1,
+            metadata_json: Some(
+                r#"{"streamingState":"streaming","parts":[{"type":"text","text":"partial answer"}]}"#,
+            ),
+        })
+        .expect("partial assistant");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-terminal-success",
+            chat_id,
+            role: "assistant",
+            content: "complete answer",
+            sequence: 5,
+            metadata_json: Some(r#"{"streamingState":"complete","parts":[]}"#),
+        })
+        .expect("complete assistant");
+
+    database
+        .insert_message(NewMessage {
+            id: "assistant-terminal-conflict",
+            chat_id,
+            role: "assistant",
+            content: "edited replacement",
+            sequence: 10,
+            metadata_json: Some(r#"{"streamingState":"streaming","parts":[]}"#),
+        })
+        .expect("conflicting assistant");
+
+    let candidates = [
+        (
+            "agent-task-terminal-existing",
+            "user-terminal-existing",
+            "assistant-terminal-existing",
+            1,
+            "run-terminal-existing",
+            "remote provider failed",
+        ),
+        (
+            "agent-task-terminal-missing",
+            "user-terminal-missing",
+            "assistant-terminal-missing",
+            3,
+            "run-terminal-missing",
+            "tool broker failed",
+        ),
+        (
+            "agent-task-terminal-success",
+            "user-terminal-success",
+            "assistant-terminal-success",
+            5,
+            "run-terminal-success",
+            "late failure must not overwrite success",
+        ),
+        (
+            "agent-task-terminal-cancel",
+            "user-terminal-cancel",
+            "assistant-terminal-cancel",
+            7,
+            "run-terminal-cancel",
+            "agent run cancelled by user",
+        ),
+        (
+            "agent-task-terminal-conflict",
+            "user-terminal-conflict",
+            "assistant-terminal-conflict",
+            9,
+            "run-terminal-conflict",
+            "stale run must not overwrite edited replacement",
+        ),
+    ];
+    for (task_id, user_id, assistant_id, sequence, run_id, error_message) in candidates {
+        let task_id = AgentTaskId::new(task_id).expect("task id");
+        seed_failed_coordinator_task(
+            &mut database,
+            &team_id,
+            &coordinator_id,
+            &task_id,
+            user_id,
+            assistant_id,
+            sequence,
+            r#"{"message":"terminal task failure"}"#,
+        );
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("event-{run_id}-start"),
+                chat_id,
+                run_id,
+                sequence: 0,
+                event_type: "start",
+                payload_json: &json!({ "assistantMessageId": assistant_id }).to_string(),
+            })
+            .expect("start event");
+        database
+            .insert_run_event(NewRunEvent {
+                id: &format!("event-{run_id}-error"),
+                chat_id,
+                run_id,
+                sequence: 1,
+                event_type: "error",
+                payload_json: &json!({ "message": error_message }).to_string(),
+            })
+            .expect("error event");
+    }
+
+    assert_eq!(
+        database
+            .materialize_missing_terminal_failure_messages(chat_id)
+            .expect("terminal repair"),
+        2
+    );
+    assert_eq!(
+        database
+            .materialize_missing_terminal_failure_messages(chat_id)
+            .expect("second terminal repair"),
+        0
+    );
+
+    let existing = database
+        .message("assistant-terminal-existing")
+        .expect("existing assistant")
+        .expect("existing assistant");
+    assert_eq!(existing.content, "partial answer");
+    let existing_metadata: Value =
+        serde_json::from_str(&existing.metadata_json).expect("existing metadata");
+    assert_eq!(existing_metadata["streamingState"], "failed");
+    assert_eq!(
+        existing_metadata["runFailure"]["message"],
+        "remote provider failed"
+    );
+    assert_eq!(existing_metadata["parts"][0]["text"], "partial answer");
+    assert_eq!(existing_metadata["parts"][1]["type"], "error");
+
+    let missing = database
+        .message("assistant-terminal-missing")
+        .expect("missing assistant")
+        .expect("healed assistant");
+    assert_eq!(missing.content, "tool broker failed");
+    let missing_metadata: Value =
+        serde_json::from_str(&missing.metadata_json).expect("missing metadata");
+    assert_eq!(missing_metadata["streamingState"], "failed");
+    assert_eq!(missing_metadata["parts"][0]["type"], "error");
+
+    let success = database
+        .message("assistant-terminal-success")
+        .expect("success assistant")
+        .expect("success assistant");
+    assert_eq!(success.content, "complete answer");
+    let conflict = database
+        .message("assistant-terminal-conflict")
+        .expect("conflicting assistant")
+        .expect("conflicting assistant");
+    assert_eq!(conflict.content, "edited replacement");
+    assert_eq!(conflict.sequence, 10);
+    assert!(
+        database
+            .message("assistant-terminal-cancel")
+            .expect("cancel assistant")
+            .is_none(),
+        "cancelled terminal evidence must not become an error message"
+    );
+}
+
+#[test]
+fn materialize_missing_terminal_failure_is_concurrent_idempotent() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
+        let chat_id = "chat-terminal-concurrent";
+        let (team_id, coordinator_id) =
+            create_test_agent_team(&mut database, chat_id, "terminal-concurrent");
+        database
+            .insert_message(NewMessage {
+                id: "user-terminal-concurrent",
+                chat_id,
+                role: "user",
+                content: "hello",
+                sequence: 0,
+                metadata_json: None,
+            })
+            .expect("user");
+        let task_id = AgentTaskId::new("agent-task-terminal-concurrent").expect("task id");
+        seed_failed_coordinator_task(
+            &mut database,
+            &team_id,
+            &coordinator_id,
+            &task_id,
+            "user-terminal-concurrent",
+            "assistant-terminal-concurrent",
+            1,
+            r#"{"message":"provider stream failed"}"#,
+        );
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-terminal-concurrent-start",
+                chat_id,
+                run_id: "run-terminal-concurrent",
+                sequence: 0,
+                event_type: "start",
+                payload_json: r#"{"assistantMessageId":"assistant-terminal-concurrent"}"#,
+            })
+            .expect("start event");
+        database
+            .insert_run_event(NewRunEvent {
+                id: "event-terminal-concurrent-error",
+                chat_id,
+                run_id: "run-terminal-concurrent",
+                sequence: 1,
+                event_type: "error",
+                payload_json: r#"{"message":"provider stream failed"}"#,
+            })
+            .expect("error event");
+    }
+
+    let barrier = Arc::new(Barrier::new(4));
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let path = workspace_path.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            let mut database = WorkspaceDatabase::open_or_create_ungated(&path).expect("database");
+            barrier.wait();
+            database
+                .materialize_missing_terminal_failure_messages("chat-terminal-concurrent")
+                .expect("terminal repair")
+        }));
+    }
+    let applied: usize = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .sum();
+    assert_eq!(
+        applied, 1,
+        "exactly one concurrent terminal repair should apply"
+    );
+
+    let database = WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
+    let assistant = database
+        .message("assistant-terminal-concurrent")
+        .expect("assistant lookup")
+        .expect("assistant materialized");
+    let metadata: Value = serde_json::from_str(&assistant.metadata_json).expect("metadata");
+    assert_eq!(metadata["streamingState"], "failed");
+    assert_eq!(metadata["parts"][0]["text"], "provider stream failed");
+}
+
 fn seed_failed_coordinator_task(
     database: &mut WorkspaceDatabase,
     team_id: &AgentTeamId,

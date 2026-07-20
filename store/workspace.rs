@@ -6774,6 +6774,310 @@ impl WorkspaceDatabase {
 
         Ok(materialized)
     }
+    /// Bounded, idempotent repair for terminal coordinator failures that reached
+    /// the run-event stream before the assistant failure metadata was durable.
+    ///
+    /// A candidate needs a failed coordinator task plus matching start/error
+    /// run-event evidence for the task input's visible assistant identity. This
+    /// deliberately excludes cancellations and completed assistant messages.
+    pub fn materialize_missing_terminal_failure_messages(
+        &mut self,
+        chat_id: &str,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        const TERMINAL_FAILURE_SCAN_LIMIT: usize = 32;
+        const STORED_CHAT_PARTS_VERSION: i64 = 5;
+
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let mut candidates = transaction
+            .prepare(
+                "WITH recent_failed_tasks AS (
+                     SELECT task.id,
+                            task.input_json,
+                            task.completed_at,
+                            task.updated_at,
+                            team.chat_id
+                     FROM agent_tasks AS task
+                     INNER JOIN agent_teams AS team ON team.id = task.team_id
+                     WHERE team.chat_id = ?1
+                       AND task.status = 'failed'
+                       AND task.owner_instance_id = team.coordinator_instance_id
+                       AND COALESCE(
+                             json_extract(task.input_json, '$.visibleAssistantMessageId'),
+                             json_extract(task.input_json, '$.visible_assistant_message_id')
+                           ) IS NOT NULL
+                     ORDER BY task.completed_at DESC, task.updated_at DESC, task.id DESC
+                     LIMIT ?2
+                 ),
+                 recent_failed_runs AS (
+                     SELECT started.chat_id,
+                            started.run_id,
+                            started.payload_json AS start_payload_json,
+                            failed.payload_json AS error_payload_json,
+                            failed.created_at AS failed_created_at,
+                            failed.sequence AS failed_sequence
+                     FROM run_events AS started
+                     INNER JOIN run_events AS failed
+                       ON failed.chat_id = started.chat_id
+                      AND failed.run_id = started.run_id
+                      AND failed.event_type = 'error'
+                      AND failed.sequence > started.sequence
+                     WHERE started.chat_id = ?3
+                       AND started.event_type = 'start'
+                     ORDER BY failed.created_at DESC, failed.sequence DESC
+                     LIMIT ?4
+                 )
+                 SELECT task.id,
+                        task.input_json,
+                        task.completed_at,
+                        task.updated_at,
+                        failed.run_id,
+                        failed.start_payload_json,
+                        failed.error_payload_json
+                 FROM recent_failed_tasks AS task
+                 INNER JOIN recent_failed_runs AS failed ON failed.chat_id = task.chat_id
+                 ORDER BY failed.failed_created_at DESC, failed.failed_sequence DESC
+                 LIMIT ?4",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let candidate_rows = candidates
+            .query_map(
+                params![
+                    chat_id,
+                    TERMINAL_FAILURE_SCAN_LIMIT,
+                    chat_id,
+                    TERMINAL_FAILURE_SCAN_LIMIT
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        drop(candidates);
+
+        let mut materialized = 0;
+        for (
+            task_id,
+            input_json,
+            completed_at,
+            updated_at,
+            run_id,
+            start_payload_json,
+            error_payload_json,
+        ) in candidate_rows
+        {
+            let Ok(input) = serde_json::from_str::<Value>(&input_json) else {
+                continue;
+            };
+            let Some(user_message_id) = input
+                .get("queuedUserMessageId")
+                .or_else(|| input.get("queued_user_message_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(assistant_message_id) = input
+                .get("visibleAssistantMessageId")
+                .or_else(|| input.get("visible_assistant_message_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            let Some(assistant_sequence) = input
+                .get("visibleAssistantSequence")
+                .or_else(|| input.get("visible_assistant_sequence"))
+                .and_then(Value::as_i64)
+            else {
+                continue;
+            };
+            let Ok(start_payload) = serde_json::from_str::<Value>(&start_payload_json) else {
+                continue;
+            };
+            let start_assistant_id = start_payload
+                .get("assistantMessageId")
+                .or_else(|| start_payload.get("assistant_message_id"))
+                .and_then(Value::as_str);
+            if start_assistant_id != Some(assistant_message_id) {
+                continue;
+            }
+            let Ok(error_payload) = serde_json::from_str::<Value>(&error_payload_json) else {
+                continue;
+            };
+            let Some(error_message) = error_payload
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if error_message.to_ascii_lowercase().contains("cancel") {
+                continue;
+            }
+
+            let Some(user_message) =
+                message_from_transaction(&transaction, &database_path, user_message_id)?
+            else {
+                continue;
+            };
+            if user_message.chat_id != chat_id || user_message.role != "user" {
+                continue;
+            }
+
+            let run_failure = json!({
+                "code": "terminal_error",
+                "stage": "stream",
+                "retryable": false,
+                "taskId": task_id,
+                "runId": run_id,
+                "message": error_message,
+                "healedFromHistoricalRunEvents": true,
+            });
+            let created_at = completed_at
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or(updated_at.as_str());
+            let existing =
+                message_from_transaction(&transaction, &database_path, assistant_message_id)?;
+            match existing {
+                Some(existing) => {
+                    if existing.chat_id != chat_id
+                        || existing.role != "assistant"
+                        || existing.sequence != assistant_sequence
+                    {
+                        continue;
+                    }
+                    let Ok(mut metadata) = serde_json::from_str::<serde_json::Map<String, Value>>(
+                        &existing.metadata_json,
+                    ) else {
+                        continue;
+                    };
+                    if metadata
+                        .get("streamingState")
+                        .and_then(Value::as_str)
+                        .is_some_and(|state| state == "complete" || state == "cancelled")
+                    {
+                        continue;
+                    }
+                    let had_failure = metadata.contains_key("runFailure");
+                    let has_error = {
+                        let parts = metadata
+                            .entry("parts".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        let Some(parts) = parts.as_array_mut() else {
+                            continue;
+                        };
+                        parts
+                            .iter()
+                            .any(|part| part.get("type").and_then(Value::as_str) == Some("error"))
+                    };
+                    if has_error && had_failure {
+                        continue;
+                    }
+                    metadata.insert(
+                        "streamingState".to_string(),
+                        Value::String("failed".to_string()),
+                    );
+                    metadata
+                        .entry("runFailure".to_string())
+                        .or_insert(run_failure);
+                    if !has_error {
+                        let parts = metadata
+                            .entry("parts".to_string())
+                            .or_insert_with(|| Value::Array(Vec::new()));
+                        let Some(parts) = parts.as_array_mut() else {
+                            continue;
+                        };
+                        parts.push(json!({ "type": "error", "text": error_message }));
+                    }
+                    metadata
+                        .entry("partsVersion".to_string())
+                        .or_insert_with(|| Value::from(STORED_CHAT_PARTS_VERSION));
+                    metadata
+                        .entry("partsSource".to_string())
+                        .or_insert_with(|| {
+                            Value::String("terminal_failure_historical".to_string())
+                        });
+                    let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+                        WorkspaceDatabaseError::InvalidMessageMetadata {
+                            message: format!(
+                                "assistant message metadata is invalid JSON: {source}"
+                            ),
+                        }
+                    })?;
+                    transaction
+                        .execute(
+                            "UPDATE messages SET metadata_json = ?1
+                             WHERE id = ?2 AND chat_id = ?3 AND role = 'assistant' AND sequence = ?4",
+                            params![metadata_json, assistant_message_id, chat_id, assistant_sequence],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                    materialized += 1;
+                }
+                None => {
+                    let sequence_taken = transaction
+                        .query_row(
+                            "SELECT 1 FROM messages WHERE chat_id = ?1 AND sequence = ?2",
+                            params![chat_id, assistant_sequence],
+                            |_| Ok(1_i64),
+                        )
+                        .optional()
+                        .map_err(|source| sqlite_error(&database_path, source))?
+                        .is_some();
+                    if sequence_taken {
+                        continue;
+                    }
+                    let metadata_json = json!({
+                        "streamingState": "failed",
+                        "runFailure": run_failure,
+                        "parts": [{ "type": "error", "text": error_message }],
+                        "partsVersion": STORED_CHAT_PARTS_VERSION,
+                        "partsSource": "terminal_failure_historical",
+                    })
+                    .to_string();
+                    let inserted = transaction
+                        .execute(
+                            "INSERT INTO messages
+                                (id, chat_id, role, content, sequence, created_at, metadata_json)
+                             VALUES (?1, ?2, 'assistant', ?3, ?4, ?5, ?6)
+                             ON CONFLICT(id) DO NOTHING",
+                            params![
+                                assistant_message_id,
+                                chat_id,
+                                error_message,
+                                assistant_sequence,
+                                created_at,
+                                metadata_json,
+                            ],
+                        )
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                    materialized += usize::from(inserted == 1);
+                }
+            }
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(materialized)
+    }
 
     pub fn clear_chat_queued_run(
         &mut self,
