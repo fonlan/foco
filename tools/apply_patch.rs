@@ -782,7 +782,12 @@ fn prepare_write_target(
 ) -> Result<(), ToolRuntimeError> {
     match fs::symlink_metadata(target) {
         Ok(_) => validate_existing_regular_file(workspace, target, raw_path),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => {
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
             ensure_safe_parent_dirs(workspace, target, raw_path)
         }
         Err(source) => Err(ToolRuntimeError::Io {
@@ -1151,6 +1156,156 @@ mod tests {
         );
     }
 
+    #[test]
+    fn apply_patch_preserves_utf8_bom_and_accepts_crlf_context() {
+        let directory = tempdir().expect("temp directory");
+        let target = directory.path().join("bom.txt");
+        fs::write(&target, b"\xEF\xBB\xBFbefore\r\n").expect("seed UTF-8 BOM file");
+
+        apply_patch(
+            directory.path(),
+            json!({
+                "patch": "<<'EOF'\r\n*** Begin Patch\r\n*** Update File: bom.txt\r\n@@\r\n-before\r\n+after\r\n*** End Patch\r\nEOF",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("CRLF patch should apply");
+
+        assert_eq!(
+            fs::read(&target).expect("updated BOM file"),
+            b"\xEF\xBB\xBFafter\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_preserves_utf16le_bom() {
+        let directory = tempdir().expect("temp directory");
+        let target = directory.path().join("utf16.txt");
+        let mut encoded = vec![0xFF, 0xFE];
+        for unit in "before\n".encode_utf16() {
+            encoded.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&target, encoded).expect("seed UTF-16 file");
+
+        apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Update File: utf16.txt\n@@\n-before\n+after"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect("UTF-16 patch should apply");
+
+        let bytes = fs::read(&target).expect("updated UTF-16 file");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE]);
+        let units = bytes[2..]
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        assert_eq!(String::from_utf16(&units).expect("UTF-16 text"), "after\n");
+    }
+
+    #[test]
+    fn apply_patch_rejects_directory_and_external_absolute_targets() {
+        let directory = tempdir().expect("workspace directory");
+        let outside = tempdir().expect("outside directory");
+        fs::create_dir(directory.path().join("directory.txt")).expect("seed directory target");
+
+        let directory_error = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Add File: directory.txt\n+nope"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("directory target must fail");
+        assert!(directory_error.to_string().contains("is not a file"));
+
+        let external_path = outside.path().join("outside.txt");
+        let external_error = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch(&format!("*** Add File: {}\n+nope", external_path.display())),
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("external absolute path must fail");
+        assert!(
+            external_error
+                .to_string()
+                .contains("path escapes the workspace")
+        );
+        assert!(!external_path.exists());
+    }
+
+    #[test]
+    fn apply_patch_reports_missing_context_and_replaces_move_destination() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(directory.path().join("source.txt"), "before\n").expect("seed source");
+        fs::write(
+            directory.path().join("destination.txt"),
+            "old destination\n",
+        )
+        .expect("seed destination");
+
+        let missing_context = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Update File: source.txt\n@@ missing heading\n-before\n+after"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("missing context must fail");
+        assert_eq!(
+            missing_context.to_string(),
+            "Failed to find context 'missing heading' in source.txt"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.path().join("source.txt")).expect("source unchanged"),
+            "before\n"
+        );
+
+        let result = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Update File: source.txt\n*** Move to: destination.txt\n@@\n-before\n+after"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect("move should replace destination");
+        assert!(!directory.path().join("source.txt").exists());
+        assert_eq!(
+            fs::read_to_string(directory.path().join("destination.txt")).expect("moved file"),
+            "after\n"
+        );
+        assert_eq!(
+            result["summary"],
+            "Success. Updated the following files:\nM destination.txt\n"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn apply_patch_accepts_windows_path_separators() {
+        let directory = tempdir().expect("temp directory");
+        fs::create_dir(directory.path().join("nested")).expect("nested directory");
+
+        apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Add File: nested\\\\note.txt\n+windows"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect("Windows path should apply");
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("nested").join("note.txt"))
+                .expect("created file"),
+            "windows\n"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn apply_patch_rejects_dangling_target_symlink() {
@@ -1170,6 +1325,27 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "apply_patch rejects symlink paths: link.txt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rejects_non_directory_parent_component() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(directory.path().join("parent"), "file\n").expect("seed file parent");
+
+        let error = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Add File: parent/child.txt\n+nope"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("file parent must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "apply_patch parent is not a directory: parent/child.txt"
         );
     }
 }

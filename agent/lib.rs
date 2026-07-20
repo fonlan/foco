@@ -3435,6 +3435,85 @@ mod tests {
     }
 
     #[test]
+    fn plans_disjoint_apply_patches_in_parallel_and_orders_move_destination_conflicts() {
+        let disjoint_calls = vec![
+            test_tool_call(
+                APPLY_PATCH_TOOL_NAME,
+                json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/one.rs\n+one\n*** End Patch"
+                }),
+            ),
+            test_tool_call(
+                APPLY_PATCH_TOOL_NAME,
+                json!({
+                    "patch": "*** Begin Patch\n*** Add File: src/two.rs\n+two\n*** End Patch"
+                }),
+            ),
+        ];
+        assert_eq!(
+            plan_tool_execution(&disjoint_calls).expect("parallel patch plan"),
+            ToolExecutionPlan {
+                groups: vec![ToolExecutionGroup {
+                    mode: ToolExecutionMode::Parallel,
+                    call_indices: vec![0, 1],
+                }],
+            }
+        );
+
+        let move_calls = vec![
+            test_tool_call(
+                APPLY_PATCH_TOOL_NAME,
+                json!({
+                    "patch": "*** Begin Patch\n*** Update File: src/source.rs\n*** Move to: src/destination.rs\n@@\n-old\n+new\n*** End Patch"
+                }),
+            ),
+            test_tool_call(EDIT_FILE_TOOL_NAME, json!({ "path": "src/destination.rs" })),
+        ];
+        assert_eq!(
+            plan_tool_execution(&move_calls).expect("ordered move destination edits"),
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_apply_patch_uses_conservative_sequential_workspace_lock() {
+        let calls = vec![
+            test_tool_call(APPLY_PATCH_TOOL_NAME, json!({ "patch": "not a patch" })),
+            test_tool_call(
+                SEARCH_TEXT_TOOL_NAME,
+                json!({ "query": "needle", "path": ".", "continuation": null }),
+            ),
+        ];
+
+        assert_eq!(
+            plan_tool_execution(&calls).expect("conservative plan"),
+            ToolExecutionPlan {
+                groups: vec![
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Sequential,
+                        call_indices: vec![0],
+                    },
+                    ToolExecutionGroup {
+                        mode: ToolExecutionMode::Parallel,
+                        call_indices: vec![1],
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
     fn plans_calls_with_missing_schema_arguments_so_tools_can_return_errors() {
         let calls = vec![
             PendingToolCall {

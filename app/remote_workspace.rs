@@ -34812,6 +34812,7 @@ mod tests {
             .await
             .expect("fallback catalog");
         assert!(catalog.allows("read_file"));
+        assert!(!catalog.allows("apply_patch"));
         assert!(catalog.allows("web_fetch"));
         assert!(!catalog.allows("web_search"));
         assert!(catalog.mcp_prompt_tools.is_empty());
@@ -34848,6 +34849,7 @@ mod tests {
             .await;
         let discovery = RemoteBrokerToolDiscovery {
             web_search_available: true,
+            apply_patch_available: false,
             local_mcp_tools: vec![
                 mcp_tool("mcp__docs__search", "local-duplicate"),
                 mcp_tool("mcp__local__lookup", "local-only"),
@@ -34929,6 +34931,7 @@ mod tests {
             None,
             RemoteBrokerToolDiscovery {
                 web_search_available: true,
+                apply_patch_available: true,
                 local_mcp_tools: vec![local_mcp.clone()],
             },
             workspace_registry.clone(),
@@ -34936,6 +34939,7 @@ mod tests {
             false,
         )
         .await;
+        assert!(normal.allows("apply_patch"));
         assert!(normal.tools.iter().all(|tool| {
             normal.allows(tool.name.as_str()) && normal.route(tool.name.as_str()).is_some()
         }));
@@ -34965,6 +34969,7 @@ mod tests {
             Some("plan"),
             RemoteBrokerToolDiscovery {
                 web_search_available: true,
+                apply_patch_available: true,
                 local_mcp_tools: vec![local_mcp],
             },
             workspace_registry,
@@ -34978,6 +34983,7 @@ mod tests {
         for hidden in [
             "write_file",
             "edit_file",
+            "apply_patch",
             "run_command",
             "create_todo_graph",
             "update_spec",
@@ -35042,6 +35048,7 @@ mod tests {
             None,
             RemoteBrokerToolDiscovery {
                 web_search_available: true,
+                apply_patch_available: true,
                 local_mcp_tools: vec![mcp_tool("mcp__local__lookup", "local-tools")],
             },
             Arc::new(McpRegistry::default()),

@@ -23,7 +23,8 @@ use foco_agent::{
     context_compression_trigger_tokens,
 };
 use foco_providers::{
-    OPENAI_CHAT_KIND, OpenAiRespWsSessionRegistry, ProviderModelRedirect, ProviderRequestOverride,
+    GROQ_KIND, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND,
+    OpenAiRespWsSessionRegistry, ProviderModelRedirect, ProviderRequestOverride, TOGETHER_KIND,
     redirected_provider_model_ids,
 };
 use foco_store::{
@@ -3904,6 +3905,87 @@ fn provider_model_refresh_associates_redirected_model_ids_only() {
     assert_eq!(provider_models, vec!["qwen3.6-35b-a3b"]);
     assert!(models[0].provider_ids.is_empty());
     assert_eq!(models[1].provider_ids, vec!["redirected-provider"]);
+}
+
+#[test]
+fn apply_patch_eligibility_allows_only_native_openai_gpt_routes_after_redirects() {
+    fn config_for_route(
+        provider_kind: &str,
+        model_id: &str,
+        model_redirects: Vec<ProviderModelRedirect>,
+    ) -> GlobalConfig {
+        let mut config = GlobalConfig::first_run(std::env::temp_dir());
+        config.providers = vec![ProviderSettings {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            kind: provider_kind.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: None,
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects,
+            api_proxy: ApiProxySettings::default(),
+        }];
+        config.models = vec![ModelSettings {
+            id: model_id.to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider".to_string()],
+            active_provider_id: Some("provider".to_string()),
+            thinking_level: None,
+            system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        }];
+        config
+    }
+
+    for provider_kind in [
+        OPENAI_CHAT_KIND,
+        OPENAI_RESPONSES_KIND,
+        OPENAI_RESPONSES_WEBSOCKET_KIND,
+    ] {
+        let config = config_for_route(provider_kind, "GPT-4.1", Vec::new());
+        assert!(
+            apply_patch_available_for_model(&config, "GPT-4.1").expect("eligible route"),
+            "{provider_kind} should expose apply_patch for GPT models"
+        );
+    }
+
+    let redirected = config_for_route(
+        OPENAI_CHAT_KIND,
+        "friendly-alias",
+        vec![ProviderModelRedirect {
+            from: "GPT-4.1-mini".to_string(),
+            to: "friendly-alias".to_string(),
+        }],
+    );
+    assert!(
+        apply_patch_available_for_model(&redirected, "friendly-alias").expect("redirected route"),
+        "eligibility must use the upstream redirected model id"
+    );
+
+    for provider_kind in [OPENAI_CHAT_KIND, GROQ_KIND, TOGETHER_KIND] {
+        let config = config_for_route(provider_kind, "o3-mini", Vec::new());
+        assert!(
+            !apply_patch_available_for_model(&config, "o3-mini").expect("non-GPT route"),
+            "{provider_kind} must not expose apply_patch for a non-GPT model"
+        );
+    }
+
+    for provider_kind in [GROQ_KIND, TOGETHER_KIND] {
+        let config = config_for_route(provider_kind, "gpt-4.1", Vec::new());
+        assert!(
+            !apply_patch_available_for_model(&config, "gpt-4.1").expect("compatible route"),
+            "OpenAI-compatible provider {provider_kind} must not expose apply_patch"
+        );
+    }
 }
 
 #[test]
