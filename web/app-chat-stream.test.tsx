@@ -5562,6 +5562,114 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("restores a durable stream error after closing and reopening the chat tab", async () => {
+    const failureMessage = "Provider connection failed. Please retry.";
+    const retryPrompt = "Retry the persisted failure.";
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      retryPrompt,
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        message: failureMessage,
+        type: "error",
+      });
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    expect(await screen.findByText(failureMessage)).toBeInTheDocument();
+
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": {
+        ...chatMessages,
+        messages: [
+          ...chatMessages.messages,
+          {
+            content: retryPrompt,
+            createdAt: "2026-07-20T08:00:00.000Z",
+            extractedMemories: [],
+            id: "message-user-stream",
+            memoriesUsed: [],
+            metrics: null,
+            parts: [{ text: retryPrompt, type: "text" }],
+            reasoning: null,
+            role: "user",
+            runConfig: {
+              latencyMode: "standard",
+              modelId: "gpt-test",
+              providerId: "openai",
+              selectedSkillIds: [],
+              sessionMode: null,
+              teamModeEnabled: false,
+              thinkingLevel: "high",
+            },
+            toolCalls: [],
+          },
+          {
+            content: failureMessage,
+            createdAt: "2026-07-20T08:00:01.000Z",
+            extractedMemories: [],
+            id: "message-assistant-stream",
+            memoriesUsed: [],
+            metrics: null,
+            parts: [{ text: failureMessage, type: "error" }],
+            reasoning: null,
+            role: "assistant",
+            status: "error",
+            toolCalls: [],
+          },
+        ],
+      } as unknown as typeof chatMessages,
+    };
+    const messageRequestsBeforeReopen = fetchMock.mock.calls.filter(([url]) =>
+      url.toString().includes("/chats/chat-1/messages"),
+    ).length;
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    await userEvent.click(
+      within(tabList).getByRole("button", {
+        name: "Close chat tab Retry the persisted failure.",
+      }),
+    );
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([url]) =>
+          url.toString().includes("/chats/chat-1/messages"),
+        ).length,
+      ).toBeGreaterThan(messageRequestsBeforeReopen),
+    );
+    expect(await screen.findByText(failureMessage)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Retry last run" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry last run" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+    const retryRequest = fetchMock.mock.calls
+      .filter(([url]) => url.toString().includes("/chat/stream"))
+      .at(-1);
+    expect(JSON.parse(String(retryRequest?.[1]?.body))).toMatchObject({
+      message: retryPrompt,
+      modelId: "gpt-test",
+      providerId: "openai",
+      thinkingLevel: "high",
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("appends stream errors after already rendered assistant text", async () => {
     renderApp();
 
