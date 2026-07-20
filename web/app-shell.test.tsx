@@ -1758,6 +1758,11 @@ describe("app-shell verification surfaces", () => {
         element?.tagName === "PRE" && Boolean(element.textContent?.includes('"cursorExpired": true')),
       ),
     ).toBeInTheDocument();
+
+    await userEvent.click(within(outputBubble).getByRole("button", { name: "Compact" }));
+    expect(within(outputBubble).getAllByText("Background running")).not.toHaveLength(0);
+    expect(within(outputBubble).getByText("cursor 20–21")).toBeInTheDocument();
+    expect(outputBubble.querySelector(".tool-call-scroll")).not.toBeNull();
   });
 
   it("localizes completed tool status and uses success color", async () => {

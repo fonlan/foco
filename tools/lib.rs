@@ -531,12 +531,18 @@ fn execute_builtin_tool_inner(
             context.chat_id,
             context.run_id,
         ),
-        GET_COMMAND_OUTPUT_TOOL => {
-            command_tools::get_command_output(workspace_path, arguments, background_commands)
-        }
-        STOP_COMMAND_TOOL => {
-            command_tools::stop_command(workspace_path, arguments, background_commands)
-        }
+        GET_COMMAND_OUTPUT_TOOL => command_tools::get_command_output(
+            workspace_path,
+            arguments,
+            background_commands,
+            context.chat_id,
+        ),
+        STOP_COMMAND_TOOL => command_tools::stop_command(
+            workspace_path,
+            arguments,
+            background_commands,
+            context.chat_id,
+        ),
         SLEEP_TOOL => command_tools::sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
@@ -4279,6 +4285,96 @@ mod tests {
         assert!(missing.is_error, "{:?}", missing.output);
         assert_eq!(foreign.output["error"], missing.output["error"]);
         assert!(!stop.is_error, "{:?}", stop.output);
+    }
+
+    #[test]
+    fn managed_command_hides_cross_chat_handle_existence() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runtime = BuiltinToolRuntime::default();
+        let command = std::env::current_exe()
+            .expect("current test executable")
+            .to_string_lossy()
+            .to_string();
+        let launch = execute_builtin_tool_with_context_and_execution_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some("chat-owner")),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": command,
+                "args": ["--ignored", "--exact", "tests::timeout_child_process"],
+                "cwd": null,
+                "timeoutMs": null,
+                "background": true,
+                "backgroundTimeoutMs": null
+            }),
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        );
+        assert!(!launch.is_error, "{:?}", launch.output);
+        let process_id = launch.output["processId"]
+            .as_str()
+            .expect("process id")
+            .to_string();
+
+        let foreign_output = execute_builtin_tool_with_context_and_execution_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some("chat-other")),
+            GET_COMMAND_OUTPUT_TOOL,
+            json!({
+                "processId": process_id,
+                "cursor": null,
+                "waitMs": null,
+                "timeoutMs": null
+            }),
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        );
+        let foreign_stop = execute_builtin_tool_with_context_and_execution_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some("chat-other")),
+            STOP_COMMAND_TOOL,
+            json!({ "processId": launch.output["processId"], "timeoutMs": null }),
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        );
+        let missing = execute_builtin_tool_with_context_and_execution_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some("chat-other")),
+            GET_COMMAND_OUTPUT_TOOL,
+            json!({
+                "processId": "command-does-not-exist",
+                "cursor": null,
+                "waitMs": null,
+                "timeoutMs": null
+            }),
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        );
+        let owner_stop = execute_builtin_tool_with_context_and_execution_options(
+            workspace.path(),
+            BuiltinToolContext::for_chat(Some("chat-owner")),
+            STOP_COMMAND_TOOL,
+            json!({ "processId": launch.output["processId"], "timeoutMs": null }),
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        );
+
+        assert!(foreign_output.is_error, "{:?}", foreign_output.output);
+        assert!(foreign_stop.is_error, "{:?}", foreign_stop.output);
+        assert!(missing.is_error, "{:?}", missing.output);
+        assert_eq!(foreign_output.output["error"], missing.output["error"]);
+        assert_eq!(foreign_stop.output["error"], missing.output["error"]);
+        assert!(!owner_stop.is_error, "{:?}", owner_stop.output);
     }
 
     #[test]

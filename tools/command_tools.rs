@@ -129,6 +129,7 @@ pub(crate) fn get_command_output(
     workspace_path: &Path,
     arguments: Value,
     background_commands: &BackgroundCommandRegistry,
+    owner_chat_id: Option<&str>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: GetCommandOutputInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
@@ -139,8 +140,12 @@ pub(crate) fn get_command_output(
         .min(timeout_ms.saturating_sub(1));
 
     loop {
-        let snapshot =
-            owned_command_snapshot(background_commands, workspace_path, &request.process_id)?;
+        let snapshot = owned_command_snapshot(
+            background_commands,
+            workspace_path,
+            owner_chat_id,
+            &request.process_id,
+        )?;
         let output = background_commands
             .output_after(&request.process_id, request.cursor)
             .map_err(background_command_error)?;
@@ -161,10 +166,16 @@ pub(crate) fn stop_command(
     workspace_path: &Path,
     arguments: Value,
     background_commands: &BackgroundCommandRegistry,
+    owner_chat_id: Option<&str>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: StopCommandInput = parse_arguments(arguments)?;
     let _timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
-    owned_command_snapshot(background_commands, workspace_path, &request.process_id)?;
+    owned_command_snapshot(
+        background_commands,
+        workspace_path,
+        owner_chat_id,
+        &request.process_id,
+    )?;
     let snapshot = background_commands
         .stop(&request.process_id)
         .map_err(background_command_error)?;
@@ -305,6 +316,7 @@ fn text_line_count(text: &str) -> usize {
 fn owned_command_snapshot(
     registry: &BackgroundCommandRegistry,
     workspace_path: &Path,
+    owner_chat_id: Option<&str>,
     process_id: &str,
 ) -> Result<BackgroundCommandSnapshot, ToolRuntimeError> {
     let snapshot = registry
@@ -314,7 +326,7 @@ fn owned_command_snapshot(
         path: workspace_path.to_path_buf(),
         source,
     })?;
-    if snapshot.workspace_path != workspace {
+    if snapshot.workspace_path != workspace || snapshot.owner_chat_id.as_deref() != owner_chat_id {
         return Err(managed_command_not_found_error());
     }
     Ok(snapshot)

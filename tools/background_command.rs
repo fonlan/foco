@@ -1056,6 +1056,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn registry_reports_an_immediately_exited_command_as_terminal() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(workspace.path(), "exit 0"))
+            .expect("start command");
+
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert_eq!(terminal.status, BackgroundCommandStatus::Exited);
+        assert_eq!(terminal.exit_code, Some(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn registry_stops_the_entire_unix_process_group() {
         let workspace = tempfile::tempdir().expect("workspace");
         let registry = BackgroundCommandRegistry::new();
@@ -1084,6 +1099,43 @@ mod tests {
         assert!(
             !alive.success(),
             "child process should be killed with its process group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_shutdown_stops_the_entire_unix_process_group() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(BackgroundCommandRequest {
+                workspace_path: workspace.path().to_path_buf(),
+                cwd: workspace.path().to_path_buf(),
+                command: "sh".to_string(),
+                args: vec!["-c".to_string(), "sleep 30 & echo $!; wait".to_string()],
+                owner_chat_id: None,
+                owner_run_id: None,
+                timeout: None,
+            })
+            .expect("start command");
+
+        let child_pid = wait_for_output_pid(&registry, &command.command_id);
+        registry.shutdown_all();
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+        let alive = std::process::Command::new("kill")
+            .args(["-0", &child_pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .expect("check process");
+
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+        assert_eq!(
+            terminal.termination,
+            Some(BackgroundCommandTermination::HostShutdown)
+        );
+        assert!(
+            !alive.success(),
+            "child process should be killed with its process group during host shutdown"
         );
     }
 
@@ -1133,6 +1185,137 @@ mod tests {
             error,
             BackgroundCommandError::WorkspaceProcessLimit { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_enforces_the_process_limit_when_concurrent_starts_race() {
+        use std::sync::{Arc, Barrier};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::with_limits(BackgroundCommandLimits {
+            max_active_per_workspace: 1,
+            ..BackgroundCommandLimits::default()
+        });
+        let barrier = Arc::new(Barrier::new(5));
+        let handles = (0..4)
+            .map(|_| {
+                let registry = registry.clone();
+                let workspace_path = workspace.path().to_path_buf();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    registry.start(background_request(&workspace_path, "sleep 30"))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let results = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("start task"))
+            .collect::<Vec<_>>();
+        let started = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok())
+            .collect::<Vec<_>>();
+
+        registry.shutdown_all();
+        for command in &started {
+            let _ = wait_for_terminal(&registry, &command.command_id);
+        }
+
+        assert_eq!(started.len(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| {
+                    matches!(
+                        result,
+                        Err(BackgroundCommandError::WorkspaceProcessLimit { .. })
+                    )
+                })
+                .count(),
+            3
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_allows_concurrent_output_reads_while_stop_is_idempotent() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(
+                workspace.path(),
+                "while :; do printf x; sleep 0.01; done",
+            ))
+            .expect("start command");
+        let readers = (0..4)
+            .map(|_| {
+                let registry = registry.clone();
+                let command_id = command.command_id.clone();
+                thread::spawn(move || {
+                    for _ in 0..20 {
+                        registry
+                            .output_after(&command_id, None)
+                            .expect("concurrent output read");
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let stoppers = (0..2)
+            .map(|_| {
+                let registry = registry.clone();
+                let command_id = command.command_id.clone();
+                thread::spawn(move || registry.stop(&command_id).expect("concurrent stop"))
+            })
+            .collect::<Vec<_>>();
+
+        for reader in readers {
+            reader.join().expect("output reader task");
+        }
+        for stopper in stoppers {
+            let _ = stopper.join().expect("stop task");
+        }
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+        assert_eq!(
+            terminal.termination,
+            Some(BackgroundCommandTermination::ExplicitStop)
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_shutdown_stops_the_windows_job_tree() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(BackgroundCommandRequest {
+                workspace_path: workspace.path().to_path_buf(),
+                cwd: workspace.path().to_path_buf(),
+                command: "cmd".to_string(),
+                args: vec![
+                    "/C".to_string(),
+                    "start /B cmd /C ping -n 30 127.0.0.1 >NUL & ping -n 30 127.0.0.1 >NUL"
+                        .to_string(),
+                ],
+                owner_chat_id: None,
+                owner_run_id: None,
+                timeout: None,
+            })
+            .expect("start command");
+
+        registry.shutdown_all();
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+        assert_eq!(
+            terminal.termination,
+            Some(BackgroundCommandTermination::HostShutdown)
+        );
     }
 
     #[cfg(unix)]
@@ -1243,7 +1426,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn wait_for_terminal(
         registry: &BackgroundCommandRegistry,
         command_id: &str,

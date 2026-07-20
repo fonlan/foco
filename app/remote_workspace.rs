@@ -33753,6 +33753,119 @@ mod tests {
         assert_eq!(sleep_output["durationMs"], 1);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_sidecar_locally_runs_polls_and_stops_managed_commands() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, catalog) = test_remote_sidecar_local_catalog(workspace.path(), None).await;
+        let (launch, launch_error, launch_events, launch_context) =
+            test_execute_remote_sidecar_local_tool(
+                &state,
+                &catalog,
+                "call-command-start",
+                "run_command",
+                json!({
+                    "command": "sh",
+                    "args": ["-c", "printf remote-ready; while :; do sleep 1; done"],
+                    "cwd": null,
+                    "timeoutMs": null,
+                    "background": true,
+                    "backgroundTimeoutMs": null
+                }),
+                None,
+            )
+            .await;
+        assert!(!launch_error, "{launch}");
+        assert!(launch_events.is_empty());
+        assert!(launch_context.is_empty());
+        let process_id = launch["processId"]
+            .as_str()
+            .expect("managed process id")
+            .to_string();
+
+        let (first_poll, first_poll_error, first_poll_events, first_poll_context) =
+            test_execute_remote_sidecar_local_tool(
+                &state,
+                &catalog,
+                "call-command-poll",
+                "get_command_output",
+                json!({
+                    "processId": process_id,
+                    "cursor": null,
+                    "waitMs": 500,
+                    "timeoutMs": 1_000
+                }),
+                None,
+            )
+            .await;
+        assert!(!first_poll_error, "{first_poll}");
+        assert!(first_poll_events.is_empty());
+        assert!(first_poll_context.is_empty());
+        assert_eq!(first_poll["status"], "running");
+        assert!(
+            first_poll["chunks"]
+                .as_array()
+                .expect("output chunks")
+                .iter()
+                .any(|chunk| chunk["text"].as_str() == Some("remote-ready"))
+        );
+
+        let cursor = first_poll["nextCursor"].as_u64().expect("next cursor");
+        let (empty_poll, empty_poll_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-command-empty-poll",
+            "get_command_output",
+            json!({
+                "processId": process_id,
+                "cursor": cursor,
+                "waitMs": 25,
+                "timeoutMs": 1_000
+            }),
+            None,
+        )
+        .await;
+        assert!(!empty_poll_error, "{empty_poll}");
+        assert_eq!(empty_poll["status"], "running");
+        assert!(
+            empty_poll["chunks"]
+                .as_array()
+                .expect("output chunks")
+                .is_empty()
+        );
+
+        let (stop, stop_error, stop_events, stop_context) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-command-stop",
+            "stop_command",
+            json!({ "processId": process_id, "timeoutMs": 1_000 }),
+            None,
+        )
+        .await;
+        assert!(!stop_error, "{stop}");
+        assert!(stop_events.is_empty());
+        assert!(stop_context.is_empty());
+
+        let (final_poll, final_poll_error, _, _) = test_execute_remote_sidecar_local_tool(
+            &state,
+            &catalog,
+            "call-command-final-poll",
+            "get_command_output",
+            json!({
+                "processId": stop["processId"],
+                "cursor": cursor,
+                "waitMs": 1_000,
+                "timeoutMs": 1_500
+            }),
+            None,
+        )
+        .await;
+        assert!(!final_poll_error, "{final_poll}");
+        assert_eq!(final_poll["status"], "stopped");
+        assert_eq!(final_poll["terminationReason"], "explicit_stop");
+    }
+
     #[tokio::test]
     async fn remote_sidecar_local_todo_and_plan_tools_use_remote_chat_database_and_session_mode() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
