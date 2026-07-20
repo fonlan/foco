@@ -14,7 +14,7 @@ use crate::{
     BackgroundCommandTermination, COMMAND_WAIT_POLL_MS, CommandOutputLimits,
     DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS, DEFAULT_RUN_COMMAND_TIMEOUT_MS,
     DEFAULT_SLEEP_TIMEOUT_MS, MAX_COMMAND_CAPTURE_BYTES_PER_STREAM, ToolCancellationToken,
-    ToolOutputSink, background_command_registry,
+    ToolOutputSink,
     errors::{ToolRuntimeError, tool_timeout_ms},
     limited_output_text, parse_arguments, relative_workspace_path, resolve_workspace_path,
     run_command_with_timeout,
@@ -25,6 +25,9 @@ pub(crate) fn run_command(
     arguments: Value,
     cancellation_token: Option<&ToolCancellationToken>,
     output_sink: Option<&dyn ToolOutputSink>,
+    background_commands: &BackgroundCommandRegistry,
+    owner_chat_id: Option<&str>,
+    owner_run_id: Option<&str>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: RunCommandInput = parse_arguments(arguments)?;
     let command = request.command.trim();
@@ -57,15 +60,14 @@ pub(crate) fn run_command(
 
     if request.background.unwrap_or(false) {
         let timeout = background_timeout(request.background_timeout_ms)?;
-        let registry = background_command_registry();
-        let snapshot = registry
+        let snapshot = background_commands
             .start(BackgroundCommandRequest {
                 workspace_path: workspace_path.to_path_buf(),
                 cwd,
                 command: command.to_string(),
                 args,
-                owner_chat_id: None,
-                owner_run_id: None,
+                owner_chat_id: owner_chat_id.map(str::to_string),
+                owner_run_id: owner_run_id.map(str::to_string),
                 timeout,
             })
             .map_err(background_start_error)?;
@@ -73,10 +75,10 @@ pub(crate) fn run_command(
         // Give immediate spawn failures a tiny chance to settle without turning long commands
         // back into synchronous tool calls.
         thread::sleep(Duration::from_millis(COMMAND_WAIT_POLL_MS));
-        let snapshot = registry
+        let snapshot = background_commands
             .command(&snapshot.command_id)
             .map_err(background_command_error)?;
-        return background_command_response(registry, snapshot, None, false);
+        return background_command_response(background_commands, snapshot, None, false);
     }
 
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_RUN_COMMAND_TIMEOUT_MS)?;
@@ -126,10 +128,10 @@ pub(crate) fn run_command(
 pub(crate) fn get_command_output(
     workspace_path: &Path,
     arguments: Value,
+    background_commands: &BackgroundCommandRegistry,
 ) -> Result<Value, ToolRuntimeError> {
     let request: GetCommandOutputInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
-    let registry = background_command_registry();
     let started = Instant::now();
     let wait_ms = request
         .wait_ms
@@ -137,8 +139,9 @@ pub(crate) fn get_command_output(
         .min(timeout_ms.saturating_sub(1));
 
     loop {
-        let snapshot = owned_command_snapshot(registry, workspace_path, &request.process_id)?;
-        let output = registry
+        let snapshot =
+            owned_command_snapshot(background_commands, workspace_path, &request.process_id)?;
+        let output = background_commands
             .output_after(&request.process_id, request.cursor)
             .map_err(background_command_error)?;
         if !output.chunks.is_empty()
@@ -157,15 +160,15 @@ pub(crate) fn get_command_output(
 pub(crate) fn stop_command(
     workspace_path: &Path,
     arguments: Value,
+    background_commands: &BackgroundCommandRegistry,
 ) -> Result<Value, ToolRuntimeError> {
     let request: StopCommandInput = parse_arguments(arguments)?;
     let _timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
-    let registry = background_command_registry();
-    owned_command_snapshot(registry, workspace_path, &request.process_id)?;
-    let snapshot = registry
+    owned_command_snapshot(background_commands, workspace_path, &request.process_id)?;
+    let snapshot = background_commands
         .stop(&request.process_id)
         .map_err(background_command_error)?;
-    background_command_response(registry, snapshot, None, true)
+    background_command_response(background_commands, snapshot, None, true)
 }
 
 fn background_command_response(

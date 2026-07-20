@@ -25,8 +25,10 @@ use foco_store::workspace::{
 use foco_tools::{
     AGENT_CANCEL_TASK_TOOL, AGENT_CREATE_INSTANCES_TOOL, AGENT_DELEGATE_TASK_TOOL,
     AGENT_GET_TASK_TOOL, AGENT_LIST_TOOL, AGENT_SEND_MESSAGE_TOOL, AGENT_TRANSFER_TASK_TOOL,
-    AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, BuiltinToolContext, RUN_COMMAND_TOOL, SLEEP_TOOL,
-    ToolCancellationToken, ToolExecution, ToolOutputSink, builtin_tool_timeout_ms,
+    AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL, BuiltinToolContext, BuiltinToolExecutionOptions,
+    BuiltinToolRuntime, RUN_COMMAND_TOOL, SLEEP_TOOL, ToolCancellationToken, ToolExecution,
+    ToolOutputSink, builtin_tool_timeout_ms,
+    execute_builtin_tool_with_context_and_execution_options,
     execute_builtin_tool_with_context_and_options, find_files_target_outside_workspace,
     read_file_target_outside_workspace, search_text_target_outside_workspace,
 };
@@ -267,6 +269,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    builtin_tool_runtime: BuiltinToolRuntime,
 ) -> Result<Vec<ToolHookOutcome>, ApiError> {
     let mut executed_by_index = (0..tool_calls.len())
         .map(|_| None)
@@ -296,6 +299,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         tool_resource_lock_registry.clone(),
                         cancellation_token.clone(),
                         tool_output_delta_tx.clone(),
+                        builtin_tool_runtime.clone(),
                         assistant_message_id,
                         workspace_id,
                         workspace_path,
@@ -340,6 +344,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let tool_resource_lock_registry = tool_resource_lock_registry.clone();
                     let cancellation_token = cancellation_token.clone();
                     let tool_output_delta_tx = tool_output_delta_tx.clone();
+                    let builtin_tool_runtime = builtin_tool_runtime.clone();
                     let tool_call = tool_calls.get(tool_index).cloned();
 
                     tokio::spawn(async move {
@@ -367,6 +372,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 tool_resource_lock_registry,
                                 cancellation_token,
                                 tool_output_delta_tx,
+                                builtin_tool_runtime,
                                 &assistant_message_id,
                                 &workspace_id,
                                 &workspace_path,
@@ -422,6 +428,7 @@ async fn execute_tool_call(
     tool_resource_lock_registry: ToolResourceLockRegistry,
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    builtin_tool_runtime: BuiltinToolRuntime,
     assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
@@ -436,7 +443,7 @@ async fn execute_tool_call(
 ) -> ToolHookOutcome {
     let started_at_text = utc_timestamp();
     memory_tool_context.tool_call_id = tool_call.call_id.clone();
-    let mut tool_execution = execute_tool(
+    let mut tool_execution = execute_tool_with_runtime(
         mcp_registry,
         hook_runtime.clone(),
         &global_hooks,
@@ -466,6 +473,7 @@ async fn execute_tool_call(
         &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
+        builtin_tool_runtime,
     )
     .await;
     let completed_at_text = utc_timestamp();
@@ -619,6 +627,11 @@ fn budget_tool_result_envelope(
     )
 }
 
+/// Executes a tool with an ephemeral runtime for callers that do not own host state.
+///
+/// Production local and sidecar paths must use [`execute_tool_with_runtime`] so managed
+/// background command handles stay scoped to their owning host.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn execute_tool(
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
@@ -650,6 +663,74 @@ pub(crate) async fn execute_tool(
     tool_name: &str,
     arguments: Value,
 ) -> ToolExecutionWithHooks {
+    execute_tool_with_runtime(
+        mcp_registry,
+        hook_runtime,
+        global_hooks,
+        api_audit_save_details,
+        global_config,
+        provider_config,
+        web_search_settings,
+        question_registry,
+        question_event_tx,
+        memory_tool_context,
+        agent_tool_context,
+        skill_read_root_dirs,
+        attachment_read_allowlist,
+        tool_resource_lock_registry,
+        cancellation_token,
+        tool_output_delta_tx,
+        assistant_message_id,
+        workspace_id,
+        workspace_path,
+        tool_workspace_path,
+        chat_id,
+        session_mode,
+        run_id,
+        model_id,
+        provider_id,
+        llm_request_retry_count,
+        tool_call_id,
+        tool_name,
+        arguments,
+        BuiltinToolRuntime::default(),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tool_with_runtime(
+    mcp_registry: Arc<McpRegistry>,
+    hook_runtime: HookRuntime,
+    global_hooks: &HookConfig,
+    api_audit_save_details: bool,
+    global_config: &GlobalConfig,
+    provider_config: Option<&ProviderConnectionConfig>,
+    web_search_settings: &WebSearchSettings,
+    question_registry: QuestionRegistry,
+    question_event_tx: mpsc::UnboundedSender<QuestionRequest>,
+    memory_tool_context: MemoryToolContext,
+    agent_tool_context: Option<AgentToolContext>,
+    skill_read_root_dirs: Vec<PathBuf>,
+    attachment_read_allowlist: Vec<PathBuf>,
+    tool_resource_lock_registry: ToolResourceLockRegistry,
+    cancellation_token: ToolCancellationToken,
+    tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
+    assistant_message_id: &str,
+    workspace_id: &str,
+    workspace_path: &Path,
+    tool_workspace_path: &Path,
+    chat_id: &str,
+    session_mode: Option<&str>,
+    run_id: &str,
+    model_id: &str,
+    provider_id: &str,
+    llm_request_retry_count: u32,
+    tool_call_id: &str,
+    tool_name: &str,
+    arguments: Value,
+    builtin_tool_runtime: BuiltinToolRuntime,
+) -> ToolExecutionWithHooks {
     let mut result = execute_tool_unbudgeted(
         mcp_registry,
         hook_runtime,
@@ -680,6 +761,7 @@ pub(crate) async fn execute_tool(
         tool_call_id,
         tool_name,
         arguments,
+        builtin_tool_runtime,
     )
     .await;
     let budgeted = budget_tool_execution(tool_name, result.execution);
@@ -730,6 +812,7 @@ async fn execute_tool_unbudgeted(
     tool_call_id: &str,
     tool_name: &str,
     mut arguments: Value,
+    builtin_tool_runtime: BuiltinToolRuntime,
 ) -> ToolExecutionWithHooks {
     if cancellation_token.is_cancelled() {
         return cancelled_tool_execution();
@@ -1227,31 +1310,37 @@ async fn execute_tool_unbudgeted(
         let worker = tokio::task::spawn_blocking({
             let workspace_path = builtin_workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
+            let run_id = run_id.to_string();
             let session_mode = session_mode.map(str::to_string);
             let assistant_message_id = assistant_message_id.to_string();
             let tool_call_id = tool_call_id.to_string();
             let tool_name = tool_name.clone();
             let cancellation_token = cancellation_token.clone();
+            let builtin_tool_runtime = builtin_tool_runtime.clone();
             move || {
-                execute_builtin_tool_with_context_and_options(
+                execute_builtin_tool_with_context_and_execution_options(
                     &workspace_path,
                     BuiltinToolContext {
                         chat_id: Some(&chat_id),
+                        run_id: Some(&run_id),
                         session_mode: session_mode.as_deref(),
                     },
                     &tool_name,
                     arguments,
-                    Some(cancellation_token),
-                    if tool_name == RUN_COMMAND_TOOL {
-                        Some(Arc::new(ToolOutputDeltaSink {
-                            assistant_message_id: assistant_message_id.clone(),
-                            tool_call_id: tool_call_id.clone(),
-                            tx: tool_output_delta_tx,
-                        }) as Arc<dyn ToolOutputSink>)
-                    } else {
-                        None
+                    BuiltinToolExecutionOptions {
+                        runtime: builtin_tool_runtime,
+                        cancellation_token: Some(cancellation_token),
+                        output_sink: if tool_name == RUN_COMMAND_TOOL {
+                            Some(Arc::new(ToolOutputDeltaSink {
+                                assistant_message_id: assistant_message_id.clone(),
+                                tool_call_id: tool_call_id.clone(),
+                                tx: tool_output_delta_tx,
+                            }) as Arc<dyn ToolOutputSink>)
+                        } else {
+                            None
+                        },
+                        allow_external_read_access,
                     },
-                    allow_external_read_access,
                 )
             }
         });

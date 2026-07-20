@@ -2609,6 +2609,18 @@ pub(crate) async fn delete_chat(
         return Err(ApiError::bad_request("chat id must not be empty"));
     }
 
+    if let Err(error) = state
+        .background_command_registry
+        .stop_for_workspace_chat(&workspace.path, chat_id)
+    {
+        tracing::warn!(
+            workspace_id,
+            chat_id,
+            error = %error,
+            "failed to stop managed commands for deleted chat"
+        );
+    }
+
     let mut database = open_workspace_database(&workspace.path)?;
 
     if !database

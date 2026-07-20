@@ -77,13 +77,13 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    AGENT_CREATE_INSTANCES_TOOL, ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
-    DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
-    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
-    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolExecution, ToolOutputStream,
-    UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
-    WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
+    AGENT_CREATE_INSTANCES_TOOL, ASK_QUESTION_TOOL, BackgroundCommandRegistry, BuiltinToolRuntime,
+    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
+    GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
+    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
+    ToolExecution, ToolOutputStream, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
 };
 use image::{ImageFormat, ImageReader};
 
@@ -424,6 +424,7 @@ pub(crate) struct AppState {
     scheduled_task_scheduler: ScheduledTaskScheduler,
     plan_auto_run_scheduler: PlanAutoRunScheduler,
     tool_resource_locks: ToolResourceLockRegistry,
+    background_command_registry: BackgroundCommandRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
     remote_server_connections: Arc<Mutex<HashSet<String>>>,
@@ -818,6 +819,7 @@ async fn run_server_until_shutdown(
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        background_command_registry: BackgroundCommandRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),
@@ -849,6 +851,7 @@ async fn run_server_until_shutdown(
         .wake()
         .map_err(|error| std::io::Error::other(error.message))?;
     let remote_workspace_manager = state.remote_workspace_manager.clone();
+    let background_command_registry = state.background_command_registry.clone();
     let openai_resp_ws_sessions = state.openai_resp_ws_sessions.clone();
     let user_profile_dir_for_update_ready = state.user_profile_dir.clone();
     let app = crate::http::router::app_router(state);
@@ -935,6 +938,7 @@ async fn run_server_until_shutdown(
         terminal_shutdown_tx,
         mcp_registry,
         remote_workspace_manager,
+        background_command_registry,
         openai_resp_ws_sessions,
     ))
     .await;
@@ -1124,6 +1128,7 @@ async fn shutdown_signal(
     terminal_shutdown_tx: broadcast::Sender<()>,
     mcp_registry: Arc<McpRegistry>,
     remote_workspace_manager: remote_workspace::RemoteWorkspaceManager,
+    background_command_registry: BackgroundCommandRegistry,
     openai_resp_ws_sessions: Arc<OpenAiRespWsSessionRegistry>,
 ) {
     tokio::select! {
@@ -1143,7 +1148,8 @@ async fn shutdown_signal(
         }
     }
 
-    tracing::info!("shutdown requested; closing terminal sessions");
+    tracing::info!("shutdown requested; stopping managed commands and closing terminal sessions");
+    background_command_registry.shutdown_all();
     let _ = terminal_shutdown_tx.send(());
     openai_resp_ws_sessions.shutdown_all().await;
     if let Err(error) = remote_workspace_manager.disconnect_all().await {
@@ -2275,6 +2281,7 @@ struct PreparedChatContext {
     global_hooks: HookConfig,
     question_registry: QuestionRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
+    builtin_tool_runtime: BuiltinToolRuntime,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
     /// Live global config used to resolve the active provider immediately before every
@@ -4544,6 +4551,7 @@ impl PreparedChatContext {
                                     self.tool_resource_locks.clone(),
                                     tool_cancellation_token.clone(),
                                     tool_output_delta_tx,
+                                    self.builtin_tool_runtime.clone(),
                                 );
                                 tokio::pin!(tool_results);
                                 let mut question_events_open = true;
@@ -5265,6 +5273,7 @@ async fn prepare_chat_context_for_output(
         global_hooks: config.hooks.clone(),
         question_registry: state.question_registry.clone(),
         tool_resource_locks: state.tool_resource_locks.clone(),
+        builtin_tool_runtime: BuiltinToolRuntime::new(state.background_command_registry.clone()),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
         live_config: Some(state.config.clone()),

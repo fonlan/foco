@@ -126,7 +126,6 @@ const MAX_COMMAND_PIPE_MESSAGES_PER_DRAIN: usize = 8;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-static BACKGROUND_COMMAND_REGISTRY: OnceLock<BackgroundCommandRegistry> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +158,7 @@ pub enum ToolOutputStream {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BuiltinToolContext<'a> {
     pub chat_id: Option<&'a str>,
+    pub run_id: Option<&'a str>,
     pub session_mode: Option<&'a str>,
 }
 
@@ -166,6 +166,7 @@ impl<'a> BuiltinToolContext<'a> {
     pub fn for_chat(chat_id: Option<&'a str>) -> Self {
         Self {
             chat_id,
+            run_id: None,
             session_mode: None,
         }
     }
@@ -194,6 +195,44 @@ impl ToolCancellationToken {
     }
 }
 
+/// Host-owned services needed by built-in tools that retain in-memory state across calls.
+#[derive(Clone, Default)]
+pub struct BuiltinToolRuntime {
+    background_commands: BackgroundCommandRegistry,
+}
+
+impl BuiltinToolRuntime {
+    pub fn new(background_commands: BackgroundCommandRegistry) -> Self {
+        Self {
+            background_commands,
+        }
+    }
+
+    pub fn background_commands(&self) -> &BackgroundCommandRegistry {
+        &self.background_commands
+    }
+}
+
+/// Typed execution settings shared by built-in tools for one invocation.
+#[derive(Clone)]
+pub struct BuiltinToolExecutionOptions {
+    pub runtime: BuiltinToolRuntime,
+    pub cancellation_token: Option<ToolCancellationToken>,
+    pub output_sink: Option<Arc<dyn ToolOutputSink>>,
+    pub allow_external_read_access: bool,
+}
+
+impl Default for BuiltinToolExecutionOptions {
+    fn default() -> Self {
+        Self {
+            runtime: BuiltinToolRuntime::default(),
+            cancellation_token: None,
+            output_sink: None,
+            allow_external_read_access: false,
+        }
+    }
+}
+
 pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     definitions::builtin_tool_definitions()
 }
@@ -210,11 +249,6 @@ pub fn set_ripgrep_path(path: Option<PathBuf>) {
     let state = RIPGREP_PATH.get_or_init(|| Mutex::new(None));
     let mut current = state.lock().expect("ripgrep path lock poisoned");
     *current = path;
-}
-
-/// Returns the host-local registry used by the built-in managed command tools.
-pub fn background_command_registry() -> &'static BackgroundCommandRegistry {
-    BACKGROUND_COMMAND_REGISTRY.get_or_init(BackgroundCommandRegistry::new)
 }
 
 pub fn execute_builtin_tool(
@@ -349,6 +383,7 @@ pub fn execute_builtin_tool_for_chat_with_cancellation_and_output_sink_and_exter
     )
 }
 
+/// Compatibility wrapper for callers that do not own a long-lived tool runtime.
 pub fn execute_builtin_tool_with_context_and_options(
     workspace_path: &Path,
     context: BuiltinToolContext<'_>,
@@ -358,14 +393,36 @@ pub fn execute_builtin_tool_with_context_and_options(
     output_sink: Option<Arc<dyn ToolOutputSink>>,
     allow_external_read_access: bool,
 ) -> ToolExecution {
+    execute_builtin_tool_with_context_and_execution_options(
+        workspace_path,
+        context,
+        tool_name,
+        arguments,
+        BuiltinToolExecutionOptions {
+            cancellation_token,
+            output_sink,
+            allow_external_read_access,
+            ..BuiltinToolExecutionOptions::default()
+        },
+    )
+}
+
+pub fn execute_builtin_tool_with_context_and_execution_options(
+    workspace_path: &Path,
+    context: BuiltinToolContext<'_>,
+    tool_name: &str,
+    arguments: Value,
+    options: BuiltinToolExecutionOptions,
+) -> ToolExecution {
     match execute_builtin_tool_inner(
         workspace_path,
         context,
         tool_name,
         arguments,
-        cancellation_token.as_ref(),
-        output_sink.as_deref(),
-        allow_external_read_access,
+        options.cancellation_token.as_ref(),
+        options.output_sink.as_deref(),
+        options.allow_external_read_access,
+        options.runtime.background_commands(),
     ) {
         Ok(output) => ToolExecution {
             output,
@@ -414,6 +471,7 @@ fn execute_builtin_tool_inner(
     // authorization). write/edit/run/graph never consume it and stay on execution-root resolvers.
     // Shared-workspace auto-trust for Plan worktrees lives in app authorization helpers, not here.
     allow_external_read_access: bool,
+    background_commands: &BackgroundCommandRegistry,
 ) -> Result<Value, ToolRuntimeError> {
     match tool_name {
         READ_FILE_TOOL if allow_external_read_access => {
@@ -464,11 +522,21 @@ fn execute_builtin_tool_inner(
         ASK_QUESTION_TOOL => Err(ToolRuntimeError::InvalidArguments(
             "ask_question must be executed through the chat UI question bridge".to_string(),
         )),
-        RUN_COMMAND_TOOL => {
-            command_tools::run_command(workspace_path, arguments, cancellation_token, output_sink)
+        RUN_COMMAND_TOOL => command_tools::run_command(
+            workspace_path,
+            arguments,
+            cancellation_token,
+            output_sink,
+            background_commands,
+            context.chat_id,
+            context.run_id,
+        ),
+        GET_COMMAND_OUTPUT_TOOL => {
+            command_tools::get_command_output(workspace_path, arguments, background_commands)
         }
-        GET_COMMAND_OUTPUT_TOOL => command_tools::get_command_output(workspace_path, arguments),
-        STOP_COMMAND_TOOL => command_tools::stop_command(workspace_path, arguments),
+        STOP_COMMAND_TOOL => {
+            command_tools::stop_command(workspace_path, arguments, background_commands)
+        }
         SLEEP_TOOL => command_tools::sleep_tool(arguments, cancellation_token),
         other => Err(ToolRuntimeError::UnknownTool(other.to_string())),
     }
@@ -1277,6 +1345,24 @@ mod tests {
                 self.truncation_notices.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    fn execute_builtin_tool_with_runtime(
+        workspace_path: &Path,
+        runtime: &BuiltinToolRuntime,
+        tool_name: &str,
+        arguments: Value,
+    ) -> ToolExecution {
+        execute_builtin_tool_with_context_and_execution_options(
+            workspace_path,
+            BuiltinToolContext::default(),
+            tool_name,
+            arguments,
+            BuiltinToolExecutionOptions {
+                runtime: runtime.clone(),
+                ..BuiltinToolExecutionOptions::default()
+            },
+        )
     }
 
     #[test]
@@ -2357,6 +2443,7 @@ mod tests {
         drop(database);
         let context = BuiltinToolContext {
             chat_id: Some("chat-plan"),
+            run_id: None,
             session_mode: Some("plan"),
         };
 
@@ -2497,10 +2584,12 @@ mod tests {
 
         let owner_context = BuiltinToolContext {
             chat_id: Some("chat-owner"),
+            run_id: None,
             session_mode: Some("plan"),
         };
         let other_context = BuiltinToolContext {
             chat_id: Some("chat-other"),
+            run_id: None,
             session_mode: Some("plan"),
         };
 
@@ -4062,13 +4151,15 @@ mod tests {
     #[test]
     fn managed_background_command_returns_a_reusable_handle_and_idempotent_stop() {
         let workspace = tempfile::tempdir().expect("workspace");
+        let runtime = BuiltinToolRuntime::default();
         let command = std::env::current_exe()
             .expect("current test executable")
             .to_string_lossy()
             .to_string();
         let started = Instant::now();
-        let launch = execute_builtin_tool(
+        let launch = execute_builtin_tool_with_runtime(
             workspace.path(),
+            &runtime,
             RUN_COMMAND_TOOL,
             json!({
                 "command": command,
@@ -4094,8 +4185,9 @@ mod tests {
             .expect("process id")
             .to_string();
         let cursor = launch.output["nextCursor"].as_u64();
-        let read = execute_builtin_tool(
+        let read = execute_builtin_tool_with_runtime(
             workspace.path(),
+            &runtime,
             GET_COMMAND_OUTPUT_TOOL,
             json!({
                 "processId": process_id,
@@ -4110,14 +4202,16 @@ mod tests {
         assert!(read.output["cursorExpired"].is_boolean());
         assert!(read.output["retainedOutputBytes"].as_u64().is_some());
 
-        let first_stop = execute_builtin_tool(
+        let first_stop = execute_builtin_tool_with_runtime(
             workspace.path(),
+            &runtime,
             STOP_COMMAND_TOOL,
             json!({ "processId": process_id, "timeoutMs": null }),
         );
         assert!(!first_stop.is_error, "{:?}", first_stop.output);
-        let second_stop = execute_builtin_tool(
+        let second_stop = execute_builtin_tool_with_runtime(
             workspace.path(),
+            &runtime,
             STOP_COMMAND_TOOL,
             json!({ "processId": first_stop.output["processId"], "timeoutMs": null }),
         );
@@ -4128,12 +4222,14 @@ mod tests {
     fn managed_command_hides_cross_workspace_handle_existence() {
         let owner_workspace = tempfile::tempdir().expect("owner workspace");
         let other_workspace = tempfile::tempdir().expect("other workspace");
+        let runtime = BuiltinToolRuntime::default();
         let command = std::env::current_exe()
             .expect("current test executable")
             .to_string_lossy()
             .to_string();
-        let launch = execute_builtin_tool(
+        let launch = execute_builtin_tool_with_runtime(
             owner_workspace.path(),
+            &runtime,
             RUN_COMMAND_TOOL,
             json!({
                 "command": command,
@@ -4150,8 +4246,9 @@ mod tests {
             .expect("process id")
             .to_string();
 
-        let foreign = execute_builtin_tool(
+        let foreign = execute_builtin_tool_with_runtime(
             other_workspace.path(),
+            &runtime,
             GET_COMMAND_OUTPUT_TOOL,
             json!({
                 "processId": process_id,
@@ -4160,8 +4257,9 @@ mod tests {
                 "timeoutMs": null
             }),
         );
-        let missing = execute_builtin_tool(
+        let missing = execute_builtin_tool_with_runtime(
             other_workspace.path(),
+            &runtime,
             GET_COMMAND_OUTPUT_TOOL,
             json!({
                 "processId": "command-does-not-exist",
@@ -4170,8 +4268,9 @@ mod tests {
                 "timeoutMs": null
             }),
         );
-        let stop = execute_builtin_tool(
+        let stop = execute_builtin_tool_with_runtime(
             owner_workspace.path(),
+            &runtime,
             STOP_COMMAND_TOOL,
             json!({ "processId": launch.output["processId"], "timeoutMs": null }),
         );

@@ -526,31 +526,42 @@ impl BackgroundCommandRegistry {
     }
 
     /// Requests termination for every command owned by a workspace.
+    pub fn stop_for_workspace(
+        &self,
+        workspace_path: &Path,
+    ) -> Result<usize, BackgroundCommandError> {
+        let workspace_path = workspace_owner_path(workspace_path)?;
+        Ok(self.stop_matching(|entry| entry.workspace_path == workspace_path))
+    }
+
+    /// Backwards-compatible alias for [`Self::stop_for_workspace`].
     pub fn stop_workspace(&self, workspace_path: &Path) -> Result<usize, BackgroundCommandError> {
-        let workspace_path = std::fs::canonicalize(workspace_path).map_err(|source| {
-            BackgroundCommandError::Spawn {
-                command: "canonicalize execution workspace".to_string(),
-                source,
-            }
-        })?;
-        let entries = {
-            let state = lock_recover(&self.inner.state);
-            state
-                .entries
-                .values()
-                .filter(|entry| entry.workspace_path == workspace_path)
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-        let stopped = entries
-            .iter()
-            .filter(|entry| entry.request_termination(BackgroundCommandTermination::ExplicitStop))
-            .count();
-        Ok(stopped)
+        self.stop_for_workspace(workspace_path)
+    }
+
+    /// Requests termination for every command owned by a chat, across its execution workspaces.
+    pub fn stop_for_chat(&self, chat_id: &str) -> usize {
+        self.stop_matching(|entry| entry.owner_chat_id.as_deref() == Some(chat_id))
+    }
+
+    /// Requests termination for every command owned by one chat in one workspace.
+    ///
+    /// Hosts with a shared registry must use this scoped variant because chat IDs are only
+    /// guaranteed to be meaningful within their workspace.
+    pub fn stop_for_workspace_chat(
+        &self,
+        workspace_path: &Path,
+        chat_id: &str,
+    ) -> Result<usize, BackgroundCommandError> {
+        let workspace_path = workspace_owner_path(workspace_path)?;
+        Ok(self.stop_matching(|entry| {
+            entry.workspace_path == workspace_path
+                && entry.owner_chat_id.as_deref() == Some(chat_id)
+        }))
     }
 
     /// Force-terminates all active process trees. Hosts should call this during orderly shutdown.
-    pub fn shutdown(&self) {
+    pub fn shutdown_all(&self) {
         let entries = {
             let state = lock_recover(&self.inner.state);
             state.entries.values().cloned().collect::<Vec<_>>()
@@ -563,9 +574,30 @@ impl BackgroundCommandRegistry {
         }
     }
 
+    /// Backwards-compatible alias for [`Self::shutdown_all`].
+    pub fn shutdown(&self) {
+        self.shutdown_all();
+    }
+
     pub fn prune_completed(&self) {
         let mut state = lock_recover(&self.inner.state);
         prune_completed_entries(&mut state, self.inner.limits.completed_retention);
+    }
+
+    fn stop_matching(&self, predicate: impl Fn(&BackgroundCommandEntry) -> bool) -> usize {
+        let entries = {
+            let state = lock_recover(&self.inner.state);
+            state
+                .entries
+                .values()
+                .filter(|entry| predicate(entry))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        entries
+            .iter()
+            .filter(|entry| entry.request_termination(BackgroundCommandTermination::ExplicitStop))
+            .count()
     }
 
     fn entry(
@@ -798,6 +830,26 @@ fn normalize_execution_paths(
         });
     }
     Ok((workspace_path, cwd))
+}
+
+fn workspace_owner_path(workspace_path: &Path) -> Result<PathBuf, BackgroundCommandError> {
+    match std::fs::canonicalize(workspace_path) {
+        Ok(path) => Ok(path),
+        // Workspace configuration stores canonical local paths. If the directory was removed
+        // before host cleanup runs, preserve that stored path so existing entries still match.
+        Err(source)
+            if matches!(
+                source.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(workspace_path.to_path_buf())
+        }
+        Err(source) => Err(BackgroundCommandError::Spawn {
+            command: "canonicalize execution workspace".to_string(),
+            source,
+        }),
+    }
 }
 
 fn spawn_managed_child(
@@ -1081,6 +1133,55 @@ mod tests {
             error,
             BackgroundCommandError::WorkspaceProcessLimit { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_stops_only_commands_owned_by_the_deleted_chat_in_its_workspace() {
+        let workspace = tempfile::tempdir().expect("first workspace");
+        let other_workspace = tempfile::tempdir().expect("second workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let mut first_request = background_request(workspace.path(), "sleep 30");
+        first_request.owner_chat_id = Some("chat-1".to_string());
+        let first = registry.start(first_request).expect("start first command");
+        let mut second_request = background_request(other_workspace.path(), "sleep 30");
+        second_request.owner_chat_id = Some("chat-1".to_string());
+        let second = registry
+            .start(second_request)
+            .expect("start second command");
+
+        let stopped = registry
+            .stop_for_workspace_chat(workspace.path(), "chat-1")
+            .expect("stop first workspace chat");
+        let terminal = wait_for_terminal(&registry, &first.command_id);
+        let other = registry
+            .command(&second.command_id)
+            .expect("second command");
+        registry.shutdown_all();
+
+        assert_eq!(stopped, 1);
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+        assert_eq!(other.status, BackgroundCommandStatus::Running);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_stops_commands_after_the_workspace_directory_is_removed() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let workspace_path = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(&workspace_path, "sleep 30"))
+            .expect("start command");
+
+        std::fs::remove_dir_all(&workspace_path).expect("remove workspace");
+        let stopped = registry
+            .stop_for_workspace(&workspace_path)
+            .expect("stop removed workspace command");
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert_eq!(stopped, 1);
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
     }
 
     #[cfg(unix)]

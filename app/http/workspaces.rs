@@ -1051,6 +1051,18 @@ pub(crate) async fn delete_workspace(
         .then(|| removed.path.clone())
         .filter(|path| !path.as_os_str().is_empty());
 
+    if !removed.is_remote()
+        && let Err(error) = state
+            .background_command_registry
+            .stop_for_workspace(&removed.path)
+    {
+        tracing::warn!(
+            workspace_id = %removed.id,
+            error = %error,
+            "failed to stop managed commands for deleted workspace"
+        );
+    }
+
     save_config(&state, &mut config)?;
     if let Some(path) = remote_logo_cache_path
         && let Err(source) = fs::remove_dir_all(&path)

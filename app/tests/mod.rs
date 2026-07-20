@@ -1012,6 +1012,7 @@ fn test_prepared_chat_context(
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -14320,6 +14321,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -16248,6 +16250,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -16665,6 +16668,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         mcp_registry,
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -31794,6 +31798,7 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         scheduled_task_scheduler,
         plan_auto_run_scheduler,
         tool_resource_locks: ToolResourceLockRegistry::default(),
+        background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         remote_workspace_manager: remote_workspace::RemoteWorkspaceManager::default(),
         remote_server_connections: Arc::new(Mutex::new(HashSet::new())),

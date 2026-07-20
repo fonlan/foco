@@ -140,8 +140,8 @@ use crate::{
         ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
         REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
         SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool, execute_web_tool,
-        image_tool_timeout_ms, materialize_brokered_image_result,
+        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
+        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
         open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
         reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
     },
@@ -2704,6 +2704,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         token: options.token.clone(),
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
+        background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
         user_profile_dir: resolve_remote_sidecar_user_profile_dir(),
         last_config_hash: Arc::new(Mutex::new(None)),
         runtime_config: Arc::new(Mutex::new(None)),
@@ -2718,6 +2719,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     };
 
     let heartbeat_state = state.clone();
+    let shutdown_state = state.clone();
     // Build the router before printing bootstrap. Route-registration panics must
     // fail the process before main reads a readiness line and opens the tunnel.
     let app = Router::new()
@@ -3067,6 +3069,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let server_result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
+    shutdown_state.background_command_registry.shutdown_all();
     if let Some(session_file) = options.session_file.as_deref() {
         let _ = fs::remove_file(session_file);
     }
@@ -3527,6 +3530,7 @@ pub(crate) struct RemoteSidecarState {
     shutdown_tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
     workspace_id: String,
     pub(crate) workspace_path: String,
+    background_command_registry: foco_tools::BackgroundCommandRegistry,
     /// Sidecar-local user profile (remote `$HOME`). Used only for remote global
     /// Skills under `~/.agents/skills`. Never taken from the main-process host
     /// profile or guessed from the workspace parent. `None` when HOME is missing
@@ -3589,6 +3593,7 @@ async fn remote_sidecar_health(State(state): State<RemoteSidecarState>) -> Json<
 }
 
 async fn remote_sidecar_shutdown(State(state): State<RemoteSidecarState>) -> Json<Value> {
+    state.background_command_registry.shutdown_all();
     if let Ok(mut tx) = state.shutdown_tx.lock() {
         if let Some(tx) = tx.take() {
             let _ = tx.send(());
@@ -9280,6 +9285,9 @@ async fn remote_sidecar_delete_chat(
     if chat_id.is_empty() {
         return Err(ApiError::bad_request("chat id must not be empty").into_response());
     }
+    // Stop managed commands before clearing run streams and deleting history. A successful
+    // background handle outlives its originating run, but not its owning chat.
+    state.background_command_registry.stop_for_chat(&chat_id);
     // Stop background runners before mutating/deleting history so a late
     // completion cannot rewrite a deleted chat. Matches host delete semantics
     // (no 409) while keeping edit-under-active-run as 409.
@@ -12877,7 +12885,7 @@ async fn remote_sidecar_execute_tool_call(
         }
     });
 
-    let execution = execute_tool(
+    let execution = execute_tool_with_runtime(
         tool_catalog.workspace_mcp_registry.clone(),
         hook_runtime.clone(),
         &global_hooks,
@@ -12917,6 +12925,7 @@ async fn remote_sidecar_execute_tool_call(
         &tool_call.call_id,
         &tool_call.name,
         tool_call.arguments.clone(),
+        foco_tools::BuiltinToolRuntime::new(state.background_command_registry.clone()),
     )
     .await;
 
@@ -20775,6 +20784,7 @@ mod tests {
                 shutdown_tx: default_shutdown_tx(),
                 workspace_id: "workspace".to_string(),
                 workspace_path,
+                background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
                 user_profile_dir,
             },
             broker_rx,
@@ -24525,6 +24535,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_string_lossy().to_string(),
+            background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
             user_profile_dir: None,
         };
         let base_payload = json!({
@@ -27236,6 +27247,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_string_lossy().to_string(),
+            background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
             user_profile_dir: None,
         };
 
@@ -33366,6 +33378,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
             user_profile_dir: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -33435,6 +33448,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
             user_profile_dir: None,
         };
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -37882,6 +37896,7 @@ mod tests {
             shutdown_tx: default_shutdown_tx(),
             workspace_id: "workspace".to_string(),
             workspace_path: "/tmp/workspace".to_string(),
+            background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
             user_profile_dir: None,
         };
 
