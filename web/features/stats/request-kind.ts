@@ -3,17 +3,42 @@ import type { Translate } from "../../api/types";
 export const CHAT_COMPLETION_REQUEST_KIND = "chat completion";
 export const CONTEXT_COMPRESSION_REQUEST_KIND = "contextCompression";
 
+export const STABLE_REQUEST_KINDS = [
+  CHAT_COMPLETION_REQUEST_KIND,
+  CONTEXT_COMPRESSION_REQUEST_KIND,
+  "prompt hook",
+  "chat title generation",
+  "memory extraction",
+  "memory retrieval",
+  "model availability test",
+  "workspace spec generation",
+  "workspace spec update",
+  "workspace spec compaction",
+  "workspace spec update compaction",
+  "git_commit_message_generation",
+] as const;
+
+type StableRequestKind = (typeof STABLE_REQUEST_KINDS)[number];
+
+const REQUEST_KIND_TRANSLATION_KEYS: Record<StableRequestKind, string> = {
+  "chat completion": "Chat completion",
+  contextCompression: "Context compression",
+  "prompt hook": "Prompt hook",
+  "chat title generation": "Chat title generation",
+  "memory extraction": "Memory extraction",
+  "memory retrieval": "Memory retrieval",
+  "model availability test": "Model availability test",
+  "workspace spec generation": "Workspace Spec generation",
+  "workspace spec update": "Workspace Spec update",
+  "workspace spec compaction": "Workspace Spec compaction",
+  "workspace spec update compaction": "Workspace Spec update compaction",
+  git_commit_message_generation: "Git commit message generation",
+};
+
 export function requestKindLabel(requestKind: string, t: Translate) {
-  switch (requestKind) {
-    case CHAT_COMPLETION_REQUEST_KIND:
-      return t("Chat completion");
-    case CONTEXT_COMPRESSION_REQUEST_KIND:
-      return t("Context compression");
-    case "prompt hook":
-      return t("Prompt hook");
-    default:
-      return requestKind;
-  }
+  const translationKey =
+    REQUEST_KIND_TRANSLATION_KEYS[requestKind as StableRequestKind];
+  return translationKey ? t(translationKey) : requestKind;
 }
 
 export function requestKindBadgeClass(requestKind: string) {

@@ -58,8 +58,7 @@ import {
   writeAiStatsVisibleColumnIds,
 } from "./ai-stats-preferences";
 import {
-  CHAT_COMPLETION_REQUEST_KIND,
-  CONTEXT_COMPRESSION_REQUEST_KIND,
+  STABLE_REQUEST_KINDS,
   requestKindBadgeClass,
   requestKindLabel,
 } from "./request-kind";
@@ -230,12 +229,10 @@ export function ApiStatsPanel({
     requests.map((request) => request.modelId),
   );
   const requestKindOptions = auditOptions(
-    [CHAT_COMPLETION_REQUEST_KIND, CONTEXT_COMPRESSION_REQUEST_KIND].map(
-      (requestKind) => ({
-        label: requestKindLabel(requestKind, t),
-        value: requestKind,
-      }),
-    ),
+    STABLE_REQUEST_KINDS.map((requestKind) => ({
+      label: requestKindLabel(requestKind, t),
+      value: requestKind,
+    })),
     [
       ...requests.map((request) => request.requestKind),
       ...summary.requestKindBreakdown.map((item) => item.requestKind),

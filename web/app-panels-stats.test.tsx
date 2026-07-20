@@ -4401,7 +4401,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
-  it("localizes provider-row transport suffixes for zh-CN", async () => {
+  it("localizes provider-row transport suffixes and request kinds for zh-CN", async () => {
     const zhSettings = {
       ...settings,
       general: { ...settings.general, language: "zh-CN" },
@@ -4415,9 +4415,9 @@ describe("app-panels-stats verification surfaces", () => {
     ).map(([id, transport]) => ({
       ...aiStatistics.requests[0],
       id,
+      requestKind: "workspace spec update",
       transport,
     }));
-
     vi.mocked(fetch).mockImplementation((input, init) => {
       const rawPath =
         typeof input === "string"
@@ -4439,6 +4439,18 @@ describe("app-panels-stats verification surfaces", () => {
             requests,
             totalCount: requests.length,
             totalPages: 1,
+          }),
+        );
+      }
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/req-http") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              requestKind: "workspace spec update",
+            },
           }),
         );
       }
@@ -4465,6 +4477,23 @@ describe("app-panels-stats verification surfaces", () => {
       expect(modelLine.textContent).toBe("GPT Test");
       expect(modelLine.textContent).not.toMatch(/HTTP|WebSocket|未知/);
     }
+
+    const requestTypeFilter = screen.getByRole("combobox", {
+      name: "请求类型",
+    });
+    expect(
+      within(requestTypeFilter).getByRole("option", {
+        name: "Workspace Spec 更新",
+      }),
+    ).toHaveValue("workspace spec update");
+    expect(within(table).getAllByText("Workspace Spec 更新")).toHaveLength(3);
+
+    await userEvent.click(
+      within(table).getAllByRole("button", { name: "查看请求详情" })[0],
+    );
+    const dialog = await screen.findByRole("dialog", { name: "请求详情" });
+    expect(within(dialog).getByText("请求类型")).toBeInTheDocument();
+    expect(within(dialog).getByText("Workspace Spec 更新")).toBeInTheDocument();
   });
 
   it("forwards vertical request audit wheel input with a non-passive listener", async () => {
