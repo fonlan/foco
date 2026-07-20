@@ -25,10 +25,10 @@ use crate::memory_runtime::{
 use crate::memory_runtime::{apply_memory_expiration_to_fact, expire_due_memories};
 use crate::*;
 
-const MEMORY_DREAM_JOBS_LIMIT_DEFAULT: u32 = 50;
-const MEMORY_DREAM_JOBS_LIMIT_MAX: u32 = 200;
-const MEMORY_DREAM_CHANGES_LIMIT_DEFAULT: u32 = 500;
-const MEMORY_DREAM_CHANGES_LIMIT_MAX: u32 = 10_000;
+pub(crate) const MEMORY_DREAM_JOBS_LIMIT_DEFAULT: u32 = 50;
+pub(crate) const MEMORY_DREAM_JOBS_LIMIT_MAX: u32 = 200;
+pub(crate) const MEMORY_DREAM_CHANGES_LIMIT_DEFAULT: u32 = 500;
+pub(crate) const MEMORY_DREAM_CHANGES_LIMIT_MAX: u32 = 10_000;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1477,6 +1477,51 @@ pub(crate) fn memory_dream_workspace_jobs_response(
     })
 }
 
+/// Build a workspace-owned Dream job response after checking the sidecar's
+/// workspace scope. This keeps remote detail responses aligned with the local
+/// handler without allowing a sidecar workspace to read another job record.
+pub(crate) fn memory_dream_workspace_job_response(
+    database: &MemoryDatabase,
+    workspace_id: &str,
+    job_id: &str,
+) -> Result<MemoryDreamJobResponse, ApiError> {
+    let job = memory_dream_workspace_job_record(database, workspace_id, job_id)?;
+    let job = memory_dream_job_summary(database, job, Some(workspace_id.to_string()))?;
+    Ok(MemoryDreamJobResponse { job })
+}
+
+/// Build workspace-owned Dream changes after checking the job's scope and
+/// owner. The job existence check happens before loading changes so a job id
+/// from a different workspace cannot leak an empty or partial response.
+pub(crate) fn memory_dream_workspace_changes_response(
+    database: &MemoryDatabase,
+    workspace_id: &str,
+    job_id: &str,
+    status: Option<MemoryDreamChangeStatus>,
+    limit: u32,
+) -> Result<MemoryDreamChangesResponse, ApiError> {
+    memory_dream_workspace_job_record(database, workspace_id, job_id)?;
+    let changes = database
+        .dream_changes_for_job(job_id, status, limit)
+        .map_err(ApiError::from_memory_error)?
+        .into_iter()
+        .map(memory_dream_change_summary)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MemoryDreamChangesResponse { changes })
+}
+
+fn memory_dream_workspace_job_record(
+    database: &MemoryDatabase,
+    workspace_id: &str,
+    job_id: &str,
+) -> Result<MemoryDreamJobRecord, ApiError> {
+    database
+        .dream_job(job_id)
+        .map_err(ApiError::from_memory_error)?
+        .filter(|job| job.scope == "workspace" && job.workspace_id.as_deref() == Some(workspace_id))
+        .ok_or_else(|| ApiError::bad_request(format!("memory Dream job was not found: {job_id}")))
+}
+
 #[derive(Debug, Clone)]
 enum MemoryDreamJobCandidate {
     Local(PendingMemoryDreamJob),
@@ -1936,7 +1981,7 @@ fn memory_dream_transcript_workspace_id_by_chat_lookup(
     };
     let chat_id = transcript_chat_id.to_string();
     let (chat_to_workspace, _stats) = resolve_legacy_transcript_chat_ids_with_stats(
-        config.workspaces.iter(),
+        config.local_workspaces(),
         std::slice::from_ref(&chat_id),
         |workspace| {
             WorkspaceDatabase::open_or_create(&workspace.path)

@@ -48,8 +48,8 @@ use foco_store::{
         WorkspaceConfig, WorkspaceLocation,
     },
     memory::{
-        MemoryDatabase, MemoryDreamJobStatus, MemoryDreamScope, MemoryKind, MemoryScope,
-        MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
+        MemoryDatabase, MemoryDreamChangeStatus, MemoryDreamJobStatus, MemoryDreamScope,
+        MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
         AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
@@ -17721,7 +17721,16 @@ async fn remote_sidecar_memory_get(
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, axum::response::Response> {
     if path == "dream/jobs" {
+        remote_sidecar_memory_dream_workspace_query(&state, &query)?;
         return remote_sidecar_memory_dream_jobs(state, query).await;
+    }
+    if let Some(job_id) = remote_sidecar_memory_dream_job_id(&path, "/changes") {
+        remote_sidecar_memory_dream_workspace_query(&state, &query)?;
+        return remote_sidecar_memory_dream_changes(state, job_id, query).await;
+    }
+    if let Some(job_id) = remote_sidecar_memory_dream_job_id(&path, "") {
+        remote_sidecar_memory_dream_workspace_query(&state, &query)?;
+        return remote_sidecar_memory_dream_job(state, job_id).await;
     }
 
     if path == "sources" {
@@ -17749,26 +17758,59 @@ async fn remote_sidecar_memory_get(
     Err(remote_sidecar_memory_unimplemented_response(&path))
 }
 
-async fn remote_sidecar_memory_dream_jobs(
-    state: RemoteSidecarState,
-    query: HashMap<String, String>,
-) -> Result<Json<Value>, axum::response::Response> {
-    let scope = MemoryDreamScope::parse(
-        query
-            .get("scope")
-            .map(String::as_str)
-            .unwrap_or("workspace"),
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+fn remote_sidecar_memory_dream_workspace_query(
+    state: &RemoteSidecarState,
+    query: &HashMap<String, String>,
+) -> Result<(), axum::response::Response> {
+    let scope = query
+        .get("scope")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("workspace");
+    let scope = MemoryDreamScope::parse(scope)
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
     if scope != MemoryDreamScope::Workspace {
         return Err(
             ApiError::bad_request("remote Dream history only supports workspace scope")
                 .into_response(),
         );
     }
+    if let Some(workspace_id) = query
+        .get("workspaceId")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|workspace_id| !workspace_id.is_empty())
+        && workspace_id != state.workspace_id
+    {
+        return Err(
+            ApiError::bad_request("remote Dream workspaceId does not match the sidecar")
+                .into_response(),
+        );
+    }
+    Ok(())
+}
+
+fn remote_sidecar_memory_dream_job_id<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
+    let job_id = path.strip_prefix("dream/jobs/")?;
+    let job_id = if suffix.is_empty() {
+        job_id
+    } else {
+        job_id.strip_suffix(suffix)?
+    };
+    let job_id = job_id.trim();
+    (!job_id.is_empty() && !job_id.contains('/')).then_some(job_id)
+}
+
+async fn remote_sidecar_memory_dream_jobs(
+    state: RemoteSidecarState,
+    query: HashMap<String, String>,
+) -> Result<Json<Value>, axum::response::Response> {
     let status = query
         .get("status")
         .map(String::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
         .map(MemoryDreamJobStatus::parse)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
@@ -17782,8 +17824,8 @@ async fn remote_sidecar_memory_dream_jobs(
         .or_else(|| query.get("page_size"))
         .or_else(|| query.get("limit"))
         .and_then(|value| value.parse::<u32>().ok())
-        .unwrap_or(50)
-        .clamp(1, 200);
+        .unwrap_or(crate::http::memory::MEMORY_DREAM_JOBS_LIMIT_DEFAULT)
+        .clamp(1, crate::http::memory::MEMORY_DREAM_JOBS_LIMIT_MAX);
     let fetch_limit = match query.get("fetchLimit") {
         Some(value) => Some(value.parse::<u32>().map_err(|_| {
             ApiError::bad_request("fetchLimit must be a positive integer").into_response()
@@ -17805,10 +17847,69 @@ async fn remote_sidecar_memory_dream_jobs(
         fetch_limit,
     )
     .map_err(|error| error.into_response())?;
-    let response = serde_json::to_value(response).map_err(|_| {
+    remote_sidecar_memory_dream_json_response(response)
+}
+
+async fn remote_sidecar_memory_dream_job(
+    state: RemoteSidecarState,
+    job_id: &str,
+) -> Result<Json<Value>, axum::response::Response> {
+    let database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+    let response = crate::http::memory::memory_dream_workspace_job_response(
+        &database,
+        &state.workspace_id,
+        job_id,
+    )
+    .map_err(|error| error.into_response())?;
+    remote_sidecar_memory_dream_json_response(response)
+}
+
+async fn remote_sidecar_memory_dream_changes(
+    state: RemoteSidecarState,
+    job_id: &str,
+    query: HashMap<String, String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let status = query
+        .get("status")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(MemoryDreamChangeStatus::parse)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let limit = query
+        .get("limit")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|limit| !limit.is_empty())
+        .map(|limit| {
+            limit.parse::<u32>().map_err(|_| {
+                ApiError::bad_request("limit must be a positive integer").into_response()
+            })
+        })
+        .transpose()?
+        .unwrap_or(crate::http::memory::MEMORY_DREAM_CHANGES_LIMIT_DEFAULT)
+        .clamp(1, crate::http::memory::MEMORY_DREAM_CHANGES_LIMIT_MAX);
+    let database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+    let response = crate::http::memory::memory_dream_workspace_changes_response(
+        &database,
+        &state.workspace_id,
+        job_id,
+        status,
+        limit,
+    )
+    .map_err(|error| error.into_response())?;
+    remote_sidecar_memory_dream_json_response(response)
+}
+
+fn remote_sidecar_memory_dream_json_response<T: Serialize>(
+    response: T,
+) -> Result<Json<Value>, axum::response::Response> {
+    serde_json::to_value(response).map(Json).map_err(|_| {
         ApiError::internal("failed to serialize remote Dream history response").into_response()
-    })?;
-    Ok(Json(response))
+    })
 }
 
 async fn remote_sidecar_memory_mutation(
@@ -34856,12 +34957,115 @@ mod tests {
         assert!(state.broker_pending.lock().await.is_empty());
     }
 
-    #[test]
-    fn remote_sidecar_memory_dream_known_gap_returns_not_implemented() {
-        let response =
-            remote_sidecar_memory_unimplemented_response("dream/jobs/dream-job-42/changes");
+    #[tokio::test]
+    async fn remote_sidecar_memory_dream_detail_and_changes_only_serve_owned_workspace_jobs() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut database = foco_store::open_workspace_memory_database(workspace.path())
+            .expect("workspace memory database");
+        for (id, workspace_id) in [
+            ("owned-job", "workspace"),
+            ("foreign-job", "other-workspace"),
+        ] {
+            database
+                .insert_dream_job(foco_store::memory::NewMemoryDreamJob {
+                    id,
+                    scope: MemoryDreamScope::Workspace,
+                    workspace_id: Some(workspace_id),
+                    trigger_type: foco_store::memory::MemoryDreamTriggerType::Manual,
+                    mode: foco_store::memory::MemoryDreamRunMode::DeterministicOnly,
+                    status: MemoryDreamJobStatus::Completed,
+                    model_id: None,
+                    input_summary_json: "{}",
+                    output_summary_json: None,
+                    transcript_chat_id: None,
+                    error_message: None,
+                })
+                .expect("insert Dream job");
+        }
+        drop(database);
 
-        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let query = HashMap::from([
+            ("scope".to_string(), "workspace".to_string()),
+            ("workspaceId".to_string(), "workspace".to_string()),
+        ]);
+        let Json(list) = remote_sidecar_memory_get(
+            State(state.clone()),
+            AxumPath("dream/jobs".to_string()),
+            Query(query.clone()),
+        )
+        .await
+        .expect("owned Dream list");
+        assert_eq!(list["totalCount"], 1);
+        assert_eq!(list["jobs"][0]["id"], "owned-job");
+
+        let Json(detail) = remote_sidecar_memory_get(
+            State(state.clone()),
+            AxumPath("dream/jobs/owned-job".to_string()),
+            Query(query.clone()),
+        )
+        .await
+        .expect("owned Dream detail");
+        assert_eq!(detail["job"]["id"], "owned-job");
+        assert_eq!(detail["job"]["workspaceId"], "workspace");
+
+        let Json(changes) = remote_sidecar_memory_get(
+            State(state.clone()),
+            AxumPath("dream/jobs/owned-job/changes".to_string()),
+            Query(query.clone()),
+        )
+        .await
+        .expect("owned Dream changes");
+        assert_eq!(changes["changes"], json!([]));
+
+        let error = remote_sidecar_memory_get(
+            State(state),
+            AxumPath("dream/jobs/foreign-job".to_string()),
+            Query(query),
+        )
+        .await
+        .expect_err("foreign Dream job must not be visible");
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_memory_dream_rejects_global_scope_mismatched_workspace_and_extra_path()
+    {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+
+        let global_scope = remote_sidecar_memory_get(
+            State(state.clone()),
+            AxumPath("dream/jobs".to_string()),
+            Query(HashMap::from([(
+                String::from("scope"),
+                String::from("global"),
+            )])),
+        )
+        .await
+        .expect_err("global Dream scope must stay in the main process");
+        assert_eq!(global_scope.status(), StatusCode::BAD_REQUEST);
+
+        let wrong_workspace = remote_sidecar_memory_get(
+            State(state.clone()),
+            AxumPath("dream/jobs/owned-job".to_string()),
+            Query(HashMap::from([(
+                String::from("workspaceId"),
+                String::from("other-workspace"),
+            )])),
+        )
+        .await
+        .expect_err("mismatched workspace must be rejected");
+        assert_eq!(wrong_workspace.status(), StatusCode::BAD_REQUEST);
+
+        let extra_path = remote_sidecar_memory_get(
+            State(state),
+            AxumPath("dream/jobs/owned-job/changes/unexpected".to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect_err("extra path must not match a Dream read handler");
+        assert_eq!(extra_path.status(), StatusCode::NOT_IMPLEMENTED);
     }
 
     #[tokio::test]

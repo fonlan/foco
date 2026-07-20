@@ -1173,6 +1173,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_memory_dream_detail_stays_on_the_main_process() {
+        let request = Request::builder()
+            .uri("/api/memory/dream/jobs/dream-job-42?workspaceId=remote-workspace&scope=global")
+            .body(Body::empty())
+            .expect("valid request");
+
+        let (target, _) = proxy_global_workspace_route(request)
+            .await
+            .expect("route classification");
+
+        assert_eq!(target, None);
+    }
+
+    #[tokio::test]
     async fn global_memory_mutation_remains_on_the_main_process() {
         let request = Request::builder()
             .method(axum::http::Method::POST)

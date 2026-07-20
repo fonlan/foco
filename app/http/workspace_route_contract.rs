@@ -1066,8 +1066,7 @@ pub(crate) const GLOBAL_WORKSPACE_ROUTE_CONTRACTS: &[GlobalWorkspaceRouteContrac
         Get,
         "memory/dream/jobs/{job_id}",
         Query,
-        true,
-        "remote sidecar returns an explicit unsupported response until workspace/chat Dream job detail is implemented"
+        true
     ),
     global_workspace_route!(
         "memory-dream-job-changes",
@@ -1075,8 +1074,7 @@ pub(crate) const GLOBAL_WORKSPACE_ROUTE_CONTRACTS: &[GlobalWorkspaceRouteContrac
         Get,
         "memory/dream/jobs/{job_id}/changes",
         Query,
-        true,
-        "remote sidecar returns an explicit unsupported response until workspace/chat Dream job changes are implemented"
+        true
     ),
     global_workspace_route!(
         "hooks-settings-write",
@@ -1449,6 +1447,22 @@ mod tests {
                 contract.browser_path,
                 contract.id
             );
+        }
+    }
+
+    #[test]
+    fn memory_dream_reads_require_the_sidecar_without_known_gap_exceptions() {
+        for id in [
+            "memory-dream-jobs",
+            "memory-dream-job",
+            "memory-dream-job-changes",
+        ] {
+            let contract = GLOBAL_WORKSPACE_ROUTE_CONTRACTS
+                .iter()
+                .find(|contract| contract.id == id)
+                .expect("Dream route contract");
+            assert_eq!(contract.alignment, RemoteRouteAlignment::Required, "{id}");
+            assert_eq!(contract.exception, None, "{id}");
         }
     }
 
