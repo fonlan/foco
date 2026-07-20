@@ -1009,6 +1009,14 @@ async fn execute_tool_unbudgeted(
         }
     }
 
+    normalize_read_file_skill_alias_arguments(
+        tool_name,
+        workspace_path,
+        tool_workspace_path,
+        &skill_read_root_dirs,
+        &mut arguments,
+    );
+
     let tool_timeout_ms = match execution_tool_timeout_ms(tool_name, &arguments) {
         Ok(timeout_ms) => timeout_ms,
         Err(error) => {
@@ -3394,6 +3402,162 @@ enum ExternalReadonlyTargetKind {
     Path,
 }
 
+/// Rewrites a missing worktree-relative Skill path to the matching real Skill file
+/// from the run-scoped snapshot. This is deliberately narrower than external-read
+/// authorization: it only corrects `read_file` inputs and leaves all other tools on
+/// their execution-root resolvers.
+fn normalize_read_file_skill_alias_arguments(
+    tool_name: &str,
+    workspace_path: &Path,
+    tool_workspace_path: &Path,
+    skill_read_root_dirs: &[PathBuf],
+    arguments: &mut Value,
+) {
+    let Some(path) = arguments.get("path").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(alias_target) = resolve_worktree_read_file_skill_alias(
+        tool_name,
+        workspace_path,
+        tool_workspace_path,
+        skill_read_root_dirs,
+        path,
+    ) else {
+        return;
+    };
+    let Some(alias_target) = alias_target.to_str() else {
+        return;
+    };
+    let Some(path) = arguments.get_mut("path") else {
+        return;
+    };
+
+    *path = Value::String(alias_target.to_string());
+}
+
+fn resolve_worktree_read_file_skill_alias(
+    tool_name: &str,
+    workspace_path: &Path,
+    tool_workspace_path: &Path,
+    skill_read_root_dirs: &[PathBuf],
+    path: &str,
+) -> Option<PathBuf> {
+    if tool_name != READ_FILE_TOOL || workspace_path == tool_workspace_path {
+        return None;
+    }
+
+    let shared_workspace_root = std::fs::canonicalize(workspace_path).ok()?;
+    let worktree_root = std::fs::canonicalize(tool_workspace_path).ok()?;
+    if shared_workspace_root == worktree_root {
+        return None;
+    }
+
+    let relative_path = worktree_skill_relative_path(path, tool_workspace_path)?;
+    if !is_workspace_skill_relative_path(&relative_path) {
+        return None;
+    }
+
+    let worktree_target = tool_workspace_path.join(&relative_path);
+    match std::fs::symlink_metadata(&worktree_target) {
+        Ok(_) => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return None,
+    }
+    if worktree_path_has_symlink_component(tool_workspace_path, &relative_path) {
+        return None;
+    }
+
+    let canonical_candidate =
+        std::fs::canonicalize(shared_workspace_root.join(relative_path)).ok()?;
+    if !std::fs::metadata(&canonical_candidate).ok()?.is_file()
+        || !path_is_within_runtime_skill_read_roots(&canonical_candidate, skill_read_root_dirs)
+    {
+        return None;
+    }
+
+    Some(canonical_candidate)
+}
+
+fn worktree_skill_relative_path(path: &str, tool_workspace_path: &Path) -> Option<PathBuf> {
+    let input = Path::new(path);
+    if input.as_os_str().is_empty()
+        || input
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+
+    let relative_path = if input.is_absolute() {
+        if tool_workspace_path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        input.strip_prefix(tool_workspace_path).ok()?.to_path_buf()
+    } else {
+        input.to_path_buf()
+    };
+
+    if relative_path.as_os_str().is_empty()
+        || relative_path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+                    | std::path::Component::ParentDir
+            )
+        })
+    {
+        return None;
+    }
+
+    Some(relative_path)
+}
+
+fn is_workspace_skill_relative_path(path: &Path) -> bool {
+    let mut components = path.components();
+    let Some(std::path::Component::Normal(location)) = components.next() else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(skills)) = components.next() else {
+        return false;
+    };
+    let Some(std::path::Component::Normal(_skill_name)) = components.next() else {
+        return false;
+    };
+
+    (location == ".agents" || location == ".claude")
+        && skills == "skills"
+        && components.next().is_some()
+}
+
+fn worktree_path_has_symlink_component(worktree_root: &Path, relative_path: &Path) -> bool {
+    let mut current = worktree_root.to_path_buf();
+    for component in relative_path.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return true;
+        };
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => return true,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(_) => return true,
+        }
+    }
+    false
+}
+
+fn path_is_within_runtime_skill_read_roots(target_path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .ok()
+            .is_some_and(|root| target_path.starts_with(root))
+    })
+}
+
 fn is_external_readonly_access_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -3828,6 +3992,201 @@ mod tests {
         workspace::{NewAgentTeam, WorkspaceDatabase, workspace_database_path},
     };
     use std::fs;
+
+    fn worktree_skill_alias_fixture() -> (tempfile::TempDir, tempfile::TempDir, PathBuf, PathBuf) {
+        let shared_workspace = tempfile::tempdir().expect("shared workspace");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let skill_root = shared_workspace.path().join(".agents/skills/example");
+        let reference = skill_root.join("references/guide.md");
+        fs::create_dir_all(reference.parent().expect("reference parent"))
+            .expect("create skill reference directory");
+        fs::write(skill_root.join("SKILL.md"), "skill instructions").expect("write skill");
+        fs::write(&reference, "reference instructions").expect("write reference");
+        (shared_workspace, worktree, skill_root, reference)
+    }
+
+    #[test]
+    fn read_file_skill_alias_redirects_missing_relative_skill_file() {
+        let (shared_workspace, worktree, skill_root, _) = worktree_skill_alias_fixture();
+        let expected = fs::canonicalize(skill_root.join("SKILL.md")).expect("canonical skill");
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+        let mut arguments = json!({
+            "path": ".agents/skills/example/SKILL.md",
+            "startLine": null,
+            "endLine": null,
+        });
+
+        normalize_read_file_skill_alias_arguments(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            &mut arguments,
+        );
+
+        assert_eq!(arguments["path"], expected.to_string_lossy().as_ref());
+        let execution = execute_builtin_tool_with_context_and_options(
+            worktree.path(),
+            BuiltinToolContext::for_chat(None),
+            READ_FILE_TOOL,
+            arguments,
+            None,
+            None,
+            true,
+        );
+        assert!(!execution.is_error, "{:?}", execution.output);
+        assert_eq!(
+            execution.output["path"],
+            expected.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn read_file_skill_alias_redirects_missing_worktree_absolute_nested_file() {
+        let (shared_workspace, worktree, skill_root, reference) = worktree_skill_alias_fixture();
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+        let missing_worktree_path = worktree
+            .path()
+            .join(".agents/skills/example/references/guide.md");
+
+        let resolved = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            &missing_worktree_path.to_string_lossy(),
+        );
+
+        assert_eq!(
+            resolved,
+            Some(fs::canonicalize(reference).expect("canonical reference"))
+        );
+    }
+
+    #[test]
+    fn read_file_skill_alias_redirects_missing_claude_skill_asset() {
+        let shared_workspace = tempfile::tempdir().expect("shared workspace");
+        let worktree = tempfile::tempdir().expect("worktree");
+        let skill_root = shared_workspace.path().join(".claude/skills/example");
+        let asset = skill_root.join("assets/template.txt");
+        fs::create_dir_all(asset.parent().expect("asset parent")).expect("create asset directory");
+        fs::write(&asset, "template").expect("write asset");
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+
+        let resolved = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".claude/skills/example/assets/template.txt",
+        );
+
+        assert_eq!(
+            resolved,
+            Some(fs::canonicalize(asset).expect("canonical asset"))
+        );
+    }
+
+    #[test]
+    fn read_file_skill_alias_requires_a_current_snapshot_root() {
+        let (shared_workspace, worktree, _, _) = worktree_skill_alias_fixture();
+
+        let resolved = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &[],
+            ".agents/skills/example/SKILL.md",
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_skill_alias_rejects_source_symlink_escape() {
+        let (shared_workspace, worktree, skill_root, _) = worktree_skill_alias_fixture();
+        let outside_file = tempfile::NamedTempFile::new().expect("outside file");
+        let escaped_file = skill_root.join("assets/escaped.txt");
+        fs::create_dir_all(escaped_file.parent().expect("asset parent"))
+            .expect("create asset directory");
+        std::os::unix::fs::symlink(outside_file.path(), &escaped_file)
+            .expect("create source symlink");
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+
+        let resolved = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".agents/skills/example/assets/escaped.txt",
+        );
+
+        assert_eq!(resolved, None);
+    }
+
+    #[test]
+    fn read_file_skill_alias_keeps_existing_worktree_file_and_rejects_unrouted_inputs() {
+        let (shared_workspace, worktree, skill_root, _) = worktree_skill_alias_fixture();
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+        let worktree_skill = worktree.path().join(".agents/skills/example/SKILL.md");
+        fs::create_dir_all(worktree_skill.parent().expect("worktree skill parent"))
+            .expect("create worktree skill directory");
+        fs::write(&worktree_skill, "worktree instructions").expect("write worktree skill");
+
+        let existing = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".agents/skills/example/SKILL.md",
+        );
+        let traversal = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            "../.agents/skills/example/SKILL.md",
+        );
+        let lookalike = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".agents/skills-lookalike/example/SKILL.md",
+        );
+        let other_tool = resolve_worktree_read_file_skill_alias(
+            FIND_FILES_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".agents/skills/example/SKILL.md",
+        );
+
+        assert_eq!(existing, None);
+        assert_eq!(traversal, None);
+        assert_eq!(lookalike, None);
+        assert_eq!(other_tool, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_skill_alias_rejects_worktree_symlink_components() {
+        let (shared_workspace, worktree, skill_root, _) = worktree_skill_alias_fixture();
+        let roots = vec![fs::canonicalize(&skill_root).expect("canonical skill root")];
+        std::os::unix::fs::symlink(shared_workspace.path(), worktree.path().join(".agents"))
+            .expect("create worktree symlink");
+
+        let resolved = resolve_worktree_read_file_skill_alias(
+            READ_FILE_TOOL,
+            shared_workspace.path(),
+            worktree.path(),
+            &roots,
+            ".agents/skills/example/missing.md",
+        );
+
+        assert_eq!(resolved, None);
+    }
 
     #[test]
     fn repeated_tool_call_detector_rejects_oversized_transport_id_before_execution() {

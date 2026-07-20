@@ -25,6 +25,12 @@ Attachment exact allowlist remains **read_file-only** (canonical file equality; 
 
 Symlink escapes that canonicalize outside the execution root are treated as external (not internal).
 
+## Isolated-worktree Skill aliases
+
+Before external-path classification, the app may normalize a `read_file.path` that names a missing worktree-local `.agents/skills/<skill>/...` or `.claude/skills/<skill>/...` file. The alias is available only when the shared workspace and execution worktree differ, the input is syntactically beneath that worktree without `..`, and the corresponding shared-workspace candidate canonicalizes to a regular file under one of the **current run's** `AvailableSkillsSnapshot.read_root_dirs`.
+
+Existing worktree targets, path-prefix lookalikes, directories, symlinked worktree components, non-snapshotted/disabled Skills, and all non-`read_file` tools keep their normal behavior. The rewritten canonical absolute path then goes through this document's ordinary authorization and `read_file` size/integrity handling, so the result reports the actual file that was read.
+
 ## `search_text` specifics
 
 1. **path** may be a file or a directory, same as ripgrep; not directory-only.
