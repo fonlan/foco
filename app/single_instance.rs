@@ -1,9 +1,10 @@
 use std::{
     fmt, fs,
-    io::{self, Write},
-    net::SocketAddr,
+    io::{self, Read, Write},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
+    time::Duration,
 };
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,10 @@ const METADATA_FILE_NAME: &str = ".foco-single-instance.json";
 const METADATA_VERSION: u8 = 1;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const METADATA_TEMP_FILE_ATTEMPTS: u64 = 16;
+const EXISTING_INSTANCE_PROBE_ATTEMPTS: usize = 20;
+const EXISTING_INSTANCE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const EXISTING_INSTANCE_CONNECT_TIMEOUT: Duration = Duration::from_millis(180);
+const EXISTING_INSTANCE_IO_TIMEOUT: Duration = Duration::from_millis(250);
 
 static NEXT_METADATA_TEMP_SUFFIX: AtomicU64 = AtomicU64::new(1);
 
@@ -117,6 +122,37 @@ impl SingleInstanceMetadata {
 pub(crate) enum SingleInstanceState {
     Starting,
     Ready,
+}
+
+/// Platform-neutral action selected after the main-service lock is already held elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExistingInstanceContentionAction {
+    OpenExistingUi,
+    ExitSilently,
+    ReportError,
+}
+
+/// Bounded observation of the process that currently owns the single-instance lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ExistingInstanceObservation {
+    pub(crate) metadata: Option<SingleInstanceMetadata>,
+    pub(crate) healthy_listen_addr: Option<SocketAddr>,
+}
+
+impl ExistingInstanceObservation {
+    fn unavailable(metadata: Option<SingleInstanceMetadata>) -> Self {
+        Self {
+            metadata,
+            healthy_listen_addr: None,
+        }
+    }
+
+    fn healthy(metadata: SingleInstanceMetadata, listen_addr: SocketAddr) -> Self {
+        Self {
+            metadata: Some(metadata),
+            healthy_listen_addr: Some(listen_addr),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -265,6 +301,140 @@ pub(crate) fn read_single_instance_metadata(
     metadata.validate(&metadata_path)?;
 
     Ok(Some(metadata))
+}
+
+/// Classifies the user-facing behavior after another process has won the main-service lock.
+pub(crate) fn existing_instance_contention_action(
+    desktop_release: bool,
+    args: impl IntoIterator<Item = String>,
+) -> ExistingInstanceContentionAction {
+    if !desktop_release {
+        return ExistingInstanceContentionAction::ReportError;
+    }
+
+    if args
+        .into_iter()
+        .any(|arg| arg == crate::AUTO_START_COMMAND || arg == crate::UPDATED_RESTART_COMMAND)
+    {
+        ExistingInstanceContentionAction::ExitSilently
+    } else {
+        ExistingInstanceContentionAction::OpenExistingUi
+    }
+}
+
+/// Waits briefly for the lock owner to publish a healthy listener without treating metadata as a
+/// lock authority. A metadata read failure is intentionally equivalent to unavailable metadata:
+/// the OS lock already proved another owner exists.
+pub(crate) fn observe_existing_instance(
+    config_root: impl AsRef<Path>,
+) -> ExistingInstanceObservation {
+    observe_existing_instance_with(
+        || {
+            read_single_instance_metadata(config_root.as_ref())
+                .ok()
+                .flatten()
+        },
+        owner_health_responds,
+        || std::thread::sleep(EXISTING_INSTANCE_PROBE_INTERVAL),
+        EXISTING_INSTANCE_PROBE_ATTEMPTS,
+    )
+}
+
+fn observe_existing_instance_with<ReadMetadata, HealthProbe, Wait>(
+    mut read_metadata: ReadMetadata,
+    mut health_probe: HealthProbe,
+    mut wait: Wait,
+    attempts: usize,
+) -> ExistingInstanceObservation
+where
+    ReadMetadata: FnMut() -> Option<SingleInstanceMetadata>,
+    HealthProbe: FnMut(SocketAddr) -> bool,
+    Wait: FnMut(),
+{
+    let mut latest_metadata = None;
+    for attempt in 0..attempts {
+        if let Some(metadata) = read_metadata() {
+            if let Some(listen_addr) = metadata.listen_addr
+                && health_probe(owner_probe_addr(listen_addr))
+            {
+                return ExistingInstanceObservation::healthy(metadata, listen_addr);
+            }
+            latest_metadata = Some(metadata);
+        }
+        if attempt + 1 < attempts {
+            wait();
+        }
+    }
+
+    ExistingInstanceObservation::unavailable(latest_metadata)
+}
+
+fn owner_health_responds(listen_addr: SocketAddr) -> bool {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&listen_addr, EXISTING_INSTANCE_CONNECT_TIMEOUT)
+    else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(EXISTING_INSTANCE_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(EXISTING_INSTANCE_IO_TIMEOUT));
+    let request =
+        format!("GET /api/health HTTP/1.1\r\nHost: {listen_addr}\r\nConnection: close\r\n\r\n");
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+
+    let mut response = Vec::with_capacity(1024);
+    let mut buffer = [0_u8; 1024];
+    while response.len() < 8 * 1024 {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => response.extend_from_slice(&buffer[..count]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                ) =>
+            {
+                break;
+            }
+            Err(_) => return false,
+        }
+    }
+
+    health_response_is_foco(&response)
+}
+
+fn owner_probe_addr(listen_addr: SocketAddr) -> SocketAddr {
+    let host = match listen_addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::from((host, listen_addr.port()))
+}
+
+fn health_response_is_foco(response: &[u8]) -> bool {
+    let Some(header_end) = response
+        .windows(b"\r\n\r\n".len())
+        .position(|window| window == b"\r\n\r\n")
+    else {
+        return false;
+    };
+    let Ok(headers) = std::str::from_utf8(&response[..header_end]) else {
+        return false;
+    };
+    let Some(status_line) = headers.lines().next() else {
+        return false;
+    };
+    if status_line.split_whitespace().nth(1) != Some("200") {
+        return false;
+    }
+
+    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&response[header_end + 4..])
+    else {
+        return false;
+    };
+    payload.get("service").and_then(serde_json::Value::as_str) == Some("foco")
 }
 
 fn resolve_config_root(config_root: &Path) -> Result<PathBuf, SingleInstanceError> {
@@ -563,6 +733,7 @@ fn is_lock_contention(error: &io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
     use tempfile::tempdir;
 
     fn acquired(root: &Path) -> SingleInstanceGuard {
@@ -674,6 +845,116 @@ mod tests {
             read_result,
             Err(SingleInstanceMetadataError::UnsupportedVersion { version: 2, .. })
         ));
+    }
+
+    #[test]
+    fn contention_action_opens_existing_ui_for_manual_desktop_launch() {
+        let action = existing_instance_contention_action(true, ["--ignored".to_string()]);
+
+        assert_eq!(action, ExistingInstanceContentionAction::OpenExistingUi);
+    }
+
+    #[test]
+    fn contention_action_exits_silently_for_auto_start_and_updated_restart() {
+        let auto_start = existing_instance_contention_action(true, ["--auto-start".to_string()]);
+        let updated_restart =
+            existing_instance_contention_action(true, ["--updated-restart".to_string()]);
+
+        assert_eq!(auto_start, ExistingInstanceContentionAction::ExitSilently);
+        assert_eq!(
+            updated_restart,
+            ExistingInstanceContentionAction::ExitSilently
+        );
+    }
+
+    #[test]
+    fn contention_action_reports_error_for_non_desktop_launches() {
+        let action = existing_instance_contention_action(false, ["--auto-start".to_string()]);
+
+        assert_eq!(action, ExistingInstanceContentionAction::ReportError);
+    }
+
+    #[test]
+    fn observation_uses_owner_metadata_address_after_startup_health_becomes_ready() {
+        let listen_addr = "127.0.0.1:4567".parse().expect("valid address");
+        let mut metadata = [
+            Some(SingleInstanceMetadata::starting(42)),
+            Some(SingleInstanceMetadata::ready(42, listen_addr)),
+            Some(SingleInstanceMetadata::ready(42, listen_addr)),
+        ]
+        .into_iter();
+        let mut health_attempts = 0;
+        let mut wait_count = 0;
+
+        let observation = observe_existing_instance_with(
+            || metadata.next().flatten(),
+            |addr| {
+                assert_eq!(addr, listen_addr);
+                health_attempts += 1;
+                health_attempts == 2
+            },
+            || wait_count += 1,
+            3,
+        );
+
+        assert_eq!(observation.healthy_listen_addr, Some(listen_addr));
+        assert_eq!(wait_count, 2);
+    }
+
+    #[test]
+    fn observation_keeps_ready_metadata_when_owner_health_times_out() {
+        let listen_addr = "127.0.0.1:4567".parse().expect("valid address");
+        let mut wait_count = 0;
+
+        let observation = observe_existing_instance_with(
+            || Some(SingleInstanceMetadata::ready(42, listen_addr)),
+            |_| false,
+            || wait_count += 1,
+            3,
+        );
+
+        assert_eq!(observation.healthy_listen_addr, None);
+        assert_eq!(
+            observation.metadata,
+            Some(SingleInstanceMetadata::ready(42, listen_addr))
+        );
+        assert_eq!(wait_count, 2);
+    }
+
+    #[test]
+    fn health_response_requires_foco_service_marker() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"service\":\"other\"}";
+
+        assert!(!health_response_is_foco(response));
+    }
+
+    #[test]
+    fn health_response_accepts_foco_service_marker() {
+        let response =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"service\":\"foco\"}";
+
+        assert!(health_response_is_foco(response));
+    }
+
+    #[test]
+    fn owner_health_probe_accepts_foco_loopback_listener() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let listen_addr = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("health probe connection");
+            let mut request = [0_u8; 512];
+            let count = stream.read(&mut request).expect("health probe request");
+            assert!(String::from_utf8_lossy(&request[..count]).starts_with("GET /api/health "));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 18\r\nConnection: close\r\n\r\n{\"service\":\"foco\"}",
+                )
+                .expect("health response");
+        });
+
+        assert!(owner_health_responds(listen_addr));
+        server.join().expect("health probe server");
     }
 
     #[cfg(unix)]

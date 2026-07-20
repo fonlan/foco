@@ -1027,12 +1027,14 @@ async fn audited_prompt_hook_stream(
     );
     let mut hook_request = request.hook_request.clone();
     if let Some(chat_id) = request.chat_id.as_deref() {
-        if let Ok((session_id, thread_id)) = crate::provider_agent_headers::resolve_provider_session_thread_for_chat(
-            &request.workspace_path,
-            chat_id,
-            None,
-            None,
-        ) {
+        if let Ok((session_id, thread_id)) =
+            crate::provider_agent_headers::resolve_provider_session_thread_for_chat(
+                &request.workspace_path,
+                chat_id,
+                None,
+                None,
+            )
+        {
             crate::provider_agent_headers::attach_agent_request_correlation(
                 &mut hook_request,
                 &session_id,

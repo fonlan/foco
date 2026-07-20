@@ -8,8 +8,6 @@ use std::{
 };
 
 #[cfg(all(windows, not(debug_assertions)))]
-use foco_store::config::load_or_create_global_config;
-#[cfg(all(windows, not(debug_assertions)))]
 use tokio::sync::watch;
 
 #[cfg(all(windows, not(debug_assertions)))]
@@ -70,9 +68,11 @@ fn args_start_silently(args: impl IntoIterator<Item = String>) -> bool {
 }
 
 #[cfg(all(windows, not(debug_assertions)))]
-pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
+pub(crate) fn run_windows_tray_entrypoint(
+    single_instance_guard: crate::single_instance::SingleInstanceGuard,
+    loaded_config: foco_store::config::LoadedGlobalConfig,
+) -> AppResult<()> {
     let start_silently = args_start_silently(std::env::args().skip(1));
-    let loaded_config = load_or_create_global_config()?;
     // Initialise logging on the main thread BEFORE spawning the server so
     // that any tray-loop error is captured in the daily log file. The
     // server thread will call logging::init again; the second call is a
@@ -81,6 +81,7 @@ pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
     let addr = local_addr(&loaded_config.config)?;
     let ui_url = foco_ui_url_for_listen_addr(addr);
     let labels = tray_menu_labels(&loaded_config.config.app.language)?;
+    let runtime_loaded_config = loaded_config.clone();
     let (tray_menu_update_tx, tray_menu_update_rx) = std::sync::mpsc::channel();
     let tray_menu_thread_id = Arc::new(AtomicU32::new(0));
     let tray_menu_update_notifier = TrayMenuUpdateNotifier {
@@ -99,6 +100,8 @@ pub(crate) fn run_windows_tray_entrypoint() -> AppResult<()> {
                 .build()
                 .expect("failed to build Foco HTTP runtime");
             if let Err(error) = runtime.block_on(run_server_until_shutdown(
+                single_instance_guard,
+                runtime_loaded_config,
                 Some((runtime_shutdown_tx, shutdown_rx)),
                 !start_silently,
                 tray_menu_update_notifier,

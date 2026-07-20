@@ -44,14 +44,14 @@ use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
         ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
-        HookConfig, McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits,
-        ModelSettings, PromptSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
+        HookConfig, LoadedGlobalConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
+        ModelLimits, ModelSettings, PromptSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
         SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
         SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
         SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
         WorkspaceLocation, default_agent_execution_workspace_modes,
         default_terminal_shell_for_current_platform, load_global_config,
-        load_or_create_global_config, save_global_config,
+        load_or_create_global_config_at_paths, save_global_config,
         validate_agent_definition_tool_references,
     },
     memory::{
@@ -390,9 +390,7 @@ const AUTH_COOKIE_NAME: &str = "foco_auth";
 // Algorithm marker prepended to stored password hashes.
 const PASSWORD_HASH_PREFIX: &str = "sha256";
 const MEMORY_DREAM_LATEST_COMMAND: &str = "--memory-dream-latest";
-#[cfg(any(windows, all(target_os = "macos", not(debug_assertions)), test))]
 pub(crate) const UPDATED_RESTART_COMMAND: &str = crate::update_runtime::UPDATED_RESTART_ARG;
-#[cfg(any(windows, target_os = "macos", test))]
 pub(crate) const AUTO_START_COMMAND: &str = "--auto-start";
 // Process-wide counter used by unique_id to keep IDs distinct within the same millisecond.
 static NEXT_ID_SUFFIX: AtomicU64 = AtomicU64::new(1);
@@ -476,16 +474,113 @@ async fn run_entrypoint() -> AppResult<()> {
         return Ok(());
     }
 
+    let paths = FocoPaths::from_user_profile_env()?;
+    let config_root = paths.root_dir.clone();
+    let (single_instance_guard, loaded_config) =
+        match prepare_main_service_startup(&config_root, || {
+            Ok(load_or_create_global_config_at_paths(paths)?)
+        })? {
+            MainServiceStartup::Ready {
+                single_instance_guard,
+                loaded_config,
+            } => (single_instance_guard, loaded_config),
+            MainServiceStartup::Contended => {
+                return handle_single_instance_contention(&config_root);
+            }
+        };
+
     #[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
     {
-        return crate::platform::tray::run_platform_tray_entrypoint().await;
+        return crate::platform::tray::run_platform_tray_entrypoint(
+            single_instance_guard,
+            loaded_config,
+        )
+        .await;
     }
 
     #[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
     {
-        run_server_until_shutdown(None, false, ActiveChatRunRegistry::default()).await
+        run_server_until_shutdown(
+            single_instance_guard,
+            loaded_config,
+            None,
+            false,
+            ActiveChatRunRegistry::default(),
+        )
+        .await
     }
 }
+
+enum MainServiceStartup<T> {
+    Ready {
+        single_instance_guard: crate::single_instance::SingleInstanceGuard,
+        loaded_config: T,
+    },
+    Contended,
+}
+
+fn prepare_main_service_startup<T>(
+    config_root: &Path,
+    load_config: impl FnOnce() -> AppResult<T>,
+) -> AppResult<MainServiceStartup<T>> {
+    match crate::single_instance::acquire_single_instance(config_root)? {
+        crate::single_instance::SingleInstanceAcquire::Acquired(single_instance_guard) => {
+            let loaded_config = load_config()?;
+            Ok(MainServiceStartup::Ready {
+                single_instance_guard,
+                loaded_config,
+            })
+        }
+        crate::single_instance::SingleInstanceAcquire::Contended => {
+            Ok(MainServiceStartup::Contended)
+        }
+    }
+}
+
+fn handle_single_instance_contention(config_root: &Path) -> AppResult<()> {
+    let action = crate::single_instance::existing_instance_contention_action(
+        cfg!(all(
+            any(windows, target_os = "macos"),
+            not(debug_assertions)
+        )),
+        env::args().skip(1),
+    );
+    if action == crate::single_instance::ExistingInstanceContentionAction::ExitSilently {
+        return Ok(());
+    }
+
+    let observation = crate::single_instance::observe_existing_instance(config_root);
+    if action == crate::single_instance::ExistingInstanceContentionAction::OpenExistingUi
+        && let Some(listen_addr) = observation.healthy_listen_addr
+    {
+        open_existing_foco_ui(listen_addr);
+        return Ok(());
+    }
+
+    let listener_hint = observation
+        .metadata
+        .and_then(|metadata| metadata.listen_addr)
+        .map(|listen_addr| format!("; owner advertised {listen_addr}"))
+        .unwrap_or_default();
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!(
+            "another Foco instance is already starting or running for configuration directory {}{listener_hint}",
+            config_root.display()
+        ),
+    )
+    .into())
+}
+
+#[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
+fn open_existing_foco_ui(listen_addr: SocketAddr) {
+    crate::platform::tray::open_foco_ui(&crate::platform::tray::foco_ui_url_for_listen_addr(
+        listen_addr,
+    ));
+}
+
+#[cfg(any(not(any(windows, target_os = "macos")), debug_assertions))]
+fn open_existing_foco_ui(_listen_addr: SocketAddr) {}
 
 fn print_latest_memory_dream_job_if_requested() -> AppResult<bool> {
     let mut args = env::args().skip(1);
@@ -595,6 +690,8 @@ fn memory_dream_latest_usage() -> String {
 }
 
 async fn run_server_until_shutdown(
+    single_instance_guard: crate::single_instance::SingleInstanceGuard,
+    loaded_config: LoadedGlobalConfig,
     shutdown_channel: Option<(watch::Sender<bool>, watch::Receiver<bool>)>,
     open_browser_on_startup: bool,
     #[cfg(all(windows, not(debug_assertions)))] tray_menu_update_notifier: TrayMenuUpdateNotifier,
@@ -602,8 +699,6 @@ async fn run_server_until_shutdown(
 ) -> AppResult<()> {
     let _ = open_browser_on_startup;
     let startup_started_at = Instant::now();
-    let load_config_started_at = Instant::now();
-    let loaded_config = load_or_create_global_config()?;
     let logging_started_at = Instant::now();
     logging::init(&loaded_config.paths.logs_dir)?;
     tracing::info!(
@@ -614,7 +709,6 @@ async fn run_server_until_shutdown(
         &loaded_config.paths.user_profile_dir,
     );
     tracing::info!(
-        elapsed_ms = load_config_started_at.elapsed().as_millis() as u64,
         workspace_count = loaded_config.config.workspaces.len(),
         "loaded global config from disk"
     );
@@ -777,15 +871,17 @@ async fn run_server_until_shutdown(
     let bind_started_at = Instant::now();
     tracing::info!(%addr, "HTTP listener bind started");
     let listener = TcpListener::bind(addr).await?;
+    let listen_addr = listener.local_addr()?;
+    single_instance_guard.publish_ready(listen_addr)?;
     tracing::info!(
-        %addr,
+        %listen_addr,
         elapsed_ms = bind_started_at.elapsed().as_millis() as u64,
         "HTTP listener bound"
     );
     // Browsers resolve `*.preview.localhost` (and often `localhost`) with Happy
     // Eyeballs and may try `::1` first. Default listen is `127.0.0.1` only, so
     // bind the companion loopback family on the same port when applicable.
-    let companion_listener = match companion_loopback_listen_addr(addr) {
+    let companion_listener = match companion_loopback_listen_addr(listen_addr) {
         Some(companion_addr) => match TcpListener::bind(companion_addr).await {
             Ok(listener) => {
                 tracing::info!(%companion_addr, "HTTP companion loopback listener bound");
@@ -806,7 +902,7 @@ async fn run_server_until_shutdown(
     {
         crate::platform::tray::open_foco_ui_if_listener_bound(
             open_browser_on_startup,
-            addr,
+            listen_addr,
             crate::platform::tray::open_foco_ui,
         );
     }
@@ -814,16 +910,16 @@ async fn run_server_until_shutdown(
         spawn_code_graph_index_initialization(code_graph_workspaces, code_graph_indexes)?;
 
     tracing::info!(
-        %addr,
+        %listen_addr,
         elapsed_ms = startup_started_at.elapsed().as_millis() as u64,
         "starting local HTTP server"
     );
-    println!("Foco is running at http://{addr}");
+    println!("Foco is running at http://{listen_addr}");
     // Only mark the update ready after the server is accepting /api/health, so helpers
     // never discard the previous install merely because the listener bound.
     crate::update_runtime::spawn_mark_updated_restart_ready_when_serving(
         user_profile_dir_for_update_ready,
-        addr,
+        listen_addr,
     );
     let companion_server_task = companion_listener.map(|companion_listener| {
         let companion_app = app.clone();
@@ -2747,11 +2843,8 @@ impl PreparedChatContext {
             self.provider_thread_id = thread_id;
             return Ok(());
         }
-        let (session_id, thread_id) = resolve_provider_session_thread_with_database(
-            database,
-            &self.chat_id,
-            None,
-        )?;
+        let (session_id, thread_id) =
+            resolve_provider_session_thread_with_database(database, &self.chat_id, None)?;
         self.provider_session_id = session_id;
         self.provider_thread_id = thread_id;
         Ok(())
@@ -5457,7 +5550,7 @@ pub(crate) fn prepare_git_commit_message_request(
         max_output_tokens: Some(max_output_tokens.min(GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS)),
         prompt_cache_key: None,
         prompt_cache_retention: None,
-    agent_correlation: None,
+        agent_correlation: None,
     })
 }
 
@@ -5634,12 +5727,8 @@ pub(crate) async fn audited_provider_text_request(
         let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
         let mut attempt_request = request.clone();
         if let Some(chat_id) = chat_id {
-            let (session_id, thread_id) = resolve_provider_session_thread_for_chat(
-                workspace_path,
-                chat_id,
-                None,
-                None,
-            )?;
+            let (session_id, thread_id) =
+                resolve_provider_session_thread_for_chat(workspace_path, chat_id, None, None)?;
             attach_agent_request_correlation(
                 &mut attempt_request,
                 &session_id,
@@ -5810,12 +5899,8 @@ pub(crate) async fn audited_provider_tool_request(
         let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
         let mut attempt_request = request.clone();
         if let Some(chat_id) = chat_id {
-            let (session_id, thread_id) = resolve_provider_session_thread_for_chat(
-                workspace_path,
-                chat_id,
-                None,
-                None,
-            )?;
+            let (session_id, thread_id) =
+                resolve_provider_session_thread_for_chat(workspace_path, chat_id, None, None)?;
             attach_agent_request_correlation(
                 &mut attempt_request,
                 &session_id,

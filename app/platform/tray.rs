@@ -1,6 +1,11 @@
 use std::net::{IpAddr, SocketAddr};
 
+#[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
+use foco_store::config::LoadedGlobalConfig;
 use foco_store::config::SUPPORTED_APP_LANGUAGES;
+
+#[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
+use crate::single_instance::SingleInstanceGuard;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct TrayMenuLabels {
@@ -11,13 +16,20 @@ pub(crate) struct TrayMenuLabels {
     pub(crate) quit: &'static str,
 }
 #[cfg(all(windows, not(debug_assertions)))]
-pub(crate) async fn run_platform_tray_entrypoint() -> crate::AppResult<()> {
-    crate::platform::tray_windows::run_windows_tray_entrypoint()
+pub(crate) async fn run_platform_tray_entrypoint(
+    single_instance_guard: SingleInstanceGuard,
+    loaded_config: LoadedGlobalConfig,
+) -> crate::AppResult<()> {
+    crate::platform::tray_windows::run_windows_tray_entrypoint(single_instance_guard, loaded_config)
 }
 
 #[cfg(all(target_os = "macos", not(debug_assertions)))]
-pub(crate) async fn run_platform_tray_entrypoint() -> crate::AppResult<()> {
-    crate::platform::tray_macos::run_macos_menu_bar_entrypoint().await
+pub(crate) async fn run_platform_tray_entrypoint(
+    single_instance_guard: SingleInstanceGuard,
+    loaded_config: LoadedGlobalConfig,
+) -> crate::AppResult<()> {
+    crate::platform::tray_macos::run_macos_menu_bar_entrypoint(single_instance_guard, loaded_config)
+        .await
 }
 #[cfg(all(any(windows, target_os = "macos"), not(debug_assertions)))]
 pub(crate) fn open_foco_ui(ui_url: &str) {

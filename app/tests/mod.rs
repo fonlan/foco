@@ -33638,3 +33638,26 @@ fn proxy_workspace_route_path_excludes_preview() {
         Some("files")
     );
 }
+
+#[test]
+fn preparing_main_service_with_contended_lock_skips_config_loading() {
+    let directory = tempfile::tempdir().expect("temporary configuration directory");
+    let _owner = match crate::single_instance::acquire_single_instance(directory.path())
+        .expect("first single-instance acquisition")
+    {
+        crate::single_instance::SingleInstanceAcquire::Acquired(guard) => guard,
+        crate::single_instance::SingleInstanceAcquire::Contended => {
+            panic!("first single-instance acquisition must succeed")
+        }
+    };
+    let config_loader_called = std::sync::atomic::AtomicBool::new(false);
+
+    let startup = prepare_main_service_startup(directory.path(), || {
+        config_loader_called.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .expect("contention must not be an acquisition error");
+
+    assert!(matches!(startup, MainServiceStartup::Contended));
+    assert!(!config_loader_called.load(std::sync::atomic::Ordering::SeqCst));
+}

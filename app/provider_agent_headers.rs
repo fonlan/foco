@@ -26,8 +26,7 @@ pub(crate) fn attach_agent_request_correlation(
     if session_id.is_empty() || thread_id.is_empty() || client_request_id.is_empty() {
         return;
     }
-    let mut correlation =
-        AgentRequestCorrelation::new(session_id, thread_id, client_request_id);
+    let mut correlation = AgentRequestCorrelation::new(session_id, thread_id, client_request_id);
     if let Some(run_id) = run_id.map(str::trim).filter(|value| !value.is_empty()) {
         correlation = correlation.with_run_id(run_id);
     }
@@ -51,7 +50,10 @@ pub(crate) fn resolve_provider_session_thread_for_chat(
     if chat_id.is_empty() {
         return Ok((String::new(), String::new()));
     }
-    if let Some(plan_id) = plan_id_hint.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(plan_id) = plan_id_hint
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return Ok(resolve_agent_session_thread_ids(
             chat_id,
             Some(plan_id),
@@ -71,7 +73,10 @@ pub(crate) fn resolve_provider_session_thread_with_database(
     let plan_id_for_chat = database
         .plan_id_for_implementation_chat(chat_id)
         .map_err(ApiError::from_workspace_error)?;
-    let plan_id_for_parent = match parent_chat_id.map(str::trim).filter(|value| !value.is_empty()) {
+    let plan_id_for_parent = match parent_chat_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         Some(parent_chat_id) if parent_chat_id != chat_id.trim() => database
             .plan_id_for_implementation_chat(parent_chat_id)
             .map_err(ApiError::from_workspace_error)?,
@@ -91,8 +96,7 @@ mod tests {
 
     #[test]
     fn normal_chat_uses_chat_id_for_session_and_thread() {
-        let (session, thread) =
-            resolve_agent_session_thread_ids("chat-abc", None, None);
+        let (session, thread) = resolve_agent_session_thread_ids("chat-abc", None, None);
         assert_eq!(session, "chat-abc");
         assert_eq!(thread, "chat-abc");
     }

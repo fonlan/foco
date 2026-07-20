@@ -5848,7 +5848,7 @@ async fn broker_llm_stream(
                 prompt_cache_retention: payload
                     .get("promptCacheRetention")
                     .and_then(|v| serde_json::from_value(v.clone()).ok()),
-            agent_correlation: None,
+                agent_correlation: None,
             }
         });
     // Ensure a nested request cannot disagree with the model selected by the broker payload.
@@ -11572,7 +11572,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                         .and_then(|limits| u32::try_from(limits.max_output_tokens).ok()),
                     prompt_cache_key: None,
                     prompt_cache_retention: None,
-                agent_correlation: None,
+                    agent_correlation: None,
                 },
                 tool_catalog,
                 session_mode,
