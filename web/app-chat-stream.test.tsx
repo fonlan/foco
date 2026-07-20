@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 
-import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -102,7 +108,10 @@ function configureRemoteChat() {
     serverName: "dev-box",
   };
   const chatKey = `${remoteWorkspaceId}/${remoteChatId}`;
-  appTestState.workspaceResponseWorkspaces = [{ ...workspace }, remoteWorkspace];
+  appTestState.workspaceResponseWorkspaces = [
+    { ...workspace },
+    remoteWorkspace,
+  ];
   appTestState.settingsResponse = {
     ...appTestState.settingsResponse,
     workspaces: [
@@ -140,7 +149,9 @@ describe("app-chat-stream verification surfaces", () => {
     resetAppTestEnvironment();
     delete (
       globalThis as {
-        __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+        __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (
+          update: () => void,
+        ) => void;
       }
     ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
   });
@@ -150,24 +161,34 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
 
-    const editButton = await screen.findByRole("button", { name: "Edit message" });
+    const editButton = await screen.findByRole("button", {
+      name: "Edit message",
+    });
     await userEvent.click(editButton);
     const editor = screen.getByRole("textbox", { name: "Edit message" });
     await userEvent.clear(editor);
     await userEvent.type(editor, "Please inspect CONTRIBUTING.md.");
-    await userEvent.click(screen.getByRole("button", { name: "Save and regenerate" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and regenerate" }),
+    );
 
     expect(confirmSpy).toHaveBeenCalledWith(
       "Editing this message will remove 1 later messages and regenerate the reply. Continue?",
     );
     await waitFor(() => {
-      expect(screen.getByText("Please inspect CONTRIBUTING.md.")).toBeInTheDocument();
+      expect(
+        screen.getByText("Please inspect CONTRIBUTING.md."),
+      ).toBeInTheDocument();
       expect(screen.queryByText("Done.")).not.toBeInTheDocument();
-      expect(screen.queryByRole("textbox", { name: "Edit message" })).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole("textbox", { name: "Edit message" }),
+      ).not.toBeInTheDocument();
     });
-    const editRequest = vi.mocked(fetch).mock.calls.find(([input]) =>
-      input.toString().includes("/messages/message-user/edit"),
-    );
+    const editRequest = vi
+      .mocked(fetch)
+      .mock.calls.find(([input]) =>
+        input.toString().includes("/messages/message-user/edit"),
+      );
     expect(editRequest).toBeDefined();
     expect(JSON.parse(String(editRequest?.[1]?.body))).toMatchObject({
       expectedContent: "Please inspect README.",
@@ -175,9 +196,11 @@ describe("app-chat-stream verification surfaces", () => {
       modelId: "gpt-test",
       providerId: "openai",
     });
-    const streamRequests = vi.mocked(fetch).mock.calls.filter(([input]) =>
-      input.toString().includes("/chat/stream"),
-    );
+    const streamRequests = vi
+      .mocked(fetch)
+      .mock.calls.filter(([input]) =>
+        input.toString().includes("/chat/stream"),
+      );
     expect(streamRequests).toHaveLength(1);
     expect(JSON.parse(String(streamRequests[0]?.[1]?.body))).toMatchObject({
       queuedUserMessageId: "message-user",
@@ -189,23 +212,33 @@ describe("app-chat-stream verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation((input, init) => {
       if (input.toString().includes("/messages/message-user/edit")) {
-        return Promise.resolve(jsonResponse({ error: "edit failed" }, { status: 409 }));
+        return Promise.resolve(
+          jsonResponse({ error: "edit failed" }, { status: 409 }),
+        );
       }
       return mockFetch(input, init);
     });
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit message" }),
+    );
     const editor = screen.getByRole("textbox", { name: "Edit message" });
     await userEvent.clear(editor);
     await userEvent.type(editor, "Edited text");
-    await userEvent.click(screen.getByRole("button", { name: "Save and regenerate" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Save and regenerate" }),
+    );
 
     expect(await screen.findByText("edit failed")).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Edit message" })).toHaveValue("Edited text");
+    expect(screen.getByRole("textbox", { name: "Edit message" })).toHaveValue(
+      "Edited text",
+    );
     expect(screen.getByText("Done.")).toBeInTheDocument();
     expect(
-      fetchMock.mock.calls.filter(([input]) => input.toString().includes("/chat/stream")),
+      fetchMock.mock.calls.filter(([input]) =>
+        input.toString().includes("/chat/stream"),
+      ),
     ).toHaveLength(0);
   });
 
@@ -214,13 +247,19 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     const composer = screen.getByPlaceholderText(defaultComposerPlaceholder);
     await userEvent.type(composer, "composer draft");
-    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit message" }),
+    );
     const editor = screen.getByRole("textbox", { name: "Edit message" });
     await userEvent.clear(editor);
     await userEvent.type(editor, "discarded edit");
-    await userEvent.click(screen.getByRole("button", { name: "Cancel editing" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Cancel editing" }),
+    );
 
-    expect(screen.queryByRole("textbox", { name: "Edit message" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("textbox", { name: "Edit message" }),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("Please inspect README.")).toBeInTheDocument();
     expect(composer).toHaveValue("composer draft");
   });
@@ -232,7 +271,11 @@ describe("app-chat-stream verification surfaces", () => {
       "# Selected Skills",
       "",
       "```json",
-      JSON.stringify([{ name: "web-design-guidelines", path: skillPath }], null, 2),
+      JSON.stringify(
+        [{ name: "web-design-guidelines", path: skillPath }],
+        null,
+        2,
+      ),
       "```",
       "",
       "## Skill 1: web-design-guidelines",
@@ -283,8 +326,12 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
 
-    expect(await screen.findByText("web-design-guidelines")).toBeInTheDocument();
-    expect(screen.getByText("Settings single-column layout.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("web-design-guidelines"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Settings single-column layout."),
+    ).toBeInTheDocument();
     expect(
       screen.queryByText("Use the existing product UI conventions."),
     ).not.toBeInTheDocument();
@@ -331,7 +378,10 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
 
     const paragraph = await screen.findByText((_, element) => {
-      return element?.tagName.toLowerCase() === "p" && element.textContent === content;
+      return (
+        element?.tagName.toLowerCase() === "p" &&
+        element.textContent === content
+      );
     });
     expect(getComputedStyle(paragraph).whiteSpace).toBe("pre-wrap");
     style.remove();
@@ -391,19 +441,32 @@ describe("app-chat-stream verification surfaces", () => {
 
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "/");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "/",
+    );
 
-    expect(await screen.findByRole("button", { name: "Select skill gitmemo" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Select skill Current skill" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Select skill Disabled skill" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Select skill Other skill" })).not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Select skill Current skill" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Disabled skill" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Other skill" }),
+    ).not.toBeInTheDocument();
   });
 
   it("lists enabled models in the flat composer model picker", async () => {
     appTestState.settingsResponse = {
       ...settings,
       providers: settings.providers.map((provider) =>
-        provider.id === "anthropic" ? { ...provider, enabled: false } : provider,
+        provider.id === "anthropic"
+          ? { ...provider, enabled: false }
+          : provider,
       ),
     } as typeof settings;
 
@@ -411,11 +474,230 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
     await userEvent.click(screen.getByLabelText("Model"));
 
-    expect(screen.getByRole("button", { name: "Model: GPT Test" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "OpenAI: GPT Test" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "OpenAI: GPT Test" }),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Anthropic: GPT Test" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("confirms Fast once, resets it for unsupported models, and snapshots Fast on send", async () => {
+    const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        fastModel,
+        {
+          ...fastModel,
+          activeProviderId: "anthropic",
+          displayName: "GPT Standard",
+          id: "gpt-standard",
+          providerIds: ["anthropic"],
+          supportsFast: false,
+        },
+      ],
+    } as typeof settings;
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const fastToggle = await screen.findByRole("button", { name: "Fast mode" });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(fastToggle);
+    const confirmation = await screen.findByRole("dialog", {
+      name: "Enable Fast mode?",
+    });
+    await userEvent.click(
+      within(confirmation).getByRole("button", { name: "Enable Fast" }),
+    );
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(fastToggle);
+    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(fastToggle);
+    expect(
+      screen.queryByRole("dialog", { name: "Enable Fast mode?" }),
+    ).not.toBeInTheDocument();
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Model: GPT Standard" }),
+    );
+    expect(
+      await screen.findByText(
+        "Fast mode is not available for the selected model.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Fast mode" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    );
+    const restoredFastToggle = await screen.findByRole("button", {
+      name: "Fast mode",
+    });
+    expect(restoredFastToggle).toHaveAttribute("aria-pressed", "false");
+    await userEvent.click(restoredFastToggle);
+    expect(restoredFastToggle).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Use Fast for this request.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+    const streamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
+      latencyMode: "fast",
+      modelId: "gpt-test",
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("sends Standard after Fast is reset by an unsupported active provider", async () => {
+    const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        fastModel,
+        {
+          ...fastModel,
+          activeProviderId: "anthropic",
+          displayName: "Anthropic Standard",
+          id: "anthropic-standard",
+          providerIds: ["anthropic"],
+          supportsFast: false,
+        },
+      ],
+    } as typeof settings;
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Fast mode" }),
+    );
+    await userEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Enable Fast mode?" }),
+      ).getByRole("button", { name: "Enable Fast" }),
+    );
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Model: Anthropic Standard" }),
+    );
+    expect(
+      await screen.findByText(
+        "Fast mode is not available for the selected model.",
+      ),
+    ).toBeInTheDocument();
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Use the standard provider route.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+    const streamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
+      latencyMode: "standard",
+      modelId: "anthropic-standard",
+      providerId: "anthropic",
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("restores Fast from a failed run and retries with the committed latency mode", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        { ...settings.configuredModels[0]!, supportsFast: true },
+      ],
+    } as typeof settings;
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": {
+        ...chatMessages,
+        messages: [
+          {
+            ...chatMessages.messages[0]!,
+            runConfig: {
+              modelId: "gpt-test",
+              providerId: "openai",
+              thinkingLevel: "high",
+              latencyMode: "fast",
+              selectedSkillIds: [],
+              sessionMode: null,
+              teamModeEnabled: false,
+            },
+          },
+          {
+            ...chatMessages.messages[1]!,
+            content: "provider failed",
+            parts: [{ text: "provider failed", type: "error" }],
+            status: "error",
+          },
+        ],
+      } as unknown as typeof chatMessages,
+    };
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(
+      await screen.findByRole("button", { name: "Retry last run" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Fast mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Retry last run" }),
+    );
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+    const streamCall = fetchMock.mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/chat/stream",
+    );
+    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
+      latencyMode: "fast",
+      thinkingLevel: "high",
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
   });
 
   it("ignores connecting chat stream progress events", async () => {
@@ -426,7 +708,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -460,7 +744,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     expect(
       screen.getByRole("status", { name: "Context usage 47%" }),
@@ -536,7 +822,9 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete + 1);
+    expect(usageCallsAfterComplete).toHaveLength(
+      usageCallCountBeforeComplete + 1,
+    );
     expect(
       screen.getByRole("status", { name: "Context usage 47%" }),
     ).toHaveTextContent("47%");
@@ -548,7 +836,11 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("uses a terminal remote context usage refresh after streamEnd", async () => {
     const { chatKey } = configureRemoteChat();
-    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    window.history.replaceState(
+      null,
+      "",
+      `/${remoteWorkspaceId}/${remoteChatId}`,
+    );
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
@@ -559,7 +851,9 @@ describe("app-chat-stream verification surfaces", () => {
     ).toHaveTextContent("47%");
     await userEvent.type(composer, "continue remotely");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
       { ...contextUsage, usagePercent: 33 },
     ];
@@ -590,7 +884,11 @@ describe("app-chat-stream verification surfaces", () => {
   it("sends a second remote message normally after a delayed terminal active-run snapshot", async () => {
     const fetchMock = vi.mocked(fetch);
     const { chatKey } = configureRemoteChat();
-    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    window.history.replaceState(
+      null,
+      "",
+      `/${remoteWorkspaceId}/${remoteChatId}`,
+    );
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
@@ -598,7 +896,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.type(composer, "first remote task");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -624,11 +924,13 @@ describe("app-chat-stream verification surfaces", () => {
       (workspaceSummary) =>
         workspaceSummary.id === remoteWorkspaceId
           ? {
-            ...workspaceSummary,
-            chats: workspaceSummary.chats.map((chat) =>
-              chat.id === remoteChatId ? { ...chat, activeRun: lateActiveRun } : chat,
-            ),
-          }
+              ...workspaceSummary,
+              chats: workspaceSummary.chats.map((chat) =>
+                chat.id === remoteChatId
+                  ? { ...chat, activeRun: lateActiveRun }
+                  : chat,
+              ),
+            }
           : workspaceSummary,
     );
     appTestState.chatMessagesResponsesByChatKey[chatKey] = {
@@ -657,7 +959,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await userEvent.type(composer, "second remote task");
-    const sendButton = await screen.findByRole("button", { name: "Send message" });
+    const sendButton = await screen.findByRole("button", {
+      name: "Send message",
+    });
     expect(sendButton).toBeEnabled();
     await userEvent.click(sendButton);
 
@@ -686,7 +990,11 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("refreshes terminal context usage after a remote stream error", async () => {
     const { chatKey } = configureRemoteChat();
-    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    window.history.replaceState(
+      null,
+      "",
+      `/${remoteWorkspaceId}/${remoteChatId}`,
+    );
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
@@ -697,13 +1005,18 @@ describe("app-chat-stream verification surfaces", () => {
     ).toHaveTextContent("47%");
     await userEvent.type(composer, "fail remotely");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
       { ...contextUsage, usagePercent: 39 },
     ];
 
     await act(async () => {
-      enqueueChatStreamEvent({ message: "Remote broker failed.", type: "error" });
+      enqueueChatStreamEvent({
+        message: "Remote broker failed.",
+        type: "error",
+      });
       enqueueChatStreamEvent({ type: "streamEnd" });
     });
     expect(
@@ -713,7 +1026,11 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("refreshes terminal context usage after a remote run is cancelled", async () => {
     const { chatKey } = configureRemoteChat();
-    window.history.replaceState(null, "", `/${remoteWorkspaceId}/${remoteChatId}`);
+    window.history.replaceState(
+      null,
+      "",
+      `/${remoteWorkspaceId}/${remoteChatId}`,
+    );
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
@@ -721,7 +1038,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.type(composer, "cancel remotely");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     appTestState.contextUsageResponseQueuesByChatKey[chatKey] = [
       { ...contextUsage, usagePercent: 42 },
     ];
@@ -747,7 +1066,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -785,7 +1106,9 @@ describe("app-chat-stream verification surfaces", () => {
     expect(usageCalls).toHaveLength(3);
     const [, usageInit] = usageCalls.at(-1)!;
     expect(typeof usageInit?.body).toBe("string");
-    expect(JSON.parse(usageInit?.body as string)).toMatchObject({ chatId: "chat-1" });
+    expect(JSON.parse(usageInit?.body as string)).toMatchObject({
+      chatId: "chat-1",
+    });
     expect(JSON.parse(usageInit?.body as string)).not.toHaveProperty(
       "latestResponseUsage",
     );
@@ -813,7 +1136,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const usageCallCountBeforeDeltas = contextUsageCalls().length;
 
@@ -837,8 +1162,12 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    await waitFor(() => expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 1));
-    const liveUsageBody = JSON.parse(contextUsageCalls().at(-1)?.[1]?.body as string);
+    await waitFor(() =>
+      expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 1),
+    );
+    const liveUsageBody = JSON.parse(
+      contextUsageCalls().at(-1)?.[1]?.body as string,
+    );
     expect(liveUsageBody).toMatchObject({
       assistantDraft: "Part one. Part two.",
       chatId: "chat-1",
@@ -863,8 +1192,12 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    await waitFor(() => expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 2));
-    const finalUsageBody = JSON.parse(contextUsageCalls().at(-1)?.[1]?.body as string);
+    await waitFor(() =>
+      expect(contextUsageCalls()).toHaveLength(usageCallCountBeforeDeltas + 2),
+    );
+    const finalUsageBody = JSON.parse(
+      contextUsageCalls().at(-1)?.[1]?.body as string,
+    );
     expect(finalUsageBody).toMatchObject({ chatId: "chat-1" });
     expect(finalUsageBody).not.toHaveProperty("assistantDraft");
     expect(finalUsageBody).not.toHaveProperty("assistantDraftReasoning");
@@ -882,7 +1215,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const messageList = document.querySelector(".message-list");
     if (!(messageList instanceof HTMLElement)) {
@@ -940,7 +1275,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const messageList = document.querySelector(".message-list");
     if (!(messageList instanceof HTMLElement)) {
@@ -1004,7 +1341,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1035,7 +1374,9 @@ describe("app-chat-stream verification surfaces", () => {
       "retry",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1137,7 +1478,9 @@ describe("app-chat-stream verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     const contextUsageCallCount = () =>
       fetchMock.mock.calls.filter(
-        ([url]) => typeof url === "string" && url === "/api/workspaces/workspace-1/context-usage",
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
       ).length;
 
     renderApp();
@@ -1147,7 +1490,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     const contextUsageCallCountBeforeStart = contextUsageCallCount();
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1168,7 +1513,9 @@ describe("app-chat-stream verification surfaces", () => {
 
     expect(await screen.findByText("Context compression")).toBeInTheDocument();
     expect(screen.getByText("Compressing")).toBeInTheDocument();
-    expect(screen.getByText("Context compression in progress")).toBeInTheDocument();
+    expect(
+      screen.getByText("Context compression in progress"),
+    ).toBeInTheDocument();
 
     expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart);
     await act(async () => {
@@ -1193,9 +1540,15 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Compressed")).toBeInTheDocument();
-    expect(screen.getByText("Context compression completed")).toBeInTheDocument();
+    expect(
+      screen.getByText("Context compression completed"),
+    ).toBeInTheDocument();
     expect(screen.getByText(/Saved 880 tokens/)).toBeInTheDocument();
-    await waitFor(() => expect(contextUsageCallCount()).toBe(contextUsageCallCountBeforeStart + 1));
+    await waitFor(() =>
+      expect(contextUsageCallCount()).toBe(
+        contextUsageCallCountBeforeStart + 1,
+      ),
+    );
     expect(screen.getAllByText("Context compression")).toHaveLength(1);
     await userEvent.click(screen.getByText("Context compression"));
     expect(screen.getByText("Original tokens")).toBeInTheDocument();
@@ -1217,7 +1570,9 @@ describe("app-chat-stream verification surfaces", () => {
       "compress please",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1263,7 +1618,9 @@ describe("app-chat-stream verification surfaces", () => {
     expect(await screen.findByText("Compressed")).toBeInTheDocument();
     expect(screen.queryByText("Compressing")).not.toBeInTheDocument();
     expect(screen.getAllByText("Context compression")).toHaveLength(1);
-    expect(screen.getByText(/Saved 4,100 tokens|Saved 4100 tokens/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Saved 4,100 tokens|Saved 4100 tokens/),
+    ).toBeInTheDocument();
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
@@ -1314,18 +1671,20 @@ describe("app-chat-stream verification surfaces", () => {
       ],
     };
 
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse(durableMessages);
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse(durableMessages);
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
@@ -1334,31 +1693,35 @@ describe("app-chat-stream verification surfaces", () => {
     expect(await screen.findByText("Recovered answer.")).toBeInTheDocument();
     expect(screen.getByText("Context compression")).toBeInTheDocument();
     expect(screen.getByText("Compressed")).toBeInTheDocument();
-    expect(screen.getByText(/Saved 3,400 tokens|Saved 3400 tokens/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/Saved 3,400 tokens|Saved 3400 tokens/),
+    ).toBeInTheDocument();
   });
 
   it("opens and reloads active plans after a plan refresh side event", async () => {
     let activePlanRequests = 0;
     const refreshedPlan = activePlan("plan-refresh-1", "Refresh-visible plan");
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        activePlanRequests += 1;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [refreshedPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          activePlanRequests += 1;
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [refreshedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
@@ -1368,7 +1731,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1391,44 +1756,51 @@ describe("app-chat-stream verification surfaces", () => {
 
   it("opens and reloads active plans after a running chat plan refresh event", async () => {
     let activePlanRequests = 0;
-    const refreshedPlan = activePlan("plan-refresh-running", "Running-refresh plan");
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const refreshedPlan = activePlan(
+      "plan-refresh-running",
+      "Running-refresh plan",
+    );
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          ...chatMessages,
-          activeRun: {
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/plans") {
-        activePlanRequests += 1;
-        return jsonResponse({
-          page: 1,
-          pageSize: 50,
-          plans: [refreshedPlan],
-          totalCount: 1,
-          totalPages: 1,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/plans") {
+          activePlanRequests += 1;
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [refreshedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await act(async () => {
@@ -1463,7 +1835,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await act(async () => {
@@ -1521,7 +1895,9 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1568,8 +1944,12 @@ describe("app-chat-stream verification surfaces", () => {
         await screen.findByPlaceholderText(defaultComposerPlaceholder),
         "multi think",
       );
-      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-      await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+      await userEvent.click(
+        screen.getByRole("button", { name: "Send message" }),
+      );
+      await waitFor(() =>
+        expect(appTestState.activeChatStreamController).not.toBeNull(),
+      );
 
       await act(async () => {
         enqueueChatStreamEvent({
@@ -1629,8 +2009,16 @@ describe("app-chat-stream verification surfaces", () => {
       expect(thinkingToggles).toHaveLength(2);
       expect(within(thinkingToggles[0]).getByText("1 s")).toBeInTheDocument();
       expect(within(thinkingToggles[1]).getByText("2 s")).toBeInTheDocument();
-      expect(within(assistantRow as HTMLElement).getByText("First plan.", { selector: "span" })).toBeInTheDocument();
-      expect(within(assistantRow as HTMLElement).getByText("Second plan.", { selector: "span" })).toBeInTheDocument();
+      expect(
+        within(assistantRow as HTMLElement).getByText("First plan.", {
+          selector: "span",
+        }),
+      ).toBeInTheDocument();
+      expect(
+        within(assistantRow as HTMLElement).getByText("Second plan.", {
+          selector: "span",
+        }),
+      ).toBeInTheDocument();
       expect(answer).toBeInTheDocument();
     } finally {
       nowSpy.mockRestore();
@@ -1647,7 +2035,9 @@ describe("app-chat-stream verification surfaces", () => {
       "start work",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -1720,19 +2110,27 @@ describe("app-chat-stream verification surfaces", () => {
       .closest(".message-row");
     expect(interruptedAssistantRow).not.toBeNull();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText("Model: gpt-test"),
+      within(interruptedAssistantRow as HTMLElement).getByText(
+        "Model: gpt-test",
+      ),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText("Channel: openai"),
+      within(interruptedAssistantRow as HTMLElement).getByText(
+        "Channel: openai",
+      ),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText("Total time: 2 sec"),
+      within(interruptedAssistantRow as HTMLElement).getByText(
+        "Total time: 2 sec",
+      ),
     ).toBeInTheDocument();
     expect(
       within(interruptedAssistantRow as HTMLElement).getByText("tokens/s: 5"),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).queryByText(/First token latency/),
+      within(interruptedAssistantRow as HTMLElement).queryByText(
+        /First token latency/,
+      ),
     ).not.toBeInTheDocument();
 
     await act(async () => {
@@ -1811,7 +2209,9 @@ describe("app-chat-stream verification surfaces", () => {
       "start work",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -1839,7 +2239,9 @@ describe("app-chat-stream verification surfaces", () => {
     const recoveryText = await screen.findByText(
       "repeated reasoning loop, check and continue",
     );
-    const recoveryRow = recoveryText.closest(".message-row") as HTMLElement | null;
+    const recoveryRow = recoveryText.closest(
+      ".message-row",
+    ) as HTMLElement | null;
     expect(recoveryRow).not.toBeNull();
     expect(recoveryRow?.className).toContain("message-row-user");
     expect(
@@ -1877,7 +2279,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const recoveredAnswer = await screen.findByText("Recovered answer.");
-    const recoveredRow = recoveredAnswer.closest(".message-row") as HTMLElement | null;
+    const recoveredRow = recoveredAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
     expect(recoveredRow).not.toBeNull();
     expect(recoveredRow).not.toBe(recoveryRow);
     expect(
@@ -1913,7 +2317,9 @@ describe("app-chat-stream verification surfaces", () => {
       "start work",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const durableAssistantId = "message-assistant-stream";
     const recoveryText = "repeated reasoning loop, check and continue";
@@ -1961,7 +2367,9 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const firstRecoveryAnswer = await screen.findByText("first recovery answer");
+    const firstRecoveryAnswer = await screen.findByText(
+      "first recovery answer",
+    );
     const firstRecoveryAnswerRow = firstRecoveryAnswer.closest(
       ".message-row",
     ) as HTMLElement | null;
@@ -2013,7 +2421,9 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const secondRecoveryAnswer = await screen.findByText("second recovery answer");
+    const secondRecoveryAnswer = await screen.findByText(
+      "second recovery answer",
+    );
     const secondRecoveryAnswerRow = secondRecoveryAnswer.closest(
       ".message-row",
     ) as HTMLElement | null;
@@ -2022,8 +2432,12 @@ describe("app-chat-stream verification surfaces", () => {
 
     const recoveryBubbles = screen.getAllByText(recoveryText);
     expect(recoveryBubbles).toHaveLength(2);
-    const firstRecoveryRow = recoveryBubbles[0].closest(".message-row") as HTMLElement;
-    const secondRecoveryRow = recoveryBubbles[1].closest(".message-row") as HTMLElement;
+    const firstRecoveryRow = recoveryBubbles[0].closest(
+      ".message-row",
+    ) as HTMLElement;
+    const secondRecoveryRow = recoveryBubbles[1].closest(
+      ".message-row",
+    ) as HTMLElement;
     expect(firstRecoveryRow.className).toContain("message-row-user");
     expect(secondRecoveryRow.className).toContain("message-row-user");
 
@@ -2057,13 +2471,17 @@ describe("app-chat-stream verification surfaces", () => {
       within(secondRecoveryAnswerRow as HTMLElement).getByText(/second_tool/),
     ).toBeInTheDocument();
     expect(
-      within(secondRecoveryAnswerRow as HTMLElement).queryByText("first recovery answer"),
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText(
+        "first recovery answer",
+      ),
     ).not.toBeInTheDocument();
     expect(
       within(secondRecoveryAnswerRow as HTMLElement).queryByText(/first_tool/),
     ).not.toBeInTheDocument();
     expect(
-      within(secondRecoveryAnswerRow as HTMLElement).queryByText("first loop reasoning"),
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText(
+        "first loop reasoning",
+      ),
     ).not.toBeInTheDocument();
 
     // Older assistant bubbles must not absorb second-recovery events.
@@ -2074,20 +2492,26 @@ describe("app-chat-stream verification surfaces", () => {
       within(initialReasoningRow).queryByText(/second_tool/),
     ).not.toBeInTheDocument();
     expect(
-      within(firstRecoveryAnswerRow as HTMLElement).queryByText("second recovery answer"),
+      within(firstRecoveryAnswerRow as HTMLElement).queryByText(
+        "second recovery answer",
+      ),
     ).not.toBeInTheDocument();
     expect(
       within(firstRecoveryAnswerRow as HTMLElement).queryByText(/second_tool/),
     ).not.toBeInTheDocument();
     // First recovery content stays on its own bubble.
     expect(
-      within(firstRecoveryAnswerRow as HTMLElement).getByText("first recovery answer"),
+      within(firstRecoveryAnswerRow as HTMLElement).getByText(
+        "first recovery answer",
+      ),
     ).toBeInTheDocument();
     expect(
       within(firstRecoveryAnswerRow as HTMLElement).getByText(/first_tool/),
     ).toBeInTheDocument();
     expect(
-      within(firstRecoveryAnswerRow as HTMLElement).getByText("second loop reasoning"),
+      within(firstRecoveryAnswerRow as HTMLElement).getByText(
+        "second loop reasoning",
+      ),
     ).toBeInTheDocument();
 
     await act(async () => {
@@ -2239,7 +2663,9 @@ describe("app-chat-stream verification surfaces", () => {
       "start work",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -2257,7 +2683,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const toolName = await screen.findByText("pre_guidance_tool");
-    const interruptedAssistantRow = toolName.closest(".message-row") as HTMLElement | null;
+    const interruptedAssistantRow = toolName.closest(
+      ".message-row",
+    ) as HTMLElement | null;
     expect(interruptedAssistantRow).not.toBeNull();
     expect(
       within(interruptedAssistantRow as HTMLElement).getByText("running"),
@@ -2279,7 +2707,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const guidedAnswer = await screen.findByText("Use safer option.");
-    const guidedAssistantRow = guidedAnswer.closest(".message-row") as HTMLElement | null;
+    const guidedAssistantRow = guidedAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
     expect(guidedAssistantRow).not.toBeNull();
     expect(guidedAssistantRow).not.toBe(interruptedAssistantRow);
 
@@ -2309,10 +2739,14 @@ describe("app-chat-stream verification surfaces", () => {
       within(interruptedAssistantRow as HTMLElement).getByText("completed"),
     ).toBeInTheDocument();
     expect(
-      within(interruptedAssistantRow as HTMLElement).getByText(/finished output/),
+      within(interruptedAssistantRow as HTMLElement).getByText(
+        /finished output/,
+      ),
     ).toBeInTheDocument();
     expect(
-      within(guidedAssistantRow as HTMLElement).queryByText("Pre Guidance Tool"),
+      within(guidedAssistantRow as HTMLElement).queryByText(
+        "Pre Guidance Tool",
+      ),
     ).not.toBeInTheDocument();
 
     await act(async () => {
@@ -2329,7 +2763,9 @@ describe("app-chat-stream verification surfaces", () => {
       "run tests",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const assistantMessageId = "message-assistant-stream";
     await act(async () => {
@@ -2342,7 +2778,7 @@ describe("app-chat-stream verification surfaces", () => {
         assistantMessageId,
         toolCall: {
           id: "call-run-command",
-          input: "{\"",
+          input: '{"',
           isError: false,
           name: "run_command",
           output: null,
@@ -2483,9 +2919,13 @@ describe("app-chat-stream verification surfaces", () => {
   function installHeldStreamAuxiliaryUpdateScheduler() {
     const pending: Array<() => void> = [];
     const globalWithHook = globalThis as {
-      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (
+        update: () => void,
+      ) => void;
     };
-    globalWithHook.__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__ = (update) => {
+    globalWithHook.__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__ = (
+      update,
+    ) => {
       pending.push(update);
     };
     return {
@@ -2510,8 +2950,12 @@ describe("app-chat-stream verification surfaces", () => {
         await screen.findByPlaceholderText(defaultComposerPlaceholder),
         "inspect files",
       );
-      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-      await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+      await userEvent.click(
+        screen.getByRole("button", { name: "Send message" }),
+      );
+      await waitFor(() =>
+        expect(appTestState.activeChatStreamController).not.toBeNull(),
+      );
 
       const assistantMessageId = "message-assistant-stream";
       // Interleave high-frequency deltas with a sparse bubble event so deferred
@@ -2545,9 +2989,13 @@ describe("app-chat-stream verification surfaces", () => {
 
       // Sync DOM assert while auxiliary updates stay held — no tab switch / reload.
       const toolLabel = screen.getByText("Read");
-      const assistantRow = toolLabel.closest(".message-row") as HTMLElement | null;
+      const assistantRow = toolLabel.closest(
+        ".message-row",
+      ) as HTMLElement | null;
       expect(assistantRow).not.toBeNull();
-      expect(within(assistantRow as HTMLElement).getByText("running")).toBeInTheDocument();
+      expect(
+        within(assistantRow as HTMLElement).getByText("running"),
+      ).toBeInTheDocument();
 
       await act(async () => {
         enqueueChatStreamEvent({
@@ -2562,7 +3010,9 @@ describe("app-chat-stream verification surfaces", () => {
       expect(
         within(assistantRow as HTMLElement).queryByText("running"),
       ).not.toBeInTheDocument();
-      expect(within(assistantRow as HTMLElement).getByText("completed")).toBeInTheDocument();
+      expect(
+        within(assistantRow as HTMLElement).getByText("completed"),
+      ).toBeInTheDocument();
       expect(screen.getAllByText("Read")).toHaveLength(1);
     } finally {
       await act(async () => {
@@ -2584,8 +3034,12 @@ describe("app-chat-stream verification surfaces", () => {
         await screen.findByPlaceholderText(defaultComposerPlaceholder),
         "keep streaming",
       );
-      await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-      await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+      await userEvent.click(
+        screen.getByRole("button", { name: "Send message" }),
+      );
+      await waitFor(() =>
+        expect(appTestState.activeChatStreamController).not.toBeNull(),
+      );
 
       const assistantMessageId = "message-assistant-stream";
       await act(async () => {
@@ -2614,7 +3068,9 @@ describe("app-chat-stream verification surfaces", () => {
 
       expect(screen.getByText("Context compression")).toBeInTheDocument();
       expect(screen.getByText("Compressing")).toBeInTheDocument();
-      expect(screen.getByText("Context compression in progress")).toBeInTheDocument();
+      expect(
+        screen.getByText("Context compression in progress"),
+      ).toBeInTheDocument();
       expect(screen.getAllByText("Context compression")).toHaveLength(1);
 
       await act(async () => {
@@ -2654,38 +3110,40 @@ describe("app-chat-stream verification surfaces", () => {
   it("renders tool and compression events on GET active-run reattach without switching tabs", async () => {
     const auxiliaryScheduler = installHeldStreamAuxiliaryUpdateScheduler();
     try {
-      const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        const path = url.startsWith("http://127.0.0.1")
-          ? new URL(url).pathname
-          : url.split("?")[0];
+      const fetchMock = vi.fn(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const path = url.startsWith("http://127.0.0.1")
+            ? new URL(url).pathname
+            : url.split("?")[0];
 
-        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-          return jsonResponse({
-            messages: [
-              chatMessages.messages[0],
-              {
-                ...chatMessages.messages[1],
-                content: "",
-                id: "message-assistant-stream",
-                metrics: null,
-                parts: [],
-                reasoning: null,
-                status: "streaming",
-                toolCalls: [],
+          if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+            return jsonResponse({
+              messages: [
+                chatMessages.messages[0],
+                {
+                  ...chatMessages.messages[1],
+                  content: "",
+                  id: "message-assistant-stream",
+                  metrics: null,
+                  parts: [],
+                  reasoning: null,
+                  status: "streaming",
+                  toolCalls: [],
+                },
+              ],
+              activeRun: {
+                chatId: "chat-1",
+                lastSequence: 0,
+                runId: "request-stream",
+                workspaceId: "workspace-1",
               },
-            ],
-            activeRun: {
-              chatId: "chat-1",
-              lastSequence: 0,
-              runId: "request-stream",
-              workspaceId: "workspace-1",
-            },
-          });
-        }
+            });
+          }
 
-        return mockFetch(input, init);
-      });
+          return mockFetch(input, init);
+        },
+      );
       vi.stubGlobal("fetch", fetchMock);
       window.history.replaceState(null, "", "/workspace-1/chat-1");
       renderApp();
@@ -2701,7 +3159,9 @@ describe("app-chat-stream verification surfaces", () => {
         ).toBe(true);
       });
       await waitFor(() =>
-        expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+        expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+          true,
+        ),
       );
 
       const assistantMessageId = "message-assistant-stream";
@@ -2790,7 +3250,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(await screen.findByText("Second chat"));
@@ -2867,7 +3329,9 @@ describe("app-chat-stream verification surfaces", () => {
       "generate an image",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const directPath = ".foco/sessions/chat-1/image_gen/run-1/image.png";
     const delegatedPath = ".foco/sessions/chat-1/image_gen/run-2/image.png";
@@ -2958,7 +3422,9 @@ describe("app-chat-stream verification surfaces", () => {
       "test multi-agent resume",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     const assistantMessageId = "message-assistant-stream";
 
     await act(async () => {
@@ -3022,7 +3488,10 @@ describe("app-chat-stream verification surfaces", () => {
       .getByText("Waiting for worker.")
       .closest(".message-row") as HTMLElement | null;
     expect(waitingRow).not.toBeNull();
-    expect(within(waitingRow as HTMLElement).getAllByText("Waiting for worker.").length).toBeGreaterThan(0);
+    expect(
+      within(waitingRow as HTMLElement).getAllByText("Waiting for worker.")
+        .length,
+    ).toBeGreaterThan(0);
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -3067,9 +3536,15 @@ describe("app-chat-stream verification surfaces", () => {
     );
     expect(waitingRow).toHaveTextContent("Waiting for worker.");
     expect(waitingRow).toHaveTextContent("Planning handoff.");
-    expect(within(waitingRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
-    expect(within(waitingRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
-    expect(screen.getAllByText("Waiting for worker.").length).toBeGreaterThan(0);
+    expect(
+      within(waitingRow as HTMLElement).getByText("Delegate Task"),
+    ).toBeInTheDocument();
+    expect(
+      within(waitingRow as HTMLElement).getByText("Wait Tasks"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Waiting for worker.").length).toBeGreaterThan(
+      0,
+    );
     expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
 
     await act(async () => {
@@ -3180,7 +3655,10 @@ describe("app-chat-stream verification surfaces", () => {
           }),
         );
       }
-      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream") {
+      if (
+        path ===
+        "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream"
+      ) {
         const encoder = new TextEncoder();
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
@@ -3220,7 +3698,9 @@ describe("app-chat-stream verification surfaces", () => {
       "delegate then wait",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -3274,15 +3754,23 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const historyRows = await screen.findAllByText("Before handoff.");
-    const historyRow = historyRows[0]?.closest(".message-row") as HTMLElement | null;
+    const historyRow = historyRows[0]?.closest(
+      ".message-row",
+    ) as HTMLElement | null;
     expect(historyRow).not.toBeNull();
     expect(historyRow).toHaveTextContent("Pre-delegate reasoning.");
-    expect(within(historyRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
-    expect(within(historyRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
+    expect(
+      within(historyRow as HTMLElement).getByText("Delegate Task"),
+    ).toBeInTheDocument();
+    expect(
+      within(historyRow as HTMLElement).getByText("Wait Tasks"),
+    ).toBeInTheDocument();
     // Content may appear in both summary and body nodes inside one bubble.
     expect(
       new Set(
-        screen.getAllByText("Before handoff.").map((node) => node.closest(".message-row")),
+        screen
+          .getAllByText("Before handoff.")
+          .map((node) => node.closest(".message-row")),
       ).size,
     ).toBe(1);
 
@@ -3318,7 +3806,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() =>
-      expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("button", { name: "Cancel run" }),
+      ).not.toBeInTheDocument(),
     );
 
     // Later attempt appears under a new runId; reopen chat to take GET reattach path.
@@ -3356,7 +3846,9 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh workspaces" }),
+    );
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
@@ -3377,7 +3869,8 @@ describe("app-chat-stream verification surfaces", () => {
     // History must survive the reattach `start` before later deltas arrive.
     const historyAfterStart = await screen.findAllByText("Before handoff.");
     expect(
-      new Set(historyAfterStart.map((node) => node.closest(".message-row"))).size,
+      new Set(historyAfterStart.map((node) => node.closest(".message-row")))
+        .size,
     ).toBe(1);
     expect(screen.getByText("Pre-delegate reasoning.")).toBeInTheDocument();
     expect(screen.getByText("Delegate Task")).toBeInTheDocument();
@@ -3397,11 +3890,17 @@ describe("app-chat-stream verification surfaces", () => {
     expect(resumedRow).not.toBeNull();
     expect(resumedRow).toHaveTextContent("Before handoff.");
     expect(resumedRow).toHaveTextContent("Pre-delegate reasoning.");
-    expect(within(resumedRow as HTMLElement).getByText("Delegate Task")).toBeInTheDocument();
-    expect(within(resumedRow as HTMLElement).getByText("Wait Tasks")).toBeInTheDocument();
+    expect(
+      within(resumedRow as HTMLElement).getByText("Delegate Task"),
+    ).toBeInTheDocument();
+    expect(
+      within(resumedRow as HTMLElement).getByText("Wait Tasks"),
+    ).toBeInTheDocument();
     expect(
       new Set(
-        screen.getAllByText("Before handoff.").map((node) => node.closest(".message-row")),
+        screen
+          .getAllByText("Before handoff.")
+          .map((node) => node.closest(".message-row")),
       ).size,
     ).toBe(1);
     expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
@@ -3421,7 +3920,9 @@ describe("app-chat-stream verification surfaces", () => {
       "start work",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -3438,7 +3939,8 @@ describe("app-chat-stream verification surfaces", () => {
         fetchMock.mock.calls.some(
           ([url]) =>
             typeof url === "string" &&
-            url === "/api/workspaces/workspace-1/chat/runs/request-stream/cancel",
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/cancel",
         ),
       ).toBe(true);
     });
@@ -3461,16 +3963,22 @@ describe("app-chat-stream verification surfaces", () => {
       "first task",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "next task",
     );
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    );
     await userEvent.click(screen.getByLabelText("Thinking"));
-    await userEvent.click(screen.getByRole("button", { name: "Thinking: High" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Thinking: High" }),
+    );
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
     });
@@ -3551,7 +4059,9 @@ describe("app-chat-stream verification surfaces", () => {
       "first task",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -3616,7 +4126,9 @@ describe("app-chat-stream verification surfaces", () => {
       "first task",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -3726,7 +4238,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(await screen.findByText("Second chat"));
@@ -3778,7 +4292,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(
@@ -3945,7 +4461,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
     renderApp();
 
-    expect(await screen.findByRole("heading", { name: workspace.name })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: workspace.name }),
+    ).toBeInTheDocument();
     expect(statsSignal).toBeNull();
     await userEvent.type(
       await screen.findByRole("textbox"),
@@ -3993,7 +4511,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
     renderApp();
 
-    await userEvent.click((await screen.findAllByRole("button", { name: "API details" }))[0]);
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
     expect(await screen.findByText("API details")).toBeInTheDocument();
     const refreshButton = screen.getByRole("button", {
       name: "Refresh request audit",
@@ -4031,7 +4551,10 @@ describe("app-chat-stream verification surfaces", () => {
       if (path === "/api/workspaces/workspace-1/chat/stream") {
         const body =
           typeof init?.body === "string"
-            ? (JSON.parse(init.body) as { chatId?: string | null; message?: string })
+            ? (JSON.parse(init.body) as {
+                chatId?: string | null;
+                message?: string;
+              })
             : {};
         if (body.chatId && body.message === "Scheduled task") {
           appTestState.workspaceResponseWorkspaces = [
@@ -4064,7 +4587,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(
@@ -4094,10 +4619,11 @@ describe("app-chat-stream verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const scheduledHistoryTitle = await within(workspaceList).findByText(
-      "Scheduled task",
+    const scheduledHistoryTitle =
+      await within(workspaceList).findByText("Scheduled task");
+    expect(within(workspaceList).getAllByText("Scheduled task")).toHaveLength(
+      1,
     );
-    expect(within(workspaceList).getAllByText("Scheduled task")).toHaveLength(1);
     const scheduledHistoryButton = scheduledHistoryTitle.closest("button");
     if (!scheduledHistoryButton) {
       throw new Error("Expected scheduled chat history item button");
@@ -4122,11 +4648,15 @@ describe("app-chat-stream verification surfaces", () => {
     expect(queuedTabs).toHaveLength(1);
     expect(queuedTabs[0]).toHaveAttribute("aria-selected", "true");
 
-    const tabListBeforeComplete = await screen.findByRole("tablist", { name: "Chat" });
+    const tabListBeforeComplete = await screen.findByRole("tablist", {
+      name: "Chat",
+    });
     await userEvent.click(
       within(tabListBeforeComplete).getByRole("tab", { name: /Tool run/ }),
     );
-    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Please inspect README."),
+    ).toBeInTheDocument();
 
     const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
       ([url]) =>
@@ -4185,19 +4715,26 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
-    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(
+      within(tabList).getByRole("tab", { name: /Tool run/ }),
+    ).toHaveAttribute("aria-selected", "true");
     const activeMessageList = document.querySelector(".message-list");
     if (!(activeMessageList instanceof HTMLElement)) {
       throw new Error("Expected message list");
     }
-    expect(within(activeMessageList).getByText("Please inspect README.")).toBeInTheDocument();
-    expect(within(activeMessageList).queryByText("Scheduled task")).not.toBeInTheDocument();
-    expect(within(activeMessageList).queryByText("Scheduled answer.")).not.toBeInTheDocument();
+    expect(
+      within(activeMessageList).getByText("Please inspect README."),
+    ).toBeInTheDocument();
+    expect(
+      within(activeMessageList).queryByText("Scheduled task"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(activeMessageList).queryByText("Scheduled answer."),
+    ).not.toBeInTheDocument();
 
-    await userEvent.click(within(tabList).getByRole("tab", { name: /Scheduled task/ }));
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: /Scheduled task/ }),
+    );
     const scheduledMessageList = document.querySelector(".message-list");
     if (!(scheduledMessageList instanceof HTMLElement)) {
       throw new Error("Expected scheduled message list");
@@ -4207,9 +4744,11 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       consoleErrorSpy.mock.calls
         .flat()
-        .some((entry) =>
-          String(entry).includes("Encountered two children with the same key") &&
-          String(entry).includes("queued-chat-2"),
+        .some(
+          (entry) =>
+            String(entry).includes(
+              "Encountered two children with the same key",
+            ) && String(entry).includes("queued-chat-2"),
         ),
     ).toBe(false);
 
@@ -4229,7 +4768,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(
@@ -4309,7 +4850,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
     await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(true),
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
     );
 
     await userEvent.click(
@@ -4436,10 +4979,14 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await screen.findByText("Tool run");
-    const addAttachmentButton = screen.getByRole("button", { name: "Add attachment" });
+    const addAttachmentButton = screen.getByRole("button", {
+      name: "Add attachment",
+    });
     await waitFor(() => expect(addAttachmentButton).toBeEnabled());
     await userEvent.click(addAttachmentButton);
-    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+    const picker = await screen.findByRole("dialog", {
+      name: "Add attachment",
+    });
 
     await waitFor(() => {
       expect(
@@ -4461,12 +5008,17 @@ describe("app-chat-stream verification surfaces", () => {
     });
     expect(listBody.allowOutsideWorkspace).toBe(true);
 
-    await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
-    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+    await userEvent.click(
+      within(picker).getByRole("button", { name: /note\.txt/ }),
+    );
+    await userEvent.click(
+      within(picker).getByRole("button", { name: "Select" }),
+    );
     expect(await screen.findByText("note.txt")).toBeInTheDocument();
 
     const readCall = fetchMock.mock.calls.find(
-      ([url]) => typeof url === "string" && url === "/api/file-picker/read-files",
+      ([url]) =>
+        typeof url === "string" && url === "/api/file-picker/read-files",
     );
     expect(readCall).toBeDefined();
     const readBody = JSON.parse(String(readCall?.[1]?.body ?? "{}")) as {
@@ -4480,8 +5032,13 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
+    await userEvent.click(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Review it",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
@@ -4517,7 +5074,6 @@ describe("app-chat-stream verification surfaces", () => {
       }),
     );
 
-
     await act(async () => {
       appTestState.activeChatStreamController?.close();
     });
@@ -4527,12 +5083,20 @@ describe("app-chat-stream verification surfaces", () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(await screen.findByRole("button", { name: "Edit message" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Edit message" }),
+    );
 
-    const editAttachmentButtons = screen.getAllByRole("button", { name: "Add attachment" });
+    const editAttachmentButtons = screen.getAllByRole("button", {
+      name: "Add attachment",
+    });
     // Composer + inline edit both expose Add attachment; use the last (edit UI).
-    await userEvent.click(editAttachmentButtons[editAttachmentButtons.length - 1]!);
-    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
+    await userEvent.click(
+      editAttachmentButtons[editAttachmentButtons.length - 1]!,
+    );
+    const picker = await screen.findByRole("dialog", {
+      name: "Add attachment",
+    });
 
     await waitFor(() => {
       expect(
@@ -4543,7 +5107,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
     const listCall = [...fetchMock.mock.calls]
       .reverse()
-      .find(([url]) => typeof url === "string" && url === "/api/file-picker/list");
+      .find(
+        ([url]) => typeof url === "string" && url === "/api/file-picker/list",
+      );
     const listBody = JSON.parse(String(listCall?.[1]?.body ?? "{}")) as {
       allowOutsideWorkspace?: boolean;
       target?: { kind?: string; workspaceId?: string };
@@ -4554,19 +5120,27 @@ describe("app-chat-stream verification surfaces", () => {
       workspaceId: "workspace-1",
     });
 
-    await userEvent.click(within(picker).getByRole("button", { name: /note\.txt/ }));
-    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+    await userEvent.click(
+      within(picker).getByRole("button", { name: /note\.txt/ }),
+    );
+    await userEvent.click(
+      within(picker).getByRole("button", { name: "Select" }),
+    );
 
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
-          ([url]) => typeof url === "string" && url === "/api/file-picker/read-files",
+          ([url]) =>
+            typeof url === "string" && url === "/api/file-picker/read-files",
         ),
       ).toBe(true);
     });
     const readCall = [...fetchMock.mock.calls]
       .reverse()
-      .find(([url]) => typeof url === "string" && url === "/api/file-picker/read-files");
+      .find(
+        ([url]) =>
+          typeof url === "string" && url === "/api/file-picker/read-files",
+      );
     const readBody = JSON.parse(String(readCall?.[1]?.body ?? "{}")) as {
       allowOutsideWorkspace?: boolean;
     };
@@ -4578,10 +5152,18 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await screen.findByText("Tool run");
-    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
-    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
-    await userEvent.click(within(picker).getByRole("button", { name: /screen\.png/ }));
-    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Add attachment" }),
+    );
+    const picker = await screen.findByRole("dialog", {
+      name: "Add attachment",
+    });
+    await userEvent.click(
+      within(picker).getByRole("button", { name: /screen\.png/ }),
+    );
+    await userEvent.click(
+      within(picker).getByRole("button", { name: "Select" }),
+    );
 
     expect(
       await screen.findByText(
@@ -4590,7 +5172,10 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("screen.png")).toBeNull();
 
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "Review it");
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "Review it",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() => {
@@ -4628,10 +5213,18 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await screen.findByText("Tool run");
-    await userEvent.click(screen.getByRole("button", { name: "Add attachment" }));
-    const picker = await screen.findByRole("dialog", { name: "Add attachment" });
-    await userEvent.click(within(picker).getByRole("button", { name: /screen\.png/ }));
-    await userEvent.click(within(picker).getByRole("button", { name: "Select" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Add attachment" }),
+    );
+    const picker = await screen.findByRole("dialog", {
+      name: "Add attachment",
+    });
+    await userEvent.click(
+      within(picker).getByRole("button", { name: /screen\.png/ }),
+    );
+    await userEvent.click(
+      within(picker).getByRole("button", { name: "Select" }),
+    );
 
     expect(await screen.findByText("screen.png")).toBeInTheDocument();
     expect(
@@ -4646,7 +5239,10 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "diagram");
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "diagram",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -4658,7 +5254,9 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText(/flowchart TD/)).toBeInTheDocument();
-    expect(screen.queryByText("Mermaid diagram failed to render.")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Mermaid diagram failed to render."),
+    ).not.toBeInTheDocument();
     expect(mermaidMock.render).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -4734,8 +5332,12 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    const rawMarkdown = await screen.findByText(/\[docs\]\(https:\/\/example\.com\)/);
-    const streamingBubble = rawMarkdown.closest(".message-bubble") as HTMLElement;
+    const rawMarkdown = await screen.findByText(
+      /\[docs\]\(https:\/\/example\.com\)/,
+    );
+    const streamingBubble = rawMarkdown.closest(
+      ".message-bubble",
+    ) as HTMLElement;
     expect(streamingBubble).not.toBeNull();
     expect(
       within(streamingBubble).queryByRole("link", { name: "docs" }),
@@ -4786,7 +5388,9 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await userEvent.click(await screen.findByText("Memories used"));
-    expect(screen.getByText("Use memory before streaming.")).toBeInTheDocument();
+    expect(
+      screen.getByText("Use memory before streaming."),
+    ).toBeInTheDocument();
     expect(screen.queryByText("Model: gpt-test")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -4820,42 +5424,46 @@ describe("app-chat-stream verification surfaces", () => {
       scope: "workspace",
       source: "direct",
     };
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/chat/questions/pending") {
-        return jsonResponse({ questions: exposeReloadQuestion ? [pendingQuestion] : [] });
-      }
+        if (path === "/api/chat/questions/pending") {
+          return jsonResponse({
+            questions: exposeReloadQuestion ? [pendingQuestion] : [],
+          });
+        }
 
-      if (
-        exposeReloadQuestion &&
-        path === "/api/workspaces/workspace-1/chats/chat-1/messages"
-      ) {
-        refreshedMessages += 1;
-        return jsonResponse({
-          ...chatMessages,
-          activeRun: {
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-          messages: [
-            {
-              ...chatMessages.messages[0],
-              content: "use memory",
-              id: "message-user-stream",
-              parts: [{ text: "use memory", type: "text" }],
+        if (
+          exposeReloadQuestion &&
+          path === "/api/workspaces/workspace-1/chats/chat-1/messages"
+        ) {
+          refreshedMessages += 1;
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
             },
-          ],
-        });
-      }
+            messages: [
+              {
+                ...chatMessages.messages[0],
+                content: "use memory",
+                id: "message-user-stream",
+                parts: [{ text: "use memory", type: "text" }],
+              },
+            ],
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
@@ -4865,7 +5473,9 @@ describe("app-chat-stream verification surfaces", () => {
       "use memory",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
     await waitFor(() =>
       expect(document.querySelector(".message-waiting-spinner")).not.toBeNull(),
     );
@@ -4901,7 +5511,9 @@ describe("app-chat-stream verification surfaces", () => {
       "remember this",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -4953,7 +5565,10 @@ describe("app-chat-stream verification surfaces", () => {
   it("appends stream errors after already rendered assistant text", async () => {
     renderApp();
 
-    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "debug");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "debug",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -4984,7 +5599,10 @@ describe("app-chat-stream verification surfaces", () => {
   it("shows hook blocking notifications in the active chat", async () => {
     renderApp();
 
-    await userEvent.type(await screen.findByPlaceholderText(defaultComposerPlaceholder), "danger");
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "danger",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await act(async () => {
@@ -4999,7 +5617,9 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    expect(await screen.findByText("Hook blocked run_command: denied")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Hook blocked run_command: denied"),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("[PreToolUse] Hook blocked run_command: denied"),
     ).toBeInTheDocument();
@@ -5028,7 +5648,10 @@ describe("app-chat-stream verification surfaces", () => {
     await screen.findByText("Please inspect README.");
     expect(statusDot()).toHaveClass("session-status-dot-open");
 
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
@@ -5067,7 +5690,10 @@ describe("app-chat-stream verification surfaces", () => {
 
     await userEvent.click(historyButton);
     await screen.findByText("Please inspect README.");
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     await waitFor(() =>
@@ -5111,26 +5737,35 @@ describe("app-chat-stream verification surfaces", () => {
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
     await waitFor(() =>
-      expect(within(tabList).getByRole("tab", { name: /README\.md/ })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(
+        within(tabList).getByRole("tab", { name: /README\.md/ }),
+      ).toHaveAttribute("aria-selected", "true"),
     );
-    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: /Second chat/ }),
+    );
     expect(
-      within(tabList).getByRole("button", { name: "Close chat tab Second chat" }),
+      within(tabList).getByRole("button", {
+        name: "Close chat tab Second chat",
+      }),
     ).toBeInTheDocument();
 
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const secondChatButton = within(workspaceList).getByText("Second chat").closest("button");
+    const secondChatButton = within(workspaceList)
+      .getByText("Second chat")
+      .closest("button");
     if (!secondChatButton) {
       throw new Error("Expected Second chat history item button");
     }
-    const statusDot = () => secondChatButton.querySelector(".session-status-dot");
+    const statusDot = () =>
+      secondChatButton.querySelector(".session-status-dot");
 
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(
@@ -5147,13 +5782,17 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(closeButton);
 
     await waitFor(() =>
-      expect(within(tabList).queryByRole("tab", { name: /Second chat/ })).not.toBeInTheDocument(),
+      expect(
+        within(tabList).queryByRole("tab", { name: /Second chat/ }),
+      ).not.toBeInTheDocument(),
     );
     expect(statusDot()).toHaveClass("session-status-dot-running");
     expect(
       vi.mocked(fetch).mock.calls.some(([input]) => {
         const url = typeof input === "string" ? input : input.toString();
-        return url.includes("/api/workspaces/workspace-1/chat/runs/request-stream/cancel");
+        return url.includes(
+          "/api/workspaces/workspace-1/chat/runs/request-stream/cancel",
+        );
       }),
     ).toBe(false);
 
@@ -5172,13 +5811,17 @@ describe("app-chat-stream verification surfaces", () => {
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
     await waitFor(() =>
-      expect(within(tabList).getByRole("tab", { name: /README\.md/ })).toHaveAttribute(
-        "aria-selected",
-        "true",
-      ),
+      expect(
+        within(tabList).getByRole("tab", { name: /README\.md/ }),
+      ).toHaveAttribute("aria-selected", "true"),
     );
-    await userEvent.click(within(tabList).getByRole("tab", { name: /Second chat/ }));
-    await userEvent.type(screen.getByPlaceholderText(defaultComposerPlaceholder), "continue");
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: /Second chat/ }),
+    );
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue",
+    );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(
@@ -5188,7 +5831,9 @@ describe("app-chat-stream verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const secondChatButton = within(workspaceList).getByText("Second chat").closest("button");
+    const secondChatButton = within(workspaceList)
+      .getByText("Second chat")
+      .closest("button");
     if (!secondChatButton) {
       throw new Error("Expected Second chat history item button");
     }
@@ -5198,26 +5843,33 @@ describe("app-chat-stream verification surfaces", () => {
       ),
     );
 
-    const toolRunTabItem = within(tabList).getByRole("tab", { name: /Tool run/ }).closest(".chat-tab-item");
+    const toolRunTabItem = within(tabList)
+      .getByRole("tab", { name: /Tool run/ })
+      .closest(".chat-tab-item");
     expect(toolRunTabItem).not.toBeNull();
     fireEvent.contextMenu(toolRunTabItem as HTMLElement);
     const menu = await screen.findByRole("menu", { name: "Tool run" });
-    await userEvent.click(within(menu).getByRole("menuitem", { name: "Close other tabs" }));
+    await userEvent.click(
+      within(menu).getByRole("menuitem", { name: "Close other tabs" }),
+    );
 
     await waitFor(() =>
-      expect(within(tabList).queryByRole("tab", { name: /Second chat/ })).not.toBeInTheDocument(),
+      expect(
+        within(tabList).queryByRole("tab", { name: /Second chat/ }),
+      ).not.toBeInTheDocument(),
     );
-    expect(within(tabList).getByRole("tab", { name: /Tool run/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
+    expect(
+      within(tabList).getByRole("tab", { name: /Tool run/ }),
+    ).toHaveAttribute("aria-selected", "true");
     expect(secondChatButton.querySelector(".session-status-dot")).toHaveClass(
       "session-status-dot-running",
     );
     expect(
       vi.mocked(fetch).mock.calls.some(([input]) => {
         const url = typeof input === "string" ? input : input.toString();
-        return url.includes("/api/workspaces/workspace-1/chat/runs/request-stream/cancel");
+        return url.includes(
+          "/api/workspaces/workspace-1/chat/runs/request-stream/cancel",
+        );
       }),
     ).toBe(false);
 
@@ -5235,13 +5887,17 @@ describe("app-chat-stream verification surfaces", () => {
       "wait for worker",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const historyButton = within(workspaceList).getByText("Tool run").closest("button");
+    const historyButton = within(workspaceList)
+      .getByText("Tool run")
+      .closest("button");
     if (!historyButton) {
       throw new Error("Expected Tool run history item button");
     }
@@ -5250,8 +5906,12 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await within(tabList).findByRole("status", { name: "Chat is running" }),
     ).toBeInTheDocument();
-    await waitFor(() => expect(statusDot()).toHaveClass("session-status-dot-running"));
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(statusDot()).toHaveClass("session-status-dot-running"),
+    );
+    expect(
+      screen.getByRole("button", { name: "Cancel run" }),
+    ).toBeInTheDocument();
 
     appTestState.workspaceResponseWorkspaces = [
       {
@@ -5284,13 +5944,21 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() =>
-      expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument(),
+      expect(
+        screen.queryByRole("button", { name: "Cancel run" }),
+      ).not.toBeInTheDocument(),
     );
-    expect(within(tabList).getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
+    expect(
+      within(tabList).getByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
     expect(tabList.querySelector(".chat-tab-running-spinner")).not.toBeNull();
     expect(statusDot()).toHaveClass("session-status-dot-running");
-    expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Send guidance" })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Send message" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Send guidance" }),
+    ).not.toBeInTheDocument();
 
     // Still durable-running while a later activeRun appears (resume handoff).
     appTestState.workspaceResponseWorkspaces = [
@@ -5323,10 +5991,14 @@ describe("app-chat-stream verification surfaces", () => {
       },
       secondaryWorkspace,
     ];
-    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh workspaces" }),
+    );
 
     await waitFor(() =>
-      expect(within(tabList).getByRole("status", { name: "Chat is running" })).toBeInTheDocument(),
+      expect(
+        within(tabList).getByRole("status", { name: "Chat is running" }),
+      ).toBeInTheDocument(),
     );
     expect(statusDot()).toHaveClass("session-status-dot-running");
 
@@ -5345,14 +6017,18 @@ describe("app-chat-stream verification surfaces", () => {
       },
       secondaryWorkspace,
     ];
-    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh workspaces" }),
+    );
 
     await waitFor(() =>
       expect(
         within(tabList).queryByRole("status", { name: "Chat is running" }),
       ).not.toBeInTheDocument(),
     );
-    await waitFor(() => expect(statusDot()).not.toHaveClass("session-status-dot-running"));
+    await waitFor(() =>
+      expect(statusDot()).not.toHaveClass("session-status-dot-running"),
+    );
   });
 
   it("keeps the tab context menu open when the active stream scrolls messages", async () => {
@@ -5364,13 +6040,19 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     const tabList = await screen.findByRole("tablist", { name: "Chat" });
-    const toolRunTabItem = within(tabList).getByRole("tab", { name: /Tool run/ }).closest(".chat-tab-item");
+    const toolRunTabItem = within(tabList)
+      .getByRole("tab", { name: /Tool run/ })
+      .closest(".chat-tab-item");
     expect(toolRunTabItem).not.toBeNull();
     fireEvent.contextMenu(toolRunTabItem as HTMLElement);
-    expect(await screen.findByRole("menu", { name: "Tool run" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("menu", { name: "Tool run" }),
+    ).toBeInTheDocument();
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -5403,19 +6085,23 @@ describe("app-chat-stream verification surfaces", () => {
       "continue",
     );
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() => expect(appTestState.activeChatStreamController).not.toBeNull());
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
 
     await userEvent.click(screen.getByRole("tab", { name: "Files" }));
     const contextPanel = document.querySelector(".context-panel");
     if (!(contextPanel instanceof HTMLElement)) {
       throw new Error("Expected context panel");
     }
-    const fileRow = (await within(contextPanel).findByText("README.md")).closest(
-      "div[role='treeitem']",
-    );
+    const fileRow = (
+      await within(contextPanel).findByText("README.md")
+    ).closest("div[role='treeitem']");
     expect(fileRow).not.toBeNull();
     fireEvent.contextMenu(fileRow as HTMLElement);
-    expect(await screen.findByRole("menu", { name: "README.md" })).toBeInTheDocument();
+    expect(
+      await screen.findByRole("menu", { name: "README.md" }),
+    ).toBeInTheDocument();
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -5468,7 +6154,9 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
-    expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Please inspect README."),
+    ).toBeInTheDocument();
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
 
@@ -5496,7 +6184,9 @@ describe("app-chat-stream verification surfaces", () => {
     const initialWorkspaceRequests = fetchMock.mock.calls.filter(([url]) =>
       String(url).includes("/api/workspaces"),
     ).length;
-    await userEvent.click(screen.getByRole("button", { name: "Refresh workspaces" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh workspaces" }),
+    );
     await waitFor(() => {
       const workspaceRequests = fetchMock.mock.calls.filter(([url]) =>
         String(url).includes("/api/workspaces"),
@@ -5528,7 +6218,9 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
-    expect(await screen.findByText("Reattached from workspace list.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Reattached from workspace list."),
+    ).toBeInTheDocument();
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
@@ -5536,54 +6228,60 @@ describe("app-chat-stream verification surfaces", () => {
   });
 
   it("restores a pending question when loading an active chat", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          ...chatMessages,
-          activeRun: {
-            acceptingGuidance: true,
-            chatId: "chat-1",
-            lastSequence: 853,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-          pendingQuestion: {
-            chatId: "chat-1",
-            id: "read-file-question-1",
-            questions: [
-              {
-                allowFreeText: false,
-                id: "read-file-question-1-item-1",
-                options: [
-                  {
-                    description: "Allow this read.",
-                    label: "Allow",
-                    value: "allow",
-                  },
-                ],
-                question: "read_file wants to read outside the workspace.",
-              },
-            ],
-            toolCallId: "read-file-call-1",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: {
+              acceptingGuidance: true,
+              chatId: "chat-1",
+              lastSequence: 853,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+            pendingQuestion: {
+              chatId: "chat-1",
+              id: "read-file-question-1",
+              questions: [
+                {
+                  allowFreeText: false,
+                  id: "read-file-question-1-item-1",
+                  options: [
+                    {
+                      description: "Allow this read.",
+                      label: "Allow",
+                      value: "allow",
+                    },
+                  ],
+                  question: "read_file wants to read outside the workspace.",
+                },
+              ],
+              toolCallId: "read-file-call-1",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
 
-    const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+    const dialog = await screen.findByRole("dialog", {
+      name: "Foco needs your answer",
+    });
     expect(
-      within(dialog).getByText("read_file wants to read outside the workspace."),
+      within(dialog).getByText(
+        "read_file wants to read outside the workspace.",
+      ),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("Allow")).toBeInTheDocument();
 
@@ -5615,40 +6313,47 @@ describe("app-chat-stream verification surfaces", () => {
         workspaceId: "workspace-1",
       },
     ];
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
-        return jsonResponse({
-          ...secondChatMessages,
-          activeRun: null,
-          pendingQuestion: appTestState.pendingQuestionsResponse[0],
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-2/messages") {
+          return jsonResponse({
+            ...secondChatMessages,
+            activeRun: null,
+            pendingQuestion: appTestState.pendingQuestionsResponse[0],
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
 
     renderApp();
 
-    expect(await screen.findByRole("tab", { name: /Second chat/ })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+    expect(
+      await screen.findByRole("tab", { name: /Second chat/ }),
+    ).toHaveAttribute("aria-selected", "true");
+    const dialog = await screen.findByRole("dialog", {
+      name: "Foco needs your answer",
+    });
     expect(
       within(dialog).getByText("Should the background run continue?"),
     ).toBeInTheDocument();
 
     await userEvent.click(within(dialog).getByText("Proceed"));
-    await userEvent.click(within(dialog).getByRole("button", { name: "Continue run" }));
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Continue run" }),
+    );
 
     await waitFor(() => {
-      expect(appTestState.answeredQuestionIds).toEqual(["pending-startup-question"]);
+      expect(appTestState.answeredQuestionIds).toEqual([
+        "pending-startup-question",
+      ]);
     });
   });
 
@@ -5681,61 +6386,69 @@ describe("app-chat-stream verification surfaces", () => {
   });
 
   it("reconnects an idle active run stream from the last processed sequence", async () => {
-    (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
-      .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;
+    (
+      globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number }
+    ).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;
     let runStreamRequests = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          messages: [
-            chatMessages.messages[0],
-            {
-              ...chatMessages.messages[1],
-              id: "message-assistant-stream",
-              status: "streaming",
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                id: "message-assistant-stream",
+                status: "streaming",
+              },
+            ],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
             },
-          ],
-          activeRun: {
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
-        runStreamRequests += 1;
-        const encoder = new TextEncoder();
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            appTestState.chatStreamControllers.set("request-stream", controller);
-            if (runStreamRequests === 1) {
-              controller.enqueue(
-                encoder.encode(
-                  `id: 1\ndata: ${JSON.stringify({
-                    assistantMessageId: "message-assistant-stream",
-                    delta: "Still alive.",
-                    type: "textDelta",
-                  })}\n\n`,
-                ),
+        if (
+          path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream"
+        ) {
+          runStreamRequests += 1;
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              appTestState.chatStreamControllers.set(
+                "request-stream",
+                controller,
               );
-            }
-          },
-        });
-        return new Response(stream, {
-          headers: { "Content-Type": "text/event-stream" },
-          status: 200,
-        });
-      }
+              if (runStreamRequests === 1) {
+                controller.enqueue(
+                  encoder.encode(
+                    `id: 1\ndata: ${JSON.stringify({
+                      assistantMessageId: "message-assistant-stream",
+                      delta: "Still alive.",
+                      type: "textDelta",
+                    })}\n\n`,
+                  ),
+                );
+              }
+            },
+          });
+          return new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -5774,8 +6487,9 @@ describe("app-chat-stream verification surfaces", () => {
       } catch {
         // Stream may already be cancelled by the idle watchdog.
       }
-      delete (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
-        .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
+      delete (
+        globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number }
+      ).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
     }
   });
 
@@ -5799,37 +6513,40 @@ describe("app-chat-stream verification surfaces", () => {
       secondaryWorkspace,
     ];
     let messageRequests = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        messageRequests += 1;
-        return jsonResponse({
-          ...chatMessages,
-          activeRun: messageRequests === 1
-            ? {
-              acceptingGuidance: false,
-              chatId: "chat-1",
-              lastSequence: 0,
-              runId: "stale-run",
-              workspaceId: "workspace-1",
-            }
-            : null,
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          messageRequests += 1;
+          return jsonResponse({
+            ...chatMessages,
+            activeRun:
+              messageRequests === 1
+                ? {
+                    acceptingGuidance: false,
+                    chatId: "chat-1",
+                    lastSequence: 0,
+                    runId: "stale-run",
+                    workspaceId: "workspace-1",
+                  }
+                : null,
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chat/runs/stale-run/stream") {
-        return jsonResponse(
-          { error: "active chat run was not found: stale-run" },
-          { status: 400 },
-        );
-      }
+        if (path === "/api/workspaces/workspace-1/chat/runs/stale-run/stream") {
+          return jsonResponse(
+            { error: "active chat run was not found: stale-run" },
+            { status: 400 },
+          );
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
@@ -5838,9 +6555,9 @@ describe("app-chat-stream verification surfaces", () => {
     const workspaceList = await screen.findByRole("navigation", {
       name: "Workspace list",
     });
-    const historyButton = (await within(workspaceList).findByText("Tool run")).closest(
-      "button",
-    );
+    const historyButton = (
+      await within(workspaceList).findByText("Tool run")
+    ).closest("button");
     if (!historyButton) {
       throw new Error("Expected Tool run history item button");
     }
@@ -5849,128 +6566,149 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() =>
       expect(
         fetchMock.mock.calls.some(([input]) =>
-          String(input).includes("/api/workspaces/workspace-1/chat/runs/stale-run/stream"),
+          String(input).includes(
+            "/api/workspaces/workspace-1/chat/runs/stale-run/stream",
+          ),
         ),
       ).toBe(true),
     );
     await waitFor(() => expect(messageRequests).toBeGreaterThan(1));
-    await waitFor(() => expect(statusDot()).not.toHaveClass("session-status-dot-running"));
-    expect(screen.queryByText("active chat run was not found: stale-run")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Cancel run" })).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(statusDot()).not.toHaveClass("session-status-dot-running"),
+    );
+    expect(
+      screen.queryByText("active chat run was not found: stale-run"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Cancel run" }),
+    ).not.toBeInTheDocument();
   });
 
   it("shows non-stale active run stream backend errors", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          ...chatMessages,
-          activeRun: {
-            acceptingGuidance: false,
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "broken-run",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: {
+              acceptingGuidance: false,
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "broken-run",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chat/runs/broken-run/stream") {
-        return jsonResponse(
-          { error: "stream exploded" },
-          { status: 500 },
-        );
-      }
+        if (
+          path === "/api/workspaces/workspace-1/chat/runs/broken-run/stream"
+        ) {
+          return jsonResponse({ error: "stream exploded" }, { status: 500 });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     renderApp();
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("stream exploded");
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "stream exploded",
+    );
   });
 
   it("keeps a pending ask_question dialog and draft through idle active run reconnect", async () => {
-    (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
-      .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;
+    (
+      globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number }
+    ).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__ = 20;
     let runStreamRequests = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          messages: [
-            chatMessages.messages[0],
-            {
-              ...chatMessages.messages[1],
-              id: "message-assistant-stream",
-              status: "streaming",
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                id: "message-assistant-stream",
+                status: "streaming",
+              },
+            ],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
             },
-          ],
-          activeRun: {
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
-        runStreamRequests += 1;
-        const encoder = new TextEncoder();
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            appTestState.chatStreamControllers.set("request-stream", controller);
-            if (runStreamRequests === 1) {
-              controller.enqueue(
-                encoder.encode(
-                  `id: 1\ndata: ${JSON.stringify({
-                    assistantMessageId: "message-assistant-stream",
-                    request: {
-                      chatId: "chat-1",
-                      id: "idle-reconnect-question",
-                      questions: [
-                        {
-                          allowFreeText: true,
-                          id: "idle-reconnect-question-item",
-                          options: [],
-                          question: "What should Foco do next?",
-                        },
-                      ],
-                      toolCallId: "ask-question-call",
-                      workspaceId: "workspace-1",
-                    },
-                    type: "questionRequest",
-                  })}\n\n`,
-                ),
+        if (
+          path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream"
+        ) {
+          runStreamRequests += 1;
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              appTestState.chatStreamControllers.set(
+                "request-stream",
+                controller,
               );
-            }
-          },
-        });
-        return new Response(stream, {
-          headers: { "Content-Type": "text/event-stream" },
-          status: 200,
-        });
-      }
+              if (runStreamRequests === 1) {
+                controller.enqueue(
+                  encoder.encode(
+                    `id: 1\ndata: ${JSON.stringify({
+                      assistantMessageId: "message-assistant-stream",
+                      request: {
+                        chatId: "chat-1",
+                        id: "idle-reconnect-question",
+                        questions: [
+                          {
+                            allowFreeText: true,
+                            id: "idle-reconnect-question-item",
+                            options: [],
+                            question: "What should Foco do next?",
+                          },
+                        ],
+                        toolCallId: "ask-question-call",
+                        workspaceId: "workspace-1",
+                      },
+                      type: "questionRequest",
+                    })}\n\n`,
+                  ),
+                );
+              }
+            },
+          });
+          return new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
 
     try {
       renderApp();
-      const dialog = await screen.findByRole("dialog", { name: "Foco needs your answer" });
+      const dialog = await screen.findByRole("dialog", {
+        name: "Foco needs your answer",
+      });
       const answerDraft = within(dialog).getByLabelText("Custom answer");
       fireEvent.change(answerDraft, { target: { value: "Keep this draft" } });
 
@@ -5991,54 +6729,60 @@ describe("app-chat-stream verification surfaces", () => {
         name: "Foco needs your answer",
       });
       expect(reconnectedDialog).toBeInTheDocument();
-      expect(within(reconnectedDialog).getByLabelText("Custom answer"))
-        .toHaveValue("Keep this draft");
+      expect(
+        within(reconnectedDialog).getByLabelText("Custom answer"),
+      ).toHaveValue("Keep this draft");
     } finally {
       try {
         appTestState.chatStreamControllers.get("request-stream")?.close();
       } catch {
         // Stream may already be cancelled by the idle watchdog.
       }
-      delete (globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number })
-        .__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
+      delete (
+        globalThis as { __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: number }
+      ).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
     }
   });
 
   it("does not duplicate active run subscriptions on recovery events while the stream is alive", async () => {
     let runStreamRequests = 0;
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          messages: [
-            chatMessages.messages[0],
-            {
-              ...chatMessages.messages[1],
-              id: "message-assistant-stream",
-              status: "streaming",
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                id: "message-assistant-stream",
+                status: "streaming",
+              },
+            ],
+            activeRun: {
+              acceptingGuidance: true,
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
             },
-          ],
-          activeRun: {
-            acceptingGuidance: true,
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+          });
+        }
 
-      if (path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream") {
-        runStreamRequests += 1;
-        return chatStreamResponse("chat-1");
-      }
+        if (
+          path === "/api/workspaces/workspace-1/chat/runs/request-stream/stream"
+        ) {
+          runStreamRequests += 1;
+          return chatStreamResponse("chat-1");
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
@@ -6062,40 +6806,42 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
   it("reattaches to an active run when loading chat messages", async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = typeof input === "string" ? input : input.toString();
-      const path = url.startsWith("http://127.0.0.1")
-        ? new URL(url).pathname
-        : url.split("?")[0];
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
 
-      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-        return jsonResponse({
-          messages: [
-            chatMessages.messages[0],
-            {
-              ...chatMessages.messages[1],
-              content: "Persisted fallback text.",
-              id: "message-assistant-stream",
-              metrics: null,
-              parts: [
-                { text: "Persisted fallback reasoning.", type: "reasoning" },
-                { text: "Persisted fallback text.", type: "text" },
-              ],
-              reasoning: "Persisted fallback reasoning.",
-              toolCalls: [],
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "Persisted fallback text.",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [
+                  { text: "Persisted fallback reasoning.", type: "reasoning" },
+                  { text: "Persisted fallback text.", type: "text" },
+                ],
+                reasoning: "Persisted fallback reasoning.",
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
             },
-          ],
-          activeRun: {
-            chatId: "chat-1",
-            lastSequence: 0,
-            runId: "request-stream",
-            workspaceId: "workspace-1",
-          },
-        });
-      }
+          });
+        }
 
-      return mockFetch(input, init);
-    });
+        return mockFetch(input, init);
+      },
+    );
     vi.stubGlobal("fetch", fetchMock);
     window.history.replaceState(null, "", "/workspace-1/chat-1");
     renderApp();
@@ -6120,9 +6866,15 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     expect(await screen.findByText("Still running.")).toBeInTheDocument();
-    expect(screen.queryByText("Persisted fallback text.")).not.toBeInTheDocument();
-    expect(screen.queryByText("Persisted fallback reasoning.")).not.toBeInTheDocument();
-    expect(screen.getByRole("status", { name: "Chat is running" })).toBeInTheDocument();
+    expect(
+      screen.queryByText("Persisted fallback text."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Persisted fallback reasoning."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
 
     const usageCallCountBeforeUsage = fetchMock.mock.calls.filter(
       ([url]) =>
@@ -6182,7 +6934,9 @@ describe("app-chat-stream verification surfaces", () => {
         typeof url === "string" &&
         url === "/api/workspaces/workspace-1/context-usage",
     );
-    expect(usageCallsAfterComplete).toHaveLength(usageCallCountBeforeComplete + 1);
+    expect(usageCallsAfterComplete).toHaveLength(
+      usageCallCountBeforeComplete + 1,
+    );
     expect(
       screen.getByRole("status", { name: "Context usage 47%" }),
     ).toHaveTextContent("47%");
@@ -6191,5 +6945,4 @@ describe("app-chat-stream verification surfaces", () => {
       appTestState.activeChatStreamController?.close();
     });
   });
-
 });

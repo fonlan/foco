@@ -6483,6 +6483,7 @@ export function App() {
         modelId: runConfig.modelId,
         providerId: runConfig.providerId ?? selectedProviderIdRef.current ?? "",
         thinkingLevel: runConfig.thinkingLevel ?? "",
+        latencyMode: latencyModeFromValue(runConfig.latencyMode),
         skillIds: normalizeStringArray(runConfig.selectedSkillIds),
         sessionMode:
           runConfig.sessionMode ?? userMessage.sessionMode ?? undefined,
@@ -6880,6 +6881,7 @@ export function App() {
         if (!hadCachedMessagesBeforeLoad) {
           setIsPlanModeEnabled(planModeFromMessages);
           applyComposerModelForPlanMode(planModeFromMessages);
+          setSelectedLatencyMode(resolveCommittedLatencyModeForChatKey(chatKey));
         }
       }
       if (activeRun) {
@@ -9226,6 +9228,7 @@ export function App() {
             modelId,
             providerId,
             thinkingLevel: runConfig?.thinkingLevel || null,
+            latencyMode: latencyModeFromValue(runConfig?.latencyMode),
             selectedSkillIds: editedSkillIds,
             sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
             teamModeEnabled: runConfig?.teamModeEnabled ?? false,
@@ -9251,6 +9254,7 @@ export function App() {
             modelId,
             providerId,
             thinkingLevel: runConfig?.thinkingLevel ?? null,
+            latencyMode: latencyModeFromValue(runConfig?.latencyMode),
             selectedSkillIds: editedSkillIds,
             sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
             teamModeEnabled: runConfig?.teamModeEnabled ?? false,
@@ -9269,6 +9273,7 @@ export function App() {
             runConfig?.sessionMode ?? message.sessionMode ?? undefined,
           teamModeEnabled: runConfig?.teamModeEnabled ?? false,
           thinkingLevel: runConfig?.thinkingLevel ?? "",
+          latencyMode: latencyModeFromValue(runConfig?.latencyMode),
           workspaceId,
         },
         chatKey,
@@ -9309,6 +9314,7 @@ export function App() {
         sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? undefined,
         teamModeEnabled: runConfig?.teamModeEnabled ?? false,
         thinkingLevel: runConfig?.thinkingLevel ?? "",
+        latencyMode: latencyModeFromValue(runConfig?.latencyMode),
         workspaceId,
         localChatKey: chatKey,
         pendingUserMessageId: edited.userMessageId,
@@ -9667,6 +9673,7 @@ export function App() {
     setSelectedModelId(retryRequest.modelId);
     setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
+    setSelectedLatencyMode(retryRequest.latencyMode ?? "standard");
     await runChatMessage(retryRequest);
   }
 
@@ -11547,6 +11554,7 @@ export function App() {
             skillIds: request.skillIds.length ? request.skillIds : null,
             sessionMode: request.sessionMode ?? null,
             thinkingLevel: request.thinkingLevel || null,
+            latencyMode: request.latencyMode ?? "standard",
           }),
           cache: "no-store",
           credentials: "same-origin",

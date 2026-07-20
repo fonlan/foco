@@ -3595,6 +3595,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fast_latency_mode_is_present_in_captured_responses_wire_dump() {
+        let response = concat!(
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-fast-fixture\",\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Fast wire",
+        )]);
+        request.model_id = "gpt-5.4".to_string();
+        let mut stream = stream_chat_with_capture_runtime_options(
+            &config,
+            request,
+            ChatRequestRuntimeOptions {
+                latency_mode: LatencyMode::Fast,
+            },
+            true,
+        )
+        .await
+        .expect("open Fast Responses fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("captured wire request")
+            .as_http()
+            .expect("HTTP wire request");
+        let body =
+            serde_json::from_str::<Value>(dump.body.as_deref().expect("captured request body"))
+                .expect("request JSON");
+        assert_eq!(body["service_tier"], "priority");
+
+        while stream.next_event().await.is_some() {}
+        let raw_request = String::from_utf8(
+            fixture
+                .await
+                .expect("fixture task")
+                .into_iter()
+                .next()
+                .expect("fixture request"),
+        )
+        .expect("raw HTTP request UTF-8");
+        assert!(raw_request.contains("\"service_tier\":\"priority\""));
+    }
+
+    #[tokio::test]
+    async fn default_runtime_options_do_not_upgrade_responses_requests_to_fast() {
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some("https://gateway.example/v1/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "Internal request",
+        )]);
+        request.model_id = "gpt-5.4".to_string();
+        let client = config.genai_client().expect("client");
+        let chat_request =
+            genai_chat_request_for_adapter(&request, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options(&config, &request).expect("default options");
+        let model = genai::ModelIden::new(config.kind.adapter_kind(), "gpt-5.4");
+        let prepared = client
+            .prepare_chat_stream_request(model, chat_request, Some(&options))
+            .await
+            .expect("prepare default Responses request");
+
+        assert!(prepared.payload.get("service_tier").is_none());
+    }
+
+    #[tokio::test]
     async fn websocket_stream_maps_to_neutral_events_and_closes_cleanly() {
         use futures_util::{SinkExt, StreamExt};
         use tokio::net::TcpListener;

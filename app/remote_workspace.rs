@@ -25500,7 +25500,7 @@ mod tests {
                 method: "POST".to_string(),
                 url: "https://provider.test/v1/chat".to_string(),
                 headers: BTreeMap::new(),
-                body: Some(r#"{"model":"first"}"#.to_string()),
+                body: Some(r#"{"model":"first","service_tier":"priority"}"#.to_string()),
                 body_encoding: Some("utf8".to_string()),
             },
         );
@@ -25588,7 +25588,17 @@ mod tests {
         )
         .expect("valid provider request JSON");
         assert_eq!(request_body["format"], "provider_request_v1");
-        assert_eq!(request_body["body"], r#"{"model":"first"}"#);
+        assert_eq!(
+            request_body["body"],
+            r#"{"model":"first","service_tier":"priority"}"#
+        );
+        let captured_request_body = serde_json::from_str::<Value>(
+            request_body["body"]
+                .as_str()
+                .expect("captured request body"),
+        )
+        .expect("captured request JSON");
+        assert_eq!(captured_request_body["service_tier"], "priority");
         let response_body = serde_json::from_str::<Value>(
             request
                 .response_body_json
