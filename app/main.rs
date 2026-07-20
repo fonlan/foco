@@ -7254,6 +7254,18 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
     }
 }
 
+fn captured_chat_error_message(events: &[CapturedAuditEvent]) -> Result<Option<String>, ApiError> {
+    let Some(event) = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "error")
+    else {
+        return Ok(None);
+    };
+    let value = parse_json_value(&event.normalized_event_json, "chat error event")?;
+    Ok(string_json_field(&value, "message", "message").map(str::to_string))
+}
+
 pub(crate) fn api_audit_save_details(config: &GlobalConfig) -> bool {
     config.app.api_audit.save_request_response_details
 }
@@ -10434,12 +10446,14 @@ fn assistant_message_metadata_json(
     code_change_stats: &CodeChangeStats,
     streaming_state: Option<&str>,
     parts: Option<&[StoredChatMessagePart]>,
+    run_failure_message: Option<&str>,
 ) -> Result<String, ApiError> {
     if reasoning.is_none()
         && code_change_stats.additions == 0
         && code_change_stats.deletions == 0
         && streaming_state.is_none()
         && parts.is_none()
+        && run_failure_message.is_none()
     {
         return Ok("{}".to_string());
     }
@@ -10458,6 +10472,12 @@ fn assistant_message_metadata_json(
         metadata.insert(
             "streamingState".to_string(),
             Value::String(streaming_state.to_string()),
+        );
+    }
+    if let Some(run_failure_message) = run_failure_message {
+        metadata.insert(
+            "runFailure".to_string(),
+            json!({ "message": run_failure_message }),
         );
     }
     if let Some(parts) = parts {
@@ -12350,6 +12370,7 @@ fn finalized_assistant_message_parts(
     assistant_text: &str,
     assistant_reasoning: Option<&str>,
     tool_calls: &[ChatToolCallSummary],
+    failure_message: Option<&str>,
 ) -> Result<Vec<StoredChatMessagePart>, ApiError> {
     let tool_calls_by_id = tool_calls
         .iter()
@@ -12547,6 +12568,15 @@ fn finalized_assistant_message_parts(
             &tool_calls_by_id,
             &tool_call.id,
         );
+    }
+    if let Some(failure_message) = failure_message.filter(|message| !message.is_empty())
+        && !parts
+            .iter()
+            .any(|part| matches!(part, ChatMessagePart::Error { text } if text == failure_message))
+    {
+        parts.push(ChatMessagePart::Error {
+            text: failure_message.to_string(),
+        });
     }
 
     if parts.is_empty() {

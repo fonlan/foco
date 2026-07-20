@@ -58,6 +58,7 @@ pub(crate) struct ChatRunEventFrame {
 struct StreamingAssistantDraft {
     pub(crate) content: String,
     reasoning: String,
+    error_message: Option<String>,
     status: StreamingAssistantStatus,
 }
 
@@ -568,6 +569,9 @@ impl ActiveChatRunRegistration {
             if persisted && self.primary_chat_output {
                 self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
                 self.persist_tool_state_for_event(&mut database, chat_id, event)?;
+                if matches!(event, ChatSseEvent::ToolCall { .. }) {
+                    self.persist_assistant_draft(&mut database, chat_id)?;
+                }
             }
             persisted
         };
@@ -620,14 +624,14 @@ impl ActiveChatRunRegistration {
             } if assistant_message_id == &self.assistant_message_id => {
                 self.assistant_draft.status = StreamingAssistantStatus::Streaming;
             }
-            ChatSseEvent::Error { .. }
-                if self.assistant_draft.status == StreamingAssistantStatus::Streaming =>
-            {
-                self.assistant_draft.status = if self.cancellation_is_active() {
-                    StreamingAssistantStatus::Cancelled
+            ChatSseEvent::Error { message } => {
+                if self.cancellation_is_active() {
+                    self.assistant_draft.status = StreamingAssistantStatus::Cancelled;
+                    self.assistant_draft.error_message = None;
                 } else {
-                    StreamingAssistantStatus::Failed
-                };
+                    self.assistant_draft.status = StreamingAssistantStatus::Failed;
+                    self.assistant_draft.error_message = Some(message.clone());
+                }
             }
             _ => return Ok(()),
         }
@@ -734,12 +738,40 @@ impl ActiveChatRunRegistration {
         chat_id: &str,
     ) -> Result<(), ApiError> {
         let reasoning = non_empty_string(&self.assistant_draft.reasoning);
+        let events = database
+            .run_events_for_run(&self.run_id)
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .map(|event| CapturedAuditEvent {
+                event_at: event.created_at,
+                event_type: event.event_type,
+                normalized_event_json: event.payload_json,
+            })
+            .collect::<Vec<_>>();
+        let tool_calls = database
+            .tool_calls_for_chat(chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .filter(|tool_call| {
+                tool_call.message_id.as_deref() == Some(self.assistant_message_id.as_str())
+            })
+            .map(chat_tool_call_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        let parts = finalized_assistant_message_parts(
+            &self.assistant_message_id,
+            &events,
+            &self.assistant_draft.content,
+            reasoning.as_deref(),
+            &tool_calls,
+            self.assistant_draft.error_message.as_deref(),
+        )?;
         let metadata_json = assistant_message_metadata_json(
             reasoning.as_deref(),
             &self.memories_used,
             &CodeChangeStats::default(),
             self.assistant_draft.status.as_metadata_value(),
-            None,
+            Some(&parts),
+            self.assistant_draft.error_message.as_deref(),
         )?;
 
         database

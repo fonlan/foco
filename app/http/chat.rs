@@ -663,6 +663,7 @@ pub(crate) async fn edit_chat_user_message(
         &CodeChangeStats::default(),
         Some("streaming"),
         None,
+        None,
     )?;
     let team = database
         .agent_team_for_chat(&chat_id)

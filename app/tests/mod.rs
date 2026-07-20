@@ -8476,8 +8476,90 @@ fn active_chat_run_record_event_persists_streaming_assistant_message() {
     assert_eq!(assistant.sequence, 1);
     assert_eq!(metadata["reasoning"], "Thinking");
     assert_eq!(metadata["streamingState"], "failed");
+    assert_eq!(metadata["runFailure"]["message"], "provider failed");
+    let parts = assistant_parts_from_metadata(&assistant.metadata_json, &[])
+        .expect("assistant parts")
+        .expect("stored assistant parts");
+    assert!(matches!(&parts[0], ChatMessagePart::Text { text } if text == "Partial"));
+    assert!(matches!(
+        &parts[1],
+        ChatMessagePart::Reasoning { text, .. } if text == "Thinking"
+    ));
+    assert!(matches!(
+        &parts[2],
+        ChatMessagePart::Error { text } if text == "provider failed"
+    ));
 
     drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn active_chat_run_record_event_persists_error_only_assistant_message() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-error-only-assistant-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Error-only chat")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Tell me something.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::Error {
+                message: "provider failed before first token".to_string(),
+            },
+        )
+        .expect("error record");
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+    let messages = database
+        .messages_for_chat("chat-1")
+        .expect("messages for chat");
+    let summaries = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
+        .expect("message summaries");
+    let assistant = summaries
+        .iter()
+        .find(|message| message.id == "assistant-1")
+        .expect("assistant message");
+    assert_eq!(assistant.content, "");
+    assert_eq!(assistant.status.as_deref(), Some("error"));
+    assert!(matches!(
+        assistant.parts.as_slice(),
+        [ChatMessagePart::Error { text }] if text == "provider failed before first token"
+    ));
+
+    drop(database);
+    registration.finish();
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
@@ -9172,6 +9254,28 @@ fn chat_message_parts_ignore_unknown_tool_call_audit_events() {
 }
 
 #[test]
+fn finalized_assistant_parts_append_failed_error_without_text() {
+    let events = [captured_event(&ChatSseEvent::Error {
+        message: "provider failed before first token".to_string(),
+    })];
+
+    let parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "",
+        None,
+        &[],
+        Some("provider failed before first token"),
+    )
+    .expect("stored parts");
+
+    assert!(matches!(
+        parts.as_slice(),
+        [StoredChatMessagePart::Error { text }] if text == "provider failed before first token"
+    ));
+}
+
+#[test]
 fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     let tool_call = ChatToolCallSummary {
         id: "tool-1".to_string(),
@@ -9221,6 +9325,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         "Before.After.",
         None,
         std::slice::from_ref(&tool_call),
+        None,
     )
     .expect("stored parts");
     let metadata_json = assistant_message_metadata_json(
@@ -9229,6 +9334,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         &CodeChangeStats::default(),
         None,
         Some(&stored_parts),
+        None,
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
@@ -9273,15 +9379,22 @@ fn finalized_assistant_parts_persist_reasoning_duration_from_stream_events() {
     })
     .collect::<Vec<_>>();
 
-    let stored_parts =
-        finalized_assistant_message_parts("assistant-1", &events, "Answer.", Some("Think."), &[])
-            .expect("stored parts");
+    let stored_parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Answer.",
+        Some("Think."),
+        &[],
+        None,
+    )
+    .expect("stored parts");
     let metadata_json = assistant_message_metadata_json(
         Some("Think."),
         &[],
         &CodeChangeStats::default(),
         None,
         Some(&stored_parts),
+        None,
     )
     .expect("assistant metadata");
     assert!(metadata_json.contains(r#""duration_ms":1500"#));
@@ -9345,7 +9458,7 @@ fn finalized_assistant_parts_persist_context_compression_events() {
     .collect::<Vec<_>>();
 
     let stored_parts =
-        finalized_assistant_message_parts("assistant-1", &events, "Done.", None, &[])
+        finalized_assistant_message_parts("assistant-1", &events, "Done.", None, &[], None)
             .expect("stored parts");
     let metadata_json = assistant_message_metadata_json(
         None,
@@ -9353,6 +9466,7 @@ fn finalized_assistant_parts_persist_context_compression_events() {
         &CodeChangeStats::default(),
         None,
         Some(&stored_parts),
+        None,
     )
     .expect("assistant metadata");
     let parts = assistant_parts_from_metadata(&metadata_json, &[])
@@ -9394,7 +9508,8 @@ fn finalized_assistant_parts_keep_start_only_compression_without_completed() {
     }];
 
     let stored_parts =
-        finalized_assistant_message_parts("assistant-1", &events, "", None, &[]).expect("parts");
+        finalized_assistant_message_parts("assistant-1", &events, "", None, &[], None)
+            .expect("parts");
     assert_eq!(stored_parts.len(), 1);
     assert!(matches!(
         &stored_parts[0],
@@ -9710,6 +9825,7 @@ fn finalized_assistant_parts_persist_user_interruption_boundary_and_replay() {
         "Recovered answer.",
         Some("Looping thought. "),
         &[],
+        None,
     )
     .expect("stored parts");
     assert!(matches!(
@@ -9735,6 +9851,7 @@ fn finalized_assistant_parts_persist_user_interruption_boundary_and_replay() {
         &CodeChangeStats::default(),
         None,
         Some(&stored_parts),
+        None,
     )
     .expect("assistant metadata");
     let public_parts = assistant_parts_from_metadata(&metadata_json, &[])
@@ -17241,6 +17358,18 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
     let metadata = parse_json_value(&messages[0].metadata_json, "assistant metadata")
         .expect("assistant metadata json");
     assert_eq!(metadata["streamingState"], "failed");
+    assert_eq!(
+        metadata["runFailure"]["message"],
+        "agent run exceeded 128 tool continuation rounds"
+    );
+    assert!(metadata["parts"].as_array().is_some_and(|parts| {
+        matches!(
+            parts.last(),
+            Some(part)
+                if part["type"] == "error"
+                    && part["text"] == "agent run exceeded 128 tool continuation rounds"
+        )
+    }));
     assert_eq!(tool_calls.len(), 1);
     assert_eq!(tool_calls[0].message_id.as_deref(), Some("assistant-1"));
 

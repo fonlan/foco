@@ -2746,6 +2746,12 @@ pub(crate) fn persist_chat_result(
         return Ok(());
     }
 
+    let failure_message = if final_state == "failed" {
+        captured_chat_error_message(events)?
+    } else {
+        None
+    };
+
     // Final assistant parts must include durable stream events (especially context_compression
     // start/completed) for success, tool-only, failure, and cancel paths. Relying on browser
     // memory alone would drop compression blocks after refresh.
@@ -2766,15 +2772,12 @@ pub(crate) fn persist_chat_result(
             content,
             assistant_reasoning,
             &tool_call_summaries,
+            failure_message.as_deref(),
         )?;
-        let streaming_state = if assistant_text.is_none() {
-            match final_state {
-                "cancelled" => Some("cancelled"),
-                "failed" => Some("failed"),
-                _ => None,
-            }
-        } else {
-            None
+        let streaming_state = match final_state {
+            "cancelled" => Some("cancelled"),
+            "failed" => Some("failed"),
+            _ => None,
         };
         let metadata_json = assistant_message_metadata_json(
             assistant_reasoning,
@@ -2782,6 +2785,7 @@ pub(crate) fn persist_chat_result(
             &context.code_change_stats,
             streaming_state,
             Some(&parts),
+            failure_message.as_deref(),
         )?;
         database
             .upsert_message_content(NewMessage {
@@ -2866,6 +2870,7 @@ fn events_contain_assistant_history_parts(events: &[CapturedAuditEvent]) -> bool
                 | "tool_call"
                 | "context_compression"
                 | "guidance_applied"
+                | "error"
         )
     })
 }
