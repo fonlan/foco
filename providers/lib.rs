@@ -715,6 +715,10 @@ impl ProviderConnectionConfig {
         Ok(config)
     }
 
+    pub fn supports_fast_latency_mode(&self, model_id: &str) -> Result<bool, ProviderConfigError> {
+        supports_fast_latency_mode(self.kind, model_id, &self.model_redirects)
+    }
+
     fn custom_endpoint(&self) -> Result<Option<Endpoint>, ProviderConfigError> {
         self.base_url
             .as_deref()
@@ -840,6 +844,47 @@ pub async fn test_provider_connection(
     config: &ProviderConnectionConfig,
 ) -> Result<usize, ProviderConfigError> {
     Ok(fetch_provider_model_ids(config).await?.len())
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LatencyMode {
+    #[default]
+    Standard,
+    Fast,
+}
+
+/// Runtime parameters that affect a user-visible chat request without changing its prompt.
+///
+/// These parameters are intentionally separate from `NeutralChatRequest` so internal one-shot
+/// calls retain the default behavior unless an explicit user chat/agent run opts in.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ChatRequestRuntimeOptions {
+    #[serde(default)]
+    pub latency_mode: LatencyMode,
+}
+
+/// Return whether this provider route can expose the Fast latency mode for `model_id`.
+///
+/// The decision is centralized here so callers must resolve the active provider and its upstream
+/// model redirect before presenting Fast to users.
+pub fn supports_fast_latency_mode(
+    kind: ProviderKind,
+    model_id: &str,
+    redirects: &[ProviderModelRedirect],
+) -> Result<bool, ProviderConfigError> {
+    if kind.adapter_kind() != AdapterKind::OpenAIResp {
+        return Ok(false);
+    }
+
+    let upstream_model_id = upstream_provider_model_id(model_id, redirects)?;
+    Ok(openai_priority_processing_supports_model(upstream_model_id))
+}
+
+fn openai_priority_processing_supports_model(model_id: &str) -> bool {
+    let model_id = model_id.trim().to_ascii_lowercase();
+    model_id == "gpt-5" || model_id.starts_with("gpt-5-") || model_id.starts_with("gpt-5.")
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1303,9 +1348,17 @@ pub async fn stream_chat(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
 ) -> Result<NeutralChatStream, ProviderConfigError> {
-    stream_chat_with_capture(config, request, false)
+    stream_chat_with_runtime_options(config, request, ChatRequestRuntimeOptions::default())
         .await
         .map_err(|failure| failure.error)
+}
+
+pub async fn stream_chat_with_runtime_options(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    runtime_options: ChatRequestRuntimeOptions,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    stream_chat_with_capture_runtime_options(config, request, runtime_options, false).await
 }
 
 pub async fn stream_chat_with_capture(
@@ -1313,7 +1366,30 @@ pub async fn stream_chat_with_capture(
     request: NeutralChatRequest,
     capture_details: bool,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
-    stream_chat_with_capture_observer(config, request, capture_details, None, None).await
+    stream_chat_with_capture_runtime_options(
+        config,
+        request,
+        ChatRequestRuntimeOptions::default(),
+        capture_details,
+    )
+    .await
+}
+
+pub async fn stream_chat_with_capture_runtime_options(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    runtime_options: ChatRequestRuntimeOptions,
+    capture_details: bool,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    stream_chat_with_capture_observer_runtime_options(
+        config,
+        request,
+        runtime_options,
+        capture_details,
+        None,
+        None,
+    )
+    .await
 }
 
 pub async fn stream_chat_with_capture_observer(
@@ -1323,10 +1399,30 @@ pub async fn stream_chat_with_capture_observer(
     request_observer: Option<ProviderRequestDumpObserver>,
     session_ctx: Option<ProviderWsSessionContext>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
+    stream_chat_with_capture_observer_runtime_options(
+        config,
+        request,
+        ChatRequestRuntimeOptions::default(),
+        capture_details,
+        request_observer,
+        session_ctx,
+    )
+    .await
+}
+
+pub async fn stream_chat_with_capture_observer_runtime_options(
+    config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    runtime_options: ChatRequestRuntimeOptions,
+    capture_details: bool,
+    request_observer: Option<ProviderRequestDumpObserver>,
+    session_ctx: Option<ProviderWsSessionContext>,
+) -> Result<NeutralChatStream, ProviderRequestFailure> {
     if config.kind.uses_websocket() {
         return stream_chat_with_capture_observer_websocket(
             config,
             request,
+            runtime_options,
             capture_details,
             request_observer,
             session_ctx,
@@ -1358,10 +1454,11 @@ pub async fn stream_chat_with_capture_observer(
             error,
             request_dump: None,
         })?;
-    let options = genai_chat_options(config, &request).map_err(|error| ProviderRequestFailure {
-        error,
-        request_dump: None,
-    })?;
+    let options = genai_chat_options_with_runtime_options(config, &request, &runtime_options)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
     let captured_response_status = Arc::new(Mutex::new(None));
@@ -1427,6 +1524,7 @@ pub async fn stream_chat_with_capture_observer(
 async fn stream_chat_with_capture_observer_websocket(
     config: &ProviderConnectionConfig,
     request: NeutralChatRequest,
+    runtime_options: ChatRequestRuntimeOptions,
     capture_details: bool,
     request_observer: Option<ProviderRequestDumpObserver>,
     session_ctx: Option<ProviderWsSessionContext>,
@@ -1453,10 +1551,11 @@ async fn stream_chat_with_capture_observer_websocket(
             error,
             request_dump: None,
         })?;
-    let options = genai_chat_options(config, &request).map_err(|error| ProviderRequestFailure {
-        error,
-        request_dump: None,
-    })?;
+    let options = genai_chat_options_with_runtime_options(config, &request, &runtime_options)
+        .map_err(|error| ProviderRequestFailure {
+            error,
+            request_dump: None,
+        })?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     openai_resp_websocket::stream_chat_openai_resp_websocket(
         config,
@@ -1971,9 +2070,18 @@ fn is_model_visible_binary_attachment(content_type: &str) -> bool {
         || content_type == "application/pdf"
 }
 
+#[cfg(test)]
 fn genai_chat_options(
     config: &ProviderConnectionConfig,
     request: &NeutralChatRequest,
+) -> Result<ChatOptions, ProviderConfigError> {
+    genai_chat_options_with_runtime_options(config, request, &ChatRequestRuntimeOptions::default())
+}
+
+fn genai_chat_options_with_runtime_options(
+    config: &ProviderConnectionConfig,
+    request: &NeutralChatRequest,
+    runtime_options: &ChatRequestRuntimeOptions,
 ) -> Result<ChatOptions, ProviderConfigError> {
     let model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
     // ponytail: model-id heuristic; add provider metadata if non-Claude ids ever contain "claude".
@@ -2019,13 +2127,14 @@ fn genai_chat_options(
         options = options.with_cache_control(cache_control);
     }
 
-    apply_request_overrides_and_agent_headers(options, config, request)
+    apply_request_overrides_and_agent_headers(options, config, request, runtime_options)
 }
 
 fn apply_request_overrides_and_agent_headers(
     mut options: ChatOptions,
     config: &ProviderConnectionConfig,
     request: &NeutralChatRequest,
+    runtime_options: &ChatRequestRuntimeOptions,
 ) -> Result<ChatOptions, ProviderConfigError> {
     let mut override_headers = Vec::new();
     let mut body = Map::new();
@@ -2051,6 +2160,10 @@ fn apply_request_overrides_and_agent_headers(
         }
     }
 
+    // Fast is a first-class runtime choice. Apply it after generic body overrides so the
+    // persisted UI mode always describes the service tier sent to OpenAI Responses.
+    apply_fast_latency_mode(&mut body, config, request, runtime_options)?;
+
     // OpenAIResp only: built-in Agent headers first, then request_overrides (same name wins).
     let headers = if config.kind.adapter_kind() == AdapterKind::OpenAIResp {
         merge_header_pairs(
@@ -2073,6 +2186,31 @@ fn apply_request_overrides_and_agent_headers(
     }
 
     Ok(options)
+}
+
+fn apply_fast_latency_mode(
+    body: &mut Map<String, Value>,
+    config: &ProviderConnectionConfig,
+    request: &NeutralChatRequest,
+    runtime_options: &ChatRequestRuntimeOptions,
+) -> Result<(), ProviderConfigError> {
+    if runtime_options.latency_mode != LatencyMode::Fast {
+        return Ok(());
+    }
+
+    if !config.supports_fast_latency_mode(&request.model_id)? {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "Fast latency mode is not supported for provider '{}' and model '{}'",
+            config.kind.as_str(),
+            request.model_id
+        )));
+    }
+
+    body.insert(
+        "service_tier".to_string(),
+        Value::String("priority".to_string()),
+    );
+    Ok(())
 }
 
 fn insert_nested_body_override(
@@ -3046,6 +3184,108 @@ mod tests {
     }
 
     #[test]
+    fn fast_latency_capability_uses_active_adapter_and_redirected_upstream_model() {
+        let redirects = [ProviderModelRedirect {
+            from: "gpt-5.4".to_string(),
+            to: "friendly-fast-model".to_string(),
+        }];
+        let responses_kind = openai_responses_kind();
+        let chat_kind = parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind");
+
+        assert!(
+            supports_fast_latency_mode(responses_kind, "friendly-fast-model", &redirects)
+                .expect("redirected Responses capability")
+        );
+        assert!(
+            !supports_fast_latency_mode(responses_kind, "gpt-4o", &redirects)
+                .expect("older model is not Fast-capable")
+        );
+        assert!(
+            !supports_fast_latency_mode(chat_kind, "friendly-fast-model", &redirects)
+                .expect("non-Responses adapter is not Fast-capable")
+        );
+    }
+
+    #[test]
+    fn fast_latency_runtime_options_serialize_as_camel_case() {
+        let value = serde_json::to_value(ChatRequestRuntimeOptions {
+            latency_mode: LatencyMode::Fast,
+        })
+        .expect("serialize runtime options");
+
+        assert_eq!(value, serde_json::json!({ "latencyMode": "fast" }));
+    }
+
+    #[test]
+    fn fast_latency_mode_overrides_service_tier_request_override() {
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: vec![ProviderRequestOverride {
+                target: REQUEST_OVERRIDE_TARGET_BODY.to_string(),
+                name: "service_tier".to_string(),
+                value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                value: Value::String("default".to_string()),
+            }],
+            model_redirects: Vec::new(),
+        };
+        let mut body = Map::new();
+        insert_nested_body_override(
+            &mut body,
+            "service_tier",
+            Value::String("default".to_string()),
+        )
+        .expect("apply configured override");
+        let mut request = neutral_request(Vec::new());
+        request.model_id = "gpt-5.4".to_string();
+
+        apply_fast_latency_mode(
+            &mut body,
+            &config,
+            &request,
+            &ChatRequestRuntimeOptions {
+                latency_mode: LatencyMode::Fast,
+            },
+        )
+        .expect("Fast should take precedence over service tier override");
+
+        assert_eq!(body["service_tier"], "priority");
+    }
+
+    #[test]
+    fn fast_latency_mode_rejects_non_responses_adapter() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut body = Map::new();
+        let mut request = neutral_request(Vec::new());
+        request.model_id = "gpt-5.4".to_string();
+
+        let error = apply_fast_latency_mode(
+            &mut body,
+            &config,
+            &request,
+            &ChatRequestRuntimeOptions {
+                latency_mode: LatencyMode::Fast,
+            },
+        )
+        .expect_err("non-Responses adapters must reject Fast");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Fast latency mode is not supported")
+        );
+    }
+
+    #[test]
     fn rejects_ambiguous_model_redirect_targets() {
         let error = validate_model_redirects(&[
             ProviderModelRedirect {
@@ -3316,6 +3556,42 @@ mod tests {
             websocket_url_from_responses_http_url(&prepared.url).expect("ws url"),
             "wss://gateway.example/v1/responses"
         );
+    }
+
+    #[tokio::test]
+    async fn fast_latency_mode_maps_service_tier_to_http_and_websocket_bodies() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some("https://gateway.example/v1/".to_string()),
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request =
+            neutral_request(vec![neutral_text_message(NeutralChatRole::User, "Fast")]);
+        request.model_id = "gpt-5.4".to_string();
+        let client = config.genai_client().expect("client");
+        let chat_request =
+            genai_chat_request_for_adapter(&request, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options_with_runtime_options(
+            &config,
+            &request,
+            &ChatRequestRuntimeOptions {
+                latency_mode: LatencyMode::Fast,
+            },
+        )
+        .expect("Fast options");
+        let model = genai::ModelIden::new(config.kind.adapter_kind(), "gpt-5.4");
+        let prepared = client
+            .prepare_chat_stream_request(model, chat_request, Some(&options))
+            .await
+            .expect("prepare Responses request");
+        let ws_payload =
+            genai::adapter::openai_resp_websocket_create_payload(prepared.payload.clone());
+
+        assert_eq!(prepared.payload["service_tier"], "priority");
+        assert_eq!(ws_payload["service_tier"], "priority");
     }
 
     #[tokio::test]

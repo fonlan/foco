@@ -1201,6 +1201,8 @@ export type ConfiguredModelSummary = {
   thinkingLevel: string | null;
   systemPromptName: string;
   supportsThinking: boolean;
+  /** Server-resolved Fast eligibility for the active provider and upstream model. */
+  supportsFast?: boolean;
   supportedThinkingLevels: string[];
   warnings: string[];
 };

@@ -731,8 +731,21 @@ pub(crate) fn configured_model_summary_for_config(
 ) -> ConfiguredModelSummary {
     let mut summary = configured_model_summary(model);
     summary.supports_thinking = model_supports_thinking(model, config);
+    summary.supports_fast = model_supports_fast_latency_mode(model, config);
     summary.warnings = model_warnings(model, config, summary.can_enable, summary.supports_thinking);
     summary
+}
+
+fn model_supports_fast_latency_mode(model: &ModelSettings, config: &GlobalConfig) -> bool {
+    let Ok((_resolved_model, provider)) = config.resolve_active_model_provider(&model.id) else {
+        return false;
+    };
+    let Ok(kind) = foco_providers::parse_provider_kind(&provider.kind) else {
+        return false;
+    };
+
+    foco_providers::supports_fast_latency_mode(kind, &model.id, &provider.model_redirects)
+        .unwrap_or(false)
 }
 
 pub(crate) fn configured_model_summary_for_config_and_metadata(
@@ -970,6 +983,7 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         thinking_level: model.thinking_level.clone(),
         system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
+        supports_fast: false,
         supported_thinking_levels: Vec::new(),
         warnings: Vec::new(),
     }

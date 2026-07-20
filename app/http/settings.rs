@@ -780,6 +780,7 @@ pub(crate) struct ConfiguredModelSummary {
     pub(crate) thinking_level: Option<String>,
     pub(crate) system_prompt_name: String,
     pub(crate) supports_thinking: bool,
+    pub(crate) supports_fast: bool,
     pub(crate) supported_thinking_levels: Vec<String>,
     pub(crate) warnings: Vec<String>,
 }
