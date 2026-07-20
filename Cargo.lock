@@ -1190,7 +1190,7 @@ checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
 name = "foco-agent"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "foco-providers",
  "serde",
@@ -1200,7 +1200,7 @@ dependencies = [
 
 [[package]]
 name = "foco-app"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "async-stream",
  "axum",
@@ -1251,7 +1251,7 @@ dependencies = [
 
 [[package]]
 name = "foco-graph"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "chrono",
  "foco-store",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "foco-mcp"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "process-wrap",
  "reqwest",
@@ -1303,7 +1303,7 @@ dependencies = [
 
 [[package]]
 name = "foco-providers"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "async-stream",
  "base64",
@@ -1320,7 +1320,7 @@ dependencies = [
 
 [[package]]
 name = "foco-store"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "chrono",
  "fancy-regex",
@@ -1336,7 +1336,7 @@ dependencies = [
 
 [[package]]
 name = "foco-tools"
-version = "0.1.54"
+version = "0.1.55"
 dependencies = [
  "foco-store",
  "gix",
