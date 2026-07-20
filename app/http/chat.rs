@@ -1280,6 +1280,7 @@ pub(crate) fn chat_title_generation_provider_request(
         max_output_tokens: Some(CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     }
 }
 

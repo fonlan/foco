@@ -34,6 +34,10 @@ use foco_providers::{
     ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
     normalized_proxy_url, parse_provider_kind, stream_chat_with_capture_observer,
 };
+use crate::provider_agent_headers::{
+    attach_agent_request_correlation, resolve_provider_session_thread_for_chat,
+    resolve_provider_session_thread_with_database,
+};
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
 use foco_store::{
@@ -175,6 +179,7 @@ mod plan_merge;
 mod plan_runtime;
 mod platform;
 mod prompt;
+mod provider_agent_headers;
 mod provider_retry;
 mod remote_workspace;
 mod runtime;
@@ -2161,6 +2166,10 @@ struct PreparedChatContext {
     tool_workspace_path: PathBuf,
     memory_database_file: PathBuf,
     chat_id: String,
+    /// OpenAIResp `session-id` (chat_id or plan_id). Resolved at prepare / after plan bind.
+    provider_session_id: String,
+    /// OpenAIResp `thread-id` (conversation line). Usually chat_id.
+    provider_thread_id: String,
     provider_id: String,
     model_id: String,
     user_message_id: String,
@@ -2705,6 +2714,48 @@ fn resolve_active_model_route(
 }
 
 impl PreparedChatContext {
+    pub(crate) fn attach_agent_correlation(
+        &self,
+        request: &mut NeutralChatRequest,
+        client_request_id: &str,
+    ) {
+        attach_agent_request_correlation(
+            request,
+            &self.provider_session_id,
+            &self.provider_thread_id,
+            client_request_id,
+            Some(&self.llm_request_id),
+            Some(&self.workspace_id),
+        );
+    }
+
+    /// Refresh OpenAIResp session/thread mapping using an already-open workspace DB.
+    /// Prefer this over opening a second connection while holding a gate permit.
+    pub(crate) fn refresh_provider_session_thread_mapping_with_database(
+        &mut self,
+        database: &WorkspaceDatabase,
+    ) -> Result<(), ApiError> {
+        let plan_id_hint = self
+            .plan_phase_provenance
+            .as_ref()
+            .map(|provenance| provenance.plan_id.as_str());
+        if let Some(plan_id) = plan_id_hint.map(str::trim).filter(|value| !value.is_empty()) {
+            let (session_id, thread_id) =
+                foco_providers::resolve_agent_session_thread_ids(&self.chat_id, Some(plan_id), None);
+            self.provider_session_id = session_id;
+            self.provider_thread_id = thread_id;
+            return Ok(());
+        }
+        let (session_id, thread_id) = resolve_provider_session_thread_with_database(
+            database,
+            &self.chat_id,
+            None,
+        )?;
+        self.provider_session_id = session_id;
+        self.provider_thread_id = thread_id;
+        Ok(())
+    }
+
     /// Run-scoped WebSocket affinity for chat completion (assistant message identity).
     /// Returns None when the active provider is not WebSocket Responses so callers stay
     /// protocol-agnostic.
@@ -3206,6 +3257,7 @@ impl PreparedChatContext {
                 let mut turn_request = self.provider_request.clone();
                 turn_request.messages = packed_messages;
                 let turn_llm_request_id = unique_id("llm");
+                self.attach_agent_correlation(&mut turn_request, &turn_llm_request_id);
                 let turn_request_started_at = utc_timestamp();
                 let turn_started_at = Instant::now();
                 let mut turn_events = vec![CapturedAuditEvent {
@@ -5097,12 +5149,14 @@ async fn prepare_chat_context_for_output(
         );
     }
 
-    Ok(PreparedChatContext {
+    let mut context = PreparedChatContext {
         workspace_id: prompt_context.workspace_id,
         workspace_path: prompt_context.workspace_path.clone(),
         tool_workspace_path: prompt_context.workspace_path,
         memory_database_file: state.memory_database_file.clone(),
-        chat_id,
+        chat_id: chat_id.clone(),
+        provider_session_id: chat_id.clone(),
+        provider_thread_id: chat_id.clone(),
         provider_id: prompt_context.provider_id,
         model_id: prompt_context.model_id,
         user_message_id,
@@ -5150,7 +5204,9 @@ async fn prepare_chat_context_for_output(
         attachment_read_allowlist: prompt_context.attachment_read_allowlist,
         last_chat_completion_input_tokens: None,
         openai_resp_ws_sessions: state.openai_resp_ws_sessions.clone(),
-    })
+    };
+    context.refresh_provider_session_thread_mapping_with_database(&database)?;
+    Ok(context)
 }
 
 fn persist_pending_chat_spec_snapshot(
@@ -5400,6 +5456,7 @@ pub(crate) fn prepare_git_commit_message_request(
         max_output_tokens: Some(max_output_tokens.min(GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS)),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+    agent_correlation: None,
     })
 }
 
@@ -5574,9 +5631,26 @@ pub(crate) async fn audited_provider_text_request(
         drop(database);
 
         let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
+        let mut attempt_request = request.clone();
+        if let Some(chat_id) = chat_id {
+            let (session_id, thread_id) = resolve_provider_session_thread_for_chat(
+                workspace_path,
+                chat_id,
+                None,
+                None,
+            )?;
+            attach_agent_request_correlation(
+                &mut attempt_request,
+                &session_id,
+                &thread_id,
+                &request_id,
+                None,
+                Some(workspace_id),
+            );
+        }
         let result = run_provider_stream_for_text(
             provider_config,
-            request.clone(),
+            attempt_request,
             request_kind,
             timeout_ms,
             &capture,
@@ -5733,9 +5807,26 @@ pub(crate) async fn audited_provider_tool_request(
         drop(database);
 
         let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
+        let mut attempt_request = request.clone();
+        if let Some(chat_id) = chat_id {
+            let (session_id, thread_id) = resolve_provider_session_thread_for_chat(
+                workspace_path,
+                chat_id,
+                None,
+                None,
+            )?;
+            attach_agent_request_correlation(
+                &mut attempt_request,
+                &session_id,
+                &thread_id,
+                &request_id,
+                None,
+                Some(workspace_id),
+            );
+        }
         let result = run_provider_stream_for_tool(
             provider_config,
-            request.clone(),
+            attempt_request,
             request_kind,
             expected_tool_name,
             tool_label,

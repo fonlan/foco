@@ -730,6 +730,7 @@ async fn run_prompt_hook(
         max_output_tokens: Some(1024),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     };
     let executor_request = PromptHookExecutorRequest {
         hook_request,
@@ -1024,12 +1025,30 @@ async fn audited_prompt_hook_stream(
         request_id.clone(),
         request.api_audit_save_details,
     );
+    let mut hook_request = request.hook_request.clone();
+    if let Some(chat_id) = request.chat_id.as_deref() {
+        if let Ok((session_id, thread_id)) = crate::provider_agent_headers::resolve_provider_session_thread_for_chat(
+            &request.workspace_path,
+            chat_id,
+            None,
+            None,
+        ) {
+            crate::provider_agent_headers::attach_agent_request_correlation(
+                &mut hook_request,
+                &session_id,
+                &thread_id,
+                &request_id,
+                request.run_id.as_deref(),
+                Some(workspace_id),
+            );
+        }
+    }
     let started_at = std::time::Instant::now();
     match timeout(
         Duration::from_millis(request.timeout_ms),
         stream_chat_with_capture_observer(
             provider_config,
-            request.hook_request.clone(),
+            hook_request,
             request.api_audit_save_details,
             capture.observer(),
             None,

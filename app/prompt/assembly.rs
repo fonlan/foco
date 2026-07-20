@@ -589,6 +589,7 @@ pub(crate) async fn prepare_prompt_context(
         max_output_tokens: Some(max_output_tokens),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     };
     Ok(PreparedPromptContext {
         workspace_id: workspace.id.clone(),

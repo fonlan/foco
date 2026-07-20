@@ -857,6 +857,9 @@ async fn run_coordinator_task_inner(
             agent_task_id: task.id.clone(),
             integration_status: PlanPhaseIntegrationStatus::AwaitingIntegration,
         });
+    // Re-resolve after plan bind so OpenAIResp session-id becomes plan_id when applicable.
+    // Reuse the critical DB still held below; do not nest another workspace open.
+    chat_context.refresh_provider_session_thread_mapping_with_database(&database)?;
     drop(database);
     chat_context.agent_definition_snapshot = Some(
         serde_json::to_value(&instance.definition_snapshot).map_err(|source| {

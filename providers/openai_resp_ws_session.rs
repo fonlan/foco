@@ -721,7 +721,27 @@ pub fn tools_fingerprint_json(tools: &Option<Vec<genai::chat::Tool>>) -> String 
 }
 
 pub fn chat_options_fingerprint_json(options: &ChatOptions) -> String {
-    serde_json::to_string(options).unwrap_or_else(|_| "{}".to_string())
+    // Per-turn correlation headers (x-client-request-id / x-foco-run-id) must not
+    // invalidate previous_response_id continuation. Identity, session/thread, and
+    // OpenAI-Beta remain part of the fingerprint.
+    let mut value = match serde_json::to_value(options) {
+        Ok(value) => value,
+        Err(_) => return "{}".to_string(),
+    };
+    if let Some(extra_headers) = value.get_mut("extra_headers").and_then(|v| v.as_object_mut()) {
+        for name in crate::AGENT_VOLATILE_HEADER_NAMES {
+            let key = name.to_ascii_lowercase();
+            let victims: Vec<String> = extra_headers
+                .keys()
+                .filter(|existing| existing.eq_ignore_ascii_case(name) || existing.as_str() == key)
+                .cloned()
+                .collect();
+            for victim in victims {
+                extra_headers.remove(&victim);
+            }
+        }
+    }
+    serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Content fingerprint for messages[0..len] (or all messages when len exceeds length).
@@ -993,6 +1013,53 @@ mod tests {
         assert_eq!(messages_prefix_hash(&a, 2), messages_prefix_hash(&a, 2));
         assert_ne!(messages_prefix_hash(&a, 2), messages_prefix_hash(&b, 2));
         assert_ne!(messages_prefix_hash(&a, 1), messages_prefix_hash(&a, 2));
+    }
+
+    #[test]
+    fn chat_options_fingerprint_ignores_volatile_agent_headers() {
+        use genai::Headers;
+        use genai::chat::ChatOptions;
+
+        let stable = ChatOptions::default().with_extra_headers(Headers::from(vec![
+            ("session-id".to_string(), "chat-1".to_string()),
+            ("thread-id".to_string(), "chat-1".to_string()),
+            ("originator".to_string(), "foco".to_string()),
+            (
+                "x-client-request-id".to_string(),
+                "req-turn-1".to_string(),
+            ),
+            ("x-foco-run-id".to_string(), "run-1".to_string()),
+        ]));
+        let next_turn = ChatOptions::default().with_extra_headers(Headers::from(vec![
+            ("session-id".to_string(), "chat-1".to_string()),
+            ("thread-id".to_string(), "chat-1".to_string()),
+            ("originator".to_string(), "foco".to_string()),
+            (
+                "x-client-request-id".to_string(),
+                "req-turn-2".to_string(),
+            ),
+            ("x-foco-run-id".to_string(), "run-2".to_string()),
+        ]));
+        let session_changed = ChatOptions::default().with_extra_headers(Headers::from(vec![
+            ("session-id".to_string(), "other-session".to_string()),
+            ("thread-id".to_string(), "chat-1".to_string()),
+            ("originator".to_string(), "foco".to_string()),
+            (
+                "x-client-request-id".to_string(),
+                "req-turn-1".to_string(),
+            ),
+        ]));
+
+        assert_eq!(
+            chat_options_fingerprint_json(&stable),
+            chat_options_fingerprint_json(&next_turn),
+            "per-turn x-client-request-id / x-foco-run-id must not break continuation fingerprint"
+        );
+        assert_ne!(
+            chat_options_fingerprint_json(&stable),
+            chat_options_fingerprint_json(&session_changed),
+            "session-id changes must still invalidate continuation fingerprint"
+        );
     }
 
     #[tokio::test]

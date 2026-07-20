@@ -5311,6 +5311,7 @@ async fn broker_llm_stream(
                 prompt_cache_retention: payload
                     .get("promptCacheRetention")
                     .and_then(|v| serde_json::from_value(v.clone()).ok()),
+            agent_correlation: None,
             }
         });
     // Ensure a nested request cannot disagree with the model selected by the broker payload.
@@ -11034,6 +11035,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                         .and_then(|limits| u32::try_from(limits.max_output_tokens).ok()),
                     prompt_cache_key: None,
                     prompt_cache_retention: None,
+                agent_correlation: None,
                 },
                 tool_catalog,
                 session_mode,
@@ -11094,6 +11096,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         },
         tool_catalog,
         session_mode,
@@ -14700,6 +14703,23 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         let mut broker_request = current_request.clone();
         broker_request.messages = packed_messages;
         let broker_request_id = unique_id("broker-request");
+        if let Ok((session_id, thread_id)) =
+            crate::provider_agent_headers::resolve_provider_session_thread_for_chat(
+                sidecar_workspace_path(&stream_state),
+                &chat_id,
+                None,
+                None,
+            )
+        {
+            crate::provider_agent_headers::attach_agent_request_correlation(
+                &mut broker_request,
+                &session_id,
+                &thread_id,
+                &broker_request_id,
+                Some(&run_id),
+                Some(stream_state.workspace_id.as_str()),
+            );
+        }
         run_stream.set_broker_request_id(broker_request_id.clone());
         let broker_payload = json!({
             "workspaceId": stream_state.workspace_id,
@@ -15164,6 +15184,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     max_output_tokens: current_request.max_output_tokens,
                     prompt_cache_key: current_request.prompt_cache_key.clone(),
                     prompt_cache_retention: current_request.prompt_cache_retention.clone(),
+                    agent_correlation: None,
                 };
             }
             Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
@@ -21109,6 +21130,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
 
         let runtime_tool_state =
@@ -24398,6 +24420,7 @@ mod tests {
             max_output_tokens: Some(64),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -24738,6 +24761,7 @@ mod tests {
             max_output_tokens: Some(64),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -24957,6 +24981,7 @@ mod tests {
             max_output_tokens: Some(64),
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -29662,6 +29687,7 @@ mod tests {
                 max_output_tokens: Some(1024),
                 prompt_cache_key: None,
                 prompt_cache_retention: None,
+            agent_correlation: None,
             },
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_path_buf(),
@@ -29733,6 +29759,7 @@ mod tests {
                 max_output_tokens: Some(1024),
                 prompt_cache_key: None,
                 prompt_cache_retention: None,
+                agent_correlation: None,
             },
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_path_buf(),

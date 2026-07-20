@@ -3386,6 +3386,44 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    /// Reverse-lookup `plan_id` when `chat_id` was bound as a phase implementation (or merge)
+    /// chat. Checks current phase rows and attempt history so retries/merge overwrite still
+    /// resolve prior implementation chats. Never invents a plan for the source chat.
+    pub fn plan_id_for_implementation_chat(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<String>, WorkspaceDatabaseError> {
+        let chat_id = chat_id.trim();
+        if chat_id.is_empty() {
+            return Ok(None);
+        }
+        let plan_id = self
+            .connection
+            .query_row(
+                "SELECT plan_id FROM plan_phases
+                 WHERE implementation_chat_id = ?1
+                 LIMIT 1",
+                params![chat_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))?;
+        if plan_id.is_some() {
+            return Ok(plan_id);
+        }
+        self.connection
+            .query_row(
+                "SELECT plan_id FROM plan_phase_attempts
+                 WHERE implementation_chat_id = ?1
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![chat_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn insert_plan_phase_derived_effects(
         &mut self,
         effects: NewPlanPhaseDerivedEffects<'_>,

@@ -854,6 +854,200 @@ pub struct NeutralChatRequest {
     pub prompt_cache_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_cache_retention: Option<String>,
+    /// OpenAIResp Agent correlation headers (session/thread/request ids).
+    /// Optional; when absent, Foco still injects fixed identity (+ WS beta) for OpenAIResp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_correlation: Option<AgentRequestCorrelation>,
+}
+
+/// Session / multi-turn correlation for OpenAI Responses (HTTP and WebSocket).
+/// See `docs/agent-openai-request-headers-contract.md`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRequestCorrelation {
+    pub session_id: String,
+    pub thread_id: String,
+    /// Prefer the durable LLM audit / broker request id.
+    pub client_request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+}
+
+/// Fixed Foco client originator (not Codex).
+pub const FOCO_AGENT_ORIGINATOR: &str = "foco";
+/// Responses WebSocket capability header name.
+pub const OPENAI_RESP_WS_BETA_HEADER: &str = "OpenAI-Beta";
+/// Responses WebSocket capability header value.
+pub const OPENAI_RESP_WS_BETA_VALUE: &str = "responses_websockets=2026-02-06";
+pub const AGENT_HEADER_SESSION_ID: &str = "session-id";
+pub const AGENT_HEADER_THREAD_ID: &str = "thread-id";
+pub const AGENT_HEADER_CLIENT_REQUEST_ID: &str = "x-client-request-id";
+pub const AGENT_HEADER_FOCO_RUN_ID: &str = "x-foco-run-id";
+pub const AGENT_HEADER_FOCO_WORKSPACE_ID: &str = "x-foco-workspace-id";
+pub const AGENT_HEADER_ORIGINATOR: &str = "originator";
+pub const AGENT_HEADER_USER_AGENT: &str = "User-Agent";
+pub const AGENT_HEADER_VERSION: &str = "version";
+
+/// Headers that must not affect OpenAI Responses WebSocket continuation fingerprints.
+pub const AGENT_VOLATILE_HEADER_NAMES: &[&str] = &[
+    AGENT_HEADER_CLIENT_REQUEST_ID,
+    AGENT_HEADER_FOCO_RUN_ID,
+];
+
+impl AgentRequestCorrelation {
+    pub fn new(
+        session_id: impl Into<String>,
+        thread_id: impl Into<String>,
+        client_request_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            thread_id: thread_id.into(),
+            client_request_id: client_request_id.into(),
+            run_id: None,
+            workspace_id: None,
+        }
+    }
+
+    pub fn with_run_id(mut self, run_id: impl Into<String>) -> Self {
+        self.run_id = Some(run_id.into());
+        self
+    }
+
+    pub fn with_workspace_id(mut self, workspace_id: impl Into<String>) -> Self {
+        self.workspace_id = Some(workspace_id.into());
+        self
+    }
+}
+
+pub fn foco_agent_user_agent() -> String {
+    format!(
+        "foco/{} ({} {}; {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        std::env::consts::FAMILY
+    )
+}
+
+pub fn foco_agent_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
+fn header_name_key(name: &str) -> String {
+    name.trim().to_ascii_lowercase()
+}
+
+/// Build default OpenAIResp Agent headers (L2–L4). Callers merge `request_overrides` after.
+pub fn default_openai_resp_agent_headers(
+    uses_websocket: bool,
+    correlation: Option<&AgentRequestCorrelation>,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::with_capacity(10);
+    headers.push((
+        AGENT_HEADER_ORIGINATOR.to_string(),
+        FOCO_AGENT_ORIGINATOR.to_string(),
+    ));
+    headers.push((AGENT_HEADER_USER_AGENT.to_string(), foco_agent_user_agent()));
+    headers.push((
+        AGENT_HEADER_VERSION.to_string(),
+        foco_agent_version().to_string(),
+    ));
+    if uses_websocket {
+        headers.push((
+            OPENAI_RESP_WS_BETA_HEADER.to_string(),
+            OPENAI_RESP_WS_BETA_VALUE.to_string(),
+        ));
+    }
+    if let Some(correlation) = correlation {
+        let session_id = correlation.session_id.trim();
+        let thread_id = correlation.thread_id.trim();
+        let client_request_id = correlation.client_request_id.trim();
+        if !session_id.is_empty() {
+            headers.push((AGENT_HEADER_SESSION_ID.to_string(), session_id.to_string()));
+        }
+        if !thread_id.is_empty() {
+            headers.push((AGENT_HEADER_THREAD_ID.to_string(), thread_id.to_string()));
+        }
+        if !client_request_id.is_empty() {
+            headers.push((
+                AGENT_HEADER_CLIENT_REQUEST_ID.to_string(),
+                client_request_id.to_string(),
+            ));
+        }
+        if let Some(run_id) = correlation
+            .run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            headers.push((AGENT_HEADER_FOCO_RUN_ID.to_string(), run_id.to_string()));
+        }
+        if let Some(workspace_id) = correlation
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            headers.push((
+                AGENT_HEADER_FOCO_WORKSPACE_ID.to_string(),
+                workspace_id.to_string(),
+            ));
+        }
+    }
+    headers
+}
+
+/// Merge default headers then override headers; later same-name (case-insensitive) wins.
+pub fn merge_header_pairs(
+    defaults: Vec<(String, String)>,
+    overrides: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    for (name, value) in defaults.into_iter().chain(overrides) {
+        let key = header_name_key(&name);
+        if key.is_empty() {
+            continue;
+        }
+        if !map.contains_key(&key) {
+            order.push(key.clone());
+        }
+        map.insert(key, (name, value));
+    }
+    order
+        .into_iter()
+        .filter_map(|key| map.remove(&key))
+        .collect()
+}
+
+/// Resolve session/thread ids per Agent header contract (no DB).
+///
+/// - If `chat_id` is a plan phase implementation (or merge) chat → session=`plan_id`, thread=`chat_id`
+/// - Else if parent chat is plan-bound → session=`plan_id`, thread=`chat_id` (subagent)
+/// - Else normal → session=thread=`chat_id`
+pub fn resolve_agent_session_thread_ids(
+    chat_id: &str,
+    plan_id_for_chat: Option<&str>,
+    plan_id_for_parent_chat: Option<&str>,
+) -> (String, String) {
+    let chat_id = chat_id.trim();
+    if chat_id.is_empty() {
+        return (String::new(), String::new());
+    }
+    if let Some(plan_id) = plan_id_for_chat.map(str::trim).filter(|value| !value.is_empty()) {
+        return (plan_id.to_string(), chat_id.to_string());
+    }
+    if let Some(plan_id) = plan_id_for_parent_chat
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return (plan_id.to_string(), chat_id.to_string());
+    }
+    (chat_id.to_string(), chat_id.to_string())
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1824,17 +2018,18 @@ fn genai_chat_options(
         options = options.with_cache_control(cache_control);
     }
 
-    apply_request_overrides(options, &config.request_overrides)
+    apply_request_overrides_and_agent_headers(options, config, request)
 }
 
-fn apply_request_overrides(
+fn apply_request_overrides_and_agent_headers(
     mut options: ChatOptions,
-    overrides: &[ProviderRequestOverride],
+    config: &ProviderConnectionConfig,
+    request: &NeutralChatRequest,
 ) -> Result<ChatOptions, ProviderConfigError> {
-    let mut headers = Vec::new();
+    let mut override_headers = Vec::new();
     let mut body = Map::new();
 
-    for override_rule in overrides {
+    for override_rule in &config.request_overrides {
         let target = override_rule.normalized_target()?;
         let name = override_rule.normalized_name()?.to_string();
         let value = override_rule.normalized_value()?;
@@ -1846,7 +2041,7 @@ fn apply_request_overrides(
                         "header request override '{name}' value must be a string"
                     )));
                 };
-                headers.push((name, header_value.to_string()));
+                override_headers.push((name, header_value.to_string()));
             }
             REQUEST_OVERRIDE_TARGET_BODY => {
                 insert_nested_body_override(&mut body, &name, value)?;
@@ -1854,6 +2049,19 @@ fn apply_request_overrides(
             _ => unreachable!("request override target was validated"),
         }
     }
+
+    // OpenAIResp only: built-in Agent headers first, then request_overrides (same name wins).
+    let headers = if config.kind.adapter_kind() == AdapterKind::OpenAIResp {
+        merge_header_pairs(
+            default_openai_resp_agent_headers(
+                config.kind.uses_websocket(),
+                request.agent_correlation.as_ref(),
+            ),
+            override_headers,
+        )
+    } else {
+        override_headers
+    };
 
     if !headers.is_empty() {
         options = options.with_extra_headers(Headers::from(headers));
@@ -2711,6 +2919,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         }
     }
 
@@ -2997,6 +3206,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let client = config.genai_client().expect("client");
@@ -3087,6 +3297,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let mut stream = stream_chat_with_capture(&config, request, true)
@@ -3246,6 +3457,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
         let mut stream1 =
             stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
@@ -3302,6 +3514,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
         let mut stream2 =
             stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
@@ -3440,6 +3653,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let mut stream =
@@ -3472,6 +3686,329 @@ mod tests {
             saw_bearer.load(Ordering::SeqCst),
             1,
             "provider upgrade must see Authorization exactly once"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_upgrade_receives_agent_correlation_identity_and_beta_headers() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{
+            accept_hdr_async,
+            tungstenite::{
+                Message,
+                handshake::server::{Request, Response},
+            },
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let saw_agent_headers = Arc::new(AtomicUsize::new(0));
+        let saw_agent_headers_server = Arc::clone(&saw_agent_headers);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_hdr_async(stream, |req: &Request, response: Response| {
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or("")
+                        .to_string()
+                };
+                assert_eq!(header("Authorization"), "Bearer test-key");
+                assert_eq!(header(AGENT_HEADER_ORIGINATOR), FOCO_AGENT_ORIGINATOR);
+                assert!(
+                    header(AGENT_HEADER_USER_AGENT).starts_with("foco/"),
+                    "User-Agent must be Foco identity, got {}",
+                    header(AGENT_HEADER_USER_AGENT)
+                );
+                assert_eq!(header(AGENT_HEADER_SESSION_ID), "plan-ws-upgrade");
+                assert_eq!(header(AGENT_HEADER_THREAD_ID), "chat-impl-ws");
+                assert_eq!(header(AGENT_HEADER_CLIENT_REQUEST_ID), "llm-req-ws");
+                assert_eq!(header(AGENT_HEADER_FOCO_RUN_ID), "run-ws");
+                assert_eq!(header(AGENT_HEADER_FOCO_WORKSPACE_ID), "ws-ws");
+                assert_eq!(
+                    header(OPENAI_RESP_WS_BETA_HEADER),
+                    OPENAI_RESP_WS_BETA_VALUE
+                );
+                saw_agent_headers_server.fetch_add(1, Ordering::SeqCst);
+                Ok(response)
+            })
+            .await
+            .expect("ws accept");
+            let first = ws.next().await.expect("msg").expect("ok");
+            match first {
+                Message::Text(text) => {
+                    let create: Value = serde_json::from_str(&text).expect("json");
+                    assert_eq!(create["type"], "response.create");
+                }
+                other => panic!("expected text, got {other:?}"),
+            }
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"ok"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_agent_hdr","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+            let _ = ws.close(None).await;
+        });
+
+        let observer_calls = Arc::new(Mutex::new(Vec::<ProviderAuditRequestDump>::new()));
+        let observer_slot = Arc::clone(&observer_calls);
+        let observer: ProviderRequestDumpObserver = Arc::new(move |dump| {
+            observer_slot
+                .lock()
+                .expect("observer lock")
+                .push(dump.clone());
+        });
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(
+                AgentRequestCorrelation::new("plan-ws-upgrade", "chat-impl-ws", "llm-req-ws")
+                    .with_run_id("run-ws")
+                    .with_workspace_id("ws-ws"),
+            ),
+        };
+
+        let mut stream =
+            stream_chat_with_capture_observer(&config, request, true, Some(observer), None)
+                .await
+                .expect("stream");
+        let dumps = observer_calls.lock().expect("lock").clone();
+        assert_eq!(dumps.len(), 1);
+        let wire = dumps[0].as_websocket().expect("ws dump");
+        assert_eq!(
+            dump_header_first(&wire.headers, AGENT_HEADER_SESSION_ID).as_deref(),
+            Some("plan-ws-upgrade")
+        );
+        assert_eq!(
+            dump_header_first(&wire.headers, AGENT_HEADER_THREAD_ID).as_deref(),
+            Some("chat-impl-ws")
+        );
+        assert_eq!(
+            dump_header_first(&wire.headers, AGENT_HEADER_CLIENT_REQUEST_ID).as_deref(),
+            Some("llm-req-ws")
+        );
+        assert_eq!(
+            dump_header_first(&wire.headers, OPENAI_RESP_WS_BETA_HEADER).as_deref(),
+            Some(OPENAI_RESP_WS_BETA_VALUE)
+        );
+        assert_eq!(
+            dump_header_first(&wire.headers, AGENT_HEADER_ORIGINATOR).as_deref(),
+            Some(FOCO_AGENT_ORIGINATOR)
+        );
+        while let Some(event) = stream.next_event().await {
+            let _ = event.expect("event");
+        }
+        assert_eq!(
+            saw_agent_headers.load(Ordering::SeqCst),
+            1,
+            "upgrade must receive agent headers exactly once"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn websocket_one_shot_disables_previous_response_continuation() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_server = Arc::clone(&accepts);
+        let server = tokio::spawn(async move {
+            // One-shot turns still reuse the live socket when affinity matches, but must
+            // never send previous_response_id / store continuation semantics.
+            let (stream, _) = listener.accept().await.expect("accept");
+            accepts_server.fetch_add(1, Ordering::SeqCst);
+            let mut ws = accept_async(stream).await.expect("ws accept");
+
+            let first = ws.next().await.expect("msg").expect("ok");
+            let text = match first {
+                Message::Text(text) => text.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let create: Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(create["type"], "response.create");
+            assert!(
+                create.get("previous_response_id").is_none(),
+                "one-shot turn1 must not continue"
+            );
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"A"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_one_shot_1","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+
+            let second = ws.next().await.expect("msg2").expect("ok");
+            let text2 = match second {
+                Message::Text(text) => text.to_string(),
+                other => panic!("expected text, got {other:?}"),
+            };
+            let create2: Value = serde_json::from_str(&text2).expect("json");
+            assert_eq!(create2["type"], "response.create");
+            assert!(
+                create2.get("previous_response_id").is_none(),
+                "one-shot turn2 must not send previous_response_id, got {create2}"
+            );
+            // Full history is re-sent when continuation is disabled.
+            let input = create2["input"].as_array().expect("input array");
+            assert!(
+                input.len() >= 2,
+                "one-shot should resend full context, got {input:?}"
+            );
+            ws.send(Message::Text(
+                r#"{"type":"response.output_text.delta","delta":"B"}"#.into(),
+            ))
+            .await
+            .expect("send");
+            ws.send(Message::Text(
+                r#"{"type":"response.completed","response":{"id":"resp_one_shot_2","status":"completed","model":"gpt-4.1-mini","output":[],"usage":null}}"#.into(),
+            ))
+            .await
+            .expect("send");
+            let _ = ws.close(None).await;
+        });
+
+        let registry = Arc::new(OpenAiRespWsSessionRegistry::new(8));
+        let session = ProviderWsSessionContext {
+            registry: Arc::clone(&registry),
+            key: OpenAiRespWsSessionKey::new("ws", "assistant-one-shot", "prov", "gpt-4.1-mini"),
+            enable_continuation: false,
+        };
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+
+        let request1 = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![NeutralChatMessage {
+                role: NeutralChatRole::User,
+                content: "hi".to_string(),
+                attachments: vec![],
+                reasoning: None,
+                tool_calls: vec![],
+                tool_call_id: None,
+                tool_name: None,
+            }],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(AgentRequestCorrelation::new(
+                "chat-one-shot",
+                "chat-one-shot",
+                "req-1",
+            )),
+        };
+        let mut stream1 =
+            stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
+                .await
+                .expect("stream1");
+        while let Some(event) = stream1.next_event().await {
+            let _ = event.expect("event");
+        }
+        drop(stream1);
+
+        let request2 = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "hi".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::Assistant,
+                    content: "A".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "again".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+            ],
+            tools: vec![],
+            max_output_tokens: None,
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(AgentRequestCorrelation::new(
+                "chat-one-shot",
+                "chat-one-shot",
+                "req-2",
+            )),
+        };
+        let mut stream2 =
+            stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
+                .await
+                .expect("stream2");
+        while let Some(event) = stream2.next_event().await {
+            let _ = event.expect("event");
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "one-shot may reuse the socket but must not use previous_response_id"
         );
         server.await.expect("server");
     }
@@ -3525,6 +4062,7 @@ mod tests {
             thinking_level: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let failure =
@@ -3999,6 +4537,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -4025,6 +4564,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         genai_chat_request(&request).expect("reasoning-only assistant message should convert");
@@ -4055,6 +4595,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -4093,6 +4634,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -4136,6 +4678,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let result = genai_chat_request(&request);
@@ -4183,6 +4726,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+        agent_correlation: None,
         };
 
         let result = genai_chat_request(&request);
@@ -4209,6 +4753,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: Some("foco:workspace:chat".to_string()),
             prompt_cache_retention: Some("24h".to_string()),
+            agent_correlation: None,
         };
 
         let config = ProviderConnectionConfig {
@@ -4240,6 +4785,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
 
         let config = ProviderConnectionConfig {
@@ -4264,6 +4810,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
 
         let config = ProviderConnectionConfig {
@@ -4293,6 +4840,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: None,
             prompt_cache_retention: None,
+            agent_correlation: None,
         };
 
         let config = ProviderConnectionConfig {
@@ -4319,6 +4867,7 @@ mod tests {
             max_output_tokens: None,
             prompt_cache_key: Some("foco:workspace:chat".to_string()),
             prompt_cache_retention: Some("1h".to_string()),
+            agent_correlation: None,
         };
         let config = ProviderConnectionConfig {
             kind: openai_responses_kind(),
@@ -4335,6 +4884,447 @@ mod tests {
                 .to_string()
                 .contains("unsupported prompt cache retention")
         );
+    }
+
+    fn header_map_from_options(options: &ChatOptions) -> std::collections::HashMap<String, String> {
+        let value = serde_json::to_value(options).expect("options json");
+        let headers = value
+            .get("extra_headers")
+            .and_then(|value| value.as_object())
+            .cloned()
+            .unwrap_or_default();
+        headers
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    key.to_ascii_lowercase(),
+                    value.as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn openai_resp_http_injects_identity_and_correlation_headers() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(
+                AgentRequestCorrelation::new("plan-xyz", "chat-impl-1", "llm-req-1")
+                    .with_run_id("run-1")
+                    .with_workspace_id("ws-1"),
+            ),
+        };
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("options");
+        let headers = header_map_from_options(&options);
+        assert_eq!(headers.get("originator").map(String::as_str), Some("foco"));
+        assert!(
+            headers
+                .get("user-agent")
+                .is_some_and(|value| value.starts_with("foco/"))
+        );
+        assert_eq!(
+            headers.get("session-id").map(String::as_str),
+            Some("plan-xyz")
+        );
+        assert_eq!(
+            headers.get("thread-id").map(String::as_str),
+            Some("chat-impl-1")
+        );
+        assert_eq!(
+            headers.get("x-client-request-id").map(String::as_str),
+            Some("llm-req-1")
+        );
+        assert_eq!(
+            headers.get("x-foco-run-id").map(String::as_str),
+            Some("run-1")
+        );
+        assert_eq!(
+            headers.get("x-foco-workspace-id").map(String::as_str),
+            Some("ws-1")
+        );
+        assert!(!headers.contains_key("openai-beta"));
+    }
+
+    #[test]
+    fn openai_resp_websocket_injects_beta_header() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(AgentRequestCorrelation::new(
+                "chat-abc",
+                "chat-abc",
+                "llm-req-2",
+            )),
+        };
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("options");
+        let headers = header_map_from_options(&options);
+        assert_eq!(
+            headers.get("openai-beta").map(String::as_str),
+            Some(OPENAI_RESP_WS_BETA_VALUE)
+        );
+        assert_eq!(headers.get("originator").map(String::as_str), Some("foco"));
+        assert_eq!(
+            headers.get("session-id").map(String::as_str),
+            Some("chat-abc")
+        );
+    }
+
+    #[test]
+    fn request_overrides_replace_same_named_agent_headers() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-5.5".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(AgentRequestCorrelation::new(
+                "session-default",
+                "thread-default",
+                "req-default",
+            )),
+        };
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: vec![
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "session-id".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("session-override".to_string()),
+                },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "originator".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("custom-gateway".to_string()),
+                },
+            ],
+            model_redirects: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("options");
+        let headers = header_map_from_options(&options);
+        assert_eq!(
+            headers.get("session-id").map(String::as_str),
+            Some("session-override")
+        );
+        assert_eq!(
+            headers.get("originator").map(String::as_str),
+            Some("custom-gateway")
+        );
+        assert_eq!(
+            headers.get("thread-id").map(String::as_str),
+            Some("thread-default")
+        );
+    }
+
+    #[test]
+    fn non_openai_resp_adapters_do_not_get_default_agent_headers() {
+        let request = NeutralChatRequest {
+            model_id: "gpt-4o-mini".to_string(),
+            messages: Vec::new(),
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: Some(AgentRequestCorrelation::new("s", "t", "r")),
+        };
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("options");
+        let headers = header_map_from_options(&options);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn resolve_agent_session_thread_mapping_table() {
+        assert_eq!(
+            resolve_agent_session_thread_ids("chat-abc", None, None),
+            ("chat-abc".to_string(), "chat-abc".to_string())
+        );
+        assert_eq!(
+            resolve_agent_session_thread_ids("chat-impl-1", Some("plan-xyz"), None),
+            ("plan-xyz".to_string(), "chat-impl-1".to_string())
+        );
+        assert_eq!(
+            resolve_agent_session_thread_ids("chat-sub-9", None, Some("plan-xyz")),
+            ("plan-xyz".to_string(), "chat-sub-9".to_string())
+        );
+    }
+
+    fn dump_header_first(
+        headers: &ProviderHttpHeadersDump,
+        name: &str,
+    ) -> Option<String> {
+        headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .and_then(|(_, values)| values.first().cloned())
+    }
+
+    fn raw_header_value(raw: &RawHttpRequest, name: &str) -> Option<String> {
+        raw.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.clone())
+    }
+
+    #[tokio::test]
+    async fn openai_resp_http_wire_dump_includes_agent_headers() {
+        let openai_responses = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"headers ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-agent-headers\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"headers ok\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", openai_responses).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "agent headers wire",
+        )]);
+        request.model_id = "fixture-responses-model".to_string();
+        request.agent_correlation = Some(
+            AgentRequestCorrelation::new("plan-wire", "chat-impl-wire", "llm-req-wire")
+                .with_run_id("run-wire")
+                .with_workspace_id("ws-wire"),
+        );
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open openai responses fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("http wire dump")
+            .as_http()
+            .expect("http dump")
+            .clone();
+        while stream.next_event().await.is_some() {}
+
+        let requests = fixture.await.expect("fixture task");
+        assert_eq!(requests.len(), 1);
+        let raw = parse_raw_http_request(requests.into_iter().next().expect("raw request"));
+
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_ORIGINATOR).as_deref(),
+            Some(FOCO_AGENT_ORIGINATOR)
+        );
+        assert!(
+            dump_header_first(&dump.headers, AGENT_HEADER_USER_AGENT)
+                .is_some_and(|value| value.starts_with("foco/"))
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_SESSION_ID).as_deref(),
+            Some("plan-wire")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_THREAD_ID).as_deref(),
+            Some("chat-impl-wire")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_CLIENT_REQUEST_ID).as_deref(),
+            Some("llm-req-wire")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_FOCO_RUN_ID).as_deref(),
+            Some("run-wire")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_FOCO_WORKSPACE_ID).as_deref(),
+            Some("ws-wire")
+        );
+        assert!(
+            dump_header_first(&dump.headers, OPENAI_RESP_WS_BETA_HEADER).is_none(),
+            "HTTP Responses must not send OpenAI-Beta websocket capability header"
+        );
+
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_ORIGINATOR).as_deref(),
+            Some(FOCO_AGENT_ORIGINATOR)
+        );
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_SESSION_ID).as_deref(),
+            Some("plan-wire")
+        );
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_THREAD_ID).as_deref(),
+            Some("chat-impl-wire")
+        );
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_CLIENT_REQUEST_ID).as_deref(),
+            Some("llm-req-wire")
+        );
+        assert!(
+            raw_header_value(&raw, OPENAI_RESP_WS_BETA_HEADER).is_none(),
+            "raw HTTP must not include OpenAI-Beta websocket header"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_resp_http_wire_dump_request_overrides_replace_agent_headers() {
+        let openai_responses = concat!(
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"override ok\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-override\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"override ok\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", openai_responses).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "session-id".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("session-from-override".to_string()),
+                },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "originator".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("gateway-custom".to_string()),
+                },
+            ],
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "override wire",
+        )]);
+        request.model_id = "fixture-responses-model".to_string();
+        request.agent_correlation = Some(AgentRequestCorrelation::new(
+            "session-default",
+            "thread-default",
+            "req-default",
+        ));
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open override stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("http wire dump")
+            .as_http()
+            .expect("http dump")
+            .clone();
+        while stream.next_event().await.is_some() {}
+        let requests = fixture.await.expect("fixture task");
+        let raw = parse_raw_http_request(requests.into_iter().next().expect("raw request"));
+
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_SESSION_ID).as_deref(),
+            Some("session-from-override")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_ORIGINATOR).as_deref(),
+            Some("gateway-custom")
+        );
+        assert_eq!(
+            dump_header_first(&dump.headers, AGENT_HEADER_THREAD_ID).as_deref(),
+            Some("thread-default")
+        );
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_SESSION_ID).as_deref(),
+            Some("session-from-override")
+        );
+        assert_eq!(
+            raw_header_value(&raw, AGENT_HEADER_ORIGINATOR).as_deref(),
+            Some("gateway-custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_openai_resp_http_wire_dump_does_not_inject_agent_headers() {
+        let openai_chat = concat!(
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"chat ok\"}}]}\n\n",
+            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", openai_chat).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "no agent headers",
+        )]);
+        request.agent_correlation = Some(AgentRequestCorrelation::new(
+            "should-not-appear",
+            "should-not-appear",
+            "should-not-appear",
+        ));
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open chat stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("http wire dump")
+            .as_http()
+            .expect("http dump")
+            .clone();
+        while stream.next_event().await.is_some() {}
+        let requests = fixture.await.expect("fixture task");
+        let raw = parse_raw_http_request(requests.into_iter().next().expect("raw request"));
+
+        assert!(dump_header_first(&dump.headers, AGENT_HEADER_SESSION_ID).is_none());
+        assert!(dump_header_first(&dump.headers, AGENT_HEADER_THREAD_ID).is_none());
+        assert!(dump_header_first(&dump.headers, AGENT_HEADER_ORIGINATOR).is_none());
+        assert!(dump_header_first(&dump.headers, AGENT_HEADER_CLIENT_REQUEST_ID).is_none());
+        assert!(raw_header_value(&raw, AGENT_HEADER_SESSION_ID).is_none());
+        assert!(raw_header_value(&raw, AGENT_HEADER_ORIGINATOR).is_none());
     }
 
     #[test]

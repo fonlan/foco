@@ -1784,6 +1784,7 @@ Submit a substantially shorter complete Project Spec. contentMarkdown MUST be un
         max_output_tokens,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     }
 }
 
@@ -1842,6 +1843,7 @@ Submit ordered exact-text edits that shrink the CURRENT candidate. After all edi
         max_output_tokens,
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     }
 }
 
@@ -2077,6 +2079,7 @@ fn workspace_spec_provider_request(
         max_output_tokens: Some(max_output_tokens),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     })
 }
 
@@ -2112,6 +2115,7 @@ fn workspace_spec_update_provider_request(
         max_output_tokens: Some(max_output_tokens),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+    agent_correlation: None,
     })
 }
 

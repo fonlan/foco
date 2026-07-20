@@ -2606,6 +2606,7 @@ pub(crate) fn model_test_provider_request(model_id: &str) -> NeutralChatRequest 
         max_output_tokens: Some(MODEL_TEST_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     }
 }
 

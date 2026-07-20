@@ -728,6 +728,7 @@ pub(crate) fn build_context_compression_summary_request_with_prompt(
         max_output_tokens: Some(LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+        agent_correlation: None,
     }
 }
 
@@ -1287,12 +1288,13 @@ async fn llm_context_compression_summary_once(
     checkpoint_messages: &[NeutralChatMessage],
     compression_system_prompt: &str,
 ) -> Result<String, ApiError> {
-    let request = build_context_compression_summary_request_with_prompt(
+    let mut request = build_context_compression_summary_request_with_prompt(
         &context.model_id,
         checkpoint_messages,
         compression_system_prompt,
     );
     let request_id = unique_id("llm");
+    context.attach_agent_correlation(&mut request, &request_id);
     let request_started_at = utc_timestamp();
     let started_at = Instant::now();
     let mut events = vec![CapturedAuditEvent {

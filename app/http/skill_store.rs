@@ -1014,6 +1014,7 @@ pub(crate) fn skill_translation_provider_request(
         max_output_tokens: Some(SKILL_TRANSLATION_MAX_OUTPUT_TOKENS),
         prompt_cache_key: None,
         prompt_cache_retention: None,
+    agent_correlation: None,
     })
 }
 
