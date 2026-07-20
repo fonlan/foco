@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    time::Duration,
 };
 
 use axum::{
@@ -243,7 +244,7 @@ pub(crate) struct MemoryDreamRunResponse {
     job: MemoryDreamJobSummary,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryDreamJobsResponse {
     jobs: Vec<MemoryDreamJobSummary>,
@@ -251,6 +252,47 @@ pub(crate) struct MemoryDreamJobsResponse {
     page_size: u32,
     total_count: u32,
     total_pages: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    partial_unavailable: Vec<MemoryDreamPartialUnavailable>,
+}
+
+/// A bounded, safe diagnostic for a remote source that could not contribute.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MemoryDreamPartialUnavailable {
+    workspace_id: String,
+    reason: MemoryDreamRemoteUnavailableReason,
+    message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum MemoryDreamRemoteUnavailableReason {
+    NotConnected,
+    RequestFailed,
+    InvalidResponse,
+}
+
+impl MemoryDreamRemoteUnavailableReason {
+    fn safe_message(self) -> &'static str {
+        match self {
+            Self::NotConnected => {
+                "Remote Dream history is unavailable because the workspace is not connected."
+            }
+            Self::RequestFailed => "Remote Dream history is temporarily unavailable.",
+            Self::InvalidResponse => "Remote Dream history returned an invalid response.",
+        }
+    }
+}
+
+impl MemoryDreamPartialUnavailable {
+    fn new(workspace_id: &str, reason: MemoryDreamRemoteUnavailableReason) -> Self {
+        Self {
+            workspace_id: workspace_id.to_string(),
+            reason,
+            message: reason.safe_message().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -265,7 +307,7 @@ pub(crate) struct MemoryDreamChangesResponse {
     changes: Vec<MemoryDreamChangeSummary>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryDreamJobSummary {
     id: String,
@@ -285,7 +327,7 @@ pub(crate) struct MemoryDreamJobSummary {
     completed_at: Option<String>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MemoryDreamChangeCounts {
     added: u32,
@@ -1129,61 +1171,92 @@ pub(crate) async fn memory_dream_jobs(
         .clamp(1, MEMORY_DREAM_JOBS_LIMIT_MAX);
     let offset = page.saturating_sub(1).saturating_mul(page_size);
     let fetch_limit = offset.saturating_add(page_size);
-    let mut pending = Vec::new();
-    let mut total_count = 0;
+    let mut candidates = Vec::new();
+    let mut partial_unavailable = Vec::new();
+    let mut total_count = 0_u32;
 
     if scope.is_none() || scope == Some(MemoryDreamScope::Global) {
         let database = open_dream_memory_database(&state, &config, MemoryDreamScope::Global, None)?;
-        total_count += database
-            .count_dream_jobs_for_scope(MemoryDreamScope::Global, None, status)
-            .map_err(ApiError::from_memory_error)?;
-        for job in database
-            .dream_jobs_for_scope_page(MemoryDreamScope::Global, None, status, fetch_limit, 0)
-            .map_err(ApiError::from_memory_error)?
-        {
-            pending.push(PendingMemoryDreamJob {
-                job,
-                source_workspace_id: None,
-            });
-        }
+        total_count = total_count.saturating_add(
+            database
+                .count_dream_jobs_for_scope(MemoryDreamScope::Global, None, status)
+                .map_err(ApiError::from_memory_error)?,
+        );
+        candidates.extend(
+            database
+                .dream_jobs_for_scope_page(MemoryDreamScope::Global, None, status, fetch_limit, 0)
+                .map_err(ApiError::from_memory_error)?
+                .into_iter()
+                .map(|job| {
+                    MemoryDreamJobCandidate::Local(PendingMemoryDreamJob {
+                        job,
+                        source_workspace_id: None,
+                    })
+                }),
+        );
     }
 
     if scope.is_none() || scope == Some(MemoryDreamScope::Workspace) {
-        let workspaces = memory_dream_workspaces(&config, workspace_id.as_deref())?;
-        for workspace in workspaces {
-            let database = open_dream_memory_database(
-                &state,
-                &config,
-                MemoryDreamScope::Workspace,
-                Some(&workspace.id),
-            )?;
-            total_count += database
-                .count_dream_jobs_for_scope(
-                    MemoryDreamScope::Workspace,
-                    Some(&workspace.id),
-                    status,
-                )
-                .map_err(ApiError::from_memory_error)?;
-            for job in database
-                .dream_jobs_for_scope_page(
-                    MemoryDreamScope::Workspace,
-                    Some(&workspace.id),
-                    status,
-                    fetch_limit,
-                    0,
-                )
-                .map_err(ApiError::from_memory_error)?
-            {
-                pending.push(PendingMemoryDreamJob {
-                    job,
-                    source_workspace_id: Some(workspace.id.clone()),
-                });
+        for workspace in memory_dream_workspace_sources(&config, workspace_id.as_deref())? {
+            match workspace {
+                MemoryDreamWorkspaceSource::Local(workspace) => {
+                    let database = open_dream_memory_database(
+                        &state,
+                        &config,
+                        MemoryDreamScope::Workspace,
+                        Some(&workspace.id),
+                    )?;
+                    total_count = total_count.saturating_add(
+                        database
+                            .count_dream_jobs_for_scope(
+                                MemoryDreamScope::Workspace,
+                                Some(&workspace.id),
+                                status,
+                            )
+                            .map_err(ApiError::from_memory_error)?,
+                    );
+                    candidates.extend(
+                        database
+                            .dream_jobs_for_scope_page(
+                                MemoryDreamScope::Workspace,
+                                Some(&workspace.id),
+                                status,
+                                fetch_limit,
+                                0,
+                            )
+                            .map_err(ApiError::from_memory_error)?
+                            .into_iter()
+                            .map(|job| {
+                                MemoryDreamJobCandidate::Local(PendingMemoryDreamJob {
+                                    job,
+                                    source_workspace_id: Some(workspace.id.clone()),
+                                })
+                            }),
+                    );
+                }
+                MemoryDreamWorkspaceSource::Remote(workspace) => {
+                    match fetch_remote_memory_dream_jobs(&state, &workspace.id, status, fetch_limit)
+                        .await
+                    {
+                        Ok(response) => {
+                            total_count = total_count.saturating_add(response.total_count);
+                            candidates.extend(
+                                response
+                                    .jobs
+                                    .into_iter()
+                                    .map(MemoryDreamJobCandidate::Remote),
+                            );
+                        }
+                        Err(reason) => partial_unavailable
+                            .push(MemoryDreamPartialUnavailable::new(&workspace.id, reason)),
+                    }
+                }
             }
         }
     }
 
-    let page_jobs = select_memory_dream_jobs_page(pending, offset, page_size);
-    let jobs = materialize_memory_dream_job_summaries_for_page(&state, &config, page_jobs)?;
+    let page_jobs = select_memory_dream_job_candidates_page(candidates, offset, page_size);
+    let jobs = materialize_memory_dream_job_candidates_for_page(&state, &config, page_jobs)?;
 
     Ok(Json(MemoryDreamJobsResponse {
         jobs,
@@ -1195,6 +1268,7 @@ pub(crate) async fn memory_dream_jobs(
         } else {
             total_count.div_ceil(page_size)
         },
+        partial_unavailable,
     }))
 }
 
@@ -1259,15 +1333,218 @@ fn open_dream_memory_database(
     open_memory_database(state, config, memory_scope, workspace_id)
 }
 
-fn memory_dream_workspaces<'a>(
+enum MemoryDreamWorkspaceSource<'a> {
+    Local(&'a WorkspaceConfig),
+    Remote(&'a WorkspaceConfig),
+}
+
+fn memory_dream_workspace_sources<'a>(
     config: &'a GlobalConfig,
     workspace_id: Option<&str>,
-) -> Result<Vec<&'a WorkspaceConfig>, ApiError> {
+) -> Result<Vec<MemoryDreamWorkspaceSource<'a>>, ApiError> {
     if let Some(workspace_id) = workspace_id {
-        return Ok(vec![workspace_by_id(config, workspace_id)?]);
+        let workspace = workspace_by_id(config, workspace_id)?;
+        return Ok(vec![if workspace.server_id().is_some() {
+            MemoryDreamWorkspaceSource::Remote(workspace)
+        } else {
+            MemoryDreamWorkspaceSource::Local(workspace)
+        }]);
     }
 
-    Ok(config.workspaces.iter().collect())
+    let mut sources = config
+        .local_workspaces()
+        .map(MemoryDreamWorkspaceSource::Local)
+        .collect::<Vec<_>>();
+    sources.extend(
+        config
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.server_id().is_some())
+            .map(MemoryDreamWorkspaceSource::Remote),
+    );
+    Ok(sources)
+}
+
+async fn fetch_remote_memory_dream_jobs(
+    state: &AppState,
+    workspace_id: &str,
+    status: Option<MemoryDreamJobStatus>,
+    fetch_limit: u32,
+) -> Result<MemoryDreamJobsResponse, MemoryDreamRemoteUnavailableReason> {
+    let (base, token) = match crate::remote_workspace::sidecar_proxy_target(state, workspace_id) {
+        Ok(crate::remote_workspace::SidecarProxyTarget::Connected { base, token }) => (base, token),
+        Ok(crate::remote_workspace::SidecarProxyTarget::Disconnected) => {
+            return Err(MemoryDreamRemoteUnavailableReason::NotConnected);
+        }
+        Ok(crate::remote_workspace::SidecarProxyTarget::Local) => {
+            return Err(MemoryDreamRemoteUnavailableReason::InvalidResponse);
+        }
+        Err(_) => return Err(MemoryDreamRemoteUnavailableReason::RequestFailed),
+    };
+    let status_query = status
+        .map(|status| format!("&status={}", status.as_str()))
+        .unwrap_or_default();
+    let url = format!(
+        "{}/api/remote/workspace/memory/dream/jobs?scope=workspace&page=1&pageSize={MEMORY_DREAM_JOBS_LIMIT_MAX}&fetchLimit={fetch_limit}{status_query}",
+        base.trim_end_matches('/')
+    );
+    let response = reqwest::Client::new()
+        .get(url)
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|_| MemoryDreamRemoteUnavailableReason::RequestFailed)?;
+    if !response.status().is_success() {
+        return Err(MemoryDreamRemoteUnavailableReason::RequestFailed);
+    }
+    let response = response
+        .json::<MemoryDreamJobsResponse>()
+        .await
+        .map_err(|_| MemoryDreamRemoteUnavailableReason::InvalidResponse)?;
+    validate_remote_memory_dream_jobs_response(&response, workspace_id, status, fetch_limit)?;
+    Ok(response)
+}
+
+fn validate_remote_memory_dream_jobs_response(
+    response: &MemoryDreamJobsResponse,
+    workspace_id: &str,
+    status: Option<MemoryDreamJobStatus>,
+    fetch_limit: u32,
+) -> Result<(), MemoryDreamRemoteUnavailableReason> {
+    if !response.partial_unavailable.is_empty()
+        || response.total_count < response.jobs.len() as u32
+        || response.jobs.len() as u32 > fetch_limit
+    {
+        return Err(MemoryDreamRemoteUnavailableReason::InvalidResponse);
+    }
+    for job in &response.jobs {
+        if job.scope != "workspace"
+            || job.workspace_id.as_deref() != Some(workspace_id)
+            || status.is_some_and(|expected| job.status != expected.as_str())
+        {
+            return Err(MemoryDreamRemoteUnavailableReason::InvalidResponse);
+        }
+    }
+    if response.jobs.windows(2).any(|jobs| {
+        jobs[0].created_at < jobs[1].created_at
+            || (jobs[0].created_at == jobs[1].created_at && jobs[0].id > jobs[1].id)
+    }) {
+        return Err(MemoryDreamRemoteUnavailableReason::InvalidResponse);
+    }
+    Ok(())
+}
+
+pub(crate) fn memory_dream_workspace_jobs_response(
+    database: &MemoryDatabase,
+    workspace_id: &str,
+    status: Option<MemoryDreamJobStatus>,
+    page: u32,
+    page_size: u32,
+    fetch_limit: Option<u32>,
+) -> Result<MemoryDreamJobsResponse, ApiError> {
+    let total_count = database
+        .count_dream_jobs_for_scope(MemoryDreamScope::Workspace, Some(workspace_id), status)
+        .map_err(ApiError::from_memory_error)?;
+    let (limit, offset) = match fetch_limit {
+        Some(limit) => (limit, 0),
+        None => (page_size, page.saturating_sub(1).saturating_mul(page_size)),
+    };
+    let jobs = database
+        .dream_jobs_for_scope_page(
+            MemoryDreamScope::Workspace,
+            Some(workspace_id),
+            status,
+            limit,
+            offset,
+        )
+        .map_err(ApiError::from_memory_error)?
+        .into_iter()
+        .map(|job| memory_dream_job_summary(database, job, Some(workspace_id.to_string())))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(MemoryDreamJobsResponse {
+        jobs,
+        page,
+        page_size,
+        total_count,
+        total_pages: if total_count == 0 {
+            0
+        } else {
+            total_count.div_ceil(page_size)
+        },
+        partial_unavailable: Vec::new(),
+    })
+}
+
+#[derive(Debug, Clone)]
+enum MemoryDreamJobCandidate {
+    Local(PendingMemoryDreamJob),
+    Remote(MemoryDreamJobSummary),
+}
+
+impl MemoryDreamJobCandidate {
+    fn created_at(&self) -> &str {
+        match self {
+            Self::Local(pending) => &pending.job.created_at,
+            Self::Remote(summary) => &summary.created_at,
+        }
+    }
+
+    fn id(&self) -> &str {
+        match self {
+            Self::Local(pending) => &pending.job.id,
+            Self::Remote(summary) => &summary.id,
+        }
+    }
+}
+
+fn select_memory_dream_job_candidates_page(
+    mut candidates: Vec<MemoryDreamJobCandidate>,
+    offset: u32,
+    page_size: u32,
+) -> Vec<MemoryDreamJobCandidate> {
+    candidates.sort_by(|left, right| {
+        right
+            .created_at()
+            .cmp(left.created_at())
+            .then_with(|| left.id().cmp(right.id()))
+    });
+    candidates
+        .into_iter()
+        .skip(offset as usize)
+        .take(page_size as usize)
+        .collect()
+}
+
+fn materialize_memory_dream_job_candidates_for_page(
+    state: &AppState,
+    config: &GlobalConfig,
+    page_jobs: Vec<MemoryDreamJobCandidate>,
+) -> Result<Vec<MemoryDreamJobSummary>, ApiError> {
+    let local_jobs = page_jobs
+        .iter()
+        .filter_map(|candidate| match candidate {
+            MemoryDreamJobCandidate::Local(pending) => Some(pending.clone()),
+            MemoryDreamJobCandidate::Remote(_) => None,
+        })
+        .collect();
+    let mut local_summaries =
+        materialize_memory_dream_job_summaries_for_page(state, config, local_jobs)?.into_iter();
+    let mut summaries = Vec::with_capacity(page_jobs.len());
+
+    for candidate in page_jobs {
+        match candidate {
+            MemoryDreamJobCandidate::Local(_) => {
+                let summary = local_summaries.next().ok_or_else(|| {
+                    ApiError::internal("Dream job summary materialization lost a local candidate")
+                })?;
+                summaries.push(summary);
+            }
+            MemoryDreamJobCandidate::Remote(summary) => summaries.push(summary),
+        }
+    }
+    Ok(summaries)
 }
 
 /// Sortable Dream job row collected before summary / legacy transcript resolution.
@@ -1286,6 +1563,7 @@ pub(crate) struct LegacyTranscriptLookupStats {
 }
 
 /// Sort by `created_at DESC, id ASC` and take the requested page.
+#[cfg(test)]
 pub(crate) fn select_memory_dream_jobs_page(
     mut pending: Vec<PendingMemoryDreamJob>,
     offset: u32,
@@ -1424,7 +1702,7 @@ where
 
     let candidates: Vec<String> = legacy_chat_to_job_ids.keys().cloned().collect();
     let (chat_to_workspace, lookup_stats) = resolve_legacy_transcript_chat_ids_with_stats(
-        config.workspaces.iter(),
+        config.local_workspaces(),
         &candidates,
         &mut open_workspace,
     )?;

@@ -29,7 +29,7 @@ use foco_providers::{
 use foco_store::{
     config::{
         DEFAULT_WORKSPACE_ID, DEFAULT_WORKSPACE_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME, PromptSettings,
-        REVIEW_SYSTEM_PROMPT_NAME, WebSearchSettings,
+        REVIEW_SYSTEM_PROMPT_NAME, WebSearchSettings, WorkspaceLocation,
     },
     memory::{
         MemoryDreamJobStatus, MemoryDreamRunMode, MemoryDreamScope, MemoryDreamTriggerType,
@@ -19949,6 +19949,35 @@ async fn memory_dream_jobs_paginates_and_filters_on_server() {
     assert_eq!(filtered_response["jobs"][0]["id"], "workspace-one-failed");
     assert_eq!(filtered_response["jobs"][0]["scope"], "workspace");
     assert_eq!(filtered_response["jobs"][0]["status"], "failed");
+}
+
+#[tokio::test]
+async fn memory_dream_jobs_reports_disconnected_ssh_workspace_without_opening_its_local_path() {
+    let profile = tempfile::tempdir().expect("profile");
+    let local_workspace = tempfile::tempdir().expect("local workspace");
+    let mut config = GlobalConfig::first_run(local_workspace.path().to_path_buf());
+    let mut remote_workspace = config.workspaces[0].clone();
+    remote_workspace.id = "remote-workspace".to_string();
+    remote_workspace.path = std::path::PathBuf::new();
+    remote_workspace.location = WorkspaceLocation::Ssh {
+        server_id: "remote-server".to_string(),
+        remote_path: "/workspace".to_string(),
+    };
+    config.workspaces.push(remote_workspace);
+    let state = test_app_state(config, profile.path().to_path_buf());
+
+    let query = serde_json::from_value(json!({})).expect("default Dream jobs query");
+    let Json(response) = memory_dream_jobs(State(state), Query(query))
+        .await
+        .expect("Dream history remains available");
+    let response = serde_json::to_value(response).expect("Dream history JSON");
+
+    assert_eq!(response["totalCount"], 0);
+    assert_eq!(
+        response["partialUnavailable"][0]["workspaceId"],
+        "remote-workspace"
+    );
+    assert_eq!(response["partialUnavailable"][0]["reason"], "notConnected");
 }
 
 #[test]

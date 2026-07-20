@@ -48,8 +48,8 @@ use foco_store::{
         WorkspaceConfig, WorkspaceLocation,
     },
     memory::{
-        MemoryDatabase, MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact,
-        NewMemorySource,
+        MemoryDatabase, MemoryDreamJobStatus, MemoryDreamScope, MemoryKind, MemoryScope,
+        MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
         AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
@@ -17720,6 +17720,10 @@ async fn remote_sidecar_memory_get(
     AxumPath(path): AxumPath<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, axum::response::Response> {
+    if path == "dream/jobs" {
+        return remote_sidecar_memory_dream_jobs(state, query).await;
+    }
+
     if path == "sources" {
         let scope = MemoryScope::parse(query.get("scope").map(String::as_str).unwrap_or(""))
             .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
@@ -17743,6 +17747,68 @@ async fn remote_sidecar_memory_get(
     }
 
     Err(remote_sidecar_memory_unimplemented_response(&path))
+}
+
+async fn remote_sidecar_memory_dream_jobs(
+    state: RemoteSidecarState,
+    query: HashMap<String, String>,
+) -> Result<Json<Value>, axum::response::Response> {
+    let scope = MemoryDreamScope::parse(
+        query
+            .get("scope")
+            .map(String::as_str)
+            .unwrap_or("workspace"),
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    if scope != MemoryDreamScope::Workspace {
+        return Err(
+            ApiError::bad_request("remote Dream history only supports workspace scope")
+                .into_response(),
+        );
+    }
+    let status = query
+        .get("status")
+        .map(String::as_str)
+        .map(MemoryDreamJobStatus::parse)
+        .transpose()
+        .map_err(|error| ApiError::bad_request(error.to_string()).into_response())?;
+    let page = query
+        .get("page")
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(1)
+        .max(1);
+    let page_size = query
+        .get("pageSize")
+        .or_else(|| query.get("page_size"))
+        .or_else(|| query.get("limit"))
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let fetch_limit = match query.get("fetchLimit") {
+        Some(value) => Some(value.parse::<u32>().map_err(|_| {
+            ApiError::bad_request("fetchLimit must be a positive integer").into_response()
+        })?),
+        None => None,
+    };
+    if fetch_limit == Some(0) {
+        return Err(ApiError::bad_request("fetchLimit must be a positive integer").into_response());
+    }
+
+    let database = foco_store::open_workspace_memory_database(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_memory_error(error).into_response())?;
+    let response = crate::http::memory::memory_dream_workspace_jobs_response(
+        &database,
+        &state.workspace_id,
+        status,
+        page,
+        page_size,
+        fetch_limit,
+    )
+    .map_err(|error| error.into_response())?;
+    let response = serde_json::to_value(response).map_err(|_| {
+        ApiError::internal("failed to serialize remote Dream history response").into_response()
+    })?;
+    Ok(Json(response))
 }
 
 async fn remote_sidecar_memory_mutation(

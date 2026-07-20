@@ -1058,8 +1058,7 @@ pub(crate) const GLOBAL_WORKSPACE_ROUTE_CONTRACTS: &[GlobalWorkspaceRouteContrac
         Get,
         "memory/dream/jobs",
         Query,
-        true,
-        "remote sidecar returns an explicit unsupported response until workspace/chat Dream job listing is implemented"
+        true
     ),
     global_workspace_route!(
         "memory-dream-job",
