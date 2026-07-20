@@ -39,7 +39,7 @@ use foco_providers::{
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderRequestDumpObserver,
     ProviderRequestFailure, ProviderWireRequestDump, ProviderWsSessionContext,
-    stream_chat_with_capture_observer,
+    recover_model_json_from_text, stream_chat_with_capture_observer,
 };
 use foco_store::{
     config::{
@@ -1159,6 +1159,81 @@ fn broker_llm_final_state(
         "succeeded"
     } else {
         "failed"
+    }
+}
+
+/// Prefix for broker-normalized single-tool text JSON recovery call ids.
+/// The full id is `{prefix}{broker_request_id}` so each broker RPC is unique and cannot
+/// collide with a prior completed tool_calls row or with provider-issued call ids.
+const BROKER_TEXT_JSON_FALLBACK_CALL_ID_PREFIX: &str = "foco-text-json-fallback:";
+
+fn broker_text_json_fallback_call_id(broker_request_id: &str) -> String {
+    format!("{BROKER_TEXT_JSON_FALLBACK_CALL_ID_PREFIX}{broker_request_id}")
+}
+
+/// Internal structured request kinds that force a single tool (parity with local
+/// `audited_provider_tool_request`). Normal chat completion must not synthesize tool calls
+/// from assistant text, to avoid corrupting remote chat tool state.
+fn broker_allows_single_tool_text_json_fallback(request_kind: &str) -> bool {
+    matches!(
+        request_kind,
+        kind if kind == GIT_COMMIT_MESSAGE_REQUEST_KIND
+            || kind == LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION
+            || kind == LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE
+            || kind == LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION
+            || kind == LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION
+    )
+}
+
+/// When a single-tool internal broker request yields no real ToolCall, try conservative
+/// plain-text JSON recovery and synthesize one NeutralToolCall for Sidecar consumption.
+/// Real ToolCalls always win; multi-tool / zero-tool / chat completion / invalid text → `None`.
+fn recover_broker_single_tool_call_from_text(
+    broker_request_id: &str,
+    request_kind: &str,
+    tools: &[NeutralToolDefinition],
+    existing_tool_calls: &[NeutralToolCall],
+    final_text: &str,
+) -> Option<NeutralToolCall> {
+    if !broker_allows_single_tool_text_json_fallback(request_kind) {
+        return None;
+    }
+    if !existing_tool_calls.is_empty() {
+        return None;
+    }
+    if tools.len() != 1 {
+        return None;
+    }
+    let tool = &tools[0];
+    let arguments = recover_model_json_from_text(final_text.trim())?;
+    Some(NeutralToolCall {
+        call_id: broker_text_json_fallback_call_id(broker_request_id),
+        name: tool.name.clone(),
+        arguments,
+        thought_signatures: None,
+    })
+}
+
+/// Classify retryable completion failures after optional single-tool text recovery.
+/// Complete-only unstreamed text that was recovered into toolCalls is not `stream_incomplete`.
+fn broker_retryable_completion_failure(
+    completed: bool,
+    completed_with_unstreamed_text: bool,
+    final_text: &str,
+    final_tool_calls: &[NeutralToolCall],
+) -> Option<(&'static str, &'static str)> {
+    if completed_with_unstreamed_text && final_tool_calls.is_empty() {
+        Some((
+            "stream_incomplete",
+            "provider completed without streaming assistant text deltas",
+        ))
+    } else if completed && final_text.trim().is_empty() && final_tool_calls.is_empty() {
+        Some((
+            "empty_completion",
+            "provider completed without assistant text or tool calls",
+        ))
+    } else {
+        None
     }
 }
 
@@ -5853,6 +5928,9 @@ async fn broker_llm_stream(
         });
     // Ensure a nested request cannot disagree with the model selected by the broker payload.
     request.model_id = model_id.clone();
+    // Snapshot tools before the request is moved into the provider stream so completion
+    // can recover single-tool text JSON without re-borrowing the moved request.
+    let request_tools = request.tools.clone();
 
     let audit_context =
         match broker_llm_audit_context(state, workspace_id, &payload, &request_kind, id) {
@@ -6511,19 +6589,31 @@ async fn broker_llm_stream(
                 })
         });
     let completed = saw_complete;
-    let retryable_completion_failure = if completed_with_unstreamed_text {
-        Some((
-            "stream_incomplete",
-            "provider completed without streaming assistant text deltas",
-        ))
-    } else if completed && final_text.trim().is_empty() && final_tool_calls.is_empty() {
-        Some((
-            "empty_completion",
-            "provider completed without assistant text or tool calls",
-        ))
-    } else {
-        None
-    };
+    // Prefer real ToolCalls. When the provider returned only text for a single-tool request,
+    // recover arguments into a synthetic NeutralToolCall before classifying failures so
+    // Complete-only JSON is not rejected as stream_incomplete and Sidecar can use toolCalls.
+    if let Some(recovered) = recover_broker_single_tool_call_from_text(
+        id,
+        &request_kind,
+        &request_tools,
+        &final_tool_calls,
+        &final_text,
+    ) {
+        tracing::debug!(
+            request_id = %id,
+            request_kind = %request_kind,
+            tool_name = %recovered.name,
+            text_json_fallback = true,
+            "recovered single-tool call from broker model text JSON"
+        );
+        final_tool_calls = vec![recovered];
+    }
+    let retryable_completion_failure = broker_retryable_completion_failure(
+        completed,
+        completed_with_unstreamed_text,
+        &final_text,
+        &final_tool_calls,
+    );
     let prompt_hook_tool_call_failure = request_kind == BROKER_PROMPT_HOOK_REQUEST_KIND
         && completed
         && !final_tool_calls.is_empty();
@@ -35472,6 +35562,906 @@ mod tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].call_id, complete.call_id);
         assert_eq!(merged[0].arguments, complete.arguments);
+    }
+
+    fn single_submit_spec_tool() -> NeutralToolDefinition {
+        NeutralToolDefinition {
+            name: "submit_workspace_spec_update".to_string(),
+            description: "submit update".to_string(),
+            input_schema: json!({ "type": "object" }),
+            strict: true,
+        }
+    }
+
+    #[test]
+    fn recover_broker_single_tool_call_from_streamed_or_complete_only_text_json() {
+        let tools = [single_submit_spec_tool()];
+        let broker_request_id = "broker-rpc-streamed-1";
+        let plain = r#"{"updateNeeded":true,"edits":[{"oldText":"a","newText":"b"}]}"#;
+        let recovered = recover_broker_single_tool_call_from_text(
+            broker_request_id,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            &tools,
+            &[],
+            plain,
+        )
+        .expect("streamed/plain text JSON should recover");
+        assert_eq!(
+            recovered.call_id,
+            broker_text_json_fallback_call_id(broker_request_id)
+        );
+        assert_eq!(recovered.name, "submit_workspace_spec_update");
+        assert_eq!(recovered.arguments["updateNeeded"], true);
+        assert_eq!(recovered.arguments["edits"][0]["newText"], "b");
+
+        let fenced = "```json\n{\"updateNeeded\":false,\"edits\":null}\n```";
+        let recovered_fenced = recover_broker_single_tool_call_from_text(
+            "broker-rpc-fenced-1",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            &tools,
+            &[],
+            fenced,
+        )
+        .expect("fenced JSON");
+        assert_eq!(
+            recovered_fenced.call_id,
+            broker_text_json_fallback_call_id("broker-rpc-fenced-1")
+        );
+        assert_eq!(recovered_fenced.arguments["updateNeeded"], false);
+
+        // Complete-only path uses the same final_text; recovery does not depend on stream flags.
+        let complete_only_text = plain;
+        let recovered_complete_only = recover_broker_single_tool_call_from_text(
+            "broker-rpc-complete-only-1",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            &tools,
+            &[],
+            complete_only_text,
+        )
+        .expect("complete-only text JSON should recover");
+        assert_eq!(recovered_complete_only.arguments, recovered.arguments);
+
+        // Distinct broker RPC ids must produce distinct synthetic call ids.
+        assert_ne!(
+            recovered.call_id, recovered_complete_only.call_id,
+            "synthetic call id must be unique per broker request"
+        );
+    }
+
+    #[test]
+    fn recover_broker_single_tool_call_prefers_real_tool_calls_and_rejects_invalid() {
+        let tools = [single_submit_spec_tool()];
+        let real = NeutralToolCall {
+            call_id: "provider-call-1".to_string(),
+            name: "submit_workspace_spec_update".to_string(),
+            arguments: json!({ "updateNeeded": true, "edits": [] }),
+            thought_signatures: None,
+        };
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-1",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &tools,
+                &[real],
+                r#"{"updateNeeded":false,"edits":null}"#
+            )
+            .is_none(),
+            "real ToolCall must not be synthesized over"
+        );
+
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-2",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &[],
+                &[],
+                r#"{"updateNeeded":true}"#
+            )
+            .is_none(),
+            "zero-tool request must not synthesize"
+        );
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-3",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &[
+                    single_submit_spec_tool(),
+                    NeutralToolDefinition {
+                        name: "other_tool".to_string(),
+                        description: "other".to_string(),
+                        input_schema: json!({ "type": "object" }),
+                        strict: false,
+                    }
+                ],
+                &[],
+                r#"{"updateNeeded":true}"#
+            )
+            .is_none(),
+            "multi-tool request must not auto-select a tool"
+        );
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-4",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &tools,
+                &[],
+                "Here is JSON:\n{\"updateNeeded\":true}"
+            )
+            .is_none()
+        );
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-5",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &tools,
+                &[],
+                "{'a':1}"
+            )
+            .is_none()
+        );
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-6",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &tools,
+                &[],
+                ""
+            )
+            .is_none()
+        );
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-7",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                &tools,
+                &[],
+                "   "
+            )
+            .is_none()
+        );
+
+        // Normal chat completion must not recover even for a single tool + valid JSON.
+        assert!(
+            recover_broker_single_tool_call_from_text(
+                "broker-rpc-chat",
+                BROKER_DEFAULT_LLM_REQUEST_KIND,
+                &tools,
+                &[],
+                r#"{"updateNeeded":true,"edits":[]}"#
+            )
+            .is_none(),
+            "chat completion must not synthesize tool calls from text JSON"
+        );
+    }
+
+    #[test]
+    fn broker_retryable_completion_failure_skips_stream_incomplete_after_text_json_recovery() {
+        let tools = [single_submit_spec_tool()];
+        let text = r#"{"updateNeeded":true,"edits":[]}"#;
+
+        // Complete-only unstreamed text without recovery → stream_incomplete (legacy behavior).
+        assert_eq!(
+            broker_retryable_completion_failure(true, true, text, &[]),
+            Some((
+                "stream_incomplete",
+                "provider completed without streaming assistant text deltas"
+            ))
+        );
+
+        // After single-tool recovery, Complete-only recoverable JSON is not stream_incomplete.
+        let recovered = recover_broker_single_tool_call_from_text(
+            "broker-rpc-retryable-1",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            &tools,
+            &[],
+            text,
+        )
+        .expect("recover complete-only JSON");
+        assert_eq!(
+            broker_retryable_completion_failure(true, true, text, &[recovered.clone()]),
+            None
+        );
+
+        // Streamed text JSON (saw deltas → completed_with_unstreamed_text=false) + recovery.
+        assert_eq!(
+            broker_retryable_completion_failure(true, false, text, &[recovered]),
+            None
+        );
+
+        // Empty / non-recoverable still fails.
+        assert_eq!(
+            broker_retryable_completion_failure(true, false, "", &[]),
+            Some((
+                "empty_completion",
+                "provider completed without assistant text or tool calls"
+            ))
+        );
+        assert_eq!(
+            broker_retryable_completion_failure(true, true, "not valid json {", &[]),
+            Some((
+                "stream_incomplete",
+                "provider completed without streaming assistant text deltas"
+            ))
+        );
+
+        // Real ToolCall present: no stream_incomplete even with unstreamed Complete text.
+        let real = NeutralToolCall {
+            call_id: "call-real".to_string(),
+            name: "submit_workspace_spec_update".to_string(),
+            arguments: json!({ "updateNeeded": false, "edits": null }),
+            thought_signatures: None,
+        };
+        assert_eq!(
+            broker_retryable_completion_failure(true, true, "ignored prose", &[real]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_tool_request_accepts_synthetic_text_json_fallback_call_id() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        database
+            .update_workspace_spec_content(
+                0,
+                "# Project Spec\n\n## Purpose\n\nExisting remote spec.\n",
+            )
+            .expect("seed spec content")
+            .expect("content write");
+        database
+            .insert_chat("chat-1", "Remote chat")
+            .expect("insert chat");
+        let input_summary = json!({
+            "workspaceId": "workspace",
+            "chatId": "chat-1",
+            "currentSpecRevision": 1,
+            "userMessageId": "msg-user-1",
+            "assistantMessageId": "msg-assistant-1",
+            "runId": "run-1",
+            "codeChangeStats": null,
+            "chatExcerpt": {
+                "user": "please update remote contract",
+                "userTruncated": false,
+                "assistant": "updated remote contract",
+                "assistantTruncated": false
+            },
+            "currentSpecMarkdown": "# Project Spec\n\n## Purpose\n\nExisting remote spec.\n"
+        })
+        .to_string();
+        let job = database
+            .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+                id: "spec-update-text-json-fallback-1",
+                trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+                chat_id: Some("chat-1"),
+                run_id: Some("run-1"),
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: Some(&input_summary),
+            })
+            .expect("insert update job");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                request.payload.get("requestKind").and_then(Value::as_str),
+                Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE)
+            );
+            // Simulate broker response after text-JSON recovery (per-request synthetic call id).
+            let request_id = request.id.clone().expect("broker request id");
+            let synthetic_call_id = broker_text_json_fallback_call_id(&request_id);
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id.clone()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "toolCalls": [{
+                        "callId": synthetic_call_id,
+                        "name": "submit_workspace_spec_update",
+                        "arguments": {
+                            "updateNeeded": true,
+                            "edits": [{
+                                "oldText": "Existing remote spec.",
+                                "newText": "Updated via text JSON fallback."
+                            }]
+                        }
+                    }],
+                    "usage": null,
+                    "llmRequestId": request_id.clone(),
+                    "text": "{\"updateNeeded\":true,\"edits\":[{\"oldText\":\"Existing remote spec.\",\"newText\":\"Updated via text JSON fallback.\"}]}",
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let tx = broker_pending
+                .lock()
+                .await
+                .remove(&request_id)
+                .expect("pending broker receiver");
+            tx.send(response).expect("send broker response");
+        });
+
+        wake_remote_sidecar_spec_runner(&state);
+        wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "completed").await;
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let spec = database
+            .workspace_spec()
+            .expect("read spec")
+            .expect("spec row");
+        assert!(
+            spec.content_markdown
+                .contains("Updated via text JSON fallback."),
+            "sidecar must apply arguments from synthetic text-JSON fallback tool call"
+        );
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_tool_request_fails_without_tool_calls_for_invalid_text() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        fs::write(workspace.path().join("README.md"), "# remote demo\n").expect("readme");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .upsert_workspace_spec_settings(true, true)
+            .expect("enable spec");
+        database
+            .update_workspace_spec_content(0, "# Project Spec\n\n## Purpose\n\nSeed.\n")
+            .expect("seed spec content")
+            .expect("content write");
+        database
+            .insert_chat("chat-1", "Remote chat")
+            .expect("insert chat");
+        let input_summary = json!({
+            "workspaceId": "workspace",
+            "chatId": "chat-1",
+            "currentSpecRevision": 1,
+            "userMessageId": "msg-user-1",
+            "assistantMessageId": "msg-assistant-1",
+            "runId": "run-1",
+            "codeChangeStats": null,
+            "chatExcerpt": {
+                "user": "no tool",
+                "userTruncated": false,
+                "assistant": "no tool",
+                "assistantTruncated": false
+            },
+            "currentSpecMarkdown": "# Project Spec\n\n## Purpose\n\nSeed.\n"
+        })
+        .to_string();
+        let job = database
+            .insert_workspace_spec_job(foco_store::workspace::NewWorkspaceSpecJob {
+                id: "spec-update-no-tool-calls-1",
+                trigger_type: WorkspaceSpecTriggerType::ChatCompleted.as_str(),
+                chat_id: Some("chat-1"),
+                run_id: Some("run-1"),
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: Some(&input_summary),
+            })
+            .expect("insert update job");
+        drop(database);
+
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        *state.runtime_config.lock().expect("runtime config") =
+            Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
+
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            let request_id = request.id.clone().expect("broker request id");
+            // Empty toolCalls: broker did not recover (invalid/prose text). Sidecar must fail.
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id.clone()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "toolCalls": [],
+                    "usage": null,
+                    "llmRequestId": request_id.clone(),
+                    "text": "Here is some prose without a tool call.",
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let tx = broker_pending
+                .lock()
+                .await
+                .remove(&request_id)
+                .expect("pending broker receiver");
+            tx.send(response).expect("send broker response");
+        });
+
+        wake_remote_sidecar_spec_runner(&state);
+        let failed = wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "failed").await;
+        assert!(
+            failed
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("submit_workspace_spec_update")),
+            "empty toolCalls must fail with missing tool-call error, got {:?}",
+            failed.error_message
+        );
+        broker_task.await.expect("broker task");
+    }
+
+    /// mock provider → broker_llm_stream: streamed text JSON for a single-tool internal
+    /// request recovers toolCalls; audit keeps original provider wire text (not synthetic ToolCall).
+    #[tokio::test]
+    async fn broker_control_llm_stream_recovers_streamed_text_json_for_single_tool_and_preserves_wire_audit()
+     {
+        let json_text =
+            r#"{"updateNeeded":true,"edits":[{"oldText":"a","newText":"recovered-via-broker"}]}"#;
+        let escaped = json_text.replace('\\', "\\\\").replace('"', "\\\"");
+        let sse_body = format!(
+            concat!(
+                "data: {{\"id\":\"broker-text-json\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n",
+                "data: {{\"id\":\"broker-text-json\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":9,\"completion_tokens\":5}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            content = escaped
+        );
+        let (broker_response, audit_row, response_wire) =
+            run_broker_control_llm_stream_text_json_fixture(
+                "broker-request-text-json-streamed",
+                LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+                vec![single_submit_spec_tool()],
+                sse_body,
+            )
+            .await;
+
+        assert_eq!(broker_response.payload["status"], "ok");
+        assert_eq!(
+            broker_response.payload["llmRequestId"],
+            "broker-request-text-json-streamed"
+        );
+        assert_eq!(broker_response.payload["text"], json_text);
+        let tool_calls = broker_response.payload["toolCalls"]
+            .as_array()
+            .expect("recovered toolCalls array");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(
+            tool_calls[0]["callId"],
+            broker_text_json_fallback_call_id("broker-request-text-json-streamed")
+        );
+        assert_eq!(tool_calls[0]["name"], "submit_workspace_spec_update");
+        assert_eq!(
+            tool_calls[0]["arguments"]["edits"][0]["newText"],
+            "recovered-via-broker"
+        );
+
+        assert_eq!(audit_row.final_state, "succeeded");
+        assert_eq!(
+            audit_row.request_kind,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE
+        );
+        assert_eq!(response_wire["format"], "provider_final_response_v1");
+        assert_eq!(response_wire["state"], "succeeded");
+        // Audit is capture-sourced: original provider text, not a synthesized ToolCall dump.
+        assert_eq!(response_wire["text"], json_text);
+        let response_dump = response_wire.to_string();
+        assert!(
+            !response_dump.contains("foco-text-json-fallback:"),
+            "audit response_body_json must not embed synthetic call ids as provider wire"
+        );
+        assert!(
+            !response_dump.contains("submit_workspace_spec_update")
+                || response_wire["text"]
+                    .as_str()
+                    .is_some_and(|text| !text.contains("submit_workspace_spec_update")),
+            "provider wire text remains plain JSON arguments"
+        );
+    }
+
+    /// Complete-only / non-SSE fixture: when the adapter yields End text without streamed tool
+    /// calls, recovery should produce toolCalls and succeeded audit. If the OpenAI stream client
+    /// rejects non-SSE bodies, this test soft-passes; unit tests lock the
+    /// `completed_with_unstreamed_text` + recovery classification path.
+    #[tokio::test]
+    async fn broker_control_llm_stream_recovers_complete_only_text_json_without_stream_incomplete()
+    {
+        let json_text = r#"{"updateNeeded":false,"edits":null}"#;
+        // Non-streaming OpenAI chat completion body: no SSE deltas.
+        let body = format!(
+            r#"{{"id":"broker-complete-only","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":{content}}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":4,"completion_tokens":3}}}}"#,
+            content = serde_json::to_string(json_text).expect("escape content")
+        );
+        let outcome = run_broker_control_llm_stream_text_json_fixture_with_content_type(
+            "broker-request-text-json-complete-only",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            vec![single_submit_spec_tool()],
+            body,
+            "application/json",
+        )
+        .await;
+
+        match outcome {
+            Ok((broker_response, audit_row, response_wire))
+                if broker_response.message_type == "response"
+                    && broker_response
+                        .payload
+                        .get("status")
+                        .and_then(Value::as_str)
+                        == Some("ok") =>
+            {
+                let tool_calls = broker_response.payload["toolCalls"]
+                    .as_array()
+                    .expect("recovered toolCalls");
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(
+                    tool_calls[0]["callId"],
+                    broker_text_json_fallback_call_id("broker-request-text-json-complete-only")
+                );
+                assert_eq!(tool_calls[0]["arguments"]["updateNeeded"], false);
+                assert_eq!(audit_row.final_state, "succeeded");
+                assert_eq!(response_wire["format"], "provider_final_response_v1");
+                let response_dump = response_wire.to_string();
+                assert!(
+                    !response_dump.contains("foco-text-json-fallback:"),
+                    "audit response_body_json must not embed synthetic call ids as provider wire"
+                );
+            }
+            Ok((broker_response, audit_row, _)) => {
+                eprintln!(
+                    "complete-only non-SSE fixture not recovered (message_type={}, status={:?}, audit={}); \
+                     unit tests cover stream_incomplete skip after recovery",
+                    broker_response.message_type,
+                    broker_response.payload.get("status"),
+                    audit_row.final_state
+                );
+            }
+            Err(message) => {
+                eprintln!(
+                    "complete-only non-SSE fixture unsupported by provider adapter ({message}); \
+                     unit tests cover stream_incomplete skip after recovery"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn broker_control_llm_stream_does_not_recover_text_json_for_multi_tool_or_chat_completion()
+     {
+        let json_text = r#"{"updateNeeded":true,"edits":[]}"#;
+        let escaped = json_text.replace('\\', "\\\\").replace('"', "\\\"");
+        let sse_body = format!(
+            concat!(
+                "data: {{\"id\":\"broker-no-recover\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n",
+                "data: {{\"id\":\"broker-no-recover\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":3,\"completion_tokens\":2}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            content = escaped
+        );
+
+        // Multi-tool structured request: must not auto-select a tool.
+        let multi_tools = vec![
+            single_submit_spec_tool(),
+            NeutralToolDefinition {
+                name: "other_tool".to_string(),
+                description: "other".to_string(),
+                input_schema: json!({ "type": "object" }),
+                strict: false,
+            },
+        ];
+        let (multi_response, multi_audit, _) = run_broker_control_llm_stream_text_json_fixture(
+            "broker-request-text-json-multi",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            multi_tools,
+            sse_body.clone(),
+        )
+        .await;
+        assert_eq!(multi_response.payload["status"], "ok");
+        assert_eq!(
+            multi_response.payload["toolCalls"]
+                .as_array()
+                .map(|calls| calls.len())
+                .unwrap_or(0),
+            0,
+            "multi-tool request must not synthesize a tool call from text"
+        );
+        assert_eq!(multi_audit.final_state, "succeeded");
+
+        // Single tool but chat completion: gated off (does not synthesize).
+        let (chat_response, chat_audit, _) = run_broker_control_llm_stream_text_json_fixture(
+            "broker-request-text-json-chat",
+            BROKER_DEFAULT_LLM_REQUEST_KIND,
+            vec![single_submit_spec_tool()],
+            sse_body,
+        )
+        .await;
+        assert_eq!(chat_response.payload["status"], "ok");
+        assert_eq!(
+            chat_response.payload["toolCalls"]
+                .as_array()
+                .map(|calls| calls.len())
+                .unwrap_or(0),
+            0,
+            "chat completion must not synthesize tool calls from text JSON"
+        );
+        assert_eq!(chat_audit.final_state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn broker_control_llm_stream_does_not_recover_invalid_streamed_prose() {
+        let prose = "Here is prose without a tool call.";
+        let escaped = prose.replace('\\', "\\\\").replace('"', "\\\"");
+        let sse_body = format!(
+            concat!(
+                "data: {{\"id\":\"broker-invalid-prose\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{content}\"}}}}]}}\n\n",
+                "data: {{\"id\":\"broker-invalid-prose\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":2,\"completion_tokens\":1}}}}\n\n",
+                "data: [DONE]\n\n"
+            ),
+            content = escaped
+        );
+        let (response, audit_row, _) = run_broker_control_llm_stream_text_json_fixture(
+            "broker-request-text-json-invalid-prose",
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            vec![single_submit_spec_tool()],
+            sse_body,
+        )
+        .await;
+        assert_eq!(response.payload["status"], "ok");
+        assert_eq!(
+            response.payload["toolCalls"]
+                .as_array()
+                .map(|calls| calls.len())
+                .unwrap_or(0),
+            0,
+            "invalid/prose text must not synthesize a tool call"
+        );
+        assert_eq!(response.payload["text"], prose);
+        assert_eq!(audit_row.final_state, "succeeded");
+    }
+
+    async fn run_broker_control_llm_stream_text_json_fixture(
+        broker_request_id: &str,
+        request_kind: &str,
+        tools: Vec<NeutralToolDefinition>,
+        sse_body: String,
+    ) -> (
+        ControlEnvelope,
+        foco_store::workspace::LlmRequestRecord,
+        Value,
+    ) {
+        run_broker_control_llm_stream_text_json_fixture_with_content_type(
+            broker_request_id,
+            request_kind,
+            tools,
+            sse_body,
+            "text/event-stream",
+        )
+        .await
+        .expect("broker control llm.stream fixture")
+    }
+
+    async fn run_broker_control_llm_stream_text_json_fixture_with_content_type(
+        broker_request_id: &str,
+        request_kind: &str,
+        tools: Vec<NeutralToolDefinition>,
+        response_body: String,
+        content_type: &'static str,
+    ) -> Result<
+        (
+            ControlEnvelope,
+            foco_store::workspace::LlmRequestRecord,
+            Value,
+        ),
+        String,
+    > {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let response_body = Arc::new(response_body);
+        let content_type = content_type.to_string();
+        let provider_app = Router::new().route(
+            "/v1/chat/completions",
+            post({
+                let response_body = response_body.clone();
+                let content_type = content_type.clone();
+                move || {
+                    let response_body = response_body.clone();
+                    let content_type = content_type.clone();
+                    async move {
+                        let mut response = axum::response::Response::new(axum::body::Body::from(
+                            response_body.to_string(),
+                        ));
+                        response.headers_mut().insert(
+                            header::CONTENT_TYPE,
+                            header::HeaderValue::from_str(&content_type)
+                                .expect("content type header"),
+                        );
+                        response
+                    }
+                }
+            }),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: "/remote/project".to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_CHAT_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        let provider_request = NeutralChatRequest {
+            model_id: "model-1".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Return tool arguments as JSON text.".to_string(),
+            )],
+            tools,
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+        };
+        let broker_payload = json!({
+            "workspaceId": workspace_id,
+            "chatId": "chat-text-json-fallback",
+            "chatTitle": "Text JSON fallback",
+            "providerId": "provider-1",
+            "modelId": "model-1",
+            "requestKind": request_kind,
+            "request": provider_request,
+        });
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_request_id = broker_request_id.to_string();
+        let control_task = tokio::spawn(async move {
+            let (stream, _) = control_listener
+                .accept()
+                .await
+                .expect("accept control connection");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept control websocket");
+            let config_message = timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("config sync timeout")
+                .expect("config sync message")
+                .expect("config sync websocket result");
+            let tungstenite::Message::Text(config_text) = config_message else {
+                panic!("expected config sync text frame");
+            };
+            let config_envelope: ControlEnvelope =
+                serde_json::from_str(config_text.as_str()).expect("config sync envelope");
+            assert_eq!(config_envelope.message_type, "config");
+            let config_id = config_envelope.id.expect("config sync id");
+            let config_response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(config_id),
+                method: None,
+                payload: json!({ "status": "ok" }),
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&config_response)
+                        .expect("serialize config response")
+                        .into(),
+                ))
+                .await
+                .expect("send config response");
+            let request = ControlEnvelope {
+                version: 1,
+                message_type: "request".to_string(),
+                id: Some(control_request_id.clone()),
+                method: Some("llm.stream".to_string()),
+                payload: broker_payload,
+                timestamp: None,
+            };
+            socket
+                .send(tungstenite::Message::Text(
+                    serde_json::to_string(&request)
+                        .expect("serialize broker request")
+                        .into(),
+                ))
+                .await
+                .expect("send broker request");
+
+            loop {
+                let message = timeout(Duration::from_secs(8), socket.next())
+                    .await
+                    .expect("broker response timeout")
+                    .expect("broker response message")
+                    .expect("broker response websocket result");
+                let tungstenite::Message::Text(text) = message else {
+                    continue;
+                };
+                let envelope: ControlEnvelope =
+                    serde_json::from_str(text.as_str()).expect("broker response envelope");
+                if envelope.id.as_deref() != Some(control_request_id.as_str()) {
+                    continue;
+                }
+                match envelope.message_type.as_str() {
+                    "response" | "error" => return envelope,
+                    _ => {}
+                }
+            }
+        });
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .map_err(|error| format!("connect control ws: {}", error.message()))?;
+        let broker_response = timeout(Duration::from_secs(10), control_task)
+            .await
+            .map_err(|_| "control fixture completion timeout".to_string())?
+            .map_err(|error| format!("control fixture task: {error}"))?;
+        connection_task.abort();
+        let _ = connection_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        let database = WorkspaceDatabase::open_or_create(&audit_path).expect("audit database");
+        let request = database
+            .llm_request(broker_request_id)
+            .expect("broker audit lookup")
+            .ok_or_else(|| "missing broker audit row".to_string())?;
+        let response_wire: Value = match request.response_body_json.as_deref() {
+            Some(body) => serde_json::from_str(body).expect("provider response wire JSON"),
+            None => json!(null),
+        };
+        Ok((broker_response, request, response_wire))
     }
 
     #[test]
