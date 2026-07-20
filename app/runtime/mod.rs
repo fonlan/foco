@@ -20,7 +20,7 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
-    validate_agent_snapshot_for_workspace,
+    reconcile_running_llm_request_audits_on_startup, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use agent_scheduler::{

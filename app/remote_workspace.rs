@@ -2719,6 +2719,19 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         broker_tx,
         shutdown_tx: shutdown_tx.clone(),
     };
+    let reconciled_llm_requests = {
+        let mut database =
+            WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(&state))?;
+        database.reconcile_running_llm_requests_on_startup()?
+    };
+    if reconciled_llm_requests > 0 {
+        tracing::warn!(
+            workspace_id = %state.workspace_id,
+            reconciled_llm_requests,
+            reason = "backend_restart_interrupted",
+            "reconciled running LLM request audits when the remote sidecar started"
+        );
+    }
 
     let heartbeat_state = state.clone();
     let shutdown_state = state.clone();
@@ -5691,7 +5704,7 @@ impl BrokerLlmAuditWriter {
                     normalized_event_json: &normalized_event_json[index],
                 })
                 .collect::<Vec<_>>();
-            database.update_llm_request_outcome_with_events(
+            database.finalize_llm_request_outcome_with_events(
                 &self.context.request_id,
                 UpdateLlmRequestOutcome {
                     first_token_at: outcome.first_token_at,

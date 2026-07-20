@@ -2069,6 +2069,7 @@ fn captured_test_llm_request(
             final_state: "succeeded",
             response_body_json: None,
         },
+        terminal_persisted: false,
     }
 }
 
@@ -17093,6 +17094,7 @@ fn persist_chat_result_writes_cancelled_captured_llm_request_with_details(save_d
                 r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#.to_string(),
             ),
         },
+        terminal_persisted: false,
     });
     let capture = ProviderAuditCapture::new(&workspace_dir, "llm-cancelled", save_details);
     context.capture_cancelled_llm_request(

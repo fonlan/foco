@@ -1283,6 +1283,48 @@ async fn llm_context_compression_summary(
     }
 }
 
+fn captured_context_compression_request_body(
+    context: &PreparedChatContext,
+    capture: &ProviderAuditCapture,
+    request_id: &str,
+) -> String {
+    match capture.captured_request_json() {
+        Ok(request_body_json) => request_body_json.unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %context.workspace_id,
+                request_id,
+                request_kind = "contextCompression",
+                error_category = "llm_audit_request_wire_read_failed",
+                error = %error.message,
+                "failed to read provider request wire before terminal LLM audit"
+            );
+            String::new()
+        }
+    }
+}
+
+fn best_effort_context_compression_audit_detail(
+    context: &PreparedChatContext,
+    request_id: &str,
+    result: Result<Option<String>, ApiError>,
+) -> Option<String> {
+    match result {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %context.workspace_id,
+                request_id,
+                request_kind = "contextCompression",
+                error_category = "llm_audit_detail_capture_failed",
+                error = %error.message,
+                "failed to capture provider audit detail; finalizing LLM request without it"
+            );
+            None
+        }
+    }
+}
+
 async fn llm_context_compression_summary_once(
     context: &mut PreparedChatContext,
     checkpoint_messages: &[NeutralChatMessage],
@@ -1341,12 +1383,25 @@ async fn llm_context_compression_summary_once(
     {
         Ok(Ok(stream)) => stream,
         Ok(Err(source)) => {
-            capture.persist_request_failure(&source)?;
+            if let Err(error) = capture.persist_request_failure(&source) {
+                tracing::warn!(
+                    workspace_id = %context.workspace_id,
+                    request_id = %request_id,
+                    request_kind = "contextCompression",
+                    error_category = "llm_audit_request_wire_write_failed",
+                    error = %error.message,
+                    "failed to persist provider request wire before terminal LLM audit"
+                );
+            }
             let message = source.to_string();
-            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-            let response_body_json =
-                capture.failed_response_json(message.clone(), source.status_code(), false)?;
-            context.captured_llm_requests.push(CapturedLlmRequest {
+            let request_body_json =
+                captured_context_compression_request_body(context, &capture, &request_id);
+            let response_body_json = best_effort_context_compression_audit_detail(
+                context,
+                &request_id,
+                capture.failed_response_json(message.clone(), source.status_code(), false),
+            );
+            context.record_finished_llm_request(CapturedLlmRequest {
                 id: request_id,
                 request_kind: "contextCompression",
                 request_started_at,
@@ -1360,6 +1415,7 @@ async fn llm_context_compression_summary_once(
                         source.status_code().map(i64::from),
                     )
                 },
+                terminal_persisted: false,
             });
             return Err(ApiError::internal(message));
         }
@@ -1367,9 +1423,14 @@ async fn llm_context_compression_summary_once(
             let message = format!(
                 "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
             );
-            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-            let response_body_json = capture.failed_response_json(message.clone(), None, false)?;
-            context.captured_llm_requests.push(CapturedLlmRequest {
+            let request_body_json =
+                captured_context_compression_request_body(context, &capture, &request_id);
+            let response_body_json = best_effort_context_compression_audit_detail(
+                context,
+                &request_id,
+                capture.failed_response_json(message.clone(), None, false),
+            );
+            context.record_finished_llm_request(CapturedLlmRequest {
                 id: request_id,
                 request_kind: "contextCompression",
                 request_started_at,
@@ -1379,6 +1440,7 @@ async fn llm_context_compression_summary_once(
                     response_body_json,
                     ..failed_provider_audit_outcome(started_at, &message, None)
                 },
+                terminal_persisted: false,
             });
             return Err(ApiError::internal(message));
         }
@@ -1400,10 +1462,14 @@ async fn llm_context_compression_summary_once(
                 let message = format!(
                     "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
                 );
-                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-                let response_body_json =
-                    capture.failed_response_json(message.clone(), None, true)?;
-                context.captured_llm_requests.push(CapturedLlmRequest {
+                let request_body_json =
+                    captured_context_compression_request_body(context, &capture, &request_id);
+                let response_body_json = best_effort_context_compression_audit_detail(
+                    context,
+                    &request_id,
+                    capture.failed_response_json(message.clone(), None, true),
+                );
+                context.record_finished_llm_request(CapturedLlmRequest {
                     id: request_id,
                     request_kind: "contextCompression",
                     request_started_at,
@@ -1413,15 +1479,21 @@ async fn llm_context_compression_summary_once(
                         response_body_json,
                         ..failed_provider_audit_outcome(started_at, &message, None)
                     },
+                    terminal_persisted: false,
                 });
                 return Err(ApiError::internal(message));
             }
         };
         let Some(event_result) = event_result else {
             let message = "context compression summary stream ended without a completion event";
-            let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-            let response_body_json = capture.failed_response_json(message, None, true)?;
-            context.captured_llm_requests.push(CapturedLlmRequest {
+            let request_body_json =
+                captured_context_compression_request_body(context, &capture, &request_id);
+            let response_body_json = best_effort_context_compression_audit_detail(
+                context,
+                &request_id,
+                capture.failed_response_json(message, None, true),
+            );
+            context.record_finished_llm_request(CapturedLlmRequest {
                 id: request_id,
                 request_kind: "contextCompression",
                 request_started_at,
@@ -1431,6 +1503,7 @@ async fn llm_context_compression_summary_once(
                     response_body_json,
                     ..failed_provider_audit_outcome(started_at, message, None)
                 },
+                terminal_persisted: false,
             });
             return Err(ApiError::internal(message));
         };
@@ -1438,16 +1511,21 @@ async fn llm_context_compression_summary_once(
             Ok(event) => event,
             Err(source) => {
                 let message = source.to_string();
-                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-                let response_body_json =
-                    capture
-                        .response_json(stream.final_response_dump())?
-                        .or(capture.failed_response_json(
-                            message.clone(),
-                            source.status_code(),
-                            true,
-                        )?);
-                context.captured_llm_requests.push(CapturedLlmRequest {
+                let request_body_json =
+                    captured_context_compression_request_body(context, &capture, &request_id);
+                let response_body_json = best_effort_context_compression_audit_detail(
+                    context,
+                    &request_id,
+                    capture.response_json(stream.final_response_dump()),
+                )
+                .or_else(|| {
+                    best_effort_context_compression_audit_detail(
+                        context,
+                        &request_id,
+                        capture.failed_response_json(message.clone(), source.status_code(), true),
+                    )
+                });
+                context.record_finished_llm_request(CapturedLlmRequest {
                     id: request_id,
                     request_kind: "contextCompression",
                     request_started_at,
@@ -1461,6 +1539,7 @@ async fn llm_context_compression_summary_once(
                             source.status_code().map(i64::from),
                         )
                     },
+                    terminal_persisted: false,
                 });
                 return Err(ApiError::internal(message));
             }
@@ -1485,10 +1564,14 @@ async fn llm_context_compression_summary_once(
                     "context compression summary called unsupported tool '{}'",
                     tool_call.name
                 );
-                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-                let response_body_json =
-                    capture.failed_response_json(message.clone(), None, true)?;
-                context.captured_llm_requests.push(CapturedLlmRequest {
+                let request_body_json =
+                    captured_context_compression_request_body(context, &capture, &request_id);
+                let response_body_json = best_effort_context_compression_audit_detail(
+                    context,
+                    &request_id,
+                    capture.failed_response_json(message.clone(), None, true),
+                );
+                context.record_finished_llm_request(CapturedLlmRequest {
                     id: request_id,
                     request_kind: "contextCompression",
                     request_started_at,
@@ -1498,6 +1581,7 @@ async fn llm_context_compression_summary_once(
                         response_body_json,
                         ..failed_provider_audit_outcome(started_at, &message, None)
                     },
+                    terminal_persisted: false,
                 });
                 return Err(ApiError::internal(message));
             }
@@ -1512,11 +1596,21 @@ async fn llm_context_compression_summary_once(
             }
             NeutralChatStreamEvent::Error { message } => {
                 let message = format!("context compression summary stream error: {message}");
-                let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-                let response_body_json = capture
-                    .response_json(stream.final_response_dump())?
-                    .or(capture.failed_response_json(message.clone(), None, true)?);
-                context.captured_llm_requests.push(CapturedLlmRequest {
+                let request_body_json =
+                    captured_context_compression_request_body(context, &capture, &request_id);
+                let response_body_json = best_effort_context_compression_audit_detail(
+                    context,
+                    &request_id,
+                    capture.response_json(stream.final_response_dump()),
+                )
+                .or_else(|| {
+                    best_effort_context_compression_audit_detail(
+                        context,
+                        &request_id,
+                        capture.failed_response_json(message.clone(), None, true),
+                    )
+                });
+                context.record_finished_llm_request(CapturedLlmRequest {
                     id: request_id,
                     request_kind: "contextCompression",
                     request_started_at,
@@ -1526,6 +1620,7 @@ async fn llm_context_compression_summary_once(
                         response_body_json,
                         ..failed_provider_audit_outcome(started_at, &message, None)
                     },
+                    terminal_persisted: false,
                 });
                 return Err(ApiError::internal(message));
             }
@@ -1535,9 +1630,14 @@ async fn llm_context_compression_summary_once(
     let summary = output_text.trim().to_string();
     if summary.is_empty() {
         let message = "context compression summary returned empty text";
-        let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-        let response_body_json = capture.failed_response_json(message, None, false)?;
-        context.captured_llm_requests.push(CapturedLlmRequest {
+        let request_body_json =
+            captured_context_compression_request_body(context, &capture, &request_id);
+        let response_body_json = best_effort_context_compression_audit_detail(
+            context,
+            &request_id,
+            capture.failed_response_json(message, None, false),
+        );
+        context.record_finished_llm_request(CapturedLlmRequest {
             id: request_id,
             request_kind: "contextCompression",
             request_started_at,
@@ -1547,12 +1647,18 @@ async fn llm_context_compression_summary_once(
                 response_body_json,
                 ..failed_provider_audit_outcome(started_at, message, None)
             },
+            terminal_persisted: false,
         });
         return Err(ApiError::internal(message));
     }
-    let request_body_json = capture.captured_request_json()?.unwrap_or_default();
-    let response_body_json = capture.response_json(stream.final_response_dump())?;
-    context.captured_llm_requests.push(CapturedLlmRequest {
+    let request_body_json =
+        captured_context_compression_request_body(context, &capture, &request_id);
+    let response_body_json = best_effort_context_compression_audit_detail(
+        context,
+        &request_id,
+        capture.response_json(stream.final_response_dump()),
+    );
+    context.record_finished_llm_request(CapturedLlmRequest {
         id: request_id,
         request_kind: "contextCompression",
         request_started_at,
@@ -1578,6 +1684,7 @@ async fn llm_context_compression_summary_once(
             final_state: "succeeded",
             response_body_json,
         },
+        terminal_persisted: false,
     });
 
     Ok(summary)
@@ -2725,9 +2832,18 @@ pub(crate) fn persist_chat_result(
                 .map_err(ApiError::from_workspace_error)?;
         }
     } else {
-        for llm_request in &context.captured_llm_requests {
+        // Terminal writes normally happen at every provider request boundary. Retrying here is
+        // limited to a failed boundary write so it is both visible to the caller and does not
+        // turn chat completion back into the normal audit-finalization point.
+        for llm_request in context
+            .captured_llm_requests
+            .iter()
+            .filter(|request| !request.terminal_persisted)
+        {
             persist_llm_request(&mut database, context, llm_request)?;
-            if !current_history_run {
+        }
+        if !current_history_run {
+            for llm_request in &context.captured_llm_requests {
                 database
                     .invalidate_llm_request(&llm_request.id, "chat history was rewritten")
                     .map_err(ApiError::from_workspace_error)?;
@@ -3026,8 +3142,31 @@ fn persist_llm_request(
         .map_err(ApiError::from_workspace_error)?
         .is_some()
     {
+        let compact_events = compact_audit_events(&request.events, save_details);
+        let event_ids = compact_events
+            .iter()
+            .map(|(sequence, _)| format!("{}-event-{sequence}", request.id))
+            .collect::<Vec<_>>();
+        let audit_events = compact_events
+            .iter()
+            .enumerate()
+            .map(|(index, (sequence, event))| {
+                let sequence = i64::try_from(*sequence).map_err(|_| {
+                    ApiError::internal("too many LLM request events to fit SQLite sequence")
+                })?;
+                Ok(NewLlmRequestEvent {
+                    id: &event_ids[index],
+                    llm_request_id: &request.id,
+                    sequence,
+                    event_at: &event.event_at,
+                    event_type: &event.event_type,
+                    raw_chunk_json: None,
+                    normalized_event_json: &event.normalized_event_json,
+                })
+            })
+            .collect::<Result<Vec<_>, ApiError>>()?;
         database
-            .update_llm_request_outcome(
+            .finalize_llm_request_outcome_with_events(
                 &request.id,
                 UpdateLlmRequestOutcome {
                     first_token_at: request.outcome.first_token_at.as_deref(),
@@ -3051,18 +3190,9 @@ fn persist_llm_request(
                         },
                     ),
                 },
+                &audit_events,
             )
-            .map_err(ApiError::from_workspace_error)?;
-        let next_sequence = database
-            .llm_request_event_next_sequence(&request.id)
-            .map_err(ApiError::from_workspace_error)?;
-        persist_llm_request_events(
-            database,
-            &request.id,
-            &request.events,
-            next_sequence,
-            save_details,
-        )
+            .map_err(ApiError::from_workspace_error)
     } else {
         database
             .insert_llm_request(NewLlmRequest {

@@ -9193,6 +9193,130 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))
     }
 
+    /// Finalizes a running LLM audit exactly once while atomically appending its events.
+    ///
+    /// Provider request boundaries may retry this operation after an ambiguous database
+    /// failure. Once another attempt has already made the request terminal, this method
+    /// preserves that terminal snapshot and only applies idempotent event inserts.
+    pub fn finalize_llm_request_outcome_with_events(
+        &mut self,
+        id: &str,
+        outcome: UpdateLlmRequestOutcome<'_>,
+        events: &[NewLlmRequestEvent<'_>],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let cache_ratio = validate_llm_request_outcome(&outcome)?;
+        let prepared_events = events
+            .iter()
+            .map(prepare_llm_request_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        finalize_llm_request_outcome_in_transaction(
+            &transaction,
+            &database_path,
+            id,
+            &outcome,
+            cache_ratio,
+        )?;
+        for event in &prepared_events {
+            insert_prepared_llm_request_event(&transaction, &database_path, event)?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))
+    }
+
+    /// Closes audits that were running when a previous Foco process exited.
+    ///
+    /// This is intentionally a startup-only operation: callers must invoke it before
+    /// accepting new provider work for this workspace so a live request is never
+    /// mistaken for an orphan from the prior process.
+    pub fn reconcile_running_llm_requests_on_startup(
+        &mut self,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        let completed_at = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let request_ids = {
+            let mut statement = transaction
+                .prepare("SELECT id FROM llm_requests WHERE final_state = 'running' ORDER BY id")
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            collect_rows(rows, &database_path)?
+        };
+
+        for request_id in &request_ids {
+            let request = select_llm_request_record(&transaction, request_id)
+                .map_err(|source| sqlite_error(&database_path, source))?
+                .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest {
+                    id: request_id.clone(),
+                })?;
+            let sequence: i64 = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), -1) + 1
+                     FROM llm_request_events
+                     WHERE llm_request_id = ?1",
+                    params![request_id],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let reason = "backend restarted while LLM request was active";
+            let event_id = format!("{request_id}-restart-{sequence}");
+            let event_json = json!({
+                "type": "error",
+                "reason": "backend_restart_interrupted",
+                "message": reason,
+            })
+            .to_string();
+            let event = NewLlmRequestEvent {
+                id: &event_id,
+                llm_request_id: request_id,
+                sequence,
+                event_at: &completed_at,
+                event_type: "error",
+                raw_chunk_json: None,
+                normalized_event_json: &event_json,
+            };
+            let outcome = UpdateLlmRequestOutcome {
+                first_token_at: request.first_token_at.as_deref(),
+                completed_at: Some(&completed_at),
+                input_tokens: request.input_tokens,
+                output_tokens: request.output_tokens,
+                cache_read_tokens: request.cache_read_tokens,
+                cache_write_tokens: request.cache_write_tokens,
+                reasoning_tokens: request.reasoning_tokens,
+                first_token_latency_ms: request.first_token_latency_ms,
+                total_latency_ms: request.total_latency_ms.or(Some(0)),
+                status_code: request.status_code,
+                final_state: "failed",
+                response_body_json: None,
+            };
+            let cache_ratio = validate_llm_request_outcome(&outcome)?;
+            update_llm_request_outcome_in_transaction(
+                &transaction,
+                &database_path,
+                request_id,
+                &outcome,
+                cache_ratio,
+            )?;
+            let prepared_event = prepare_llm_request_event(&event)?;
+            insert_prepared_llm_request_event(&transaction, &database_path, &prepared_event)?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(request_ids.len())
+    }
+
     pub fn rebuild_llm_request_usage_rollups(&mut self) -> Result<(), WorkspaceDatabaseError> {
         let database_path = self.database_path.clone();
         let transaction = self
@@ -18344,9 +18468,47 @@ fn update_llm_request_outcome_in_transaction(
     outcome: &UpdateLlmRequestOutcome<'_>,
     cache_ratio: Option<f64>,
 ) -> Result<(), WorkspaceDatabaseError> {
+    update_llm_request_outcome_in_transaction_with_mode(
+        transaction,
+        database_path,
+        id,
+        outcome,
+        cache_ratio,
+        false,
+    )
+}
+
+fn finalize_llm_request_outcome_in_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+    outcome: &UpdateLlmRequestOutcome<'_>,
+    cache_ratio: Option<f64>,
+) -> Result<(), WorkspaceDatabaseError> {
+    update_llm_request_outcome_in_transaction_with_mode(
+        transaction,
+        database_path,
+        id,
+        outcome,
+        cache_ratio,
+        true,
+    )
+}
+
+fn update_llm_request_outcome_in_transaction_with_mode(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    id: &str,
+    outcome: &UpdateLlmRequestOutcome<'_>,
+    cache_ratio: Option<f64>,
+    only_if_running: bool,
+) -> Result<(), WorkspaceDatabaseError> {
     let old_request = select_llm_request_record(transaction, id)
         .map_err(|source| sqlite_error(database_path, source))?
         .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
+    if only_if_running && old_request.final_state != "running" {
+        return Ok(());
+    }
     let response_body_json = merge_audit_detail_for_update(
         old_request.response_body_json.as_deref(),
         outcome.response_body_json,

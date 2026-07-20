@@ -14,14 +14,14 @@ use foco_providers::{
     NeutralChatStreamEvent, NeutralUsage, ProviderConnectionConfig,
     stream_chat_with_capture_observer,
 };
+#[cfg(test)]
+use foco_store::workspace::WorkspaceDatabase;
 use foco_store::{
     config::{
         HOOK_HANDLER_COMMAND, HOOK_HANDLER_HTTP, HOOK_HANDLER_MCP_TOOL, HOOK_HANDLER_PROMPT,
         HookConfig, HookHandler, load_workspace_hook_config,
     },
-    workspace::{
-        NewHookRun, NewLlmRequest, NewLlmRequestEvent, UpdateLlmRequestOutcome, WorkspaceDatabase,
-    },
+    workspace::{NewHookRun, NewLlmRequest, NewLlmRequestEvent, UpdateLlmRequestOutcome},
 };
 use regex::Regex;
 use serde::Serialize;
@@ -786,7 +786,7 @@ async fn run_prompt_hook_attempt(
         .await
         .map_err(|_| format!("prompt hook timed out after {timeout_ms} ms"))
         .map_err(|message| {
-            let _ = audited_stream.fail(&message);
+            audited_stream.fail_with_diagnostic(&message);
             message
         })?
         else {
@@ -795,7 +795,7 @@ async fn run_prompt_hook_attempt(
         let event = event
             .map_err(|source| format!("prompt hook stream failed: {source}"))
             .map_err(|message| {
-                let _ = audited_stream.fail(&message);
+                audited_stream.fail_with_diagnostic(&message);
                 message
             })?;
         audited_stream.events.push(event.clone());
@@ -825,7 +825,7 @@ async fn run_prompt_hook_attempt(
                     "prompt hook attempted unsupported tool call '{}'",
                     tool_call.name
                 );
-                let _ = audited_stream.fail(&message);
+                audited_stream.fail_with_diagnostic(&message);
                 return Err(message);
             }
             NeutralChatStreamEvent::Complete {
@@ -836,7 +836,7 @@ async fn run_prompt_hook_attempt(
             } => {
                 if !tool_calls.is_empty() {
                     let message = "prompt hook completed with unsupported tool calls".to_string();
-                    let _ = audited_stream.fail(&message);
+                    audited_stream.fail_with_diagnostic(&message);
                     return Err(message);
                 }
                 if output.trim().is_empty() {
@@ -849,7 +849,7 @@ async fn run_prompt_hook_attempt(
             }
             NeutralChatStreamEvent::Error { message } => {
                 let message = format!("prompt hook stream error: {message}");
-                let _ = audited_stream.fail(&message);
+                audited_stream.fail_with_diagnostic(&message);
                 return Err(message);
             }
         }
@@ -867,6 +867,7 @@ async fn run_prompt_hook_attempt(
 
 struct AuditedPromptHookStream {
     stream: NeutralChatStream,
+    workspace_id: String,
     workspace_path: PathBuf,
     request_id: String,
     started_at: Instant,
@@ -883,6 +884,19 @@ struct SerializedPromptHookAuditEvent {
 }
 
 impl AuditedPromptHookStream {
+    fn fail_with_diagnostic(&self, message: &str) {
+        if let Err(error) = self.fail(message) {
+            tracing::error!(
+                workspace_id = %self.workspace_id,
+                request_id = %self.request_id,
+                request_kind = "prompt hook",
+                error_category = "llm_audit_terminal_write_failed",
+                error = %error,
+                "failed to persist terminal prompt hook LLM audit"
+            );
+        }
+    }
+
     fn complete(
         &self,
         first_token_at: Option<String>,
@@ -907,9 +921,21 @@ impl AuditedPromptHookStream {
         let response_body_json = response_body_json.as_deref().and_then(|value| {
             persistable_audit_response_body_json(value, self.save_details, "succeeded")
         });
+        let audit_events = events
+            .iter()
+            .map(|event| NewLlmRequestEvent {
+                id: &event.id,
+                llm_request_id: &self.request_id,
+                sequence: event.sequence,
+                event_at: &event.event_at,
+                event_type: event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &event.normalized_event_json,
+            })
+            .collect::<Vec<_>>();
         let mut database = open_hook_audit_database(&self.workspace_path)?;
         database
-            .update_llm_request_outcome(
+            .finalize_llm_request_outcome_with_events(
                 &self.request_id,
                 UpdateLlmRequestOutcome {
                     first_token_at: first_token_at.as_deref(),
@@ -925,9 +951,9 @@ impl AuditedPromptHookStream {
                     final_state: "succeeded",
                     response_body_json,
                 },
+                &audit_events,
             )
             .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
-        self.persist_events(&mut database, &events)?;
 
         Ok(())
     }
@@ -939,6 +965,7 @@ impl AuditedPromptHookStream {
             .map(|dump| serde_json::to_string(&dump))
             .transpose()
             .map_err(|source| format!("failed to serialize prompt hook failure dump: {source}"))?;
+        let events = self.serialized_events()?;
         fail_prompt_hook_audit(
             &self.workspace_path,
             &self.request_id,
@@ -947,6 +974,7 @@ impl AuditedPromptHookStream {
             message,
             response_body_json.as_deref(),
             self.save_details,
+            &events,
         )
     }
 
@@ -972,30 +1000,6 @@ impl AuditedPromptHookStream {
                 })
             })
             .collect()
-    }
-
-    fn persist_events(
-        &self,
-        database: &mut WorkspaceDatabase,
-        events: &[SerializedPromptHookAuditEvent],
-    ) -> Result<(), String> {
-        for event in events {
-            database
-                .insert_llm_request_event(NewLlmRequestEvent {
-                    id: &event.id,
-                    llm_request_id: &self.request_id,
-                    sequence: event.sequence,
-                    event_at: &event.event_at,
-                    event_type: event.event_type,
-                    raw_chunk_json: None,
-                    normalized_event_json: &event.normalized_event_json,
-                })
-                .map_err(|source| {
-                    format!("failed to insert prompt hook LLM audit event: {source}")
-                })?;
-        }
-
-        Ok(())
     }
 }
 
@@ -1104,6 +1108,7 @@ async fn audited_prompt_hook_stream(
     {
         Ok(Ok(stream)) => Ok(AuditedPromptHookStream {
             stream,
+            workspace_id: request.workspace_id.clone(),
             workspace_path: request.workspace_path.to_path_buf(),
             request_id,
             started_at,
@@ -1111,12 +1116,16 @@ async fn audited_prompt_hook_stream(
             save_details: request.api_audit_save_details,
         }),
         Ok(Err(source)) => {
-            capture.persist_request_failure(&source).map_err(|error| {
-                format!(
-                    "failed to persist prompt hook request dump: {}",
-                    error.message
-                )
-            })?;
+            if let Err(error) = capture.persist_request_failure(&source) {
+                tracing::warn!(
+                    workspace_id = %request.workspace_id,
+                    request_id = %request_id,
+                    request_kind = "prompt hook",
+                    error_category = "llm_audit_request_wire_write_failed",
+                    error = %error.message,
+                    "failed to persist provider request wire before terminal LLM audit"
+                );
+            }
             let response_body_json = capture
                 .failed_response_json(
                     format!("prompt hook provider call failed: {source}"),
@@ -1132,6 +1141,7 @@ async fn audited_prompt_hook_stream(
                 &format!("prompt hook provider call failed: {source}"),
                 response_body_json.as_deref(),
                 request.api_audit_save_details,
+                &[],
             )?;
             Err(format!("prompt hook provider call failed: {source}"))
         }
@@ -1148,6 +1158,7 @@ async fn audited_prompt_hook_stream(
                 &message,
                 response_body_json.as_deref(),
                 request.api_audit_save_details,
+                &[],
             )?;
             Err(message)
         }
@@ -1191,6 +1202,7 @@ fn fail_prompt_hook_audit(
     message: &str,
     response_body_json: Option<&str>,
     save_details: bool,
+    events: &[SerializedPromptHookAuditEvent],
 ) -> Result<(), String> {
     let fallback_response_body_json = foco_providers::ProviderFinalResponseDump::failed(
         message,
@@ -1204,9 +1216,21 @@ fn fail_prompt_hook_audit(
     let total_latency_ms = elapsed_millis(started_at);
     let response_body_json =
         persistable_audit_response_body_json(response_body_json, save_details, "failed");
+    let audit_events = events
+        .iter()
+        .map(|event| NewLlmRequestEvent {
+            id: &event.id,
+            llm_request_id: request_id,
+            sequence: event.sequence,
+            event_at: &event.event_at,
+            event_type: event.event_type,
+            raw_chunk_json: None,
+            normalized_event_json: &event.normalized_event_json,
+        })
+        .collect::<Vec<_>>();
     let mut database = open_hook_audit_database(workspace_path)?;
     database
-        .update_llm_request_outcome(
+        .finalize_llm_request_outcome_with_events(
             request_id,
             UpdateLlmRequestOutcome {
                 first_token_at: None,
@@ -1222,6 +1246,7 @@ fn fail_prompt_hook_audit(
                 final_state: "failed",
                 response_body_json,
             },
+            &audit_events,
         )
         .map_err(|source| format!("failed to update prompt hook LLM audit: {source}"))?;
 
@@ -1688,6 +1713,76 @@ mod tests {
         assert!(if_filter_matches(Some("run_command(git *)"), &request));
         assert!(!if_filter_matches(Some("run_command(cargo *)"), &request));
         assert!(!if_filter_matches(Some("malformed"), &request));
+    }
+
+    #[test]
+    fn failed_prompt_hook_audit_persists_events_with_terminal_outcome() {
+        let workspace = TempDir::new().expect("workspace");
+        let request_id = "prompt-hook-failed";
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("hook audit database");
+        database
+            .insert_llm_request(NewLlmRequest {
+                id: request_id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "prompt hook",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-1",
+                model_id: "model-1",
+                thinking_level: None,
+                request_started_at: "2026-07-20T00:00:00Z",
+                first_token_at: None,
+                completed_at: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: None,
+                status_code: None,
+                final_state: "running",
+                request_body_json: None,
+                response_body_json: None,
+            })
+            .expect("insert running prompt hook audit");
+        let events = [SerializedPromptHookAuditEvent {
+            id: format!("{request_id}-event-1"),
+            sequence: 1,
+            event_at: "2026-07-20T00:00:01Z".to_string(),
+            event_type: "error",
+            normalized_event_json: json!({ "type": "error", "message": "provider failed" })
+                .to_string(),
+        }];
+
+        fail_prompt_hook_audit(
+            workspace.path(),
+            request_id,
+            Instant::now(),
+            None,
+            "provider failed",
+            None,
+            true,
+            &events,
+        )
+        .expect("persist failed prompt hook audit");
+
+        let request = database
+            .llm_request(request_id)
+            .expect("read prompt hook audit")
+            .expect("prompt hook audit row");
+        assert_eq!(request.final_state, "failed");
+        assert_eq!(
+            database
+                .llm_request_events(request_id)
+                .expect("read prompt hook audit events")
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

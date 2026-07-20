@@ -298,123 +298,176 @@ where
     }
 }
 
+pub(crate) fn reconcile_running_llm_request_audits_on_startup(state: &AppState) {
+    let config = match config_snapshot(state) {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!(
+                error_category = "llm_audit_startup_reconciliation_failed",
+                error = %error.message,
+                "failed to load configuration for startup LLM audit reconciliation"
+            );
+            return;
+        }
+    };
+    for workspace in config.local_workspaces() {
+        let reconciliation = (|| -> Result<usize, ApiError> {
+            let mut database = open_workspace_database_critical(&workspace.path)?;
+            database
+                .reconcile_running_llm_requests_on_startup()
+                .map_err(ApiError::from_workspace_error)
+        })();
+        match reconciliation {
+            Ok(reconciled_llm_requests) if reconciled_llm_requests > 0 => {
+                tracing::warn!(
+                    workspace_id = %workspace.id,
+                    reconciled_llm_requests,
+                    reason = "backend_restart_interrupted",
+                    "reconciled running LLM request audits from a previous backend process"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(
+                    workspace_id = %workspace.id,
+                    error_category = "llm_audit_startup_reconciliation_failed",
+                    error = %error.message,
+                    "failed to reconcile running LLM request audits at startup"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> {
+    reconcile_running_llm_request_audits_on_startup(state);
     let config = config_snapshot(state)?;
     for workspace in config.local_workspaces() {
-        let mut database = open_workspace_database_critical(&workspace.path)?;
-        for record in database
-            .startup_agent_reconciliation()
-            .map_err(ApiError::from_workspace_error)?
-        {
-            let expected_status = record.task.status;
-            if expected_status != AgentTaskStatus::Running {
-                continue;
-            }
-            if database
-                .suspend_running_agent_task_with_wait_dependencies(
-                    &record.task.team_id,
-                    &record.task.id,
-                )
+        let reconciliation = (|| -> Result<(), ApiError> {
+            let mut database = open_workspace_database_critical(&workspace.path)?;
+            for record in database
+                .startup_agent_reconciliation()
                 .map_err(ApiError::from_workspace_error)?
             {
+                let expected_status = record.task.status;
+                if expected_status != AgentTaskStatus::Running {
+                    continue;
+                }
+                if database
+                    .suspend_running_agent_task_with_wait_dependencies(
+                        &record.task.team_id,
+                        &record.task.id,
+                    )
+                    .map_err(ApiError::from_workspace_error)?
+                {
+                    insert_agent_event(
+                        &mut database,
+                        &record.task.team_id,
+                        "task_suspended",
+                        Some(&record.task.owner_instance_id),
+                        Some(&record.task.id),
+                        Some(&record.attempt.id),
+                        json!({ "reason": "startup_wait_dependency_recovery" }),
+                    )?;
+                    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                    &mut database,
+                    &record.task.id,
+                )?;
+                    continue;
+                }
+                database
+                    .update_agent_task_state(AgentTaskStateUpdate {
+                        team_id: &record.task.team_id,
+                        task_id: &record.task.id,
+                        expected_status,
+                        transition: AgentTaskTransition::Interrupt,
+                        result_json: None,
+                        error_json: Some(
+                            r#"{"message":"backend restarted while Agent attempt was active"}"#,
+                        ),
+                        interruption_reason: Some(RESTART_INTERRUPTION_REASON),
+                    })
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .transition_agent_instance_status(
+                        &record.task.owner_instance_id,
+                        AgentInstanceStatus::Paused,
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
                 insert_agent_event(
                     &mut database,
                     &record.task.team_id,
-                    "task_suspended",
+                    "attempt_interrupted",
                     Some(&record.task.owner_instance_id),
                     Some(&record.task.id),
                     Some(&record.attempt.id),
-                    json!({ "reason": "startup_wait_dependency_recovery" }),
+                    json!({ "reason": RESTART_INTERRUPTION_REASON }),
                 )?;
+                database
+                    .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
+                    .map_err(ApiError::from_workspace_error)?;
                 crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
-                    &mut database,
-                    &record.task.id,
-                )?;
-                continue;
-            }
-            database
-                .update_agent_task_state(AgentTaskStateUpdate {
-                    team_id: &record.task.team_id,
-                    task_id: &record.task.id,
-                    expected_status,
-                    transition: AgentTaskTransition::Interrupt,
-                    result_json: None,
-                    error_json: Some(
-                        r#"{"message":"backend restarted while Agent attempt was active"}"#,
-                    ),
-                    interruption_reason: Some(RESTART_INTERRUPTION_REASON),
-                })
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .transition_agent_instance_status(
-                    &record.task.owner_instance_id,
-                    AgentInstanceStatus::Paused,
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            insert_agent_event(
-                &mut database,
-                &record.task.team_id,
-                "attempt_interrupted",
-                Some(&record.task.owner_instance_id),
-                Some(&record.task.id),
-                Some(&record.attempt.id),
-                json!({ "reason": RESTART_INTERRUPTION_REASON }),
-            )?;
-            database
-                .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
-                .map_err(ApiError::from_workspace_error)?;
-            crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
                 &mut database,
                 &record.task.id,
             )?;
-        }
-        database
-            .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .fail_running_plan_phases_without_agent_runs(
-                "Plan phase start did not create an implementation chat or Agent task",
-            )
-            .map_err(ApiError::from_workspace_error)?;
-        // Before terminal attempt reconciliation: reopen false `completed`
-        // phases whose bound Agent task is still Queued/Running/Waiting so a
-        // stale completed phase cannot force live attempts terminal.
-        database
-            .reconcile_prematurely_completed_plan_phases_with_active_tasks()
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .reconcile_plan_phase_attempts_for_terminal_phases()
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .discard_terminal_plan_phase_derived_effects(RESTART_INTERRUPTION_REASON)
-            .map_err(ApiError::from_workspace_error)?;
-        for instance in database
-            .isolated_agent_instances()
-            .map_err(ApiError::from_workspace_error)?
-        {
-            if instance.worktree_status.as_deref() == Some("deleted") {
-                continue;
             }
-            let root_path = agent_instance_execution_root(&workspace.path, &instance);
-            if root_path.exists() {
-                continue;
-            }
-            let updated = database
-                .update_agent_instance_worktree_status(&instance.id, "deleted")
+            database
+                .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
                 .map_err(ApiError::from_workspace_error)?;
-            insert_agent_event(
-                &mut database,
-                &instance.team_id,
-                "worktree_reconciled",
-                Some(&instance.id),
-                None,
-                None,
-                json!({
-                    "reason": "isolated worktree path was not found during startup reconciliation",
-                    "executionRootPath": root_path.display().to_string(),
-                    "worktreeStatus": updated.worktree_status,
-                }),
-            )?;
+            database
+                .fail_running_plan_phases_without_agent_runs(
+                    "Plan phase start did not create an implementation chat or Agent task",
+                )
+                .map_err(ApiError::from_workspace_error)?;
+            // Before terminal attempt reconciliation: reopen false `completed`
+            // phases whose bound Agent task is still Queued/Running/Waiting so a
+            // stale completed phase cannot force live attempts terminal.
+            database
+                .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .reconcile_plan_phase_attempts_for_terminal_phases()
+                .map_err(ApiError::from_workspace_error)?;
+            database
+                .discard_terminal_plan_phase_derived_effects(RESTART_INTERRUPTION_REASON)
+                .map_err(ApiError::from_workspace_error)?;
+            for instance in database
+                .isolated_agent_instances()
+                .map_err(ApiError::from_workspace_error)?
+            {
+                if instance.worktree_status.as_deref() == Some("deleted") {
+                    continue;
+                }
+                let root_path = agent_instance_execution_root(&workspace.path, &instance);
+                if root_path.exists() {
+                    continue;
+                }
+                let updated = database
+                    .update_agent_instance_worktree_status(&instance.id, "deleted")
+                    .map_err(ApiError::from_workspace_error)?;
+                insert_agent_event(
+                    &mut database,
+                    &instance.team_id,
+                    "worktree_reconciled",
+                    Some(&instance.id),
+                    None,
+                    None,
+                    json!({
+                        "reason": "isolated worktree path was not found during startup reconciliation",
+                        "executionRootPath": root_path.display().to_string(),
+                        "worktreeStatus": updated.worktree_status,
+                    }),
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = reconciliation {
+            tracing::error!(
+                workspace_id = %workspace.id,
+                error_category = "agent_startup_reconciliation_failed",
+                error = %error.message,
+                "failed to reconcile Agent runtime at startup for workspace"
+            );
         }
     }
     if let Err(error) = crate::plan_runtime::reconcile_plan_derived_effects(state) {

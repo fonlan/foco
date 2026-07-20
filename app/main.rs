@@ -829,6 +829,7 @@ async fn run_server_until_shutdown(
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
+    crate::runtime::reconcile_running_llm_request_audits_on_startup(&state);
     let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
     let scheduled_task_scheduler_task =
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
@@ -2696,6 +2697,9 @@ struct CapturedLlmRequest {
     request_body_json: String,
     events: Vec<CapturedAuditEvent>,
     outcome: ChatAuditOutcome,
+    /// The terminal outcome was durably persisted at the provider request boundary.
+    /// A false value asks `persist_chat_result` for one last synchronous recovery attempt.
+    terminal_persisted: bool,
 }
 
 impl CapturedLlmRequest {
@@ -2712,6 +2716,7 @@ impl CapturedLlmRequest {
             request_body_json: String::new(),
             events: events.to_vec(),
             outcome,
+            terminal_persisted: false,
         }
     }
 
@@ -2730,6 +2735,7 @@ impl CapturedLlmRequest {
             request_body_json: request_body_json.to_string(),
             events: events.to_vec(),
             outcome: cancelled_audit_outcome(started_at, message),
+            terminal_persisted: false,
         }
     }
 }
@@ -2738,11 +2744,33 @@ fn persist_completed_llm_request(
     context: &PreparedChatContext,
     request: &CapturedLlmRequest,
 ) -> Result<(), ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
+    let mut database = open_workspace_database(&context.workspace_path)?;
     let save_details = api_audit_save_details(&context.global_config);
+    let compact_events = compact_audit_events(&request.events, save_details);
+    let event_ids = compact_events
+        .iter()
+        .map(|(sequence, _)| format!("{}-event-{sequence}", request.id))
+        .collect::<Vec<_>>();
+    let audit_events = compact_events
+        .iter()
+        .enumerate()
+        .map(|(index, (sequence, event))| {
+            let sequence = i64::try_from(*sequence).map_err(|_| {
+                ApiError::internal("too many LLM request events to fit SQLite sequence")
+            })?;
+            Ok(NewLlmRequestEvent {
+                id: &event_ids[index],
+                llm_request_id: &request.id,
+                sequence,
+                event_at: &event.event_at,
+                event_type: &event.event_type,
+                raw_chunk_json: None,
+                normalized_event_json: &event.normalized_event_json,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
     database
-        .update_llm_request_outcome(
+        .finalize_llm_request_outcome_with_events(
             &request.id,
             UpdateLlmRequestOutcome {
                 first_token_at: request.outcome.first_token_at.as_deref(),
@@ -2758,33 +2786,30 @@ fn persist_completed_llm_request(
                 final_state: request.outcome.final_state,
                 response_body_json: request.outcome.response_body_json.as_deref(),
             },
+            &audit_events,
         )
-        .map_err(ApiError::from_workspace_error)?;
-    let next_sequence = database
-        .llm_request_event_next_sequence(&request.id)
-        .map_err(ApiError::from_workspace_error)?
-        .max(1);
-    for (index, event) in compact_audit_events(&request.events, save_details)
-        .into_iter()
-        .filter(|(index, _)| *index >= next_sequence)
-    {
-        let sequence = i64::try_from(index).map_err(|_| {
-            ApiError::internal("too many LLM request events to fit SQLite sequence")
-        })?;
-        let id = format!("{}-event-{sequence}", request.id);
-        database
-            .insert_llm_request_event(NewLlmRequestEvent {
-                id: &id,
-                llm_request_id: &request.id,
-                sequence,
-                event_at: &event.event_at,
-                event_type: &event.event_type,
-                raw_chunk_json: None,
-                normalized_event_json: &event.normalized_event_json,
-            })
-            .map_err(ApiError::from_workspace_error)?;
+        .map_err(ApiError::from_workspace_error)
+}
+
+fn best_effort_chat_audit_detail(
+    context: &PreparedChatContext,
+    request_id: &str,
+    result: Result<Option<String>, ApiError>,
+) -> Option<String> {
+    match result {
+        Ok(detail) => detail,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id = %context.workspace_id,
+                request_id,
+                request_kind = "chat completion",
+                error_category = "llm_audit_detail_capture_failed",
+                error = %error.message,
+                "failed to capture provider audit detail; finalizing LLM request without it"
+            );
+            None
+        }
     }
-    Ok(())
 }
 
 fn resolve_active_model_route(
@@ -2914,6 +2939,23 @@ impl PreparedChatContext {
         Ok(())
     }
 
+    pub(crate) fn record_finished_llm_request(&mut self, mut request: CapturedLlmRequest) {
+        match persist_completed_llm_request(self, &request) {
+            Ok(()) => request.terminal_persisted = true,
+            Err(error) => {
+                tracing::error!(
+                    workspace_id = %self.workspace_id,
+                    request_id = %request.id,
+                    request_kind = request.request_kind,
+                    error_category = "llm_audit_terminal_write_failed",
+                    error = %error.message,
+                    "failed to persist terminal LLM request audit; chat finalization will retry"
+                );
+            }
+        }
+        self.captured_llm_requests.push(request);
+    }
+
     fn capture_cancelled_llm_request(
         &mut self,
         capture: &ProviderAuditCapture,
@@ -2945,7 +2987,7 @@ impl PreparedChatContext {
         if let Some(response_body_json) = wire_response_body_json {
             request.outcome.response_body_json = Some(response_body_json);
         }
-        self.captured_llm_requests.push(request);
+        self.record_finished_llm_request(request);
     }
 
     fn capture_failed_llm_request(
@@ -2972,7 +3014,7 @@ impl PreparedChatContext {
             )
             .ok()
             .flatten();
-        self.captured_llm_requests.push(CapturedLlmRequest {
+        self.record_finished_llm_request(CapturedLlmRequest {
             id: request_id,
             request_kind: "chat completion",
             request_started_at,
@@ -2982,6 +3024,7 @@ impl PreparedChatContext {
                 response_body_json,
                 ..failed_provider_audit_outcome(started_at, message, status_code)
             },
+            terminal_persisted: false,
         });
     }
 
@@ -3476,10 +3519,14 @@ impl PreparedChatContext {
                     Ok(provider_stream) => provider_stream,
                     Err(error) => {
                         if let Err(persist_error) = turn_capture.persist_request_failure(&error) {
-                            yield ChatSseEvent::Error {
-                                message: persist_error.message,
-                            };
-                            return;
+                            tracing::warn!(
+                                workspace_id = %self.workspace_id,
+                                request_id = %turn_llm_request_id,
+                                request_kind = "chat completion",
+                                error_category = "llm_audit_request_wire_write_failed",
+                                error = %persist_error.message,
+                                "failed to persist provider request wire before terminal LLM audit"
+                            );
                         }
                         let status_code = error.status_code().map(i64::from);
                         let message = error.to_string();
@@ -3688,27 +3735,18 @@ impl PreparedChatContext {
                                 status_code,
                             )
                             .await;
-                            let response_body_json = match turn_capture
-                                .response_json(provider_stream.final_response_dump())
-                            {
-                                Ok(response_body_json) => response_body_json,
-                                Err(error) => {
-                                    yield ChatSseEvent::Error {
-                                        message: error.message,
-                                    };
-                                    return;
-                                }
-                            };
-                            let captured_request_json = match turn_capture.captured_request_json() {
-                                Ok(request_body_json) => request_body_json.unwrap_or_default(),
-                                Err(error) => {
-                                    yield ChatSseEvent::Error {
-                                        message: error.message,
-                                    };
-                                    return;
-                                }
-                            };
-                            self.captured_llm_requests.push(CapturedLlmRequest {
+                            let response_body_json = best_effort_chat_audit_detail(
+                                &self,
+                                &turn_llm_request_id,
+                                turn_capture.response_json(provider_stream.final_response_dump()),
+                            );
+                            let captured_request_json = best_effort_chat_audit_detail(
+                                &self,
+                                &turn_llm_request_id,
+                                turn_capture.captured_request_json(),
+                            )
+                            .unwrap_or_default();
+                            self.record_finished_llm_request(CapturedLlmRequest {
                                 id: turn_llm_request_id,
                                 request_kind: "chat completion",
                                 request_started_at: turn_request_started_at,
@@ -3718,6 +3756,7 @@ impl PreparedChatContext {
                                     response_body_json,
                                     ..outcome.clone()
                                 },
+                                terminal_persisted: false,
                             });
 
                             if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &[]) {
@@ -3789,18 +3828,6 @@ impl PreparedChatContext {
                                 if reasoning_loop_recovery_count
                                     < MAX_REASONING_LOOP_RECOVERIES_PER_RUN
                                 {
-                                    if let Some(failed_request) =
-                                        self.captured_llm_requests.last()
-                                        && let Err(error) = persist_completed_llm_request(
-                                            &self,
-                                            failed_request,
-                                        )
-                                    {
-                                        yield ChatSseEvent::Error {
-                                            message: error.message,
-                                        };
-                                        return;
-                                    }
                                     reasoning_loop_recovery_count =
                                         reasoning_loop_recovery_count.saturating_add(1);
                                     if reasoning_duration_ms.is_none()
@@ -4073,26 +4100,17 @@ impl PreparedChatContext {
                                 final_usage = Some(total_usage.clone());
                             }
                             let turn_total_latency_ms = elapsed_millis(turn_started_at);
-                            let response_body_json = match turn_capture
-                                .response_json(provider_stream.final_response_dump())
-                            {
-                                Ok(response_body_json) => response_body_json,
-                                Err(error) => {
-                                    yield ChatSseEvent::Error {
-                                        message: error.message,
-                                    };
-                                    return;
-                                }
-                            };
-                            let request_body_json = match turn_capture.captured_request_json() {
-                                Ok(request_body_json) => request_body_json.unwrap_or_default(),
-                                Err(error) => {
-                                    yield ChatSseEvent::Error {
-                                        message: error.message,
-                                    };
-                                    return;
-                                }
-                            };
+                            let response_body_json = best_effort_chat_audit_detail(
+                                &self,
+                                &turn_llm_request_id,
+                                turn_capture.response_json(provider_stream.final_response_dump()),
+                            );
+                            let request_body_json = best_effort_chat_audit_detail(
+                                &self,
+                                &turn_llm_request_id,
+                                turn_capture.captured_request_json(),
+                            )
+                            .unwrap_or_default();
                             let completed_turn_request = CapturedLlmRequest {
                                 id: turn_llm_request_id.clone(),
                                 request_kind: "chat completion",
@@ -4119,14 +4137,9 @@ impl PreparedChatContext {
                                     final_state: "succeeded",
                                     response_body_json,
                                 },
+                                terminal_persisted: false,
                             };
-                            if let Err(error) = persist_completed_llm_request(&self, &completed_turn_request) {
-                                yield ChatSseEvent::Error {
-                                    message: error.message,
-                                };
-                                return;
-                            }
-                            self.captured_llm_requests.push(completed_turn_request);
+                            self.record_finished_llm_request(completed_turn_request);
                             record_chat_completion_input_tokens(
                                 &mut self.last_chat_completion_input_tokens,
                                 usage.as_ref().and_then(|usage| usage.input_tokens),

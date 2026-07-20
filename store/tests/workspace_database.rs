@@ -11896,6 +11896,190 @@ fn llm_request_outcome_and_events_roll_back_together() {
 }
 
 #[test]
+fn startup_reconciliation_closes_running_llm_audit_once_and_updates_rollup() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "interrupted-request",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-16T00:00:00Z",
+            first_token_at: Some("2026-07-16T00:00:01Z"),
+            completed_at: None,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: Some(2),
+            cache_write_tokens: Some(1),
+            reasoning_tokens: Some(3),
+            first_token_latency_ms: Some(1000),
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+
+    assert_eq!(
+        database
+            .reconcile_running_llm_requests_on_startup()
+            .expect("startup reconciliation"),
+        1
+    );
+    let request = database
+        .llm_request("interrupted-request")
+        .expect("request lookup")
+        .expect("request row");
+    assert_eq!(request.final_state, "failed");
+    assert!(request.completed_at.is_some());
+    assert_eq!(request.total_latency_ms, Some(0));
+    let events = database
+        .llm_request_events("interrupted-request")
+        .expect("reconciliation event lookup");
+    assert_eq!(events.len(), 1);
+    assert!(
+        events[0]
+            .normalized_event_json
+            .contains("backend_restart_interrupted")
+    );
+    let rollup = database
+        .llm_request_usage_rollup_summary(LlmRequestUsageRollupFilters::default())
+        .expect("rollup summary");
+    assert_eq!(rollup.total_requests, 1);
+    assert_eq!(rollup.failed_requests, 1);
+    assert_eq!(
+        database
+            .reconcile_running_llm_requests_on_startup()
+            .expect("idempotent reconciliation"),
+        0
+    );
+}
+
+#[test]
+fn finalizer_preserves_terminal_outcome_and_usage_rollup_on_retry() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "request-1",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-20T00:00:00Z",
+            first_token_at: None,
+            completed_at: None,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            status_code: None,
+            final_state: "running",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("request insert");
+
+    let succeeded = UpdateLlmRequestOutcome {
+        first_token_at: Some("2026-07-20T00:00:00.100Z"),
+        completed_at: Some("2026-07-20T00:00:01Z"),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        first_token_latency_ms: Some(100),
+        total_latency_ms: Some(1000),
+        status_code: Some(200),
+        final_state: "succeeded",
+        response_body_json: None,
+    };
+    database
+        .finalize_llm_request_outcome_with_events(
+            "request-1",
+            succeeded,
+            &[NewLlmRequestEvent {
+                id: "request-1-event-0",
+                llm_request_id: "request-1",
+                sequence: 0,
+                event_at: "2026-07-20T00:00:01Z",
+                event_type: "completion",
+                raw_chunk_json: None,
+                normalized_event_json: r#"{"type":"completion"}"#,
+            }],
+        )
+        .expect("first finalization");
+
+    database
+        .finalize_llm_request_outcome_with_events(
+            "request-1",
+            UpdateLlmRequestOutcome {
+                first_token_at: None,
+                completed_at: Some("2026-07-20T00:00:02Z"),
+                input_tokens: Some(99),
+                output_tokens: Some(99),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(2000),
+                status_code: None,
+                final_state: "failed",
+                response_body_json: None,
+            },
+            &[NewLlmRequestEvent {
+                id: "request-1-event-1",
+                llm_request_id: "request-1",
+                sequence: 1,
+                event_at: "2026-07-20T00:00:02Z",
+                event_type: "retry",
+                raw_chunk_json: None,
+                normalized_event_json: r#"{"type":"retry"}"#,
+            }],
+        )
+        .expect("idempotent finalization retry");
+
+    let request = database
+        .llm_request("request-1")
+        .expect("request lookup")
+        .expect("request row");
+    assert_eq!(request.final_state, "succeeded");
+    assert_eq!(request.output_tokens, Some(5));
+    let rollup = database
+        .llm_request_usage_rollup_summary(LlmRequestUsageRollupFilters::default())
+        .expect("rollup summary");
+    assert_eq!(rollup.total_requests, 1);
+    assert_eq!(rollup.failed_requests, 0);
+    assert_eq!(
+        database
+            .llm_request_events("request-1")
+            .expect("request events")
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn versioned_provider_http_headers_only_mask_authorization() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
