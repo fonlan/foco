@@ -308,17 +308,17 @@ pub(crate) fn existing_instance_contention_action(
     desktop_release: bool,
     args: impl IntoIterator<Item = String>,
 ) -> ExistingInstanceContentionAction {
-    if !desktop_release {
-        return ExistingInstanceContentionAction::ReportError;
-    }
-
     if args
         .into_iter()
         .any(|arg| arg == crate::AUTO_START_COMMAND || arg == crate::UPDATED_RESTART_COMMAND)
     {
-        ExistingInstanceContentionAction::ExitSilently
-    } else {
+        return ExistingInstanceContentionAction::ExitSilently;
+    }
+
+    if desktop_release {
         ExistingInstanceContentionAction::OpenExistingUi
+    } else {
+        ExistingInstanceContentionAction::ReportError
     }
 }
 
@@ -868,8 +868,15 @@ mod tests {
     }
 
     #[test]
-    fn contention_action_reports_error_for_non_desktop_launches() {
-        let action = existing_instance_contention_action(false, ["--auto-start".to_string()]);
+    fn contention_action_exits_silently_for_automatic_non_desktop_launches() {
+        let action = existing_instance_contention_action(false, ["--updated-restart".to_string()]);
+
+        assert_eq!(action, ExistingInstanceContentionAction::ExitSilently);
+    }
+
+    #[test]
+    fn contention_action_reports_error_for_manual_non_desktop_launches() {
+        let action = existing_instance_contention_action(false, ["--ignored".to_string()]);
 
         assert_eq!(action, ExistingInstanceContentionAction::ReportError);
     }

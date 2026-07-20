@@ -713,23 +713,6 @@ async fn run_server_until_shutdown(
         "loaded global config from disk"
     );
 
-    let prepare_config_log_started_at = Instant::now();
-    let redacted_config_json = loaded_config.config.to_redacted_log_json()?;
-    tracing::info!(
-        elapsed_ms = prepare_config_log_started_at.elapsed().as_millis() as u64,
-        bytes = redacted_config_json.len(),
-        "prepared redacted global config log"
-    );
-    let write_config_log_started_at = Instant::now();
-    tracing::info!(
-        config = %redacted_config_json,
-        "loaded global config"
-    );
-    tracing::info!(
-        elapsed_ms = write_config_log_started_at.elapsed().as_millis() as u64,
-        "wrote redacted global config log"
-    );
-
     let global_memory_started_at = Instant::now();
     tracing::info!(
         path = %loaded_config.paths.memory_database_file.display(),

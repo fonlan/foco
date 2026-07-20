@@ -140,7 +140,7 @@ SSH 远程工作区使用桌面发布包内置的 Linux sidecar。CI release wor
 
 **Foco 托管的远端 sidecar 版本保留：** 在托管 sidecar 成功完成 bootstrap 身份校验且 control broker 就绪后，Foco 以 best-effort 方式清理远端 `~/.foco/sidecars/` 下的历史**版本目录**，最多保留 **2** 个（当前已成功启动的版本目录 + 按 mtime 最近的 1 个历史版本）。仅考虑该根目录的直接子项；当前版本始终受保护；符号链接与非目录会被跳过。自定义 `focoCommand` **不参与**该清理。清理失败只记 warning，不阻断打开远程工作区。这与启动前按同一工作区身份停止远端孤儿 sidecar **进程**是不同机制（停止进程不会删除旧版本二进制或版本目录）。
 
-**本机自动更新资产保留：** 更新下载目录位于本机 `~/.foco/updates/<version>/`。在安装成功并以 `--updated-restart` 重启后，Foco 以 best-effort 清理 `~/.foco/updates/` 下的历史版本目录，最多保留 **2** 个（当前运行版本 + 按 mtime 最近的 1 个历史版本）。普通启动不触发清理；失败只记 warning，不影响重启启动。
+**本机自动更新资产保留：** 更新下载目录位于本机 `~/.foco/updates/<version>/`。在安装成功并以 `--updated-restart` 重启后，Foco 以 best-effort 清理 `~/.foco/updates/` 下的历史版本目录，最多保留 **2** 个（当前运行版本 + 按 mtime 最近的 1 个历史版本）。普通启动不触发清理；失败只记 warning，不影响重启启动。更新 helper 会先等待被替换的 owner 进程退出，才启动更新后的服务；新服务只有在健康检查成功后才会记录更新就绪，因此已退出 owner 的残留私有启动记录不会阻断更新重启或回滚重启。
 
 支持的 OpenSSH config 字段（配置文件字段可被服务器配置覆盖）：HostName、User、Port、IdentityFile、UserKnownHostsFile、StrictHostKeyChecking。`ProxyCommand` / `ProxyJump` 会明确拒绝（不会静默直连）。登录密码仅可保存在本机全局配置；摘要 API 只暴露 `passwordConfigured`。未知主机密钥需确认指纹；密钥已变更时硬失败，需用户自行修正 known_hosts。
 
@@ -196,6 +196,23 @@ Foco 会把全局配置和应用级数据存放在配置根目录下。默认路
 | `FOCO_CONFIG_DIR` | 用户目录下的 `/.foco` | 全局配置与数据根目录 |
 
 同样的值也可以通过 npm 开发脚本参数传入：`--host`、`--port` / `--backend-port` 和 `--config-dir`。
+
+### 主服务单实例
+
+每个规范化后的配置目录只允许一个 Foco **主服务**。仅修改 `FOCO_HOST` 或 `FOCO_PORT` 不能在同一 `FOCO_CONFIG_DIR` 下再启动一个服务；如需有意并行运行 Foco，请使用不同的配置目录。
+
+该限制只作用于主服务。辅助 CLI 命令和远程工作区 sidecar 不受影响。Windows 或 macOS release 的手动重复启动会等待现有 owner，并在健康检查通过后打开其 UI；自动启动和更新重启在 owner 已存在时会静默退出。Linux 和 debug 构建的重复主服务启动会明确报告已有实例正在启动或运行；诊断允许包含规范化配置目录、现有 owner 的 PID 或监听地址，但不会包含配置正文、凭据或工作区内容。
+
+#### Release 验证清单
+
+Windows 或 macOS release 发布前，请验证以下全部事项：
+
+- 使用默认配置目录时，第二次主服务启动符合对应平台的重复启动行为；
+- 仅修改 `FOCO_PORT` 仍不能在该目录中启动第二个服务；
+- 两个不同 `FOCO_CONFIG_DIR` 能在不同端口同时提供服务；
+- 强制终止 owner 后，可立即使用同一配置目录重新启动；
+- `--auto-start` 与 `--updated-restart` 不会创建第二个 owner；在前一个 owner 退出后，更新和回滚重启能够就绪；以及
+- 辅助 CLI 命令和远程 sidecar 仍然可用。
 
 ## 内置智能体工具
 

@@ -140,7 +140,7 @@ Users only need to install local Foco. The main process uses a pure-Rust SSH cli
 
 **Managed remote sidecar version retention:** after a Foco-managed sidecar successfully finishes bootstrap identity checks and the control broker is ready, Foco best-effort prunes older **version directories** under remote `~/.foco/sidecars/`, keeping at most **two** (the currently started version directory plus one recent historical version by mtime). Only real direct children of that root are candidates; the current version is always protected; symlinks and non-directories are skipped. Custom `focoCommand` paths **do not** participate in this cleanup. Cleanup failure is warning-only and never blocks opening the workspace. This is not the same as stopping orphaned remote sidecar **processes** for the same workspace identity before a new start (process stop does not delete old version binaries or directories).
 
-**Local automatic-update asset retention:** download archives live under `~/.foco/updates/<version>/` on the machine running Foco. After a successful install restarts the app with `--updated-restart`, Foco best-effort prunes historical version directories under `~/.foco/updates/`, keeping at most **two** (the running version plus one recent historical version by mtime). Ordinary startups do not trigger cleanup; failures are warning-only and never abort restart.
+**Local automatic-update asset retention:** download archives live under `~/.foco/updates/<version>/` on the machine running Foco. After a successful install restarts the app with `--updated-restart`, Foco best-effort prunes historical version directories under `~/.foco/updates/`, keeping at most **two** (the running version plus one recent historical version by mtime). Ordinary startups do not trigger cleanup; failures are warning-only and never abort restart. Update helpers wait for the replaced owner process to exit before launching the updated service, and the new service records update readiness only after its health check succeeds; an exited owner's stale private startup record does not block an updated or rollback restart.
 
 Supported OpenSSH config fields (profile overrides config): HostName, User, Port, IdentityFile, UserKnownHostsFile, StrictHostKeyChecking. `ProxyCommand` and `ProxyJump` are rejected (not silently ignored). Login passwords may be stored in local global config only; API summaries expose `passwordConfigured` without the secret. Unknown host keys require fingerprint confirmation; changed host keys hard-fail until known_hosts is fixed out-of-band.
 
@@ -196,6 +196,23 @@ Environment variables:
 | `FOCO_CONFIG_DIR` | user profile `/.foco` | Global configuration and data root |
 
 The same values can be passed to the npm development scripts with `--host`, `--port` / `--backend-port`, and `--config-dir`.
+
+### Single-Instance Main Service
+
+Each canonical configuration directory permits exactly one Foco **main service**. Changing only `FOCO_HOST` or `FOCO_PORT` does not create another service for the same `FOCO_CONFIG_DIR`; use a different configuration directory when you intentionally need parallel Foco instances.
+
+This limit applies only to the main service. Auxiliary CLI commands and remote-workspace sidecars are not blocked by it. A manual duplicate launch of a Windows or macOS release waits for the existing owner and opens its UI after a verified health check. Auto-start and update-restart launches exit quietly when an owner already exists. On Linux and debug builds, a duplicate main-service launch reports that an instance is already starting or running; the diagnostic may include the normalized configuration directory and the existing owner's PID or listen address, but never configuration contents, credentials, or workspace data.
+
+#### Release Validation Checklist
+
+Before shipping a Windows or macOS release, verify all of the following:
+
+- a second main-service launch with the default configuration directory follows the platform's duplicate-launch behavior;
+- changing only `FOCO_PORT` still prevents a second service for that directory;
+- two distinct `FOCO_CONFIG_DIR` values can serve concurrently on distinct ports;
+- force-terminating the owner allows an immediate restart with the same configuration directory;
+- `--auto-start` and `--updated-restart` do not create a second owner, while update and rollback restarts become ready after the previous owner exits; and
+- auxiliary CLI commands and remote sidecars remain usable.
 
 ## Built-in Agent Tools
 
