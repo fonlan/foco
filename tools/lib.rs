@@ -1,4 +1,5 @@
 mod agent_tools;
+mod apply_patch;
 mod background_command;
 mod command_tools;
 mod definitions;
@@ -51,6 +52,7 @@ pub const WEB_FETCH_TOOL: &str = "web_fetch";
 pub const IMAGE_GEN_TOOL: &str = "image_gen";
 pub const WRITE_FILE_TOOL: &str = "write_file";
 pub const EDIT_FILE_TOOL: &str = "edit_file";
+pub const APPLY_PATCH_TOOL: &str = "apply_patch";
 pub const RUN_COMMAND_TOOL: &str = "run_command";
 pub const GET_COMMAND_OUTPUT_TOOL: &str = "get_command_output";
 pub const STOP_COMMAND_TOOL: &str = "stop_command";
@@ -113,6 +115,7 @@ const DEFAULT_SEARCH_TEXT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WEB_TOOL_TIMEOUT_MS: u64 = 15_000;
 const DEFAULT_IMAGE_GEN_TOOL_TIMEOUT_MS: u64 = 300_000;
 const DEFAULT_WRITE_FILE_TIMEOUT_MS: u64 = 10_000;
+const DEFAULT_APPLY_PATCH_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_SLEEP_TIMEOUT_MS: u64 = 600_000;
 const DEFAULT_RUN_COMMAND_TIMEOUT_MS: u64 = 60_000;
 const DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS: u64 = 10_000;
@@ -503,6 +506,7 @@ fn execute_builtin_tool_inner(
         }
         WRITE_FILE_TOOL => file_tools::write_file(workspace_path, arguments),
         EDIT_FILE_TOOL => file_tools::edit_file(workspace_path, arguments),
+        APPLY_PATCH_TOOL => apply_patch::apply_patch(workspace_path, arguments),
         CREATE_TODO_GRAPH_TOOL => {
             todo_tools::create_todo_graph(workspace_path, context.chat_id, arguments)
         }
@@ -4796,6 +4800,34 @@ mod tests {
         );
         assert_eq!(read_back.output["revision"], 1);
         assert_eq!(read_back.output["contentMarkdown"], initial_content);
+    }
+
+    #[test]
+    fn builtin_tools_include_apply_patch_with_strict_schema() {
+        let tool = builtin_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == APPLY_PATCH_TOOL)
+            .expect("apply_patch tool definition");
+
+        assert!(tool.strict);
+        assert_eq!(
+            tool.input_schema,
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "A non-empty Codex patch document, beginning with *** Begin Patch and ending with *** End Patch."
+                    },
+                    "timeoutMs": {
+                        "type": ["integer", "null"],
+                        "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                    }
+                },
+                "required": ["patch", "timeoutMs"]
+            })
+        );
     }
 
     #[test]

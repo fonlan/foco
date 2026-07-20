@@ -1,9 +1,9 @@
 use serde_json::{Value, json};
 
 use crate::{
-    ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL,
-    FIND_FILES_TOOL, GET_COMMAND_OUTPUT_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
-    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    APPLY_PATCH_TOOL, ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
+    DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_COMMAND_OUTPUT_TOOL, GET_PLANS_TOOL,
+    GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
     GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
     READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
     STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
@@ -26,6 +26,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         image_gen_definition(),
         write_file_definition(),
         edit_file_definition(),
+        apply_patch_definition(),
         create_todo_graph_definition(),
         update_todo_graph_definition(),
         get_todo_graph_definition(),
@@ -568,6 +569,29 @@ fn edit_file_definition() -> ToolDefinition {
                 }
             },
             "required": ["path", "oldStr", "newStr", "replaceAll", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn apply_patch_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: APPLY_PATCH_TOOL,
+        description: "Apply a Codex-compatible *** Begin Patch document inside the execution workspace. Supports Add File, Delete File, Update File, Move to, multi-file patches, and fuzzy context matching. The patch is applied in hunk order; if a later hunk fails, earlier successful edits remain. Only use this when the current runtime has explicitly made apply_patch available.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "patch": {
+                    "type": "string",
+                    "description": "A non-empty Codex patch document, beginning with *** Begin Patch and ending with *** End Patch."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["patch", "timeoutMs"]
         }),
         strict: true,
     }
