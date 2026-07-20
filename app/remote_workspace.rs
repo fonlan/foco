@@ -1232,11 +1232,168 @@ pub(crate) struct RemoteActiveRunSummary {
 }
 
 #[derive(Clone, Debug, Default)]
+struct RemoteSidecarCleanupSingleflight {
+    flights: Arc<Mutex<HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>>>,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+struct RemoteSidecarCleanupKey {
+    server_id: String,
+    managed_install_version: String,
+}
+
+impl RemoteSidecarCleanupKey {
+    fn new(server_id: &str, managed_install_version: &str) -> Self {
+        Self {
+            server_id: server_id.to_string(),
+            managed_install_version: managed_install_version.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteSidecarCleanupFlight {
+    result_tx: watch::Sender<Option<Arc<RemoteSidecarCleanupOutcome>>>,
+}
+
+impl RemoteSidecarCleanupFlight {
+    fn new() -> Self {
+        let (result_tx, _) = watch::channel(None);
+        Self { result_tx }
+    }
+
+    fn subscribe(&self) -> watch::Receiver<Option<Arc<RemoteSidecarCleanupOutcome>>> {
+        self.result_tx.subscribe()
+    }
+
+    fn publish(&self, outcome: Arc<RemoteSidecarCleanupOutcome>) {
+        self.result_tx.send_replace(Some(outcome));
+    }
+}
+
+#[derive(Debug)]
+enum RemoteSidecarCleanupFlightJoin {
+    Leader(RemoteSidecarCleanupFlightLeader),
+    Waiter(RemoteSidecarCleanupFlightWaiter),
+}
+
+#[derive(Debug)]
+struct RemoteSidecarCleanupFlightLeader {
+    flights: Arc<Mutex<HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>>>,
+    key: RemoteSidecarCleanupKey,
+    flight: Arc<RemoteSidecarCleanupFlight>,
+    completed: bool,
+}
+
+impl RemoteSidecarCleanupFlightLeader {
+    fn complete(mut self, outcome: Arc<RemoteSidecarCleanupOutcome>) {
+        self.flight.publish(outcome);
+        self.completed = true;
+        release_remote_sidecar_cleanup_flight(&self.flights, &self.key, &self.flight);
+    }
+}
+
+impl Drop for RemoteSidecarCleanupFlightLeader {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        tracing::warn!(
+            server_id = %self.key.server_id,
+            managed_install_version = %self.key.managed_install_version,
+            "managed remote sidecar cleanup leader ended before publishing a result"
+        );
+        self.flight
+            .publish(Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled));
+        release_remote_sidecar_cleanup_flight(&self.flights, &self.key, &self.flight);
+    }
+}
+
+#[derive(Debug)]
+struct RemoteSidecarCleanupFlightWaiter {
+    flights: Arc<Mutex<HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>>>,
+    key: RemoteSidecarCleanupKey,
+    flight: Arc<RemoteSidecarCleanupFlight>,
+    result_rx: watch::Receiver<Option<Arc<RemoteSidecarCleanupOutcome>>>,
+}
+
+impl RemoteSidecarCleanupFlightWaiter {
+    async fn wait(mut self) -> Arc<RemoteSidecarCleanupOutcome> {
+        loop {
+            if let Some(outcome) = self.result_rx.borrow_and_update().clone() {
+                return outcome;
+            }
+            if self.result_rx.changed().await.is_err() {
+                return Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled);
+            }
+        }
+    }
+}
+
+impl Drop for RemoteSidecarCleanupFlightWaiter {
+    fn drop(&mut self) {
+        release_remote_sidecar_cleanup_flight(&self.flights, &self.key, &self.flight);
+    }
+}
+
+impl RemoteSidecarCleanupSingleflight {
+    fn join(&self, key: RemoteSidecarCleanupKey) -> RemoteSidecarCleanupFlightJoin {
+        let mut flights = lock_remote_sidecar_cleanup_flights(&self.flights);
+        if let Some(flight) = flights.get(&key) {
+            return RemoteSidecarCleanupFlightJoin::Waiter(RemoteSidecarCleanupFlightWaiter {
+                flights: self.flights.clone(),
+                key,
+                flight: flight.clone(),
+                result_rx: flight.subscribe(),
+            });
+        }
+
+        let flight = Arc::new(RemoteSidecarCleanupFlight::new());
+        flights.insert(key.clone(), flight.clone());
+        RemoteSidecarCleanupFlightJoin::Leader(RemoteSidecarCleanupFlightLeader {
+            flights: self.flights.clone(),
+            key,
+            flight,
+            completed: false,
+        })
+    }
+}
+
+fn lock_remote_sidecar_cleanup_flights(
+    flights: &Arc<Mutex<HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>>>,
+) -> std::sync::MutexGuard<'_, HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>> {
+    match flights.lock() {
+        Ok(flights) => flights,
+        Err(poisoned) => {
+            tracing::warn!(
+                "managed remote sidecar cleanup singleflight lock was poisoned; recovering state"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn release_remote_sidecar_cleanup_flight(
+    flights: &Arc<Mutex<HashMap<RemoteSidecarCleanupKey, Arc<RemoteSidecarCleanupFlight>>>>,
+    key: &RemoteSidecarCleanupKey,
+    flight: &Arc<RemoteSidecarCleanupFlight>,
+) {
+    let mut flights = lock_remote_sidecar_cleanup_flights(flights);
+    let should_remove = flights
+        .get(key)
+        .is_some_and(|existing| Arc::ptr_eq(existing, flight) && Arc::strong_count(existing) == 2);
+    if should_remove {
+        flights.remove(key);
+    }
+}
+
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RemoteWorkspaceManager {
     sessions: Arc<Mutex<HashMap<String, Arc<RemoteWorkspaceSession>>>>,
     statuses: Arc<Mutex<HashMap<String, RemoteSessionStatus>>>,
     // ponytail: process-local keyed mutex; remote lockfile later if multiple Foco processes must coordinate.
     sidecar_install_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    sidecar_cleanup_singleflight: RemoteSidecarCleanupSingleflight,
 }
 
 impl RemoteWorkspaceManager {
@@ -1682,7 +1839,7 @@ impl RemoteWorkspaceManager {
         // Best-effort: after bootstrap identity + control broker succeed, prune older
         // Foco-managed sidecar version dirs. Custom focoCommand is skipped. Failures never
         // downgrade a successful Ready session.
-        maybe_cleanup_stale_managed_remote_sidecar_versions(
+        self.maybe_cleanup_stale_managed_remote_sidecar_versions(
             server,
             server_id,
             workspace_id,
@@ -4445,85 +4602,209 @@ exit 0
     )
 }
 
-/// Best-effort prune of older Foco-managed remote sidecar version directories after a
-/// successful connect. Custom `focoCommand` is a no-op. Failures are logged only.
-///
-/// Success is determined from the parsed `FOCO_SIDECAR_RETAIN_V1` summary, not SSH exit
-/// status alone. Cleanup never removes a Ready session or verified sidecar cache.
-async fn maybe_cleanup_stale_managed_remote_sidecar_versions(
+#[derive(Debug)]
+enum RemoteSidecarCleanupOutcome {
+    RetainSummary {
+        exit_success: bool,
+        result: RemoteSidecarRetainResult,
+    },
+    InvalidSummary {
+        exit_success: bool,
+        parse_error: &'static str,
+    },
+    SshError {
+        message: String,
+    },
+    LeaderCancelled,
+}
+
+impl RemoteSidecarCleanupOutcome {
+    fn status(&self) -> &'static str {
+        match self {
+            Self::RetainSummary { result, .. } => result.status.as_str(),
+            Self::InvalidSummary { .. } => "invalid_summary",
+            Self::SshError { .. } => "ssh_error",
+            Self::LeaderCancelled => "leader_cancelled",
+        }
+    }
+}
+
+impl RemoteWorkspaceManager {
+    /// Best-effort prune of older Foco-managed remote sidecar version directories after a
+    /// successful connect. Custom `focoCommand` is a no-op. Failures are logged only.
+    ///
+    /// Concurrent connections for one server and managed version share the same cleanup flight.
+    /// After its leader and waiters release the published result, the flight is removed so a later
+    /// independent connection can recheck.
+    async fn maybe_cleanup_stale_managed_remote_sidecar_versions(
+        &self,
+        server: &RemoteServerProfile,
+        server_id: &str,
+        workspace_id: &str,
+        sidecar_command: &RemoteSidecarCommand,
+    ) {
+        if !should_run_managed_remote_sidecar_version_cleanup(sidecar_command) {
+            return;
+        }
+        let Some(current_version) = sidecar_command
+            .managed_install_version
+            .as_deref()
+            .filter(|version| is_safe_remote_sidecar_version_dir_name(version))
+        else {
+            return;
+        };
+
+        let key = RemoteSidecarCleanupKey::new(server_id, current_version);
+        match self.sidecar_cleanup_singleflight.join(key) {
+            RemoteSidecarCleanupFlightJoin::Leader(leader) => {
+                let outcome = Arc::new(
+                    run_managed_remote_sidecar_version_cleanup(
+                        server,
+                        server_id,
+                        workspace_id,
+                        current_version,
+                    )
+                    .await,
+                );
+                log_managed_remote_sidecar_version_cleanup_outcome(
+                    outcome.as_ref(),
+                    server_id,
+                    workspace_id,
+                    current_version,
+                );
+                leader.complete(outcome);
+            }
+            RemoteSidecarCleanupFlightJoin::Waiter(waiter) => {
+                let outcome = waiter.wait().await;
+                if matches!(
+                    outcome.as_ref(),
+                    RemoteSidecarCleanupOutcome::LeaderCancelled
+                ) {
+                    tracing::warn!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        current_version,
+                        status = outcome.status(),
+                        "managed remote sidecar cleanup leader ended before shared result (best-effort)"
+                    );
+                } else {
+                    tracing::debug!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        current_version,
+                        status = outcome.status(),
+                        "reused concurrent managed remote sidecar cleanup result"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Success is determined from the parsed `FOCO_SIDECAR_RETAIN_V1` summary, not SSH exit status
+/// alone. Cleanup never removes a Ready session or verified sidecar cache.
+async fn run_managed_remote_sidecar_version_cleanup(
     server: &RemoteServerProfile,
     server_id: &str,
     workspace_id: &str,
-    sidecar_command: &RemoteSidecarCommand,
-) {
-    if !should_run_managed_remote_sidecar_version_cleanup(sidecar_command) {
-        return;
-    }
-    let Some(current_version) = sidecar_command
-        .managed_install_version
-        .as_deref()
-        .filter(|version| is_safe_remote_sidecar_version_dir_name(version))
-    else {
-        return;
-    };
-
+    current_version: &str,
+) -> RemoteSidecarCleanupOutcome {
     let script = remote_managed_sidecar_version_retain_script(
         current_version,
         REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
     );
     match run_ssh_output(server, &script, server_id, Some(workspace_id)).await {
         Ok(output) => {
-            let stdout = output.stdout_lossy();
-            match parse_remote_sidecar_retain_summary(&stdout) {
-                Ok(result) if output.success() && result.status.is_success() => {
-                    tracing::info!(
-                        server_id = %server_id,
-                        workspace_id = %workspace_id,
-                        current_version,
-                        status = result.status.as_str(),
-                        scanned = result.scanned,
-                        kept = result.kept,
-                        deleted = result.deleted,
-                        failed = result.failed,
-                        retain_count = REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
-                        "managed remote sidecar version cleanup completed"
-                    );
-                }
-                Ok(result) => {
-                    tracing::warn!(
-                        server_id = %server_id,
-                        workspace_id = %workspace_id,
-                        current_version,
-                        status = result.status.as_str(),
-                        scanned = result.scanned,
-                        kept = result.kept,
-                        deleted = result.deleted,
-                        failed = result.failed,
-                        exit_success = output.success(),
-                        "managed remote sidecar version cleanup reported failure (best-effort)"
-                    );
-                }
-                Err(parse_error) => {
-                    tracing::warn!(
-                        server_id = %server_id,
-                        workspace_id = %workspace_id,
-                        current_version,
-                        status = "invalid_summary",
-                        parse_error,
-                        exit_success = output.success(),
-                        "managed remote sidecar version cleanup summary invalid (best-effort)"
-                    );
-                }
+            let exit_success = output.success();
+            match parse_remote_sidecar_retain_summary(&output.stdout_lossy()) {
+                Ok(result) => RemoteSidecarCleanupOutcome::RetainSummary {
+                    exit_success,
+                    result,
+                },
+                Err(parse_error) => RemoteSidecarCleanupOutcome::InvalidSummary {
+                    exit_success,
+                    parse_error,
+                },
             }
         }
-        Err(error) => {
+        Err(error) => RemoteSidecarCleanupOutcome::SshError {
+            message: error.message().to_string(),
+        },
+    }
+}
+
+fn log_managed_remote_sidecar_version_cleanup_outcome(
+    outcome: &RemoteSidecarCleanupOutcome,
+    server_id: &str,
+    workspace_id: &str,
+    current_version: &str,
+) {
+    match outcome {
+        RemoteSidecarCleanupOutcome::RetainSummary {
+            exit_success,
+            result,
+        } if *exit_success && result.status.is_success() => {
+            tracing::info!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                status = result.status.as_str(),
+                scanned = result.scanned,
+                kept = result.kept,
+                deleted = result.deleted,
+                failed = result.failed,
+                retain_count = REMOTE_SIDECAR_VERSION_DIR_RETAIN_COUNT,
+                "managed remote sidecar version cleanup completed"
+            );
+        }
+        RemoteSidecarCleanupOutcome::RetainSummary {
+            exit_success,
+            result,
+        } => {
             tracing::warn!(
                 server_id = %server_id,
                 workspace_id = %workspace_id,
                 current_version,
-                status = "ssh_error",
-                error = %error.message(),
+                status = result.status.as_str(),
+                scanned = result.scanned,
+                kept = result.kept,
+                deleted = result.deleted,
+                failed = result.failed,
+                exit_success,
+                "managed remote sidecar version cleanup reported failure (best-effort)"
+            );
+        }
+        RemoteSidecarCleanupOutcome::InvalidSummary {
+            exit_success,
+            parse_error,
+        } => {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                status = outcome.status(),
+                parse_error,
+                exit_success,
+                "managed remote sidecar version cleanup summary invalid (best-effort)"
+            );
+        }
+        RemoteSidecarCleanupOutcome::SshError { message } => {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                status = outcome.status(),
+                error = %message,
                 "managed remote sidecar version cleanup failed (best-effort)"
+            );
+        }
+        RemoteSidecarCleanupOutcome::LeaderCancelled => {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                current_version,
+                status = outcome.status(),
+                "managed remote sidecar cleanup leader ended before publishing a result (best-effort)"
             );
         }
     }
@@ -23852,6 +24133,149 @@ mod tests {
         );
         remove.sort();
         assert_eq!(remove, vec!["b-hist".to_string(), "c-hist".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_cleanup_singleflight_shares_leader_result_with_waiters() {
+        let singleflight = RemoteSidecarCleanupSingleflight::default();
+        let key = RemoteSidecarCleanupKey::new("server-1", "1.2.3");
+        let RemoteSidecarCleanupFlightJoin::Leader(leader) = singleflight.join(key.clone()) else {
+            panic!("first cleanup join must become leader");
+        };
+        let RemoteSidecarCleanupFlightJoin::Waiter(waiter_one) = singleflight.join(key.clone())
+        else {
+            panic!("second cleanup join must become waiter");
+        };
+        let RemoteSidecarCleanupFlightJoin::Waiter(waiter_two) = singleflight.join(key.clone())
+        else {
+            panic!("third cleanup join must become waiter");
+        };
+
+        let outcome = Arc::new(RemoteSidecarCleanupOutcome::RetainSummary {
+            exit_success: true,
+            result: RemoteSidecarRetainResult {
+                status: RemoteSidecarRetainStatus::Ok,
+                scanned: 3,
+                kept: 1,
+                deleted: 2,
+                failed: 0,
+            },
+        });
+        leader.complete(outcome.clone());
+        let RemoteSidecarCleanupFlightJoin::Waiter(late_waiter) = singleflight.join(key.clone())
+        else {
+            panic!("published cleanup flight must still serve concurrent waiters");
+        };
+
+        let (waiter_one_outcome, waiter_two_outcome, late_waiter_outcome) =
+            tokio::join!(waiter_one.wait(), waiter_two.wait(), late_waiter.wait());
+        assert!(Arc::ptr_eq(&waiter_one_outcome, &outcome));
+        assert!(Arc::ptr_eq(&waiter_two_outcome, &outcome));
+        assert!(Arc::ptr_eq(&late_waiter_outcome, &outcome));
+
+        let RemoteSidecarCleanupFlightJoin::Leader(retry_leader) = singleflight.join(key) else {
+            panic!("completed cleanup flight must release its key");
+        };
+        retry_leader.complete(Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_cleanup_singleflight_does_not_block_different_server_or_version() {
+        let singleflight = RemoteSidecarCleanupSingleflight::default();
+        let server_one_version_one = RemoteSidecarCleanupKey::new("server-1", "1.2.3");
+        let server_two_version_one = RemoteSidecarCleanupKey::new("server-2", "1.2.3");
+        let server_one_version_two = RemoteSidecarCleanupKey::new("server-1", "1.2.4");
+        let RemoteSidecarCleanupFlightJoin::Leader(first_leader) =
+            singleflight.join(server_one_version_one.clone())
+        else {
+            panic!("first server/version must become leader");
+        };
+        let RemoteSidecarCleanupFlightJoin::Waiter(partial_failure_waiter) =
+            singleflight.join(server_one_version_one)
+        else {
+            panic!("same server/version must join the active cleanup flight");
+        };
+        let RemoteSidecarCleanupFlightJoin::Leader(second_leader) =
+            singleflight.join(server_two_version_one)
+        else {
+            panic!("different server must not wait for first cleanup flight");
+        };
+        let RemoteSidecarCleanupFlightJoin::Leader(third_leader) =
+            singleflight.join(server_one_version_two)
+        else {
+            panic!("different managed version must not wait for first cleanup flight");
+        };
+
+        first_leader.complete(Arc::new(RemoteSidecarCleanupOutcome::RetainSummary {
+            exit_success: true,
+            result: RemoteSidecarRetainResult {
+                status: RemoteSidecarRetainStatus::PartialFailure,
+                scanned: 3,
+                kept: 1,
+                deleted: 1,
+                failed: 1,
+            },
+        }));
+        let partial_failure_outcome = partial_failure_waiter.wait().await;
+        assert!(matches!(
+            partial_failure_outcome.as_ref(),
+            RemoteSidecarCleanupOutcome::RetainSummary {
+                result: RemoteSidecarRetainResult {
+                    status: RemoteSidecarRetainStatus::PartialFailure,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        second_leader.complete(Arc::new(RemoteSidecarCleanupOutcome::SshError {
+            message: "connection lost".to_string(),
+        }));
+        third_leader.complete(Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled));
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_cleanup_singleflight_retries_after_failed_wave() {
+        let singleflight = RemoteSidecarCleanupSingleflight::default();
+        let key = RemoteSidecarCleanupKey::new("server-1", "1.2.3");
+        let RemoteSidecarCleanupFlightJoin::Leader(leader) = singleflight.join(key.clone()) else {
+            panic!("first cleanup join must become leader");
+        };
+        let RemoteSidecarCleanupFlightJoin::Waiter(waiter) = singleflight.join(key.clone()) else {
+            panic!("concurrent cleanup join must become waiter");
+        };
+
+        leader.complete(Arc::new(RemoteSidecarCleanupOutcome::SshError {
+            message: "connection lost".to_string(),
+        }));
+        let outcome = waiter.wait().await;
+        assert!(matches!(
+            outcome.as_ref(),
+            RemoteSidecarCleanupOutcome::SshError { .. }
+        ));
+
+        let RemoteSidecarCleanupFlightJoin::Leader(retry_leader) = singleflight.join(key) else {
+            panic!("failed cleanup wave must release its key for retry");
+        };
+        retry_leader.complete(Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled));
+    }
+
+    #[test]
+    fn remote_sidecar_cleanup_singleflight_recovers_from_poisoned_map_lock() {
+        let singleflight = RemoteSidecarCleanupSingleflight::default();
+        let flights = singleflight.flights.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = flights.lock().expect("singleflight lock");
+            panic!("poison cleanup singleflight lock for recovery test");
+        })
+        .join();
+
+        let RemoteSidecarCleanupFlightJoin::Leader(leader) =
+            singleflight.join(RemoteSidecarCleanupKey::new("server-1", "1.2.3"))
+        else {
+            panic!("poisoned map lock must recover without producing a waiter");
+        };
+        leader.complete(Arc::new(RemoteSidecarCleanupOutcome::LeaderCancelled));
     }
 
     #[test]
