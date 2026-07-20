@@ -813,6 +813,109 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();
   });
 
+  it("renders consecutive agent-message guidance in transcript order without duplicates", async () => {
+    const consecutiveGuidanceTranscript: AgentTranscriptResponse = {
+      ...agentTranscriptResponse,
+      items: [
+        {
+          ...agentTranscriptResponse.items[0]!,
+          content: "Worker, inspect the current task.",
+          id: "task:agent-task-1:input",
+          metrics: null,
+          parts: [],
+          role: "user" as const,
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "Before first guidance.",
+          id: "task:agent-task-1:run:segment:0",
+          parts: [{ type: "text", text: "Before first guidance." }],
+          role: "assistant" as const,
+          status: null,
+          taskStatus: "completed",
+        },
+        {
+          ...agentTranscriptResponse.items[0]!,
+          author: "Main agent",
+          content: "Address the failed check.",
+          id: "message:agent-message-guidance-1",
+          kind: "Message",
+          metrics: null,
+          parts: [],
+          role: "user" as const,
+          status: null,
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "After first guidance.",
+          id: "task:agent-task-1:run:segment:2",
+          parts: [{ type: "text", text: "After first guidance." }],
+          role: "assistant" as const,
+          status: null,
+          taskStatus: "completed",
+        },
+        {
+          ...agentTranscriptResponse.items[0]!,
+          author: "Main agent",
+          content: "Also verify the release notes.",
+          id: "message:agent-message-guidance-2",
+          kind: "Message",
+          metrics: null,
+          parts: [],
+          role: "user" as const,
+          status: null,
+        },
+        {
+          ...agentTranscriptResponse.items[1]!,
+          content: "After second guidance.",
+          id: "task:agent-task-1:run:segment:4",
+          parts: [{ type: "text", text: "After second guidance." }],
+          role: "assistant" as const,
+          status: null,
+          taskStatus: "completed",
+        },
+      ],
+      totalCount: 6,
+    };
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path.endsWith("/agent-instance-worker/transcript")) {
+          return jsonResponse(consecutiveGuidanceTranscript);
+        }
+        return mockFetch(input, init);
+      },
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open agent Worker" }));
+
+    const transcriptText = (await screen.findByText("Before first guidance."))
+      .closest(".message-list")
+      ?.textContent;
+    expect(transcriptText).toBeDefined();
+    const orderedTexts = [
+      "Before first guidance.",
+      "Address the failed check.",
+      "After first guidance.",
+      "Also verify the release notes.",
+      "After second guidance.",
+    ];
+    const indices = orderedTexts.map((text) => transcriptText?.indexOf(text) ?? -1);
+    expect(indices.every((index) => index >= 0)).toBe(true);
+    expect(indices).toEqual([...indices].sort((left, right) => left - right));
+    expect((transcriptText?.match(/Address the failed check\./g) ?? []).length).toBe(1);
+    expect((transcriptText?.match(/Also verify the release notes\./g) ?? []).length).toBe(1);
+    expect(
+      screen.queryByRole("status", { name: "Agent is running" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("refreshes empty Agent transcripts without replaying snapshot events", async () => {
     vi.mocked(fetch).mockImplementation(
       async (input: RequestInfo | URL, init?: RequestInit) => {

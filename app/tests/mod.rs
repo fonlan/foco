@@ -325,6 +325,8 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
     let failed_attempt_id =
         foco_agent::AgentAttemptId::new("agent-attempt-transcript-failed").expect("attempt id");
     let message_id = foco_agent::AgentMessageId::new("agent-message-transcript-input").expect("id");
+    let second_message_id =
+        foco_agent::AgentMessageId::new("agent-message-transcript-follow-up").expect("id");
     let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
     database
         .insert_chat("chat-transcript", "Transcript")
@@ -382,7 +384,19 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
             kind: foco_agent::AgentMessageKind::Notification,
             content: "Inspect transcript",
         })
-        .expect("insert message");
+        .expect("insert first message");
+    database
+        .insert_agent_message(foco_store::workspace::NewAgentMessage {
+            id: &second_message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&coordinator_id),
+            receiver_instance_id: &worker_id,
+            related_task_id: Some(&task_id),
+            reply_to_message_id: Some(&message_id),
+            kind: foco_agent::AgentMessageKind::Notification,
+            content: "Finish with the outstanding checks.",
+        })
+        .expect("insert second message");
     database
         .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
         .expect("claim task");
@@ -394,8 +408,10 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         json!({ "type": "toolResult", "toolCallId": "tool-1", "output": { "content": "done" }, "isError": false, "startedAt": "2026-07-03T08:00:00Z", "completedAt": "2026-07-03T08:00:01Z" }),
         json!({ "type": "guidanceApplied", "id": "agent-message-transcript-input", "content": "Continue with the summary.", "source": "agentMessage", "interruptedAssistantMetrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 5, "firstTokenLatencyMs": 1, "outputTokens": 1, "llmRequestIds": ["request-interrupted"] } }),
         json!({ "type": "reasoningDelta", "delta": "Resume. " }),
+        json!({ "type": "guidanceApplied", "id": "agent-message-transcript-follow-up", "content": "Finish with the outstanding checks.", "source": "agentMessage" }),
+        json!({ "type": "textDelta", "delta": "Finish. " }),
         json!({ "type": "guidanceApplied", "id": "guidance-reasoning-loop", "content": "repeated reasoning loop, check and continue", "source": "reasoningLoopGuard" }),
-        json!({ "type": "complete", "text": "Resume. Done.", "reasoning": "Resume. More.", "metrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 10, "firstTokenLatencyMs": 1, "outputTokens": 2, "llmRequestIds": ["request-1"] } }),
+        json!({ "type": "complete", "text": "Finish. Done.", "reasoning": "Finish. More.", "metrics": { "modelId": "model", "providerId": "provider", "totalLatencyMs": 10, "firstTokenLatencyMs": 1, "outputTokens": 2, "llmRequestIds": ["request-1"] } }),
     ]
     .into_iter()
     .enumerate()
@@ -465,20 +481,25 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         .iter()
         .find(|item| item.id == "task:agent-task-transcript-run:run:segment:5")
         .expect("interim run segment");
-    let resumed_segment = items
+    let follow_up_segment = items
         .iter()
         .find(|item| item.id == "task:agent-task-transcript-run:run:segment:7")
+        .expect("follow-up run segment");
+    let resumed_segment = items
+        .iter()
+        .find(|item| item.id == "task:agent-task-transcript-run:run:segment:9")
         .expect("resumed run segment");
     let virtual_guidance = items
         .iter()
-        .find(|item| item.id == "task:agent-task-transcript-run:guidance:7")
+        .find(|item| item.id == "task:agent-task-transcript-run:guidance:9")
         .expect("virtual guidance");
     let transcript_ids = items
         .iter()
         .filter(|item| {
             item.id.starts_with("task:agent-task-transcript-run:run")
                 || item.id == "message:agent-message-transcript-input"
-                || item.id == "task:agent-task-transcript-run:guidance:7"
+                || item.id == "message:agent-message-transcript-follow-up"
+                || item.id == "task:agent-task-transcript-run:guidance:9"
         })
         .map(|item| item.id.as_str())
         .collect::<Vec<_>>();
@@ -488,8 +509,10 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
             "task:agent-task-transcript-run:run:segment:0",
             "message:agent-message-transcript-input",
             "task:agent-task-transcript-run:run:segment:5",
-            "task:agent-task-transcript-run:guidance:7",
+            "message:agent-message-transcript-follow-up",
             "task:agent-task-transcript-run:run:segment:7",
+            "task:agent-task-transcript-run:guidance:9",
+            "task:agent-task-transcript-run:run:segment:9",
         ]
     );
     assert_eq!(first_segment.content, "Read. ");
@@ -542,11 +565,13 @@ fn agent_transcript_items_replay_run_parts_and_task_error() {
         &interim_segment.parts[0],
         ChatMessagePart::Reasoning { text, .. } if text == "Resume. "
     ));
+    assert_eq!(follow_up_segment.content, "Finish. ");
+    assert!(follow_up_segment.status.is_none());
     assert_eq!(
         virtual_guidance.content,
         "repeated reasoning loop, check and continue"
     );
-    assert_eq!(resumed_segment.content, "Resume. Done.");
+    assert_eq!(resumed_segment.content, "Finish. Done.");
     assert!(resumed_segment.status.is_none());
     assert_eq!(
         resumed_segment

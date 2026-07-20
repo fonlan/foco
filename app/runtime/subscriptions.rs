@@ -1046,4 +1046,162 @@ mod tests {
         assert!(first_rx.try_recv().is_err());
         assert!(second_rx.try_recv().is_err());
     }
+
+    #[test]
+    fn agent_message_guidance_queues_when_workspace_team_or_instance_does_not_match() {
+        let registry = ActiveChatRunRegistry::default();
+        let team_id = AgentTeamId::new("agent-team-guidance-routing").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-guidance-routing").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-guidance-routing").expect("task id");
+        let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register_agent(
+                "run-guidance-routing".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance".to_string(),
+                "assistant-guidance".to_string(),
+                1,
+                Vec::new(),
+                false,
+                ActiveAgentRunIdentity {
+                    team_id: team_id.clone(),
+                    instance_id: instance_id.clone(),
+                    task_id: task_id.clone(),
+                    _attempt_id: AgentAttemptId::new("agent-attempt-guidance-routing")
+                        .expect("attempt id"),
+                },
+                0,
+                guidance_tx,
+            )
+            .expect("register active Agent run");
+        let other_team_id = AgentTeamId::new("agent-team-guidance-other").expect("other team id");
+        let other_instance_id =
+            AgentInstanceId::new("agent-instance-guidance-other").expect("other instance id");
+
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-other",
+                &team_id,
+                &instance_id,
+                Some(&task_id),
+                agent_message_guidance("agent-message-guidance-workspace"),
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &other_team_id,
+                &instance_id,
+                Some(&task_id),
+                agent_message_guidance("agent-message-guidance-team"),
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &team_id,
+                &other_instance_id,
+                Some(&task_id),
+                agent_message_guidance("agent-message-guidance-instance"),
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+        assert!(guidance_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn agent_message_guidance_queues_when_matching_guidance_channel_has_closed() {
+        let registry = ActiveChatRunRegistry::default();
+        let team_id = AgentTeamId::new("agent-team-guidance-closed").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-guidance-closed").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-guidance-closed").expect("task id");
+        let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register_agent(
+                "run-guidance-closed".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance".to_string(),
+                "assistant-guidance".to_string(),
+                1,
+                Vec::new(),
+                false,
+                ActiveAgentRunIdentity {
+                    team_id: team_id.clone(),
+                    instance_id: instance_id.clone(),
+                    task_id: task_id.clone(),
+                    _attempt_id: AgentAttemptId::new("agent-attempt-guidance-closed")
+                        .expect("attempt id"),
+                },
+                0,
+                guidance_tx,
+            )
+            .expect("register active Agent run");
+        drop(guidance_rx);
+
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &team_id,
+                &instance_id,
+                Some(&task_id),
+                agent_message_guidance("agent-message-guidance-closed"),
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_chat_registration_still_accepts_manual_guidance() {
+        let registry = ActiveChatRunRegistry::default();
+        let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register(
+                "run-manual-guidance".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance".to_string(),
+                "assistant-guidance".to_string(),
+                1,
+                Vec::new(),
+                false,
+                0,
+                guidance_tx,
+            )
+            .expect("register ordinary chat run");
+
+        let guidance = registry
+            .push_guidance(
+                "workspace-guidance",
+                ChatGuidanceRequest {
+                    chat_id: "chat-guidance".to_string(),
+                    run_id: "run-manual-guidance".to_string(),
+                    message: "Continue manually.".to_string(),
+                    attachments: Vec::new(),
+                },
+            )
+            .expect("manual guidance accepted");
+
+        assert_eq!(guidance.source, crate::runtime::MANUAL_GUIDANCE_SOURCE);
+        assert_eq!(
+            guidance_rx
+                .recv()
+                .await
+                .expect("manual guidance delivered")
+                .content,
+            "Continue manually."
+        );
+    }
+
+    fn agent_message_guidance(id: &str) -> GuidanceMessage {
+        GuidanceMessage {
+            id: id.to_string(),
+            content: "apply this guidance".to_string(),
+            attachments: Vec::new(),
+            source: crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE.to_string(),
+            interrupted_assistant_id: None,
+        }
+    }
 }

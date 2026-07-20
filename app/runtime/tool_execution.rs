@@ -7669,11 +7669,11 @@ mod tests {
     }
 
     #[test]
-    fn agent_send_message_delivers_live_guidance_without_consuming_message() {
+    fn agent_send_message_persists_live_guidance_then_consumes_it_when_applied() {
         let (workspace, context, team_id, instance_id, _task_id, _wake_rx) =
             create_agent_tool_fixture(AgentPermissions::default());
         let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
-        let _registration = context
+        let mut registration = context
             .active_chat_runs
             .register_agent(
                 "run-agent-message-live".to_string(),
@@ -7742,6 +7742,98 @@ mod tests {
                 .any(|event| {
                     event.event_type == "message_created"
                         && event.message_id.as_ref() == Some(&message_id)
+                })
+        );
+        drop(database);
+
+        registration
+            .record_event(
+                workspace.path(),
+                "chat-agent-tool-test",
+                &ChatSseEvent::GuidanceApplied {
+                    id: guidance.id,
+                    content: guidance.content,
+                    parts: Vec::new(),
+                    interrupted_assistant_metrics: None,
+                    source: guidance.source,
+                    interrupted_assistant_id: None,
+                },
+            )
+            .expect("persist applied Agent guidance");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        assert!(
+            database
+                .agent_message(&message_id)
+                .expect("message read")
+                .expect("message")
+                .consumed_at
+                .is_some()
+        );
+        let run_events = database
+            .run_events_for_run("run-agent-message-live")
+            .expect("run events");
+        assert_eq!(run_events.len(), 1);
+        assert!(
+            run_events[0]
+                .payload_json
+                .contains(AGENT_MESSAGE_GUIDANCE_SOURCE)
+        );
+        assert!(
+            database
+                .agent_events_after(&team_id, -1)
+                .expect("Agent events")
+                .iter()
+                .any(|event| {
+                    event.event_type == "message_consumed"
+                        && event.message_id.as_ref() == Some(&message_id)
+                })
+        );
+    }
+
+    #[test]
+    fn agent_send_message_queues_unread_message_when_receiver_is_idle() {
+        let (workspace, context, team_id, instance_id, _task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions::default());
+
+        let output = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_SEND_MESSAGE_TOOL,
+            "call-agent-message-idle",
+            json!({
+                "receiverInstanceId": instance_id.to_string(),
+                "kind": "notification",
+                "content": "apply this on the next attempt",
+                "replyToMessageId": null,
+                "relatedTaskId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect("persist queued Agent message");
+        assert_eq!(output["delivery"], "queued");
+
+        let message_id = foco_agent::AgentMessageId::new(
+            output["messageId"].as_str().expect("message id string"),
+        )
+        .expect("Agent message id");
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        assert_eq!(
+            database
+                .agent_message(&message_id)
+                .expect("message read")
+                .expect("message")
+                .consumed_at,
+            None
+        );
+        assert!(
+            database
+                .agent_events_after(&team_id, -1)
+                .expect("Agent events")
+                .iter()
+                .all(|event| {
+                    event.message_id.as_ref() != Some(&message_id)
+                        || event.event_type != "message_consumed"
                 })
         );
     }
