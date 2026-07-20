@@ -2321,24 +2321,99 @@ fn neutral_tool_call(tool_call: &GenaiToolCall) -> NeutralToolCall {
     }
 }
 
-fn normalized_tool_arguments(arguments: &serde_json::Value) -> serde_json::Value {
-    let mut current = arguments.clone();
+/// Maximum recursive unwraps of JSON-encoded string values from models.
+/// Shared by ToolCall argument normalization and plain-text JSON recovery.
+const MODEL_JSON_STRING_UNWRAP_DEPTH: usize = 4;
 
-    for _ in 0..4 {
-        let serde_json::Value::String(text) = &current else {
+/// Normalize ToolCall `arguments` that providers sometimes deliver as JSON strings
+/// (including limited nested string encoding). Non-string values and non-JSON strings
+/// are returned unchanged. Never panics and never repairs invalid JSON syntax.
+pub fn normalized_tool_arguments(arguments: &Value) -> Value {
+    unwrap_model_json_encoded_value(arguments.clone())
+}
+
+/// Recover a `serde_json::Value` from model text that was intended as structured tool
+/// arguments rather than a native ToolCall.
+///
+/// Accepts, conservatively:
+/// - pure JSON object/array text (after trim)
+/// - limited nested JSON string encoding of those values
+/// - a single Markdown fenced code block whose language is empty or `json` (case
+///   insensitive), with no surrounding prose
+///
+/// Rejects extra prose, non-`json` fences, invalid JSON, and inputs that would require
+/// guessing (single quotes, trailing commas, unquoted keys, etc.).
+pub fn recover_model_json_from_text(text: &str) -> Option<Value> {
+    let candidate = extract_model_json_candidate_text(text)?;
+    let parsed = serde_json::from_str::<Value>(candidate.trim()).ok()?;
+    Some(unwrap_model_json_encoded_value(parsed))
+}
+
+fn extract_model_json_candidate_text(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(inner) = extract_single_json_fenced_block(trimmed) {
+        return Some(inner);
+    }
+
+    if model_json_text_looks_like_encoded_json(trimmed) {
+        return Some(trimmed);
+    }
+
+    None
+}
+
+/// Extract the body of a single fenced code block that is the entire `text`.
+/// Language must be empty or `json` (ASCII case insensitive). No surrounding prose.
+fn extract_single_json_fenced_block(text: &str) -> Option<&str> {
+    let text = text.trim();
+    if !text.starts_with("```") {
+        return None;
+    }
+
+    let after_open = &text[3..];
+    let newline_idx = after_open.find('\n')?;
+    let lang = after_open[..newline_idx]
+        .trim()
+        .trim_end_matches('\r');
+    if !lang.is_empty() && !lang.eq_ignore_ascii_case("json") {
+        return None;
+    }
+
+    let body = &after_open[newline_idx + 1..];
+    let body_trimmed_end = body.trim_end();
+    let content = body_trimmed_end.strip_suffix("```")?;
+    let content = content.trim();
+    if content.is_empty() {
+        return None;
+    }
+
+    Some(content)
+}
+
+fn model_json_text_looks_like_encoded_json(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with('{')
+        || trimmed.starts_with('[')
+        || trimmed.starts_with("\"{")
+        || trimmed.starts_with("\"[")
+}
+
+fn unwrap_model_json_encoded_value(mut current: Value) -> Value {
+    for _ in 0..MODEL_JSON_STRING_UNWRAP_DEPTH {
+        let Value::String(text) = &current else {
             return current;
         };
 
         let trimmed = text.trim();
-        let looks_like_json = trimmed.starts_with('{')
-            || trimmed.starts_with('[')
-            || trimmed.starts_with("\"{")
-            || trimmed.starts_with("\"[");
-        if !looks_like_json {
+        if !model_json_text_looks_like_encoded_json(trimmed) {
             return current;
         }
 
-        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        let Ok(parsed) = serde_json::from_str::<Value>(trimmed) else {
             return current;
         };
         current = parsed;
@@ -4329,22 +4404,156 @@ mod tests {
     #[test]
     fn normalizes_json_string_tool_arguments() {
         assert_eq!(
-            normalized_tool_arguments(&serde_json::Value::String(
-                r#"{"path":"note.txt"}"#.to_string()
-            )),
+            normalized_tool_arguments(&Value::String(r#"{"path":"note.txt"}"#.to_string())),
             serde_json::json!({ "path": "note.txt" })
         );
 
         let double_encoded =
             serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encoded JSON argument");
         assert_eq!(
-            normalized_tool_arguments(&serde_json::Value::String(double_encoded)),
+            normalized_tool_arguments(&Value::String(double_encoded)),
             serde_json::json!({ "path": "note.txt" })
         );
 
         assert_eq!(
-            normalized_tool_arguments(&serde_json::Value::String("plain text".to_string())),
-            serde_json::Value::String("plain text".to_string())
+            normalized_tool_arguments(&Value::String("plain text".to_string())),
+            Value::String("plain text".to_string())
+        );
+
+        // Already-structured values are returned unchanged.
+        let object = serde_json::json!({ "path": "note.txt" });
+        assert_eq!(normalized_tool_arguments(&object), object);
+    }
+
+    #[test]
+    fn recover_model_json_from_text_accepts_pure_json_object_and_array() {
+        assert_eq!(
+            recover_model_json_from_text(r#"{"path":"note.txt"}"#),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+        assert_eq!(
+            recover_model_json_from_text("  \n[1, 2, 3]\n  "),
+            Some(serde_json::json!([1, 2, 3]))
+        );
+    }
+
+    #[test]
+    fn recover_model_json_from_text_unwraps_double_encoded_json_string() {
+        let double_encoded =
+            serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encoded JSON");
+        assert_eq!(
+            recover_model_json_from_text(&double_encoded),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+    }
+
+    #[test]
+    fn recover_model_json_from_text_accepts_single_json_or_bare_fence() {
+        let with_lang = "```json\n{\"path\":\"note.txt\"}\n```";
+        assert_eq!(
+            recover_model_json_from_text(with_lang),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+
+        let bare = "```\n{\"path\":\"note.txt\"}\n```";
+        assert_eq!(
+            recover_model_json_from_text(bare),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+
+        let uppercase_lang = "```JSON\n{\"path\":\"note.txt\"}\n```";
+        assert_eq!(
+            recover_model_json_from_text(uppercase_lang),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+
+        let crlf = "```json\r\n{\"path\":\"note.txt\"}\r\n```";
+        assert_eq!(
+            recover_model_json_from_text(crlf),
+            Some(serde_json::json!({ "path": "note.txt" }))
+        );
+    }
+
+    #[test]
+    fn recover_model_json_from_text_rejects_prose_and_non_json_fences() {
+        assert_eq!(
+            recover_model_json_from_text(
+                "Here is the payload:\n```json\n{\"path\":\"note.txt\"}\n```"
+            ),
+            None
+        );
+        assert_eq!(
+            recover_model_json_from_text("```json\n{\"path\":\"note.txt\"}\n```\nThanks!"),
+            None
+        );
+        assert_eq!(
+            recover_model_json_from_text("```javascript\n{\"path\":\"note.txt\"}\n```"),
+            None
+        );
+        assert_eq!(
+            recover_model_json_from_text("plain text without json"),
+            None
+        );
+        assert_eq!(recover_model_json_from_text(""), None);
+        assert_eq!(recover_model_json_from_text("   \n\t  "), None);
+    }
+
+    #[test]
+    fn recover_model_json_from_text_does_not_repair_invalid_json_syntax() {
+        // Single quotes, trailing commas, and unquoted keys are not repaired.
+        assert_eq!(
+            recover_model_json_from_text("{'path': 'note.txt'}"),
+            None
+        );
+        assert_eq!(
+            recover_model_json_from_text(r#"{"path": "note.txt",}"#),
+            None
+        );
+        assert_eq!(
+            recover_model_json_from_text(r#"{path: "note.txt"}"#),
+            None
+        );
+        assert_eq!(
+            normalized_tool_arguments(&Value::String(
+                r#"{"path": "note.txt",}"#.to_string()
+            )),
+            Value::String(r#"{"path": "note.txt",}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn model_json_string_unwrap_respects_depth_limit() {
+        // Shared hard cap used by ToolCall args and text recovery.
+        assert_eq!(MODEL_JSON_STRING_UNWRAP_DEPTH, 4);
+
+        let leaf = serde_json::json!({ "path": "note.txt" });
+
+        // One encoding layer.
+        assert_eq!(
+            normalized_tool_arguments(&Value::String(r#"{"path":"note.txt"}"#.to_string())),
+            leaf
+        );
+
+        // Two encoding layers (JSON string of object text) fully unwrap.
+        let double = Value::String(
+            serde_json::to_string(r#"{"path":"note.txt"}"#).expect("double encode"),
+        );
+        assert_eq!(normalized_tool_arguments(&double), leaf);
+        assert_eq!(
+            recover_model_json_from_text(double.as_str().expect("double is string")),
+            Some(leaf.clone())
+        );
+
+        // A third serde_json string layer starts with `"\` rather than `"{` /
+        // `"[{`, so the conservative looks-like gate leaves it unchanged. This
+        // proves unwrap is bounded and does not invent repairs for deeper nests.
+        let triple = Value::String(serde_json::to_string(&double).expect("triple encode"));
+        let triple_result = normalized_tool_arguments(&triple);
+        assert!(triple_result.is_string());
+        assert_ne!(triple_result, leaf);
+        assert_eq!(
+            recover_model_json_from_text(triple.as_str().expect("triple is string")),
+            None
         );
     }
 
