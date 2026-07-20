@@ -33,6 +33,7 @@ use tokio::{
     time,
 };
 
+use super::ActiveAgentRunIdentity;
 use crate::git_backend::{
     agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response,
     resolve_agent_worktree_path,
@@ -813,6 +814,35 @@ async fn run_coordinator_task_inner(
     if let Some(max_output_tokens) = instance.definition_snapshot.model_options.max_output_tokens {
         chat_context.provider_request.max_output_tokens = Some(max_output_tokens);
     }
+    chat_context.agent_associations = AgentRunAssociations {
+        team_id: Some(task.team_id.clone()),
+        instance_id: Some(task.owner_instance_id.clone()),
+        task_id: Some(task.id.clone()),
+        attempt_id: Some(attempt_id.clone()),
+    };
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    let next_run_event_sequence = open_workspace_database_critical(&workspace.path)?
+        .next_run_event_sequence(task.id.as_str())
+        .map_err(ApiError::from_workspace_error)?;
+    // Register before snapshotting unread Agent messages. Messages sent after the snapshot are
+    // buffered as live guidance instead of being stranded until a later attempt.
+    let registration = state.active_chat_runs.register_agent(
+        task.id.to_string(),
+        workspace.id.clone(),
+        team.chat_id.clone(),
+        chat_context.assistant_message_id.clone(),
+        chat_context.assistant_sequence,
+        chat_context.memories_used.clone(),
+        chat_context.agent_primary_chat_output,
+        ActiveAgentRunIdentity {
+            team_id: task.team_id.clone(),
+            instance_id: task.owner_instance_id.clone(),
+            task_id: task.id.clone(),
+            _attempt_id: attempt_id.clone(),
+        },
+        next_run_event_sequence,
+        guidance_tx,
+    )?;
     let (agent_unread_messages, consumed_agent_message_ids) = apply_agent_prompt_layers(
         &workspace.path,
         &mut chat_context,
@@ -843,12 +873,6 @@ async fn run_coordinator_task_inner(
         consume_agent_messages(&workspace.path, &consumed_agent_message_ids)
     })
     .await?;
-    chat_context.agent_associations = AgentRunAssociations {
-        team_id: Some(task.team_id.clone()),
-        instance_id: Some(task.owner_instance_id.clone()),
-        task_id: Some(task.id.clone()),
-        attempt_id: Some(attempt_id.clone()),
-    };
     let database = open_workspace_database_critical(&workspace.path)?;
     chat_context.plan_phase_provenance = database
         .plan_phase_attempt_for_agent_task(&task.id)
@@ -875,30 +899,17 @@ async fn run_coordinator_task_inner(
     chat_context.agent_task_input = Some(input);
     chat_context.agent_allowed_tools = Some(allowed_tools);
     chat_context.agent_tool_context = Some(AgentToolContext {
+        workspace_id: workspace.id.clone(),
         workspace_path: workspace.path.clone(),
         associations: chat_context.agent_associations.clone(),
         collaboration_tools_enabled: task_input.collaboration_tools_enabled,
         permissions: collaboration_permissions,
         agent_definitions: config.agent_definitions.clone(),
         scheduler: state.agent_scheduler.clone(),
+        active_chat_runs: state.active_chat_runs.clone(),
     });
     chat_context.session_upload_paths = Some(session_upload_paths);
 
-    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
-    let next_run_event_sequence = open_workspace_database_critical(&workspace.path)?
-        .next_run_event_sequence(task.id.as_str())
-        .map_err(ApiError::from_workspace_error)?;
-    let registration = state.active_chat_runs.register(
-        task.id.to_string(),
-        workspace.id.clone(),
-        team.chat_id.clone(),
-        chat_context.assistant_message_id.clone(),
-        chat_context.assistant_sequence,
-        chat_context.memories_used.clone(),
-        chat_context.agent_primary_chat_output,
-        next_run_event_sequence,
-        guidance_tx,
-    )?;
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
     let lifecycle_context =
         AgentLifecycleOperationContext::from_identity(workspace, task_id, attempt_id);

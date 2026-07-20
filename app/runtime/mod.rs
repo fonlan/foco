@@ -38,6 +38,7 @@ pub(crate) use code_graph::{
     CodeGraphIndexState, recently_active_code_graph_workspaces,
     spawn_code_graph_index_initialization, spawn_code_graph_workspace_initialization_if_needed,
 };
+pub(crate) use foco_store::workspace::AGENT_MESSAGE_GUIDANCE_SOURCE;
 pub(crate) use image_tools::{
     BrokeredImageFile, execute_image_tool, image_model_available, image_tool_timeout_ms,
     is_image_tool_name, materialize_brokered_image_result,
@@ -70,8 +71,9 @@ pub(crate) use reasoning_loop_detector::{
 };
 pub(crate) use sidecar_config::{SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle};
 pub(crate) use subscriptions::{
-    ActiveChatRunRegistration, ActiveChatRunRegistry, ActiveChatRunSubscription,
-    ActiveChatRunSummary, ChatRunCancellation, GuidanceMessage, chat_run_subscription_stream,
+    ActiveAgentRunIdentity, ActiveChatRunRegistration, ActiveChatRunRegistry,
+    ActiveChatRunSubscription, ActiveChatRunSummary, AgentMessageGuidanceDelivery,
+    ChatRunCancellation, GuidanceMessage, chat_run_subscription_stream,
 };
 pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
 #[cfg(test)]

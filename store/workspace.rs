@@ -92,6 +92,8 @@ pub const WORKSPACE_SCHEMA_VERSION: u32 = 40;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
+/// Stable `guidanceApplied.source` marker for a persisted Agent message delivered live.
+pub const AGENT_MESSAGE_GUIDANCE_SOURCE: &str = "agentMessage";
 
 /// Persisted `llm_requests.request_kind` for Workspace Spec manual/refresh generation.
 pub const LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION: &str = "workspace spec generation";
@@ -7915,6 +7917,121 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         Ok(())
+    }
+
+    /// Durably applies one live Agent message guidance event and consumes that message.
+    ///
+    /// A previously consumed message is an idempotent no-op, preventing a duplicate live
+    /// delivery from producing another run event or changing `consumed_at`.
+    pub fn insert_agent_message_guidance_run_event_and_consume(
+        &mut self,
+        event: NewRunEvent<'_>,
+        message_id: &AgentMessageId,
+        source: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if event.event_type != "guidance_applied" {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent message consumption requires a guidance_applied run event"
+                    .to_string(),
+            });
+        }
+        if source != AGENT_MESSAGE_GUIDANCE_SOURCE {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent message consumption requires the agentMessage guidance source"
+                    .to_string(),
+            });
+        }
+        let payload =
+            serde_json::from_str::<serde_json::Value>(event.payload_json).map_err(|err| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!("agent message guidance payload must be valid JSON: {err}"),
+                }
+            })?;
+        let payload_id = payload.get("id").and_then(serde_json::Value::as_str);
+        let payload_source = payload.get("source").and_then(serde_json::Value::as_str);
+        if payload_id != Some(message_id.as_str())
+            || payload_source != Some(AGENT_MESSAGE_GUIDANCE_SOURCE)
+        {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "agent message guidance payload id or source did not match".to_string(),
+            });
+        }
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let message = transaction
+            .query_row(
+                AGENT_MESSAGE_SELECT_BY_ID,
+                params![message_id.as_str()],
+                agent_message_from_row,
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("agent message '{message_id}' was not found"),
+            })?;
+        if message.consumed_at.is_some() {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+
+        transaction
+            .execute(
+                "INSERT INTO run_events
+                    (id, chat_id, run_id, sequence, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.id,
+                    event.chat_id,
+                    event.run_id,
+                    event.sequence,
+                    event.event_type,
+                    event.payload_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let consumed = transaction
+            .execute(
+                "UPDATE agent_messages SET consumed_at = ?2
+                 WHERE id = ?1 AND consumed_at IS NULL",
+                params![message_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if consumed != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("agent message '{message_id}' could not be consumed"),
+            });
+        }
+        let audit_payload = json!({
+            "senderInstanceId": message.sender_instance_id.as_ref().map(ToString::to_string),
+            "receiverInstanceId": message.receiver_instance_id.to_string(),
+            "kind": message.kind.as_str(),
+        })
+        .to_string();
+        append_agent_event_in_transaction(
+            &transaction,
+            NewAgentEvent {
+                team_id: &message.team_id,
+                event_type: "message_consumed",
+                instance_id: Some(&message.receiver_instance_id),
+                task_id: message.related_task_id.as_ref(),
+                attempt_id: None,
+                message_id: Some(&message.id),
+                payload_json: &audit_payload,
+            },
+            &database_path,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     pub fn run_events_for_run(

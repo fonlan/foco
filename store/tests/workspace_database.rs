@@ -17553,6 +17553,145 @@ fn phase6_agent_messages_are_ordered_redacted_and_explicitly_consumed() {
 }
 
 #[test]
+fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-agent-guidance", "guidance");
+    let message_id = AgentMessageId::new("agent-message-guidance-live").expect("message id");
+    database
+        .insert_agent_message(NewAgentMessage {
+            id: &message_id,
+            team_id: &team_id,
+            sender_instance_id: Some(&instance_id),
+            receiver_instance_id: &instance_id,
+            related_task_id: None,
+            reply_to_message_id: None,
+            kind: AgentMessageKind::Notification,
+            content: "apply this live guidance",
+        })
+        .expect("insert message");
+
+    let payload = json!({
+        "type": "guidanceApplied",
+        "id": message_id.to_string(),
+        "content": "apply this live guidance",
+        "source": "agentMessage",
+    })
+    .to_string();
+    let rejected_payload = json!({
+        "type": "guidanceApplied",
+        "id": message_id.to_string(),
+        "content": "apply this live guidance",
+        "source": "manualGuidance",
+    })
+    .to_string();
+    let rejected = database
+        .insert_agent_message_guidance_run_event_and_consume(
+            NewRunEvent {
+                id: "run-guidance-event-manual",
+                chat_id: "chat-agent-guidance",
+                run_id: "run-guidance",
+                sequence: 0,
+                event_type: "guidance_applied",
+                payload_json: &rejected_payload,
+            },
+            &message_id,
+            "manualGuidance",
+        )
+        .expect_err("manual guidance must not consume an Agent message");
+    assert!(
+        rejected
+            .to_string()
+            .contains("agentMessage guidance source")
+    );
+    assert_eq!(
+        database
+            .agent_message(&message_id)
+            .expect("message read")
+            .expect("message")
+            .consumed_at,
+        None
+    );
+    assert!(
+        database
+            .run_events_for_run("run-guidance")
+            .expect("events")
+            .is_empty()
+    );
+
+    assert!(
+        database
+            .insert_agent_message_guidance_run_event_and_consume(
+                NewRunEvent {
+                    id: "run-guidance-event-0",
+                    chat_id: "chat-agent-guidance",
+                    run_id: "run-guidance",
+                    sequence: 0,
+                    event_type: "guidance_applied",
+                    payload_json: &payload,
+                },
+                &message_id,
+                "agentMessage",
+            )
+            .expect("persist live guidance")
+    );
+    assert!(
+        database
+            .agent_message(&message_id)
+            .expect("message read")
+            .expect("message")
+            .consumed_at
+            .is_some()
+    );
+    let events = database.run_events_for_run("run-guidance").expect("events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, "run-guidance-event-0");
+    let consumed_events = database
+        .agent_events_after(&team_id, -1)
+        .expect("Agent events")
+        .into_iter()
+        .filter(|event| event.event_type == "message_consumed")
+        .collect::<Vec<_>>();
+    assert_eq!(consumed_events.len(), 1);
+    assert_eq!(consumed_events[0].message_id.as_ref(), Some(&message_id));
+
+    assert!(
+        !database
+            .insert_agent_message_guidance_run_event_and_consume(
+                NewRunEvent {
+                    id: "run-guidance-event-1",
+                    chat_id: "chat-agent-guidance",
+                    run_id: "run-guidance",
+                    sequence: 1,
+                    event_type: "guidance_applied",
+                    payload_json: &payload,
+                },
+                &message_id,
+                "agentMessage",
+            )
+            .expect("duplicate live guidance is a no-op")
+    );
+    assert_eq!(
+        database
+            .run_events_for_run("run-guidance")
+            .expect("events")
+            .len(),
+        1
+    );
+    assert_eq!(
+        database
+            .agent_events_after(&team_id, -1)
+            .expect("Agent events")
+            .into_iter()
+            .filter(|event| event.event_type == "message_consumed")
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn phase6_agent_child_tasks_are_team_scoped_and_queued_only_cancellable() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

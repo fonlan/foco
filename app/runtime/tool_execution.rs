@@ -8,10 +8,10 @@ use std::{
 use chrono::{Duration as ChronoDuration, SecondsFormat, Utc};
 
 use foco_agent::{
-    AgentAttemptId, AgentCollaborationTool, AgentDefinitionId, AgentExecutionWorkspaceMode,
-    AgentInstanceId, AgentMessageId, AgentMessageKind, AgentPermissions, AgentRunAssociations,
-    AgentTaskId, AgentTaskStatus, AgentTaskWaitMode, PendingToolCall, ToolExecutionMode,
-    ToolExecutionPlan, ToolResourceLock, tool_resource_locks,
+    AgentCollaborationTool, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
+    AgentMessageId, AgentMessageKind, AgentPermissions, AgentRunAssociations, AgentTaskId,
+    AgentTaskStatus, AgentTaskWaitMode, PendingToolCall, ToolExecutionMode, ToolExecutionPlan,
+    ToolResourceLock, tool_resource_locks,
 };
 use foco_mcp::{McpRegistry, is_mcp_tool_name};
 use foco_providers::ProviderConnectionConfig;
@@ -41,11 +41,12 @@ use tokio::time::timeout;
 use super::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
-    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, AskQuestionInput, QuestionAnswer,
-    QuestionItem, QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest,
-    ToolOutputDeltaSink, ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry,
-    execute_image_tool, execute_web_tool, image_tool_timeout_ms, is_image_tool_name,
-    is_web_tool_name, web_tool_timeout_ms,
+    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AGENT_MESSAGE_GUIDANCE_SOURCE, ActiveChatRunRegistry,
+    AgentMessageGuidanceDelivery, AgentScheduler, AskQuestionInput, QuestionAnswer, QuestionItem,
+    QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest, ToolOutputDeltaSink,
+    ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry, execute_image_tool,
+    execute_web_tool, image_tool_timeout_ms, is_image_tool_name, is_web_tool_name,
+    web_tool_timeout_ms,
 };
 use crate::*;
 
@@ -232,12 +233,14 @@ pub(crate) fn pending_tool_calls(tool_calls: &[NeutralToolCall]) -> Vec<PendingT
 
 #[derive(Clone)]
 pub(crate) struct AgentToolContext {
+    pub(crate) workspace_id: String,
     pub(crate) workspace_path: PathBuf,
     pub(crate) associations: AgentRunAssociations,
     pub(crate) collaboration_tools_enabled: bool,
     pub(crate) permissions: AgentPermissions,
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) scheduler: AgentScheduler,
+    pub(crate) active_chat_runs: ActiveChatRunRegistry,
 }
 
 pub(crate) async fn execute_tool_calls_parallel(
@@ -1680,12 +1683,30 @@ fn execute_agent_send_message(
             "replyToMessageId": message.reply_to_message_id.as_ref().map(ToString::to_string),
         }),
     )?;
+    drop(database);
+    let delivery = context.active_chat_runs.deliver_agent_message_guidance(
+        &context.workspace_id,
+        team_id,
+        &message.receiver_instance_id,
+        message.related_task_id.as_ref(),
+        GuidanceMessage {
+            id: message.id.to_string(),
+            content: message.content.clone(),
+            attachments: Vec::new(),
+            source: AGENT_MESSAGE_GUIDANCE_SOURCE.to_string(),
+            interrupted_assistant_id: None,
+        },
+    );
     Ok(json!({
         "messageId": message.id.to_string(),
         "receiverInstanceId": message.receiver_instance_id.to_string(),
         "kind": message.kind.as_str(),
         "sequence": message.sequence,
         "createdAt": message.created_at,
+        "delivery": match delivery {
+            AgentMessageGuidanceDelivery::Guidance => "guidance",
+            AgentMessageGuidanceDelivery::Queued => "queued",
+        },
     }))
 }
 
@@ -3985,7 +4006,7 @@ fn normalize_question_options(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foco_agent::{AgentDefinitionId, AgentTeamId};
+    use foco_agent::{AgentAttemptId, AgentDefinitionId, AgentTeamId};
     use foco_store::{
         config::{AgentDefinitionSettings, AgentModelOptions, MemorySettings},
         memory::MemoryStatus,
@@ -7549,6 +7570,7 @@ mod tests {
         // Keep wake_rx alive so successful collaboration tools can call scheduler.wake().
         let (scheduler, wake_rx) = AgentScheduler::new();
         let context = AgentToolContext {
+            workspace_id: "workspace-agent-tool-test".to_string(),
             workspace_path: workspace.path().to_path_buf(),
             associations: AgentRunAssociations {
                 team_id: Some(team_id.clone()),
@@ -7560,6 +7582,7 @@ mod tests {
             permissions,
             agent_definitions: Vec::new(),
             scheduler,
+            active_chat_runs: ActiveChatRunRegistry::default(),
         };
         (workspace, context, team_id, instance_id, task_id, wake_rx)
     }
@@ -7642,6 +7665,84 @@ mod tests {
                 .as_str()
                 .expect("error text")
                 .contains("is not enabled for this run")
+        );
+    }
+
+    #[test]
+    fn agent_send_message_delivers_live_guidance_without_consuming_message() {
+        let (workspace, context, team_id, instance_id, _task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions::default());
+        let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+        let _registration = context
+            .active_chat_runs
+            .register_agent(
+                "run-agent-message-live".to_string(),
+                context.workspace_id.clone(),
+                "chat-agent-tool-test".to_string(),
+                "assistant-agent-message-live".to_string(),
+                1,
+                Vec::new(),
+                false,
+                crate::runtime::ActiveAgentRunIdentity {
+                    team_id: team_id.clone(),
+                    instance_id: instance_id.clone(),
+                    task_id: context
+                        .associations
+                        .task_id
+                        .clone()
+                        .expect("fixture task id"),
+                    _attempt_id: AgentAttemptId::new("agent-attempt-tool-message-live")
+                        .expect("attempt id"),
+                },
+                0,
+                guidance_tx,
+            )
+            .expect("register active Agent run");
+
+        let output = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_SEND_MESSAGE_TOOL,
+            "call-agent-message-live",
+            json!({
+                "receiverInstanceId": instance_id.to_string(),
+                "kind": "notification",
+                "content": "apply this immediately",
+                "replyToMessageId": null,
+                "relatedTaskId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect("send Agent message");
+        assert_eq!(output["delivery"], "guidance");
+
+        let guidance = guidance_rx.try_recv().expect("live guidance");
+        assert_eq!(guidance.id, output["messageId"]);
+        assert_eq!(guidance.content, "apply this immediately");
+        assert_eq!(guidance.source, AGENT_MESSAGE_GUIDANCE_SOURCE);
+
+        let message_id = foco_agent::AgentMessageId::new(
+            output["messageId"].as_str().expect("message id string"),
+        )
+        .expect("Agent message id");
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        assert_eq!(
+            database
+                .agent_message(&message_id)
+                .expect("message read")
+                .expect("message")
+                .consumed_at,
+            None
+        );
+        assert!(
+            database
+                .agent_events_after(&team_id, -1)
+                .expect("Agent events")
+                .iter()
+                .any(|event| {
+                    event.event_type == "message_created"
+                        && event.message_id.as_ref() == Some(&message_id)
+                })
         );
     }
 

@@ -105,7 +105,7 @@ fn agent_get_task_definition() -> ToolDefinition {
 fn agent_send_message_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_SEND_MESSAGE_TOOL,
-        description: "Send a persistent point-to-point message to another instance in the current Agent team. This does not create a task or wake an idle model run.",
+        description: "Send a persistent point-to-point message to another instance in the current Agent team. This does not create a task or wake an idle model run. When the matching receiver task is already running, the message is applied as guidance for that run; otherwise it remains queued for a later attempt.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

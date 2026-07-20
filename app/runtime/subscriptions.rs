@@ -6,7 +6,9 @@ use std::{
 };
 
 use axum::response::sse::Event;
-use foco_agent::AgentRunCancellation;
+use foco_agent::{
+    AgentAttemptId, AgentInstanceId, AgentMessageId, AgentRunCancellation, AgentTaskId, AgentTeamId,
+};
 use foco_providers::NeutralChatAttachment;
 use foco_store::workspace::{
     CodeChangeStats, NewMessage, NewRunEvent, NewToolCall, NewToolResult, WorkspaceDatabase,
@@ -23,10 +25,19 @@ pub(crate) struct ActiveChatRunRegistry {
     runs: Arc<Mutex<HashMap<String, ActiveChatRun>>>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveAgentRunIdentity {
+    pub(crate) team_id: AgentTeamId,
+    pub(crate) instance_id: AgentInstanceId,
+    pub(crate) task_id: AgentTaskId,
+    pub(crate) _attempt_id: AgentAttemptId,
+}
+
 #[derive(Clone)]
 struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
+    agent_identity: Option<ActiveAgentRunIdentity>,
     primary_chat_output: bool,
     guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     accepting_guidance: bool,
@@ -111,9 +122,15 @@ pub(crate) struct GuidanceMessage {
     pub(crate) id: String,
     pub(crate) content: String,
     pub(crate) attachments: Vec<NeutralChatAttachment>,
-    /// `manualGuidance` or `reasoningLoopGuard` (and future interruption sources).
+    /// `manualGuidance`, `agentMessage`, or `reasoningLoopGuard`.
     pub(crate) source: String,
     pub(crate) interrupted_assistant_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentMessageGuidanceDelivery {
+    Guidance,
+    Queued,
 }
 
 impl ActiveChatRunRegistry {
@@ -130,6 +147,11 @@ impl ActiveChatRunRegistry {
             .count())
     }
 
+    /// Registers an ordinary chat run without Agent task identity.
+    ///
+    /// This intentionally preserves the long-standing internal API used by chat handling and
+    /// focused runtime tests. Agent task runs must use [`Self::register_agent`] so that only
+    /// scheduler-owned runs can receive an Agent message as live guidance.
     pub(crate) fn register(
         &self,
         run_id: String,
@@ -139,6 +161,65 @@ impl ActiveChatRunRegistry {
         assistant_sequence: i64,
         memories_used: Vec<ChatMemoryUsedSummary>,
         primary_chat_output: bool,
+        next_sequence: i64,
+        guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    ) -> Result<ActiveChatRunRegistration, ApiError> {
+        self.register_with_agent_identity(
+            run_id,
+            workspace_id,
+            chat_id,
+            assistant_message_id,
+            assistant_sequence,
+            memories_used,
+            primary_chat_output,
+            None,
+            next_sequence,
+            guidance_tx,
+        )
+    }
+
+    /// Registers a scheduler-owned Agent task run that may accept live Agent-message guidance.
+    pub(crate) fn register_agent(
+        &self,
+        run_id: String,
+        workspace_id: String,
+        chat_id: String,
+        assistant_message_id: String,
+        assistant_sequence: i64,
+        memories_used: Vec<ChatMemoryUsedSummary>,
+        primary_chat_output: bool,
+        agent_identity: ActiveAgentRunIdentity,
+        next_sequence: i64,
+        guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    ) -> Result<ActiveChatRunRegistration, ApiError> {
+        self.register_with_agent_identity(
+            run_id,
+            workspace_id,
+            chat_id,
+            assistant_message_id,
+            assistant_sequence,
+            memories_used,
+            primary_chat_output,
+            Some(agent_identity),
+            next_sequence,
+            guidance_tx,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the registration boundary keeps run state explicit and preserves the existing chat API"
+    )]
+    fn register_with_agent_identity(
+        &self,
+        run_id: String,
+        workspace_id: String,
+        chat_id: String,
+        assistant_message_id: String,
+        assistant_sequence: i64,
+        memories_used: Vec<ChatMemoryUsedSummary>,
+        primary_chat_output: bool,
+        agent_identity: Option<ActiveAgentRunIdentity>,
         next_sequence: i64,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
@@ -167,6 +248,7 @@ impl ActiveChatRunRegistry {
             ActiveChatRun {
                 workspace_id,
                 chat_id,
+                agent_identity,
                 primary_chat_output,
                 guidance_tx,
                 accepting_guidance: true,
@@ -363,6 +445,50 @@ impl ActiveChatRunRegistry {
 
         Ok(guidance)
     }
+
+    /// Delivers a persisted Agent message to exactly one matching active Agent run.
+    ///
+    /// This deliberately treats every routing uncertainty as queued delivery: the durable
+    /// message remains unread and is injected when the receiver starts its next attempt.
+    pub(crate) fn deliver_agent_message_guidance(
+        &self,
+        workspace_id: &str,
+        team_id: &AgentTeamId,
+        receiver_instance_id: &AgentInstanceId,
+        related_task_id: Option<&AgentTaskId>,
+        guidance: GuidanceMessage,
+    ) -> AgentMessageGuidanceDelivery {
+        let matching_runs = match self.runs.lock() {
+            Ok(runs) => runs
+                .values()
+                .filter(|run| {
+                    let Some(identity) = run.agent_identity.as_ref() else {
+                        return false;
+                    };
+                    run.workspace_id == workspace_id
+                        && run.accepting_guidance
+                        && !*run.completed_rx.borrow()
+                        && identity.team_id == *team_id
+                        && identity.instance_id == *receiver_instance_id
+                        && related_task_id
+                            .map(|task_id| identity.task_id == *task_id)
+                            .unwrap_or(true)
+                })
+                .map(|run| run.guidance_tx.clone())
+                .collect::<Vec<_>>(),
+            Err(_) => return AgentMessageGuidanceDelivery::Queued,
+        };
+
+        let [guidance_tx] = matching_runs.as_slice() else {
+            return AgentMessageGuidanceDelivery::Queued;
+        };
+
+        if guidance_tx.send(guidance).is_ok() {
+            AgentMessageGuidanceDelivery::Guidance
+        } else {
+            AgentMessageGuidanceDelivery::Queued
+        }
+    }
 }
 
 pub(crate) struct ActiveChatRunRegistration {
@@ -399,26 +525,56 @@ impl ActiveChatRunRegistration {
             event_type: captured.event_type,
             payload_json,
         };
-        self.next_sequence += 1;
 
-        {
+        let persisted = {
             let mut database = open_workspace_database(workspace_path)?;
-            let id = format!("{}-event-{}", self.run_id, event_frame.sequence);
-            database
-                .insert_run_event(NewRunEvent {
-                    id: &id,
-                    chat_id,
-                    run_id: &self.run_id,
-                    sequence: event_frame.sequence,
-                    event_type: &event_frame.event_type,
-                    payload_json: &event_frame.payload_json,
-                })
-                .map_err(ApiError::from_workspace_error)?;
-            if self.primary_chat_output {
+            let run_event_id = format!("{}-event-{}", self.run_id, event_frame.sequence);
+            let persisted = match event {
+                ChatSseEvent::GuidanceApplied { id, source, .. }
+                    if source == crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE =>
+                {
+                    let message_id = AgentMessageId::new(id.clone()).map_err(|source| {
+                        ApiError::internal(format!("invalid Agent message guidance id: {source}"))
+                    })?;
+                    database
+                        .insert_agent_message_guidance_run_event_and_consume(
+                            NewRunEvent {
+                                id: &run_event_id,
+                                chat_id,
+                                run_id: &self.run_id,
+                                sequence: event_frame.sequence,
+                                event_type: &event_frame.event_type,
+                                payload_json: &event_frame.payload_json,
+                            },
+                            &message_id,
+                            crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE,
+                        )
+                        .map_err(ApiError::from_workspace_error)?
+                }
+                _ => {
+                    database
+                        .insert_run_event(NewRunEvent {
+                            id: &run_event_id,
+                            chat_id,
+                            run_id: &self.run_id,
+                            sequence: event_frame.sequence,
+                            event_type: &event_frame.event_type,
+                            payload_json: &event_frame.payload_json,
+                        })
+                        .map_err(ApiError::from_workspace_error)?;
+                    true
+                }
+            };
+            if persisted && self.primary_chat_output {
                 self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
                 self.persist_tool_state_for_event(&mut database, chat_id, event)?;
             }
+            persisted
+        };
+        if !persisted {
+            return Ok(());
         }
+        self.next_sequence += 1;
 
         self.events
             .lock()
@@ -718,7 +874,7 @@ mod tests {
         body::to_bytes,
         response::{IntoResponse, Sse},
     };
-    use tokio::sync::{broadcast, watch};
+    use tokio::sync::{broadcast, mpsc, watch};
 
     use super::*;
 
@@ -754,5 +910,140 @@ mod tests {
         assert!(!text.contains("old"));
         assert!(text.contains("id: 2"));
         assert!(text.contains("new"));
+    }
+
+    #[tokio::test]
+    async fn agent_message_guidance_delivers_only_to_the_exact_active_task() {
+        let registry = ActiveChatRunRegistry::default();
+        let team_id = AgentTeamId::new("agent-team-guidance").expect("team id");
+        let instance_id = AgentInstanceId::new("agent-instance-guidance").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-guidance").expect("task id");
+        let other_task_id = AgentTaskId::new("agent-task-guidance-other").expect("other task id");
+        let (guidance_tx, mut guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register_agent(
+                "run-guidance".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance".to_string(),
+                "assistant-guidance".to_string(),
+                1,
+                Vec::new(),
+                false,
+                ActiveAgentRunIdentity {
+                    team_id: team_id.clone(),
+                    instance_id: instance_id.clone(),
+                    task_id: task_id.clone(),
+                    _attempt_id: AgentAttemptId::new("agent-attempt-guidance").expect("attempt id"),
+                },
+                0,
+                guidance_tx,
+            )
+            .expect("register active Agent run");
+        let guidance = GuidanceMessage {
+            id: "agent-message-guidance".to_string(),
+            content: "apply this now".to_string(),
+            attachments: Vec::new(),
+            source: crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE.to_string(),
+            interrupted_assistant_id: None,
+        };
+
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &team_id,
+                &instance_id,
+                Some(&other_task_id),
+                guidance.clone(),
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+        assert!(guidance_rx.try_recv().is_err());
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &team_id,
+                &instance_id,
+                Some(&task_id),
+                guidance,
+            ),
+            AgentMessageGuidanceDelivery::Guidance
+        );
+        assert_eq!(
+            guidance_rx.recv().await.expect("guidance delivered").id,
+            "agent-message-guidance"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_message_guidance_queues_when_matching_runs_are_ambiguous() {
+        let registry = ActiveChatRunRegistry::default();
+        let team_id = AgentTeamId::new("agent-team-guidance-ambiguous").expect("team id");
+        let instance_id =
+            AgentInstanceId::new("agent-instance-guidance-ambiguous").expect("instance id");
+        let first_identity = ActiveAgentRunIdentity {
+            team_id: team_id.clone(),
+            instance_id: instance_id.clone(),
+            task_id: AgentTaskId::new("agent-task-guidance-ambiguous-first")
+                .expect("first task id"),
+            _attempt_id: AgentAttemptId::new("agent-attempt-guidance-ambiguous-first")
+                .expect("first attempt id"),
+        };
+        let second_identity = ActiveAgentRunIdentity {
+            team_id: team_id.clone(),
+            instance_id: instance_id.clone(),
+            task_id: AgentTaskId::new("agent-task-guidance-ambiguous-second")
+                .expect("second task id"),
+            _attempt_id: AgentAttemptId::new("agent-attempt-guidance-ambiguous-second")
+                .expect("second attempt id"),
+        };
+        let (first_tx, mut first_rx) = mpsc::unbounded_channel();
+        let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+        let _first = registry
+            .register_agent(
+                "run-guidance-first".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance-first".to_string(),
+                "assistant-guidance-first".to_string(),
+                1,
+                Vec::new(),
+                false,
+                first_identity,
+                0,
+                first_tx,
+            )
+            .expect("register first run");
+        let _second = registry
+            .register_agent(
+                "run-guidance-second".to_string(),
+                "workspace-guidance".to_string(),
+                "chat-guidance-second".to_string(),
+                "assistant-guidance-second".to_string(),
+                1,
+                Vec::new(),
+                false,
+                second_identity,
+                0,
+                second_tx,
+            )
+            .expect("register second run");
+
+        assert_eq!(
+            registry.deliver_agent_message_guidance(
+                "workspace-guidance",
+                &team_id,
+                &instance_id,
+                None,
+                GuidanceMessage {
+                    id: "agent-message-guidance-ambiguous".to_string(),
+                    content: "do not misroute".to_string(),
+                    attachments: Vec::new(),
+                    source: crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE.to_string(),
+                    interrupted_assistant_id: None,
+                },
+            ),
+            AgentMessageGuidanceDelivery::Queued
+        );
+        assert!(first_rx.try_recv().is_err());
+        assert!(second_rx.try_recv().is_err());
     }
 }
