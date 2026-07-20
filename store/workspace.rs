@@ -17425,6 +17425,33 @@ fn apply_message_metadata_mutation(
                 metadata.insert(key, value);
             }
         }
+        MessageMetadataMutation::MergeFieldsAndNestedObjectFields {
+            fields,
+            key,
+            nested_fields,
+        } => {
+            if key.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "message metadata key must not be empty".to_string(),
+                });
+            }
+            match metadata.get_mut(&key) {
+                None | Some(Value::Null) => {}
+                Some(Value::Object(nested)) => {
+                    for (field, value) in nested_fields {
+                        nested.insert(field, value);
+                    }
+                }
+                Some(_) => {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!("message metadata.{key} must be a JSON object"),
+                    });
+                }
+            }
+            for (key, value) in fields {
+                metadata.insert(key, value);
+            }
+        }
         MessageMetadataMutation::SetParts {
             parts,
             parts_version,

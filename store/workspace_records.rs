@@ -178,6 +178,13 @@ pub enum MessageMetadataMutation {
     MergeFields {
         fields: serde_json::Map<String, Value>,
     },
+    /// Merge top-level fields and fields of an existing nested object in one transaction.
+    /// The nested update is a no-op when `key` is missing or null; it errors when present but not an object.
+    MergeFieldsAndNestedObjectFields {
+        fields: serde_json::Map<String, Value>,
+        key: String,
+        nested_fields: serde_json::Map<String, Value>,
+    },
     /// Replace `parts` / `partsVersion` / `partsSource` without touching other keys.
     SetParts {
         parts: Value,

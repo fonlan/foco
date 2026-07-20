@@ -37,7 +37,7 @@ use foco_providers::{
     OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
     ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
     normalized_proxy_url, parse_provider_kind, recover_model_json_from_text,
-    stream_chat_with_capture_observer,
+    stream_chat_with_capture_observer, stream_chat_with_capture_observer_runtime_options,
 };
 #[cfg(test)]
 use foco_store::config::DEFAULT_TERMINAL_SHELL;
@@ -1464,6 +1464,7 @@ struct PromptContextRequest {
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
+    latency_mode: foco_providers::LatencyMode,
     skill_ids: Option<Vec<String>>,
     session_mode: Option<String>,
     message: Option<String>,
@@ -1480,6 +1481,7 @@ impl ChatStreamRequest {
             model_id: self.model_id,
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
+            latency_mode: self.latency_mode,
             skill_ids: self.skill_ids,
             session_mode: self.session_mode,
             message: Some(self.message),
@@ -1498,6 +1500,7 @@ impl ContextUsageRequest {
             model_id: self.model_id,
             provider_id: self.provider_id,
             thinking_level: self.thinking_level,
+            latency_mode: foco_providers::LatencyMode::Standard,
             skill_ids: self.skill_ids,
             session_mode: None,
             message: None,
@@ -1909,6 +1912,7 @@ struct ChatMessageRunConfigSummary {
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
+    latency_mode: foco_providers::LatencyMode,
     selected_skill_ids: Vec<String>,
     session_mode: Option<String>,
     team_mode_enabled: bool,
@@ -1921,6 +1925,7 @@ struct QueuedMessageRunSummary {
     model_id: String,
     provider_id: Option<String>,
     thinking_level: Option<String>,
+    latency_mode: foco_providers::LatencyMode,
     skill_ids: Vec<String>,
     session_mode: Option<String>,
     assistant_message_id: Option<String>,
@@ -2276,6 +2281,7 @@ struct PreparedChatContext {
     session_upload_paths: Option<Vec<String>>,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
+    latency_mode: foco_providers::LatencyMode,
     mcp_registry: Arc<McpRegistry>,
     hook_runtime: HookRuntime,
     global_hooks: HookConfig,
@@ -2324,6 +2330,7 @@ struct PreparedPromptContext {
     provider_id: String,
     provider_config: ProviderConnectionConfig,
     provider_request: NeutralChatRequest,
+    latency_mode: foco_providers::LatencyMode,
     default_agent_tool_capabilities: Vec<String>,
     context_budget: foco_agent::ContextBudget,
     memory_context_tokens: u64,
@@ -3449,9 +3456,12 @@ impl PreparedChatContext {
                     }
                     provider_stream = timeout(
                         Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
-                        stream_chat_with_capture_observer(
+                        stream_chat_with_capture_observer_runtime_options(
                             &self.provider_config,
                             turn_request,
+                            foco_providers::ChatRequestRuntimeOptions {
+                                latency_mode: self.latency_mode,
+                            },
                             api_audit_save_details(&self.global_config),
                             turn_capture.observer(),
                             self.openai_resp_ws_session_context(),
@@ -5277,6 +5287,7 @@ async fn prepare_chat_context_for_output(
         session_upload_paths: None,
         provider_config: prompt_context.provider_config,
         provider_request,
+        latency_mode: prompt_context.latency_mode,
         mcp_registry: state.mcp_registry.clone(),
         hook_runtime: state.hook_runtime.clone(),
         global_hooks: config.hooks.clone(),
@@ -9938,6 +9949,7 @@ fn queued_chat_metadata_json(
     model_id: &str,
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
+    latency_mode: foco_providers::LatencyMode,
     skill_ids: &[String],
     content: &str,
     session_mode: Option<&str>,
@@ -9952,6 +9964,7 @@ fn queued_chat_metadata_json(
             "modelId": model_id,
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
+            "latencyMode": latency_mode,
             "skillIds": skill_ids,
             "sessionMode": session_mode,
             "content": content,
@@ -9972,6 +9985,7 @@ fn queued_user_message_metadata_json(
     model_id: &str,
     provider_id: Option<&str>,
     thinking_level: Option<&str>,
+    latency_mode: foco_providers::LatencyMode,
     skill_ids: &[String],
     session_mode: Option<&str>,
     team_mode_enabled: bool,
@@ -9990,6 +10004,7 @@ fn queued_user_message_metadata_json(
     metadata_object.insert("modelId".to_string(), json!(model_id));
     metadata_object.insert("providerId".to_string(), json!(provider_id));
     metadata_object.insert("thinkingLevel".to_string(), json!(thinking_level));
+    metadata_object.insert("latencyMode".to_string(), json!(latency_mode));
     metadata_object.insert("selectedSkillIds".to_string(), json!(skill_ids));
     metadata_object.insert("teamModeEnabled".to_string(), json!(team_mode_enabled));
     metadata_object.insert(
@@ -10001,6 +10016,7 @@ fn queued_user_message_metadata_json(
             "modelId": model_id,
             "providerId": provider_id,
             "thinkingLevel": thinking_level,
+            "latencyMode": latency_mode,
             "skillIds": skill_ids,
             "sessionMode": session_mode,
         }),
@@ -12054,6 +12070,8 @@ fn queued_run_summary_from_chat_metadata(
         string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
     let thinking_level =
         string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
+    let latency_mode =
+        latency_mode_json_field(queued_run, "latencyMode", "latency_mode").unwrap_or_default();
     let session_mode =
         string_json_field(queued_run, "sessionMode", "session_mode").map(str::to_string);
     let assistant_message_id =
@@ -12082,6 +12100,7 @@ fn queued_run_summary_from_chat_metadata(
         model_id,
         provider_id,
         thinking_level,
+        latency_mode,
         skill_ids,
         session_mode,
         content,
@@ -12105,6 +12124,8 @@ fn queued_run_summary_from_message_metadata(
         string_json_field(queued_run, "providerId", "provider_id").map(str::to_string);
     let thinking_level =
         string_json_field(queued_run, "thinkingLevel", "thinking_level").map(str::to_string);
+    let latency_mode =
+        latency_mode_json_field(queued_run, "latencyMode", "latency_mode").unwrap_or_default();
     let session_mode =
         string_json_field(queued_run, "sessionMode", "session_mode").map(str::to_string);
     let assistant_message_id =
@@ -12129,6 +12150,7 @@ fn queued_run_summary_from_message_metadata(
         model_id: model_id.to_string(),
         provider_id,
         thinking_level,
+        latency_mode,
         skill_ids,
         session_mode,
         assistant_message_id,
@@ -12163,6 +12185,9 @@ fn user_message_run_config(
     let thinking_level = string_json_field(&metadata, "thinkingLevel", "thinking_level")
         .map(str::to_string)
         .or_else(|| queued_run.and_then(|queued_run| queued_run.thinking_level.clone()));
+    let latency_mode = latency_mode_json_field(&metadata, "latencyMode", "latency_mode")
+        .or_else(|| queued_run.map(|queued_run| queued_run.latency_mode))
+        .unwrap_or_default();
     let session_mode = string_json_field(&metadata, "sessionMode", "session_mode")
         .map(str::to_string)
         .or_else(|| queued_run.and_then(|queued_run| queued_run.session_mode.clone()));
@@ -12189,6 +12214,7 @@ fn user_message_run_config(
         model_id,
         provider_id,
         thinking_level,
+        latency_mode,
         selected_skill_ids,
         session_mode,
         team_mode_enabled,
@@ -12234,6 +12260,18 @@ fn string_json_field<'a>(value: &'a Value, primary: &str, alternate: &str) -> Op
         .get(primary)
         .or_else(|| value.get(alternate))
         .and_then(Value::as_str)
+}
+
+fn latency_mode_json_field(
+    value: &Value,
+    primary: &str,
+    alternate: &str,
+) -> Option<foco_providers::LatencyMode> {
+    value
+        .get(primary)
+        .or_else(|| value.get(alternate))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
 }
 
 fn i64_json_field(value: &Value, primary: &str, alternate: &str) -> Option<i64> {

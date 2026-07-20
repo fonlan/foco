@@ -113,6 +113,8 @@ pub(crate) struct CoordinatorTaskInput {
     pub(crate) skill_ids: Vec<String>,
     #[serde(default)]
     pub(crate) session_mode: Option<String>,
+    #[serde(default)]
+    pub(crate) latency_mode: foco_providers::LatencyMode,
     #[serde(default = "default_collaboration_tools_enabled")]
     pub(crate) collaboration_tools_enabled: bool,
     #[serde(default)]
@@ -767,6 +769,7 @@ async fn run_coordinator_task_inner(
             model_id: model_selection.model_id,
             provider_id: None,
             thinking_level: model_selection.thinking_level,
+            latency_mode: task_input.latency_mode,
             skill_ids: Some(task_input.skill_ids.clone()),
             session_mode: task_input.session_mode.clone(),
             message: task_input.message.clone(),
@@ -3754,6 +3757,7 @@ mod tests {
             attachments: Vec::new(),
             skill_ids: Vec::new(),
             session_mode: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
             collaboration_tools_enabled: false,
             defer_until_workspace_idle: false,
             delegated_input: None,

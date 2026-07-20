@@ -39,7 +39,7 @@ use foco_providers::{
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderRequestDumpObserver,
     ProviderRequestFailure, ProviderWireRequestDump, ProviderWsSessionContext,
-    recover_model_json_from_text, stream_chat_with_capture_observer,
+    recover_model_json_from_text, stream_chat_with_capture_observer_runtime_options,
 };
 use foco_store::{
     config::{
@@ -254,6 +254,7 @@ impl RemoteToolCatalog {
 /// Lightweight remote prompt context: messages plus durable source metadata for snapshot replay.
 struct RemotePreparedChatContext {
     provider_request: NeutralChatRequest,
+    latency_mode: foco_providers::LatencyMode,
     tool_catalog: Arc<RemoteToolCatalog>,
     session_mode: Option<String>,
     message_source_sequences: Vec<Option<i64>>,
@@ -310,6 +311,7 @@ impl RemoteSidecarRuntimeToolState {
         });
         let prepared = RemotePreparedChatContext {
             provider_request: request.clone(),
+            latency_mode: foco_providers::LatencyMode::Standard,
             tool_catalog,
             session_mode: None,
             message_source_sequences: vec![None; request.messages.len()],
@@ -5899,6 +5901,37 @@ async fn broker_llm_stream(
         }
     };
 
+    let latency_mode = if request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND {
+        match payload
+            .get("latencyMode")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default()
+        {
+            foco_providers::LatencyMode::Fast => {
+                match provider_config.supports_fast_latency_mode(&model_id) {
+                    Ok(true) => foco_providers::LatencyMode::Fast,
+                    Ok(false) => foco_providers::LatencyMode::Standard,
+                    Err(error) => {
+                        let _ = send_broker_llm_error(
+                            write,
+                            id,
+                            "bad_request",
+                            error.to_string(),
+                            provider_id.as_str(),
+                            model_id.as_str(),
+                        )
+                        .await;
+                        return;
+                    }
+                }
+            }
+            foco_providers::LatencyMode::Standard => foco_providers::LatencyMode::Standard,
+        }
+    } else {
+        foco_providers::LatencyMode::Standard
+    };
+
     let mut request = payload
         .get("request")
         .and_then(|request| serde_json::from_value::<NeutralChatRequest>(request.clone()).ok())
@@ -5996,6 +6029,7 @@ async fn broker_llm_stream(
             "kind": "route",
             "providerId": provider_id.as_str(),
             "modelId": model_id.as_str(),
+            "latencyMode": latency_mode,
         }),
         timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
     };
@@ -6072,9 +6106,10 @@ async fn broker_llm_stream(
                 .await;
                 return;
             }
-            result = stream_chat_with_capture_observer(
+            result = stream_chat_with_capture_observer_runtime_options(
                 &provider_config,
                 request,
+                foco_providers::ChatRequestRuntimeOptions { latency_mode },
                 save_details,
                 audit_writer.observer(),
                 broker_openai_resp_ws_session_context(
@@ -6089,9 +6124,10 @@ async fn broker_llm_stream(
             ) => result,
         }
     } else {
-        stream_chat_with_capture_observer(
+        stream_chat_with_capture_observer_runtime_options(
             &provider_config,
             request,
+            foco_providers::ChatRequestRuntimeOptions { latency_mode },
             save_details,
             audit_writer.observer(),
             broker_openai_resp_ws_session_context(
@@ -8517,6 +8553,15 @@ fn remote_message_run_config(metadata: &Value, queued_run: Option<&Value>) -> Op
         .cloned()
         .or_else(|| queued_run.and_then(|run| run.get("thinkingLevel").cloned()))
         .unwrap_or(Value::Null);
+    let latency_mode = queued_run
+        .and_then(|run| run.get("latencyMode").cloned())
+        .or_else(|| {
+            metadata
+                .get("latencyMode")
+                .or_else(|| metadata.get("latency_mode"))
+                .cloned()
+        })
+        .unwrap_or_else(|| json!(foco_providers::LatencyMode::Standard));
     let selected_skill_ids = remote_queued_skill_ids(
         metadata
             .get("selectedSkillIds")
@@ -8538,6 +8583,7 @@ fn remote_message_run_config(metadata: &Value, queued_run: Option<&Value>) -> Op
         "modelId": model_id,
         "providerId": provider_id,
         "thinkingLevel": thinking_level,
+        "latencyMode": latency_mode,
         "selectedSkillIds": selected_skill_ids,
         "sessionMode": session_mode,
         "teamModeEnabled": team_mode_enabled,
@@ -9183,6 +9229,11 @@ async fn remote_sidecar_edit_chat_user_message(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id = remote_optional_string(payload.get("providerId"));
     let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let latency_mode: foco_providers::LatencyMode = payload
+        .get("latencyMode")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let selected_skill_ids = remote_queued_skill_ids(
         payload
             .get("selectedSkillIds")
@@ -9228,6 +9279,7 @@ async fn remote_sidecar_edit_chat_user_message(
         "modelId": model_id,
         "providerId": provider_id,
         "thinkingLevel": thinking_level,
+        "latencyMode": latency_mode,
         "skillIds": selected_skill_ids,
         "sessionMode": session_mode,
         "content": message,
@@ -9237,6 +9289,7 @@ async fn remote_sidecar_edit_chat_user_message(
         "modelId": model_id,
         "providerId": provider_id,
         "thinkingLevel": thinking_level,
+        "latencyMode": latency_mode,
         "selectedSkillIds": selected_skill_ids,
         "sessionMode": session_mode,
         "teamModeEnabled": team_mode_enabled,
@@ -10307,6 +10360,27 @@ fn remote_sidecar_persist_owned_assistant_message(
     Ok(true)
 }
 
+fn remote_update_message_queued_latency_mode(
+    database: &mut WorkspaceDatabase,
+    message_id: &str,
+    latency_mode: foco_providers::LatencyMode,
+) -> Result<(), WorkspaceDatabaseError> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("latencyMode".to_string(), json!(latency_mode));
+    let mut nested_fields = serde_json::Map::new();
+    nested_fields.insert("latencyMode".to_string(), json!(latency_mode));
+    database
+        .mutate_message_metadata(
+            message_id,
+            MessageMetadataMutation::MergeFieldsAndNestedObjectFields {
+                fields,
+                key: "queuedRun".to_string(),
+                nested_fields,
+            },
+        )
+        .map(|_| ())
+}
+
 fn remote_mark_message_queued_run_started(
     database: &mut WorkspaceDatabase,
     message_id: &str,
@@ -10338,6 +10412,11 @@ async fn remote_sidecar_chat_queue(
     let model_id = remote_required_text(payload.get("modelId"), "modelId")?;
     let provider_id = remote_optional_string(payload.get("providerId"));
     let thinking_level = remote_optional_string(payload.get("thinkingLevel"));
+    let latency_mode: foco_providers::LatencyMode = payload
+        .get("latencyMode")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_default();
     let chat_title_override = remote_optional_trimmed_string(payload.get("chatTitleOverride"));
     let skill_ids =
         remote_queued_skill_ids(payload.get("skillIds").or_else(|| payload.get("skill_ids")));
@@ -10412,6 +10491,7 @@ async fn remote_sidecar_chat_queue(
         "modelId": model_id,
         "providerId": provider_id,
         "thinkingLevel": thinking_level,
+        "latencyMode": latency_mode,
         "skillIds": skill_ids,
         "sessionMode": session_mode,
         "content": message,
@@ -11438,6 +11518,7 @@ async fn remote_sidecar_provider_request(
         assistant_message_id,
         model_id,
         thinking_level,
+        json!(foco_providers::LatencyMode::Standard),
         tool_catalog,
         session_mode,
     )?
@@ -11452,12 +11533,14 @@ fn remote_sidecar_prepare_chat_context(
     assistant_message_id: &str,
     model_id: &str,
     thinking_level: Value,
+    latency_mode: Value,
     tool_catalog: Arc<RemoteToolCatalog>,
     session_mode: Option<String>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
     let requested_skill_ids =
         remote_sidecar_requested_skill_ids(database, chat_id, queued_user_message_id)?;
     let requested_thinking_level = serde_json::from_value(thinking_level).ok();
+    let requested_latency_mode = serde_json::from_value(latency_mode).unwrap_or_default();
     remote_sidecar_prepare_chat_context_with_options(
         state,
         database,
@@ -11467,6 +11550,7 @@ fn remote_sidecar_prepare_chat_context(
             model_id,
             requested_skill_ids: &requested_skill_ids,
             requested_thinking_level,
+            requested_latency_mode,
             assistant_draft: None,
             assistant_draft_reasoning: None,
             tool_catalog,
@@ -11480,6 +11564,7 @@ struct RemoteChatContextOptions<'a> {
     model_id: &'a str,
     requested_skill_ids: &'a [String],
     requested_thinking_level: Option<String>,
+    requested_latency_mode: foco_providers::LatencyMode,
     assistant_draft: Option<&'a str>,
     assistant_draft_reasoning: Option<&'a str>,
     tool_catalog: Arc<RemoteToolCatalog>,
@@ -11497,6 +11582,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
         model_id,
         requested_skill_ids,
         requested_thinking_level,
+        requested_latency_mode,
         assistant_draft,
         assistant_draft_reasoning,
         tool_catalog,
@@ -11674,6 +11760,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                     prompt_cache_retention: None,
                     agent_correlation: None,
                 },
+                requested_latency_mode,
                 tool_catalog,
                 session_mode,
                 message_source_sequences,
@@ -11735,6 +11822,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
             prompt_cache_retention: None,
             agent_correlation: None,
         },
+        requested_latency_mode,
         tool_catalog,
         session_mode,
         message_source_sequences,
@@ -11811,6 +11899,7 @@ fn remote_sidecar_append_assistant_draft(
 fn remote_sidecar_finish_prepared_context(
     state: &RemoteSidecarState,
     provider_request: NeutralChatRequest,
+    latency_mode: foco_providers::LatencyMode,
     tool_catalog: Arc<RemoteToolCatalog>,
     session_mode: Option<String>,
     message_source_sequences: Vec<Option<i64>>,
@@ -11824,6 +11913,7 @@ fn remote_sidecar_finish_prepared_context(
         .map_err(|e| e.into_response())?;
     Ok(RemotePreparedChatContext {
         provider_request,
+        latency_mode,
         tool_catalog,
         session_mode,
         message_source_sequences,
@@ -13021,6 +13111,7 @@ async fn remote_sidecar_run_broker_llm_turn(
     queued_user_message_id: &str,
     provider_id: &str,
     model_id: &str,
+    latency_mode: &mut foco_providers::LatencyMode,
     text: &mut String,
     reasoning: &mut String,
     run_metrics: &mut RemoteSidecarRunMetrics,
@@ -13150,6 +13241,31 @@ async fn remote_sidecar_run_broker_llm_turn(
                     .get("delta")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if kind == "route" {
+                    let effective_latency_mode = envelope
+                        .payload
+                        .get("latencyMode")
+                        .cloned()
+                        .and_then(|value| serde_json::from_value(value).ok())
+                        .unwrap_or_default();
+                    if *latency_mode != effective_latency_mode {
+                        *latency_mode = effective_latency_mode;
+                        if let Err(error) = with_sidecar_workspace_database(state, |database| {
+                            remote_update_message_queued_latency_mode(
+                                database,
+                                queued_user_message_id,
+                                effective_latency_mode,
+                            )
+                        }) {
+                            tracing::warn!(
+                                chat_id,
+                                queued_user_message_id,
+                                error = %error,
+                                "failed to persist normalized remote latency mode"
+                            );
+                        }
+                    }
+                }
                 if kind == "textDelta" {
                     run_metrics.capture_first_output();
                     turn_metrics.capture_first_output();
@@ -15060,6 +15176,7 @@ struct RemoteSidecarChatRunContext {
     provider_id: String,
     run_stream: RemoteActiveRunStream,
     initial_provider_request: NeutralChatRequest,
+    latency_mode: foco_providers::LatencyMode,
     tool_catalog: Arc<RemoteToolCatalog>,
     session_mode: Option<String>,
     skill_read_root_dirs: Vec<PathBuf>,
@@ -15081,6 +15198,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         mut provider_id,
         run_stream,
         initial_provider_request,
+        mut latency_mode,
         tool_catalog,
         session_mode,
         skill_read_root_dirs,
@@ -15367,6 +15485,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
             "providerId": provider_id,
             "modelId": model_id,
+            "latencyMode": latency_mode,
             "request": broker_request,
         });
         let turn_text_start = text.len();
@@ -15383,6 +15502,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             &queued_user_message_id,
             &provider_id,
             &model_id,
+            &mut latency_mode,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -17123,6 +17243,10 @@ async fn remote_sidecar_start_chat_run(
             &assistant_message_id,
             &model_id,
             payload.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+            payload
+                .get("latencyMode")
+                .cloned()
+                .unwrap_or_else(|| json!(foco_providers::LatencyMode::Standard)),
             tool_catalog,
             session_mode,
         ) {
@@ -17144,6 +17268,7 @@ async fn remote_sidecar_start_chat_run(
         }
     };
     let initial_provider_request = initial_prepared.provider_request.clone();
+    let latency_mode = initial_prepared.latency_mode;
     let tool_catalog = initial_prepared.tool_catalog.clone();
     let session_mode = initial_prepared.session_mode.clone();
     let skill_read_root_dirs = initial_prepared.skill_read_root_dirs.clone();
@@ -17164,6 +17289,7 @@ async fn remote_sidecar_start_chat_run(
             provider_id,
             run_stream: run_stream.clone(),
             initial_provider_request,
+            latency_mode,
             tool_catalog,
             session_mode,
             skill_read_root_dirs,
@@ -17294,6 +17420,7 @@ async fn remote_sidecar_context_usage(
             model_id: &model_id,
             requested_skill_ids: &requested_skill_ids,
             requested_thinking_level: thinking_level,
+            requested_latency_mode: foco_providers::LatencyMode::Standard,
             assistant_draft: assistant_draft.as_deref(),
             assistant_draft_reasoning: assistant_draft_reasoning.as_deref(),
             tool_catalog,
@@ -21713,6 +21840,7 @@ mod tests {
             assistant_message_id,
             model_id,
             thinking_level,
+            json!(foco_providers::LatencyMode::Standard),
             tool_catalog,
             session_mode,
         )
@@ -23597,6 +23725,7 @@ mod tests {
                 model_id: "model-1",
                 requested_skill_ids: &requested_skill_ids,
                 requested_thinking_level: None,
+                requested_latency_mode: foco_providers::LatencyMode::Standard,
                 assistant_draft: Some("assistant draft marker"),
                 assistant_draft_reasoning: Some("assistant draft reasoning marker"),
                 tool_catalog,
@@ -29390,7 +29519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_sidecar_chat_stream_aggregates_tool_followup_metrics() {
+    async fn remote_sidecar_chat_stream_downgrades_fast_before_tool_followup() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         fs::write(
             workspace.path().join("Cargo.toml"),
@@ -29411,18 +29540,54 @@ mod tests {
                 sequence: 0,
                 metadata_json: Some(
                     &json!({
+                        "modelId": "model-1",
+                        "providerId": "provider-1",
+                        "latencyMode": "fast",
                         "queuedRun": {
                             "status": "queued",
                             "userMessageId": "msg-user-1",
                             "assistantMessageId": "msg-assistant-1",
+                            "latencyMode": "fast",
                         }
                     })
                     .to_string(),
                 ),
             })
             .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-1",
+                chat_id: "chat-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
+        drop(database);
         let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let mut config = remote_test_config(workspace.path());
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: Some("https://example.invalid/v1".to_string()),
+            api_key: Some("remote-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: vec![foco_providers::ProviderModelRedirect {
+                from: "model-1".to_string(),
+                to: "gpt-5.4".to_string(),
+            }],
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
         let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
 
         let response = remote_sidecar_chat_stream(
@@ -29433,11 +29598,14 @@ mod tests {
                 "visibleAssistantMessageId": "msg-assistant-1",
                 "modelId": "model-1",
                 "providerId": "provider-1",
+                "latencyMode": "fast",
             })),
         )
         .await
         .expect("SSE response");
 
+        let (second_request_tx, second_request_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
         let broker_state = state.clone();
         let broker = tokio::spawn(async move {
             let first_request = loop {
@@ -29446,6 +29614,13 @@ mod tests {
                     break envelope;
                 }
             };
+            assert_eq!(
+                first_request
+                    .payload
+                    .get("latencyMode")
+                    .and_then(Value::as_str),
+                Some("fast")
+            );
             let first_id = first_request.id.expect("first request id");
             let first_pending = broker_state
                 .broker_pending
@@ -29454,6 +29629,21 @@ mod tests {
                 .get(&first_id)
                 .cloned()
                 .expect("first pending response channel");
+            first_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(first_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "route",
+                        "providerId": "provider-1",
+                        "modelId": "model-1",
+                        "latencyMode": "standard",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send normalized route");
             first_pending
                 .send(ControlEnvelope {
                     version: 1,
@@ -29490,6 +29680,19 @@ mod tests {
                     .iter()
                     .any(|message| message["role"] == "tool")
             );
+            assert_eq!(
+                second_request
+                    .payload
+                    .get("latencyMode")
+                    .and_then(Value::as_str),
+                Some("standard")
+            );
+            second_request_tx
+                .send(())
+                .expect("notify second request is ready for durable-state assertion");
+            finish_rx
+                .await
+                .expect("wait for durable-state assertion before final response");
             let second_id = second_request.id.expect("second request id");
             let second_pending = broker_state
                 .broker_pending
@@ -29527,13 +29730,42 @@ mod tests {
             (first_id, second_id)
         });
 
-        let bytes = tokio::time::timeout(
-            Duration::from_secs(10),
-            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
-        )
-        .await
-        .expect("tool followup SSE body should finish")
-        .expect("SSE bytes");
+        let mut sse_body = Box::pin(axum::body::to_bytes(
+            response.into_response().into_body(),
+            usize::MAX,
+        ));
+        let second_request_ready = tokio::time::timeout(Duration::from_secs(10), second_request_rx);
+        tokio::pin!(second_request_ready);
+        tokio::select! {
+            result = &mut sse_body => panic!(
+                "SSE ended before the tool follow-up request arrived: {result:?}"
+            ),
+            result = &mut second_request_ready => {
+                result
+                    .expect("second broker request should arrive")
+                    .expect("broker should notify second request");
+            }
+        }
+        {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+            let user_message = database
+                .message("msg-user-1")
+                .expect("user message lookup")
+                .expect("user message");
+            let running_metadata = serde_json::from_str::<Value>(&user_message.metadata_json)
+                .expect("running user metadata");
+            assert_eq!(running_metadata["latencyMode"], "standard");
+            assert_eq!(running_metadata["queuedRun"]["latencyMode"], "standard");
+        }
+        finish_tx
+            .send(())
+            .expect("allow final broker response after durable-state assertion");
+
+        let bytes = tokio::time::timeout(Duration::from_secs(10), sse_body)
+            .await
+            .expect("tool followup SSE body should finish")
+            .expect("SSE bytes");
         let (first_broker_request_id, second_broker_request_id) =
             broker.await.expect("broker task");
         let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
@@ -29558,6 +29790,18 @@ mod tests {
         assert_eq!(
             metadata["metrics"]["llmRequestIds"],
             json!([&first_broker_request_id, &second_broker_request_id])
+        );
+
+        let user_message = database
+            .message("msg-user-1")
+            .expect("user message lookup")
+            .expect("user message");
+        let user_metadata =
+            serde_json::from_str::<Value>(&user_message.metadata_json).expect("user metadata");
+        assert!(user_metadata.get("queuedRun").is_none());
+        assert_eq!(
+            remote_message_run_config(&user_metadata, None).expect("completed user run config")["latencyMode"],
+            "standard"
         );
 
         let audit_rows = database
@@ -29652,6 +29896,7 @@ mod tests {
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
         let result = remote_sidecar_run_broker_llm_turn(
             &state,
             &run_stream,
@@ -29663,6 +29908,7 @@ mod tests {
             "msg-user-1",
             "provider-legacy",
             "model-1",
+            &mut latency_mode,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -29806,6 +30052,7 @@ mod tests {
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
         let result = remote_sidecar_run_broker_llm_turn(
             &state,
             &run_stream,
@@ -29817,6 +30064,7 @@ mod tests {
             "msg-user-1",
             "provider-1",
             "model-1",
+            &mut latency_mode,
             &mut text,
             &mut reasoning,
             &mut run_metrics,
@@ -30772,6 +31020,7 @@ mod tests {
         let mut reasoning = String::new();
         let mut run_metrics = RemoteSidecarRunMetrics::new();
         let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
         let outcome = remote_sidecar_run_broker_llm_turn(
             &state,
             &run_stream,
@@ -30783,6 +31032,7 @@ mod tests {
             "msg-user-1",
             "provider-legacy",
             "model-1",
+            &mut latency_mode,
             &mut text,
             &mut reasoning,
             &mut run_metrics,

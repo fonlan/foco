@@ -688,6 +688,7 @@ fn scheduled_queue_input(
                 model_id,
                 provider_id: None,
                 thinking_level,
+                latency_mode: foco_providers::LatencyMode::Standard,
                 skill_ids: Some(skill_ids),
                 session_mode: None,
                 message: prompt,
