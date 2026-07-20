@@ -5145,6 +5145,10 @@ async fn prepare_chat_context_for_output(
         &chat_id,
         prompt_context.pending_spec_snapshot.as_ref(),
     )?;
+    // SessionStart may await command, HTTP, MCP, or prompt hooks. The initial
+    // chat and spec snapshot are durable now, so release the ordinary permit
+    // before crossing that external-effect boundary.
+    drop(database);
     let session_start_summary = state
         .hook_runtime
         .run_hooks(HookRunRequest {
@@ -5175,6 +5179,11 @@ async fn prepare_chat_context_for_output(
     let mut hook_context_messages = user_prompt_summary.additional_context;
     hook_context_messages.extend(session_start_summary.additional_context);
     let user_metadata_json = user_message_metadata_json(&prompt_context.attachments)?;
+    let mut database = open_workspace_database_ordinary_with_pre_stream_retry(
+        &prompt_context.workspace_path,
+        state.app_shutdown_rx.clone(),
+    )
+    .await?;
 
     if queued_user_message_id.is_some() {
         database

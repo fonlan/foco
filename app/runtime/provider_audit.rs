@@ -7,10 +7,9 @@ use foco_providers::{
     ProviderAuditRequestDump, ProviderFinalResponseDump, ProviderRequestDumpObserver,
     ProviderRequestFailure,
 };
-use foco_store::workspace::WorkspaceDatabase;
 use serde::Serialize;
 
-use crate::ApiError;
+use crate::{ApiError, open_workspace_database};
 
 #[derive(Clone)]
 pub(crate) struct ProviderAuditCapture {
@@ -68,8 +67,7 @@ impl ProviderAuditCapture {
         if !self.save_details {
             return Ok(None);
         }
-        let database = WorkspaceDatabase::open_or_create(&self.workspace_path)
-            .map_err(ApiError::from_workspace_error)?;
+        let database = open_workspace_database(&self.workspace_path)?;
         let request = database
             .llm_request(&self.request_id)
             .map_err(ApiError::from_workspace_error)?;
@@ -97,8 +95,7 @@ impl ProviderAuditCapture {
         let Some(request_json) = self.request_json(Some(dump))? else {
             return Ok(());
         };
-        let mut database = WorkspaceDatabase::open_or_create(&self.workspace_path)
-            .map_err(ApiError::from_workspace_error)?;
+        let mut database = open_workspace_database(&self.workspace_path)?;
         database
             .update_llm_request_body(&self.request_id, Some(&request_json))
             .map_err(ApiError::from_workspace_error)
