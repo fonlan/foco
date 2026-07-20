@@ -2354,6 +2354,74 @@ describe("app-settings verification surfaces", () => {
       "bg-stone-50",
       "text-stone-500",
     );
+    expect(screen.queryByText("Some remote Dream history is unavailable")).toBeNull();
+  });
+
+  it("keeps Dream history visible when a remote workspace is partially unavailable", async () => {
+    const job: MemoryDreamJobSummary = {
+      ...memoryDreamJob,
+      mode: "llm",
+      scope: "workspace",
+      status: "completed",
+      triggerType: "manual",
+    };
+    appTestState.memoryDreamJobsResponses.push({
+      jobs: [job],
+      page: 1,
+      pageSize: 10,
+      partialUnavailable: [
+        {
+          workspaceId: workspace.id,
+          reason: "notConnected",
+          message: "Remote Dream history is unavailable because the workspace is not connected.",
+        },
+      ],
+      totalCount: 1,
+      totalPages: 1,
+    });
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    const partialAvailability = await screen.findByText(
+      "Some remote Dream history is unavailable",
+    );
+    const partialNotice = partialAvailability.closest('[role="status"]');
+    if (!partialNotice) {
+      throw new Error("Expected partial Dream availability notice");
+    }
+    expect(partialNotice).toHaveTextContent(workspace.name);
+    expect(partialNotice).toHaveTextContent("Remote workspace is not connected");
+    expect(screen.getByRole("table")).toHaveTextContent("Completed");
+    expect(screen.queryByText("invalid memory data: workspace path is not a directory:")).toBeNull();
+  });
+
+  it("uses the existing Dream history error path when the request fails", async () => {
+    vi.mocked(fetch).mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/memory/dream/jobs") {
+        return Promise.resolve(jsonResponse({ error: "Dream history request failed" }, { status: 502 }));
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+
+    expect(await screen.findByText("Dream history request failed")).toBeInTheDocument();
+    expect(screen.queryByText("Some remote Dream history is unavailable")).toBeNull();
   });
 
   it("requests Dream history pages from the server", async () => {

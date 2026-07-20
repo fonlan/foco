@@ -92,6 +92,7 @@ import type {
   MemoryDreamChangesResponse,
   MemoryDreamJobSummary,
   MemoryDreamJobsResponse,
+  MemoryDreamPartialUnavailable,
   MemoryDreamRunMode,
   MemoryDreamRunResponse,
   MemoryDreamScope,
@@ -526,6 +527,9 @@ export function SettingsPanel({
   const [memoryDreamDetailJobSnapshot, setMemoryDreamDetailJobSnapshot] =
     useState<MemoryDreamJobSummary | null>(null);
   const [memoryDreamError, setMemoryDreamError] = useState<string | null>(null);
+  const [memoryDreamPartialUnavailable, setMemoryDreamPartialUnavailable] = useState<
+    MemoryDreamPartialUnavailable[]
+  >([]);
   const [selectedMemoryId, setSelectedMemoryId] = useState<string | null>(null);
   const [memorySources, setMemorySources] = useState<MemorySourceRecord[]>([]);
   const [workspaceForm, setWorkspaceForm] = useState<WorkspaceFormState>(() =>
@@ -1446,6 +1450,7 @@ export function SettingsPanel({
     const requestedPage = pageOverride ?? memoryDreamPage;
     setIsLoadingMemoryDreamJobs(true);
     setMemoryDreamError(null);
+    setMemoryDreamPartialUnavailable([]);
 
     try {
       const params = new URLSearchParams({
@@ -1464,6 +1469,7 @@ export function SettingsPanel({
       });
       setMemoryDreamPage(data.page);
       setMemoryDreamPageSize(data.pageSize);
+      setMemoryDreamPartialUnavailable(data.partialUnavailable ?? []);
       setMemoryDreamDetailJobSnapshot((current) => {
         if (!current) {
           return current;
@@ -1480,6 +1486,7 @@ export function SettingsPanel({
       });
       setMemoryDreamDetailJobId(null);
       setMemoryDreamDetailJobSnapshot(null);
+      setMemoryDreamPartialUnavailable([]);
       setMemoryDreamError(errorMessage(requestError));
     } finally {
       setIsLoadingMemoryDreamJobs(false);
@@ -8248,6 +8255,29 @@ export function SettingsPanel({
                 {memoryDreamError ? (
                   <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                     {memoryDreamError}
+                  </div>
+                ) : null}
+
+                {memoryDreamPartialUnavailable.length > 0 ? (
+                  <div
+                    className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                    role="status"
+                  >
+                    <div className="font-semibold">
+                      {t("Some remote Dream history is unavailable")}
+                    </div>
+                    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-amber-800">
+                      {memoryDreamPartialUnavailable.map((item) => {
+                        const workspaceName =
+                          workspaces.find((workspace) => workspace.id === item.workspaceId)
+                            ?.name ?? item.workspaceId;
+                        return (
+                          <li key={`${item.workspaceId}:${item.reason}`}>
+                            {workspaceName}: {memoryDreamPartialUnavailableReasonLabel(item.reason, t)}
+                          </li>
+                        );
+                      })}
+                    </ul>
                   </div>
                 ) : null}
 
@@ -15114,6 +15144,17 @@ function memoryDreamJobKey(scope: MemoryDreamScope, workspaceId: string | null) 
 
 function memoryDreamScopeLabel(scope: string, t: Translate) {
   return scope === "global" ? t("Global Dream") : t("Workspace Dream");
+}
+
+function memoryDreamPartialUnavailableReasonLabel(reason: string, t: Translate) {
+  switch (reason) {
+    case "notConnected":
+      return t("Remote workspace is not connected");
+    case "invalidResponse":
+      return t("Remote Dream history returned an invalid response");
+    default:
+      return t("Remote Dream history is temporarily unavailable");
+  }
 }
 
 function specJobTime(job: WorkspaceSpecJobSummary) {

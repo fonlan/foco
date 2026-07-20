@@ -92,7 +92,7 @@ These APIs are workspace-scoped because they use remote source files, remote `.f
 | Spec | `/spec`, `/spec/settings`, `/spec/generate`, `/spec/jobs`, `/spec/jobs/{job_id}/retry` | remote sidecar for workspace state; generation LLM calls use brokered local service. |
 | Hooks | `/hooks/runs`, `/hooks/runs/{hook_run_id}` plus hook execution background entrypoints | remote sidecar for workspace hook runs and command hooks; local/global hook definitions arrive via runtime config. |
 | Scheduled tasks | `/scheduled-tasks/*`, `/scheduled-task-runs/*`, scheduler background entrypoints | remote sidecar. Local Foco may wake/connect the sidecar, but jobs are not promised while local Foco is closed. |
-| Workspace/chat memory | `/memory/*` when scoped to the workspace/chat; extraction/dream background entrypoints | remote sidecar for workspace/chat memory DB; LLM extraction/dream calls use brokered local service. |
+| Workspace/chat memory | `/memory/*` when scoped to the workspace/chat; extraction background entrypoints; Dream history reads | remote sidecar for workspace/chat memory DB. Dream read APIs (`jobs`, job detail, `changes`) are read-only and sidecar-owned; LLM extraction calls use brokered local service. Remote Dream manual execution, automatic scheduling, and LLM planning are out of scope. |
 | Global memory | `/memory/*` when scoped global | brokered local service or merged view; global memory DB remains local. |
 | Skills | workspace skill discovery/install into workspace | remote sidecar for workspace files; global skill store/marketplace remains local main and can be sent read-only in runtime config. |
 | MCP | MCP server runtime/tool calls | route by `executionHost`: workspace-host in remote sidecar, local-host as brokered local service, merged definitions for UI/agent prompts. |
@@ -100,6 +100,19 @@ These APIs are workspace-scoped because they use remote source files, remote `.f
 | AI statistics | `/api/ai-statistics`, `/api/workspaces/{id}/ai-statistics/{request_id}`, chat statistics | List and dump detail stay on local main (SSH reads profile remote-workspace-audit mirror). Chat statistics may still use remote sidecar for message/runtime metrics. Sidecar structured audit mirrors keep detail NULL and must not be the wire dump source of truth; never dual-count brokered requests across main + sidecar. |
 
 Server-scoped APIs such as `Remote Servers list/create/update/delete/test/connect/disconnect/status` must not be mounted under `/api/workspaces/{workspace_id}`. They operate on `RemoteServerProfile` and aggregate workspace references.
+
+## Dream History Read Aggregation
+
+The unscoped `GET /api/memory/dream/jobs` response is a merged read, not a reason to treat every configured workspace as a local filesystem path.
+
+- Global Dream history is read only from local main's global-memory database.
+- A local workspace's Dream history is read only through that workspace's gated local database opener.
+- An SSH workspace's Dream history is read only through its connected sidecar, which owns the remote workspace database. Local main must never use `WorkspaceConfig.path` (including an empty or logo-cache-only path) as an SSH SQLite path and must not copy or fall back to a local workspace database.
+- Local main merges successful sources by the public job ordering, then applies the public pagination and total-count contract. Connected remote sources participate alongside Global and local sources.
+- A disconnected, failed, or invalid remote source is non-blocking: successful Global/local/other-remote jobs remain visible and the response may include bounded `partialUnavailable` diagnostics keyed by workspace id. UI resolves the configured workspace name and localizes the stable reason; it must not expose raw sidecar, SQLite, SSH, or remote-path errors.
+- Explicit workspace-scoped Dream `jobs`, job-detail, and `changes` reads continue through the normal workspace route to the sidecar.
+
+Non-goals for this read-aggregation contract: remote Dream manual execution, automatic scheduling, LLM planning, schema changes, changes to Dream state transitions, and changes to Memory's single-flight constraints.
 
 ## Sidecar Launch Flow
 

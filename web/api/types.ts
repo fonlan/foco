@@ -1934,12 +1934,24 @@ export type MemoryDreamJobSummary = {
   completedAt: string | null;
 };
 
+export type MemoryDreamPartialUnavailableReason =
+  | "notConnected"
+  | "requestFailed"
+  | "invalidResponse";
+
+export type MemoryDreamPartialUnavailable = {
+  workspaceId: string;
+  reason: MemoryDreamPartialUnavailableReason;
+  message: string;
+};
+
 export type MemoryDreamJobsResponse = {
   jobs: MemoryDreamJobSummary[];
   page: number;
   pageSize: number;
   totalCount: number;
   totalPages: number;
+  partialUnavailable?: MemoryDreamPartialUnavailable[];
 };
 
 export type MemoryDreamRunResponse = {
