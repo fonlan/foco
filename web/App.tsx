@@ -222,7 +222,10 @@ import {
   workspaceNameFromPath,
 } from "./features/workspaces/workspace-helpers";
 import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
-import { FilePickerDialog, type FilePickerSelection } from "./features/file-picker/FilePickerDialog";
+import {
+  FilePickerDialog,
+  type FilePickerSelection,
+} from "./features/file-picker/FilePickerDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
@@ -278,7 +281,11 @@ const SettingsPanel = lazy(() =>
     default: m.SettingsPanel,
   })),
 );
-import { errorMessage, requestJson, responseErrorMessage } from "./shared/api-client";
+import {
+  errorMessage,
+  requestJson,
+  responseErrorMessage,
+} from "./shared/api-client";
 import { installUpdateAndWaitForRestart } from "./shared/update-install";
 const ScheduledTasksPage = lazy(() =>
   import("./features/scheduled-tasks/ScheduledTasksPage").then((m) => ({
@@ -295,14 +302,7 @@ const PLAN_PHASE_RETRY_REFRESH_INTERVAL_MS = 3000;
 const PLAN_AUTO_RUN_REFRESH_MS = 3000;
 const REQUEST_STORM_DEDUPE_MS = 400;
 const WORKSPACE_SPEC_JOB_POLL_DELAYS_MS = [
-  1000,
-  2000,
-  4000,
-  8000,
-  15000,
-  30000,
-  45000,
-  60000,
+  1000, 2000, 4000, 8000, 15000, 30000, 45000, 60000,
 ] as const;
 const WORKSPACE_SPEC_JOB_STEADY_POLL_MS = 60000;
 
@@ -324,7 +324,9 @@ function requestStormDedupeNow() {
 }
 
 function isDocumentVisible() {
-  return typeof document === "undefined" || document.visibilityState === "visible";
+  return (
+    typeof document === "undefined" || document.visibilityState === "visible"
+  );
 }
 
 function shouldReuseRequest<T>(
@@ -336,7 +338,10 @@ function shouldReuseRequest<T>(
     return false;
   }
 
-  return !entry.settled || (!force && nowMs - entry.startedAtMs < REQUEST_STORM_DEDUPE_MS);
+  return (
+    !entry.settled ||
+    (!force && nowMs - entry.startedAtMs < REQUEST_STORM_DEDUPE_MS)
+  );
 }
 
 type ViewMode = BrowserRoute["viewMode"];
@@ -356,7 +361,12 @@ function isAutoRunPlanInFlight(plan: Plan) {
 }
 
 function isPlanOrderReorderable(plan: Plan) {
-  return plan.status === "draft" || plan.status === "ready" || plan.status === "paused" || plan.status === "failed";
+  return (
+    plan.status === "draft" ||
+    plan.status === "ready" ||
+    plan.status === "paused" ||
+    plan.status === "failed"
+  );
 }
 
 function activePlanOrderIds(plans: Plan[]) {
@@ -376,7 +386,11 @@ function reorderActivePlansByIds(plans: Plan[], planIds: string[]) {
     return plans;
   }
   let nextIndex = 0;
-  return plans.map((plan) => (isPlanOrderReorderable(plan) ? nextReorderablePlans[nextIndex++] ?? plan : plan));
+  return plans.map((plan) =>
+    isPlanOrderReorderable(plan)
+      ? (nextReorderablePlans[nextIndex++] ?? plan)
+      : plan,
+  );
 }
 
 export function trimInactiveChatMessageCaches(
@@ -391,7 +405,8 @@ export function trimInactiveChatMessageCaches(
   },
 ) {
   const pageLimit = options.pageLimit ?? CHAT_MESSAGES_INITIAL_PAGE_LIMIT;
-  const fullCacheLimit = options.fullCacheLimit ?? INACTIVE_CHAT_FULL_CACHE_LIMIT;
+  const fullCacheLimit =
+    options.fullCacheLimit ?? INACTIVE_CHAT_FULL_CACHE_LIMIT;
   const inactiveChatKeys = accessOrder.filter(
     (chatKey) =>
       chatKey !== options.activeChatKey &&
@@ -500,9 +515,13 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
   const {
     preserveStreamingPlaceholders = false,
     preserveDisjointActiveRunCache = false,
-  } = typeof options === "boolean"
-    ? { preserveStreamingPlaceholders: options, preserveDisjointActiveRunCache: false }
-    : options;
+  } =
+    typeof options === "boolean"
+      ? {
+          preserveStreamingPlaceholders: options,
+          preserveDisjointActiveRunCache: false,
+        }
+      : options;
 
   if (!cachedMessages.length) {
     return { messages: loadedMessages, preservedCachePrefix: false };
@@ -748,7 +767,7 @@ function expandAssistantMessageWithInterruptions(
       reasoning: reasoningText || null,
       parts: segmentParts,
       toolCalls,
-      metrics: isLast ? message.metrics : metrics ?? null,
+      metrics: isLast ? message.metrics : (metrics ?? null),
       memoriesUsed: isLast ? message.memoriesUsed : [],
       extractedMemories: isLast ? message.extractedMemories : [],
       specUpdates: isLast ? message.specUpdates : [],
@@ -878,7 +897,8 @@ type MainTabSummary =
 
 type MainTabCloseScope = "current" | "others" | "all" | "right" | "left";
 
-type ChatSessionStatusKind = "idle" | "open" | "scheduled" | "running" | "failed";
+type ChatSessionStatusKind =
+  "idle" | "open" | "scheduled" | "running" | "failed";
 
 type ChatSessionStatus = {
   activeRun: ActiveRunInfo | ActiveChatRunSummary | null;
@@ -904,18 +924,16 @@ export function isTerminalActiveRun(
   activeRun: ActiveChatRunSummary | null | undefined,
   terminalRunId: string | null | undefined,
 ): boolean {
-  return Boolean(activeRun?.runId && terminalRunId && activeRun.runId === terminalRunId);
+  return Boolean(
+    activeRun?.runId && terminalRunId && activeRun.runId === terminalRunId,
+  );
 }
 
 export function isGuidableActiveRun(
   runInfo: ActiveRunInfo | null | undefined,
   isRunning: boolean,
 ): runInfo is ActiveRunInfo & { runId: string } {
-  return Boolean(
-    isRunning &&
-      runInfo?.runId &&
-      runInfo.acceptingGuidance,
-  );
+  return Boolean(isRunning && runInfo?.runId && runInfo.acceptingGuidance);
 }
 
 export function deriveChatSessionStatus({
@@ -931,9 +949,10 @@ export function deriveChatSessionStatus({
   terminalRunId = null,
   workspaceActiveRun = null,
 }: ChatSessionStatusInput): ChatSessionStatus {
-  const statusChatKeys = scheduledChatKey && scheduledChatKey !== chatKey
-    ? [chatKey, scheduledChatKey]
-    : [chatKey];
+  const statusChatKeys =
+    scheduledChatKey && scheduledChatKey !== chatKey
+      ? [chatKey, scheduledChatKey]
+      : [chatKey];
   const operationalWorkspaceActiveRun = isTerminalActiveRun(
     workspaceActiveRun,
     terminalRunId,
@@ -947,12 +966,16 @@ export function deriveChatSessionStatus({
     operationalWorkspaceActiveRun;
   // persistedRunning is tab/sidebar lifecycle only — never invents activeRun for cancel/guidance.
   const isRunning =
-    statusChatKeys.some((statusChatKey) => runningChatKeys.has(statusChatKey)) ||
+    statusChatKeys.some((statusChatKey) =>
+      runningChatKeys.has(statusChatKey),
+    ) ||
     operationalWorkspaceActiveRun !== null ||
     persistedRunning;
-  const isScheduled = scheduledStatus === "queued" || scheduledStatus === "starting";
+  const isScheduled =
+    scheduledStatus === "queued" || scheduledStatus === "starting";
   const isOpen = statusChatKeys.some(
-    (statusChatKey) => openChatKeySet.has(statusChatKey) || activeChatKey === statusChatKey,
+    (statusChatKey) =>
+      openChatKeySet.has(statusChatKey) || activeChatKey === statusChatKey,
   );
   const isFailed = isOpen && failedChatKeySet.has(chatKey);
 
@@ -1042,11 +1065,31 @@ function remoteWorkspacePathBasename(path: string) {
   return normalized.split("/").filter(Boolean).at(-1) ?? normalized;
 }
 
-function remoteWorkspacePendingStages(t: Translate): RemoteServerDiagnosticStage[] {
+function remoteWorkspacePendingStages(
+  t: Translate,
+): RemoteServerDiagnosticStage[] {
   return [
-    { details: null, errorKind: null, message: t("Checking SSH"), stage: "ssh", status: "running" },
-    { details: null, errorKind: null, message: t("Detecting target"), stage: "target", status: "pending" },
-    { details: null, errorKind: null, message: t("Installing sidecar"), stage: "sidecarAsset", status: "pending" },
+    {
+      details: null,
+      errorKind: null,
+      message: t("Checking SSH"),
+      stage: "ssh",
+      status: "running",
+    },
+    {
+      details: null,
+      errorKind: null,
+      message: t("Detecting target"),
+      stage: "target",
+      status: "pending",
+    },
+    {
+      details: null,
+      errorKind: null,
+      message: t("Installing sidecar"),
+      stage: "sidecarAsset",
+      status: "pending",
+    },
     {
       details: null,
       errorKind: null,
@@ -1064,15 +1107,23 @@ function remoteWorkspacePendingStages(t: Translate): RemoteServerDiagnosticStage
   ];
 }
 
-function sourceControlLabelForWorktree(worktree: Pick<GitWorktreeSummary, "branch" | "name">) {
+function sourceControlLabelForWorktree(
+  worktree: Pick<GitWorktreeSummary, "branch" | "name">,
+) {
   return worktree.branch ?? worktree.name;
 }
 
-function worktreeMatchesExecutionRoot(worktreePath: string, executionRootPath: string) {
-  const normalize = (path: string) => path.replace(/\\/g, "/").replace(/\/+$/, "");
+function worktreeMatchesExecutionRoot(
+  worktreePath: string,
+  executionRootPath: string,
+) {
+  const normalize = (path: string) =>
+    path.replace(/\\/g, "/").replace(/\/+$/, "");
   const left = normalize(worktreePath);
   const right = normalize(executionRootPath);
-  return left === right || left.endsWith(`/${right}`) || right.endsWith(`/${left}`);
+  return (
+    left === right || left.endsWith(`/${right}`) || right.endsWith(`/${left}`)
+  );
 }
 
 function sourceControlDefaultTarget(
@@ -1082,7 +1133,9 @@ function sourceControlDefaultTarget(
 ): SourceControlTarget | null {
   const workspaceTarget: SourceControlTarget = {
     kind: "workspace",
-    label: gitBranches?.currentBranch ?? (workspacePath ? pathBasename(workspacePath) : "Workspace"),
+    label:
+      gitBranches?.currentBranch ??
+      (workspacePath ? pathBasename(workspacePath) : "Workspace"),
     path: null,
   };
 
@@ -1094,14 +1147,17 @@ function sourceControlDefaultTarget(
   }
 
   const byPath = coordinatorInstance.executionRootPath
-    ? gitBranches?.worktrees.find((worktree) =>
-        worktreeMatchesExecutionRoot(worktree.path, coordinatorInstance.executionRootPath!),
-      ) ?? null
+    ? (gitBranches?.worktrees.find((worktree) =>
+        worktreeMatchesExecutionRoot(
+          worktree.path,
+          coordinatorInstance.executionRootPath!,
+        ),
+      ) ?? null)
     : null;
   const byBranch = coordinatorInstance.worktreeBranch
-    ? gitBranches?.worktrees.find(
+    ? (gitBranches?.worktrees.find(
         (worktree) => worktree.branch === coordinatorInstance.worktreeBranch,
-      ) ?? null
+      ) ?? null)
     : null;
   const worktree = byPath ?? byBranch;
   if (worktree) {
@@ -1114,7 +1170,9 @@ function sourceControlDefaultTarget(
   if (coordinatorInstance.executionRootPath) {
     return {
       kind: "worktree",
-      label: coordinatorInstance.worktreeBranch ?? pathBasename(coordinatorInstance.executionRootPath),
+      label:
+        coordinatorInstance.worktreeBranch ??
+        pathBasename(coordinatorInstance.executionRootPath),
       path: coordinatorInstance.executionRootPath,
     };
   }
@@ -1129,13 +1187,18 @@ function sourceControlTargets(
   const targets: SourceControlTarget[] = [
     {
       kind: "workspace",
-      label: gitBranches?.currentBranch ?? (workspacePath ? pathBasename(workspacePath) : "Workspace"),
+      label:
+        gitBranches?.currentBranch ??
+        (workspacePath ? pathBasename(workspacePath) : "Workspace"),
       path: null,
     },
   ];
 
   for (const worktree of gitBranches?.worktrees ?? []) {
-    if (workspacePath && worktreeMatchesExecutionRoot(worktree.path, workspacePath)) {
+    if (
+      workspacePath &&
+      worktreeMatchesExecutionRoot(worktree.path, workspacePath)
+    ) {
       continue;
     }
     targets.push({
@@ -1152,7 +1215,9 @@ function sourceControlTargetFromKey(
   targets: SourceControlTarget[],
   key: string,
 ) {
-  return targets.find((target) => sourceControlTargetKey(target) === key) ?? null;
+  return (
+    targets.find((target) => sourceControlTargetKey(target) === key) ?? null
+  );
 }
 
 function appendGitTargetParams(
@@ -1181,7 +1246,9 @@ function gitTargetRequestBody<T extends Record<string, unknown>>(
 function deferStreamAuxiliaryUpdate(update: () => void) {
   const testScheduler = (
     globalThis as {
-      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (update: () => void) => void;
+      __FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__?: (
+        update: () => void,
+      ) => void;
     }
   ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
   if (typeof testScheduler === "function") {
@@ -1199,7 +1266,13 @@ type ComposerDefaultSelection = {
   thinkingLevel: string;
 };
 
-function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): T {
+function latencyModeFromValue(value: unknown): "standard" | "fast" {
+  return value === "fast" ? "fast" : "standard";
+}
+
+function useStableCallback<T extends (...args: any[]) => unknown>(
+  callback: T,
+): T {
   const callbackRef = useRef(callback);
 
   useLayoutEffect(() => {
@@ -1214,7 +1287,11 @@ function useStableCallback<T extends (...args: any[]) => unknown>(callback: T): 
 
 function workspaceConnectionLooksReady(status: string) {
   const normalized = status.toLowerCase();
-  return normalized === "connected" || normalized === "ready" || normalized === "degraded";
+  return (
+    normalized === "connected" ||
+    normalized === "ready" ||
+    normalized === "degraded"
+  );
 }
 
 /**
@@ -1263,7 +1340,10 @@ function normalizeBaseWorkspaceSummaries(
 }
 
 function shouldHydrateRemoteWorkspaceChats(workspace: WorkspaceSummary) {
-  return Boolean(workspace.serverId) && workspaceConnectionLooksReady(workspace.connectionStatus);
+  return (
+    Boolean(workspace.serverId) &&
+    workspaceConnectionLooksReady(workspace.connectionStatus)
+  );
 }
 
 function workspaceChatPagingFromWorkspaces(
@@ -1375,7 +1455,11 @@ export function App() {
   );
   const [statsRouteFilters, setStatsRouteFilters] = useState<
     Partial<AiStatsFilterState>
-  >(initialBrowserRoute.viewMode === "stats" ? initialBrowserRoute.filters ?? {} : {});
+  >(
+    initialBrowserRoute.viewMode === "stats"
+      ? (initialBrowserRoute.filters ?? {})
+      : {},
+  );
   const statsRouteFiltersRef = useRef(statsRouteFilters);
   statsRouteFiltersRef.current = statsRouteFilters;
   const [isWorkspaceDialogOpen, setIsWorkspaceDialogOpen] = useState(false);
@@ -1385,22 +1469,27 @@ export function App() {
   const [workspaceTestStages, setWorkspaceTestStages] = useState<
     RemoteServerDiagnosticResponse["result"]["stages"]
   >([]);
-  const [isTestingWorkspaceConnection, setIsTestingWorkspaceConnection] = useState(false);
+  const [isTestingWorkspaceConnection, setIsTestingWorkspaceConnection] =
+    useState(false);
   const [inlineRemoteServerName, setInlineRemoteServerName] = useState("");
   const [inlineRemoteServerHost, setInlineRemoteServerHost] = useState("");
-  const [isCreatingInlineRemoteServer, setIsCreatingInlineRemoteServer] = useState(false);
-  const [retryingRemoteWorkspaceId, setRetryingRemoteWorkspaceId] = useState<string | null>(null);
+  const [isCreatingInlineRemoteServer, setIsCreatingInlineRemoteServer] =
+    useState(false);
+  const [retryingRemoteWorkspaceId, setRetryingRemoteWorkspaceId] = useState<
+    string | null
+  >(null);
   const [workspaceName, setWorkspaceName] = useState("");
   const [workspacePath, setWorkspacePath] = useState("");
   const [workspaceTerminalShell, setWorkspaceTerminalShell] = useState("");
   const [workspaceSpecEnabled, setWorkspaceSpecEnabled] = useState(false);
   const [workspaceIconDraft, setWorkspaceIconDraft] =
     useState<WorkspaceIconDraft | null>(null);
-  const [filePickerRequest, setFilePickerRequest] = useState<FilePickerRequest | null>(null);
+  const [filePickerRequest, setFilePickerRequest] =
+    useState<FilePickerRequest | null>(null);
   const [draftMessage, setDraftMessage] = useState("");
-  const [draftAttachments, setDraftAttachments] = useState<ComposerAttachment[]>(
-    [],
-  );
+  const [draftAttachments, setDraftAttachments] = useState<
+    ComposerAttachment[]
+  >([]);
   const [messages, setMessages] = useState<ShellMessage[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [isPreparingChatRun, setIsPreparingChatRun] = useState(false);
@@ -1414,13 +1503,16 @@ export function App() {
   const [openAgentTabs, setOpenAgentTabs] = useState<OpenAgentTab[]>([]);
   const openAgentTabsRef = useRef<OpenAgentTab[]>([]);
   openAgentTabsRef.current = openAgentTabs;
-  const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(() => new Set());
-  const [loadingOlderChatMessageKeys, setLoadingOlderChatMessageKeys] = useState<Set<string>>(
+  const [loadingChatKeys, setLoadingChatKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [loadingOlderChatMessageKeys, setLoadingOlderChatMessageKeys] =
+    useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const openFileTabsRef = useRef<OpenFileTab[]>([]);
-  const [openHtmlPreviewTabs, setOpenHtmlPreviewTabs] = useState<OpenHtmlPreviewTab[]>([]);
+  const [openHtmlPreviewTabs, setOpenHtmlPreviewTabs] = useState<
+    OpenHtmlPreviewTab[]
+  >([]);
   const openHtmlPreviewTabsRef = useRef<OpenHtmlPreviewTab[]>([]);
   const [workspaceFileEditors, setWorkspaceFileEditors] = useState<
     Record<string, WorkspaceFileEditorState>
@@ -1452,7 +1544,9 @@ export function App() {
       {
         activeChatKey: activeChatKeyRef.current,
         openChatKeys: new Set(
-          openChatTabsRef.current.map((tab) => chatRunKey(tab.workspaceId, tab.chatId)),
+          openChatTabsRef.current.map((tab) =>
+            chatRunKey(tab.workspaceId, tab.chatId),
+          ),
         ),
         runningChatKeys: runningChatKeysRef.current,
       },
@@ -1474,8 +1568,8 @@ export function App() {
     updater:
       | Record<string, ShellMessage[]>
       | ((
-        current: Record<string, ShellMessage[]>,
-      ) => Record<string, ShellMessage[]>),
+          current: Record<string, ShellMessage[]>,
+        ) => Record<string, ShellMessage[]>),
   ) {
     const next =
       typeof updater === "function"
@@ -1496,8 +1590,8 @@ export function App() {
     updater:
       | Record<string, ChatMessagesPaginationState>
       | ((
-        current: Record<string, ChatMessagesPaginationState>,
-      ) => Record<string, ChatMessagesPaginationState>),
+          current: Record<string, ChatMessagesPaginationState>,
+        ) => Record<string, ChatMessagesPaginationState>),
   ) {
     const next =
       typeof updater === "function"
@@ -1506,27 +1600,52 @@ export function App() {
     chatMessagePaginationByKeyRef.current = next;
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
-  const [updateStatus, setUpdateStatus] = useState<UpdateStatusSummary | null>(null);
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatusSummary | null>(
+    null,
+  );
   const [isInstallingUpdate, setIsInstallingUpdate] = useState(false);
-  const [updateInstallNotice, setUpdateInstallNotice] = useState<string | null>(null);
-  const [agentDefinitions, setAgentDefinitions] = useState<AgentDefinitionSettings[]>([]);
-  const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<Record<string, string>>({});
+  const [updateInstallNotice, setUpdateInstallNotice] = useState<string | null>(
+    null,
+  );
+  const [agentDefinitions, setAgentDefinitions] = useState<
+    AgentDefinitionSettings[]
+  >([]);
+  const [defaultAgentRolePrompts, setDefaultAgentRolePrompts] = useState<
+    Record<string, string>
+  >({});
   const [isTeamModeEnabled, setIsTeamModeEnabled] = useState(false);
   const [isPlanModeEnabled, setIsPlanModeEnabled] = useState(false);
   const planModeByChatKeyRef = useRef<Record<string, boolean>>({});
-  const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] = useState(false);
-  const [agentDefinitionsError, setAgentDefinitionsError] = useState<string | null>(null);
-  const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] = useState<string | null>(null);
-  const [agentTeamSnapshot, setAgentTeamSnapshot] = useState<AgentTeamSnapshotResponse | null>(null);
+  const [isLoadingAgentDefinitions, setIsLoadingAgentDefinitions] =
+    useState(false);
+  const [agentDefinitionsError, setAgentDefinitionsError] = useState<
+    string | null
+  >(null);
+  const [agentDefinitionOperationKey, setAgentDefinitionOperationKey] =
+    useState<string | null>(null);
+  const [agentTeamSnapshot, setAgentTeamSnapshot] =
+    useState<AgentTeamSnapshotResponse | null>(null);
   const agentTeamSnapshotChatKeyRef = useRef<string | null>(null);
-  const agentTeamSnapshotCacheRef = useRef(new Map<string, AgentTeamSnapshotResponse>());
-  const agentTranscriptViewCacheRef = useRef(new Map<string, AgentTranscriptViewCacheEntry>());
+  const agentTeamSnapshotCacheRef = useRef(
+    new Map<string, AgentTeamSnapshotResponse>(),
+  );
+  const agentTranscriptViewCacheRef = useRef(
+    new Map<string, AgentTranscriptViewCacheEntry>(),
+  );
   const [isLoadingAgentTeam, setIsLoadingAgentTeam] = useState(false);
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
+  const [selectedLatencyMode, setSelectedLatencyMode] = useState<
+    "standard" | "fast"
+  >("standard");
+  const latencyModeByChatKeyRef = useRef<Record<string, "standard" | "fast">>(
+    {},
+  );
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
-  const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(null);
+  const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(
+    null,
+  );
   const [selectedGitBranch, setSelectedGitBranch] = useState("");
   const [isLoadingBranches, setIsLoadingBranches] = useState(false);
   const [branchError, setBranchError] = useState<string | null>(null);
@@ -1538,7 +1657,9 @@ export function App() {
   );
   const [contextPanelTab, setContextPanelTab] =
     useState<ContextPanelTab>("todo");
-  const [diffPanelWidth, setDiffPanelWidth] = useState(CONTEXT_PANEL_DEFAULT_WIDTH);
+  const [diffPanelWidth, setDiffPanelWidth] = useState(
+    CONTEXT_PANEL_DEFAULT_WIDTH,
+  );
   const [contextPanelMobileHeight, setContextPanelMobileHeight] = useState(
     CONTEXT_PANEL_DEFAULT_MOBILE_HEIGHT,
   );
@@ -1556,22 +1677,30 @@ export function App() {
   const [selectedDiffPath, setSelectedDiffPath] = useState<string | null>(null);
   const [selectedSourceControlTarget, setSelectedSourceControlTarget] =
     useState<SourceControlTarget | null>(null);
-  const [selectedSourceControlTargetScope, setSelectedSourceControlTargetScope] = useState("");
-  const [isSourceControlTargetManual, setIsSourceControlTargetManual] = useState(false);
+  const [
+    selectedSourceControlTargetScope,
+    setSelectedSourceControlTargetScope,
+  ] = useState("");
+  const [isSourceControlTargetManual, setIsSourceControlTargetManual] =
+    useState(false);
   const [isLoadingDiff, setIsLoadingDiff] = useState(false);
   const [diffError, setDiffError] = useState<string | null>(null);
   const [gitCommitMessage, setGitCommitMessage] = useState("");
   const [gitOperationKey, setGitOperationKey] = useState<string | null>(null);
-  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFilesResponse | null>(null);
-  const [expandedFileTreePaths, setExpandedFileTreePaths] = useState<Set<string>>(
-    () => new Set([""]),
-  );
-  const [loadingWorkspaceDirectoryPaths, setLoadingWorkspaceDirectoryPaths] = useState<Set<string>>(
-    () => new Set(),
-  );
+  const [workspaceFiles, setWorkspaceFiles] =
+    useState<WorkspaceFilesResponse | null>(null);
+  const [expandedFileTreePaths, setExpandedFileTreePaths] = useState<
+    Set<string>
+  >(() => new Set([""]));
+  const [loadingWorkspaceDirectoryPaths, setLoadingWorkspaceDirectoryPaths] =
+    useState<Set<string>>(() => new Set());
   const [isLoadingWorkspaceFiles, setIsLoadingWorkspaceFiles] = useState(false);
-  const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(null);
-  const [workspaceFileOperationKey, setWorkspaceFileOperationKey] = useState<string | null>(null);
+  const [workspaceFilesError, setWorkspaceFilesError] = useState<string | null>(
+    null,
+  );
+  const [workspaceFileOperationKey, setWorkspaceFileOperationKey] = useState<
+    string | null
+  >(null);
   const [todoGraph, setTodoGraph] = useState<TodoGraphResponse | null>(null);
   const [isLoadingTodoGraph, setIsLoadingTodoGraph] = useState(false);
   const [todoGraphError, setTodoGraphError] = useState<string | null>(null);
@@ -1585,8 +1714,20 @@ export function App() {
     Record<string, LiveChatStatistics>
   >({});
   const [contextMemories, setContextMemories] = useState<ContextMemoryState>({
-    global: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
-    workspace: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
+    global: {
+      memories: [],
+      page: 1,
+      pageSize: 10,
+      totalCount: 0,
+      totalPages: 0,
+    },
+    workspace: {
+      memories: [],
+      page: 1,
+      pageSize: 10,
+      totalCount: 0,
+      totalPages: 0,
+    },
   });
   const [contextMemoryPages, setContextMemoryPages] = useState<{
     global: { page: number; pageSize: number };
@@ -1603,12 +1744,17 @@ export function App() {
   const [deletingContextMemoryId, setDeletingContextMemoryId] = useState<
     string | null
   >(null);
-  const [workspaceSpec, setWorkspaceSpec] = useState<WorkspaceSpecResponse | null>(null);
+  const [workspaceSpec, setWorkspaceSpec] =
+    useState<WorkspaceSpecResponse | null>(null);
   const [workspaceSpecDraft, setWorkspaceSpecDraft] = useState("");
   const [isLoadingWorkspaceSpec, setIsLoadingWorkspaceSpec] = useState(false);
-  const [workspaceSpecError, setWorkspaceSpecError] = useState<string | null>(null);
-  const [workspaceSpecConflictMessage, setWorkspaceSpecConflictMessage] = useState<string | null>(null);
-  const [workspaceSpecPreviewEnabled, setWorkspaceSpecPreviewEnabled] = useState(false);
+  const [workspaceSpecError, setWorkspaceSpecError] = useState<string | null>(
+    null,
+  );
+  const [workspaceSpecConflictMessage, setWorkspaceSpecConflictMessage] =
+    useState<string | null>(null);
+  const [workspaceSpecPreviewEnabled, setWorkspaceSpecPreviewEnabled] =
+    useState(false);
   const [workspaceSpecOperationKey, setWorkspaceSpecOperationKey] = useState<
     "generate" | "save" | "settings" | null
   >(null);
@@ -1618,8 +1764,9 @@ export function App() {
   const [isLoadingActivePlans, setIsLoadingActivePlans] = useState(false);
   const [activePlansError, setActivePlansError] = useState<string | null>(null);
   const [planOperationKey, setPlanOperationKey] = useState<string | null>(null);
-  const [planAutoRunByWorkspace, setPlanAutoRunByWorkspace] =
-    useState<Record<string, PlanAutoRunResponse>>({});
+  const [planAutoRunByWorkspace, setPlanAutoRunByWorkspace] = useState<
+    Record<string, PlanAutoRunResponse>
+  >({});
   const [isPlanAutoRunUpdating, setIsPlanAutoRunUpdating] = useState(false);
   const [pendingPlanPhaseRetryRefresh, setPendingPlanPhaseRetryRefresh] =
     useState<PendingPlanPhaseRetryRefresh | null>(null);
@@ -1640,7 +1787,9 @@ export function App() {
   const [activeRunInfoByChatKey, setActiveRunInfoByChatKey] = useState<
     Record<string, ActiveRunInfo>
   >({});
-  const [readOnlyChatKeys, setReadOnlyChatKeys] = useState<Record<string, boolean>>({});
+  const [readOnlyChatKeys, setReadOnlyChatKeys] = useState<
+    Record<string, boolean>
+  >({});
   const [contextUsageByChatKey, setContextUsageByChatKey] = useState<
     Record<string, ContextUsageResponse>
   >({});
@@ -1655,7 +1804,8 @@ export function App() {
     useState<QuestionRequestSummary | null>(null);
   const [isAnsweringQuestion, setIsAnsweringQuestion] = useState(false);
   const [questionError, setQuestionError] = useState<string | null>(null);
-  const [isRipgrepDialogDismissed, setIsRipgrepDialogDismissed] = useState(false);
+  const [isRipgrepDialogDismissed, setIsRipgrepDialogDismissed] =
+    useState(false);
   const [isInstallingRipgrep, setIsInstallingRipgrep] = useState(false);
   const [ripgrepInstallError, setRipgrepInstallError] = useState<string | null>(
     null,
@@ -1692,9 +1842,9 @@ export function App() {
   const chatStatisticsRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
-  const workspaceSpecJobObserversRef = useRef<Map<string, WorkspaceSpecJobObserver>>(
-    new Map(),
-  );
+  const workspaceSpecJobObserversRef = useRef<
+    Map<string, WorkspaceSpecJobObserver>
+  >(new Map());
   const gitBranchesRequestRef = useRef<AbortController | null>(null);
   const gitBranchesRequestIdRef = useRef(0);
   const workspacesRefreshGenerationRef = useRef(0);
@@ -1706,7 +1856,9 @@ export function App() {
   const activeChatIdRef = useRef<string | null>(null);
   const workspacesRef = useRef<WorkspaceSummary[]>([]);
   const loadingChatKeysRef = useRef<Set<string>>(new Set());
-  const loadingChatControllersRef = useRef<Map<string, AbortController>>(new Map());
+  const loadingChatControllersRef = useRef<Map<string, AbortController>>(
+    new Map(),
+  );
   const loadingOlderChatMessageKeysRef = useRef<Set<string>>(new Set());
   const runningChatKeysRef = useRef<Set<string>>(new Set());
   const restoredPendingQuestionIdsRef = useRef<Set<string>>(new Set());
@@ -1722,7 +1874,7 @@ export function App() {
   const scheduledWorkspaceRunsRef = useRef<ScheduledWorkspaceRun[]>([]);
   const failedRestoredQueuedRunKeysRef = useRef<Set<string>>(new Set());
   const pendingGuidanceMessageIdsRef = useRef<Map<string, string>>(new Map());
-  const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => { });
+  const applyBrowserRouteRef = useRef<(route: BrowserRoute) => void>(() => {});
   const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
   const hasManuallySelectedThinkingLevelRef = useRef(false);
@@ -1746,7 +1898,7 @@ export function App() {
   );
   const activeWorkspaceIdForPlanAutoRun = activeWorkspace?.id ?? "";
   const planAutoRunState = activeWorkspaceIdForPlanAutoRun
-    ? planAutoRunByWorkspace[activeWorkspaceIdForPlanAutoRun] ?? null
+    ? (planAutoRunByWorkspace[activeWorkspaceIdForPlanAutoRun] ?? null)
     : null;
   const isPlanAutoRunEnabled =
     planAutoRunState?.desiredEnabled ?? planAutoRunState?.enabled ?? false;
@@ -1782,13 +1934,19 @@ export function App() {
           const autoRun = await requestJson<PlanAutoRunResponse>(
             `/api/workspaces/${encodeURIComponent(workspaceId)}/plans/auto-run`,
           );
-          if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+          if (
+            activeWorkspaceIdRef.current &&
+            activeWorkspaceIdRef.current !== workspaceId
+          ) {
             return null;
           }
           setPlanAutoRunStateForWorkspace(workspaceId, autoRun);
           return autoRun;
         } catch (requestError) {
-          if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
+          if (
+            !activeWorkspaceIdRef.current ||
+            activeWorkspaceIdRef.current === workspaceId
+          ) {
             setActivePlansError(errorMessage(requestError));
           }
           return null;
@@ -1797,7 +1955,10 @@ export function App() {
           if (current?.promise === promise) {
             current.settled = true;
             window.setTimeout(() => {
-              if (planAutoRunSingleFlightRef.current.get(workspaceId)?.promise === promise) {
+              if (
+                planAutoRunSingleFlightRef.current.get(workspaceId)?.promise ===
+                promise
+              ) {
                 planAutoRunSingleFlightRef.current.delete(workspaceId);
               }
             }, REQUEST_STORM_DEDUPE_MS);
@@ -1856,7 +2017,7 @@ export function App() {
     activeChatKey !== null && loadingChatKeys.has(activeChatKey);
   const activeChatPagination =
     activeChatKey !== null
-      ? chatMessagePaginationByKeyRef.current[activeChatKey] ?? null
+      ? (chatMessagePaginationByKeyRef.current[activeChatKey] ?? null)
       : null;
   const isLoadingOlderActiveChatMessages =
     activeChatKey !== null && loadingOlderChatMessageKeys.has(activeChatKey);
@@ -1865,14 +2026,14 @@ export function App() {
       ? chatRunKey(activeWorkspaceId, activeChatId)
       : null;
   const contextUsage = activeContextUsageKey
-    ? contextUsageByChatKey[activeContextUsageKey] ?? null
+    ? (contextUsageByChatKey[activeContextUsageKey] ?? null)
     : null;
   const liveChatStatistics = activeChatKey
-    ? liveChatStatisticsByKey[activeChatKey] ?? null
+    ? (liveChatStatisticsByKey[activeChatKey] ?? null)
     : null;
   const latestProviderUsage =
     activeChatKey !== null && runningChatKeys.has(activeChatKey)
-      ? liveChatStatistics?.usage ?? null
+      ? (liveChatStatistics?.usage ?? null)
       : null;
   const displayedContextUsage = contextUsage
     ? contextUsageWithLatestProviderUsage(contextUsage, latestProviderUsage)
@@ -1892,12 +2053,12 @@ export function App() {
     () =>
       liveChatStatistics
         ? withLiveChatStatistics(
-          chatStatistics,
-          liveChatStatistics,
-          messages,
-          activeWorkspaceId,
-          activeChatId,
-        )
+            chatStatistics,
+            liveChatStatistics,
+            messages,
+            activeWorkspaceId,
+            activeChatId,
+          )
         : chatStatistics,
     [
       activeChatId,
@@ -1909,12 +2070,14 @@ export function App() {
   );
   const activeChatCoordinatorInstance =
     agentTeamSnapshot?.team.chatId === activeChatId
-      ? agentTeamSnapshot.instances.find(
-          (instance) => instance.id === agentTeamSnapshot.team.coordinatorInstanceId,
-        ) ?? null
+      ? (agentTeamSnapshot.instances.find(
+          (instance) =>
+            instance.id === agentTeamSnapshot.team.coordinatorInstanceId,
+        ) ?? null)
       : null;
   const activeChatWorktreeBranch =
-    activeChatCoordinatorInstance?.executionWorkspaceMode === "isolated_worktree" &&
+    activeChatCoordinatorInstance?.executionWorkspaceMode ===
+      "isolated_worktree" &&
     activeChatCoordinatorInstance.worktreeStatus !== "deleted"
       ? activeChatCoordinatorInstance.worktreeBranch
       : null;
@@ -1931,16 +2094,19 @@ export function App() {
       ),
     [activeChatCoordinatorInstance, activeWorkspace?.path, gitBranches],
   );
-  const sourceControlTargetScope = activeWorkspace?.id && activeChatId
-    ? `${activeWorkspace.id}:${activeChatId}`
-    : "";
+  const sourceControlTargetScope =
+    activeWorkspace?.id && activeChatId
+      ? `${activeWorkspace.id}:${activeChatId}`
+      : "";
   const sourceControlTarget =
-    isSourceControlTargetManual && selectedSourceControlTargetScope === sourceControlTargetScope
-      ? selectedSourceControlTarget ?? defaultSourceControlTarget
+    isSourceControlTargetManual &&
+    selectedSourceControlTargetScope === sourceControlTargetScope
+      ? (selectedSourceControlTarget ?? defaultSourceControlTarget)
       : defaultSourceControlTarget;
-  const sourceControlTargetKeyValue = sourceControlTargetKey(sourceControlTarget);
+  const sourceControlTargetKeyValue =
+    sourceControlTargetKey(sourceControlTarget);
   const isLoadingContextUsage = activeContextUsageKey
-    ? contextUsageLoadingByChatKey[activeContextUsageKey] ?? false
+    ? (contextUsageLoadingByChatKey[activeContextUsageKey] ?? false)
     : false;
   const openChatKeySet = useMemo(
     () =>
@@ -2034,14 +2200,17 @@ export function App() {
     (workspaceId: string, chatId: string, instanceId: string): boolean => {
       const chatKey = chatRunKey(workspaceId, chatId);
       const snapshot =
-        (agentTeamSnapshotChatKeyRef.current === chatKey ? agentTeamSnapshot : null) ??
+        (agentTeamSnapshotChatKeyRef.current === chatKey
+          ? agentTeamSnapshot
+          : null) ??
         agentTeamSnapshotCacheRef.current.get(chatKey) ??
         null;
       if (!snapshot) {
         return false;
       }
       return snapshot.instances.some(
-        (instance) => instance.id === instanceId && instance.status === "running",
+        (instance) =>
+          instance.id === instanceId && instance.status === "running",
       );
     },
     [agentTeamSnapshot],
@@ -2050,7 +2219,7 @@ export function App() {
     ? chatSessionStatusFor(activeChatKey)
     : { activeRun: null, kind: "idle" as const };
   const activeRunInfo = activeChatKey
-    ? activeRunInfoByChatKey[activeChatKey] ?? null
+    ? (activeRunInfoByChatKey[activeChatKey] ?? null)
     : null;
   const activeChatReadOnly = activeChatKey
     ? readOnlyChatKeys[activeChatKey] === true
@@ -2058,12 +2227,14 @@ export function App() {
   const canUseTeamMode = agentDefinitions.length > 1;
   const isSendingMessage = activeChatSessionStatus.kind === "running";
   const queuedRunRequests = activeChatKey
-    ? queuedRunRequestsByChatKey[activeChatKey] ?? []
+    ? (queuedRunRequestsByChatKey[activeChatKey] ?? [])
     : [];
   const queuedMessageIds = useMemo(
     () =>
       new Set(
-        queuedRunRequests.flatMap((request) => request.pendingUserMessageId ?? []),
+        queuedRunRequests.flatMap(
+          (request) => request.pendingUserMessageId ?? [],
+        ),
       ),
     [queuedRunRequests],
   );
@@ -2088,7 +2259,13 @@ export function App() {
         type: "htmlPreview" as const,
       })),
     ],
-    [openAgentTabs, openChatTabs, openFileTabs, openHtmlPreviewTabs, workspaces],
+    [
+      openAgentTabs,
+      openChatTabs,
+      openFileTabs,
+      openHtmlPreviewTabs,
+      workspaces,
+    ],
   );
   const activeFileEditorKey =
     activeMainTab.type === "file"
@@ -2096,32 +2273,32 @@ export function App() {
       : null;
   const activeFileTab =
     activeMainTab.type === "file"
-      ? openFileTabs.find(
-        (tab) =>
-          tab.workspaceId === activeMainTab.workspaceId &&
-          tab.path === activeMainTab.path,
-      ) ?? null
+      ? (openFileTabs.find(
+          (tab) =>
+            tab.workspaceId === activeMainTab.workspaceId &&
+            tab.path === activeMainTab.path,
+        ) ?? null)
       : null;
   const activeHtmlPreviewTab =
     activeMainTab.type === "htmlPreview"
-      ? openHtmlPreviewTabs.find(
-        (tab) =>
-          tab.workspaceId === activeMainTab.workspaceId &&
-          tab.path === activeMainTab.path,
-      ) ?? null
+      ? (openHtmlPreviewTabs.find(
+          (tab) =>
+            tab.workspaceId === activeMainTab.workspaceId &&
+            tab.path === activeMainTab.path,
+        ) ?? null)
       : null;
   const activeAgentTab =
     activeMainTab.type === "agent"
-      ? mainTabs.find(
-        (tab): tab is Extract<MainTabSummary, { type: "agent" }> =>
-          tab.type === "agent" &&
-          tab.workspaceId === activeMainTab.workspaceId &&
-          tab.chatId === activeMainTab.chatId &&
-          tab.instanceId === activeMainTab.instanceId,
-      ) ?? null
+      ? (mainTabs.find(
+          (tab): tab is Extract<MainTabSummary, { type: "agent" }> =>
+            tab.type === "agent" &&
+            tab.workspaceId === activeMainTab.workspaceId &&
+            tab.chatId === activeMainTab.chatId &&
+            tab.instanceId === activeMainTab.instanceId,
+        ) ?? null)
       : null;
   const activeFileEditor = activeFileEditorKey
-    ? workspaceFileEditors[activeFileEditorKey] ?? null
+    ? (workspaceFileEditors[activeFileEditorKey] ?? null)
     : null;
 
   const configuredModelsByName = useMemo(
@@ -2188,7 +2365,10 @@ export function App() {
   const unsupportedDraftAttachment = useMemo(
     () =>
       draftAttachments.find((attachment) =>
-        unsupportedAttachmentInputModality(selectedModel, attachment.contentType),
+        unsupportedAttachmentInputModality(
+          selectedModel,
+          attachment.contentType,
+        ),
       ) ?? null,
     [draftAttachments, selectedModel],
   );
@@ -2209,7 +2389,7 @@ export function App() {
           agentModel.activeProviderId &&
           agentModel.providerIds.includes(agentModel.activeProviderId)
             ? agentModel.activeProviderId
-            : agentModel.providerIds[0] ?? "";
+            : (agentModel.providerIds[0] ?? "");
         return {
           modelId: agentModel.id,
           providerId,
@@ -2229,9 +2409,10 @@ export function App() {
     }
 
     const providerId =
-      model.activeProviderId && model.providerIds.includes(model.activeProviderId)
+      model.activeProviderId &&
+      model.providerIds.includes(model.activeProviderId)
         ? model.activeProviderId
-        : model.providerIds[0] ?? "";
+        : (model.providerIds[0] ?? "");
 
     return {
       modelId: model.id,
@@ -2244,7 +2425,10 @@ export function App() {
     [settings],
   );
   const availableSkills = useMemo(
-    () => detectedSkills.filter((skill) => isSkillAvailableForWorkspace(skill, activeWorkspace?.id ?? null)),
+    () =>
+      detectedSkills.filter((skill) =>
+        isSkillAvailableForWorkspace(skill, activeWorkspace?.id ?? null),
+      ),
     [activeWorkspace?.id, detectedSkills],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
@@ -2254,6 +2438,8 @@ export function App() {
   )
     ? selectedThinkingLevel
     : "";
+  const selectedRequestLatencyMode =
+    selectedModel?.supportsFast === true ? selectedLatencyMode : "standard";
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
@@ -2334,14 +2520,15 @@ export function App() {
         return;
       }
 
-      const routeWithTabs = route.viewMode === "chat"
-        ? browserRouteWithOpenTabs(
-          route,
-          openChatTabsRef.current,
-          openFileTabsRef.current,
-          openHtmlPreviewTabsRef.current,
-        )
-        : route;
+      const routeWithTabs =
+        route.viewMode === "chat"
+          ? browserRouteWithOpenTabs(
+              route,
+              openChatTabsRef.current,
+              openFileTabsRef.current,
+              openHtmlPreviewTabsRef.current,
+            )
+          : route;
       const nextPath = browserPathForRoute(routeWithTabs);
       const currentPath = `${window.location.pathname}${window.location.search}`;
       if (currentPath === nextPath) {
@@ -2379,7 +2566,10 @@ export function App() {
 
   useEffect(() => {
     activeWorkspaceIdRef.current = activeWorkspaceId;
-    for (const [workspaceId, observer] of workspaceSpecJobObserversRef.current) {
+    for (const [
+      workspaceId,
+      observer,
+    ] of workspaceSpecJobObserversRef.current) {
       if (workspaceId !== activeWorkspaceId) {
         observer.cancelled = true;
         workspaceSpecJobObserversRef.current.delete(workspaceId);
@@ -2481,6 +2671,16 @@ export function App() {
       : "";
   }, [selectedModel, selectedThinkingLevel]);
 
+  useEffect(() => {
+    if (
+      selectedModel?.supportsFast !== true &&
+      selectedLatencyMode === "fast"
+    ) {
+      setSelectedLatencyMode("standard");
+      setError(t("Fast mode is not available for the selected model."));
+    }
+  }, [selectedLatencyMode, selectedModel, t]);
+
   useEffect(
     () => () => {
       for (const abortController of contextUsageAbortByChatKeyRef.current.values()) {
@@ -2574,10 +2774,13 @@ export function App() {
 
         if (!workspace || !chat) {
           setError(
-            t("Pending question chat is no longer available: {workspaceId}/{chatId}", {
-              chatId: question.chatId,
-              workspaceId: question.workspaceId,
-            }),
+            t(
+              "Pending question chat is no longer available: {workspaceId}/{chatId}",
+              {
+                chatId: question.chatId,
+                workspaceId: question.workspaceId,
+              },
+            ),
           );
           return;
         }
@@ -2618,7 +2821,9 @@ export function App() {
       setOpenChatTabs((current) => {
         let changed = false;
         const nextTabs = current.map((tab) => {
-          const nextTitle = titleByChatKey.get(chatRunKey(tab.workspaceId, tab.chatId));
+          const nextTitle = titleByChatKey.get(
+            chatRunKey(tab.workspaceId, tab.chatId),
+          );
           if (!nextTitle || tab.fallbackTitle === nextTitle) {
             return tab;
           }
@@ -2637,7 +2842,10 @@ export function App() {
   );
 
   const reconcileActiveWorkspaceSelection = useCallback(
-    (nextWorkspaces: WorkspaceSummary[], activeWorkspaceIdFromServer: string | null | undefined) => {
+    (
+      nextWorkspaces: WorkspaceSummary[],
+      activeWorkspaceIdFromServer: string | null | undefined,
+    ) => {
       const previousWorkspaceId = activeWorkspaceIdRef.current;
       const previousStillPresent = nextWorkspaces.some(
         (workspace) => workspace.id === previousWorkspaceId,
@@ -2676,16 +2884,16 @@ export function App() {
         }
         setExpandedWorkspaceId((current) =>
           current !== null &&
-            nextWorkspaces.some((workspace) => workspace.id === current)
+          nextWorkspaces.some((workspace) => workspace.id === current)
             ? current
             : nextWorkspaceId || null,
         );
       } else {
         setExpandedWorkspaceId((current) =>
           current !== null &&
-            nextWorkspaces.some((workspace) => workspace.id === current)
+          nextWorkspaces.some((workspace) => workspace.id === current)
             ? current
-            : activeWorkspaceIdFromServer ?? null,
+            : (activeWorkspaceIdFromServer ?? null),
         );
       }
     },
@@ -2693,11 +2901,7 @@ export function App() {
   );
 
   const applyRemoteWorkspaceChatsHydration = useCallback(
-    (
-      workspaceId: string,
-      data: WorkspaceChatsResponse,
-      generation: number,
-    ) => {
+    (workspaceId: string, data: WorkspaceChatsResponse, generation: number) => {
       if (workspacesRefreshGenerationRef.current !== generation) {
         return;
       }
@@ -2722,7 +2926,10 @@ export function App() {
         if (workspacesRefreshGenerationRef.current !== generation) {
           return current;
         }
-        if (!(workspaceId in current) && !workspacesRef.current.some((item) => item.id === workspaceId)) {
+        if (
+          !(workspaceId in current) &&
+          !workspacesRef.current.some((item) => item.id === workspaceId)
+        ) {
           return current;
         }
         return {
@@ -2850,11 +3057,14 @@ export function App() {
       });
 
       try {
-        const data = await requestJson<UpdateModelRouteResponse>("/api/models/route", {
-          body: JSON.stringify({ modelId, providerId }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        });
+        const data = await requestJson<UpdateModelRouteResponse>(
+          "/api/models/route",
+          {
+            body: JSON.stringify({ modelId, providerId }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
         setSettings((current) =>
           current
             ? {
@@ -2881,14 +3091,18 @@ export function App() {
             ...current,
             configuredModels: current.configuredModels.map((model) =>
               model.id === modelId
-                ? { ...model, activeProviderId: previousActiveProviderId ?? null }
+                ? {
+                    ...model,
+                    activeProviderId: previousActiveProviderId ?? null,
+                  }
                 : model,
             ),
           };
         });
         return {
           ok: false as const,
-          error: errorMessage(requestError) || t("Failed to update model route"),
+          error:
+            errorMessage(requestError) || t("Failed to update model route"),
         };
       }
     },
@@ -2911,7 +3125,9 @@ export function App() {
     try {
       const data = await installUpdateAndWaitForRestart();
       setUpdateStatus(data);
-      setUpdateInstallNotice(t("Foco is installing the update and will restart shortly."));
+      setUpdateInstallNotice(
+        t("Foco is installing the update and will restart shortly."),
+      );
     } catch (requestError) {
       setError(errorMessage(requestError));
       setIsInstallingUpdate(false);
@@ -2948,7 +3164,7 @@ export function App() {
         activeChatKeyRef.current === requestedChatKey;
       const silent =
         options?.silent ??
-        (agentTeamSnapshotChatKeyRef.current === requestedChatKey);
+        agentTeamSnapshotChatKeyRef.current === requestedChatKey;
 
       if (!silent) {
         setIsLoadingAgentTeam(true);
@@ -2988,7 +3204,9 @@ export function App() {
 
   const handleAgentTeamRefresh = useCallback(
     (event: Extract<ChatStreamEvent, { type: "agentTeamRefresh" }>) => {
-      if (activeChatKeyRef.current !== chatRunKey(event.workspaceId, event.chatId)) {
+      if (
+        activeChatKeyRef.current !== chatRunKey(event.workspaceId, event.chatId)
+      ) {
         return;
       }
 
@@ -2996,7 +3214,9 @@ export function App() {
         setContextPanelTab("agents");
         setIsContextPanelOpen(true);
       }
-      void loadAgentTeamSnapshot(event.workspaceId, event.chatId, { silent: true });
+      void loadAgentTeamSnapshot(event.workspaceId, event.chatId, {
+        silent: true,
+      });
     },
     [loadAgentTeamSnapshot],
   );
@@ -3039,17 +3259,26 @@ export function App() {
     }
 
     const requestedChatKey = chatRunKey(activeWorkspaceId, activeChatId);
-    const cachedSnapshot = agentTeamSnapshotCacheRef.current.get(requestedChatKey);
+    const cachedSnapshot =
+      agentTeamSnapshotCacheRef.current.get(requestedChatKey);
     if (cachedSnapshot) {
       agentTeamSnapshotChatKeyRef.current = requestedChatKey;
       setAgentTeamSnapshot(cachedSnapshot);
       setAgentTeamError(null);
-      void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, { silent: true });
+      void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, {
+        silent: true,
+      });
       return;
     }
 
     void loadAgentTeamSnapshot(activeWorkspaceId, activeChatId);
-  }, [activeChatId, activeMainTab.type, activeWorkspaceId, canUseApp, loadAgentTeamSnapshot]);
+  }, [
+    activeChatId,
+    activeMainTab.type,
+    activeWorkspaceId,
+    canUseApp,
+    loadAgentTeamSnapshot,
+  ]);
 
   const visibleAgentSnapshotTarget = useMemo(() => {
     if (activeMainTab.type === "agent" && activeAgentTab) {
@@ -3081,8 +3310,8 @@ export function App() {
 
   const visibleAgentSnapshotHasRunningTask = Boolean(
     visibleAgentSnapshotTarget &&
-      agentTeamSnapshot?.team.chatId === visibleAgentSnapshotTarget.chatId &&
-      agentTeamSnapshot.tasks.some((task) => task.status === "running"),
+    agentTeamSnapshot?.team.chatId === visibleAgentSnapshotTarget.chatId &&
+    agentTeamSnapshot.tasks.some((task) => task.status === "running"),
   );
 
   useEffect(() => {
@@ -3211,12 +3440,12 @@ export function App() {
       setSettings((current) =>
         current
           ? {
-            ...current,
-            nativeTools: {
-              ...current.nativeTools,
-              ripgrep: data.ripgrep,
-            },
-          }
+              ...current,
+              nativeTools: {
+                ...current.nativeTools,
+                ripgrep: data.ripgrep,
+              },
+            }
           : current,
       );
       setIsRipgrepDialogDismissed(true);
@@ -3249,7 +3478,9 @@ export function App() {
 
   const loadWorkspaceDirectoryChildren = useCallback(
     async (workspaceId: string, path: string) => {
-      setLoadingWorkspaceDirectoryPaths((current) => new Set(current).add(path));
+      setLoadingWorkspaceDirectoryPaths((current) =>
+        new Set(current).add(path),
+      );
       setWorkspaceFilesError(null);
 
       try {
@@ -3261,7 +3492,11 @@ export function App() {
           current
             ? {
                 ...current,
-                root: replaceWorkspaceFileNodeChildren(current.root, data.path, data.children),
+                root: replaceWorkspaceFileNodeChildren(
+                  current.root,
+                  data.path,
+                  data.children,
+                ),
               }
             : current,
         );
@@ -3281,7 +3516,11 @@ export function App() {
   );
 
   const loadGitDiff = useCallback(
-    async (workspaceId: string, path: string | null, target?: SourceControlTarget | null) => {
+    async (
+      workspaceId: string,
+      path: string | null,
+      target?: SourceControlTarget | null,
+    ) => {
       setIsLoadingDiff(true);
       setDiffError(null);
 
@@ -3297,7 +3536,9 @@ export function App() {
           `/api/workspaces/${encodeURIComponent(workspaceId)}/git/diff${query}`,
         );
         setGitDiff(data);
-        setSelectedDiffPath(path && data.files.some((file) => file.path === path) ? path : null);
+        setSelectedDiffPath(
+          path && data.files.some((file) => file.path === path) ? path : null,
+        );
         return data;
       } catch (requestError) {
         setGitDiff(null);
@@ -3310,57 +3551,74 @@ export function App() {
     [],
   );
 
-  const loadContextMemories = useCallback(async (workspaceId: string) => {
-    setIsLoadingContextMemories(true);
-    setContextMemoryError(null);
+  const loadContextMemories = useCallback(
+    async (workspaceId: string) => {
+      setIsLoadingContextMemories(true);
+      setContextMemoryError(null);
 
-    try {
-      const globalParams = new URLSearchParams({
-        page: String(contextMemoryPages.global.page),
-        pageSize: String(contextMemoryPages.global.pageSize),
-        scope: "global",
-        status: "active",
-      });
-      const workspaceParams = new URLSearchParams({
-        page: String(contextMemoryPages.workspace.page),
-        pageSize: String(contextMemoryPages.workspace.pageSize),
-        scope: "workspace",
-        status: "active",
-        workspaceId,
-      });
-      const [globalData, workspaceData] = await Promise.all([
-        requestJson<MemoryListResponse>(`/api/memory?${globalParams.toString()}`),
-        requestJson<MemoryListResponse>(
-          `/api/memory?${workspaceParams.toString()}`,
-        ),
-      ]);
+      try {
+        const globalParams = new URLSearchParams({
+          page: String(contextMemoryPages.global.page),
+          pageSize: String(contextMemoryPages.global.pageSize),
+          scope: "global",
+          status: "active",
+        });
+        const workspaceParams = new URLSearchParams({
+          page: String(contextMemoryPages.workspace.page),
+          pageSize: String(contextMemoryPages.workspace.pageSize),
+          scope: "workspace",
+          status: "active",
+          workspaceId,
+        });
+        const [globalData, workspaceData] = await Promise.all([
+          requestJson<MemoryListResponse>(
+            `/api/memory?${globalParams.toString()}`,
+          ),
+          requestJson<MemoryListResponse>(
+            `/api/memory?${workspaceParams.toString()}`,
+          ),
+        ]);
 
-      setContextMemories({
-        global: {
-          memories: globalData.memories,
-          page: globalData.page,
-          pageSize: globalData.pageSize,
-          totalCount: globalData.totalCount,
-          totalPages: globalData.totalPages,
-        },
-        workspace: {
-          memories: workspaceData.memories,
-          page: workspaceData.page,
-          pageSize: workspaceData.pageSize,
-          totalCount: workspaceData.totalCount,
-          totalPages: workspaceData.totalPages,
-        },
-      });
-    } catch (requestError) {
-      setContextMemories({
-        global: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
-        workspace: { memories: [], page: 1, pageSize: 10, totalCount: 0, totalPages: 0 },
-      });
-      setContextMemoryError(errorMessage(requestError));
-    } finally {
-      setIsLoadingContextMemories(false);
-    }
-  }, [contextMemoryPages]);
+        setContextMemories({
+          global: {
+            memories: globalData.memories,
+            page: globalData.page,
+            pageSize: globalData.pageSize,
+            totalCount: globalData.totalCount,
+            totalPages: globalData.totalPages,
+          },
+          workspace: {
+            memories: workspaceData.memories,
+            page: workspaceData.page,
+            pageSize: workspaceData.pageSize,
+            totalCount: workspaceData.totalCount,
+            totalPages: workspaceData.totalPages,
+          },
+        });
+      } catch (requestError) {
+        setContextMemories({
+          global: {
+            memories: [],
+            page: 1,
+            pageSize: 10,
+            totalCount: 0,
+            totalPages: 0,
+          },
+          workspace: {
+            memories: [],
+            page: 1,
+            pageSize: 10,
+            totalCount: 0,
+            totalPages: 0,
+          },
+        });
+        setContextMemoryError(errorMessage(requestError));
+      } finally {
+        setIsLoadingContextMemories(false);
+      }
+    },
+    [contextMemoryPages],
+  );
 
   const loadWorkspaceSpec = useCallback(async (workspaceId: string) => {
     setIsLoadingWorkspaceSpec(true);
@@ -3371,7 +3629,10 @@ export function App() {
       const data = await requestJson<WorkspaceSpecResponse>(
         `/api/workspaces/${encodeURIComponent(workspaceId)}/spec`,
       );
-      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+      if (
+        activeWorkspaceIdRef.current &&
+        activeWorkspaceIdRef.current !== workspaceId
+      ) {
         return null;
       }
       setWorkspaceSpec(data);
@@ -3379,7 +3640,10 @@ export function App() {
       setWorkspaceSpecPreviewEnabled(data.contentMarkdown.trim().length > 0);
       return data;
     } catch (requestError) {
-      if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+      if (
+        activeWorkspaceIdRef.current &&
+        activeWorkspaceIdRef.current !== workspaceId
+      ) {
         return null;
       }
       setWorkspaceSpec(null);
@@ -3388,77 +3652,95 @@ export function App() {
       setWorkspaceSpecError(errorMessage(requestError));
       return null;
     } finally {
-      if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
+      if (
+        !activeWorkspaceIdRef.current ||
+        activeWorkspaceIdRef.current === workspaceId
+      ) {
         setIsLoadingWorkspaceSpec(false);
       }
     }
   }, []);
 
-  const loadActivePlans = useCallback((workspaceId: string, options: { force?: boolean } = {}) => {
-    const nowMs = requestStormDedupeNow();
-    const existing = activePlansSingleFlightRef.current.get(workspaceId);
-    if (existing && !existing.settled) {
-      existing.queued = true;
-      return existing.promise;
-    }
-    if (shouldReuseRequest(existing, nowMs, options.force)) {
-      return existing!.promise;
-    }
+  const loadActivePlans = useCallback(
+    (workspaceId: string, options: { force?: boolean } = {}) => {
+      const nowMs = requestStormDedupeNow();
+      const existing = activePlansSingleFlightRef.current.get(workspaceId);
+      if (existing && !existing.settled) {
+        existing.queued = true;
+        return existing.promise;
+      }
+      if (shouldReuseRequest(existing, nowMs, options.force)) {
+        return existing!.promise;
+      }
 
-    setIsLoadingActivePlans(true);
-    setActivePlansError(null);
+      setIsLoadingActivePlans(true);
+      setActivePlansError(null);
 
-    let promise: Promise<PlansResponse | null> = Promise.resolve(null);
-    promise = (async () => {
-      try {
-        const data = await requestJson<PlansResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/plans?view=active&limit=50`,
-        );
-        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+      let promise: Promise<PlansResponse | null> = Promise.resolve(null);
+      promise = (async () => {
+        try {
+          const data = await requestJson<PlansResponse>(
+            `/api/workspaces/${encodeURIComponent(workspaceId)}/plans?view=active&limit=50`,
+          );
+          if (
+            activeWorkspaceIdRef.current &&
+            activeWorkspaceIdRef.current !== workspaceId
+          ) {
+            return null;
+          }
+          setActivePlans(data.plans);
+          setLoadedActivePlansWorkspaceId(workspaceId);
+          return data;
+        } catch (requestError) {
+          if (
+            activeWorkspaceIdRef.current &&
+            activeWorkspaceIdRef.current !== workspaceId
+          ) {
+            return null;
+          }
+          setActivePlans([]);
+          setLoadedActivePlansWorkspaceId(null);
+          setActivePlansError(errorMessage(requestError));
           return null;
-        }
-        setActivePlans(data.plans);
-        setLoadedActivePlansWorkspaceId(workspaceId);
-        return data;
-      } catch (requestError) {
-        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
-          return null;
-        }
-        setActivePlans([]);
-        setLoadedActivePlansWorkspaceId(null);
-        setActivePlansError(errorMessage(requestError));
-        return null;
-      } finally {
-        if (!activeWorkspaceIdRef.current || activeWorkspaceIdRef.current === workspaceId) {
-          setIsLoadingActivePlans(false);
-        }
-        const current = activePlansSingleFlightRef.current.get(workspaceId);
-        if (current?.promise === promise) {
-          const shouldRefreshQueued = current.queued;
-          current.settled = true;
-          if (shouldRefreshQueued) {
-            activePlansSingleFlightRef.current.delete(workspaceId);
-            // ponytail: workspace-only queue is enough for the current active-plans endpoint;
-            // upgrade to a request key if plan views or page sizes diverge.
-            void loadActivePlans(workspaceId, { force: true });
-          } else {
-            window.setTimeout(() => {
-              if (activePlansSingleFlightRef.current.get(workspaceId)?.promise === promise) {
-                activePlansSingleFlightRef.current.delete(workspaceId);
-              }
-            }, REQUEST_STORM_DEDUPE_MS);
+        } finally {
+          if (
+            !activeWorkspaceIdRef.current ||
+            activeWorkspaceIdRef.current === workspaceId
+          ) {
+            setIsLoadingActivePlans(false);
+          }
+          const current = activePlansSingleFlightRef.current.get(workspaceId);
+          if (current?.promise === promise) {
+            const shouldRefreshQueued = current.queued;
+            current.settled = true;
+            if (shouldRefreshQueued) {
+              activePlansSingleFlightRef.current.delete(workspaceId);
+              // ponytail: workspace-only queue is enough for the current active-plans endpoint;
+              // upgrade to a request key if plan views or page sizes diverge.
+              void loadActivePlans(workspaceId, { force: true });
+            } else {
+              window.setTimeout(() => {
+                if (
+                  activePlansSingleFlightRef.current.get(workspaceId)
+                    ?.promise === promise
+                ) {
+                  activePlansSingleFlightRef.current.delete(workspaceId);
+                }
+              }, REQUEST_STORM_DEDUPE_MS);
+            }
           }
         }
-      }
-    })();
-    // ponytail: per-tab single-flight only; cross-tab leader can use BroadcastChannel later.
-    activePlansSingleFlightRef.current.set(workspaceId, {
-      promise,
-      settled: false,
-      startedAtMs: nowMs,
-    });
-    return promise;
-  }, []);
+      })();
+      // ponytail: per-tab single-flight only; cross-tab leader can use BroadcastChannel later.
+      activePlansSingleFlightRef.current.set(workspaceId, {
+        promise,
+        settled: false,
+        startedAtMs: nowMs,
+      });
+      return promise;
+    },
+    [],
+  );
 
   const savePlanOrder = useCallback(
     async (workspaceId: string, planIds: string[], previousPlans: Plan[]) => {
@@ -3477,7 +3759,10 @@ export function App() {
             method: "POST",
           },
         );
-        if (activeWorkspaceIdRef.current && activeWorkspaceIdRef.current !== workspaceId) {
+        if (
+          activeWorkspaceIdRef.current &&
+          activeWorkspaceIdRef.current !== workspaceId
+        ) {
           return;
         }
         setActivePlans(response.plans);
@@ -3518,21 +3803,27 @@ export function App() {
             method: "POST",
           },
         );
-        const plansResponse = await loadActivePlans(workspaceId, { force: true });
+        const plansResponse = await loadActivePlans(workspaceId, {
+          force: true,
+        });
         await refreshWorkspaces();
         const plan =
           action === "retry_merge"
             ? response.plan
-            : plansResponse?.plans.find((candidate) => candidate.id === planId) ?? response.plan;
+            : (plansResponse?.plans.find(
+                (candidate) => candidate.id === planId,
+              ) ?? response.plan);
         if (action === "retry_merge") {
           setActivePlans((current) =>
-            current.map((candidate) => (candidate.id === planId ? plan : candidate)),
+            current.map((candidate) =>
+              candidate.id === planId ? plan : candidate,
+            ),
           );
         }
         const implementationChatId =
           action === "start" || action === "resume"
-            ? plan.phases.find((phase) => phase.id === plan.activePhaseId)
-              ?.implementationChatId ?? null
+            ? (plan.phases.find((phase) => phase.id === plan.activePhaseId)
+                ?.implementationChatId ?? null)
             : null;
         if (implementationChatId) {
           selectWorkspaceChat(workspaceId, implementationChatId);
@@ -3582,7 +3873,9 @@ export function App() {
             method: "POST",
           },
         );
-        const plansResponse = await loadActivePlans(workspaceId, { force: true });
+        const plansResponse = await loadActivePlans(workspaceId, {
+          force: true,
+        });
         const plan =
           plansResponse?.plans.find((candidate) => candidate.id === planId) ??
           response.plan;
@@ -3590,12 +3883,16 @@ export function App() {
           plan.phases.find((phase) => phase.id === phaseId) ?? null;
         setPendingPlanPhaseRetryRefresh(
           plansResponse &&
-            !planPhaseRetryRefreshStillRunning(plansResponse.plans, refreshTarget)
+            !planPhaseRetryRefreshStillRunning(
+              plansResponse.plans,
+              refreshTarget,
+            )
             ? null
             : refreshTarget,
         );
         await refreshWorkspaces();
-        const chatId = retriedPhase?.implementationChatId ?? implementationChatId;
+        const chatId =
+          retriedPhase?.implementationChatId ?? implementationChatId;
         if (chatId) {
           selectWorkspaceChat(workspaceId, chatId);
         }
@@ -3701,7 +3998,10 @@ export function App() {
             await new Promise<void>((resolve) => {
               window.setTimeout(resolve, delayMs);
             });
-            if (observer.cancelled || activeWorkspaceIdRef.current !== workspaceId) {
+            if (
+              observer.cancelled ||
+              activeWorkspaceIdRef.current !== workspaceId
+            ) {
               return;
             }
 
@@ -3711,17 +4011,25 @@ export function App() {
                 `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
               );
             } catch (requestError) {
-              if (!observer.cancelled && activeWorkspaceIdRef.current === workspaceId) {
+              if (
+                !observer.cancelled &&
+                activeWorkspaceIdRef.current === workspaceId
+              ) {
                 setWorkspaceSpecError(errorMessage(requestError));
               }
               continue;
             }
-            if (observer.cancelled || activeWorkspaceIdRef.current !== workspaceId) {
+            if (
+              observer.cancelled ||
+              activeWorkspaceIdRef.current !== workspaceId
+            ) {
               return;
             }
 
             setWorkspaceSpecError(null);
-            const job = jobsResponse.jobs.find((candidate) => candidate.id === jobId);
+            const job = jobsResponse.jobs.find(
+              (candidate) => candidate.id === jobId,
+            );
             if (!job) {
               continue;
             }
@@ -3744,7 +4052,9 @@ export function App() {
             return;
           }
         } finally {
-          if (workspaceSpecJobObserversRef.current.get(workspaceId) === observer) {
+          if (
+            workspaceSpecJobObserversRef.current.get(workspaceId) === observer
+          ) {
             workspaceSpecJobObserversRef.current.delete(workspaceId);
           }
         }
@@ -3756,11 +4066,7 @@ export function App() {
   );
 
   const saveWorkspaceSpecSettings = useCallback(
-    async (
-      workspaceId: string,
-      enabled: boolean,
-      injectEnabled: boolean,
-    ) => {
+    async (workspaceId: string, enabled: boolean, injectEnabled: boolean) => {
       const hasUnsavedDraft =
         workspaceSpec !== null &&
         workspaceSpecDraft !== workspaceSpec.contentMarkdown;
@@ -3889,8 +4195,7 @@ export function App() {
           body: JSON.stringify({
             memoryId: memory.id,
             scope: memory.scope,
-            workspaceId:
-              memory.scope === "global" ? null : activeWorkspace.id,
+            workspaceId: memory.scope === "global" ? null : activeWorkspace.id,
           }),
           headers: { "Content-Type": "application/json" },
           method: "POST",
@@ -3959,17 +4264,22 @@ export function App() {
     (workspaceId: string, chatId: string) => {
       const requestedChatKey = chatRunKey(workspaceId, chatId);
       const nowMs = requestStormDedupeNow();
-      const existing = chatStatisticsSingleFlightRef.current.get(requestedChatKey);
+      const existing =
+        chatStatisticsSingleFlightRef.current.get(requestedChatKey);
       if (shouldReuseRequest(existing, nowMs)) {
         return existing!.promise;
       }
 
       const requestId =
-        (chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) ?? 0) + 1;
-      chatStatisticsRequestIdByChatKeyRef.current.set(requestedChatKey, requestId);
+        (chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) ??
+          0) + 1;
+      chatStatisticsRequestIdByChatKeyRef.current.set(
+        requestedChatKey,
+        requestId,
+      );
       const isCurrentStatisticsRequest = () =>
-        chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) === requestId &&
-        activeChatKeyRef.current === requestedChatKey;
+        chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) ===
+          requestId && activeChatKeyRef.current === requestedChatKey;
 
       setIsLoadingChatStatistics(true);
       setChatStatisticsError(null);
@@ -3981,7 +4291,9 @@ export function App() {
             `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/statistics`,
           );
           if (isCurrentStatisticsRequest()) {
-            setChatStatistics(normalizeChatStatistics(data, workspaceId, chatId));
+            setChatStatistics(
+              normalizeChatStatistics(data, workspaceId, chatId),
+            );
             if (!runningChatKeysRef.current.has(requestedChatKey)) {
               clearLiveChatStatistics(requestedChatKey);
             }
@@ -3995,14 +4307,24 @@ export function App() {
           if (isCurrentStatisticsRequest()) {
             setIsLoadingChatStatistics(false);
           }
-          if (chatStatisticsRequestIdByChatKeyRef.current.get(requestedChatKey) === requestId) {
-            chatStatisticsRequestIdByChatKeyRef.current.delete(requestedChatKey);
+          if (
+            chatStatisticsRequestIdByChatKeyRef.current.get(
+              requestedChatKey,
+            ) === requestId
+          ) {
+            chatStatisticsRequestIdByChatKeyRef.current.delete(
+              requestedChatKey,
+            );
           }
-          const current = chatStatisticsSingleFlightRef.current.get(requestedChatKey);
+          const current =
+            chatStatisticsSingleFlightRef.current.get(requestedChatKey);
           if (current?.promise === promise) {
             current.settled = true;
             window.setTimeout(() => {
-              if (chatStatisticsSingleFlightRef.current.get(requestedChatKey)?.promise === promise) {
+              if (
+                chatStatisticsSingleFlightRef.current.get(requestedChatKey)
+                  ?.promise === promise
+              ) {
                 chatStatisticsSingleFlightRef.current.delete(requestedChatKey);
               }
             }, REQUEST_STORM_DEDUPE_MS);
@@ -4087,9 +4409,12 @@ export function App() {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      void loadUpdateStatus();
-    }, 10 * 60 * 1000);
+    const intervalId = window.setInterval(
+      () => {
+        void loadUpdateStatus();
+      },
+      10 * 60 * 1000,
+    );
 
     return () => window.clearInterval(intervalId);
   }, [canUseApp, loadUpdateStatus, updateStatus?.autoCheckEnabled]);
@@ -4122,7 +4447,10 @@ export function App() {
   useEffect(() => {
     if (
       isSourceControlTargetManual &&
-      !sourceControlTargetFromKey(availableSourceControlTargets, sourceControlTargetKeyValue)
+      !sourceControlTargetFromKey(
+        availableSourceControlTargets,
+        sourceControlTargetKeyValue,
+      )
     ) {
       setSelectedSourceControlTarget(null);
       setIsSourceControlTargetManual(false);
@@ -4159,7 +4487,9 @@ export function App() {
 
   useEffect(() => {
     const todoGraphChatTarget =
-      activeWorkspace?.id && activeChatKey ? parseChatRunKey(activeChatKey) : null;
+      activeWorkspace?.id && activeChatKey
+        ? parseChatRunKey(activeChatKey)
+        : null;
 
     if (
       !activeWorkspace?.id ||
@@ -4184,7 +4514,13 @@ export function App() {
       todoGraphChatTarget.workspaceId,
       todoGraphChatTarget.chatId,
     );
-  }, [activeChatKey, activeWorkspace?.id, contextPanelTab, isContextPanelOpen, loadTodoGraph]);
+  }, [
+    activeChatKey,
+    activeWorkspace?.id,
+    contextPanelTab,
+    isContextPanelOpen,
+    loadTodoGraph,
+  ]);
 
   useEffect(() => {
     if (
@@ -4320,7 +4656,8 @@ export function App() {
 
     const shouldRefreshAutoRunState = isPlanAutoRunEnabled;
     const shouldRefreshRunningPlans =
-      (isPlanAutoRunEnabled || (isContextPanelOpen && contextPanelTab === "plan")) &&
+      (isPlanAutoRunEnabled ||
+        (isContextPanelOpen && contextPanelTab === "plan")) &&
       (isPlanAutoRunBusy || activePlans.some(isAutoRunPlanInFlight));
 
     if (!shouldRefreshAutoRunState && !shouldRefreshRunningPlans) {
@@ -4461,7 +4798,8 @@ export function App() {
             workspaces.some((workspace) => workspace.id === tab.workspaceId)) ||
           workspaceHasChatTab(workspaces, tab) ||
           scheduledWorkspaceRunsRef.current.some(
-            (run) => run.workspaceId === tab.workspaceId && run.chatId === tab.chatId,
+            (run) =>
+              run.workspaceId === tab.workspaceId && run.chatId === tab.chatId,
           ),
       );
       return next.length === current.length ? current : next;
@@ -4485,7 +4823,9 @@ export function App() {
     });
 
     setOpenAgentTabs((current) => {
-      const next = current.filter((tab) => workspaceHasChatTab(workspaces, tab));
+      const next = current.filter((tab) =>
+        workspaceHasChatTab(workspaces, tab),
+      );
       if (next.length !== current.length) {
         pruneAgentTabCaches(
           agentTeamSnapshotCacheRef.current,
@@ -4590,14 +4930,23 @@ export function App() {
       setWorkspaceChatContextMenu(null);
     }
 
-    window.addEventListener("pointerdown", closeWorkspaceChatContextMenuForPointer);
+    window.addEventListener(
+      "pointerdown",
+      closeWorkspaceChatContextMenuForPointer,
+    );
     window.addEventListener("keydown", closeWorkspaceChatContextMenuForKey);
     window.addEventListener("resize", closeWorkspaceChatContextMenu);
     window.addEventListener("scroll", closeWorkspaceChatContextMenu, true);
 
     return () => {
-      window.removeEventListener("pointerdown", closeWorkspaceChatContextMenuForPointer);
-      window.removeEventListener("keydown", closeWorkspaceChatContextMenuForKey);
+      window.removeEventListener(
+        "pointerdown",
+        closeWorkspaceChatContextMenuForPointer,
+      );
+      window.removeEventListener(
+        "keydown",
+        closeWorkspaceChatContextMenuForKey,
+      );
       window.removeEventListener("resize", closeWorkspaceChatContextMenu);
       window.removeEventListener("scroll", closeWorkspaceChatContextMenu, true);
     };
@@ -4655,16 +5004,33 @@ export function App() {
       }
     }
 
-    window.addEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
+    window.addEventListener(
+      "pointerdown",
+      closeWorkspaceFileContextMenuForPointer,
+    );
     window.addEventListener("keydown", closeWorkspaceFileContextMenuForKey);
     window.addEventListener("resize", closeWorkspaceFileContextMenu);
-    window.addEventListener("scroll", closeWorkspaceFileContextMenuForScroll, true);
+    window.addEventListener(
+      "scroll",
+      closeWorkspaceFileContextMenuForScroll,
+      true,
+    );
 
     return () => {
-      window.removeEventListener("pointerdown", closeWorkspaceFileContextMenuForPointer);
-      window.removeEventListener("keydown", closeWorkspaceFileContextMenuForKey);
+      window.removeEventListener(
+        "pointerdown",
+        closeWorkspaceFileContextMenuForPointer,
+      );
+      window.removeEventListener(
+        "keydown",
+        closeWorkspaceFileContextMenuForKey,
+      );
       window.removeEventListener("resize", closeWorkspaceFileContextMenu);
-      window.removeEventListener("scroll", closeWorkspaceFileContextMenuForScroll, true);
+      window.removeEventListener(
+        "scroll",
+        closeWorkspaceFileContextMenuForScroll,
+        true,
+      );
     };
   }, [workspaceFileContextMenu]);
 
@@ -4682,11 +5048,17 @@ export function App() {
     const rect = element.getBoundingClientRect();
     const nextLeft = Math.max(
       margin,
-      Math.min(workspaceFileContextMenu.left, window.innerWidth - rect.width - margin),
+      Math.min(
+        workspaceFileContextMenu.left,
+        window.innerWidth - rect.width - margin,
+      ),
     );
     const nextTop = Math.max(
       margin,
-      Math.min(workspaceFileContextMenu.top, window.innerHeight - rect.height - margin),
+      Math.min(
+        workspaceFileContextMenu.top,
+        window.innerHeight - rect.height - margin,
+      ),
     );
     setWorkspaceFileContextMenu({
       ...workspaceFileContextMenu,
@@ -4746,7 +5118,7 @@ export function App() {
 
       const defaultThinkingLevel =
         !hasManuallySelectedModelRef.current &&
-          selectedModel.id === defaultComposerSelection.modelId
+        selectedModel.id === defaultComposerSelection.modelId
           ? defaultComposerSelection.thinkingLevel
           : defaultThinkingLevelForModel(selectedModel);
 
@@ -4769,9 +5141,7 @@ export function App() {
   ]);
 
   useEffect(() => {
-    const enabledSkillIds = new Set(
-      availableSkills.map((skill) => skill.key),
-    );
+    const enabledSkillIds = new Set(availableSkills.map((skill) => skill.key));
 
     setSelectedSkillIds((current) => {
       const next = current.filter((skillId) => enabledSkillIds.has(skillId));
@@ -4786,25 +5156,30 @@ export function App() {
 
     try {
       const isRemoteWorkspace = workspaceMode === "ssh";
-      const data = await requestJson<WorkspacesResponse>("/api/workspaces/add", {
-        body: JSON.stringify({
-          name: workspaceName,
-          path: isRemoteWorkspace ? workspacePath : workspacePath,
-          remotePath: isRemoteWorkspace ? workspacePath : null,
-          serverId: isRemoteWorkspace ? workspaceServerId : null,
-          terminalShell: workspaceTerminalShell || null,
-          contentBase64: workspaceIconDraft?.contentBase64 ?? null,
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
+      const data = await requestJson<WorkspacesResponse>(
+        "/api/workspaces/add",
+        {
+          body: JSON.stringify({
+            name: workspaceName,
+            path: isRemoteWorkspace ? workspacePath : workspacePath,
+            remotePath: isRemoteWorkspace ? workspacePath : null,
+            serverId: isRemoteWorkspace ? workspaceServerId : null,
+            terminalShell: workspaceTerminalShell || null,
+            contentBase64: workspaceIconDraft?.contentBase64 ?? null,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
       const createdWorkspace =
         data.workspaces.find(
           (workspace) => workspace.id === data.activeWorkspaceId,
         ) ?? data.workspaces[0];
 
       setWorkspaces(data.workspaces);
-      setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(data.workspaces));
+      setWorkspaceChatPaging(
+        workspaceChatPagingFromWorkspaces(data.workspaces),
+      );
       void loadSettings();
       const nextWorkspaceId = createdWorkspace?.id ?? data.activeWorkspaceId;
       // Clear prior chat/composer state atomically so the new workspace is never
@@ -4818,7 +5193,11 @@ export function App() {
       });
       if (workspaceSpecEnabled && createdWorkspace?.id) {
         try {
-          await saveWorkspaceSpecSettingsRequest(createdWorkspace.id, true, false);
+          await saveWorkspaceSpecSettingsRequest(
+            createdWorkspace.id,
+            true,
+            false,
+          );
         } catch (specError) {
           setError(errorMessage(specError));
         }
@@ -4858,7 +5237,9 @@ export function App() {
         {
           details: null,
           errorKind: response.result.ok ? null : response.result.errorKind,
-          message: response.result.message ?? (response.result.ok ? t("Ready") : t("Failed")),
+          message:
+            response.result.message ??
+            (response.result.ok ? t("Ready") : t("Failed")),
           stage: "ready",
           status: response.result.ok ? "success" : "failed",
         },
@@ -4912,20 +5293,25 @@ export function App() {
     setError(null);
 
     try {
-      const response = await requestJson<RemoteServerResponse>("/api/remote-servers/create", {
-        body: JSON.stringify({
-          hostAlias: inlineRemoteServerHost.trim(),
-          name: inlineRemoteServerName.trim(),
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
+      const response = await requestJson<RemoteServerResponse>(
+        "/api/remote-servers/create",
+        {
+          body: JSON.stringify({
+            hostAlias: inlineRemoteServerHost.trim(),
+            name: inlineRemoteServerName.trim(),
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
       try {
-        const connectResponse = await requestJson<RemoteServerDiagnosticResponse>(
-          `/api/remote-servers/${encodeURIComponent(response.server.id)}/connect`,
-          { method: "POST" },
-        );
-        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        const connectResponse =
+          await requestJson<RemoteServerDiagnosticResponse>(
+            `/api/remote-servers/${encodeURIComponent(response.server.id)}/connect`,
+            { method: "POST" },
+          );
+        const nextSettings =
+          await requestJson<SettingsResponse>("/api/settings");
         setSettings(nextSettings);
         setWorkspaceServerId(response.server.id);
         if (!workspacePath.trim() && response.server.defaultRemoteRoot) {
@@ -4959,7 +5345,8 @@ export function App() {
           return;
         }
       } catch (connectError) {
-        const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+        const nextSettings =
+          await requestJson<SettingsResponse>("/api/settings");
         setSettings(nextSettings);
         setWorkspaceServerId(response.server.id);
         throw connectError;
@@ -4981,7 +5368,9 @@ export function App() {
 
   function setWorkspaceRemotePath(path: string) {
     setWorkspacePath(path);
-    setWorkspaceName((current) => current.trim() ? current : remoteWorkspacePathBasename(path));
+    setWorkspaceName((current) =>
+      current.trim() ? current : remoteWorkspacePathBasename(path),
+    );
   }
 
   async function retryRemoteWorkspace(workspace: WorkspaceSummary) {
@@ -5009,7 +5398,9 @@ export function App() {
     setWorkspaceIconDraft(null);
   }
 
-  async function handleWorkspaceIconPickerSelection(selection: FilePickerSelection[]) {
+  async function handleWorkspaceIconPickerSelection(
+    selection: FilePickerSelection[],
+  ) {
     const file = selection[0]?.file;
     if (!file) {
       return;
@@ -5035,9 +5426,10 @@ export function App() {
     setFilePickerRequest({
       initialPath: workspacePath,
       mode: "directory",
-      target: workspaceMode === "ssh" && workspaceServerId
-        ? { kind: "remoteServer", serverId: workspaceServerId }
-        : { kind: "local" },
+      target:
+        workspaceMode === "ssh" && workspaceServerId
+          ? { kind: "remoteServer", serverId: workspaceServerId }
+          : { kind: "local" },
       title: t("Select workspace folder"),
       onSelect: (selection) => {
         const selectedPath = selection[0]?.path;
@@ -5060,9 +5452,10 @@ export function App() {
     setFilePickerRequest({
       mode: "file",
       readFiles: true,
-      target: workspaceMode === "ssh" && workspaceServerId
-        ? { kind: "remoteServer", serverId: workspaceServerId }
-        : { kind: "local" },
+      target:
+        workspaceMode === "ssh" && workspaceServerId
+          ? { kind: "remoteServer", serverId: workspaceServerId }
+          : { kind: "local" },
       title: t("Select workspace icon"),
       onSelect: (selection) => {
         void handleWorkspaceIconPickerSelection(selection);
@@ -5085,7 +5478,9 @@ export function App() {
         void handleAddSelectedFileAttachments(
           selection
             .map((item) => item.file)
-            .filter((file): file is NonNullable<FilePickerSelection["file"]> => Boolean(file)),
+            .filter((file): file is NonNullable<FilePickerSelection["file"]> =>
+              Boolean(file),
+            ),
         );
       },
     });
@@ -5107,7 +5502,9 @@ export function App() {
       onSelect: (selection) => {
         const attachments = selection
           .map((item) => item.file)
-          .filter((file): file is NonNullable<FilePickerSelection["file"]> => Boolean(file))
+          .filter((file): file is NonNullable<FilePickerSelection["file"]> =>
+            Boolean(file),
+          )
           .map(composerAttachmentFromSelectedFile);
         if (attachments.length) {
           onSelected(attachments);
@@ -5116,7 +5513,9 @@ export function App() {
     });
   }
 
-  async function handleAddSelectedFileAttachments(files: NonNullable<FilePickerSelection["file"]>[]) {
+  async function handleAddSelectedFileAttachments(
+    files: NonNullable<FilePickerSelection["file"]>[],
+  ) {
     if (!files.length) {
       return;
     }
@@ -5235,24 +5634,27 @@ export function App() {
         messageHasToolCall(message, delta.toolCallId);
       const updateExistingToolCall = next.some(messageOwnsToolCall);
       next = next.map((message) =>
-        (updateExistingToolCall
-          ? messageOwnsToolCall(message)
-          : message.role === "assistant" && message.id === delta.assistantMessageId)
+        (
+          updateExistingToolCall
+            ? messageOwnsToolCall(message)
+            : message.role === "assistant" &&
+              message.id === delta.assistantMessageId
+        )
           ? {
-            ...message,
-            parts: applyToolOutputDeltaToParts(
-              message.parts,
-              delta.toolCallId,
-              delta.stream,
-              delta.delta,
-            ),
-            toolCalls: applyToolOutputDelta(
-              message.toolCalls,
-              delta.toolCallId,
-              delta.stream,
-              delta.delta,
-            ),
-          }
+              ...message,
+              parts: applyToolOutputDeltaToParts(
+                message.parts,
+                delta.toolCallId,
+                delta.stream,
+                delta.delta,
+              ),
+              toolCalls: applyToolOutputDelta(
+                message.toolCalls,
+                delta.toolCallId,
+                delta.stream,
+                delta.delta,
+              ),
+            }
           : message,
       );
     }
@@ -5294,11 +5696,7 @@ export function App() {
 
     return {
       flush,
-      push(
-        chatKey: string,
-        assistantMessageId: string,
-        delta: string,
-      ) {
+      push(chatKey: string, assistantMessageId: string, delta: string) {
         const messageDeltas =
           bufferedDeltasByChatKey.get(chatKey) ?? new Map<string, string>();
         messageDeltas.set(
@@ -5419,17 +5817,17 @@ export function App() {
 
       for (const [chatKey, toolDeltas] of bufferedDeltas) {
         setMessagesForChatKey(chatKey, (current) =>
-          appendBufferedToolOutputDeltas(current, Array.from(toolDeltas.values())),
+          appendBufferedToolOutputDeltas(
+            current,
+            Array.from(toolDeltas.values()),
+          ),
         );
       }
     };
 
     return {
       flush,
-      push(
-        chatKey: string,
-        delta: BufferedToolOutputDelta,
-      ) {
+      push(chatKey: string, delta: BufferedToolOutputDelta) {
         const toolDeltas =
           bufferedDeltasByChatKey.get(chatKey) ??
           new Map<string, BufferedToolOutputDelta>();
@@ -5437,7 +5835,8 @@ export function App() {
         const current = toolDeltas.get(key);
         toolDeltas.set(key, {
           ...delta,
-          assistantMessageId: current?.assistantMessageId ?? delta.assistantMessageId,
+          assistantMessageId:
+            current?.assistantMessageId ?? delta.assistantMessageId,
           delta: `${current?.delta ?? ""}${delta.delta}`,
         });
         bufferedDeltasByChatKey.set(chatKey, toolDeltas);
@@ -5487,7 +5886,10 @@ export function App() {
     });
   }
 
-  function moveChatPaginationForChatKey(fromChatKey: string, toChatKey: string) {
+  function moveChatPaginationForChatKey(
+    fromChatKey: string,
+    toChatKey: string,
+  ) {
     setChatMessagePaginationByKey((current) => {
       const pagination = current[fromChatKey];
       if (!pagination) {
@@ -5546,7 +5948,6 @@ export function App() {
       contextUsageIdentityByChatKeyRef.current.delete(fromChatKey);
       contextUsageIdentityByChatKeyRef.current.set(toChatKey, identity);
     }
-
   }
 
   function cancelContextUsageRequestForChatKey(chatKey: string) {
@@ -5754,11 +6155,14 @@ export function App() {
       }
 
       if (runInfo.chatId) {
-        console.debug("[chat-stream] refreshing running chat after recovery trigger", {
-          chatId: runInfo.chatId,
-          reason,
-          workspaceId: runInfo.workspaceId,
-        });
+        console.debug(
+          "[chat-stream] refreshing running chat after recovery trigger",
+          {
+            chatId: runInfo.chatId,
+            reason,
+            workspaceId: runInfo.workspaceId,
+          },
+        );
         void loadChatMessages(runInfo.workspaceId, runInfo.chatId);
       }
     }
@@ -5955,16 +6359,16 @@ export function App() {
           const scheduledRun: ScheduledWorkspaceRun = existingRun
             ? { ...existingRun, request: queuedRequest }
             : {
-              id: chat.id,
-              workspaceId: workspace.id,
-              chatId: chat.id,
-              chatKey,
-              title: chat.title,
-              createdAt: chat.createdAt,
-              pendingUserMessageId: chat.queuedRun.userMessageId,
-              request: queuedRequest,
-              status: "queued",
-            };
+                id: chat.id,
+                workspaceId: workspace.id,
+                chatId: chat.id,
+                chatKey,
+                title: chat.title,
+                createdAt: chat.createdAt,
+                pendingUserMessageId: chat.queuedRun.userMessageId,
+                request: queuedRequest,
+                status: "queued",
+              };
 
           nextRuns.push(scheduledRun);
           nextRunChatKeys.add(chatKey);
@@ -6001,9 +6405,7 @@ export function App() {
         queuedUserMessageId: message.id,
         assistantMessageId: message.queuedRun?.assistantMessageId ?? undefined,
       }))
-      .filter(
-        (request) => request.modelId.trim() && request.providerId.trim(),
-      );
+      .filter((request) => request.modelId.trim() && request.providerId.trim());
 
     updateQueuedRunRequestsForChatKey(chatKey, () => queuedRequests);
     const [queuedRequest] = queuedRequests;
@@ -6033,7 +6435,8 @@ export function App() {
           title: workspaceChat.title,
           createdAt: workspaceChat.createdAt,
           pendingUserMessageId:
-            queuedRequest.pendingUserMessageId ?? queuedRequest.queuedUserMessageId,
+            queuedRequest.pendingUserMessageId ??
+            queuedRequest.queuedUserMessageId,
           request: queuedRequest,
           status: "queued",
         },
@@ -6081,7 +6484,8 @@ export function App() {
         providerId: runConfig.providerId ?? selectedProviderIdRef.current ?? "",
         thinkingLevel: runConfig.thinkingLevel ?? "",
         skillIds: normalizeStringArray(runConfig.selectedSkillIds),
-        sessionMode: runConfig.sessionMode ?? userMessage.sessionMode ?? undefined,
+        sessionMode:
+          runConfig.sessionMode ?? userMessage.sessionMode ?? undefined,
         teamModeEnabled: runConfig.teamModeEnabled ?? false,
         localChatKey: chatKey,
       });
@@ -6103,26 +6507,24 @@ export function App() {
     );
     const scheduledChats = scheduledWorkspaceRunsFor(workspace.id)
       .filter((run) => !persistedWorkspaceChatIds.has(run.chatId))
-      .map(
-        (run): WorkspaceChatListItem => ({
-          activeRun: null,
-          codeChangeStats: { additions: 0, deletions: 0 },
-          createdAt: run.createdAt,
-          id: run.chatId,
-          queuedRun: null,
-          scheduledChatKey: run.chatKey,
-          scheduledRunId: run.id,
-          scheduledStatus: run.status,
-          title: run.title,
-          updatedAt: run.createdAt,
-        }),
-      );
-    const persistedWorkspaceChats: WorkspaceChatListItem[] = workspace.chats.map(
-      (chat) => ({
+      .map((run): WorkspaceChatListItem => ({
+        activeRun: null,
+        codeChangeStats: { additions: 0, deletions: 0 },
+        createdAt: run.createdAt,
+        id: run.chatId,
+        queuedRun: null,
+        scheduledChatKey: run.chatKey,
+        scheduledRunId: run.id,
+        scheduledStatus: run.status,
+        title: run.title,
+        updatedAt: run.createdAt,
+      }));
+    const persistedWorkspaceChats: WorkspaceChatListItem[] =
+      workspace.chats.map((chat) => ({
         ...chat,
-        scheduledStatus: chat.queuedRun?.status === "queued" ? "queued" : undefined,
-      }),
-    );
+        scheduledStatus:
+          chat.queuedRun?.status === "queued" ? "queued" : undefined,
+      }));
 
     return [...scheduledChats, ...persistedWorkspaceChats].sort(
       compareWorkspaceChatListItemsByCreatedAtDesc,
@@ -6130,7 +6532,9 @@ export function App() {
   }
 
   function scheduledWorkspaceRunsFor(workspaceId: string) {
-    return scheduledWorkspaceRuns.filter((run) => run.workspaceId === workspaceId);
+    return scheduledWorkspaceRuns.filter(
+      (run) => run.workspaceId === workspaceId,
+    );
   }
 
   function setActiveWorkspaceChatRefs(
@@ -6160,10 +6564,29 @@ export function App() {
     return planModeByChatKeyRef.current[chatKey] === true;
   }
 
+  function resolveCommittedLatencyModeForChatKey(
+    chatKey: string | null,
+  ): "standard" | "fast" {
+    if (!chatKey) {
+      return "standard";
+    }
+    const messages = chatMessagesByKeyRef.current[chatKey];
+    if (messages !== undefined) {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.role === "user" && message.runConfig) {
+          return latencyModeFromValue(message.runConfig.latencyMode);
+        }
+      }
+    }
+    return latencyModeByChatKeyRef.current[chatKey] ?? "standard";
+  }
+
   function restorePlanModeForChatKey(chatKey: string | null) {
     const enabled = resolveCommittedPlanModeForChatKey(chatKey);
     setIsPlanModeEnabled(enabled);
     applyComposerModelForPlanMode(enabled);
+    setSelectedLatencyMode(resolveCommittedLatencyModeForChatKey(chatKey));
   }
 
   function applyComposerModelForPlanMode(enabled: boolean) {
@@ -6172,16 +6595,17 @@ export function App() {
       if (!modeModelId) {
         return;
       }
-      const model = availableModels.find((candidate) => candidate.id === modeModelId);
+      const model = availableModels.find(
+        (candidate) => candidate.id === modeModelId,
+      );
       if (!model) {
         return;
       }
       if (
-        !(
-          model.activeProviderId && model.providerIds.includes(model.activeProviderId)
-            ? model.activeProviderId
-            : model.providerIds[0]
-        )
+        !(model.activeProviderId &&
+        model.providerIds.includes(model.activeProviderId)
+          ? model.activeProviderId
+          : model.providerIds[0])
       ) {
         return;
       }
@@ -6202,8 +6626,14 @@ export function App() {
     planModeByChatKeyRef.current[chatKey] = value;
   }
 
-  function bindRequestPlanModeToChatKey(request: RetryRunRequest, chatKey: string) {
+  function bindRequestPlanModeToChatKey(
+    request: RetryRunRequest,
+    chatKey: string,
+  ) {
     rememberPlanModeForChatKey(chatKey, request.sessionMode === "plan");
+    latencyModeByChatKeyRef.current[chatKey] = latencyModeFromValue(
+      request.latencyMode,
+    );
   }
 
   function workspaceHasRunningOrStartingRun(workspaceId: string) {
@@ -6277,7 +6707,11 @@ export function App() {
     const cachedMessages = chatMessagesByKeyRef.current[run.chatKey] ?? [];
     setActiveWorkspaceId(run.workspaceId);
     setActiveChatId(run.chatId);
-    setActiveMainTab({ chatId: run.chatId, type: "chat", workspaceId: run.workspaceId });
+    setActiveMainTab({
+      chatId: run.chatId,
+      type: "chat",
+      workspaceId: run.workspaceId,
+    });
     setExpandedWorkspaceId(run.workspaceId);
     activeWorkspaceIdRef.current = run.workspaceId;
     activeChatIdRef.current = run.chatId;
@@ -6295,10 +6729,7 @@ export function App() {
     });
   }
 
-  async function loadChatMessages(
-    workspaceId: string,
-    chatId: string,
-  ) {
+  async function loadChatMessages(workspaceId: string, chatId: string) {
     setError(null);
     const chatKey = chatRunKey(workspaceId, chatId);
     const existingController = loadingChatControllersRef.current.get(chatKey);
@@ -6334,13 +6765,18 @@ export function App() {
         ? null
         : reportedActiveRun;
       if (reportedActiveRun && activeRun === null) {
-        clearWorkspaceChatActiveRun(workspaceId, chatId, reportedActiveRun.runId);
+        clearWorkspaceChatActiveRun(
+          workspaceId,
+          chatId,
+          reportedActiveRun.runId,
+        );
       }
       const cachedMessages = chatMessagesByKeyRef.current[chatKey] ?? [];
       const localRunInfo = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
       const hasLocalActiveRun =
         Boolean(localRunInfo) && runningChatKeysRef.current.has(chatKey);
-      const localStreamController = activeRunAbortByChatKeyRef.current.get(chatKey);
+      const localStreamController =
+        activeRunAbortByChatKeyRef.current.get(chatKey);
       const hasOpenLocalStream = Boolean(
         localStreamController && !localStreamController.signal.aborted,
       );
@@ -6361,8 +6797,7 @@ export function App() {
       // this client has no local run but the server reports one (id-overlap
       // path only re-inserts placeholders; zero-overlap still drops orphans).
       const preserveStreamingPlaceholders =
-        sameContinuousLocalRun ||
-        (!hasLocalActiveRun && Boolean(activeRun));
+        sameContinuousLocalRun || (!hasLocalActiveRun && Boolean(activeRun));
       const mergeResult = mergeLoadedMessagesWithStreamingPlaceholders(
         normalizedMessages,
         cachedMessages,
@@ -6375,12 +6810,16 @@ export function App() {
         mergeResult.messages,
         cachedMessages,
       );
-      const restoredQuestion = parseQuestionRequestSummary(data.pendingQuestion);
+      const restoredQuestion = parseQuestionRequestSummary(
+        data.pendingQuestion,
+      );
       const serverPagination = normalizeChatMessagesPagination(data.pagination);
       const existingPagination = chatMessagePaginationByKeyRef.current[chatKey];
       const cacheWasTrimmed = trimmedChatCacheKeysRef.current.has(chatKey);
       const pagination =
-        mergeResult.preservedCachePrefix && existingPagination && !cacheWasTrimmed
+        mergeResult.preservedCachePrefix &&
+        existingPagination &&
+        !cacheWasTrimmed
           ? existingPagination
           : serverPagination;
       if (loadingChatControllersRef.current.get(chatKey) !== controller) {
@@ -6389,7 +6828,10 @@ export function App() {
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
       setReadOnlyChatKeys((current) => {
         const readOnly = data.chat?.readOnly === true;
-        if ((current[chatKey] === true) === readOnly && (readOnly || !(chatKey in current))) {
+        if (
+          (current[chatKey] === true) === readOnly &&
+          (readOnly || !(chatKey in current))
+        ) {
           return current;
         }
         const next = { ...current };
@@ -6400,20 +6842,33 @@ export function App() {
         }
         return next;
       });
-      setChatMessagesByKey((current) => ({ ...current, [chatKey]: nextMessages }));
+      setChatMessagesByKey((current) => ({
+        ...current,
+        [chatKey]: nextMessages,
+      }));
       rememberChatCacheAccess(chatKey);
       trimmedChatCacheKeysRef.current.delete(chatKey);
-      setChatMessagePaginationByKey((current) => ({ ...current, [chatKey]: pagination }));
+      setChatMessagePaginationByKey((current) => ({
+        ...current,
+        [chatKey]: pagination,
+      }));
       trimInactiveChatCaches();
       restoreQueuedRunRequestsForChatKey(workspaceId, chatId, nextMessages);
-      restoreRetryRunRequestFromFailedMessages(workspaceId, chatId, nextMessages);
+      restoreRetryRunRequestFromFailedMessages(
+        workspaceId,
+        chatId,
+        nextMessages,
+      );
       const planModeFromMessages = planModeEnabledFromMessages(nextMessages);
       rememberPlanModeForChatKey(chatKey, planModeFromMessages);
       if (activeChatKeyRef.current === chatKey) {
         setMessages(nextMessages);
-        setPendingQuestion((current) =>
-          restoredQuestion ??
-          (current?.workspaceId === workspaceId && current.chatId === chatId ? null : current),
+        setPendingQuestion(
+          (current) =>
+            restoredQuestion ??
+            (current?.workspaceId === workspaceId && current.chatId === chatId
+              ? null
+              : current),
         );
         if (restoredQuestion) {
           setQuestionError(null);
@@ -6487,7 +6942,9 @@ export function App() {
 
       setChatMessagesByKey((current) => {
         const existingMessages = current[chatKey] ?? [];
-        const existingIds = new Set(existingMessages.map((message) => message.id));
+        const existingIds = new Set(
+          existingMessages.map((message) => message.id),
+        );
         nextMessagesForChat = [
           ...olderMessages.filter((message) => !existingIds.has(message.id)),
           ...existingMessages,
@@ -6524,7 +6981,9 @@ export function App() {
     if (isPendingChatId(chatId)) {
       return true;
     }
-    const workspace = workspaces.find((candidate) => candidate.id === workspaceId);
+    const workspace = workspaces.find(
+      (candidate) => candidate.id === workspaceId,
+    );
     if (!workspace) {
       return false;
     }
@@ -6616,7 +7075,10 @@ export function App() {
         .find((workspace) => workspace.id === workspaceId)
         ?.chats.find((chat) => chat.id === chatId)?.activeRun,
     );
-    for (const [loadingChatKey, controller] of loadingChatControllersRef.current) {
+    for (const [
+      loadingChatKey,
+      controller,
+    ] of loadingChatControllersRef.current) {
       if (loadingChatKey !== chatKey) {
         controller.abort();
       }
@@ -6695,7 +7157,9 @@ export function App() {
   }
 
   function openChatTab(workspaceId: string, chatId: string) {
-    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const workspace = workspaces.find(
+      (workspace) => workspace.id === workspaceId,
+    );
     const chat = workspace?.chats.find((chat) => chat.id === chatId);
     const nextTabs = upsertOpenChatTab(openChatTabsRef.current, {
       workspaceId,
@@ -6753,23 +7217,26 @@ export function App() {
         }
 
         // Off-page unknown: restore with fallback title and probe includeChatId.
-        void ensureWorkspaceChatLoaded(tab.workspaceId, tab.chatId).then((found) => {
-          if (found) {
-            return;
-          }
-
-          setOpenChatTabs((current) => {
-            const next = current.filter(
-              (openTab) =>
-                openTab.workspaceId !== tab.workspaceId || openTab.chatId !== tab.chatId,
-            );
-            if (next.length === current.length) {
-              return current;
+        void ensureWorkspaceChatLoaded(tab.workspaceId, tab.chatId).then(
+          (found) => {
+            if (found) {
+              return;
             }
-            openChatTabsRef.current = next;
-            return next;
-          });
-        });
+
+            setOpenChatTabs((current) => {
+              const next = current.filter(
+                (openTab) =>
+                  openTab.workspaceId !== tab.workspaceId ||
+                  openTab.chatId !== tab.chatId,
+              );
+              if (next.length === current.length) {
+                return current;
+              }
+              openChatTabsRef.current = next;
+              return next;
+            });
+          },
+        );
 
         return [
           {
@@ -6810,7 +7277,9 @@ export function App() {
       workspaceId: tab.workspaceId,
     });
     setExpandedWorkspaceId(tab.workspaceId);
-    setActiveWorkspaceChatRefs(tab.workspaceId, tab.chatId, { syncPlanMode: true });
+    setActiveWorkspaceChatRefs(tab.workspaceId, tab.chatId, {
+      syncPlanMode: true,
+    });
     setMessages(cachedMessages ?? []);
     setSelectedDiffPath(null);
     setViewMode("chat");
@@ -6843,7 +7312,9 @@ export function App() {
       return;
     }
 
-    const workspace = workspaces.find((workspace) => workspace.id === activeWorkspaceId);
+    const workspace = workspaces.find(
+      (workspace) => workspace.id === activeWorkspaceId,
+    );
     const nextTab: OpenAgentTab = {
       chatId: activeChatId,
       fallbackTitle: instance.definitionSnapshot.name,
@@ -6859,7 +7330,9 @@ export function App() {
 
   async function openWorkspaceFileTab(node: WorkspaceFileTreeNode) {
     if (!activeWorkspace) {
-      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      setWorkspaceFilesError(
+        t("Select a workspace before using file actions."),
+      );
       return;
     }
     if (node.kind !== "file" || !node.path) {
@@ -6889,7 +7362,9 @@ export function App() {
     activeFile: BrowserRouteFileTab | null,
   ) {
     const nextTabs = files.flatMap((file) => {
-      const workspace = workspaces.find((workspace) => workspace.id === file.workspaceId);
+      const workspace = workspaces.find(
+        (workspace) => workspace.id === file.workspaceId,
+      );
       if (!workspace) {
         return [];
       }
@@ -6901,10 +7376,11 @@ export function App() {
     setOpenFileTabs(nextTabs);
 
     const selectedFile = activeFile
-      ? nextTabs.find(
-        (tab) =>
-          tab.workspaceId === activeFile.workspaceId && tab.path === activeFile.path,
-      ) ?? null
+      ? (nextTabs.find(
+          (tab) =>
+            tab.workspaceId === activeFile.workspaceId &&
+            tab.path === activeFile.path,
+        ) ?? null)
       : null;
     if (!selectedFile) {
       return false;
@@ -6935,7 +7411,11 @@ export function App() {
     }
     setActiveWorkspaceId(file.workspaceId);
     setExpandedWorkspaceId(file.workspaceId);
-    setActiveMainTab({ path: file.path, type: "file", workspaceId: file.workspaceId });
+    setActiveMainTab({
+      path: file.path,
+      type: "file",
+      workspaceId: file.workspaceId,
+    });
     setViewMode("chat");
     setIsMobileWorkspaceOpen(false);
     if (!isWorkspaceImageFilePath(file.path)) {
@@ -6947,7 +7427,10 @@ export function App() {
   }
 
   function openWorkspaceHtmlPreviewTab(
-    file: Pick<OpenFileTab, "workspaceId" | "path" | "name" | "workspaceName" | "workspaceLogoUrl">,
+    file: Pick<
+      OpenFileTab,
+      "workspaceId" | "path" | "name" | "workspaceName" | "workspaceLogoUrl"
+    >,
     options: { updateUrl?: boolean } = {},
   ) {
     if (!isHtmlPreviewPath(file.path) && !isHtmlFilePath(file.path)) {
@@ -6968,7 +7451,10 @@ export function App() {
     preview: OpenHtmlPreviewTab,
     options: { updateUrl?: boolean } = {},
   ) {
-    const nextTabs = upsertOpenHtmlPreviewTab(openHtmlPreviewTabsRef.current, preview);
+    const nextTabs = upsertOpenHtmlPreviewTab(
+      openHtmlPreviewTabsRef.current,
+      preview,
+    );
     openHtmlPreviewTabsRef.current = nextTabs;
     setOpenHtmlPreviewTabs(nextTabs);
     // Same as file tabs: never pair a new workspace with the prior chat identity.
@@ -7001,7 +7487,9 @@ export function App() {
         return [];
       }
 
-      const workspace = workspaces.find((item) => item.id === preview.workspaceId);
+      const workspace = workspaces.find(
+        (item) => item.id === preview.workspaceId,
+      );
       if (!workspace) {
         return [];
       }
@@ -7013,11 +7501,11 @@ export function App() {
     setOpenHtmlPreviewTabs(nextTabs);
 
     const selectedPreview = activePreview
-      ? nextTabs.find(
-        (tab) =>
-          tab.workspaceId === activePreview.workspaceId &&
-          tab.path === activePreview.path,
-      ) ?? null
+      ? (nextTabs.find(
+          (tab) =>
+            tab.workspaceId === activePreview.workspaceId &&
+            tab.path === activePreview.path,
+        ) ?? null)
       : null;
     if (!selectedPreview) {
       return false;
@@ -7083,20 +7571,24 @@ export function App() {
   function browserRouteForActiveFile(file: OpenFileTab): BrowserRoute {
     return {
       activeFile: { path: file.path, workspaceId: file.workspaceId },
-      chatId: activeWorkspaceIdRef.current === file.workspaceId
-        ? activeChatIdRef.current
-        : null,
+      chatId:
+        activeWorkspaceIdRef.current === file.workspaceId
+          ? activeChatIdRef.current
+          : null,
       viewMode: "chat",
       workspaceId: file.workspaceId,
     };
   }
 
-  function browserRouteForActiveHtmlPreview(preview: OpenHtmlPreviewTab): BrowserRoute {
+  function browserRouteForActiveHtmlPreview(
+    preview: OpenHtmlPreviewTab,
+  ): BrowserRoute {
     return {
       activePreview: { path: preview.path, workspaceId: preview.workspaceId },
-      chatId: activeWorkspaceIdRef.current === preview.workspaceId
-        ? activeChatIdRef.current
-        : null,
+      chatId:
+        activeWorkspaceIdRef.current === preview.workspaceId
+          ? activeChatIdRef.current
+          : null,
       viewMode: "chat",
       workspaceId: preview.workspaceId,
     };
@@ -7256,7 +7748,9 @@ export function App() {
     chatId: string,
     fallbackTitle: string,
   ) {
-    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const workspace = workspaces.find(
+      (workspace) => workspace.id === workspaceId,
+    );
     const nextTabs = upsertOpenChatTab(openChatTabsRef.current, {
       workspaceId,
       chatId,
@@ -7273,19 +7767,24 @@ export function App() {
     pendingChatId: string,
     chatId: string,
   ) {
-    const workspace = workspaces.find((workspace) => workspace.id === workspaceId);
+    const workspace = workspaces.find(
+      (workspace) => workspace.id === workspaceId,
+    );
     const chat = workspace?.chats.find((chat) => chat.id === chatId);
 
     setOpenChatTabs((current) => {
       const pendingTab = current.find(
-        (tab) => tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
+        (tab) =>
+          tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
       );
       const nextTab: OpenChatTab = {
         workspaceId,
         chatId,
         fallbackTitle: chat?.title ?? pendingTab?.fallbackTitle ?? t("Chat"),
         fallbackWorkspaceName:
-          workspace?.name ?? pendingTab?.fallbackWorkspaceName ?? t("Workspace"),
+          workspace?.name ??
+          pendingTab?.fallbackWorkspaceName ??
+          t("Workspace"),
       };
       const withoutOldTabs = current.filter(
         (tab) =>
@@ -7293,7 +7792,8 @@ export function App() {
           (tab.chatId !== pendingChatId && tab.chatId !== chatId),
       );
       const pendingIndex = current.findIndex(
-        (tab) => tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
+        (tab) =>
+          tab.workspaceId === workspaceId && tab.chatId === pendingChatId,
       );
 
       if (pendingIndex < 0) {
@@ -7353,10 +7853,14 @@ export function App() {
     }
 
     const tabIndex = mainTabs.findIndex(
-      (current) => current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path,
+      (current) =>
+        current.type === "file" &&
+        current.workspaceId === tab.workspaceId &&
+        current.path === tab.path,
     );
     const nextOpenFileTabs = openFileTabsRef.current.filter(
-      (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
+      (current) =>
+        current.workspaceId !== tab.workspaceId || current.path !== tab.path,
     );
     openFileTabsRef.current = nextOpenFileTabs;
     setOpenFileTabs(nextOpenFileTabs);
@@ -7376,20 +7880,33 @@ export function App() {
     }
 
     const nextTabs = mainTabs.filter(
-      (current) => !(current.type === "file" && current.workspaceId === tab.workspaceId && current.path === tab.path),
+      (current) =>
+        !(
+          current.type === "file" &&
+          current.workspaceId === tab.workspaceId &&
+          current.path === tab.path
+        ),
     );
-    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab =
+      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
     if (nextTab) {
       selectMainTab(nextTab);
       return;
     }
 
-    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
-    updateBrowserRoute({
-      chatId: activeChatId,
-      viewMode: "chat",
+    setActiveMainTab({
+      chatId: null,
+      type: "chat",
       workspaceId: activeWorkspaceId || tab.workspaceId,
-    }, "replace");
+    });
+    updateBrowserRoute(
+      {
+        chatId: activeChatId,
+        viewMode: "chat",
+        workspaceId: activeWorkspaceId || tab.workspaceId,
+      },
+      "replace",
+    );
   }
 
   function closeHtmlPreviewTab(tab: OpenHtmlPreviewTab) {
@@ -7400,7 +7917,8 @@ export function App() {
         current.path === tab.path,
     );
     const nextOpenPreviewTabs = openHtmlPreviewTabsRef.current.filter(
-      (current) => current.workspaceId !== tab.workspaceId || current.path !== tab.path,
+      (current) =>
+        current.workspaceId !== tab.workspaceId || current.path !== tab.path,
     );
     openHtmlPreviewTabsRef.current = nextOpenPreviewTabs;
     setOpenHtmlPreviewTabs(nextOpenPreviewTabs);
@@ -7422,18 +7940,26 @@ export function App() {
           current.path === tab.path
         ),
     );
-    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab =
+      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
     if (nextTab) {
       selectMainTab(nextTab);
       return;
     }
 
-    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || tab.workspaceId });
-    updateBrowserRoute({
-      chatId: activeChatId,
-      viewMode: "chat",
+    setActiveMainTab({
+      chatId: null,
+      type: "chat",
       workspaceId: activeWorkspaceId || tab.workspaceId,
-    }, "replace");
+    });
+    updateBrowserRoute(
+      {
+        chatId: activeChatId,
+        viewMode: "chat",
+        workspaceId: activeWorkspaceId || tab.workspaceId,
+      },
+      "replace",
+    );
   }
 
   function updateBrowserRouteAfterTabClose(fallbackWorkspaceId: string) {
@@ -7442,14 +7968,20 @@ export function App() {
       return;
     }
     if (activeMainTab.type === "htmlPreview" && activeHtmlPreviewTab) {
-      updateBrowserRoute(browserRouteForActiveHtmlPreview(activeHtmlPreviewTab), "replace");
+      updateBrowserRoute(
+        browserRouteForActiveHtmlPreview(activeHtmlPreviewTab),
+        "replace",
+      );
       return;
     }
-    updateBrowserRoute({
-      chatId: activeChatId,
-      viewMode: "chat",
-      workspaceId: activeWorkspaceId || fallbackWorkspaceId,
-    }, "replace");
+    updateBrowserRoute(
+      {
+        chatId: activeChatId,
+        viewMode: "chat",
+        workspaceId: activeWorkspaceId || fallbackWorkspaceId,
+      },
+      "replace",
+    );
   }
 
   function closeMainTabs(scope: MainTabCloseScope, anchorTab: MainTabSummary) {
@@ -7483,13 +8015,16 @@ export function App() {
     const closedKeys = new Set(tabsToClose.map(mainTabKey));
     const nextTabs = mainTabs.filter((tab) => !closedKeys.has(mainTabKey(tab)));
     const nextOpenChatTabs = openChatTabsRef.current.filter(
-      (tab) => !closedKeys.has(`chat:${chatRunKey(tab.workspaceId, tab.chatId)}`),
+      (tab) =>
+        !closedKeys.has(`chat:${chatRunKey(tab.workspaceId, tab.chatId)}`),
     );
     const nextOpenFileTabs = openFileTabsRef.current.filter(
-      (tab) => !closedKeys.has(workspaceFileEditorKey(tab.workspaceId, tab.path)),
+      (tab) =>
+        !closedKeys.has(workspaceFileEditorKey(tab.workspaceId, tab.path)),
     );
     const nextOpenHtmlPreviewTabs = openHtmlPreviewTabsRef.current.filter(
-      (tab) => !closedKeys.has(workspaceHtmlPreviewKey(tab.workspaceId, tab.path)),
+      (tab) =>
+        !closedKeys.has(workspaceHtmlPreviewKey(tab.workspaceId, tab.path)),
     );
 
     openChatTabsRef.current = nextOpenChatTabs;
@@ -7501,7 +8036,9 @@ export function App() {
     setOpenAgentTabs((current) => {
       const next = current.filter(
         (tab) =>
-          !closedKeys.has(`agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`),
+          !closedKeys.has(
+            `agent:${tab.workspaceId}:${tab.chatId}:${tab.instanceId}`,
+          ),
       );
       pruneAgentTabCaches(
         agentTeamSnapshotCacheRef.current,
@@ -7531,13 +8068,16 @@ export function App() {
       return next;
     });
 
-    const activeWasClosed = tabsToClose.some((tab) => mainTabMatches(activeMainTab, tab));
+    const activeWasClosed = tabsToClose.some((tab) =>
+      mainTabMatches(activeMainTab, tab),
+    );
     if (!activeWasClosed) {
       updateBrowserRouteAfterTabClose(anchorTab.workspaceId);
       return;
     }
 
-    const nextTab = nextTabs[Math.min(anchorIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab =
+      nextTabs[Math.min(anchorIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
     if (nextTab) {
       selectMainTab(nextTab);
       return;
@@ -7548,11 +8088,14 @@ export function App() {
     setActiveChatId(null);
     setMessages([]);
     setActiveMainTab({ chatId: null, type: "chat", workspaceId });
-    updateBrowserRoute({
-      chatId: null,
-      viewMode: "chat",
-      workspaceId,
-    }, "replace");
+    updateBrowserRoute(
+      {
+        chatId: null,
+        viewMode: "chat",
+        workspaceId,
+      },
+      "replace",
+    );
   }
 
   function closeAgentTab(tab: OpenAgentTab) {
@@ -7596,7 +8139,8 @@ export function App() {
           current.instanceId === tab.instanceId
         ),
     );
-    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab =
+      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
     if (nextTab) {
       selectMainTab(nextTab);
       return;
@@ -7609,7 +8153,10 @@ export function App() {
     const chatKey = chatRunKey(workspaceId, chatId);
 
     const tabIndex = mainTabs.findIndex(
-      (tab) => tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId,
+      (tab) =>
+        tab.type === "chat" &&
+        tab.workspaceId === workspaceId &&
+        tab.chatId === chatId,
     );
     const nextOpenChatTabs = openChatTabsRef.current.filter(
       (tab) => tab.workspaceId !== workspaceId || tab.chatId !== chatId,
@@ -7626,19 +8173,28 @@ export function App() {
       activeMainTab.workspaceId !== workspaceId ||
       activeMainTab.chatId !== chatId
     ) {
-      updateBrowserRoute({
-        chatId: activeChatId,
-        tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
-        viewMode: "chat",
-        workspaceId: activeWorkspaceId || workspaceId,
-      }, "replace");
+      updateBrowserRoute(
+        {
+          chatId: activeChatId,
+          tabs: openChatTabsToBrowserRouteTabs(nextOpenChatTabs),
+          viewMode: "chat",
+          workspaceId: activeWorkspaceId || workspaceId,
+        },
+        "replace",
+      );
       return;
     }
 
     const nextTabs = mainTabs.filter(
-      (tab) => !(tab.type === "chat" && tab.workspaceId === workspaceId && tab.chatId === chatId),
+      (tab) =>
+        !(
+          tab.type === "chat" &&
+          tab.workspaceId === workspaceId &&
+          tab.chatId === chatId
+        ),
     );
-    const nextTab = nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
+    const nextTab =
+      nextTabs[Math.min(tabIndex, nextTabs.length - 1)] ?? nextTabs.at(-1);
 
     if (nextTab) {
       selectMainTab(nextTab);
@@ -7650,7 +8206,11 @@ export function App() {
     });
     setActiveChatId(null);
     setMessages([]);
-    setActiveMainTab({ chatId: null, type: "chat", workspaceId: activeWorkspaceId || workspaceId });
+    setActiveMainTab({
+      chatId: null,
+      type: "chat",
+      workspaceId: activeWorkspaceId || workspaceId,
+    });
     updateBrowserRoute({
       chatId: null,
       viewMode: "chat",
@@ -7659,7 +8219,10 @@ export function App() {
   }
 
   function openWorkspaceChatContextMenu(
-    event: Pick<ReactMouseEvent<HTMLElement> | ReactPointerEvent<HTMLElement>, "clientX" | "clientY" | "preventDefault" | "stopPropagation">,
+    event: Pick<
+      ReactMouseEvent<HTMLElement> | ReactPointerEvent<HTMLElement>,
+      "clientX" | "clientY" | "preventDefault" | "stopPropagation"
+    >,
     workspace: WorkspaceSummary,
     chat: WorkspaceChatListItem,
   ) {
@@ -7710,11 +8273,14 @@ export function App() {
     }, WORKSPACE_CHAT_CONTEXT_MENU_LONG_PRESS_MS);
   }
 
-  function requestDeleteWorkspaceChat(workspace: WorkspaceSummary, chat: ChatSummary) {
+  function requestDeleteWorkspaceChat(
+    workspace: WorkspaceSummary,
+    chat: ChatSummary,
+  ) {
     const chatKey = chatRunKey(workspace.id, chat.id);
     if (
-      chatSessionStatusFor(chatKey, { workspaceActiveRun: chat.activeRun }).kind ===
-      "running"
+      chatSessionStatusFor(chatKey, { workspaceActiveRun: chat.activeRun })
+        .kind === "running"
     ) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
@@ -7744,8 +8310,9 @@ export function App() {
       .find((workspace) => workspace.id === workspaceId)
       ?.chats.find((chat) => chat.id === chatId);
     if (
-      chatSessionStatusFor(chatKey, { workspaceActiveRun: workspaceChat?.activeRun ?? null })
-        .kind === "running"
+      chatSessionStatusFor(chatKey, {
+        workspaceActiveRun: workspaceChat?.activeRun ?? null,
+      }).kind === "running"
     ) {
       setError(t("Cancel the current run before deleting this chat."));
       return;
@@ -7828,8 +8395,8 @@ export function App() {
         );
         const nextTab =
           tabIndex >= 0
-            ? nextMainTabs[Math.min(tabIndex, nextMainTabs.length - 1)] ??
-              nextMainTabs.at(-1)
+            ? (nextMainTabs[Math.min(tabIndex, nextMainTabs.length - 1)] ??
+              nextMainTabs.at(-1))
             : nextMainTabs.at(-1);
 
         if (nextTab) {
@@ -7890,7 +8457,11 @@ export function App() {
         : [...current, skillId],
     );
   }
-  function renameWorkspaceFileTab(workspaceId: string, path: string, newName: string) {
+  function renameWorkspaceFileTab(
+    workspaceId: string,
+    path: string,
+    newName: string,
+  ) {
     const nextPath = workspaceRenamedFilePath(path, newName);
     setOpenFileTabs((current) =>
       current.map((tab) => {
@@ -7915,7 +8486,9 @@ export function App() {
       return next;
     });
     setActiveMainTab((current) =>
-      current.type === "file" && current.workspaceId === workspaceId && current.path === path
+      current.type === "file" &&
+      current.workspaceId === workspaceId &&
+      current.path === path
         ? { path: nextPath, type: "file", workspaceId }
         : current,
     );
@@ -8003,7 +8576,9 @@ export function App() {
     newName?: string,
   ) {
     if (!activeWorkspace) {
-      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      setWorkspaceFilesError(
+        t("Select a workspace before using file actions."),
+      );
       return;
     }
 
@@ -8015,7 +8590,9 @@ export function App() {
       const data = await requestJson<WorkspaceFileChildrenResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/files/${action}`,
         {
-          body: JSON.stringify(action === "rename" ? { path, newName } : { path }),
+          body: JSON.stringify(
+            action === "rename" ? { path, newName } : { path },
+          ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -8039,12 +8616,20 @@ export function App() {
         current
           ? {
               ...current,
-              root: replaceWorkspaceFileNodeChildren(current.root, data.path, data.children),
+              root: replaceWorkspaceFileNodeChildren(
+                current.root,
+                data.path,
+                data.children,
+              ),
             }
           : current,
       );
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
+        void loadGitDiff(
+          activeWorkspace.id,
+          selectedDiffPath,
+          sourceControlTarget,
+        );
       }
     } catch (requestError) {
       setWorkspaceFilesError(errorMessage(requestError));
@@ -8070,7 +8655,10 @@ export function App() {
       node.hasChildren &&
       !node.childrenLoaded
     ) {
-      const loaded = await loadWorkspaceDirectoryChildren(activeWorkspace.id, node.path);
+      const loaded = await loadWorkspaceDirectoryChildren(
+        activeWorkspace.id,
+        node.path,
+      );
       if (!loaded) {
         return;
       }
@@ -8094,11 +8682,15 @@ export function App() {
 
   function downloadWorkspaceFile(node: WorkspaceFileTreeNode) {
     if (!activeWorkspace) {
-      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      setWorkspaceFilesError(
+        t("Select a workspace before using file actions."),
+      );
       return;
     }
     if (!node.path) {
-      setWorkspaceFilesError(t("Select a workspace before using file actions."));
+      setWorkspaceFilesError(
+        t("Select a workspace before using file actions."),
+      );
       return;
     }
 
@@ -8112,11 +8704,16 @@ export function App() {
     anchor.remove();
   }
 
-  function workspaceFileAbsolutePath(workspacePath: string, relativePath: string) {
+  function workspaceFileAbsolutePath(
+    workspacePath: string,
+    relativePath: string,
+  ) {
     const separator = workspacePath.includes("\\") ? "\\" : "/";
     const root = workspacePath.replace(/[\\/]+$/, "");
     const normalizedRelativePath = relativePath.replace(/[\\/]+/g, separator);
-    return root ? `${root}${separator}${normalizedRelativePath}` : `${separator}${normalizedRelativePath}`;
+    return root
+      ? `${root}${separator}${normalizedRelativePath}`
+      : `${separator}${normalizedRelativePath}`;
   }
 
   async function handleGitFileOperation(
@@ -8136,14 +8733,17 @@ export function App() {
       const data = await requestJson<GitDiffResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/${action}`,
         {
-          body: JSON.stringify(gitTargetRequestBody({ path }, sourceControlTarget)),
+          body: JSON.stringify(
+            gitTargetRequestBody({ path }, sourceControlTarget),
+          ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
       );
       setGitDiff(data);
       setSelectedDiffPath(
-        selectedDiffPath && data.files.some((file) => file.path === selectedDiffPath)
+        selectedDiffPath &&
+          data.files.some((file) => file.path === selectedDiffPath)
           ? selectedDiffPath
           : null,
       );
@@ -8175,7 +8775,9 @@ export function App() {
       const data = await requestJson<GitDiffResponse>(
         `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/commit`,
         {
-          body: JSON.stringify(gitTargetRequestBody({ message }, sourceControlTarget)),
+          body: JSON.stringify(
+            gitTargetRequestBody({ message }, sourceControlTarget),
+          ),
           headers: { "Content-Type": "application/json" },
           method: "POST",
         },
@@ -8199,7 +8801,9 @@ export function App() {
       return;
     }
     if (!selectedModelId || !selectedProviderId) {
-      setDiffError(t("Select an enabled model before generating a commit message."));
+      setDiffError(
+        t("Select an enabled model before generating a commit message."),
+      );
       return;
     }
 
@@ -8267,7 +8871,11 @@ export function App() {
       setSelectedGitBranch(data.currentBranch ?? "");
 
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
+        void loadGitDiff(
+          activeWorkspace.id,
+          selectedDiffPath,
+          sourceControlTarget,
+        );
       }
     } catch (requestError) {
       setBranchError(errorMessage(requestError));
@@ -8308,7 +8916,11 @@ export function App() {
       setIsBranchDialogOpen(false);
 
       if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
+        void loadGitDiff(
+          activeWorkspace.id,
+          selectedDiffPath,
+          sourceControlTarget,
+        );
       }
     } catch (requestError) {
       setBranchError(errorMessage(requestError));
@@ -8384,7 +8996,10 @@ export function App() {
     }
 
     const totalSize =
-      draftAttachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0) +
+      draftAttachments.reduce(
+        (sum, attachment) => sum + attachment.sizeBytes,
+        0,
+      ) +
       attachments.reduce((sum, attachment) => sum + attachment.sizeBytes, 0);
     if (totalSize > MAX_CHAT_ATTACHMENT_TOTAL_BYTES) {
       setError(
@@ -8438,7 +9053,8 @@ export function App() {
       return null;
     }
 
-    const currentWorkspaceId = activeWorkspaceIdRef.current || activeWorkspace?.id || "";
+    const currentWorkspaceId =
+      activeWorkspaceIdRef.current || activeWorkspace?.id || "";
     const currentWorkspace =
       workspaces.find((workspace) => workspace.id === currentWorkspaceId) ??
       activeWorkspace;
@@ -8468,7 +9084,9 @@ export function App() {
         unsupportedAttachment,
         t,
       );
-      setError(message ?? t("Selected model does not support this attachment."));
+      setError(
+        message ?? t("Selected model does not support this attachment."),
+      );
       return null;
     }
 
@@ -8476,18 +9094,21 @@ export function App() {
     return {
       attachments,
       chatId:
-        currentChatId && !isPendingChatId(currentChatId)
-          ? currentChatId
-          : null,
+        currentChatId && !isPendingChatId(currentChatId) ? currentChatId : null,
       content,
       modelId: selectedModelId,
       providerId: selectedProviderId,
       skillIds,
       sessionMode: isPlanModeEnabled ? "plan" : undefined,
-      teamModeEnabled: !isPlanModeEnabled && canUseTeamMode && isTeamModeEnabled,
-      thinkingLevel: isModelThinkingLevelSupported(selectedModel, selectedThinkingLevel)
+      teamModeEnabled:
+        !isPlanModeEnabled && canUseTeamMode && isTeamModeEnabled,
+      thinkingLevel: isModelThinkingLevelSupported(
+        selectedModel,
+        selectedThinkingLevel,
+      )
         ? selectedThinkingLevel
         : "",
+      latencyMode: selectedRequestLatencyMode,
       workspaceId: currentWorkspace.id,
     };
   }
@@ -8555,6 +9176,7 @@ export function App() {
           teamModeEnabled: request.teamModeEnabled ?? false,
           deferStart: options.deferStart ?? false,
           thinkingLevel: request.thinkingLevel || null,
+          latencyMode: request.latencyMode ?? "standard",
         }),
         headers: { "Content-Type": "application/json" },
         method: "POST",
@@ -8571,7 +9193,12 @@ export function App() {
   ): Promise<boolean> {
     const workspaceId = activeWorkspaceIdRef.current;
     const chatId = activeChatIdRef.current;
-    if (!workspaceId || !chatId || isPendingChatId(chatId) || isSendingMessage) {
+    if (
+      !workspaceId ||
+      !chatId ||
+      isPendingChatId(chatId) ||
+      isSendingMessage
+    ) {
       return false;
     }
     const runConfig = message.runConfig;
@@ -8590,7 +9217,10 @@ export function App() {
         `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(message.id)}/edit`,
         {
           body: JSON.stringify({
-            attachments: attachments.map(({ previewDataUrl: _previewDataUrl, ...attachment }) => attachment),
+            attachments: attachments.map(
+              ({ previewDataUrl: _previewDataUrl, ...attachment }) =>
+                attachment,
+            ),
             expectedContent: message.content,
             message: content,
             modelId,
@@ -8604,7 +9234,9 @@ export function App() {
           method: "POST",
         },
       );
-      const targetIndex = previousMessages.findIndex((item) => item.id === message.id);
+      const targetIndex = previousMessages.findIndex(
+        (item) => item.id === message.id,
+      );
       if (targetIndex < 0) {
         throw new Error(t("Edited message is no longer visible."));
       }
@@ -8633,7 +9265,8 @@ export function App() {
           modelId,
           providerId,
           skillIds: editedSkillIds,
-          sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? undefined,
+          sessionMode:
+            runConfig?.sessionMode ?? message.sessionMode ?? undefined,
           teamModeEnabled: runConfig?.teamModeEnabled ?? false,
           thinkingLevel: runConfig?.thinkingLevel ?? "",
           workspaceId,
@@ -8648,7 +9281,9 @@ export function App() {
       }
       onAccepted();
       updateQueuedRunRequestsForChatKey(chatKey, () => []);
-      updateScheduledWorkspaceRuns((current) => current.filter((run) => run.chatKey !== chatKey));
+      updateScheduledWorkspaceRuns((current) =>
+        current.filter((run) => run.chatKey !== chatKey),
+      );
       setRetryRunRequest(null);
       setPendingQuestion(null);
       setQuestionError(null);
@@ -8705,7 +9340,10 @@ export function App() {
       return;
     }
 
-    if (request.chatId && readOnlyChatKeys[chatRunKey(request.workspaceId, request.chatId)]) {
+    if (
+      request.chatId &&
+      readOnlyChatKeys[chatRunKey(request.workspaceId, request.chatId)]
+    ) {
       setError(t("This transcript is read-only."));
       return;
     }
@@ -8740,7 +9378,9 @@ export function App() {
     setError(null);
 
     try {
-      const queued = await persistQueuedRunRequest(request, { deferStart: true });
+      const queued = await persistQueuedRunRequest(request, {
+        deferStart: true,
+      });
       const chatKey = chatRunKey(request.workspaceId, queued.chatId);
       const createdAt = queued.createdAt;
 
@@ -8779,7 +9419,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
-        specUpdates: [],
+          specUpdates: [],
         },
       ]);
 
@@ -8868,7 +9508,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
-        specUpdates: [],
+          specUpdates: [],
         },
       ]);
 
@@ -8917,7 +9557,7 @@ export function App() {
   async function handleGuideQueuedMessage(messageId: string) {
     const chatKey = activeChatKeyRef.current;
     const runInfo = chatKey
-      ? activeRunInfoByChatKeyRef.current[chatKey] ?? null
+      ? (activeRunInfoByChatKeyRef.current[chatKey] ?? null)
       : null;
     if (
       !chatKey ||
@@ -8959,11 +9599,11 @@ export function App() {
       current.map((message) =>
         message.id === messageId && message.pendingMode === "queued"
           ? {
-            ...message,
-            content: visibleUserContent,
-            pendingMode: "guidance",
-            parts: visibleParts,
-          }
+              ...message,
+              content: visibleUserContent,
+              pendingMode: "guidance",
+              parts: visibleParts,
+            }
           : message,
       ),
     );
@@ -9040,6 +9680,15 @@ export function App() {
     hasManuallySelectedThinkingLevelRef.current = true;
     setSelectedThinkingLevel(thinkingLevel);
   }
+
+  function handleChatLatencyModeChange(latencyMode: "standard" | "fast") {
+    if (latencyMode === "fast" && selectedModel?.supportsFast !== true) {
+      setSelectedLatencyMode("standard");
+      setError(t("Fast mode is not available for the selected model."));
+      return;
+    }
+    setSelectedLatencyMode(latencyMode);
+  }
   const {
     applyBrowserRoute,
     openCurrentChatView,
@@ -9069,7 +9718,10 @@ export function App() {
   });
 
   const updateStatsRoute = useCallback(
-    (page: number, filters: Partial<AiStatsFilterState> = statsRouteFiltersRef.current) => {
+    (
+      page: number,
+      filters: Partial<AiStatsFilterState> = statsRouteFiltersRef.current,
+    ) => {
       setStatsRoutePage((current) => (current === page ? current : page));
       setStatsRouteFilters(filters);
       updateBrowserRoute({ filters, page, viewMode: "stats" });
@@ -9085,7 +9737,8 @@ export function App() {
       }
 
       const filters: Partial<AiStatsFilterState> = {
-        chatId: activeChatId && !isPendingChatId(activeChatId) ? activeChatId : "",
+        chatId:
+          activeChatId && !isPendingChatId(activeChatId) ? activeChatId : "",
         page: "1",
         requestIds: requestIds.join(","),
         workspaceId: activeWorkspace?.id ?? activeWorkspaceId,
@@ -9189,7 +9842,10 @@ export function App() {
       ? { chatId: runInfo.chatId, workspaceId: runInfo.workspaceId }
       : parseChatRunKey(currentChatKey);
     if (cancelledChat) {
-      clearWorkspaceChatActiveRun(cancelledChat.workspaceId, cancelledChat.chatId);
+      clearWorkspaceChatActiveRun(
+        cancelledChat.workspaceId,
+        cancelledChat.chatId,
+      );
     }
     setPendingQuestion(null);
     setQuestionError(null);
@@ -9236,7 +9892,9 @@ export function App() {
             providerId: request.providerId,
             thinkingLevel: request.thinkingLevel || null,
             skillIds: request.skillIds.length ? request.skillIds : null,
-            ...(request.assistantDraft ? { assistantDraft: request.assistantDraft } : {}),
+            ...(request.assistantDraft
+              ? { assistantDraft: request.assistantDraft }
+              : {}),
             ...(request.assistantDraftReasoning
               ? { assistantDraftReasoning: request.assistantDraftReasoning }
               : {}),
@@ -9247,14 +9905,20 @@ export function App() {
         },
       );
 
-      if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
+      if (
+        contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId
+      ) {
         deferStreamAuxiliaryUpdate(() => {
-          setContextUsageByChatKey((current) => ({ ...current, [chatKey]: data }));
+          setContextUsageByChatKey((current) => ({
+            ...current,
+            [chatKey]: data,
+          }));
         });
       }
     } catch (requestError) {
       const wasCancelled =
-        requestError instanceof DOMException && requestError.name === "AbortError";
+        requestError instanceof DOMException &&
+        requestError.name === "AbortError";
       if (
         !wasCancelled &&
         contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId
@@ -9262,10 +9926,14 @@ export function App() {
         setError(errorMessage(requestError));
       }
     } finally {
-      if (contextUsageAbortByChatKeyRef.current.get(chatKey) === abortController) {
+      if (
+        contextUsageAbortByChatKeyRef.current.get(chatKey) === abortController
+      ) {
         contextUsageAbortByChatKeyRef.current.delete(chatKey);
       }
-      if (contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId) {
+      if (
+        contextUsageRequestIdByChatKeyRef.current.get(chatKey) === requestId
+      ) {
         deferStreamAuxiliaryUpdate(() => {
           setContextUsageLoadingByChatKey((current) => ({
             ...current,
@@ -9328,7 +9996,10 @@ export function App() {
               pendingMode: undefined,
               syntheticSource,
               parts: guidance.parts.length
-                ? [{ type: "text" as const, text: guidance.content }, ...guidance.parts]
+                ? [
+                    { type: "text" as const, text: guidance.content },
+                    ...guidance.parts,
+                  ]
                 : [{ type: "text" as const, text: guidance.content }],
             };
           }
@@ -9350,24 +10021,27 @@ export function App() {
         ...(reusedGuidanceMessage
           ? []
           : [
-            {
-              id: guidance.id,
-              role: "user" as const,
-              content: guidance.content,
-              createdAt,
-              reasoning: null,
-              status: undefined,
-              toolCalls: [],
-              parts: guidance.parts.length
-                ? [{ type: "text" as const, text: guidance.content }, ...guidance.parts]
-                : [{ type: "text" as const, text: guidance.content }],
-              metrics: null,
-              memoriesUsed: [],
-              extractedMemories: [],
-        specUpdates: [],
-              syntheticSource,
-            },
-          ]),
+              {
+                id: guidance.id,
+                role: "user" as const,
+                content: guidance.content,
+                createdAt,
+                reasoning: null,
+                status: undefined,
+                toolCalls: [],
+                parts: guidance.parts.length
+                  ? [
+                      { type: "text" as const, text: guidance.content },
+                      ...guidance.parts,
+                    ]
+                  : [{ type: "text" as const, text: guidance.content }],
+                metrics: null,
+                memoriesUsed: [],
+                extractedMemories: [],
+                specUpdates: [],
+                syntheticSource,
+              },
+            ]),
         {
           id: assistantId,
           role: "assistant",
@@ -9380,7 +10054,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
-        specUpdates: [],
+          specUpdates: [],
         },
       ];
     });
@@ -9449,7 +10123,8 @@ export function App() {
       );
       return;
     }
-    const existingAbortController = activeRunAbortByChatKeyRef.current.get(chatKey);
+    const existingAbortController =
+      activeRunAbortByChatKeyRef.current.get(chatKey);
     if (existingAbortController) {
       const existingRunId = activeRunInfoByChatKeyRef.current[chatKey]?.runId;
       if (existingRunId === activeRun.runId && !isReconnect) {
@@ -9510,7 +10185,10 @@ export function App() {
         return;
       }
       const now = Date.now();
-      if (now - lastLiveContextUsageRefreshAtMs < LIVE_CONTEXT_USAGE_REFRESH_MS) {
+      if (
+        now - lastLiveContextUsageRefreshAtMs <
+        LIVE_CONTEXT_USAGE_REFRESH_MS
+      ) {
         return;
       }
       const modelId = selectedModelIdRef.current;
@@ -9539,14 +10217,15 @@ export function App() {
       setMessagesForChatKey(chatKey, (current) => {
         if (current.some((message) => message.id === nextAssistantMessageId)) {
           return current.map((message) =>
-            message.id === nextAssistantMessageId && message.role === "assistant"
+            message.id === nextAssistantMessageId &&
+            message.role === "assistant"
               ? {
-                ...message,
-                memoriesUsed: message.memoriesUsed.length
-                  ? message.memoriesUsed
-                  : memoriesUsed,
-                status: "streaming",
-              }
+                  ...message,
+                  memoriesUsed: message.memoriesUsed.length
+                    ? message.memoriesUsed
+                    : memoriesUsed,
+                  status: "streaming",
+                }
               : message,
           );
         }
@@ -9557,7 +10236,9 @@ export function App() {
         ];
       });
     };
-    const finishStreamingAssistantMessage = (finishedAssistantMessageId: string) => {
+    const finishStreamingAssistantMessage = (
+      finishedAssistantMessageId: string,
+    ) => {
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) =>
           message.role === "assistant" &&
@@ -9593,20 +10274,21 @@ export function App() {
     };
 
     let activeReasoningStartedAtMs: number | null = null;
-    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null =
+      null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) =>
           isCurrentAssistantMessage(message) && message.status === "streaming"
             ? {
-              ...message,
-              parts: updateActiveReasoningPartDuration(
-                message.parts,
-                startedAtMs,
-                Date.now(),
-              ),
-            }
+                ...message,
+                parts: updateActiveReasoningPartDuration(
+                  message.parts,
+                  startedAtMs,
+                  Date.now(),
+                ),
+              }
             : message,
         ),
       );
@@ -9657,7 +10339,11 @@ export function App() {
             ...message,
             parts:
               serverParts === message.parts
-                ? finishActiveReasoningPart(message.parts, startedAtMs, endedAtMs)
+                ? finishActiveReasoningPart(
+                    message.parts,
+                    startedAtMs,
+                    endedAtMs,
+                  )
                 : serverParts,
           };
         }),
@@ -9704,13 +10390,15 @@ export function App() {
     const markAssistantLiveStreamEvent = (eventAssistantMessageId?: string) => {
       const assistantId = resolvedAssistantMessageId(eventAssistantMessageId);
       const tracked =
-        liveStreamAssistantIdsByChatKeyRef.current.get(chatKey) ?? new Set<string>();
+        liveStreamAssistantIdsByChatKeyRef.current.get(chatKey) ??
+        new Set<string>();
       tracked.add(assistantId);
       liveStreamAssistantIdsByChatKeyRef.current.set(chatKey, tracked);
     };
     const hasSeenLiveStreamEventsForAssistant = (assistantId: string) =>
-      liveStreamAssistantIdsByChatKeyRef.current.get(chatKey)?.has(assistantId) ??
-      false;
+      liveStreamAssistantIdsByChatKeyRef.current
+        .get(chatKey)
+        ?.has(assistantId) ?? false;
 
     setChatRunning(chatKey, true);
     setChatRunFailed(chatKey, false);
@@ -9741,12 +10429,15 @@ export function App() {
           (response.status === 400 || response.status === 404) &&
           isStaleActiveRunError(message)
         ) {
-          console.debug("[chat-stream] active run stream is stale; refreshing messages", {
-            chatId: activeRun.chatId,
-            runId: activeRun.runId,
-            status: response.status,
-            workspaceId: activeRun.workspaceId,
-          });
+          console.debug(
+            "[chat-stream] active run stream is stale; refreshing messages",
+            {
+              chatId: activeRun.chatId,
+              runId: activeRun.runId,
+              status: response.status,
+              workspaceId: activeRun.workspaceId,
+            },
+          );
           finishChatRun(
             chatKey,
             activeRun.runId,
@@ -9756,512 +10447,599 @@ export function App() {
           await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
           return;
         }
-        console.debug("[chat-stream] active run stream returned backend error", {
-          chatId: activeRun.chatId,
-          runId: activeRun.runId,
-          status: response.status,
-          workspaceId: activeRun.workspaceId,
-        });
+        console.debug(
+          "[chat-stream] active run stream returned backend error",
+          {
+            chatId: activeRun.chatId,
+            runId: activeRun.runId,
+            status: response.status,
+            workspaceId: activeRun.workspaceId,
+          },
+        );
         throw new Error(message);
       }
 
-      await readChatStream(response, (streamEvent, meta) => {
-        const eventSequence = meta.id === null ? null : Number(meta.id);
-        updateLastProcessedSequence(Number.isFinite(eventSequence) ? eventSequence : null);
-        if (streamEvent.type !== "textDelta") {
-          textDeltaBuffer.flush();
-        }
-        if (streamEvent.type !== "reasoningDelta") {
-          reasoningDeltaBuffer.flush();
-        }
-        if (streamEvent.type !== "toolOutputDelta") {
-          toolOutputDeltaBuffer.flush();
-        }
+      await readChatStream(
+        response,
+        (streamEvent, meta) => {
+          const eventSequence = meta.id === null ? null : Number(meta.id);
+          updateLastProcessedSequence(
+            Number.isFinite(eventSequence) ? eventSequence : null,
+          );
+          if (streamEvent.type !== "textDelta") {
+            textDeltaBuffer.flush();
+          }
+          if (streamEvent.type !== "reasoningDelta") {
+            reasoningDeltaBuffer.flush();
+          }
+          if (streamEvent.type !== "toolOutputDelta") {
+            toolOutputDeltaBuffer.flush();
+          }
 
-        if (streamEvent.type === "connecting") {
-          return;
-        }
-
-        if (streamEvent.type === "start") {
-          if (!startChatRun(chatKey, activeRun.runId)) {
+          if (streamEvent.type === "connecting") {
             return;
           }
-          const previousAssistantMessageId = currentAssistantMessageId;
-          const startsNewAssistantBubble =
-            previousAssistantMessageId !== streamEvent.assistantMessageId &&
-            previousAssistantMessageId !== placeholderAssistantMessageId;
-          assistantMessageId = streamEvent.assistantMessageId;
-          currentAssistantMessageId = streamEvent.assistantMessageId;
-          if (startsNewAssistantBubble) {
-            finishStreamingAssistantMessage(previousAssistantMessageId);
-          }
-          setMessagesForChatKey(chatKey, (current) => {
-            const existing = current.find(
-              (message) =>
-                message.role === "assistant" &&
-                message.id === streamEvent.assistantMessageId,
-            );
-            const preserveHistory = shouldPreserveAssistantHistoryOnStart(
-              hasSeenLiveStreamEventsForAssistant(streamEvent.assistantMessageId),
-            );
-            if (!existing) {
-              return current;
+
+          if (streamEvent.type === "start") {
+            if (!startChatRun(chatKey, activeRun.runId)) {
+              return;
             }
-            return current.map((message) =>
-              message.role === "assistant" &&
-              message.id === streamEvent.assistantMessageId
-                ? mergeAssistantMessageOnStreamStart(
-                    message,
-                    streamEvent.memoriesUsed,
-                    preserveHistory,
-                  )
-                : message,
-            );
-          });
-          ensureStreamingAssistantMessage(
-            streamEvent.assistantMessageId,
-            streamEvent.memoriesUsed,
-          );
-          setChatRunFailed(chatKey, false);
-          setChatRunning(chatKey, true);
-          setActiveRunInfoForChatKey(chatKey, {
-            acceptingGuidance: true,
-            chatId: streamEvent.chatId,
-            chatKey,
-            lastSequence: lastSequenceForState(),
-            runId: activeRun.runId,
-            workspaceId: activeRun.workspaceId,
-          });
-          liveStartedAtMs = Date.now();
-          liveAssistantDraft = "";
-          liveAssistantDraftReasoning = "";
-          lastLiveContextUsageRefreshAtMs = Date.now();
-          updateLiveChatStatistics(chatKey, {
-            modelId: selectedModelIdRef.current,
-            providerId: selectedProviderIdRef.current,
-            startedAtMs: liveStartedAtMs,
-            usage: null,
-          });
-          refreshActiveAgentTeamSnapshot(activeRun.workspaceId, streamEvent.chatId);
-          return;
-        }
-
-        if (streamEvent.type === "textDelta") {
-          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
-          finishLiveReasoningDuration(
-            streamEvent.assistantMessageId,
-            streamEvent.reasoningDurationMs,
-          );
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
-          );
-          textDeltaBuffer.push(
-            chatKey,
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
-            streamEvent.delta,
-          );
-          liveAssistantDraft += streamEvent.delta;
-          scheduleLiveContextUsageRefresh();
-          return;
-        }
-
-        if (streamEvent.type === "reasoningDelta") {
-          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
-          const reasoningStartedAtMs = startLiveReasoningDuration();
-          const targetAssistantMessageId = resolvedAssistantMessageId(
-            streamEvent.assistantMessageId,
-          );
-          ensureStreamingAssistantMessage(targetAssistantMessageId);
-          reasoningDeltaBuffer.push(
-            chatKey,
-            targetAssistantMessageId,
-            streamEvent.delta,
-            reasoningStartedAtMs,
-          );
-          liveAssistantDraftReasoning += streamEvent.delta;
-          scheduleLiveContextUsageRefresh();
-          return;
-        }
-
-        if (streamEvent.type === "streamAttemptStart") {
-          // A post-guidance turn still emits streamAttemptStart under the
-          // interrupted id; keep targeting the new bubble in that case.
-          if (interruptedAssistantMessageId === null) {
+            const previousAssistantMessageId = currentAssistantMessageId;
+            const startsNewAssistantBubble =
+              previousAssistantMessageId !== streamEvent.assistantMessageId &&
+              previousAssistantMessageId !== placeholderAssistantMessageId;
+            assistantMessageId = streamEvent.assistantMessageId;
             currentAssistantMessageId = streamEvent.assistantMessageId;
-          }
-          const snapshotKey = resolvedAssistantMessageId(streamEvent.assistantMessageId);
-          streamAttemptSnapshots.set(snapshotKey, emptyStreamingAttemptSnapshot());
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
-          );
-          setMessagesForChatKey(chatKey, (current) => {
-            const message = current.find((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-            );
-            if (message) {
-              streamAttemptSnapshots.set(snapshotKey, streamingAttemptSnapshot(message));
+            if (startsNewAssistantBubble) {
+              finishStreamingAssistantMessage(previousAssistantMessageId);
             }
-            return current;
-          });
-          setActiveRunInfoForChatKey(chatKey, {
-            acceptingGuidance: true,
-            chatId: activeRun.chatId,
-            chatKey,
-            lastSequence: lastSequenceForState(),
-            runId: activeRun.runId,
-            workspaceId: activeRun.workspaceId,
-          });
-          return;
-        }
+            setMessagesForChatKey(chatKey, (current) => {
+              const existing = current.find(
+                (message) =>
+                  message.role === "assistant" &&
+                  message.id === streamEvent.assistantMessageId,
+              );
+              const preserveHistory = shouldPreserveAssistantHistoryOnStart(
+                hasSeenLiveStreamEventsForAssistant(
+                  streamEvent.assistantMessageId,
+                ),
+              );
+              if (!existing) {
+                return current;
+              }
+              return current.map((message) =>
+                message.role === "assistant" &&
+                message.id === streamEvent.assistantMessageId
+                  ? mergeAssistantMessageOnStreamStart(
+                      message,
+                      streamEvent.memoriesUsed,
+                      preserveHistory,
+                    )
+                  : message,
+              );
+            });
+            ensureStreamingAssistantMessage(
+              streamEvent.assistantMessageId,
+              streamEvent.memoriesUsed,
+            );
+            setChatRunFailed(chatKey, false);
+            setChatRunning(chatKey, true);
+            setActiveRunInfoForChatKey(chatKey, {
+              acceptingGuidance: true,
+              chatId: streamEvent.chatId,
+              chatKey,
+              lastSequence: lastSequenceForState(),
+              runId: activeRun.runId,
+              workspaceId: activeRun.workspaceId,
+            });
+            liveStartedAtMs = Date.now();
+            liveAssistantDraft = "";
+            liveAssistantDraftReasoning = "";
+            lastLiveContextUsageRefreshAtMs = Date.now();
+            updateLiveChatStatistics(chatKey, {
+              modelId: selectedModelIdRef.current,
+              providerId: selectedProviderIdRef.current,
+              startedAtMs: liveStartedAtMs,
+              usage: null,
+            });
+            refreshActiveAgentTeamSnapshot(
+              activeRun.workspaceId,
+              streamEvent.chatId,
+            );
+            return;
+          }
 
-        if (streamEvent.type === "streamReset") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          latestResponseUsage = null;
-          liveAssistantDraft = "";
-          liveAssistantDraftReasoning = "";
-          lastLiveContextUsageRefreshAtMs = Date.now();
-          updateLiveChatStatistics(chatKey, {
-            modelId: selectedModelIdRef.current,
-            providerId: selectedProviderIdRef.current,
-            startedAtMs: liveStartedAtMs,
-            usage: null,
-          });
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? resetStreamingAssistantMessage(
+          if (streamEvent.type === "textDelta") {
+            markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
+            finishLiveReasoningDuration(
+              streamEvent.assistantMessageId,
+              streamEvent.reasoningDurationMs,
+            );
+            ensureStreamingAssistantMessage(
+              resolvedAssistantMessageId(streamEvent.assistantMessageId),
+            );
+            textDeltaBuffer.push(
+              chatKey,
+              resolvedAssistantMessageId(streamEvent.assistantMessageId),
+              streamEvent.delta,
+            );
+            liveAssistantDraft += streamEvent.delta;
+            scheduleLiveContextUsageRefresh();
+            return;
+          }
+
+          if (streamEvent.type === "reasoningDelta") {
+            markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
+            const reasoningStartedAtMs = startLiveReasoningDuration();
+            const targetAssistantMessageId = resolvedAssistantMessageId(
+              streamEvent.assistantMessageId,
+            );
+            ensureStreamingAssistantMessage(targetAssistantMessageId);
+            reasoningDeltaBuffer.push(
+              chatKey,
+              targetAssistantMessageId,
+              streamEvent.delta,
+              reasoningStartedAtMs,
+            );
+            liveAssistantDraftReasoning += streamEvent.delta;
+            scheduleLiveContextUsageRefresh();
+            return;
+          }
+
+          if (streamEvent.type === "streamAttemptStart") {
+            // A post-guidance turn still emits streamAttemptStart under the
+            // interrupted id; keep targeting the new bubble in that case.
+            if (interruptedAssistantMessageId === null) {
+              currentAssistantMessageId = streamEvent.assistantMessageId;
+            }
+            const snapshotKey = resolvedAssistantMessageId(
+              streamEvent.assistantMessageId,
+            );
+            streamAttemptSnapshots.set(
+              snapshotKey,
+              emptyStreamingAttemptSnapshot(),
+            );
+            ensureStreamingAssistantMessage(
+              resolvedAssistantMessageId(streamEvent.assistantMessageId),
+            );
+            setMessagesForChatKey(chatKey, (current) => {
+              const message = current.find((message) =>
+                isCurrentAssistantMessage(
                   message,
-                  streamEvent,
-                  streamAttemptSnapshots.get(
-                    resolvedAssistantMessageId(streamEvent.assistantMessageId),
-                  ),
-                )
-                : message,
-            ),
-          );
-          return;
-        }
+                  streamEvent.assistantMessageId,
+                ),
+              );
+              if (message) {
+                streamAttemptSnapshots.set(
+                  snapshotKey,
+                  streamingAttemptSnapshot(message),
+                );
+              }
+              return current;
+            });
+            setActiveRunInfoForChatKey(chatKey, {
+              acceptingGuidance: true,
+              chatId: activeRun.chatId,
+              chatKey,
+              lastSequence: lastSequenceForState(),
+              runId: activeRun.runId,
+              workspaceId: activeRun.workspaceId,
+            });
+            return;
+          }
 
-        if (streamEvent.type === "contextCompression") {
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithContextCompression(message, streamEvent)
-                : message,
-            ),
-          );
-          if (streamEvent.status === "completed") {
+          if (streamEvent.type === "streamReset") {
+            finishLiveReasoningDuration(streamEvent.assistantMessageId);
+            latestResponseUsage = null;
+            liveAssistantDraft = "";
+            liveAssistantDraftReasoning = "";
+            lastLiveContextUsageRefreshAtMs = Date.now();
+            updateLiveChatStatistics(chatKey, {
+              modelId: selectedModelIdRef.current,
+              providerId: selectedProviderIdRef.current,
+              startedAtMs: liveStartedAtMs,
+              usage: null,
+            });
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? resetStreamingAssistantMessage(
+                      message,
+                      streamEvent,
+                      streamAttemptSnapshots.get(
+                        resolvedAssistantMessageId(
+                          streamEvent.assistantMessageId,
+                        ),
+                      ),
+                    )
+                  : message,
+              ),
+            );
+            return;
+          }
+
+          if (streamEvent.type === "contextCompression") {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? assistantMessageWithContextCompression(message, streamEvent)
+                  : message,
+              ),
+            );
+            if (streamEvent.status === "completed") {
+              refreshRunContextUsage();
+            }
+            return;
+          }
+
+          if (streamEvent.type === "usage") {
+            latestResponseUsage =
+              streamEvent.usage &&
+              streamEvent.usage.inputTokens !== null &&
+              streamEvent.usage.outputTokens !== null
+                ? streamEvent.usage
+                : null;
+            deferStreamAuxiliaryUpdate(() => {
+              updateLiveChatStatistics(chatKey, {
+                modelId: selectedModelIdRef.current,
+                providerId: selectedProviderIdRef.current,
+                startedAtMs: liveStartedAtMs,
+                usage: latestResponseUsage,
+              });
+            });
+            return;
+          }
+
+          if (streamEvent.type === "guidanceApplied") {
+            finishLiveReasoningDuration(currentAssistantMessageId);
+            const previousAssistantId = currentAssistantMessageId;
+            const guidanceAssistantId = `${streamEvent.id}-assistant`;
+            currentAssistantMessageId = guidanceAssistantId;
+            // Prefer durable interrupted id from the event so consecutive
+            // recoveries keep remapping backend event ids to the newest bubble.
+            interruptedAssistantMessageId =
+              routingInterruptedAssistantMessageId(
+                previousAssistantId,
+                streamEvent.interruptedAssistantId,
+              );
+            liveAssistantDraft = "";
+            liveAssistantDraftReasoning = "";
+            lastLiveContextUsageRefreshAtMs = Date.now();
+            hasGuidanceTurns = true;
+            appendGuidanceMessage(
+              chatKey,
+              streamEvent,
+              guidanceAssistantId,
+              previousAssistantId,
+            );
+            return;
+          }
+
+          if (streamEvent.type === "complete") {
+            const completedAtMs = Date.now();
+            const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
+            activeReasoningStartedAtMs = null;
+            stopLiveReasoningDuration();
+            const liveStatisticsUsage =
+              streamEvent.usage &&
+              streamEvent.usage.inputTokens !== null &&
+              streamEvent.usage.outputTokens !== null
+                ? streamEvent.usage
+                : latestResponseUsage;
+            if (!latestResponseUsage && liveStatisticsUsage) {
+              latestResponseUsage = liveStatisticsUsage;
+            }
             refreshRunContextUsage();
-          }
-          return;
-        }
-
-        if (streamEvent.type === "usage") {
-          latestResponseUsage =
-            streamEvent.usage &&
-              streamEvent.usage.inputTokens !== null &&
-              streamEvent.usage.outputTokens !== null
-              ? streamEvent.usage
-              : null;
-          deferStreamAuxiliaryUpdate(() => {
             updateLiveChatStatistics(chatKey, {
-              modelId: selectedModelIdRef.current,
-              providerId: selectedProviderIdRef.current,
+              modelId: streamEvent.metrics.modelId,
+              providerId: streamEvent.metrics.providerId,
               startedAtMs: liveStartedAtMs,
-              usage: latestResponseUsage,
+              usage: liveStatisticsUsage,
             });
-          });
-          return;
-        }
-
-        if (streamEvent.type === "guidanceApplied") {
-          finishLiveReasoningDuration(currentAssistantMessageId);
-          const previousAssistantId = currentAssistantMessageId;
-          const guidanceAssistantId = `${streamEvent.id}-assistant`;
-          currentAssistantMessageId = guidanceAssistantId;
-          // Prefer durable interrupted id from the event so consecutive
-          // recoveries keep remapping backend event ids to the newest bubble.
-          interruptedAssistantMessageId = routingInterruptedAssistantMessageId(
-            previousAssistantId,
-            streamEvent.interruptedAssistantId,
-          );
-          liveAssistantDraft = "";
-          liveAssistantDraftReasoning = "";
-          lastLiveContextUsageRefreshAtMs = Date.now();
-          hasGuidanceTurns = true;
-          appendGuidanceMessage(
-            chatKey,
-            streamEvent,
-            guidanceAssistantId,
-            previousAssistantId,
-          );
-          return;
-        }
-
-        if (streamEvent.type === "complete") {
-          const completedAtMs = Date.now();
-          const completedReasoningStartedAtMs = activeReasoningStartedAtMs;
-          activeReasoningStartedAtMs = null;
-          stopLiveReasoningDuration();
-          const liveStatisticsUsage =
-            streamEvent.usage &&
-              streamEvent.usage.inputTokens !== null &&
-              streamEvent.usage.outputTokens !== null
-              ? streamEvent.usage
-              : latestResponseUsage;
-          if (!latestResponseUsage && liveStatisticsUsage) {
-            latestResponseUsage = liveStatisticsUsage;
-          }
-          refreshRunContextUsage();
-          updateLiveChatStatistics(chatKey, {
-            modelId: streamEvent.metrics.modelId,
-            providerId: streamEvent.metrics.providerId,
-            startedAtMs: liveStartedAtMs,
-            usage: liveStatisticsUsage,
-          });
-          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
-          void refreshWorkspaces();
-          setChatRunFailed(chatKey, false);
-          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
-          setRetryRunRequest(null);
-          setPendingQuestion(null);
-          setQuestionError(null);
-          setIsAnsweringQuestion(false);
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? hasGuidanceTurns
-                  ? completedGuidanceAssistantMessage(
-                    message,
-                    streamEvent,
-                    completedReasoningStartedAtMs,
-                    completedAtMs,
-                  )
-                  : completedAssistantMessage(
-                    message,
-                    streamEvent,
-                    completedReasoningStartedAtMs,
-                    completedAtMs,
-                  )
-                : message,
-            ),
-          );
-          return;
-        }
-
-        if (streamEvent.type === "toolCall") {
-          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
-          finishLiveReasoningDuration(
-            streamEvent.assistantMessageId,
-            streamEvent.reasoningDurationMs,
-          );
-          ensureStreamingAssistantMessage(
-            resolvedAssistantMessageId(streamEvent.assistantMessageId),
-          );
-          const messageOwnsToolCall = (message: ShellMessage) =>
-            messageHasToolCall(message, streamEvent.toolCall.id);
-          setMessagesForChatKey(chatKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
-                  toolCalls: upsertToolCall(
-                    message.toolCalls,
-                    streamEvent.toolCall,
-                  ),
-                }
-                : message,
+            void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
+            void refreshWorkspaces();
+            setChatRunFailed(chatKey, false);
+            finishChatRun(
+              chatKey,
+              activeRun.runId,
+              activeRun.workspaceId,
+              activeRun.chatId,
             );
-          });
-          return;
-        }
-
-        if (streamEvent.type === "toolResult") {
-          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
-          const messageOwnsToolCall = (message: ShellMessage) =>
-            messageHasToolCall(message, streamEvent.toolCallId);
-          setMessagesForChatKey(chatKey, (current) => {
-            const updateExistingToolCall = current.some(messageOwnsToolCall);
-            return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
-                ? {
-                  ...message,
-                  parts: applyToolResultToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                    streamEvent.startedAt,
-                    streamEvent.completedAt,
-                  ),
-                  toolCalls: applyToolResult(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                    streamEvent.startedAt,
-                    streamEvent.completedAt,
-                  ),
-                }
-                : message,
+            setRetryRunRequest(null);
+            setPendingQuestion(null);
+            setQuestionError(null);
+            setIsAnsweringQuestion(false);
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? hasGuidanceTurns
+                    ? completedGuidanceAssistantMessage(
+                        message,
+                        streamEvent,
+                        completedReasoningStartedAtMs,
+                        completedAtMs,
+                      )
+                    : completedAssistantMessage(
+                        message,
+                        streamEvent,
+                        completedReasoningStartedAtMs,
+                        completedAtMs,
+                      )
+                  : message,
+              ),
             );
-          });
-          return;
-        }
-
-        if (streamEvent.type === "toolOutputDelta") {
-          markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
-          const targetAssistantMessageId = resolvedAssistantMessageId(
-            streamEvent.assistantMessageId,
-          );
-          toolOutputDeltaBuffer.push(chatKey, {
-            assistantMessageId: targetAssistantMessageId,
-            delta: streamEvent.delta,
-            stream: streamEvent.stream,
-            toolCallId: streamEvent.toolCallId,
-          });
-          return;
-        }
-
-        if (streamEvent.type === "questionRequest") {
-          setQuestionError(null);
-          setPendingQuestion(streamEvent.request);
-          return;
-        }
-
-        if (streamEvent.type === "hookNotification") {
-          finishLiveReasoningDuration(streamEvent.assistantMessageId);
-          if (streamEvent.notification.level === "error") {
-            setError(streamEvent.notification.message);
+            return;
           }
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? {
-                  ...message,
-                  parts: appendTextPart(
-                    message.parts,
-                    `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
-                  ),
-                }
-                : message,
-            ),
-          );
-          return;
-        }
 
-        if (streamEvent.type === "gitDiffRefresh") {
-          if (isContextPanelOpen && contextPanelTab === "git") {
-            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath, sourceControlTarget);
-          }
-          deferStreamAuxiliaryUpdate(() => {
-            updateLiveChatStatistics(chatKey, {
-              codeChangeStats: streamEvent.codeChangeStats,
-              modelId: selectedModelIdRef.current,
-              providerId: selectedProviderIdRef.current,
-              startedAtMs: liveStartedAtMs,
-              usage: latestResponseUsage,
-            });
-          });
-          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
-          return;
-        }
-
-        if (streamEvent.type === "todoGraphRefresh") {
-          const isActiveTodoChat =
-            activeChatKeyRef.current ===
-            chatRunKey(streamEvent.workspaceId, streamEvent.chatId);
-          if (isActiveTodoChat) {
-            setContextPanelTab("todo");
-            setIsContextPanelOpen(true);
-            void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
-              ignoreRequestInvalidation: true,
-            });
-          }
-          return;
-        }
-
-        if (streamEvent.type === "planRefresh") {
-          handlePlanRefresh(streamEvent);
-          return;
-        }
-
-        if (streamEvent.type === "agentTeamRefresh") {
-          handleAgentTeamRefresh(streamEvent);
-          return;
-        }
-
-        if (streamEvent.type === "memoryExtractionComplete") {
-          void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithExtractedMemories(
-                  message,
-                  streamEvent.extractedMemories,
+          if (streamEvent.type === "toolCall") {
+            markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
+            finishLiveReasoningDuration(
+              streamEvent.assistantMessageId,
+              streamEvent.reasoningDurationMs,
+            );
+            ensureStreamingAssistantMessage(
+              resolvedAssistantMessageId(streamEvent.assistantMessageId),
+            );
+            const messageOwnsToolCall = (message: ShellMessage) =>
+              messageHasToolCall(message, streamEvent.toolCall.id);
+            setMessagesForChatKey(chatKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (
+                  updateExistingToolCall
+                    ? messageOwnsToolCall(message)
+                    : isCurrentAssistantMessage(
+                        message,
+                        streamEvent.assistantMessageId,
+                      )
                 )
-                : message,
-            ),
-          );
-          return;
-        }
-        if (streamEvent.type === "memoryResolved") {
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
-                ? assistantMessageWithMemoriesUsed(
-                  message,
-                  streamEvent.memoriesUsed,
+                  ? {
+                      ...message,
+                      parts: upsertToolCallPart(
+                        message.parts,
+                        streamEvent.toolCall,
+                      ),
+                      toolCalls: upsertToolCall(
+                        message.toolCalls,
+                        streamEvent.toolCall,
+                      ),
+                    }
+                  : message,
+              );
+            });
+            return;
+          }
+
+          if (streamEvent.type === "toolResult") {
+            markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
+            const messageOwnsToolCall = (message: ShellMessage) =>
+              messageHasToolCall(message, streamEvent.toolCallId);
+            setMessagesForChatKey(chatKey, (current) => {
+              const updateExistingToolCall = current.some(messageOwnsToolCall);
+              return current.map((message) =>
+                (
+                  updateExistingToolCall
+                    ? messageOwnsToolCall(message)
+                    : isCurrentAssistantMessage(
+                        message,
+                        streamEvent.assistantMessageId,
+                      )
                 )
-                : message,
-            ),
-          );
-          return;
-        }
+                  ? {
+                      ...message,
+                      parts: applyToolResultToParts(
+                        message.parts,
+                        streamEvent.toolCallId,
+                        streamEvent.output,
+                        streamEvent.isError,
+                        streamEvent.startedAt,
+                        streamEvent.completedAt,
+                      ),
+                      toolCalls: applyToolResult(
+                        message.toolCalls,
+                        streamEvent.toolCallId,
+                        streamEvent.output,
+                        streamEvent.isError,
+                        streamEvent.startedAt,
+                        streamEvent.completedAt,
+                      ),
+                    }
+                  : message,
+              );
+            });
+            return;
+          }
 
-        if (streamEvent.type === "streamEnd") {
-          finishLiveReasoningDuration();
-          stopLiveReasoningDuration();
-          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
-          refreshTerminalContextUsage();
-          refreshActiveAgentTeamSnapshot(activeRun.workspaceId, activeRun.chatId);
-          void refreshMessagesAfterSpecJobSettles(
-            activeRun.workspaceId,
-            activeRun.chatId,
-            activeRun.runId,
-          );
-          return;
-        }
+          if (streamEvent.type === "toolOutputDelta") {
+            markAssistantLiveStreamEvent(streamEvent.assistantMessageId);
+            const targetAssistantMessageId = resolvedAssistantMessageId(
+              streamEvent.assistantMessageId,
+            );
+            toolOutputDeltaBuffer.push(chatKey, {
+              assistantMessageId: targetAssistantMessageId,
+              delta: streamEvent.delta,
+              stream: streamEvent.stream,
+              toolCallId: streamEvent.toolCallId,
+            });
+            return;
+          }
 
-        if (streamEvent.type === "error") {
-          console.debug("[chat-stream] active run stream emitted backend error event", {
-            chatId: activeRun.chatId,
-            message: streamEvent.message,
-            runId: activeRun.runId,
-            workspaceId: activeRun.workspaceId,
-          });
-          finishLiveReasoningDuration();
-          setChatRunFailed(chatKey, true);
-          finishChatRun(chatKey, activeRun.runId, activeRun.workspaceId, activeRun.chatId);
-          setError(streamEvent.message);
-          setPendingQuestion(null);
-          setQuestionError(null);
-          setIsAnsweringQuestion(false);
-          setMessagesForChatKey(chatKey, (current) =>
-            current.map((message) =>
-              isCurrentAssistantMessage(message)
-                ? assistantMessageWithAppendedError(message, streamEvent.message)
-                : message,
-            ),
-          );
-        }
-      }, { signal: abortController.signal });
+          if (streamEvent.type === "questionRequest") {
+            setQuestionError(null);
+            setPendingQuestion(streamEvent.request);
+            return;
+          }
+
+          if (streamEvent.type === "hookNotification") {
+            finishLiveReasoningDuration(streamEvent.assistantMessageId);
+            if (streamEvent.notification.level === "error") {
+              setError(streamEvent.notification.message);
+            }
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? {
+                      ...message,
+                      parts: appendTextPart(
+                        message.parts,
+                        `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                      ),
+                    }
+                  : message,
+              ),
+            );
+            return;
+          }
+
+          if (streamEvent.type === "gitDiffRefresh") {
+            if (isContextPanelOpen && contextPanelTab === "git") {
+              void loadGitDiff(
+                streamEvent.workspaceId,
+                selectedDiffPath,
+                sourceControlTarget,
+              );
+            }
+            deferStreamAuxiliaryUpdate(() => {
+              updateLiveChatStatistics(chatKey, {
+                codeChangeStats: streamEvent.codeChangeStats,
+                modelId: selectedModelIdRef.current,
+                providerId: selectedProviderIdRef.current,
+                startedAtMs: liveStartedAtMs,
+                usage: latestResponseUsage,
+              });
+            });
+            void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
+            return;
+          }
+
+          if (streamEvent.type === "todoGraphRefresh") {
+            const isActiveTodoChat =
+              activeChatKeyRef.current ===
+              chatRunKey(streamEvent.workspaceId, streamEvent.chatId);
+            if (isActiveTodoChat) {
+              setContextPanelTab("todo");
+              setIsContextPanelOpen(true);
+              void loadTodoGraph(streamEvent.workspaceId, streamEvent.chatId, {
+                ignoreRequestInvalidation: true,
+              });
+            }
+            return;
+          }
+
+          if (streamEvent.type === "planRefresh") {
+            handlePlanRefresh(streamEvent);
+            return;
+          }
+
+          if (streamEvent.type === "agentTeamRefresh") {
+            handleAgentTeamRefresh(streamEvent);
+            return;
+          }
+
+          if (streamEvent.type === "memoryExtractionComplete") {
+            void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? assistantMessageWithExtractedMemories(
+                      message,
+                      streamEvent.extractedMemories,
+                    )
+                  : message,
+              ),
+            );
+            return;
+          }
+          if (streamEvent.type === "memoryResolved") {
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(
+                  message,
+                  streamEvent.assistantMessageId,
+                )
+                  ? assistantMessageWithMemoriesUsed(
+                      message,
+                      streamEvent.memoriesUsed,
+                    )
+                  : message,
+              ),
+            );
+            return;
+          }
+
+          if (streamEvent.type === "streamEnd") {
+            finishLiveReasoningDuration();
+            stopLiveReasoningDuration();
+            finishChatRun(
+              chatKey,
+              activeRun.runId,
+              activeRun.workspaceId,
+              activeRun.chatId,
+            );
+            refreshTerminalContextUsage();
+            refreshActiveAgentTeamSnapshot(
+              activeRun.workspaceId,
+              activeRun.chatId,
+            );
+            void refreshMessagesAfterSpecJobSettles(
+              activeRun.workspaceId,
+              activeRun.chatId,
+              activeRun.runId,
+            );
+            return;
+          }
+
+          if (streamEvent.type === "error") {
+            console.debug(
+              "[chat-stream] active run stream emitted backend error event",
+              {
+                chatId: activeRun.chatId,
+                message: streamEvent.message,
+                runId: activeRun.runId,
+                workspaceId: activeRun.workspaceId,
+              },
+            );
+            finishLiveReasoningDuration();
+            setChatRunFailed(chatKey, true);
+            finishChatRun(
+              chatKey,
+              activeRun.runId,
+              activeRun.workspaceId,
+              activeRun.chatId,
+            );
+            setError(streamEvent.message);
+            setPendingQuestion(null);
+            setQuestionError(null);
+            setIsAnsweringQuestion(false);
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                isCurrentAssistantMessage(message)
+                  ? assistantMessageWithAppendedError(
+                      message,
+                      streamEvent.message,
+                    )
+                  : message,
+              ),
+            );
+          }
+        },
+        { signal: abortController.signal },
+      );
 
       await refreshWorkspaces();
     } catch (requestError) {
@@ -10269,14 +11047,18 @@ export function App() {
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
-        requestError instanceof DOMException && requestError.name === "AbortError";
+        requestError instanceof DOMException &&
+        requestError.name === "AbortError";
       if (isStreamIdleError(requestError)) {
-        console.debug("[chat-stream] active run stream idle timeout; reconnecting", {
-          chatId: activeRun.chatId,
-          lastSequence: lastSequenceForState(),
-          runId: activeRun.runId,
-          workspaceId: activeRun.workspaceId,
-        });
+        console.debug(
+          "[chat-stream] active run stream idle timeout; reconnecting",
+          {
+            chatId: activeRun.chatId,
+            lastSequence: lastSequenceForState(),
+            runId: activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          },
+        );
         shouldReconnect = true;
       } else if (wasCancelled) {
         console.debug("[chat-stream] active run stream cancelled", {
@@ -10326,7 +11108,9 @@ export function App() {
     }
   }
 
-  async function runChatMessage(initialRequest: RetryRunRequest): Promise<string | null> {
+  async function runChatMessage(
+    initialRequest: RetryRunRequest,
+  ): Promise<string | null> {
     const requestModel = availableModels.find(
       (model) => model.id === initialRequest.modelId,
     );
@@ -10358,7 +11142,11 @@ export function App() {
           type: "chat",
           workspaceId: request.workspaceId,
         });
-        openPendingChatTab(request.workspaceId, queued.chatId, queued.chatTitle);
+        openPendingChatTab(
+          request.workspaceId,
+          queued.chatId,
+          queued.chatTitle,
+        );
         setExpandedWorkspaceId(request.workspaceId);
         bindRequestPlanModeToChatKey(request, queuedChatKey);
         setActiveWorkspaceChatRefs(request.workspaceId, queued.chatId);
@@ -10380,7 +11168,8 @@ export function App() {
     const runKey = localRandomId();
     const pendingUserMessageId = request.pendingUserMessageId ?? null;
     const localUserId = pendingUserMessageId ?? `local-user-${runKey}`;
-    const localAssistantId = request.assistantMessageId ?? `local-assistant-${runKey}`;
+    const localAssistantId =
+      request.assistantMessageId ?? `local-assistant-${runKey}`;
     const localCreatedAt = new Date().toISOString();
     const visibleUserContent = messageWithSelectedSkills(
       detectedSkills,
@@ -10399,9 +11188,11 @@ export function App() {
     let requestChatId = request.chatId;
     const pendingChatId =
       request.chatId || request.localChatKey ? null : `pending:${runKey}`;
-    let runMessagesKey = request.localChatKey ?? (requestChatId
-      ? chatRunKey(request.workspaceId, requestChatId)
-      : pendingChatRunKey(request.workspaceId, runKey));
+    let runMessagesKey =
+      request.localChatKey ??
+      (requestChatId
+        ? chatRunKey(request.workspaceId, requestChatId)
+        : pendingChatRunKey(request.workspaceId, runKey));
     let currentRunningChatKey = runMessagesKey;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
@@ -10449,7 +11240,10 @@ export function App() {
         return;
       }
       const now = Date.now();
-      if (now - lastLiveContextUsageRefreshAtMs < LIVE_CONTEXT_USAGE_REFRESH_MS) {
+      if (
+        now - lastLiveContextUsageRefreshAtMs <
+        LIVE_CONTEXT_USAGE_REFRESH_MS
+      ) {
         return;
       }
 
@@ -10467,7 +11261,8 @@ export function App() {
     };
 
     const shouldActivateRun =
-      !request.localChatKey || activeChatKeyRef.current === request.localChatKey;
+      !request.localChatKey ||
+      activeChatKeyRef.current === request.localChatKey;
 
     if (shouldActivateRun) {
       activeChatKeyRef.current = runMessagesKey;
@@ -10524,12 +11319,12 @@ export function App() {
           const next = current.map((message) =>
             message.id === pendingUserMessageId
               ? {
-                ...message,
-                content: visibleUserContent,
-                pendingMode: undefined,
-                sessionMode: request.sessionMode,
-                parts: localUserParts,
-              }
+                  ...message,
+                  content: visibleUserContent,
+                  pendingMode: undefined,
+                  sessionMode: request.sessionMode,
+                  parts: localUserParts,
+                }
               : message,
           );
           next.splice(pendingIndex + 1, 0, assistantMessage);
@@ -10551,7 +11346,7 @@ export function App() {
           metrics: null,
           memoriesUsed: [],
           extractedMemories: [],
-        specUpdates: [],
+          specUpdates: [],
         },
         assistantMessage,
       ];
@@ -10591,14 +11386,15 @@ export function App() {
       setMessagesForChatKey(runMessagesKey, (current) => {
         if (current.some((message) => message.id === nextAssistantMessageId)) {
           return current.map((message) =>
-            message.id === nextAssistantMessageId && message.role === "assistant"
+            message.id === nextAssistantMessageId &&
+            message.role === "assistant"
               ? {
-                ...message,
-                memoriesUsed: message.memoriesUsed.length
-                  ? message.memoriesUsed
-                  : memoriesUsed,
-                status: "streaming",
-              }
+                  ...message,
+                  memoriesUsed: message.memoriesUsed.length
+                    ? message.memoriesUsed
+                    : memoriesUsed,
+                  status: "streaming",
+                }
               : message,
           );
         }
@@ -10609,7 +11405,9 @@ export function App() {
         ];
       });
     };
-    const finishStreamingAssistantMessage = (finishedAssistantMessageId: string) => {
+    const finishStreamingAssistantMessage = (
+      finishedAssistantMessageId: string,
+    ) => {
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) =>
           message.role === "assistant" &&
@@ -10660,20 +11458,21 @@ export function App() {
       liveStreamAssistantIdsByChatKeyRef.current.set(runMessagesKey, tracked);
     };
     let activeReasoningStartedAtMs: number | null = null;
-    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null = null;
+    let liveReasoningDurationTimer: ReturnType<typeof setInterval> | null =
+      null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) =>
           isCurrentAssistantMessage(message) && message.status === "streaming"
             ? {
-              ...message,
-              parts: updateActiveReasoningPartDuration(
-                message.parts,
-                startedAtMs,
-                Date.now(),
-              ),
-            }
+                ...message,
+                parts: updateActiveReasoningPartDuration(
+                  message.parts,
+                  startedAtMs,
+                  Date.now(),
+                ),
+              }
             : message,
         ),
       );
@@ -10724,7 +11523,11 @@ export function App() {
             ...message,
             parts:
               serverParts === message.parts
-                ? finishActiveReasoningPart(message.parts, startedAtMs, endedAtMs)
+                ? finishActiveReasoningPart(
+                    message.parts,
+                    startedAtMs,
+                    endedAtMs,
+                  )
                 : serverParts,
           };
         }),
@@ -10787,7 +11590,8 @@ export function App() {
           // `runId` is the stable active-run identity. `llmRequestId` remains
           // a legacy fallback for local streams that predate `runId`; provider
           // attempts never update this value after the start event.
-          const startedRunId = activeRunIdFromStartEvent(streamEvent) ?? activeRunId;
+          const startedRunId =
+            activeRunIdFromStartEvent(streamEvent) ?? activeRunId;
           if (!startChatRun(currentRunningChatKey, startedRunId)) {
             return;
           }
@@ -10831,9 +11635,7 @@ export function App() {
                 ) ?? new Set<string>();
               for (const id of pendingLiveAssistantIds) {
                 nextLiveIds.add(
-                  id === localAssistantId
-                    ? streamEvent.assistantMessageId
-                    : id,
+                  id === localAssistantId ? streamEvent.assistantMessageId : id,
                 );
               }
               liveStreamAssistantIdsByChatKeyRef.current.set(
@@ -10858,25 +11660,28 @@ export function App() {
               );
               updateQueuedRunRequestsForChatKey(runMessagesKey, () => []);
             }
-            moveMessagesForChatKey(runMessagesKey, currentRunningChatKey, (current) =>
-              current.map((message) => {
-                if (message.id === localUserId) {
-                  return { ...message, id: streamEvent.userMessageId };
-                }
+            moveMessagesForChatKey(
+              runMessagesKey,
+              currentRunningChatKey,
+              (current) =>
+                current.map((message) => {
+                  if (message.id === localUserId) {
+                    return { ...message, id: streamEvent.userMessageId };
+                  }
 
-                if (
-                  message.role === "assistant" &&
-                  message.id === localAssistantId
-                ) {
-                  return {
-                    ...message,
-                    id: streamEvent.assistantMessageId,
-                    memoriesUsed: streamEvent.memoriesUsed,
-                  };
-                }
+                  if (
+                    message.role === "assistant" &&
+                    message.id === localAssistantId
+                  ) {
+                    return {
+                      ...message,
+                      id: streamEvent.assistantMessageId,
+                      memoriesUsed: streamEvent.memoriesUsed,
+                    };
+                  }
 
-                return message;
-              }),
+                  return message;
+                }),
             );
 
             runMessagesKey = currentRunningChatKey;
@@ -10934,16 +11739,17 @@ export function App() {
             startedAtMs: liveStartedAtMs,
             usage: null,
           });
-          refreshActiveAgentTeamSnapshot(request.workspaceId, streamEvent.chatId);
+          refreshActiveAgentTeamSnapshot(
+            request.workspaceId,
+            streamEvent.chatId,
+          );
           const shouldActivateStartedChat =
             shouldActivateRun ||
             activeChatKeyRef.current === currentRunningChatKey ||
             activeChatKeyRef.current === request.localChatKey ||
             activeChatKeyRef.current === null ||
             Boolean(request.chatId && !request.localChatKey);
-          if (
-            shouldActivateStartedChat
-          ) {
+          if (shouldActivateStartedChat) {
             setActiveWorkspaceChatRefs(request.workspaceId, streamEvent.chatId);
             setActiveChatId(streamEvent.chatId);
             updateBrowserRoute({
@@ -11000,17 +11806,28 @@ export function App() {
           if (interruptedAssistantMessageId === null) {
             currentAssistantMessageId = streamEvent.assistantMessageId;
           }
-          const snapshotKey = resolvedAssistantMessageId(streamEvent.assistantMessageId);
-          streamAttemptSnapshots.set(snapshotKey, emptyStreamingAttemptSnapshot());
+          const snapshotKey = resolvedAssistantMessageId(
+            streamEvent.assistantMessageId,
+          );
+          streamAttemptSnapshots.set(
+            snapshotKey,
+            emptyStreamingAttemptSnapshot(),
+          );
           ensureStreamingAssistantMessage(
             resolvedAssistantMessageId(streamEvent.assistantMessageId),
           );
           setMessagesForChatKey(runMessagesKey, (current) => {
             const message = current.find((message) =>
-              isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
+              isCurrentAssistantMessage(
+                message,
+                streamEvent.assistantMessageId,
+              ),
             );
             if (message) {
-              streamAttemptSnapshots.set(snapshotKey, streamingAttemptSnapshot(message));
+              streamAttemptSnapshots.set(
+                snapshotKey,
+                streamingAttemptSnapshot(message),
+              );
             }
             return current;
           });
@@ -11040,12 +11857,14 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? resetStreamingAssistantMessage(
-                  message,
-                  streamEvent,
-                  streamAttemptSnapshots.get(
-                    resolvedAssistantMessageId(streamEvent.assistantMessageId),
-                  ),
-                )
+                    message,
+                    streamEvent,
+                    streamAttemptSnapshots.get(
+                      resolvedAssistantMessageId(
+                        streamEvent.assistantMessageId,
+                      ),
+                    ),
+                  )
                 : message,
             ),
           );
@@ -11069,8 +11888,8 @@ export function App() {
         if (streamEvent.type === "usage") {
           latestResponseUsage =
             streamEvent.usage &&
-              streamEvent.usage.inputTokens !== null &&
-              streamEvent.usage.outputTokens !== null
+            streamEvent.usage.inputTokens !== null &&
+            streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : null;
           deferStreamAuxiliaryUpdate(() => {
@@ -11118,8 +11937,8 @@ export function App() {
           );
           const liveStatisticsUsage =
             streamEvent.usage &&
-              streamEvent.usage.inputTokens !== null &&
-              streamEvent.usage.outputTokens !== null
+            streamEvent.usage.inputTokens !== null &&
+            streamEvent.usage.outputTokens !== null
               ? streamEvent.usage
               : latestResponseUsage;
           if (!latestResponseUsage && liveStatisticsUsage) {
@@ -11152,17 +11971,17 @@ export function App() {
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? hasGuidanceTurns
                   ? completedGuidanceAssistantMessage(
-                    message,
-                    streamEvent,
-                    completedReasoningStartedAtMs,
-                    completedAtMs,
-                  )
+                      message,
+                      streamEvent,
+                      completedReasoningStartedAtMs,
+                      completedAtMs,
+                    )
                   : completedAssistantMessage(
-                    message,
-                    streamEvent,
-                    completedReasoningStartedAtMs,
-                    completedAtMs,
-                  )
+                      message,
+                      streamEvent,
+                      completedReasoningStartedAtMs,
+                      completedAtMs,
+                    )
                 : message,
             ),
           );
@@ -11183,17 +12002,25 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) => {
             const updateExistingToolCall = current.some(messageOwnsToolCall);
             return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+              (
+                updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(
+                      message,
+                      streamEvent.assistantMessageId,
+                    )
+              )
                 ? {
-                  ...message,
-                  toolCalls: upsertToolCall(
-                    message.toolCalls,
-                    streamEvent.toolCall,
-                  ),
-                  parts: upsertToolCallPart(message.parts, streamEvent.toolCall),
-                }
+                    ...message,
+                    toolCalls: upsertToolCall(
+                      message.toolCalls,
+                      streamEvent.toolCall,
+                    ),
+                    parts: upsertToolCallPart(
+                      message.parts,
+                      streamEvent.toolCall,
+                    ),
+                  }
                 : message,
             );
           });
@@ -11210,28 +12037,33 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) => {
             const updateExistingToolCall = current.some(messageOwnsToolCall);
             return current.map((message) =>
-              (updateExistingToolCall
-                ? messageOwnsToolCall(message)
-                : isCurrentAssistantMessage(message, streamEvent.assistantMessageId))
+              (
+                updateExistingToolCall
+                  ? messageOwnsToolCall(message)
+                  : isCurrentAssistantMessage(
+                      message,
+                      streamEvent.assistantMessageId,
+                    )
+              )
                 ? {
-                  ...message,
-                  toolCalls: applyToolResult(
-                    message.toolCalls,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                    streamEvent.startedAt,
-                    streamEvent.completedAt,
-                  ),
-                  parts: applyToolResultToParts(
-                    message.parts,
-                    streamEvent.toolCallId,
-                    streamEvent.output,
-                    streamEvent.isError,
-                    streamEvent.startedAt,
-                    streamEvent.completedAt,
-                  ),
-                }
+                    ...message,
+                    toolCalls: applyToolResult(
+                      message.toolCalls,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
+                    ),
+                    parts: applyToolResultToParts(
+                      message.parts,
+                      streamEvent.toolCallId,
+                      streamEvent.output,
+                      streamEvent.isError,
+                      streamEvent.startedAt,
+                      streamEvent.completedAt,
+                    ),
+                  }
                 : message,
             );
           });
@@ -11268,12 +12100,12 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? {
-                  ...message,
-                  parts: appendTextPart(
-                    message.parts,
-                    `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
-                  ),
-                }
+                    ...message,
+                    parts: appendTextPart(
+                      message.parts,
+                      `\n\n[${streamEvent.notification.event}] ${streamEvent.notification.message}`,
+                    ),
+                  }
                 : message,
             ),
           );
@@ -11282,7 +12114,11 @@ export function App() {
 
         if (streamEvent.type === "gitDiffRefresh") {
           if (isContextPanelOpen && contextPanelTab === "git") {
-            void loadGitDiff(streamEvent.workspaceId, selectedDiffPath, sourceControlTarget);
+            void loadGitDiff(
+              streamEvent.workspaceId,
+              selectedDiffPath,
+              sourceControlTarget,
+            );
           }
           deferStreamAuxiliaryUpdate(() => {
             updateLiveChatStatistics(runMessagesKey, {
@@ -11331,9 +12167,9 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? assistantMessageWithExtractedMemories(
-                  message,
-                  streamEvent.extractedMemories,
-                )
+                    message,
+                    streamEvent.extractedMemories,
+                  )
                 : message,
             ),
           );
@@ -11345,9 +12181,9 @@ export function App() {
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
                 ? assistantMessageWithMemoriesUsed(
-                  message,
-                  streamEvent.memoriesUsed,
-                )
+                    message,
+                    streamEvent.memoriesUsed,
+                  )
                 : message,
             ),
           );
@@ -11393,7 +12229,10 @@ export function App() {
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message)
-                ? assistantMessageWithAppendedError(message, streamEvent.message)
+                ? assistantMessageWithAppendedError(
+                    message,
+                    streamEvent.message,
+                  )
                 : message,
             ),
           );
@@ -11407,8 +12246,11 @@ export function App() {
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
       const wasCancelled =
-        requestError instanceof DOMException && requestError.name === "AbortError";
-      const message = wasCancelled ? t("Run cancelled.") : errorMessage(requestError);
+        requestError instanceof DOMException &&
+        requestError.name === "AbortError";
+      const message = wasCancelled
+        ? t("Run cancelled.")
+        : errorMessage(requestError);
       if (!wasCancelled) {
         setChatRunFailed(runMessagesKey, true);
       }
@@ -11486,7 +12328,9 @@ export function App() {
     }));
 
     try {
-      const params = new URLSearchParams({ limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE) });
+      const params = new URLSearchParams({
+        limit: String(WORKSPACE_CHAT_HISTORY_PAGE_SIZE),
+      });
       if (paging.nextCursor) {
         params.set("cursor", paging.nextCursor);
       }
@@ -11498,7 +12342,9 @@ export function App() {
           if (workspace.id !== workspaceId) {
             return workspace;
           }
-          const existingChatIds = new Set(workspace.chats.map((chat) => chat.id));
+          const existingChatIds = new Set(
+            workspace.chats.map((chat) => chat.id),
+          );
           return {
             ...workspace,
             chatPagination: {
@@ -11540,11 +12386,14 @@ export function App() {
     setWorkspaces((current) => reorderWorkspacesByIds(current, workspaceIds));
 
     try {
-      const data = await requestJson<SettingsResponse>("/api/workspaces/order", {
-        body: JSON.stringify({ workspaceIds }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
+      const data = await requestJson<SettingsResponse>(
+        "/api/workspaces/order",
+        {
+          body: JSON.stringify({ workspaceIds }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
       setSettings(data);
       setWorkspaces((current) =>
         reorderWorkspacesByIds(
@@ -11586,13 +12435,18 @@ export function App() {
     const targetWorkspace = workspaces.find(
       (workspace) => workspace.id === targetWorkspaceId,
     );
-    if (!sourceWorkspace || !targetWorkspace || sourceWorkspace.pinned !== targetWorkspace.pinned) {
+    if (
+      !sourceWorkspace ||
+      !targetWorkspace ||
+      sourceWorkspace.pinned !== targetWorkspace.pinned
+    ) {
       return;
     }
 
     event.preventDefault();
     const workspaceIds = moveItemId(
-      workspaceOrderPreviewRef.current ?? workspaces.map((workspace) => workspace.id),
+      workspaceOrderPreviewRef.current ??
+        workspaces.map((workspace) => workspace.id),
       sourceWorkspaceId,
       targetWorkspaceId,
     );
@@ -11606,7 +12460,13 @@ export function App() {
     workspaceOrderPreviewRef.current = null;
     setWorkspaceOrderPreview(null);
 
-    if (!workspaceIds || sameStringList(workspaceIds, previousWorkspaces.map((workspace) => workspace.id))) {
+    if (
+      !workspaceIds ||
+      sameStringList(
+        workspaceIds,
+        previousWorkspaces.map((workspace) => workspace.id),
+      )
+    ) {
       return;
     }
 
@@ -11669,25 +12529,31 @@ export function App() {
     setError(null);
 
     try {
-      const data = await requestJson<SettingsResponse>("/api/settings/general", {
-        body: JSON.stringify({
-          clearPassword: false,
-          hookAuditEnabled: settings.general.hookAuditEnabled,
-          language: settings.general.language,
-          listenHost: settings.general.webServer.listenHost,
-          listenPort: settings.general.webServer.listenPort,
-          password: null,
-          theme: nextTheme,
-        }),
-        headers: { "Content-Type": "application/json" },
-        method: "POST",
-      });
+      const data = await requestJson<SettingsResponse>(
+        "/api/settings/general",
+        {
+          body: JSON.stringify({
+            clearPassword: false,
+            hookAuditEnabled: settings.general.hookAuditEnabled,
+            language: settings.general.language,
+            listenHost: settings.general.webServer.listenHost,
+            listenPort: settings.general.webServer.listenPort,
+            password: null,
+            theme: nextTheme,
+          }),
+          headers: { "Content-Type": "application/json" },
+          method: "POST",
+        },
+      );
       setSettings(data);
     } catch (requestError) {
       setError(errorMessage(requestError));
       setSettings((current) =>
         current
-          ? { ...current, general: { ...current.general, theme: previousTheme } }
+          ? {
+              ...current,
+              general: { ...current.general, theme: previousTheme },
+            }
           : current,
       );
     } finally {
@@ -11695,12 +12561,15 @@ export function App() {
     }
   }
 
-  const handleSettingsPanelSettingsChange = useCallback((data: SettingsResponse) => {
-    setSettings(data);
-    setUpdateStatus(data.update);
-    setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
-    void loadAgentDefinitions();
-  }, [loadAgentDefinitions]);
+  const handleSettingsPanelSettingsChange = useCallback(
+    (data: SettingsResponse) => {
+      setSettings(data);
+      setUpdateStatus(data.update);
+      setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
+      void loadAgentDefinitions();
+    },
+    [loadAgentDefinitions],
+  );
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -11784,8 +12653,8 @@ export function App() {
   const handleGuideQueuedMessageForChatPanel = useStableCallback(
     (messageId: string) => void handleGuideQueuedMessage(messageId),
   );
-  const handleSelectDraftAttachmentsForChatPanel = useStableCallback(
-    () => handleSelectDraftAttachments(),
+  const handleSelectDraftAttachmentsForChatPanel = useStableCallback(() =>
+    handleSelectDraftAttachments(),
   );
   const handleCancelRunForChatPanel = useStableCallback(
     () => void handleCancelRun(),
@@ -11800,13 +12669,15 @@ export function App() {
     () => void handleRetryRun(),
   );
   const handleSubmitForChatPanel = useStableCallback(
-    (
-      event: FormEvent<HTMLFormElement>,
-      options?: { schedule?: boolean },
-    ) => void handleSendMessage(event, options),
+    (event: FormEvent<HTMLFormElement>, options?: { schedule?: boolean }) =>
+      void handleSendMessage(event, options),
   );
-  const handleModelChangeForChatPanel = useStableCallback(handleChatModelChange);
-  const handleRemoveAttachmentForChatPanel = useStableCallback(handleRemoveDraftAttachment);
+  const handleModelChangeForChatPanel = useStableCallback(
+    handleChatModelChange,
+  );
+  const handleRemoveAttachmentForChatPanel = useStableCallback(
+    handleRemoveDraftAttachment,
+  );
   const handleRemoveSkillForChatPanel = useStableCallback(removeSelectedSkill);
   const handleThinkingLevelChangeForChatPanel = useStableCallback(
     handleChatThinkingLevelChange,
@@ -11815,21 +12686,23 @@ export function App() {
   const handleWithdrawQueuedMessageForChatPanel = useStableCallback(
     handleWithdrawQueuedMessage,
   );
-  const providersForChatPanel = settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
+  const providersForChatPanel =
+    settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS;
   const refreshAgentPanelForContextPanel = useStableCallback(async () => {
     if (activeWorkspaceId && activeChatId && !isPendingChatId(activeChatId)) {
-      await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, { silent: false });
+      await loadAgentTeamSnapshot(activeWorkspaceId, activeChatId, {
+        silent: false,
+      });
     }
   });
-  const openAgentInstanceTabForContextPanel = useStableCallback(openAgentInstanceTab);
+  const openAgentInstanceTabForContextPanel =
+    useStableCallback(openAgentInstanceTab);
   const agentsPanelForContextPanel = useMemo(
     () => (
       <Suspense fallback={<PanelLoadingFallback />}>
         <AgentsRuntimePanel
           activeChatId={
-            activeChatId && !isPendingChatId(activeChatId)
-              ? activeChatId
-              : null
+            activeChatId && !isPendingChatId(activeChatId) ? activeChatId : null
           }
           error={agentTeamError}
           isLoading={isLoadingAgentTeam}
@@ -11838,7 +12711,7 @@ export function App() {
           selectedInstanceId={
             activeMainTab.type === "agent"
               ? activeMainTab.instanceId
-              : agentTeamSnapshot?.team.coordinatorInstanceId ?? null
+              : (agentTeamSnapshot?.team.coordinatorInstanceId ?? null)
           }
           snapshot={agentTeamSnapshot}
         />
@@ -11866,19 +12739,24 @@ export function App() {
       })),
     [activeWorkspace?.path, availableSourceControlTargets],
   );
-  const handleSourceControlTargetChange = useStableCallback((targetKey: string) => {
-    if (targetKey === sourceControlTargetKeyValue) {
-      return;
-    }
-    const target = sourceControlTargetFromKey(availableSourceControlTargets, targetKey);
-    if (!target) {
-      return;
-    }
-    setIsSourceControlTargetManual(true);
-    setSelectedSourceControlTargetScope(sourceControlTargetScope);
-    setSelectedSourceControlTarget(target);
-    setSelectedDiffPath(null);
-  });
+  const handleSourceControlTargetChange = useStableCallback(
+    (targetKey: string) => {
+      if (targetKey === sourceControlTargetKeyValue) {
+        return;
+      }
+      const target = sourceControlTargetFromKey(
+        availableSourceControlTargets,
+        targetKey,
+      );
+      if (!target) {
+        return;
+      }
+      setIsSourceControlTargetManual(true);
+      setSelectedSourceControlTargetScope(sourceControlTargetScope);
+      setSelectedSourceControlTarget(target);
+      setSelectedDiffPath(null);
+    },
+  );
   const handleGitFileOperationForContextPanel = useStableCallback(
     (action: "stage" | "unstage" | "discard", path: string) =>
       void handleGitFileOperation(action, path),
@@ -11909,7 +12787,11 @@ export function App() {
   );
   const handleRefreshDiffForContextPanel = useStableCallback(() => {
     if (activeWorkspace?.id) {
-      void loadGitDiff(activeWorkspace.id, selectedDiffPath, sourceControlTarget);
+      void loadGitDiff(
+        activeWorkspace.id,
+        selectedDiffPath,
+        sourceControlTarget,
+      );
     }
   });
   const handleForgetContextMemoryForContextPanel = useStableCallback(
@@ -11937,10 +12819,12 @@ export function App() {
       }
     },
   );
-  const handleContextPanelTabChange = useStableCallback((tab: ContextPanelTab) => {
-    setContextPanelTab(tab);
-    setIsContextPanelOpen(true);
-  });
+  const handleContextPanelTabChange = useStableCallback(
+    (tab: ContextPanelTab) => {
+      setContextPanelTab(tab);
+      setIsContextPanelOpen(true);
+    },
+  );
   const contextPanelFiles = gitDiff?.files ?? EMPTY_GIT_STATUS_FILES;
   const normalizedWorkspaceChatSearchQuery = workspaceChatSearchQuery.trim();
   const isWorkspaceSearchActive =
@@ -11992,7 +12876,9 @@ export function App() {
           active: false,
           disabled: isInstallingUpdate,
           icon: isInstallingUpdate ? LoaderCircle : Download,
-          label: isInstallingUpdate ? t("Installing update...") : t("Install update"),
+          label: isInstallingUpdate
+            ? t("Installing update...")
+            : t("Install update"),
           onClick: () => void installUpdateFromNav(),
         }
       : null;
@@ -12001,7 +12887,10 @@ export function App() {
     return (
       <I18nContext.Provider value={{ language, t }}>
         <main className="app-root grid place-items-center bg-stone-100 text-stone-950">
-          <LoaderCircle aria-hidden="true" className="size-6 animate-spin text-teal-700" />
+          <LoaderCircle
+            aria-hidden="true"
+            className="size-6 animate-spin text-teal-700"
+          />
         </main>
       </I18nContext.Provider>
     );
@@ -12049,7 +12938,10 @@ export function App() {
             className="app-status-toast"
             role="status"
           >
-            <CheckCircle2 aria-hidden="true" className="app-status-toast-icon" />
+            <CheckCircle2
+              aria-hidden="true"
+              className="app-status-toast-icon"
+            />
             <div className="app-error-toast-message">{updateInstallNotice}</div>
             <button
               aria-label={t("Dismiss update message")}
@@ -12086,57 +12978,60 @@ export function App() {
             />
             <section className="global-main-panel min-w-0">
               <Suspense fallback={<PanelLoadingFallback />}>
-              {viewMode === "settings" ? (
-                <SettingsPanel
-                  agentDefinitionOperationKey={agentDefinitionOperationKey}
-                  agentDefinitions={agentDefinitions}
-                  agentDefinitionsError={agentDefinitionsError}
-                  defaultAgentRolePrompts={defaultAgentRolePrompts}
-                  canLogout={canLogout}
-                  activeWorkspaceId={activeWorkspace?.id ?? activeWorkspaceId ?? null}
-                  activeSection={settingsSection}
-                  isLoadingAgentDefinitions={isLoadingAgentDefinitions}
-                  onAddWorkspace={openWorkspaceDialog}
-                  onActiveSectionChange={openSettingsSection}
-                  onCreateAgentDefinition={createAgentDefinition}
-                  onDeleteAgentDefinition={deleteAgentDefinition}
-                  onUpdateAgentDefinition={updateAgentDefinition}
-                  onLogout={handleLogout}
-                  onOpenChat={selectWorkspaceChat}
-                  onSettingsChange={handleSettingsPanelSettingsChange}
-                  onWorkspacesChange={refreshWorkspaces}
-                  workspaceDialogRevision={workspaceDialogRevision}
-                />
-              ) : viewMode === "scheduled" ? (
-                <ScheduledTasksPage
-                  agentDefinitions={agentDefinitions}
-                  onOpenChat={selectWorkspaceChat}
-                  settings={settings}
-                  workspaces={workspaces}
-                />
-              ) : viewMode === "skill-store" ? (
-                <SkillStorePage
-                  onSettingsChange={handleSettingsPanelSettingsChange}
-                  onWorkspacesChange={refreshWorkspaces}
-                  settings={settings}
-                  workspaces={workspaces}
-                />
-              ) : (
-                <ApiStatsPanel
-                  initialFilters={statsRouteFilters}
-                  onRouteChange={updateStatsRoute}
-                  routePage={statsRoutePage}
-                  settings={settings}
-                  workspaces={workspaces}
-                />
-              )}
+                {viewMode === "settings" ? (
+                  <SettingsPanel
+                    agentDefinitionOperationKey={agentDefinitionOperationKey}
+                    agentDefinitions={agentDefinitions}
+                    agentDefinitionsError={agentDefinitionsError}
+                    defaultAgentRolePrompts={defaultAgentRolePrompts}
+                    canLogout={canLogout}
+                    activeWorkspaceId={
+                      activeWorkspace?.id ?? activeWorkspaceId ?? null
+                    }
+                    activeSection={settingsSection}
+                    isLoadingAgentDefinitions={isLoadingAgentDefinitions}
+                    onAddWorkspace={openWorkspaceDialog}
+                    onActiveSectionChange={openSettingsSection}
+                    onCreateAgentDefinition={createAgentDefinition}
+                    onDeleteAgentDefinition={deleteAgentDefinition}
+                    onUpdateAgentDefinition={updateAgentDefinition}
+                    onLogout={handleLogout}
+                    onOpenChat={selectWorkspaceChat}
+                    onSettingsChange={handleSettingsPanelSettingsChange}
+                    onWorkspacesChange={refreshWorkspaces}
+                    workspaceDialogRevision={workspaceDialogRevision}
+                  />
+                ) : viewMode === "scheduled" ? (
+                  <ScheduledTasksPage
+                    agentDefinitions={agentDefinitions}
+                    onOpenChat={selectWorkspaceChat}
+                    settings={settings}
+                    workspaces={workspaces}
+                  />
+                ) : viewMode === "skill-store" ? (
+                  <SkillStorePage
+                    onSettingsChange={handleSettingsPanelSettingsChange}
+                    onWorkspacesChange={refreshWorkspaces}
+                    settings={settings}
+                    workspaces={workspaces}
+                  />
+                ) : (
+                  <ApiStatsPanel
+                    initialFilters={statsRouteFilters}
+                    onRouteChange={updateStatsRoute}
+                    routePage={statsRoutePage}
+                    settings={settings}
+                    workspaces={workspaces}
+                  />
+                )}
               </Suspense>
             </section>
           </div>
         ) : (
           <div
-            className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""} ${isWorkspaceSidebarOpen ? "" : "app-shell-workspace-closed"
-              }`}
+            className={`app-shell ${showContextPanel ? "app-shell-with-context" : ""} ${
+              isWorkspaceSidebarOpen ? "" : "app-shell-workspace-closed"
+            }`}
             ref={appShellRef}
             style={
               {
@@ -12172,7 +13067,9 @@ export function App() {
                 active: isTerminalOpen,
                 disabled: !activeWorkspace,
                 icon: SquareTerminal,
-                label: isTerminalOpen ? t("Close terminal") : t("Open terminal"),
+                label: isTerminalOpen
+                  ? t("Close terminal")
+                  : t("Open terminal"),
                 onClick: toggleWorkspaceTerminal,
               }}
               onLogout={handleLogout}
@@ -12189,8 +13086,9 @@ export function App() {
               updateButton={updateNavButton}
             />
             <aside
-              className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
-                }`}
+              className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
+                isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
+              }`}
               ref={workspaceSidebarRef}
             >
               <div
@@ -12199,8 +13097,9 @@ export function App() {
                 aria-valuemax={WORKSPACE_SIDEBAR_MAX_WIDTH}
                 aria-valuemin={WORKSPACE_SIDEBAR_MIN_WIDTH}
                 aria-valuenow={sidebarWidth}
-                className={`workspace-sidebar-splitter cursor-col-resize ${isResizingSidebar ? "workspace-sidebar-splitter-active" : ""
-                  }`}
+                className={`workspace-sidebar-splitter cursor-col-resize ${
+                  isResizingSidebar ? "workspace-sidebar-splitter-active" : ""
+                }`}
                 onKeyDown={(event) => {
                   if (event.key === "ArrowLeft") {
                     event.preventDefault();
@@ -12249,7 +13148,9 @@ export function App() {
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
                       className="inline-flex size-8 items-center justify-center rounded-lg text-stone-600 transition hover:bg-teal-50 hover:text-teal-800"
-                      onClick={() => setWorkspaceChatSearchOpen((current) => !current)}
+                      onClick={() =>
+                        setWorkspaceChatSearchOpen((current) => !current)
+                      }
                       title={t("Search chats")}
                       type="button"
                     >
@@ -12273,7 +13174,9 @@ export function App() {
                       <input
                         aria-label={t("Search chats")}
                         className="workspace-chat-search-input h-9 w-full rounded-lg border border-stone-300 bg-white px-3 pr-8 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                        onChange={(event) => setWorkspaceChatSearchQuery(event.target.value)}
+                        onChange={(event) =>
+                          setWorkspaceChatSearchQuery(event.target.value)
+                        }
                         placeholder={t("Search chats placeholder")}
                         type="search"
                         value={workspaceChatSearchQuery}
@@ -12300,28 +13203,37 @@ export function App() {
                   {sidebarWorkspaces.length ? (
                     sidebarWorkspaces.map((workspace) => {
                       const isExpanded =
-                        isWorkspaceSearchActive || expandedWorkspaceId === workspace.id;
+                        isWorkspaceSearchActive ||
+                        expandedWorkspaceId === workspace.id;
                       const isActive = workspace.id === activeWorkspace?.id;
                       const workspaceChats = isWorkspaceSearchActive
                         ? workspace.chats.map(
-                          (chat): WorkspaceChatListItem => ({
-                            ...chat,
-                            scheduledStatus:
-                              chat.queuedRun?.status === "queued" ? "queued" : undefined,
-                          }),
-                        )
+                            (chat): WorkspaceChatListItem => ({
+                              ...chat,
+                              scheduledStatus:
+                                chat.queuedRun?.status === "queued"
+                                  ? "queued"
+                                  : undefined,
+                            }),
+                          )
                         : workspaceChatListItemsFor(workspace);
                       const paging = workspaceChatPaging[workspace.id];
                       const visibleChats = workspaceChats;
                       const hiddenChatCount = isWorkspaceSearchActive
                         ? 0
-                        : Math.max((paging?.total ?? workspace.chats.length) - workspace.chats.length, 0);
+                        : Math.max(
+                            (paging?.total ?? workspace.chats.length) -
+                              workspace.chats.length,
+                            0,
+                          );
                       const nextVisibleChatCount = Math.min(
                         WORKSPACE_CHAT_HISTORY_PAGE_SIZE,
                         hiddenChatCount,
                       );
                       const isRemoteWorkspace = workspace.serverId !== null;
-                      const isRemoteReady = workspaceConnectionLooksReady(workspace.connectionStatus);
+                      const isRemoteReady = workspaceConnectionLooksReady(
+                        workspace.connectionStatus,
+                      );
 
                       return (
                         <div
@@ -12368,11 +13280,15 @@ export function App() {
                                   logoUrl={workspace.logoUrl}
                                 />
                                 {isRemoteWorkspace ? (
-                                  <span className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`} />
+                                  <span
+                                    className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`}
+                                  />
                                 ) : null}
                               </span>
                               <span className="min-w-0 flex-1 text-left">
-                                <span className="block truncate">{workspace.name}</span>
+                                <span className="block truncate">
+                                  {workspace.name}
+                                </span>
                                 <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
                                   {workspace.displayPath}
                                 </span>
@@ -12386,12 +13302,20 @@ export function App() {
                               disabled={isRemoteWorkspace && !isRemoteReady}
                               onClick={() => {
                                 if (isRemoteWorkspace && !isRemoteReady) {
-                                  setError(t("Remote workspace is offline. Retry the connection before opening remote operations."));
+                                  setError(
+                                    t(
+                                      "Remote workspace is offline. Retry the connection before opening remote operations.",
+                                    ),
+                                  );
                                   return;
                                 }
                                 startNewWorkspaceChat(workspace.id);
                               }}
-                              title={isRemoteWorkspace && !isRemoteReady ? t("Remote workspace is offline") : t("New chat")}
+                              title={
+                                isRemoteWorkspace && !isRemoteReady
+                                  ? t("Remote workspace is offline")
+                                  : t("New chat")
+                              }
                               type="button"
                             >
                               <Plus aria-hidden="true" className="size-4" />
@@ -12406,14 +13330,24 @@ export function App() {
                               ) : null}
                               <button
                                 className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-stone-200 bg-white px-2 font-semibold text-teal-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400"
-                                disabled={retryingRemoteWorkspaceId === workspace.id}
-                                onClick={() => void retryRemoteWorkspace(workspace)}
+                                disabled={
+                                  retryingRemoteWorkspaceId === workspace.id
+                                }
+                                onClick={() =>
+                                  void retryRemoteWorkspace(workspace)
+                                }
                                 type="button"
                               >
                                 {retryingRemoteWorkspaceId === workspace.id ? (
-                                  <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                                  <LoaderCircle
+                                    aria-hidden="true"
+                                    className="size-3 animate-spin"
+                                  />
                                 ) : (
-                                  <RefreshCw aria-hidden="true" className="size-3" />
+                                  <RefreshCw
+                                    aria-hidden="true"
+                                    className="size-3"
+                                  />
                                 )}
                                 {t("Retry")}
                               </button>
@@ -12424,15 +13358,23 @@ export function App() {
                               {visibleChats.length > 0 ? (
                                 <>
                                   {visibleChats.map((chat) => {
-                                    const chatKey = chatRunKey(workspace.id, chat.id);
+                                    const chatKey = chatRunKey(
+                                      workspace.id,
+                                      chat.id,
+                                    );
                                     const scheduledChatKey =
                                       chat.scheduledChatKey ?? null;
-                                    const sessionStatus = chatSessionVisualStatusFor(chatKey, {
-                                      scheduledChatKey,
-                                      scheduledStatus: chat.scheduledStatus ?? null,
-                                      workspaceActiveRun: chat.activeRun,
-                                    });
-                                    const statusDotClass = chatSessionStatusDotClass(sessionStatus.kind);
+                                    const sessionStatus =
+                                      chatSessionVisualStatusFor(chatKey, {
+                                        scheduledChatKey,
+                                        scheduledStatus:
+                                          chat.scheduledStatus ?? null,
+                                        workspaceActiveRun: chat.activeRun,
+                                      });
+                                    const statusDotClass =
+                                      chatSessionStatusDotClass(
+                                        sessionStatus.kind,
+                                      );
                                     const isChatActive =
                                       activeWorkspace?.id === workspace.id &&
                                       activeChatId === chat.id;
@@ -12446,13 +13388,17 @@ export function App() {
                                         className={chatItemClass(isChatActive)}
                                         key={chat.id}
                                         onClick={() => {
-                                          if (suppressNextWorkspaceChatClickRef.current) {
-                                            suppressNextWorkspaceChatClickRef.current =
-                                              false;
+                                          if (
+                                            suppressNextWorkspaceChatClickRef.current
+                                          ) {
+                                            suppressNextWorkspaceChatClickRef.current = false;
                                             return;
                                           }
 
-                                          selectWorkspaceChat(workspace.id, chat.id);
+                                          selectWorkspaceChat(
+                                            workspace.id,
+                                            chat.id,
+                                          );
                                         }}
                                         onContextMenu={(event) =>
                                           openWorkspaceChatContextMenu(
@@ -12461,7 +13407,9 @@ export function App() {
                                             chat,
                                           )
                                         }
-                                        onPointerCancel={cancelWorkspaceChatLongPress}
+                                        onPointerCancel={
+                                          cancelWorkspaceChatLongPress
+                                        }
                                         onPointerDown={(event) =>
                                           startWorkspaceChatLongPress(
                                             event,
@@ -12469,8 +13417,12 @@ export function App() {
                                             chat,
                                           )
                                         }
-                                        onPointerLeave={cancelWorkspaceChatLongPress}
-                                        onPointerUp={cancelWorkspaceChatLongPress}
+                                        onPointerLeave={
+                                          cancelWorkspaceChatLongPress
+                                        }
+                                        onPointerUp={
+                                          cancelWorkspaceChatLongPress
+                                        }
                                         title={chat.title}
                                         type="button"
                                       >
@@ -12484,10 +13436,12 @@ export function App() {
                                           </span>
                                           <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
                                             <span className="min-w-0 truncate">
-                                              {formatChatCreatedAt(chat.createdAt)}
+                                              {formatChatCreatedAt(
+                                                chat.createdAt,
+                                              )}
                                             </span>
                                             {chatDiffStats &&
-                                              hasGitDiffStats(chatDiffStats) ? (
+                                            hasGitDiffStats(chatDiffStats) ? (
                                               <span
                                                 aria-label={t(
                                                   "Code changes +{additions} -{deletions}",
@@ -12534,7 +13488,9 @@ export function App() {
                                       className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
                                       disabled={paging?.isLoading}
                                       onClick={() =>
-                                        void showMoreWorkspaceChats(workspace.id)
+                                        void showMoreWorkspaceChats(
+                                          workspace.id,
+                                        )
                                       }
                                       type="button"
                                     >
@@ -12572,7 +13528,7 @@ export function App() {
                       {isWorkspaceSearchActive
                         ? isSearchingWorkspaceChats
                           ? t("Searching chats...")
-                          : workspaceChatSearchError ?? t("No matching chats")
+                          : (workspaceChatSearchError ?? t("No matching chats"))
                         : isLoading
                           ? t("Loading workspaces...")
                           : t("No workspaces")}
@@ -12599,7 +13555,9 @@ export function App() {
               >
                 <button
                   className="workspace-chat-context-menu-item workspace-chat-context-menu-item-danger"
-                  disabled={Boolean(workspaceChatContextMenu.chat.scheduledRunId)}
+                  disabled={Boolean(
+                    workspaceChatContextMenu.chat.scheduledRunId,
+                  )}
                   onClick={() => {
                     const { chat, workspace } = workspaceChatContextMenu;
                     setWorkspaceChatContextMenu(null);
@@ -12623,7 +13581,9 @@ export function App() {
                 style={{
                   left: workspaceFileContextMenu.left,
                   top: workspaceFileContextMenu.top,
-                  visibility: workspaceFileContextMenu.positioned ? "visible" : "hidden",
+                  visibility: workspaceFileContextMenu.positioned
+                    ? "visible"
+                    : "hidden",
                 }}
               >
                 <button
@@ -12696,7 +13656,11 @@ export function App() {
                     if (!trimmedName || trimmedName === node.name) {
                       return;
                     }
-                    void handleWorkspaceFileOperation("rename", node.path, trimmedName);
+                    void handleWorkspaceFileOperation(
+                      "rename",
+                      node.path,
+                      trimmedName,
+                    );
                   }}
                   role="menuitem"
                   type="button"
@@ -12711,7 +13675,9 @@ export function App() {
                     setWorkspaceFileContextMenu(null);
                     if (
                       !window.confirm(
-                        t("Delete this file or folder?\n\nPath: {path}", { path: node.path }),
+                        t("Delete this file or folder?\n\nPath: {path}", {
+                          path: node.path,
+                        }),
                       )
                     ) {
                       return;
@@ -12808,7 +13774,10 @@ export function App() {
                         ? "flex min-h-0 min-w-0 flex-1 flex-col"
                         : "hidden"
                     }
-                    key={workspaceHtmlPreviewKey(previewTab.workspaceId, previewTab.path)}
+                    key={workspaceHtmlPreviewKey(
+                      previewTab.workspaceId,
+                      previewTab.path,
+                    )}
                   >
                     <WorkspaceHtmlPreviewPanel tab={previewTab} />
                   </div>
@@ -12828,7 +13797,10 @@ export function App() {
                     instanceId={activeAgentTab.instanceId}
                     isLoading={isLoadingAgentTeam}
                     onOpenMainChat={() =>
-                      selectWorkspaceChat(activeAgentTab.workspaceId, activeAgentTab.chatId)
+                      selectWorkspaceChat(
+                        activeAgentTab.workspaceId,
+                        activeAgentTab.chatId,
+                      )
                     }
                     onRefresh={async () => {
                       await loadAgentTeamSnapshot(
@@ -12849,12 +13821,12 @@ export function App() {
                     snapshot={
                       agentTeamSnapshot?.team.chatId === activeAgentTab.chatId
                         ? agentTeamSnapshot
-                        : agentTeamSnapshotCacheRef.current.get(
+                        : (agentTeamSnapshotCacheRef.current.get(
                             chatRunKey(
                               activeAgentTab.workspaceId,
                               activeAgentTab.chatId,
                             ),
-                          ) ?? null
+                          ) ?? null)
                     }
                     writeTranscriptCache={(entry) => {
                       const tabStillOpen = openAgentTabsRef.current.some(
@@ -12878,7 +13850,8 @@ export function App() {
                     workspaceId={activeAgentTab.workspaceId}
                   />
                 </Suspense>
-              ) : activeMainTab.type !== "file" && activeMainTab.type !== "htmlPreview" ? (
+              ) : activeMainTab.type !== "file" &&
+                activeMainTab.type !== "htmlPreview" ? (
                 <ChatPanel
                   activeWorkspaceName={activeWorkspace?.name ?? null}
                   helpers={chatPanelHelpers}
@@ -12886,19 +13859,26 @@ export function App() {
                   branchError={branchError}
                   chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
                   canGuideActiveRun={isGuidableActiveRun(
-                    activeRunInfo?.chatKey === activeChatKey ? activeRunInfo : null,
-                    activeChatKey !== null && runningChatKeys.has(activeChatKey),
+                    activeRunInfo?.chatKey === activeChatKey
+                      ? activeRunInfo
+                      : null,
+                    activeChatKey !== null &&
+                      runningChatKeys.has(activeChatKey),
                   )}
                   draftAttachments={draftAttachments}
                   draftMessage={draftMessage}
-                  draftUnsupportedAttachmentMessage={unsupportedDraftAttachmentMessage}
+                  draftUnsupportedAttachmentMessage={
+                    unsupportedDraftAttachmentMessage
+                  }
                   gitBranches={gitBranches}
                   contextUsage={displayedContextUsage}
                   isLoadingSettings={isLoadingSettings}
                   isLoadingBranches={isLoadingBranches}
                   isLoadingContextUsage={isLoadingContextUsage}
                   isLoadingMessages={isLoadingActiveChatMessages}
-                  hasMoreMessagesBefore={activeChatPagination?.hasMoreBefore === true}
+                  hasMoreMessagesBefore={
+                    activeChatPagination?.hasMoreBefore === true
+                  }
                   isLoadingMoreMessages={isLoadingOlderActiveChatMessages}
                   isSendingMessage={isSendingMessage}
                   isSelectingAttachments={isSelectingAttachments}
@@ -12906,7 +13886,9 @@ export function App() {
                   messages={messages}
                   readOnly={activeChatReadOnly}
                   overviewRenderer={chatOverviewRenderer}
-                  onAddPastedImageAttachments={handleAddPastedImageAttachmentsForChatPanel}
+                  onAddPastedImageAttachments={
+                    handleAddPastedImageAttachmentsForChatPanel
+                  }
                   onBranchChange={handleBranchChangeForChatPanel}
                   onBranchMenuOpen={() => {
                     if (activeWorkspace?.id) {
@@ -12917,10 +13899,17 @@ export function App() {
                   onEditMessage={handleEditChatMessage}
                   onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
                   onLoadMoreMessages={() => {
-                    if (!activeWorkspaceId || !activeChatId || isPendingChatId(activeChatId)) {
+                    if (
+                      !activeWorkspaceId ||
+                      !activeChatId ||
+                      isPendingChatId(activeChatId)
+                    ) {
                       return Promise.resolve();
                     }
-                    return loadOlderChatMessages(activeWorkspaceId, activeChatId);
+                    return loadOlderChatMessages(
+                      activeWorkspaceId,
+                      activeChatId,
+                    );
                   }}
                   onSelectAttachments={handleSelectDraftAttachmentsForChatPanel}
                   onSelectEditAttachments={handleSelectEditAttachments}
@@ -12935,8 +13924,11 @@ export function App() {
                   onSubmit={handleSubmitForChatPanel}
                   onPlanModeEnabledChange={handlePlanModeEnabledChange}
                   onThinkingLevelChange={handleThinkingLevelChangeForChatPanel}
+                  onLatencyModeChange={handleChatLatencyModeChange}
                   onToggleSkill={handleToggleSkillForChatPanel}
-                  onWithdrawQueuedMessage={handleWithdrawQueuedMessageForChatPanel}
+                  onWithdrawQueuedMessage={
+                    handleWithdrawQueuedMessageForChatPanel
+                  }
                   canRetryRun={retryRunRequest !== null && !isSendingMessage}
                   queuedRunCount={queuedRunRequests.length}
                   queuedMessageIds={queuedMessageIds}
@@ -12945,15 +13937,20 @@ export function App() {
                   selectedModelId={selectedModelId}
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
+                  selectedLatencyMode={selectedRequestLatencyMode}
                   settings={settings}
                   skills={availableSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}
-                  workspaceId={activeWorkspace?.id ?? (activeWorkspaceId || null)}
+                  workspaceId={
+                    activeWorkspace?.id ?? (activeWorkspaceId || null)
+                  }
                 />
               ) : null}
               {workspaces
-                .filter((workspace) => terminalOpenWorkspaceIds.has(workspace.id))
+                .filter((workspace) =>
+                  terminalOpenWorkspaceIds.has(workspace.id),
+                )
                 .map((workspace) => (
                   <Suspense fallback={null} key={workspace.id}>
                     <TerminalPanel
@@ -12997,7 +13994,11 @@ export function App() {
                 isLoadingDiff={isLoadingDiff}
                 isLoadingContextMemories={isLoadingContextMemories}
                 isLoadingPlans={isLoadingActivePlans}
-                isPlanAutoRunBusy={isPlanAutoRunBusy || isPlanAutoRunUpdating || planOperationKey !== null}
+                isPlanAutoRunBusy={
+                  isPlanAutoRunBusy ||
+                  isPlanAutoRunUpdating ||
+                  planOperationKey !== null
+                }
                 isPlanAutoRunEnabled={isPlanAutoRunEnabled}
                 planAutoRunBlockedReason={planAutoRunBlockedReason}
                 isPlanAutoRunToggleDisabled={!activeWorkspace?.id}
@@ -13010,14 +14011,20 @@ export function App() {
                 isResizing={isResizingDiffPanel}
                 loadingWorkspaceDirectoryPaths={loadingWorkspaceDirectoryPaths}
                 onGitCommit={handleGitCommit}
-                onGenerateGitCommitMessage={handleGenerateGitCommitMessageForContextPanel}
+                onGenerateGitCommitMessage={
+                  handleGenerateGitCommitMessageForContextPanel
+                }
                 onGitCommitMessageChange={setGitCommitMessage}
                 onGitFileOperation={handleGitFileOperationForContextPanel}
                 onSourceControlTargetChange={handleSourceControlTargetChange}
-                onRefreshWorkspaceFiles={handleRefreshWorkspaceFilesForContextPanel}
+                onRefreshWorkspaceFiles={
+                  handleRefreshWorkspaceFilesForContextPanel
+                }
                 onToggleFileTreePath={toggleWorkspaceFileTreePath}
                 onOpenWorkspaceFile={handleOpenWorkspaceFileForContextPanel}
-                onOpenWorkspaceFileMenu={handleOpenWorkspaceFileMenuForContextPanel}
+                onOpenWorkspaceFileMenu={
+                  handleOpenWorkspaceFileMenuForContextPanel
+                }
                 onRefreshDiff={handleRefreshDiffForContextPanel}
                 onForgetContextMemory={handleForgetContextMemoryForContextPanel}
                 onMemoryPageChange={goToContextMemoryPage}
@@ -13064,7 +14071,12 @@ export function App() {
                     );
                   }
                 }}
-                onPlanPhaseRetryWithOverride={(planId, phaseId, implementationChatId, override) => {
+                onPlanPhaseRetryWithOverride={(
+                  planId,
+                  phaseId,
+                  implementationChatId,
+                  override,
+                ) => {
                   const workspaceId = activeWorkspace?.id;
                   if (workspaceId) {
                     void runPlanPhaseRetry(
@@ -13078,10 +14090,14 @@ export function App() {
                 }}
                 onReloadWorkspaceSpec={handleReloadWorkspaceSpecForContextPanel}
                 onSaveWorkspaceSpec={handleSaveWorkspaceSpecForContextPanel}
-                onGenerateWorkspaceSpec={handleGenerateWorkspaceSpecForContextPanel}
+                onGenerateWorkspaceSpec={
+                  handleGenerateWorkspaceSpecForContextPanel
+                }
                 onWorkspaceSpecContentChange={setWorkspaceSpecDraft}
                 onWorkspaceSpecPreviewChange={setWorkspaceSpecPreviewEnabled}
-                onWorkspaceSpecSettingsChange={handleWorkspaceSpecSettingsChangeForContextPanel}
+                onWorkspaceSpecSettingsChange={
+                  handleWorkspaceSpecSettingsChangeForContextPanel
+                }
                 onSelectDiffFile={setSelectedDiffPath}
                 onTabChange={handleContextPanelTabChange}
                 onPlanAutoRunToggle={setIsPlanAutoRunEnabled}
@@ -13140,7 +14156,11 @@ export function App() {
               }
             }}
             onNameChange={setWorkspaceName}
-            onPathChange={workspaceMode === "ssh" ? setWorkspaceRemotePath : setWorkspacePath}
+            onPathChange={
+              workspaceMode === "ssh"
+                ? setWorkspaceRemotePath
+                : setWorkspacePath
+            }
             onSelectPath={handleSelectWorkspacePath}
             onSelectIcon={handleSelectWorkspaceIcon}
             onServerChange={setWorkspaceRemoteServer}
@@ -13200,7 +14220,9 @@ export function App() {
             question={pendingQuestion}
           />
         ) : null}
-        {settings && !settings.nativeTools.ripgrep.available && !isRipgrepDialogDismissed ? (
+        {settings &&
+        !settings.nativeTools.ripgrep.available &&
+        !isRipgrepDialogDismissed ? (
           <RipgrepMissingDialog
             error={ripgrepInstallError}
             installDir={settings.nativeTools.ripgrep.installDir}
@@ -13228,7 +14250,6 @@ function RipgrepMissingDialog({
   onInstall: () => void;
 }) {
   const { language, t } = useI18n();
-
 
   return (
     <div
@@ -13297,7 +14318,11 @@ function RipgrepMissingDialog({
               className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
               disabled={isInstalling}
               onClick={onInstall}
-              title={isInstalling ? t("Installing ripgrep...") : t("Download ripgrep")}
+              title={
+                isInstalling
+                  ? t("Installing ripgrep...")
+                  : t("Download ripgrep")
+              }
               type="button"
             >
               {isInstalling ? (
@@ -13466,10 +14491,11 @@ function QuestionDialog({
                           draft.selectedOptionValue === option.value;
                         return (
                           <label
-                            className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${isSelected
+                            className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${
+                              isSelected
                                 ? "border-teal-700 bg-teal-50 text-teal-950"
                                 : "border-stone-200 bg-white text-stone-800 hover:border-teal-200 hover:bg-teal-50/60"
-                              }`}
+                            }`}
                             key={option.value}
                           >
                             <input
@@ -13598,7 +14624,8 @@ function MainTabBar({
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const hasTrackedTabKeysRef = useRef(false);
   const previousTabKeysRef = useRef<string[]>([]);
-  const [contextMenu, setContextMenu] = useState<MainTabContextMenuState | null>(null);
+  const [contextMenu, setContextMenu] =
+    useState<MainTabContextMenuState | null>(null);
   const [scrollState, setScrollState] = useState({
     canScrollLeft: false,
     canScrollRight: false,
@@ -13616,8 +14643,12 @@ function MainTabBar({
       return;
     }
 
-    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
-    const availableWidth = tabsContainerRef.current?.clientWidth ?? element.clientWidth;
+    const maxScrollLeft = Math.max(
+      0,
+      element.scrollWidth - element.clientWidth,
+    );
+    const availableWidth =
+      tabsContainerRef.current?.clientWidth ?? element.clientWidth;
     const hasOverflow = element.scrollWidth > availableWidth + 1;
     if (!hasOverflow && element.scrollLeft !== 0) {
       element.scrollLeft = 0;
@@ -13632,8 +14663,8 @@ function MainTabBar({
 
     setScrollState((current) =>
       current.canScrollLeft === nextState.canScrollLeft &&
-        current.canScrollRight === nextState.canScrollRight &&
-        current.hasOverflow === nextState.hasOverflow
+      current.canScrollRight === nextState.canScrollRight &&
+      current.hasOverflow === nextState.hasOverflow
         ? current
         : nextState,
     );
@@ -13789,19 +14820,28 @@ function MainTabBar({
       return;
     }
 
-    const maxScrollLeft = Math.max(0, element.scrollWidth - element.clientWidth);
+    const maxScrollLeft = Math.max(
+      0,
+      element.scrollWidth - element.clientWidth,
+    );
     if (maxScrollLeft <= 0) {
       return;
     }
 
     const rawDelta =
-      Math.abs(event.deltaX) > Math.abs(event.deltaY) ? event.deltaX : event.deltaY;
+      Math.abs(event.deltaX) > Math.abs(event.deltaY)
+        ? event.deltaX
+        : event.deltaY;
     if (rawDelta === 0) {
       return;
     }
 
     const deltaUnit =
-      event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? element.clientWidth : 1;
+      event.deltaMode === 1
+        ? 16
+        : event.deltaMode === 2
+          ? element.clientWidth
+          : 1;
     const nextScrollLeft = Math.min(
       maxScrollLeft,
       Math.max(0, element.scrollLeft + rawDelta * deltaUnit),
@@ -13816,7 +14856,10 @@ function MainTabBar({
     updateScrollState();
   }
 
-  function handleContextMenu(event: ReactMouseEvent<HTMLDivElement>, tab: MainTabSummary) {
+  function handleContextMenu(
+    event: ReactMouseEvent<HTMLDivElement>,
+    tab: MainTabSummary,
+  ) {
     event.preventDefault();
     event.stopPropagation();
     setContextMenu({
@@ -13837,8 +14880,13 @@ function MainTabBar({
     onCloseTabs(scope, tab);
   }
 
-  function hasClosableTabs(scope: MainTabCloseScope, anchorTab: MainTabSummary) {
-    const anchorIndex = tabs.findIndex((tab) => mainTabKey(tab) === mainTabKey(anchorTab));
+  function hasClosableTabs(
+    scope: MainTabCloseScope,
+    anchorTab: MainTabSummary,
+  ) {
+    const anchorIndex = tabs.findIndex(
+      (tab) => mainTabKey(tab) === mainTabKey(anchorTab),
+    );
     if (anchorIndex < 0) {
       return false;
     }
@@ -13902,140 +14950,159 @@ function MainTabBar({
         className="chat-tabs flex min-w-0 flex-1 flex-nowrap overflow-hidden"
         ref={tabsContainerRef}
       >
-      {scrollState.hasOverflow ? (
-        <button
-          aria-label={t("Scroll chat tabs left")}
-          className="chat-tab-scroll-button"
-          disabled={!scrollState.canScrollLeft}
-          onClick={() => scrollTabs(-1)}
-          title={t("Scroll chat tabs left")}
-          type="button"
+        {scrollState.hasOverflow ? (
+          <button
+            aria-label={t("Scroll chat tabs left")}
+            className="chat-tab-scroll-button"
+            disabled={!scrollState.canScrollLeft}
+            onClick={() => scrollTabs(-1)}
+            title={t("Scroll chat tabs left")}
+            type="button"
+          >
+            <ChevronLeft aria-hidden="true" className="size-4" />
+          </button>
+        ) : null}
+        <div
+          aria-label={t("Chat")}
+          className="chat-tab-list panel-scroll flex min-w-0 flex-1 gap-1 overflow-x-auto"
+          onScroll={handleTabListScroll}
+          onWheel={handleWheel}
+          ref={tabListRef}
+          role="tablist"
         >
-          <ChevronLeft aria-hidden="true" className="size-4" />
-        </button>
-      ) : null}
-      <div
-        aria-label={t("Chat")}
-        className="chat-tab-list panel-scroll flex min-w-0 flex-1 gap-1 overflow-x-auto"
-        onScroll={handleTabListScroll}
-        onWheel={handleWheel}
-        ref={tabListRef}
-        role="tablist"
-      >
-        {tabs.length ? (
-          tabs.map((tab) => {
-            const isActive = mainTabMatches(activeTab, tab);
-            const isRunning =
-              tab.type === "chat"
-                ? chatSessionStatusFor(chatRunKey(tab.workspaceId, tab.chatId)).kind ===
-                  "running"
-                : tab.type === "agent"
-                  ? agentInstanceIsRunning(tab.workspaceId, tab.chatId, tab.instanceId)
-                  : false;
-            const title =
-              tab.type === "htmlPreview"
-                ? t("{name} · Preview", { name: tab.name })
-                : tab.title ||
-                  t(
-                    tab.type === "chat"
-                      ? "Chat"
-                      : tab.type === "agent"
-                        ? "Agent"
-                        : "Files",
-                  );
-            const key = mainTabKey(tab);
+          {tabs.length ? (
+            tabs.map((tab) => {
+              const isActive = mainTabMatches(activeTab, tab);
+              const isRunning =
+                tab.type === "chat"
+                  ? chatSessionStatusFor(
+                      chatRunKey(tab.workspaceId, tab.chatId),
+                    ).kind === "running"
+                  : tab.type === "agent"
+                    ? agentInstanceIsRunning(
+                        tab.workspaceId,
+                        tab.chatId,
+                        tab.instanceId,
+                      )
+                    : false;
+              const title =
+                tab.type === "htmlPreview"
+                  ? t("{name} · Preview", { name: tab.name })
+                  : tab.title ||
+                    t(
+                      tab.type === "chat"
+                        ? "Chat"
+                        : tab.type === "agent"
+                          ? "Agent"
+                          : "Files",
+                    );
+              const key = mainTabKey(tab);
 
-            return (
-              <div
-                className={`chat-tab-item group flex h-12 min-w-36 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${isActive
-                    ? "border-teal-200 bg-white text-stone-950 shadow-sm"
-                    : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
+              return (
+                <div
+                  className={`chat-tab-item group flex h-12 min-w-36 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
+                    isActive
+                      ? "border-teal-200 bg-white text-stone-950 shadow-sm"
+                      : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
                   }`}
-                key={key}
-                onContextMenu={(event) => handleContextMenu(event, tab)}
-                ref={(element) => {
-                  if (element) {
-                    tabItemRefs.current.set(key, element);
-                  } else {
-                    tabItemRefs.current.delete(key);
-                  }
-                }}
-              >
-                <button
-                  aria-selected={isActive}
-                  className="min-w-0 flex-1 text-left"
-                  onClick={() => onSelectTab(tab)}
-                  role="tab"
-                  title={title}
-                  type="button"
+                  key={key}
+                  onContextMenu={(event) => handleContextMenu(event, tab)}
+                  ref={(element) => {
+                    if (element) {
+                      tabItemRefs.current.set(key, element);
+                    } else {
+                      tabItemRefs.current.delete(key);
+                    }
+                  }}
                 >
-                  <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold leading-5">
-                    {tab.type === "file" ? (
-                      <FileText aria-hidden="true" className="size-3.5 shrink-0 text-slate-500" />
-                    ) : null}
-                    {tab.type === "htmlPreview" ? (
-                      <AppWindow aria-hidden="true" className="size-3.5 shrink-0 text-sky-600" />
-                    ) : null}
-                    {tab.type === "agent" ? (
-                      <Bot aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-                    ) : null}
-                    {isRunning ? (
-                      <span
-                        aria-label={t(
-                          tab.type === "agent" ? "Agent is running" : "Chat is running",
-                        )}
-                        className="inline-flex shrink-0"
-                        role="status"
-                      >
-                        <LoaderCircle
-                          aria-hidden="true"
-                          className="chat-tab-running-spinner size-3.5 animate-spin text-teal-700"
-                        />
-                      </span>
-                    ) : null}
-                    <span className="min-w-0 truncate">{title}</span>
-                  </span>
-                  <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
-                    <WorkspaceIcon
-                      className="size-3 shrink-0 rounded-sm object-cover"
-                      fallbackClassName="size-3 shrink-0"
-                      logoUrl={tab.workspaceLogoUrl}
-                    />
-                    <span className="min-w-0 truncate">{tab.workspaceName}</span>
-                  </span>
-                </button>
-                <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
                   <button
-                    aria-label={t("Close chat tab {title}", { title })}
-                    className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
-                    onClick={() => onCloseTab(tab)}
-                    title={t("Close")}
+                    aria-selected={isActive}
+                    className="min-w-0 flex-1 text-left"
+                    onClick={() => onSelectTab(tab)}
+                    role="tab"
+                    title={title}
                     type="button"
                   >
-                    <X aria-hidden="true" className="size-3.5" />
+                    <span className="flex min-w-0 items-center gap-1.5 truncate text-sm font-semibold leading-5">
+                      {tab.type === "file" ? (
+                        <FileText
+                          aria-hidden="true"
+                          className="size-3.5 shrink-0 text-slate-500"
+                        />
+                      ) : null}
+                      {tab.type === "htmlPreview" ? (
+                        <AppWindow
+                          aria-hidden="true"
+                          className="size-3.5 shrink-0 text-sky-600"
+                        />
+                      ) : null}
+                      {tab.type === "agent" ? (
+                        <Bot
+                          aria-hidden="true"
+                          className="size-3.5 shrink-0 text-teal-700"
+                        />
+                      ) : null}
+                      {isRunning ? (
+                        <span
+                          aria-label={t(
+                            tab.type === "agent"
+                              ? "Agent is running"
+                              : "Chat is running",
+                          )}
+                          className="inline-flex shrink-0"
+                          role="status"
+                        >
+                          <LoaderCircle
+                            aria-hidden="true"
+                            className="chat-tab-running-spinner size-3.5 animate-spin text-teal-700"
+                          />
+                        </span>
+                      ) : null}
+                      <span className="min-w-0 truncate">{title}</span>
+                    </span>
+                    <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
+                      <WorkspaceIcon
+                        className="size-3 shrink-0 rounded-sm object-cover"
+                        fallbackClassName="size-3 shrink-0"
+                        logoUrl={tab.workspaceLogoUrl}
+                      />
+                      <span className="min-w-0 truncate">
+                        {tab.workspaceName}
+                      </span>
+                    </span>
                   </button>
-                </span>
-              </div>
-            );
-          })
-        ) : (
-          <div className="flex h-12 min-w-0 items-center rounded-lg border border-dashed border-stone-300 bg-white/55 px-3 text-sm font-medium text-stone-500">
-            {t("No open chats")}
-          </div>
-        )}
-      </div>
-      {scrollState.hasOverflow ? (
-        <button
-          aria-label={t("Scroll chat tabs right")}
-          className="chat-tab-scroll-button"
-          disabled={!scrollState.canScrollRight}
-          onClick={() => scrollTabs(1)}
-          title={t("Scroll chat tabs right")}
-          type="button"
-        >
-          <ChevronRight aria-hidden="true" className="size-4" />
-        </button>
-      ) : null}
+                  <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
+                    <button
+                      aria-label={t("Close chat tab {title}", { title })}
+                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
+                      onClick={() => onCloseTab(tab)}
+                      title={t("Close")}
+                      type="button"
+                    >
+                      <X aria-hidden="true" className="size-3.5" />
+                    </button>
+                  </span>
+                </div>
+              );
+            })
+          ) : (
+            <div className="flex h-12 min-w-0 items-center rounded-lg border border-dashed border-stone-300 bg-white/55 px-3 text-sm font-medium text-stone-500">
+              {t("No open chats")}
+            </div>
+          )}
+        </div>
+        {scrollState.hasOverflow ? (
+          <button
+            aria-label={t("Scroll chat tabs right")}
+            className="chat-tab-scroll-button"
+            disabled={!scrollState.canScrollRight}
+            onClick={() => scrollTabs(1)}
+            title={t("Scroll chat tabs right")}
+            type="button"
+          >
+            <ChevronRight aria-hidden="true" className="size-4" />
+          </button>
+        ) : null}
       </div>
       {contextMenuElement && typeof document !== "undefined"
         ? createPortal(contextMenuElement, document.body)
@@ -14047,7 +15114,10 @@ function MainTabBar({
 type NavRailAction = {
   active: boolean;
   disabled?: boolean;
-  icon: (props: { className?: string; "aria-hidden"?: boolean | "true" | "false" }) => ReactNode;
+  icon: (props: {
+    className?: string;
+    "aria-hidden"?: boolean | "true" | "false";
+  }) => ReactNode;
   label: string;
   onClick: () => void;
 };
@@ -14225,7 +15295,11 @@ function workspaceConnectionDotClass(status: string) {
   if (normalized === "connected" || normalized === "ready") {
     return "bg-emerald-500";
   }
-  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
+  if (
+    normalized === "checking" ||
+    normalized === "connecting" ||
+    normalized === "reconnecting"
+  ) {
     return "bg-amber-500";
   }
   if (normalized === "failed" || normalized === "failedauth") {
@@ -14245,8 +15319,6 @@ function PanelLoadingFallback() {
   );
 }
 
-
-
 function FocoLogoMark() {
   return (
     <span
@@ -14261,7 +15333,9 @@ function hydrateChatTab(
   tab: OpenChatTab,
   workspaces: WorkspaceSummary[],
 ): ChatTabSummary {
-  const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
+  const workspace = workspaces.find(
+    (workspace) => workspace.id === tab.workspaceId,
+  );
   const chat = workspace?.chats.find((chat) => chat.id === tab.chatId);
 
   return {
@@ -14280,7 +15354,9 @@ function hydrateAgentTab(
   workspaceName: string;
   workspaceLogoUrl: string | null;
 } {
-  const workspace = workspaces.find((workspace) => workspace.id === tab.workspaceId);
+  const workspace = workspaces.find(
+    (workspace) => workspace.id === tab.workspaceId,
+  );
 
   return {
     ...tab,
@@ -14294,7 +15370,8 @@ function upsertOpenChatTab(tabs: OpenChatTab[], nextTab: OpenChatTab) {
   if (
     tabs.some(
       (tab) =>
-        tab.workspaceId === nextTab.workspaceId && tab.chatId === nextTab.chatId,
+        tab.workspaceId === nextTab.workspaceId &&
+        tab.chatId === nextTab.chatId,
     )
   ) {
     return tabs;
@@ -14350,14 +15427,18 @@ function browserRouteWithOpenChatTabs(
   return { ...route, tabs: dedupeBrowserRouteChatTabs(routeTabs) };
 }
 
-function openChatTabsToBrowserRouteTabs(tabs: OpenChatTab[]): BrowserRouteChatTab[] {
+function openChatTabsToBrowserRouteTabs(
+  tabs: OpenChatTab[],
+): BrowserRouteChatTab[] {
   return tabs.map((tab) => ({
     chatId: tab.chatId,
     workspaceId: tab.workspaceId,
   }));
 }
 
-function openFileTabsToBrowserRouteFileTabs(tabs: OpenFileTab[]): BrowserRouteFileTab[] {
+function openFileTabsToBrowserRouteFileTabs(
+  tabs: OpenFileTab[],
+): BrowserRouteFileTab[] {
   return tabs.map((tab) => ({
     path: tab.path,
     workspaceId: tab.workspaceId,
@@ -14465,7 +15546,8 @@ function upsertOpenAgentTab(tabs: OpenAgentTab[], nextTab: OpenAgentTab) {
 function upsertOpenFileTab(tabs: OpenFileTab[], nextTab: OpenFileTab) {
   if (
     tabs.some(
-      (tab) => tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
+      (tab) =>
+        tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
     )
   ) {
     return tabs;
@@ -14480,7 +15562,8 @@ function upsertOpenHtmlPreviewTab(
 ) {
   if (
     tabs.some(
-      (tab) => tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
+      (tab) =>
+        tab.workspaceId === nextTab.workspaceId && tab.path === nextTab.path,
     )
   ) {
     return tabs;
@@ -14506,7 +15589,10 @@ function mainTabKey(tab: MainTabSummary) {
 }
 
 function mainTabMatches(activeTab: ActiveMainTab, tab: MainTabSummary) {
-  if (activeTab.type !== tab.type || activeTab.workspaceId !== tab.workspaceId) {
+  if (
+    activeTab.type !== tab.type ||
+    activeTab.workspaceId !== tab.workspaceId
+  ) {
     return false;
   }
 
@@ -14650,10 +15736,10 @@ function LoginView({
         <div className="flex items-center gap-3">
           <FocoLogoMark />
           <div className="min-w-0">
-            <h1 className="foco-display text-2xl leading-none text-stone-950">Foco</h1>
-            <p className="foco-eyebrow mt-1.5">
-              {t("Password required")}
-            </p>
+            <h1 className="foco-display text-2xl leading-none text-stone-950">
+              Foco
+            </h1>
+            <p className="foco-eyebrow mt-1.5">{t("Password required")}</p>
           </div>
         </div>
         <label className="mt-5 block">
@@ -14721,16 +15807,24 @@ function mergeToolCallUpdate(
 
   return {
     ...normalizedToolCall,
-    status: keepExistingOutcome ? currentToolCall.status : normalizedToolCall.status,
-    output: keepExistingOutcome ? currentToolCall.output : normalizedToolCall.output,
-    isError: keepExistingOutcome ? currentToolCall.isError : normalizedToolCall.isError,
+    status: keepExistingOutcome
+      ? currentToolCall.status
+      : normalizedToolCall.status,
+    output: keepExistingOutcome
+      ? currentToolCall.output
+      : normalizedToolCall.output,
+    isError: keepExistingOutcome
+      ? currentToolCall.isError
+      : normalizedToolCall.isError,
     startedAt: normalizedToolCall.startedAt ?? currentToolCall.startedAt,
     completedAt: keepExistingOutcome
       ? currentToolCall.completedAt
-      : normalizedToolCall.completedAt ?? currentToolCall.completedAt,
+      : (normalizedToolCall.completedAt ?? currentToolCall.completedAt),
     liveOutput:
       normalizedToolCall.liveOutput ??
-      (normalizedToolCall.output === null ? currentToolCall.liveOutput : undefined),
+      (normalizedToolCall.output === null
+        ? currentToolCall.liveOutput
+        : undefined),
   };
 }
 
@@ -14745,14 +15839,14 @@ function applyToolResult(
   return toolCalls.map((toolCall) =>
     toolCall.id === toolCallId
       ? {
-        ...toolCall,
-        output,
-        isError,
-        status: isError ? "error" : "completed",
-        startedAt: startedAt ?? toolCall.startedAt ?? null,
-        completedAt: completedAt ?? toolCall.completedAt ?? null,
-        liveOutput: undefined,
-      }
+          ...toolCall,
+          output,
+          isError,
+          status: isError ? "error" : "completed",
+          startedAt: startedAt ?? toolCall.startedAt ?? null,
+          completedAt: completedAt ?? toolCall.completedAt ?? null,
+          liveOutput: undefined,
+        }
       : toolCall,
   );
 }
@@ -14766,9 +15860,9 @@ function applyToolOutputDelta(
   return toolCalls.map((toolCall) =>
     toolCall.id === toolCallId && toolCall.output === null
       ? {
-        ...toolCall,
-        liveOutput: appendToolLiveOutput(toolCall.liveOutput, stream, delta),
-      }
+          ...toolCall,
+          liveOutput: appendToolLiveOutput(toolCall.liveOutput, stream, delta),
+        }
       : toolCall,
   );
 }
@@ -14782,11 +15876,11 @@ function appendToolLiveOutput(
     stdout:
       stream === "stdout"
         ? `${liveOutput?.stdout ?? ""}${delta}`
-        : liveOutput?.stdout ?? "",
+        : (liveOutput?.stdout ?? ""),
     stderr:
       stream === "stderr"
         ? `${liveOutput?.stderr ?? ""}${delta}`
-        : liveOutput?.stderr ?? "",
+        : (liveOutput?.stderr ?? ""),
   };
 }
 
@@ -14802,7 +15896,9 @@ function addChatRunBadge(
   return { ...message, runBadges: [...runBadges, badge] };
 }
 
-function contextCompressionBadge(kind: ChatContextCompressionKind): ChatRunBadge {
+function contextCompressionBadge(
+  kind: ChatContextCompressionKind,
+): ChatRunBadge {
   if (kind === "llm") {
     return "contextCompressionLlm";
   }
@@ -14833,7 +15929,8 @@ function contextCompressionEventPart(
     ...(streamEvent.detail ?? {}),
     status: streamEvent.detail?.status ?? streamEvent.status,
     kind: streamEvent.detail?.kind ?? streamEvent.kind,
-    snapshotId: streamEvent.detail?.snapshotId ?? streamEvent.snapshotId ?? null,
+    snapshotId:
+      streamEvent.detail?.snapshotId ?? streamEvent.snapshotId ?? null,
   });
   return {
     type: "contextCompression",
@@ -14860,7 +15957,9 @@ function upsertContextCompressionPart(
     if (part.type !== "contextCompression") {
       return false;
     }
-    return part.id === nextPart.id || contextCompressionPartsMatch(part, nextPart);
+    return (
+      part.id === nextPart.id || contextCompressionPartsMatch(part, nextPart)
+    );
   });
 
   if (existingIndex === -1) {
@@ -14904,7 +16003,9 @@ function mergeContextCompressionPart(
     ...next.detail,
     snapshotId: next.detail.snapshotId ?? current.detail.snapshotId ?? null,
     originalTokenCount:
-      next.detail.originalTokenCount ?? current.detail.originalTokenCount ?? null,
+      next.detail.originalTokenCount ??
+      current.detail.originalTokenCount ??
+      null,
     summaryTokenCount:
       next.detail.summaryTokenCount ?? current.detail.summaryTokenCount ?? null,
     startedAt: next.detail.startedAt ?? current.detail.startedAt ?? null,
@@ -14951,7 +16052,9 @@ function emptyStreamingAttemptSnapshot(): StreamAttemptSnapshot {
   };
 }
 
-function streamingAttemptSnapshot(message: ShellMessage): StreamAttemptSnapshot {
+function streamingAttemptSnapshot(
+  message: ShellMessage,
+): StreamAttemptSnapshot {
   return {
     content: message.content,
     reasoning: message.reasoning,
@@ -14997,7 +16100,10 @@ function completedAssistantMessage(
 ): ShellMessage {
   let parts = message.parts;
   const nextReasoning = streamEvent.reasoning ?? null;
-  const reasoningDelta = missingFinalSuffix(message.reasoning ?? "", nextReasoning ?? "");
+  const reasoningDelta = missingFinalSuffix(
+    message.reasoning ?? "",
+    nextReasoning ?? "",
+  );
   if (reasoningDelta) {
     parts = appendReasoningPart(parts, reasoningDelta);
   }
@@ -15006,11 +16112,19 @@ function completedAssistantMessage(
       parts,
       streamEvent.reasoningDurationMs,
     );
-    parts = serverParts === parts
-      ? finishActiveReasoningPart(parts, activeReasoningStartedAtMs, completedAtMs)
-      : serverParts;
+    parts =
+      serverParts === parts
+        ? finishActiveReasoningPart(
+            parts,
+            activeReasoningStartedAtMs,
+            completedAtMs,
+          )
+        : serverParts;
   } else {
-    parts = finishReasoningPartWithDuration(parts, streamEvent.reasoningDurationMs);
+    parts = finishReasoningPartWithDuration(
+      parts,
+      streamEvent.reasoningDurationMs,
+    );
   }
   const textDelta = missingFinalSuffix(message.content, streamEvent.text);
   if (textDelta) {
@@ -15028,11 +16142,11 @@ function completedAssistantMessage(
     parts: parts.length
       ? parts
       : fallbackMessageParts({
-        ...message,
-        content: streamEvent.text,
-        reasoning: nextReasoning,
-        status: undefined,
-      }),
+          ...message,
+          content: streamEvent.text,
+          reasoning: nextReasoning,
+          status: undefined,
+        }),
   };
 }
 
@@ -15050,10 +16164,10 @@ function completedGuidanceAssistantMessage(
       );
       return serverParts === message.parts
         ? finishActiveReasoningPart(
-          message.parts,
-          activeReasoningStartedAtMs,
-          completedAtMs,
-        )
+            message.parts,
+            activeReasoningStartedAtMs,
+            completedAtMs,
+          )
         : serverParts;
     }
     return finishReasoningPartWithDuration(
@@ -15120,7 +16234,7 @@ function assistantMessageWithAppendedError(
     metrics: null,
     memoriesUsed: [],
     extractedMemories: [],
-        specUpdates: [],
+    specUpdates: [],
     status: hasVisibleContent ? undefined : "error",
   };
 }
@@ -15172,7 +16286,10 @@ function compactInlineText(value: string) {
   return value.replace(/\s+/g, " ").trim();
 }
 
-function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+function appendTextPart(
+  parts: ChatMessagePart[],
+  text: string,
+): ChatMessagePart[] {
   if (!text) {
     return parts;
   }
@@ -15191,7 +16308,10 @@ function appendTextPart(parts: ChatMessagePart[], text: string): ChatMessagePart
   ];
 }
 
-function appendErrorPart(parts: ChatMessagePart[], text: string): ChatMessagePart[] {
+function appendErrorPart(
+  parts: ChatMessagePart[],
+  text: string,
+): ChatMessagePart[] {
   if (!text) {
     return parts;
   }
@@ -15224,14 +16344,14 @@ function appendReasoningPart(
     return startedAtMs === undefined
       ? [...parts, { type: "reasoning", text }]
       : [
-        ...parts,
-        {
-          type: "reasoning",
-          text,
-          startedAtMs,
-          liveDurationMs: 0,
-        },
-      ];
+          ...parts,
+          {
+            type: "reasoning",
+            text,
+            startedAtMs,
+            liveDurationMs: 0,
+          },
+        ];
   }
 
   return [
@@ -15333,9 +16453,9 @@ function upsertToolCallPart(
   return parts.map((part, index) =>
     index === existingIndex && part.type === "toolCall"
       ? {
-        type: "toolCall",
-        toolCall: mergeToolCallUpdate(part.toolCall, normalizedToolCall),
-      }
+          type: "toolCall",
+          toolCall: mergeToolCallUpdate(part.toolCall, normalizedToolCall),
+        }
       : part,
   );
 }
@@ -15351,17 +16471,17 @@ function applyToolResultToParts(
   return parts.map((part) =>
     part.type === "toolCall" && part.toolCall.id === toolCallId
       ? ({
-        type: "toolCall",
-        toolCall: {
-          ...part.toolCall,
-          output,
-          isError,
-          status: isError ? "error" : "completed",
-          startedAt: startedAt ?? part.toolCall.startedAt ?? null,
-          completedAt: completedAt ?? part.toolCall.completedAt ?? null,
-          liveOutput: undefined,
-        },
-      } satisfies ChatMessagePart)
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            output,
+            isError,
+            status: isError ? "error" : "completed",
+            startedAt: startedAt ?? part.toolCall.startedAt ?? null,
+            completedAt: completedAt ?? part.toolCall.completedAt ?? null,
+            liveOutput: undefined,
+          },
+        } satisfies ChatMessagePart)
       : part,
   );
 }
@@ -15374,19 +16494,19 @@ function applyToolOutputDeltaToParts(
 ): ChatMessagePart[] {
   return parts.map((part) =>
     part.type === "toolCall" &&
-      part.toolCall.id === toolCallId &&
-      part.toolCall.output === null
+    part.toolCall.id === toolCallId &&
+    part.toolCall.output === null
       ? ({
-        type: "toolCall",
-        toolCall: {
-          ...part.toolCall,
-          liveOutput: appendToolLiveOutput(
-            part.toolCall.liveOutput,
-            stream,
-            delta,
-          ),
-        },
-      } satisfies ChatMessagePart)
+          type: "toolCall",
+          toolCall: {
+            ...part.toolCall,
+            liveOutput: appendToolLiveOutput(
+              part.toolCall.liveOutput,
+              stream,
+              delta,
+            ),
+          },
+        } satisfies ChatMessagePart)
       : part,
   );
 }
@@ -15493,7 +16613,9 @@ type ToolCallChangeStats = {
   linesRemoved: number;
 };
 
-function toolCallChangeStats(toolCall: ChatToolCallSummary): ToolCallChangeStats | null {
+function toolCallChangeStats(
+  toolCall: ChatToolCallSummary,
+): ToolCallChangeStats | null {
   if (toolCall.name !== "edit_file" && toolCall.name !== "write_file") {
     return null;
   }
@@ -15502,7 +16624,11 @@ function toolCallChangeStats(toolCall: ChatToolCallSummary): ToolCallChangeStats
   }
 
   const linesAdded = numericField(toolCall.output, "linesAdded", "lines_added");
-  const linesRemoved = numericField(toolCall.output, "linesRemoved", "lines_removed");
+  const linesRemoved = numericField(
+    toolCall.output,
+    "linesRemoved",
+    "lines_removed",
+  );
   if (linesAdded === null || linesRemoved === null) {
     return null;
   }
@@ -15517,7 +16643,10 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
     return compactToolJson(input);
   }
 
-  if (toolCall.name === "get_command_output" || toolCall.name === "stop_command") {
+  if (
+    toolCall.name === "get_command_output" ||
+    toolCall.name === "stop_command"
+  ) {
     const processId = textField(input, "processId");
     if (processId) {
       return compactToolText(processId);
@@ -15531,7 +16660,9 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
 
     if (command) {
       const fullCommand = [command, ...args].map(formatCommandPart).join(" ");
-      return compactToolText(cwd && cwd !== "." ? `${fullCommand} | cwd: ${cwd}` : fullCommand);
+      return compactToolText(
+        cwd && cwd !== "." ? `${fullCommand} | cwd: ${cwd}` : fullCommand,
+      );
     }
   }
 
@@ -15555,7 +16686,9 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
     numberTextField(input, "symbolId", "symbol_id"),
     numberTextField(input, "durationMs", "duration_ms"),
   ].filter(Boolean);
-  const pathIndex = parts.findIndex((part) => part === textField(input, "path"));
+  const pathIndex = parts.findIndex(
+    (part) => part === textField(input, "path"),
+  );
   const startLine = numberTextField(input, "startLine", "start_line");
   const endLine = numberTextField(input, "endLine", "end_line");
 
@@ -15563,7 +16696,9 @@ function toolCallDetailText(toolCall: ChatToolCallSummary) {
     parts[pathIndex] = `${parts[pathIndex]}:${startLine}-${endLine}`;
   }
 
-  return parts.length ? compactToolText(parts.join(" | ")) : compactToolJson(input);
+  return parts.length
+    ? compactToolText(parts.join(" | "))
+    : compactToolJson(input);
 }
 
 function normalizedToolInput(value: JsonValue): JsonValue {
@@ -15587,22 +16722,38 @@ function normalizedToolInput(value: JsonValue): JsonValue {
   return normalized;
 }
 
-function textField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+function textField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
   const field = fieldValue(value, camelName, snakeName);
   return typeof field === "string" ? field : null;
 }
 
-function numberTextField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+function numberTextField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
   const field = fieldValue(value, camelName, snakeName);
   return typeof field === "number" ? String(field) : null;
 }
 
-function numericField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+function numericField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
   const field = fieldValue(value, camelName, snakeName);
   return typeof field === "number" && Number.isFinite(field) ? field : null;
 }
 
-function stringArrayField(value: Record<string, unknown>, camelName: string, snakeName?: string) {
+function stringArrayField(
+  value: Record<string, unknown>,
+  camelName: string,
+  snakeName?: string,
+) {
   const field = fieldValue(value, camelName, snakeName);
 
   if (field === null || typeof field === "undefined") {
@@ -15619,7 +16770,9 @@ function formatCommandPart(value: string) {
     return '""';
   }
 
-  return /^[A-Za-z0-9_./:=@%+,\-\\]+$/.test(value) ? value : JSON.stringify(value);
+  return /^[A-Za-z0-9_./:=@%+,\-\\]+$/.test(value)
+    ? value
+    : JSON.stringify(value);
 }
 
 function compactToolJson(value: JsonValue) {
@@ -15628,7 +16781,9 @@ function compactToolJson(value: JsonValue) {
 
 function compactToolText(value: string) {
   const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+  return normalized.length > 240
+    ? `${normalized.slice(0, 237)}...`
+    : normalized;
 }
 
 function formatJsonValue(value: JsonValue) {
@@ -15703,14 +16858,17 @@ function withLiveChatStatistics(
   const codeChangeStats = live.codeChangeStats ?? emptyGitDiffLineStats();
   const liveLatencyMs = Math.max(0, Date.now() - live.startedAtMs);
   const base =
-    statistics ?? emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
+    statistics ??
+    emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
   const totalRequests = base.totalRequests + 1;
   const totalLatencyMs = base.totalLatencyMs + liveLatencyMs;
   const messageCount = messages.length || base.messageCount;
-  const userMessageCount = countMessagesByRole(messages, "user") || base.userMessageCount;
+  const userMessageCount =
+    countMessagesByRole(messages, "user") || base.userMessageCount;
   const assistantMessageCount =
     countMessagesByRole(messages, "assistant") || base.assistantMessageCount;
-  const toolMessageCount = countMessagesByRole(messages, "tool") || base.toolMessageCount;
+  const toolMessageCount =
+    countMessagesByRole(messages, "tool") || base.toolMessageCount;
 
   return {
     ...base,
@@ -15750,7 +16908,11 @@ function contextUsageWithLatestProviderUsage(
   latestProviderUsage: ChatUsage | null,
 ): ContextUsageResponse {
   const inputTokens = latestProviderUsage?.inputTokens;
-  if (typeof inputTokens !== "number" || inputTokens < 0 || usage.contextWindow <= 0) {
+  if (
+    typeof inputTokens !== "number" ||
+    inputTokens < 0 ||
+    usage.contextWindow <= 0
+  ) {
     return usage;
   }
 
@@ -15778,7 +16940,12 @@ function contextUsageSegmentsForProviderInput(
     segments.compressionSnapshot +
     segments.history;
   let tokensToRemove = Math.max(0, estimatedTokens - inputTokens);
-  for (const key of ["history", "compressionSnapshot", "toolSchema", "systemPrompt"] as const) {
+  for (const key of [
+    "history",
+    "compressionSnapshot",
+    "toolSchema",
+    "systemPrompt",
+  ] as const) {
     if (tokensToRemove <= 0) {
       break;
     }
@@ -15837,7 +17004,11 @@ function normalizeChatStatistics(
   workspaceId: string,
   chatId: string,
 ): ChatStatisticsResponse {
-  const base = emptyChatStatistics(workspaceId, chatId, emptyAiStatisticsSummary());
+  const base = emptyChatStatistics(
+    workspaceId,
+    chatId,
+    emptyAiStatisticsSummary(),
+  );
   const codeChangeStats = isObjectRecord(payload?.codeChangeStats)
     ? (payload.codeChangeStats as Partial<GitDiffLineStats>)
     : {};
@@ -16004,11 +17175,10 @@ function liveToolBreakdown(messages: ShellMessage[]) {
     .map(([toolName, callCount]) => ({ toolName, callCount }))
     .sort(
       (left, right) =>
-        right.callCount - left.callCount || left.toolName.localeCompare(right.toolName),
+        right.callCount - left.callCount ||
+        left.toolName.localeCompare(right.toolName),
     );
 }
-
-
 
 function formatNullableNumber(
   value: number | null,
@@ -16088,8 +17258,6 @@ function formatTokensPerSecond(
   }).format(metrics.outputTokens / (metrics.totalLatencyMs / 1000));
 }
 
-
-
 function formatNumber(value: number, language: AppLanguageId = "en") {
   return new Intl.NumberFormat(language).format(value);
 }
@@ -16114,10 +17282,10 @@ function formatChatCreatedAt(value: string) {
     minute: "2-digit",
     month: "short",
     second: "2-digit",
-    year: date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
+    year:
+      date.getFullYear() === new Date().getFullYear() ? undefined : "numeric",
   }).format(date);
 }
-
 
 function chatRunKey(workspaceId: string, chatId: string) {
   return `${workspaceId}:${chatId}`;
@@ -16198,7 +17366,9 @@ function planPhaseRetryRefreshStillRunning(
   if (!plan) {
     return false;
   }
-  const phase = plan.phases.find((candidate) => candidate.id === target.phaseId);
+  const phase = plan.phases.find(
+    (candidate) => candidate.id === target.phaseId,
+  );
   return phase?.status === "running";
 }
 
@@ -16219,7 +17389,9 @@ function chatTitleForDraft(
 ) {
   const normalized = content.trim().replace(/\s+/g, " ");
   if (normalized) {
-    return normalized.length > 48 ? `${normalized.slice(0, 48)}...` : normalized;
+    return normalized.length > 48
+      ? `${normalized.slice(0, 48)}...`
+      : normalized;
   }
 
   return attachments.length === 1
@@ -16253,9 +17425,11 @@ function isStaleActiveRunError(message: string) {
 }
 
 function chatStreamIdleTimeoutMs() {
-  const configured = (globalThis as {
-    __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: unknown;
-  }).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
+  const configured = (
+    globalThis as {
+      __FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__?: unknown;
+    }
+  ).__FOCO_TEST_CHAT_STREAM_IDLE_TIMEOUT_MS__;
   return typeof configured === "number" && configured > 0
     ? configured
     : CHAT_STREAM_IDLE_TIMEOUT_MS;
@@ -16377,10 +17551,11 @@ function readSseFrames(
 
   for (const frame of frames) {
     const lines = frame.split("\n");
-    const id = lines
-      .filter((line) => line.startsWith("id:"))
-      .map((line) => line.slice(3).trimStart())
-      .at(-1) ?? null;
+    const id =
+      lines
+        .filter((line) => line.startsWith("id:"))
+        .map((line) => line.slice(3).trimStart())
+        .at(-1) ?? null;
     const data = lines
       .filter((line) => line.startsWith("data:"))
       .map((line) => line.slice(5).trimStart())
@@ -16425,7 +17600,11 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
 
   if (value.type === "start") {
     const chatId = stringField(value, "chatId", "chat_id");
-    const userMessageId = stringField(value, "userMessageId", "user_message_id");
+    const userMessageId = stringField(
+      value,
+      "userMessageId",
+      "user_message_id",
+    );
     const assistantMessageId = stringField(
       value,
       "assistantMessageId",
@@ -16469,7 +17648,9 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       return null;
     }
 
-    return message === undefined ? { type: "connecting" } : { type: "connecting", message };
+    return message === undefined
+      ? { type: "connecting" }
+      : { type: "connecting", message };
   }
 
   if (value.type === "textDelta" || value.type === "text_delta") {
@@ -16485,11 +17666,20 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "reasoning_duration_ms",
     );
 
-    if (assistantMessageId === null || delta === null || reasoningDurationMs === false) {
+    if (
+      assistantMessageId === null ||
+      delta === null ||
+      reasoningDurationMs === false
+    ) {
       return null;
     }
 
-    return { type: "textDelta", assistantMessageId, delta, reasoningDurationMs };
+    return {
+      type: "textDelta",
+      assistantMessageId,
+      delta,
+      reasoningDurationMs,
+    };
   }
 
   if (value.type === "reasoningDelta" || value.type === "reasoning_delta") {
@@ -16616,7 +17806,6 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     };
   }
 
-
   if (value.type === "usage") {
     const usage = parseChatUsage(value.usage);
 
@@ -16700,7 +17889,12 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       return null;
     }
 
-    return { type: "toolCall", assistantMessageId, reasoningDurationMs, toolCall };
+    return {
+      type: "toolCall",
+      assistantMessageId,
+      reasoningDurationMs,
+      toolCall,
+    };
   }
 
   if (value.type === "toolResult" || value.type === "tool_result") {
@@ -16712,8 +17906,16 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     const toolCallId = stringField(value, "toolCallId", "tool_call_id");
     const output = fieldValue(value, "output");
     const isError = fieldValue(value, "isError", "is_error");
-    const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
-    const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
+    const startedAt = optionalNullableStringField(
+      value,
+      "startedAt",
+      "started_at",
+    );
+    const completedAt = optionalNullableStringField(
+      value,
+      "completedAt",
+      "completed_at",
+    );
 
     if (
       !assistantMessageId ||
@@ -16752,10 +17954,7 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     return { type: "questionRequest", assistantMessageId, request };
   }
 
-  if (
-    value.type === "hookNotification" ||
-    value.type === "hook_notification"
-  ) {
+  if (value.type === "hookNotification" || value.type === "hook_notification") {
     const assistantMessageId = stringField(
       value,
       "assistantMessageId",
@@ -16772,10 +17971,7 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     return { type: "hookNotification", assistantMessageId, notification };
   }
 
-  if (
-    value.type === "guidanceApplied" ||
-    value.type === "guidance_applied"
-  ) {
+  if (value.type === "guidanceApplied" || value.type === "guidance_applied") {
     const id = stringField(value, "id");
     const content = stringField(value, "content");
     const partsValue = fieldValue(value, "parts");
@@ -16977,7 +18173,9 @@ function parseHookNotificationSummary(
   return { event, level, message };
 }
 
-function parseQuestionRequestSummary(value: unknown): QuestionRequestSummary | null {
+function parseQuestionRequestSummary(
+  value: unknown,
+): QuestionRequestSummary | null {
   if (!isObjectRecord(value)) {
     return null;
   }
@@ -17045,7 +18243,9 @@ function parseQuestionItemSummary(value: unknown): QuestionItemSummary | null {
   };
 }
 
-function parseQuestionOptionSummary(value: unknown): QuestionOptionSummary | null {
+function parseQuestionOptionSummary(
+  value: unknown,
+): QuestionOptionSummary | null {
   if (!isObjectRecord(value)) {
     return null;
   }
@@ -17102,10 +18302,26 @@ function parseContextCompressionDetail(
 
   const kind = parseContextCompressionKind(fieldValue(value, "kind"));
   const status = optionalStringField(value, "status");
-  const snapshotId = optionalNullableStringField(value, "snapshotId", "snapshot_id");
-  const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
-  const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
-  const providerId = optionalNullableStringField(value, "providerId", "provider_id");
+  const snapshotId = optionalNullableStringField(
+    value,
+    "snapshotId",
+    "snapshot_id",
+  );
+  const startedAt = optionalNullableStringField(
+    value,
+    "startedAt",
+    "started_at",
+  );
+  const completedAt = optionalNullableStringField(
+    value,
+    "completedAt",
+    "completed_at",
+  );
+  const providerId = optionalNullableStringField(
+    value,
+    "providerId",
+    "provider_id",
+  );
   const modelId = optionalNullableStringField(value, "modelId", "model_id");
   const originalTokenCount = optionalNumberField(
     value,
@@ -17156,8 +18372,16 @@ function parseChatToolCallSummary(value: unknown): ChatToolCallSummary | null {
   const input = fieldValue(value, "input");
   const output = fieldValue(value, "output");
   const isError = fieldValue(value, "isError", "is_error");
-  const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
-  const completedAt = optionalNullableStringField(value, "completedAt", "completed_at");
+  const startedAt = optionalNullableStringField(
+    value,
+    "startedAt",
+    "started_at",
+  );
+  const completedAt = optionalNullableStringField(
+    value,
+    "completedAt",
+    "completed_at",
+  );
 
   if (
     !id ||
@@ -17295,7 +18519,9 @@ function parseChatSpecUpdates(value: unknown): ChatSpecUpdateSummary[] | false {
     : (updates as ChatSpecUpdateSummary[]);
 }
 
-function parseChatSpecUpdateSummary(value: unknown): ChatSpecUpdateSummary | null {
+function parseChatSpecUpdateSummary(
+  value: unknown,
+): ChatSpecUpdateSummary | null {
   if (!isObjectRecord(value)) {
     return null;
   }
@@ -17367,7 +18593,7 @@ function streamingAssistantMessage(
     metrics: null,
     memoriesUsed,
     extractedMemories: [],
-        specUpdates: [],
+    specUpdates: [],
     runBadges: [],
   };
 }
@@ -17443,7 +18669,9 @@ function normalizeActiveChatRunSummary(
   };
 }
 
-function normalizeChatMessageStatus(value: unknown): "error" | "streaming" | undefined {
+function normalizeChatMessageStatus(
+  value: unknown,
+): "error" | "streaming" | undefined {
   if (value === "error" || value === "failed") {
     return "error";
   }
@@ -17486,34 +18714,62 @@ export function normalizeChatMessageSummary(
       ? message.pendingMode
       : undefined;
   const rawSessionMode = fieldValue(message, "sessionMode", "session_mode");
-  const sessionMode: "plan" | null =
-    rawSessionMode === "plan" ? "plan" : null;
+  const sessionMode: "plan" | null = rawSessionMode === "plan" ? "plan" : null;
   const status = normalizeChatMessageStatus(fieldValue(message, "status"));
   const queuedRun = normalizeQueuedMessageRunSummary(message.queuedRun);
   const runConfigValue = fieldValue(message, "runConfig", "run_config");
-  const runConfigRecord = runConfigValue && typeof runConfigValue === "object"
-    ? runConfigValue as Record<string, unknown>
-    : null;
+  const runConfigRecord =
+    runConfigValue && typeof runConfigValue === "object"
+      ? (runConfigValue as Record<string, unknown>)
+      : null;
   const runConfig = runConfigRecord
     ? {
-      modelId: String(fieldValue(runConfigRecord, "modelId", "model_id") ?? ""),
-      providerId: typeof fieldValue(runConfigRecord, "providerId", "provider_id") === "string"
-        ? String(fieldValue(runConfigRecord, "providerId", "provider_id"))
-        : null,
-      thinkingLevel: typeof fieldValue(runConfigRecord, "thinkingLevel", "thinking_level") === "string"
-        ? String(fieldValue(runConfigRecord, "thinkingLevel", "thinking_level"))
-        : null,
-      selectedSkillIds: Array.isArray(fieldValue(runConfigRecord, "selectedSkillIds", "selected_skill_ids"))
-        ? (fieldValue(runConfigRecord, "selectedSkillIds", "selected_skill_ids") as unknown[])
-          .filter((value): value is string => typeof value === "string")
-        : [],
-      sessionMode: fieldValue(runConfigRecord, "sessionMode", "session_mode") === "plan" ? "plan" as const : null,
-      teamModeEnabled: fieldValue(runConfigRecord, "teamModeEnabled", "team_mode_enabled") === true,
-    }
+        modelId: String(
+          fieldValue(runConfigRecord, "modelId", "model_id") ?? "",
+        ),
+        providerId:
+          typeof fieldValue(runConfigRecord, "providerId", "provider_id") ===
+          "string"
+            ? String(fieldValue(runConfigRecord, "providerId", "provider_id"))
+            : null,
+        thinkingLevel:
+          typeof fieldValue(
+            runConfigRecord,
+            "thinkingLevel",
+            "thinking_level",
+          ) === "string"
+            ? String(
+                fieldValue(runConfigRecord, "thinkingLevel", "thinking_level"),
+              )
+            : null,
+        latencyMode: latencyModeFromValue(
+          fieldValue(runConfigRecord, "latencyMode", "latency_mode"),
+        ),
+        selectedSkillIds: Array.isArray(
+          fieldValue(runConfigRecord, "selectedSkillIds", "selected_skill_ids"),
+        )
+          ? (
+              fieldValue(
+                runConfigRecord,
+                "selectedSkillIds",
+                "selected_skill_ids",
+              ) as unknown[]
+            ).filter((value): value is string => typeof value === "string")
+          : [],
+        sessionMode:
+          fieldValue(runConfigRecord, "sessionMode", "session_mode") === "plan"
+            ? ("plan" as const)
+            : null,
+        teamModeEnabled:
+          fieldValue(
+            runConfigRecord,
+            "teamModeEnabled",
+            "team_mode_enabled",
+          ) === true,
+      }
     : null;
   const statusFromParts =
-    !status &&
-    parts.some((part) => part.type === "error")
+    !status && parts.some((part) => part.type === "error")
       ? ("error" as const)
       : status;
   const normalizedMessage = {
@@ -17544,7 +18800,8 @@ function normalizeChatMessagesPagination(
   if (!value || typeof value !== "object") {
     return { hasMoreBefore: false, nextBeforeSequence: null };
   }
-  const hasMoreBefore = fieldValue(value, "hasMoreBefore", "has_more_before") === true;
+  const hasMoreBefore =
+    fieldValue(value, "hasMoreBefore", "has_more_before") === true;
   const nextBeforeSequence = fieldValue(
     value,
     "nextBeforeSequence",
@@ -17574,7 +18831,12 @@ function normalizeQueuedMessageRunSummary(
     return null;
   }
   const providerId = fieldValue(queuedRun, "providerId", "provider_id");
-  const thinkingLevel = fieldValue(queuedRun, "thinkingLevel", "thinking_level");
+  const thinkingLevel = fieldValue(
+    queuedRun,
+    "thinkingLevel",
+    "thinking_level",
+  );
+  const latencyMode = fieldValue(queuedRun, "latencyMode", "latency_mode");
   const skillIds = fieldValue(queuedRun, "skillIds", "skill_ids");
   const assistantMessageId = fieldValue(
     queuedRun,
@@ -17588,14 +18850,14 @@ function normalizeQueuedMessageRunSummary(
   );
   const status = fieldValue(queuedRun, "status");
   const rawSessionMode = fieldValue(queuedRun, "sessionMode", "session_mode");
-  const sessionMode: "plan" | null =
-    rawSessionMode === "plan" ? "plan" : null;
+  const sessionMode: "plan" | null = rawSessionMode === "plan" ? "plan" : null;
 
   return {
     status: typeof status === "string" ? status : "queued",
     modelId,
     providerId: typeof providerId === "string" ? providerId : null,
     thinkingLevel: typeof thinkingLevel === "string" ? thinkingLevel : null,
+    latencyMode: latencyModeFromValue(latencyMode),
     skillIds: normalizeStringArray(skillIds),
     assistantMessageId:
       typeof assistantMessageId === "string" ? assistantMessageId : null,
@@ -17626,7 +18888,11 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       return null;
     }
     const durationMs = fieldValue(part, "durationMs", "duration_ms");
-    const liveDurationMs = fieldValue(part, "liveDurationMs", "live_duration_ms");
+    const liveDurationMs = fieldValue(
+      part,
+      "liveDurationMs",
+      "live_duration_ms",
+    );
     const startedAtMs = fieldValue(part, "startedAtMs", "started_at_ms");
     return {
       type: "reasoning",
@@ -17651,7 +18917,10 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
     return toolCall ? { type: "toolCall", toolCall } : null;
   }
 
-  if (part.type === "contextCompression" || part.type === "context_compression") {
+  if (
+    part.type === "contextCompression" ||
+    part.type === "context_compression"
+  ) {
     const kind = parseContextCompressionKind(fieldValue(part, "kind"));
     const status = stringField(part, "status") ?? "completed";
     const detail = parseContextCompressionDetail(fieldValue(part, "detail"));
@@ -17663,7 +18932,9 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       status: detail?.status ?? status,
       kind: detail?.kind ?? kind,
     });
-    const id = stringField(part, "id") ?? contextCompressionPartId(kind, normalizedDetail);
+    const id =
+      stringField(part, "id") ??
+      contextCompressionPartId(kind, normalizedDetail);
     return {
       type: "contextCompression",
       id,
@@ -17695,9 +18966,7 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       id,
       content,
       ...(source ? { source } : {}),
-      ...(interruptedAssistantMetrics
-        ? { interruptedAssistantMetrics }
-        : {}),
+      ...(interruptedAssistantMetrics ? { interruptedAssistantMetrics } : {}),
     };
   }
 
@@ -17743,7 +19012,9 @@ function parseChatAttachmentPartSummary(
   };
 }
 
-function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | false {
+function parseNullableChatUsage(
+  value: unknown,
+): ChatUsage | null | undefined | false {
   if (value === null) {
     return null;
   }
@@ -17751,7 +19022,9 @@ function parseNullableChatUsage(value: unknown): ChatUsage | null | undefined | 
   return parseChatUsage(value);
 }
 
-function parseRequiredChatReplyMetrics(value: unknown): ChatReplyMetrics | false {
+function parseRequiredChatReplyMetrics(
+  value: unknown,
+): ChatReplyMetrics | false {
   const metrics = parseChatReplyMetrics(value);
 
   if (metrics === undefined || metrics === null) {
@@ -17831,7 +19104,11 @@ function parseChatUsage(value: unknown): ChatUsage | undefined | false {
 
   const inputTokens = fieldValue(value, "inputTokens", "input_tokens");
   const outputTokens = fieldValue(value, "outputTokens", "output_tokens");
-  const cacheReadTokens = fieldValue(value, "cacheReadTokens", "cache_read_tokens");
+  const cacheReadTokens = fieldValue(
+    value,
+    "cacheReadTokens",
+    "cache_read_tokens",
+  );
   const cacheWriteTokens = fieldValue(
     value,
     "cacheWriteTokens",
@@ -17869,7 +19146,9 @@ function optionalStringField(
   snakeName?: string,
 ) {
   const field = fieldValue(value, camelName, snakeName);
-  return typeof field === "undefined" || typeof field === "string" ? field : null;
+  return typeof field === "undefined" || typeof field === "string"
+    ? field
+    : null;
 }
 
 function optionalNullableStringField(

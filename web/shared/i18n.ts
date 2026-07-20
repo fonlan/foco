@@ -8,7 +8,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No translation model": "No translation model",
     "Import skill URL": "Import skill URL",
     "Paste a skill URL or command": "Paste a skill URL or command",
-    "Paste skills.sh, GitHub, or npx command": "Paste skills.sh, GitHub, or npx command",
+    "Paste skills.sh, GitHub, or npx command":
+      "Paste skills.sh, GitHub, or npx command",
     Preview: "Preview",
     Raw: "Raw",
     Compact: "Compact",
@@ -48,7 +49,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Compression snapshot": "Compression snapshot",
     "Runtime tool-state snapshots": "Tool history compression",
     "Only retryable Spec jobs": "Only retryable Spec jobs",
-    "Spec changed before this job could write": "Spec changed before this job could write",
+    "Spec changed before this job could write":
+      "Spec changed before this job could write",
     "Workspace Spec is disabled": "Workspace Spec is disabled",
     "No update needed": "No update needed",
     "Chat title": "Chat title",
@@ -95,9 +97,11 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete workspace": "Delete workspace",
     "Delete workspace {name}": "Delete workspace {name}",
     "Delete workspace?": "Delete workspace?",
-    "Delete workspace confirmation": "Remove {name} from Foco settings? This only removes the configuration and does not delete files on disk.",
+    "Delete workspace confirmation":
+      "Remove {name} from Foco settings? This only removes the configuration and does not delete files on disk.",
     "Confirm delete workspace": "Confirm delete workspace",
-    "Close workspace delete confirmation backdrop": "Close workspace delete confirmation backdrop",
+    "Close workspace delete confirmation backdrop":
+      "Close workspace delete confirmation backdrop",
     "Checking Sidecar version": "Checking Sidecar version",
     "Chat title generation model": "Chat title generation model",
     "Current chat model": "Current chat model",
@@ -122,14 +126,17 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Show hidden files": "Show hidden files",
     "Test model": "Test model",
     "Test model {name}": "Test model {name}",
-    "Model test succeeded for {name}: {message}": "Model test succeeded for {name}: {message}",
-    "Model test failed for {name}: {message}": "Model test failed for {name}: {message}",
+    "Model test succeeded for {name}: {message}":
+      "Model test succeeded for {name}: {message}",
+    "Model test failed for {name}: {message}":
+      "Model test failed for {name}: {message}",
     "Dismiss model test result": "Dismiss model test result",
     "Enable provider {name}": "Enable provider {name}",
     "Disable provider {name}": "Disable provider {name}",
     "Enable memory {fact}": "Enable memory {fact}",
     "Disable memory {fact}": "Disable memory {fact}",
-    "Memory enabled update returned no memory.": "Memory enabled update returned no memory.",
+    "Memory enabled update returned no memory.":
+      "Memory enabled update returned no memory.",
     "Delete provider {name}": "Delete provider {name}",
     "Unknown transport": "Unknown",
     "({transport})": "({transport})",
@@ -199,8 +206,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Copy relative path": "复制相对路径",
     "Copy absolute path": "复制绝对路径",
     Download: "下载",
-    "Delete this file or folder?\n\nPath: {path}": "确定要删除此文件或文件夹吗？\n\n路径：{path}",
-    "Select a workspace before using file actions.": "使用文件操作前请先选择工作区。",
+    "Delete this file or folder?\n\nPath: {path}":
+      "确定要删除此文件或文件夹吗？\n\n路径：{path}",
+    "Select a workspace before using file actions.":
+      "使用文件操作前请先选择工作区。",
     "Terminal shell": "终端 Shell",
     "Common commands": "常用命令",
     "Command name": "命令名",
@@ -218,7 +227,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete workspace": "删除工作区",
     "Delete workspace {name}": "删除工作区 {name}",
     "Delete workspace?": "删除工作区？",
-    "Delete workspace confirmation": "确定要删除工作区 {name} 吗？这只会移除配置，不会删除磁盘上的文件。",
+    "Delete workspace confirmation":
+      "确定要删除工作区 {name} 吗？这只会移除配置，不会删除磁盘上的文件。",
     "Cancel workspace deletion": "取消删除工作区",
     "Confirm delete workspace": "确认删除工作区",
     "Close workspace delete confirmation backdrop": "关闭工作区删除确认背景",
@@ -228,14 +238,17 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "All chats": "全部聊天",
     "Scheduled tasks": "定时任务",
     "Skill Store": "技能商店",
-    "Browse skills.sh hot skills from the last 24 hours": "浏览 skills.sh 最近 24 小时热门技能",
-    "Browse registry skills by total installs": "按总安装量浏览公共 registry 技能",
+    "Browse skills.sh hot skills from the last 24 hours":
+      "浏览 skills.sh 最近 24 小时热门技能",
+    "Browse registry skills by total installs":
+      "按总安装量浏览公共 registry 技能",
     "Refresh skills": "刷新技能",
     "Skill list": "技能列表",
     "Skill details": "技能详情",
     "Search skills": "搜索技能",
     "Import skill URL": "导入技能 URL",
-    "Paste skills.sh, GitHub, or npx command": "粘贴 skills.sh、GitHub 或 npx 命令",
+    "Paste skills.sh, GitHub, or npx command":
+      "粘贴 skills.sh、GitHub 或 npx 命令",
     "Paste a skill URL or command": "请粘贴技能 URL 或命令",
     Preview: "预览",
     Raw: "原始",
@@ -343,7 +356,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Auto running": "自动执行中",
     "Auto run waiting for plan readiness": "等待计划进入可执行状态",
     "Auto run paused until phase retry": "自动执行已暂停，等待重试失败阶段",
-    "Auto run paused until cancelled phase retry": "自动执行已暂停，等待重试已取消阶段",
+    "Auto run paused until cancelled phase retry":
+      "自动执行已暂停，等待重试已取消阶段",
     "Auto run paused until merge retry": "自动执行已暂停，等待重试合并",
     "Auto run paused after a scheduler error": "自动执行因调度错误暂停",
     "Audit plan worktrees": "审计计划 worktree",
@@ -351,7 +365,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Legacy worktrees": "遗留 worktree",
     "Refresh audit": "刷新审计",
     "No legacy worktrees found": "未发现遗留 worktree",
-    "Unmerged implemented plans need manual cherry-pick, merge, or rerun.": "未合并的已实现计划需要手动 cherry-pick、merge 或重新运行。",
+    "Unmerged implemented plans need manual cherry-pick, merge, or rerun.":
+      "未合并的已实现计划需要手动 cherry-pick、merge 或重新运行。",
     Base: "基线",
     Ref: "引用",
     unknown: "未知",
@@ -359,10 +374,13 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No implementation chat": "无实现会话",
     "No agent task": "无智能体任务",
     "Clean up worktree": "清理 worktree",
-    "Cleanup unavailable while plan or phase is running": "计划或阶段运行中时不可清理",
-    "Clean up plan worktree confirmation": "确定清理这个遗留 worktree 吗？\n\n提交：{commit}\n路径：{path}\n\n这会删除对应 worktree 和引用，不会修改共享工作区。",
+    "Cleanup unavailable while plan or phase is running":
+      "计划或阶段运行中时不可清理",
+    "Clean up plan worktree confirmation":
+      "确定清理这个遗留 worktree 吗？\n\n提交：{commit}\n路径：{path}\n\n这会删除对应 worktree 和引用，不会修改共享工作区。",
     "Delete plan": "删除计划",
-    "Delete plan confirmation": "确定要删除这个计划吗？这会同时删除它的阶段和步骤。",
+    "Delete plan confirmation":
+      "确定要删除这个计划吗？这会同时删除它的阶段和步骤。",
     "Open implementation chat": "打开实现会话",
     "Mark complete": "标记完成",
     "Retry phase": "重试阶段",
@@ -373,7 +391,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Retrying...": "正在重试...",
     "Retrying phase...": "正在重试阶段...",
     "Retry Merge": "重试合并",
-    "Clean the shared workspace, then retry merge": "先清理共享工作区，然后重试合并",
+    "Clean the shared workspace, then retry merge":
+      "先清理共享工作区，然后重试合并",
     Blocked: "阻塞",
     "Close retry dialog": "关闭重试弹窗",
     "Scope: this retry only": "作用域：仅本次重试",
@@ -496,7 +515,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Advanced: "高级",
     "Remote workspace icon": "远程工作区图标",
     "Select a remote server first.": "请先选择远程服务器。",
-    "Remote server name and host are required.": "需要填写远程服务器名称和主机。",
+    "Remote server name and host are required.":
+      "需要填写远程服务器名称和主机。",
     "Close workspace dialog": "关闭工作区弹窗",
     Close: "关闭",
     Name: "名称",
@@ -532,7 +552,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Save and regenerate": "保存并重新生成",
     "Editing this message will remove {count} later messages and regenerate the reply. Continue?":
       "编辑此消息将移除后续 {count} 条消息并重新生成回复。是否继续？",
-    "This message does not have a reusable model configuration.": "此消息没有可复用的模型配置。",
+    "This message does not have a reusable model configuration.":
+      "此消息没有可复用的模型配置。",
     "Edited message is no longer visible.": "要编辑的消息已不再可见。",
     "Copy code": "复制代码",
     "Copied code": "已复制代码",
@@ -551,6 +572,15 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Model: "模型",
     "No enabled models": "没有已启用模型",
     Thinking: "思考",
+    Fast: "快速",
+    "Fast mode": "快速模式",
+    "Fast mode enabled": "快速模式已开启",
+    "Enable Fast mode?": "开启快速模式？",
+    "Enable Fast": "开启快速模式",
+    "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.":
+      "快速模式会以更高费率请求更快处理，仅作用于当前会话，可随时关闭。",
+    "Fast mode is not available for the selected model.":
+      "当前所选模型不支持快速模式。",
     "Collapse thinking": "收起思考",
     "Expand thinking": "展开思考",
     "Thinking duration {duration}": "思考时长 {duration}",
@@ -567,8 +597,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Send guidance. Ctrl+click queues. {count} queued.":
       "发送引导。Ctrl+点击进入队列。已排队 {count} 条。",
     "Send to queue": "发送至队列",
-    "No active run is available for guidance.":
-      "当前没有可引导的运行。",
+    "No active run is available for guidance.": "当前没有可引导的运行。",
     "Guidance pending": "引导待生效",
     Queued: "队列中",
     Send: "发送",
@@ -600,7 +629,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Background process started, no output yet": "后台进程已启动，尚无输出",
     "Still running, no new output": "仍在运行，暂无新输出",
     "Process ended, no more output": "进程已结束，无更多输出",
-    "Earlier output was removed from the retained buffer.": "较早输出已从保留缓冲区移除。",
+    "Earlier output was removed from the retained buffer.":
+      "较早输出已从保留缓冲区移除。",
     "More output is available; continue with nextCursor {cursor}.":
       "仍有更多输出；请使用 nextCursor {cursor} 继续读取。",
     "Entire process tree terminated": "已终止完整进程树",
@@ -786,9 +816,12 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "HTTP status": "HTTP 状态",
     "HTTP version": "HTTP 版本",
     "Request detail is pending or was pruned.": "请求详情尚未就绪或已被清理。",
-    "Request detail was not captured or was pruned.": "请求详情未采集或已被清理。",
-    "Stored request detail is malformed or unsupported.": "已存储的请求详情格式无效或不支持。",
-    "Stored response detail is malformed or unsupported.": "已存储的响应详情格式无效或不支持。",
+    "Request detail was not captured or was pruned.":
+      "请求详情未采集或已被清理。",
+    "Stored request detail is malformed or unsupported.":
+      "已存储的请求详情格式无效或不支持。",
+    "Stored response detail is malformed or unsupported.":
+      "已存储的响应详情格式无效或不支持。",
     "Response head was not captured for this historical record.":
       "此历史记录未采集响应头。",
     "Waiting for the final provider response...": "正在等待供应商最终响应……",
@@ -804,7 +837,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Redo: "恢复",
     Find: "查找",
     "Reload file": "重新加载文件",
-    "Save changes before reloading this file?": "重新加载此文件前是否保存未保存的改动？",
+    "Save changes before reloading this file?":
+      "重新加载此文件前是否保存未保存的改动？",
     "Word wrap": "自动换行",
     "Preview markdown": "预览 Markdown",
     "Edit markdown": "编辑 Markdown",
@@ -980,7 +1014,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Open a chat to manage its Agent team.": "请打开聊天以管理其智能体团队。",
     "Current chat agent instances": "当前会话创建的智能体实例",
     "Open agent {name}": "打开智能体 {name}",
-    "Open a chat to view its Agent instances.": "请打开聊天以查看其智能体实例。",
+    "Open a chat to view its Agent instances.":
+      "请打开聊天以查看其智能体实例。",
     "Loading agent instances...": "正在加载智能体实例...",
     "Loading agent messages...": "正在加载智能体消息...",
     "No agent instances in this chat yet.": "当前会话暂无智能体实例。",
@@ -1105,8 +1140,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No Dream jobs": "暂无 Dream 任务",
     "Some remote Dream history is unavailable": "部分远程 Dream 历史暂不可用",
     "Remote workspace is not connected": "远程工作区未连接",
-    "Remote Dream history is temporarily unavailable": "远程 Dream 历史暂时不可用",
-    "Remote Dream history returned an invalid response": "远程 Dream 历史返回了无效响应",
+    "Remote Dream history is temporarily unavailable":
+      "远程 Dream 历史暂时不可用",
+    "Remote Dream history returned an invalid response":
+      "远程 Dream 历史返回了无效响应",
     Actions: "操作",
     Scope: "范围",
     Transcript: "记录",
@@ -1164,7 +1201,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Only retryable Spec jobs": "仅显示可重试记录",
     "Chat title": "会话标题",
     "Delete Spec job": "删除 Spec 任务",
-    "Delete Spec job confirmation": "确定删除这个失败的 Spec 任务吗？这只会移除历史记录。",
+    "Delete Spec job confirmation":
+      "确定删除这个失败的 Spec 任务吗？这只会移除历史记录。",
     "Spec changed before this job could write": "写入前 Spec 已变化",
     "Workspace Spec is disabled": "Workspace Spec 已禁用",
     "No update needed": "无需更新",
@@ -1183,11 +1221,13 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete memory": "删除记忆",
     "Enable memory {fact}": "启用记忆 {fact}",
     "Disable memory {fact}": "禁用记忆 {fact}",
-    "Memory enabled update returned no memory.": "更新记忆启用状态时未返回记忆。",
+    "Memory enabled update returned no memory.":
+      "更新记忆启用状态时未返回记忆。",
     "Delete memory confirmation": "确定要删除这条记忆吗？",
     "Clear filtered workspace memories": "清空当前筛选的工作区记忆",
     "Clear filtered chat memories": "清空当前筛选的会话记忆",
-    "Clear filtered memories confirmation": "确定要清空当前筛选范围内的记忆吗？",
+    "Clear filtered memories confirmation":
+      "确定要清空当前筛选范围内的记忆吗？",
     "Memory pagination": "记忆分页",
     "Dream history pagination": "Dream 历史分页",
     "Memory scope": "记忆范围",
@@ -1208,7 +1248,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Constraint: "约束",
     Episode: "片段",
     Automatic: "自动",
-    "Manual": "手动",
+    Manual: "手动",
     Disabled: "已禁用",
     "Workspace memory": "工作区记忆",
     "Chat memory": "会话记忆",
@@ -1217,7 +1257,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Memory fact": "记忆事实",
     "Memory kind": "记忆类型",
     "Pinned memory": "置顶记忆",
-    "Confidence": "置信度",
+    Confidence: "置信度",
     "Memory metadata": "记忆元数据",
     "Memory details": "记忆详情",
     "Memory source details": "记忆来源详情",
@@ -1274,8 +1314,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Log out": "退出登录",
     "Password is enabled": "已启用密码",
     "Password is disabled": "未启用密码",
-    "New password is kept empty unless changed.":
-      "不填写则保留当前密码。",
+    "New password is kept empty unless changed.": "不填写则保留当前密码。",
     "Saved password cannot be revealed; type a new password to preview it.":
       "已保存的密码无法显示；输入新密码后可预览它。",
     "Set a password to require browser login.":
@@ -1385,15 +1424,15 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Global hooks": "全局钩子",
     "Workspace hooks": "工作区钩子",
     Event: "事件",
-    "Matcher": "匹配器",
+    Matcher: "匹配器",
     "Enable hook": "启用钩子",
     "Handler type": "处理器类型",
     HTTP: "HTTP",
     "MCP tool": "MCP 工具",
     "If filter": "if 过滤器",
-    "Shell": "Shell",
+    Shell: "Shell",
     "Timeout ms": "超时 ms",
-    "Async": "异步",
+    Async: "异步",
     "Async re-wake": "异步唤醒",
     "Status message": "状态消息",
     "Input override JSON": "输入覆盖 JSON",
@@ -1440,7 +1479,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "钩子询问是否允许工具 '{toolName}'：{reason}",
     "Return a JSON hook result.": "返回 JSON 格式的钩子结果。",
     "Select a workspace first.": "请先选择工作区。",
-    "Prompt": "提示词",
+    Prompt: "提示词",
     "MCP server id": "MCP 服务 ID",
     "MCP tool name": "MCP 工具名",
     "rules {count}": "规则 {count}",
@@ -1566,7 +1605,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "SSH password": "SSH 密码",
     "Leave empty to keep saved password": "留空以保留已保存密码",
     "Required for password auth": "密码认证必填",
-    "Password is required for password authentication": "使用密码认证时必须填写密码",
+    "Password is required for password authentication":
+      "使用密码认证时必须填写密码",
     "Identity file": "私钥文件",
     "Select private key file": "选择私钥文件",
     "Browse for private key": "浏览选择私钥",
@@ -1646,8 +1686,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete model": "删除模型",
     "Test model": "测试模型",
     "Test model {name}": "测试模型 {name}",
-    "Model test succeeded for {name}: {message}": "模型 {name} 测试成功：{message}",
-    "Model test failed for {name}: {message}": "模型 {name} 测试失败：{message}",
+    "Model test succeeded for {name}: {message}":
+      "模型 {name} 测试成功：{message}",
+    "Model test failed for {name}: {message}":
+      "模型 {name} 测试失败：{message}",
     "Dismiss model test result": "关闭模型测试结果",
     "Enable model {name}": "启用模型 {name}",
     "Disable model {name}": "停用模型 {name}",

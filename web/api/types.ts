@@ -223,11 +223,7 @@ export type PlanStatus =
   | "cancelled";
 
 export type PlanStepStatus =
-  | "pending"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
+  "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export type PlanStep = {
   id: string;
@@ -364,12 +360,7 @@ export type PlanWorktreeCleanupResponse = {
 // JSON types
 
 export type JsonValue =
-  | boolean
-  | null
-  | number
-  | string
-  | JsonValue[]
-  | { [key: string]: JsonValue };
+  boolean | null | number | string | JsonValue[] | { [key: string]: JsonValue };
 
 // Chat types
 
@@ -381,6 +372,7 @@ export type QueuedRunSummary = {
   modelId?: string | null;
   providerId: string | null;
   thinkingLevel: string | null;
+  latencyMode?: LatencyMode | null;
   skillIds: string[];
   sessionMode?: "plan" | null;
   content?: string | null;
@@ -573,6 +565,7 @@ export type QueuedMessageRunSummary = {
   modelId: string;
   providerId: string | null;
   thinkingLevel: string | null;
+  latencyMode?: LatencyMode | null;
   skillIds: string[];
   sessionMode?: "plan" | null;
   assistantMessageId: string | null;
@@ -589,6 +582,7 @@ export type ChatMessageRunConfigSummary = {
   modelId: string;
   providerId: string | null;
   thinkingLevel: string | null;
+  latencyMode?: LatencyMode | null;
   selectedSkillIds: string[];
   sessionMode?: "plan" | null;
   teamModeEnabled: boolean;
@@ -698,131 +692,136 @@ export type HookNotificationSummary = {
 
 export type ChatStreamEvent =
   | {
-    type: "start";
-    chatId: string;
-    userMessageId: string;
-    assistantMessageId: string;
-    // Backend active-run registry id. This stays stable across provider retries and tool follow-ups.
-    runId?: string;
-    // Legacy logical-run id for local streams. Never use per-attempt ids from streamAttemptStart.
-    llmRequestId?: string;
-    memoriesUsed: ChatMemoryUsedSummary[];
-  }
+      type: "start";
+      chatId: string;
+      userMessageId: string;
+      assistantMessageId: string;
+      // Backend active-run registry id. This stays stable across provider retries and tool follow-ups.
+      runId?: string;
+      // Legacy logical-run id for local streams. Never use per-attempt ids from streamAttemptStart.
+      llmRequestId?: string;
+      memoriesUsed: ChatMemoryUsedSummary[];
+    }
   | { type: "connecting"; message?: string }
-  | { type: "textDelta"; assistantMessageId?: string; delta: string; reasoningDurationMs?: number | null }
+  | {
+      type: "textDelta";
+      assistantMessageId?: string;
+      delta: string;
+      reasoningDurationMs?: number | null;
+    }
   | { type: "reasoningDelta"; assistantMessageId?: string; delta: string }
   | {
-    type: "streamAttemptStart";
-    assistantMessageId: string;
-    llmRequestId: string;
-  }
+      type: "streamAttemptStart";
+      assistantMessageId: string;
+      llmRequestId: string;
+    }
   | {
-    type: "streamReset";
-    assistantMessageId: string;
-    reason: string;
-    text: string;
-    reasoning: string | null;
-    toolCalls: ChatToolCallSummary[];
-  }
+      type: "streamReset";
+      assistantMessageId: string;
+      reason: string;
+      text: string;
+      reasoning: string | null;
+      toolCalls: ChatToolCallSummary[];
+    }
   | {
-    type: "contextCompression";
-    assistantMessageId: string;
-    snapshotId?: string;
-    kind: ChatContextCompressionKind;
-    status: string;
-    detail?: ChatContextCompressionDetail | null;
-  }
+      type: "contextCompression";
+      assistantMessageId: string;
+      snapshotId?: string;
+      kind: ChatContextCompressionKind;
+      status: string;
+      detail?: ChatContextCompressionDetail | null;
+    }
   | { type: "usage"; usage?: ChatUsage }
   | {
-    type: "complete";
-    chatId: string;
-    assistantMessageId: string;
-    text: string;
-    reasoning?: string | null;
-    reasoningDurationMs?: number | null;
-    usage?: ChatUsage | null;
-    stopReason?: string | null;
-    metrics: ChatReplyMetrics;
-    memoriesUsed: ChatMemoryUsedSummary[];
-  }
+      type: "complete";
+      chatId: string;
+      assistantMessageId: string;
+      text: string;
+      reasoning?: string | null;
+      reasoningDurationMs?: number | null;
+      usage?: ChatUsage | null;
+      stopReason?: string | null;
+      metrics: ChatReplyMetrics;
+      memoriesUsed: ChatMemoryUsedSummary[];
+    }
   | { type: "streamEnd" }
   | {
-    type: "toolCall";
-    assistantMessageId: string;
-    reasoningDurationMs?: number | null;
-    toolCall: ChatToolCallSummary;
-  }
+      type: "toolCall";
+      assistantMessageId: string;
+      reasoningDurationMs?: number | null;
+      toolCall: ChatToolCallSummary;
+    }
   | {
-    type: "toolResult";
-    assistantMessageId: string;
-    toolCallId: string;
-    output: JsonValue;
-    isError: boolean;
-    startedAt?: string | null;
-    completedAt?: string | null;
-  }
+      type: "toolResult";
+      assistantMessageId: string;
+      toolCallId: string;
+      output: JsonValue;
+      isError: boolean;
+      startedAt?: string | null;
+      completedAt?: string | null;
+    }
   | {
-    type: "toolOutputDelta";
-    assistantMessageId: string;
-    toolCallId: string;
-    stream: "stdout" | "stderr";
-    delta: string;
-  }
+      type: "toolOutputDelta";
+      assistantMessageId: string;
+      toolCallId: string;
+      stream: "stdout" | "stderr";
+      delta: string;
+    }
   | {
-    type: "questionRequest";
-    assistantMessageId: string;
-    request: QuestionRequestSummary;
-  }
+      type: "questionRequest";
+      assistantMessageId: string;
+      request: QuestionRequestSummary;
+    }
   | {
-    type: "hookNotification";
-    assistantMessageId: string;
-    notification: HookNotificationSummary;
-  }
+      type: "hookNotification";
+      assistantMessageId: string;
+      notification: HookNotificationSummary;
+    }
   | {
-    type: "guidanceApplied";
-    id: string;
-    content: string;
-    parts: ChatMessagePart[];
-    interruptedAssistantMetrics: ChatReplyMetrics | null;
-    source?: string;
-    interruptedAssistantId?: string | null;
-  }
+      type: "guidanceApplied";
+      id: string;
+      content: string;
+      parts: ChatMessagePart[];
+      interruptedAssistantMetrics: ChatReplyMetrics | null;
+      source?: string;
+      interruptedAssistantId?: string | null;
+    }
   | {
-    type: "gitDiffRefresh";
-    workspaceId: string;
-    codeChangeStats: GitDiffLineStats;
-  }
+      type: "gitDiffRefresh";
+      workspaceId: string;
+      codeChangeStats: GitDiffLineStats;
+    }
   | {
-    type: "todoGraphRefresh";
-    workspaceId: string;
-    chatId: string;
-  }
+      type: "todoGraphRefresh";
+      workspaceId: string;
+      chatId: string;
+    }
   | {
-    type: "planRefresh";
-    workspaceId: string;
-  }
+      type: "planRefresh";
+      workspaceId: string;
+    }
   | {
-    type: "agentTeamRefresh";
-    workspaceId: string;
-    chatId: string;
-    teamId: string;
-    instanceId?: string;
-    reason: string;
-    revealPanel: boolean;
-  }
+      type: "agentTeamRefresh";
+      workspaceId: string;
+      chatId: string;
+      teamId: string;
+      instanceId?: string;
+      reason: string;
+      revealPanel: boolean;
+    }
   | {
-    type: "memoryExtractionComplete";
-    assistantMessageId: string;
-    extractedMemories: ChatExtractedMemorySummary[];
-  }
+      type: "memoryExtractionComplete";
+      assistantMessageId: string;
+      extractedMemories: ChatExtractedMemorySummary[];
+    }
   | {
-    type: "memoryResolved";
-    assistantMessageId: string;
-    memoriesUsed: ChatMemoryUsedSummary[];
-    agentTeamId?: string;
-    agentInstanceId?: string;
-    agentTaskId?: string;
-  }
+      type: "memoryResolved";
+      assistantMessageId: string;
+      memoriesUsed: ChatMemoryUsedSummary[];
+      agentTeamId?: string;
+      agentInstanceId?: string;
+      agentTaskId?: string;
+    }
   | { type: "error"; message: string };
 
 export type ChatToolBreakdown = {
@@ -1776,9 +1775,7 @@ export type MemoryDreamRunMode = "deterministic_only" | "llm";
 export type MemoryDreamScope = "global" | "workspace";
 
 export type MemoryDreamTriggerType =
-  | "manual"
-  | "auto_interval"
-  | "auto_threshold";
+  "manual" | "auto_interval" | "auto_threshold";
 
 export type MemoryDreamSettingsSummary = {
   enabled: boolean;
@@ -1937,9 +1934,7 @@ export type MemoryDreamJobSummary = {
 };
 
 export type MemoryDreamPartialUnavailableReason =
-  | "notConnected"
-  | "requestFailed"
-  | "invalidResponse";
+  "notConnected" | "requestFailed" | "invalidResponse";
 
 export type MemoryDreamPartialUnavailable = {
   workspaceId: string;
@@ -2304,8 +2299,7 @@ export type ProviderWebSocketRequestDump = {
 };
 
 export type ProviderAuditRequestDump =
-  | ProviderWireRequestDump
-  | ProviderWebSocketRequestDump;
+  ProviderWireRequestDump | ProviderWebSocketRequestDump;
 
 export type ProviderHttpResponseHeadDump = {
   headers: ProviderHttpHeadersDump;
@@ -2338,19 +2332,9 @@ export type ProviderFinalResponseDump =
 
 export type AiRequestAuditDetail = AiRequestAuditSummary & {
   requestDetailStatus?:
-    | "captured"
-    | "failed"
-    | "malformed"
-    | "partial"
-    | "pending"
-    | "unavailable";
+    "captured" | "failed" | "malformed" | "partial" | "pending" | "unavailable";
   responseDetailStatus?:
-    | "captured"
-    | "failed"
-    | "malformed"
-    | "partial"
-    | "pending"
-    | "unavailable";
+    "captured" | "failed" | "malformed" | "partial" | "pending" | "unavailable";
   requestBody: JsonValue | ProviderAuditRequestDump | null;
   responseBody: JsonValue | ProviderFinalResponseDump | null;
 };
@@ -2463,7 +2447,8 @@ export type TerminalServerEvent =
   | { type: "exit"; status: string }
   | { type: "error"; message: string };
 
-export type TerminalPaneStatus = "closed" | "connected" | "connecting" | "error";
+export type TerminalPaneStatus =
+  "closed" | "connected" | "connecting" | "error";
 
 export type TerminalCommandRun = {
   input: string;
@@ -2538,6 +2523,7 @@ export type RetryRunRequest = {
   modelId: string;
   providerId: string;
   thinkingLevel: string;
+  latencyMode?: LatencyMode;
   skillIds: string[];
   sessionMode?: "plan";
   teamModeEnabled?: boolean;
@@ -2547,6 +2533,8 @@ export type RetryRunRequest = {
   queuedUserMessageId?: string;
   assistantMessageId?: string;
 };
+
+export type LatencyMode = "standard" | "fast";
 
 export type ScheduledWorkspaceRun = {
   id: string;
@@ -2562,10 +2550,7 @@ export type ScheduledWorkspaceRun = {
 };
 
 export type ScheduledTaskStatus =
-  | "enabled"
-  | "paused"
-  | "completed"
-  | "archived";
+  "enabled" | "paused" | "completed" | "archived";
 
 export type ScheduledTaskSchedule =
   | { type: "one_shot_at"; run_at: string }
@@ -2573,8 +2558,7 @@ export type ScheduledTaskSchedule =
   | { type: "cron"; expression: string; timezone?: string | null };
 
 export type ScheduledSessionMode =
-  | "create_new_chat"
-  | { reuse_chat: { chat_id: string } };
+  "create_new_chat" | { reuse_chat: { chat_id: string } };
 
 export type ScheduledTaskAction = {
   type: "agent_prompt";

@@ -24,6 +24,7 @@ import {
   User,
   Wrench,
   X,
+  Zap,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -66,12 +67,18 @@ import type {
   Translate,
   WorkspaceSummary,
 } from "../../api/types";
-import { CHAT_BOTTOM_LOCK_THRESHOLD_PX, CREATE_BRANCH_OPTION_VALUE } from "../../app/constants";
+import {
+  CHAT_BOTTOM_LOCK_THRESHOLD_PX,
+  CREATE_BRANCH_OPTION_VALUE,
+} from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
 import { forwardWheelAtVerticalBoundary } from "../../shared/scroll-forwarding";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
-import { MarkdownContent, type SelectedSkillPrefixResolver } from "./MarkdownContent";
+import {
+  MarkdownContent,
+  type SelectedSkillPrefixResolver,
+} from "./MarkdownContent";
 
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
 const COMPOSER_EDITOR_KEY_STEP_PX = 24;
@@ -159,17 +166,27 @@ export type ChatPanelHelpers = {
   formatChatCreatedAt: (value: string) => string;
   formatFileSize: (sizeBytes: number) => string;
   formatJsonValue: (value: JsonValue) => string;
-  formatNullableLatencySeconds: (value: number | null, language: string) => string;
+  formatNullableLatencySeconds: (
+    value: number | null,
+    language: string,
+  ) => string;
   formatReplyDuration: (value: number | null, language: string) => string;
-  formatTokensPerSecond: (metrics: ChatReplyMetrics, language: string) => string;
+  formatTokensPerSecond: (
+    metrics: ChatReplyMetrics,
+    language: string,
+  ) => string;
   messageCopyText: (message: ShellMessage, parts: ChatMessagePart[]) => string;
   removeActiveSkillToken: (value: string) => string;
   selectedSkillPrefix: SelectedSkillPrefixResolver;
   skillScopeLabel: (skill: ConfiguredSkillSummary, t: Translate) => string;
-  toolCallChangeStats: (toolCall: ChatToolCallSummary) => ToolCallChangeStats | null;
+  toolCallChangeStats: (
+    toolCall: ChatToolCallSummary,
+  ) => ToolCallChangeStats | null;
   normalizedToolInput: (value: JsonValue) => JsonValue;
   toolCallDetailText: (toolCall: ChatToolCallSummary) => string;
-  toolLiveOutputText: (liveOutput: ChatToolLiveOutput | undefined) => string | null;
+  toolLiveOutputText: (
+    liveOutput: ChatToolLiveOutput | undefined,
+  ) => string | null;
   toolStatusText: (toolCall: ChatToolCallSummary, t: Translate) => string;
 };
 
@@ -219,12 +236,14 @@ function ChatPanelComponent({
   onSubmit,
   onPlanModeEnabledChange,
   onThinkingLevelChange,
+  onLatencyModeChange,
   onToggleSkill,
   onWithdrawQueuedMessage,
   selectedGitBranch,
   selectedModelId,
   selectedSkillIds,
   selectedThinkingLevel,
+  selectedLatencyMode,
   settings,
   skills,
   queuedMessageIds,
@@ -270,7 +289,9 @@ function ChatPanelComponent({
     attachments: ComposerAttachment[],
     onAccepted: () => void,
   ) => Promise<boolean>;
-  onSelectEditAttachments: (onSelected: (attachments: ComposerAttachment[]) => void) => void;
+  onSelectEditAttachments: (
+    onSelected: (attachments: ComposerAttachment[]) => void,
+  ) => void;
   onGuideActiveRun: () => void;
   onGuideQueuedMessage: (messageId: string) => void;
   onLoadMoreMessages: () => Promise<void>;
@@ -287,12 +308,14 @@ function ChatPanelComponent({
   ) => void;
   onPlanModeEnabledChange: (value: boolean) => void;
   onThinkingLevelChange: (value: string) => void;
+  onLatencyModeChange: (value: "standard" | "fast") => void;
   onToggleSkill: (skillId: string) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
   selectedGitBranch: string;
   selectedModelId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
+  selectedLatencyMode: "standard" | "fast";
   settings: SettingsResponse | null;
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
@@ -301,11 +324,7 @@ function ChatPanelComponent({
   workspaces: WorkspaceSummary[];
   workspaceId: string | null;
 }) {
-  const {
-    activeSkillQuery,
-    removeActiveSkillToken,
-    skillScopeLabel,
-  } = helpers;
+  const { activeSkillQuery, removeActiveSkillToken, skillScopeLabel } = helpers;
   const { t } = useI18n();
   const chatPanelRef = useRef<HTMLDivElement>(null);
   const messageScrollRef = useRef<HTMLDivElement>(null);
@@ -331,16 +350,23 @@ function ChatPanelComponent({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [editingMessageText, setEditingMessageText] = useState("");
   const [editingSkillIds, setEditingSkillIds] = useState<string[]>([]);
-  const [editingAttachments, setEditingAttachments] = useState<ComposerAttachment[]>([]);
+  const [editingAttachments, setEditingAttachments] = useState<
+    ComposerAttachment[]
+  >([]);
   const [isSavingEditedMessage, setIsSavingEditedMessage] = useState(false);
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
   const [isResizingComposer, setIsResizingComposer] = useState(false);
   const [isSendButtonTooltipOpen, setIsSendButtonTooltipOpen] = useState(false);
+  const [isFastConfirmationOpen, setIsFastConfirmationOpen] = useState(false);
+  const confirmedFastChatKeysRef = useRef(new Set<string>());
   const [composerEditorHeight, setComposerEditorHeight] = useState(
     COMPOSER_EDITOR_MIN_HEIGHT_PX,
   );
   const skillQuery = activeSkillQuery(draftMessage);
-  const selectedSkillSet = useMemo(() => new Set(selectedSkillIds), [selectedSkillIds]);
+  const selectedSkillSet = useMemo(
+    () => new Set(selectedSkillIds),
+    [selectedSkillIds],
+  );
   const selectedSkills = useMemo(
     () =>
       selectedSkillIds
@@ -355,12 +381,15 @@ function ChatPanelComponent({
   const modelOptions = useMemo(
     () =>
       [...availableModels]
-        .sort((left, right) => left.displayName.localeCompare(right.displayName))
+        .sort((left, right) =>
+          left.displayName.localeCompare(right.displayName),
+        )
         .map((model) => ({
+          badge: model.supportsFast ? t("Fast") : undefined,
           label: model.displayName,
           value: model.id,
         })),
-    [availableModels],
+    [availableModels, t],
   );
   const selectedModel = useMemo(
     () => availableModels.find((model) => model.id === selectedModelId) ?? null,
@@ -369,10 +398,12 @@ function ChatPanelComponent({
   const thinkingOptions = useMemo(
     () => [
       { label: t("Model default"), value: "" },
-      ...thinkingLevelOptionsForModel(selectedModel, thinkingLevels).map((level) => ({
-        label: t(level.label),
-        value: level.value,
-      })),
+      ...thinkingLevelOptionsForModel(selectedModel, thinkingLevels).map(
+        (level) => ({
+          label: t(level.label),
+          value: level.value,
+        }),
+      ),
     ],
     [selectedModel, thinkingLevels, t],
   );
@@ -381,19 +412,21 @@ function ChatPanelComponent({
       skillQuery === null
         ? []
         : skills.filter((skill) => {
-        const query = skillQuery.toLowerCase();
-        return (
-          skill.enabled &&
-          !selectedSkillSet.has(skill.key) &&
-          (skill.name.toLowerCase().includes(query) ||
-            skill.id.toLowerCase().includes(query) ||
-            skill.key.toLowerCase().includes(query) ||
-            skill.description.toLowerCase().includes(query))
-        );
-      }),
+            const query = skillQuery.toLowerCase();
+            return (
+              skill.enabled &&
+              !selectedSkillSet.has(skill.key) &&
+              (skill.name.toLowerCase().includes(query) ||
+                skill.id.toLowerCase().includes(query) ||
+                skill.key.toLowerCase().includes(query) ||
+                skill.description.toLowerCase().includes(query))
+            );
+          }),
     [selectedSkillSet, skillQuery, skills],
   );
-  const hasComposerDraft = Boolean(draftMessage.trim() || draftAttachments.length);
+  const hasComposerDraft = Boolean(
+    draftMessage.trim() || draftAttachments.length,
+  );
   const runningButtonSendsMessage =
     isSendingMessage && hasComposerDraft && canGuideActiveRun;
   const runningButtonLabel = runningButtonSendsMessage
@@ -404,8 +437,8 @@ function ChatPanelComponent({
       ? t("Send to queue")
       : queuedRunCount > 0
         ? t("Send guidance. Ctrl+click queues. {count} queued.", {
-          count: queuedRunCount,
-        })
+            count: queuedRunCount,
+          })
         : t("Send guidance. Ctrl+click queues.")
     : t("Cancel run");
   const sendButtonTitle = draftUnsupportedAttachmentMessage
@@ -414,6 +447,27 @@ function ChatPanelComponent({
       ? t("Send to queue")
       : t("Send");
   const showSendButtonTooltip = isSendButtonTooltipOpen && !isSendingMessage;
+  const supportsFast = selectedModel?.supportsFast === true;
+
+  function handleFastToggle() {
+    if (selectedLatencyMode === "fast") {
+      onLatencyModeChange("standard");
+      return;
+    }
+
+    if (!confirmedFastChatKeysRef.current.has(chatScrollKey)) {
+      setIsFastConfirmationOpen(true);
+      return;
+    }
+
+    onLatencyModeChange("fast");
+  }
+
+  function confirmFastMode() {
+    confirmedFastChatKeysRef.current.add(chatScrollKey);
+    setIsFastConfirmationOpen(false);
+    onLatencyModeChange("fast");
+  }
 
   function scrollMessageListToBottom() {
     const element = messageScrollRef.current;
@@ -441,7 +495,10 @@ function ChatPanelComponent({
       return;
     }
     shouldLockMessageScrollRef.current = false;
-    element.scrollTop += Math.max(0, element.scrollHeight - previousScrollHeight);
+    element.scrollTop += Math.max(
+      0,
+      element.scrollHeight - previousScrollHeight,
+    );
     lastMessageScrollTopRef.current = element.scrollTop;
   }, [messages.length]);
 
@@ -582,7 +639,8 @@ function ChatPanelComponent({
 
   function composerEditorMaxHeight() {
     const panelHeight =
-      chatPanelRef.current?.getBoundingClientRect().height ?? window.innerHeight;
+      chatPanelRef.current?.getBoundingClientRect().height ??
+      window.innerHeight;
     // ponytail: one shared drag ceiling for desktop/mobile; split per breakpoint if UX needs it.
     return Math.max(
       COMPOSER_EDITOR_MIN_HEIGHT_PX,
@@ -590,15 +648,22 @@ function ChatPanelComponent({
     );
   }
 
-  function clampComposerEditorHeight(value: number, maxHeight = composerEditorMaxHeight()) {
+  function clampComposerEditorHeight(
+    value: number,
+    maxHeight = composerEditorMaxHeight(),
+  ) {
     return Math.min(Math.max(value, COMPOSER_EDITOR_MIN_HEIGHT_PX), maxHeight);
   }
 
   function resizeComposerEditorBy(delta: number) {
-    setComposerEditorHeight((current) => clampComposerEditorHeight(current + delta));
+    setComposerEditorHeight((current) =>
+      clampComposerEditorHeight(current + delta),
+    );
   }
 
-  function handleComposerResizePointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+  function handleComposerResizePointerDown(
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
     event.preventDefault();
     const startHeight =
       messageTextareaRef.current?.getBoundingClientRect().height ||
@@ -740,7 +805,9 @@ function ChatPanelComponent({
     activeHistoryPointerIdRef.current = null;
   }
 
-  function handleMessageListPointerDown(event: ReactPointerEvent<HTMLDivElement>) {
+  function handleMessageListPointerDown(
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
     if (event.pointerType === "mouse" && event.button !== 0) {
       return;
     }
@@ -751,7 +818,9 @@ function ChatPanelComponent({
     // <details>/<summary>, buttons, and links keep receiving the full click sequence.
   }
 
-  function handleMessageListPointerEnd(event: ReactPointerEvent<HTMLDivElement>) {
+  function handleMessageListPointerEnd(
+    event: ReactPointerEvent<HTMLDivElement>,
+  ) {
     clearPointerHistoryGesture(event.pointerId);
   }
 
@@ -815,8 +884,8 @@ function ChatPanelComponent({
     const imageFiles = itemFiles.length
       ? itemFiles
       : Array.from(event.clipboardData.files).filter((file) =>
-        file.type.startsWith("image/"),
-      );
+          file.type.startsWith("image/"),
+        );
     if (!imageFiles.length) {
       return;
     }
@@ -825,41 +894,54 @@ function ChatPanelComponent({
     onAddPastedImageAttachments(imageFiles);
   }
 
-  const handleCopyMessage = useCallback(async (messageId: string, text: string) => {
-    if (!text) {
-      return;
-    }
+  const handleCopyMessage = useCallback(
+    async (messageId: string, text: string) => {
+      if (!text) {
+        return;
+      }
 
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      return;
-    }
-    setCopiedMessageId(messageId);
-    if (copiedMessageTimerRef.current !== null) {
-      window.clearTimeout(copiedMessageTimerRef.current);
-    }
-    copiedMessageTimerRef.current = window.setTimeout(() => {
-      setCopiedMessageId((current) => (current === messageId ? null : current));
-      copiedMessageTimerRef.current = null;
-    }, 1600);
-  }, []);
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        return;
+      }
+      setCopiedMessageId(messageId);
+      if (copiedMessageTimerRef.current !== null) {
+        window.clearTimeout(copiedMessageTimerRef.current);
+      }
+      copiedMessageTimerRef.current = window.setTimeout(() => {
+        setCopiedMessageId((current) =>
+          current === messageId ? null : current,
+        );
+        copiedMessageTimerRef.current = null;
+      }, 1600);
+    },
+    [],
+  );
 
-  const beginEditingMessage = useCallback((message: ShellMessage) => {
-    const persistedSkillIds = message.runConfig?.selectedSkillIds;
-    const legacySelectedSkills = persistedSkillIds
-      ? []
-      : selectedSkillPrefix(message.content, true)?.skills ?? [];
-    const legacySkillIds = legacySelectedSkills
-      .map((selectedSkill) => skills.find((skill) =>
-        skill.name === selectedSkill.name || skill.path === selectedSkill.path
-      )?.key)
-      .filter((skillId): skillId is string => Boolean(skillId));
-    setEditingMessageId(message.id);
-    setEditingMessageText(message.content);
-    setEditingSkillIds(persistedSkillIds ?? legacySkillIds);
-    setEditingAttachments([]);
-  }, [skills]);
+  const beginEditingMessage = useCallback(
+    (message: ShellMessage) => {
+      const persistedSkillIds = message.runConfig?.selectedSkillIds;
+      const legacySelectedSkills = persistedSkillIds
+        ? []
+        : (selectedSkillPrefix(message.content, true)?.skills ?? []);
+      const legacySkillIds = legacySelectedSkills
+        .map(
+          (selectedSkill) =>
+            skills.find(
+              (skill) =>
+                skill.name === selectedSkill.name ||
+                skill.path === selectedSkill.path,
+            )?.key,
+        )
+        .filter((skillId): skillId is string => Boolean(skillId));
+      setEditingMessageId(message.id);
+      setEditingMessageText(message.content);
+      setEditingSkillIds(persistedSkillIds ?? legacySkillIds);
+      setEditingAttachments([]);
+    },
+    [skills],
+  );
 
   const clearEditingMessage = useCallback(() => {
     setEditingMessageId(null);
@@ -875,33 +957,57 @@ function ChatPanelComponent({
     clearEditingMessage();
   }, [clearEditingMessage, isSavingEditedMessage]);
 
-  const saveEditedMessage = useCallback(async (message: ShellMessage) => {
-    const trimmed = editingMessageText.trim();
-    if (!trimmed || isSavingEditedMessage) {
-      return;
-    }
-    const messageIndex = messages.findIndex((item) => item.id === message.id);
-    const removedCount = messageIndex < 0 ? 0 : messages.length - messageIndex - 1;
-    if (
-      removedCount > 0 &&
-      !window.confirm(t("Editing this message will remove {count} later messages and regenerate the reply. Continue?", { count: removedCount }))
-    ) {
-      return;
-    }
-    setIsSavingEditedMessage(true);
-    let editAccepted = false;
-    try {
-      await onEditMessage(message, trimmed, editingSkillIds, editingAttachments, () => {
-        if (editAccepted) {
-          return;
-        }
-        editAccepted = true;
-        clearEditingMessage();
-      });
-    } finally {
-      setIsSavingEditedMessage(false);
-    }
-  }, [clearEditingMessage, editingAttachments, editingMessageText, editingSkillIds, isSavingEditedMessage, messages, onEditMessage, t]);
+  const saveEditedMessage = useCallback(
+    async (message: ShellMessage) => {
+      const trimmed = editingMessageText.trim();
+      if (!trimmed || isSavingEditedMessage) {
+        return;
+      }
+      const messageIndex = messages.findIndex((item) => item.id === message.id);
+      const removedCount =
+        messageIndex < 0 ? 0 : messages.length - messageIndex - 1;
+      if (
+        removedCount > 0 &&
+        !window.confirm(
+          t(
+            "Editing this message will remove {count} later messages and regenerate the reply. Continue?",
+            { count: removedCount },
+          ),
+        )
+      ) {
+        return;
+      }
+      setIsSavingEditedMessage(true);
+      let editAccepted = false;
+      try {
+        await onEditMessage(
+          message,
+          trimmed,
+          editingSkillIds,
+          editingAttachments,
+          () => {
+            if (editAccepted) {
+              return;
+            }
+            editAccepted = true;
+            clearEditingMessage();
+          },
+        );
+      } finally {
+        setIsSavingEditedMessage(false);
+      }
+    },
+    [
+      clearEditingMessage,
+      editingAttachments,
+      editingMessageText,
+      editingSkillIds,
+      isSavingEditedMessage,
+      messages,
+      onEditMessage,
+      t,
+    ],
+  );
 
   return (
     <div
@@ -927,8 +1033,9 @@ function ChatPanelComponent({
         tabIndex={0}
       >
         <div
-          className={`message-stack mx-auto flex w-full flex-col ${messages.length ? "max-w-5xl gap-4" : "max-w-6xl"
-            }`}
+          className={`message-stack mx-auto flex w-full flex-col ${
+            messages.length ? "max-w-5xl gap-4" : "max-w-6xl"
+          }`}
           ref={messageScrollContentRef}
         >
           {messages.length ? (
@@ -942,11 +1049,18 @@ function ChatPanelComponent({
                     type="button"
                   >
                     {isLoadingMoreMessages ? (
-                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-3.5 animate-spin"
+                      />
                     ) : (
                       <ArrowUp aria-hidden="true" className="size-3.5" />
                     )}
-                    <span>{isLoadingMoreMessages ? t("Loading...") : t("Load earlier messages")}</span>
+                    <span>
+                      {isLoadingMoreMessages
+                        ? t("Loading...")
+                        : t("Load earlier messages")}
+                    </span>
                   </button>
                 </div>
               ) : null}
@@ -965,7 +1079,9 @@ function ChatPanelComponent({
                   helpers={helpers}
                   isCopied={copiedMessageId === message.id}
                   isEditing={editingMessageId === message.id}
-                  isSavingEdit={isSavingEditedMessage && editingMessageId === message.id}
+                  isSavingEdit={
+                    isSavingEditedMessage && editingMessageId === message.id
+                  }
                   key={message.id}
                   message={message}
                   onBeginEdit={beginEditingMessage}
@@ -987,7 +1103,10 @@ function ChatPanelComponent({
             </>
           ) : isLoadingMessages ? (
             <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-stone-500">
-              <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+              <LoaderCircle
+                aria-hidden="true"
+                className="size-4 animate-spin"
+              />
               <span>{t("Loading...")}</span>
             </div>
           ) : readOnly ? (
@@ -1009,8 +1128,9 @@ function ChatPanelComponent({
             aria-valuemax={composerEditorMaxHeight()}
             aria-valuemin={COMPOSER_EDITOR_MIN_HEIGHT_PX}
             aria-valuenow={composerEditorHeight}
-            className={`composer-resize-splitter ${isResizingComposer ? "composer-resize-splitter-active" : ""
-              }`}
+            className={`composer-resize-splitter ${
+              isResizingComposer ? "composer-resize-splitter-active" : ""
+            }`}
             onKeyDown={(event) => {
               if (event.key === "ArrowUp") {
                 event.preventDefault();
@@ -1028,271 +1148,370 @@ function ChatPanelComponent({
           />
 
           <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
-        <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
-          <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
-            {selectedSkills.length ? (
-              <div className="flex flex-wrap gap-1.5 px-3 pt-2">
-                {selectedSkills.map((skill) => (
-                  <span
-                    className="inline-flex max-w-full items-center gap-1 rounded-full border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
-                    key={skill.key}
+            <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
+              <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
+                {selectedSkills.length ? (
+                  <div className="flex flex-wrap gap-1.5 px-3 pt-2">
+                    {selectedSkills.map((skill) => (
+                      <span
+                        className="inline-flex max-w-full items-center gap-1 rounded-full border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
+                        key={skill.key}
+                      >
+                        <span className="max-w-44 truncate">{skill.name}</span>
+                        <button
+                          aria-label={t("Remove skill {name}", {
+                            name: skill.name,
+                          })}
+                          className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
+                          onClick={() => onRemoveSkill(skill.key)}
+                          title={t("Remove skill")}
+                          type="button"
+                        >
+                          <X aria-hidden="true" className="size-3" />
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                ) : null}
+                {draftAttachments.length ? (
+                  <div className="composer-attachment-list px-3 pt-2">
+                    {draftAttachments.map((attachment) => (
+                      <ComposerAttachmentChip
+                        helpers={helpers}
+                        attachment={attachment}
+                        key={attachment.id}
+                        onRemove={() => onRemoveAttachment(attachment.id)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+                <textarea
+                  className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
+                  name="message"
+                  onChange={(event) => onDraftMessageChange(event.target.value)}
+                  onKeyDown={(
+                    event: ReactKeyboardEvent<HTMLTextAreaElement>,
+                  ) => {
+                    if (
+                      event.key !== "Enter" ||
+                      event.shiftKey ||
+                      event.nativeEvent.isComposing
+                    ) {
+                      return;
+                    }
+
+                    event.preventDefault();
+                    if (isQueueModifierActive(event)) {
+                      onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
+                        schedule: true,
+                      });
+                      return;
+                    }
+
+                    event.currentTarget.form?.requestSubmit();
+                  }}
+                  onPaste={handlePaste}
+                  placeholder={composerPlaceholder}
+                  ref={messageTextareaRef}
+                  value={draftMessage}
+                />
+                {skillQuery !== null ? (
+                  <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+                    <div className="panel-scroll max-h-64 overflow-y-auto py-1">
+                      {visibleSkills.length ? (
+                        visibleSkills.map((skill) => (
+                          <button
+                            aria-label={t("Select skill {name}", {
+                              name: skill.name,
+                            })}
+                            className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
+                            disabled={!skill.enabled}
+                            key={skill.key}
+                            onClick={() => handleSkillSelect(skill)}
+                            title={
+                              skill.enabled
+                                ? skill.description
+                                : t("Skill is disabled")
+                            }
+                            type="button"
+                          >
+                            <span className="min-w-0">
+                              <span className="block truncate text-sm font-semibold text-stone-900">
+                                {skill.name}
+                              </span>
+                              <span className="mt-0.5 block truncate text-xs text-stone-500">
+                                {skill.description}
+                              </span>
+                            </span>
+                            <span className="self-center rounded-md border border-stone-200 px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+                              {skill.enabled
+                                ? skillScopeLabel(skill, t)
+                                : t("disabled")}
+                            </span>
+                          </button>
+                        ))
+                      ) : (
+                        <div className="px-3 py-3 text-sm text-stone-500">
+                          {t("No matching skills")}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                ) : null}
+                <div
+                  className={`message-composer-control-row ${
+                    canRetryRun ? "message-composer-actions-with-retry" : ""
+                  }`}
+                >
+                  <button
+                    aria-label={t("Add attachment")}
+                    className="composer-tool-button"
+                    disabled={isSelectingAttachments}
+                    onClick={onSelectAttachments}
+                    title={t("Add attachment")}
+                    type="button"
                   >
-                    <span className="max-w-44 truncate">{skill.name}</span>
+                    {isSelectingAttachments ? (
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin"
+                      />
+                    ) : (
+                      <Plus aria-hidden="true" className="size-4" />
+                    )}
+                  </button>
+                  <button
+                    aria-label={t("Plan mode")}
+                    aria-pressed={isPlanModeEnabled}
+                    className={`composer-team-toggle ${
+                      isPlanModeEnabled ? "composer-team-toggle-enabled" : ""
+                    }`}
+                    onClick={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
+                    title={t("Plan mode")}
+                    type="button"
+                  >
+                    <ListChecks
+                      aria-hidden="true"
+                      className="size-3.5 shrink-0"
+                    />
+                    <span className="composer-team-toggle-label">
+                      {t("Plan")}
+                    </span>
+                  </button>
+                  <ComposerSelectMenu
+                    ariaLabel={t("Model")}
+                    className="composer-model-select max-w-full"
+                    disabled={isLoadingSettings || !modelOptions.length}
+                    emptyLabel={t("No enabled models")}
+                    icon={Bot}
+                    onChange={handleModelSelect}
+                    options={modelOptions}
+                    selectedValue={selectedModelId}
+                  />
+                  <ComposerSelectMenu
+                    ariaLabel={t("Thinking")}
+                    className="composer-thinking-select max-w-full"
+                    disabled={isLoadingSettings}
+                    emptyLabel={t("Model default")}
+                    icon={SlidersHorizontal}
+                    onChange={onThinkingLevelChange}
+                    options={thinkingOptions}
+                    selectedValue={selectedThinkingLevel}
+                  />
+                  {supportsFast ? (
                     <button
-                      aria-label={t("Remove skill {name}", {
-                        name: skill.name,
-                      })}
-                      className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
-                      onClick={() => onRemoveSkill(skill.key)}
-                      title={t("Remove skill")}
+                      aria-label={t("Fast mode")}
+                      aria-pressed={selectedLatencyMode === "fast"}
+                      className={`composer-fast-toggle ${
+                        selectedLatencyMode === "fast"
+                          ? "composer-fast-toggle-enabled"
+                          : ""
+                      }`}
+                      onClick={handleFastToggle}
+                      title={
+                        selectedLatencyMode === "fast"
+                          ? t("Fast mode enabled")
+                          : t("Fast mode")
+                      }
                       type="button"
                     >
-                      <X aria-hidden="true" className="size-3" />
+                      <Zap aria-hidden="true" className="size-3.5 shrink-0" />
+                      <span>{t("Fast")}</span>
+                      <span className="sr-only">
+                        {selectedLatencyMode === "fast"
+                          ? t("enabled")
+                          : t("disabled")}
+                      </span>
                     </button>
-                  </span>
-                ))}
-              </div>
-            ) : null}
-            {draftAttachments.length ? (
-              <div className="composer-attachment-list px-3 pt-2">
-                {draftAttachments.map((attachment) => (
-                  <ComposerAttachmentChip
-                    helpers={helpers}
-                    attachment={attachment}
-                    key={attachment.id}
-                    onRemove={() => onRemoveAttachment(attachment.id)}
+                  ) : null}
+                  <BranchSelector
+                    branches={
+                      worktreeBranch
+                        ? [worktreeBranch]
+                        : (gitBranches?.branches ?? [])
+                    }
+                    currentBranch={worktreeBranch ?? selectedGitBranch}
+                    currentWorktreeBranch={worktreeBranch}
+                    disabled={isSendingMessage || worktreeBranch !== null}
+                    isGitRepository={
+                      worktreeBranch !== null ||
+                      (gitBranches?.isGitRepository ?? false)
+                    }
+                    isLoading={isLoadingBranches}
+                    onChange={onBranchChange}
+                    onOpen={onBranchMenuOpen}
+                    worktrees={gitBranches?.worktrees ?? []}
                   />
-                ))}
-              </div>
-            ) : null}
-            <textarea
-              className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
-              name="message"
-              onChange={(event) => onDraftMessageChange(event.target.value)}
-              onKeyDown={(event: ReactKeyboardEvent<HTMLTextAreaElement>) => {
-                if (
-                  event.key !== "Enter" ||
-                  event.shiftKey ||
-                  event.nativeEvent.isComposing
-                ) {
-                  return;
-                }
-
-                event.preventDefault();
-                if (isQueueModifierActive(event)) {
-                  onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
-                    schedule: true,
-                  });
-                  return;
-                }
-
-                event.currentTarget.form?.requestSubmit();
-              }}
-              onPaste={handlePaste}
-              placeholder={composerPlaceholder}
-              ref={messageTextareaRef}
-              value={draftMessage}
-            />
-            {skillQuery !== null ? (
-              <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
-                <div className="panel-scroll max-h-64 overflow-y-auto py-1">
-                  {visibleSkills.length ? (
-                    visibleSkills.map((skill) => (
-                      <button
-                        aria-label={t("Select skill {name}", {
-                          name: skill.name,
-                        })}
-                        className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
-                        disabled={!skill.enabled}
-                        key={skill.key}
-                        onClick={() => handleSkillSelect(skill)}
-                        title={
-                          skill.enabled ? skill.description : t("Skill is disabled")
-                        }
-                        type="button"
-                      >
-                        <span className="min-w-0">
-                          <span className="block truncate text-sm font-semibold text-stone-900">
-                            {skill.name}
-                          </span>
-                          <span className="mt-0.5 block truncate text-xs text-stone-500">
-                            {skill.description}
-                          </span>
-                        </span>
-                        <span className="self-center rounded-md border border-stone-200 px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
-                          {skill.enabled ? skillScopeLabel(skill, t) : t("disabled")}
-                        </span>
-                      </button>
-                    ))
+                  {canRetryRun ? (
+                    <button
+                      aria-label={t("Retry last run")}
+                      className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      onClick={onRetryRun}
+                      title={t("Retry last run")}
+                      type="button"
+                    >
+                      <RefreshCw aria-hidden="true" className="size-4" />
+                    </button>
+                  ) : null}
+                  <span
+                    aria-hidden="true"
+                    className="composer-control-spacer"
+                  />
+                  <ContextUsageCircle
+                    isLoading={isLoadingContextUsage}
+                    usage={contextUsage}
+                  />
+                  {isSendingMessage ? (
+                    <button
+                      aria-label={runningButtonLabel}
+                      className={
+                        runningButtonSendsMessage
+                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                          : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                      }
+                      disabled={
+                        runningButtonSendsMessage &&
+                        (!canGuideActiveRun ||
+                          !selectedModelId ||
+                          Boolean(draftUnsupportedAttachmentMessage))
+                      }
+                      onClick={handleRunningRunButtonClick}
+                      title={runningButtonTitle}
+                      type="button"
+                    >
+                      {runningButtonSendsMessage ? (
+                        <Send aria-hidden="true" className="size-4" />
+                      ) : (
+                        <X aria-hidden="true" className="size-4" />
+                      )}
+                    </button>
                   ) : (
-                    <div className="px-3 py-3 text-sm text-stone-500">
-                      {t("No matching skills")}
-                    </div>
+                    <span
+                      className="composer-send-button-shell"
+                      onBlur={() => setIsSendButtonTooltipOpen(false)}
+                      onFocus={() => setIsSendButtonTooltipOpen(true)}
+                      onMouseEnter={() => setIsSendButtonTooltipOpen(true)}
+                      onMouseLeave={() => setIsSendButtonTooltipOpen(false)}
+                    >
+                      <button
+                        aria-describedby={
+                          showSendButtonTooltip
+                            ? "composer-send-button-tooltip"
+                            : undefined
+                        }
+                        aria-label={t("Send message")}
+                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                        disabled={
+                          (!draftMessage.trim() && !draftAttachments.length) ||
+                          !selectedModelId ||
+                          Boolean(draftUnsupportedAttachmentMessage)
+                        }
+                        onClick={(event) => {
+                          if (isQueueModifierActive(event)) {
+                            event.preventDefault();
+                            const form = event.currentTarget.form;
+                            if (!form) {
+                              return;
+                            }
+
+                            onSubmit(
+                              event as unknown as FormEvent<HTMLFormElement>,
+                              {
+                                schedule: true,
+                              },
+                            );
+                          }
+                        }}
+                        title={sendButtonTitle}
+                        type="submit"
+                      >
+                        <Send aria-hidden="true" className="size-4" />
+                      </button>
+                      {showSendButtonTooltip ? (
+                        <span
+                          className="composer-send-tooltip"
+                          id="composer-send-button-tooltip"
+                          role="tooltip"
+                        >
+                          {sendButtonTitle}
+                        </span>
+                      ) : null}
+                    </span>
                   )}
                 </div>
               </div>
-            ) : null}
-            <div
-              className={`message-composer-control-row ${canRetryRun ? "message-composer-actions-with-retry" : ""
-                }`}
-            >
-              <button
-                aria-label={t("Add attachment")}
-                className="composer-tool-button"
-                disabled={isSelectingAttachments}
-                onClick={onSelectAttachments}
-                title={t("Add attachment")}
-                type="button"
-              >
-
-                {isSelectingAttachments ? (
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                ) : (
-                  <Plus aria-hidden="true" className="size-4" />
-                )}
-              </button>
-              <button
-                aria-label={t("Plan mode")}
-                aria-pressed={isPlanModeEnabled}
-                className={`composer-team-toggle ${isPlanModeEnabled
-                    ? "composer-team-toggle-enabled"
-                    : ""
-                  }`}
-                onClick={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
-                title={t("Plan mode")}
-                type="button"
-              >
-                <ListChecks aria-hidden="true" className="size-3.5 shrink-0" />
-                <span className="composer-team-toggle-label">{t("Plan")}</span>
-              </button>
-              <ComposerSelectMenu
-                ariaLabel={t("Model")}
-                className="composer-model-select max-w-full"
-                disabled={isLoadingSettings || !modelOptions.length}
-                emptyLabel={t("No enabled models")}
-                icon={Bot}
-                onChange={handleModelSelect}
-                options={modelOptions}
-                selectedValue={selectedModelId}
-              />
-              <ComposerSelectMenu
-                ariaLabel={t("Thinking")}
-                className="composer-thinking-select max-w-full"
-                disabled={isLoadingSettings}
-                emptyLabel={t("Model default")}
-                icon={SlidersHorizontal}
-                onChange={onThinkingLevelChange}
-                options={thinkingOptions}
-                selectedValue={selectedThinkingLevel}
-              />
-              <BranchSelector
-                branches={worktreeBranch ? [worktreeBranch] : gitBranches?.branches ?? []}
-                currentBranch={worktreeBranch ?? selectedGitBranch}
-                currentWorktreeBranch={worktreeBranch}
-                disabled={isSendingMessage || worktreeBranch !== null}
-                isGitRepository={worktreeBranch !== null || (gitBranches?.isGitRepository ?? false)}
-                isLoading={isLoadingBranches}
-                onChange={onBranchChange}
-                onOpen={onBranchMenuOpen}
-                worktrees={gitBranches?.worktrees ?? []}
-              />
-              {canRetryRun ? (
-                <button
-                  aria-label={t("Retry last run")}
-                  className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
-                  onClick={onRetryRun}
-                  title={t("Retry last run")}
-                  type="button"
-                >
-                  <RefreshCw aria-hidden="true" className="size-4" />
-                </button>
+              {branchError ? (
+                <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                  {branchError}
+                </div>
               ) : null}
-              <span aria-hidden="true" className="composer-control-spacer" />
-              <ContextUsageCircle
-                isLoading={isLoadingContextUsage}
-                usage={contextUsage}
-              />
-              {isSendingMessage ? (
-                <button
-                  aria-label={runningButtonLabel}
-                  className={
-                    runningButtonSendsMessage
-                      ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                      : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+            </form>
+            {isFastConfirmationOpen ? (
+              <div
+                aria-describedby="fast-mode-confirmation-description"
+                aria-labelledby="fast-mode-confirmation-title"
+                aria-modal="true"
+                className="fast-mode-confirmation-backdrop"
+                onMouseDown={(event) => {
+                  if (event.target === event.currentTarget) {
+                    setIsFastConfirmationOpen(false);
                   }
-                  disabled={
-                    runningButtonSendsMessage &&
-                    (!canGuideActiveRun ||
-                      !selectedModelId ||
-                      Boolean(draftUnsupportedAttachmentMessage))
-                  }
-                  onClick={handleRunningRunButtonClick}
-                  title={runningButtonTitle}
-                  type="button"
-                >
-                  {runningButtonSendsMessage ? (
-                    <Send aria-hidden="true" className="size-4" />
-                  ) : (
-                    <X aria-hidden="true" className="size-4" />
-                  )}
-                </button>
-              ) : (
-                <span
-                  className="composer-send-button-shell"
-                  onBlur={() => setIsSendButtonTooltipOpen(false)}
-                  onFocus={() => setIsSendButtonTooltipOpen(true)}
-                  onMouseEnter={() => setIsSendButtonTooltipOpen(true)}
-                  onMouseLeave={() => setIsSendButtonTooltipOpen(false)}
-                >
-                  <button
-                    aria-describedby={
-                      showSendButtonTooltip ? "composer-send-button-tooltip" : undefined
-                    }
-                    aria-label={t("Send message")}
-                    className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                    disabled={
-                      (!draftMessage.trim() && !draftAttachments.length) ||
-                      !selectedModelId ||
-                      Boolean(draftUnsupportedAttachmentMessage)
-                    }
-                    onClick={(event) => {
-                      if (isQueueModifierActive(event)) {
-                        event.preventDefault();
-                        const form = event.currentTarget.form;
-                        if (!form) {
-                          return;
-                        }
-
-                        onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
-                          schedule: true,
-                        });
-                      }
-                    }}
-                    title={sendButtonTitle}
-                    type="submit"
-                  >
-                    <Send aria-hidden="true" className="size-4" />
-                  </button>
-                  {showSendButtonTooltip ? (
-                    <span
-                      className="composer-send-tooltip"
-                      id="composer-send-button-tooltip"
-                      role="tooltip"
+                }}
+                role="dialog"
+              >
+                <div className="fast-mode-confirmation-card">
+                  <div className="fast-mode-confirmation-icon">
+                    <Zap aria-hidden="true" className="size-4" />
+                  </div>
+                  <h2 id="fast-mode-confirmation-title">
+                    {t("Enable Fast mode?")}
+                  </h2>
+                  <p id="fast-mode-confirmation-description">
+                    {t(
+                      "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.",
+                    )}
+                  </p>
+                  <div className="fast-mode-confirmation-actions">
+                    <button
+                      className="composer-dialog-button"
+                      onClick={() => setIsFastConfirmationOpen(false)}
+                      type="button"
                     >
-                      {sendButtonTitle}
-                    </span>
-                  ) : null}
-                </span>
-              )}
-            </div>
+                      {t("Cancel")}
+                    </button>
+                    <button
+                      className="composer-dialog-button composer-dialog-button-primary"
+                      onClick={confirmFastMode}
+                      type="button"
+                    >
+                      <Zap aria-hidden="true" className="size-3.5" />
+                      {t("Enable Fast")}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : null}
           </div>
-          {branchError ? (
-            <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-              {branchError}
-            </div>
-          ) : null}
-        </form>
-      </div>
         </>
       ) : null}
     </div>
@@ -1344,17 +1563,21 @@ const MessageRow = memo(function MessageRow({
   onGuideQueuedMessage: (messageId: string) => void;
   onOpenMessageApiRequests: (message: ShellMessage) => void;
   onSaveEdit: (message: ShellMessage) => void;
-  onSelectEditAttachments: (onSelected: (attachments: ComposerAttachment[]) => void) => void;
+  onSelectEditAttachments: (
+    onSelected: (attachments: ComposerAttachment[]) => void,
+  ) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
   queuedMessageIds: ReadonlySet<string>;
   skills: ConfiguredSkillSummary[];
   workspaceId: string | null;
 }) {
-  const { fallbackMessageParts, formatChatCreatedAt, messageCopyText } = helpers;
+  const { fallbackMessageParts, formatChatCreatedAt, messageCopyText } =
+    helpers;
   const { t } = useI18n();
   const isUser = message.role === "user";
   const parts = useMemo(
-    () => (message.parts.length ? message.parts : fallbackMessageParts(message)),
+    () =>
+      message.parts.length ? message.parts : fallbackMessageParts(message),
     [fallbackMessageParts, message],
   );
   const reasoningPartCount = useMemo(
@@ -1387,10 +1610,11 @@ const MessageRow = memo(function MessageRow({
     >
       <div className="message-card-shell">
         <div
-          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${isUser
+          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+            isUser
               ? "message-bubble-user flex-row rounded-tr-md"
               : "message-bubble-assistant flex-row rounded-tl-md"
-            } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
+          } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
           style={{
             backgroundColor: isPendingUserMessage
               ? "var(--foco-panel-soft)"
@@ -1405,10 +1629,11 @@ const MessageRow = memo(function MessageRow({
           }}
         >
           <div
-            className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${isUser
+            className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
+              isUser
                 ? "bg-teal-950/45 text-white"
                 : "bg-stone-100 text-stone-700"
-              }`}
+            }`}
           >
             {isUser ? (
               <User aria-hidden="true" className="size-4" />
@@ -1449,7 +1674,8 @@ const MessageRow = memo(function MessageRow({
                     {t("Reconnected")}
                   </span>
                 ) : null}
-                {!isUser && message.runBadges?.includes("contextCompressionRule") ? (
+                {!isUser &&
+                message.runBadges?.includes("contextCompressionRule") ? (
                   <span
                     className="message-run-badge"
                     title={t("Rule-based context compression was triggered")}
@@ -1457,7 +1683,8 @@ const MessageRow = memo(function MessageRow({
                     {t("Rule compressed")}
                   </span>
                 ) : null}
-                {!isUser && message.runBadges?.includes("contextCompressionLlm") ? (
+                {!isUser &&
+                message.runBadges?.includes("contextCompressionLlm") ? (
                   <span
                     className="message-run-badge"
                     title={t("LLM summary context compression was triggered")}
@@ -1465,7 +1692,8 @@ const MessageRow = memo(function MessageRow({
                     {t("LLM compressed")}
                   </span>
                 ) : null}
-                {!isUser && message.runBadges?.includes("contextCompressionRuntime") ? (
+                {!isUser &&
+                message.runBadges?.includes("contextCompressionRuntime") ? (
                   <span
                     className="message-run-badge"
                     title={t("Runtime tool-state compression was triggered")}
@@ -1534,7 +1762,11 @@ const MessageRow = memo(function MessageRow({
                         <button
                           className="rounded-full border border-teal-800/20 bg-white/70 px-2 py-0.5 text-xs text-teal-950"
                           key={skillId}
-                          onClick={() => onEditingSkillIdsChange(editingSkillIds.filter((id) => id !== skillId))}
+                          onClick={() =>
+                            onEditingSkillIdsChange(
+                              editingSkillIds.filter((id) => id !== skillId),
+                            )
+                          }
                           title={t("Remove skill")}
                           type="button"
                         >
@@ -1558,13 +1790,24 @@ const MessageRow = memo(function MessageRow({
                     value=""
                   >
                     <option value="">{t("Add skill")}</option>
-                    {skills.filter((skill) => !editingSkillIds.includes(skill.key)).map((skill) => (
-                      <option key={skill.key} value={skill.key}>{skill.name}</option>
-                    ))}
+                    {skills
+                      .filter((skill) => !editingSkillIds.includes(skill.key))
+                      .map((skill) => (
+                        <option key={skill.key} value={skill.key}>
+                          {skill.name}
+                        </option>
+                      ))}
                   </select>
                   <button
                     className="rounded-lg border border-stone-300 bg-white/90 px-2 py-1 text-xs"
-                    onClick={() => onSelectEditAttachments((attachments) => onEditingAttachmentsChange([...editingAttachments, ...attachments]))}
+                    onClick={() =>
+                      onSelectEditAttachments((attachments) =>
+                        onEditingAttachmentsChange([
+                          ...editingAttachments,
+                          ...attachments,
+                        ]),
+                      )
+                    }
                     type="button"
                   >
                     {t("Add attachment")}
@@ -1576,8 +1819,16 @@ const MessageRow = memo(function MessageRow({
                       <button
                         className="rounded-full border border-stone-300 bg-white/70 px-2 py-0.5 text-xs"
                         key={attachment.id}
-                        onClick={() => onEditingAttachmentsChange(editingAttachments.filter((item) => item.id !== attachment.id))}
-                        title={t("Remove attachment {name}", { name: attachment.name })}
+                        onClick={() =>
+                          onEditingAttachmentsChange(
+                            editingAttachments.filter(
+                              (item) => item.id !== attachment.id,
+                            ),
+                          )
+                        }
+                        title={t("Remove attachment {name}", {
+                          name: attachment.name,
+                        })}
                         type="button"
                       >
                         {attachment.name} ×
@@ -1622,7 +1873,10 @@ const MessageRow = memo(function MessageRow({
                     type="button"
                   >
                     {isSavingEdit ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                      <LoaderCircle
+                        aria-hidden="true"
+                        className="size-4 animate-spin"
+                      />
                     ) : (
                       <Send aria-hidden="true" className="size-4" />
                     )}
@@ -1630,7 +1884,9 @@ const MessageRow = memo(function MessageRow({
                 </div>
               </div>
             ) : null}
-            {!isEditing && !isUser ? <MemoriesUsedBlock memories={message.memoriesUsed} /> : null}
+            {!isEditing && !isUser ? (
+              <MemoriesUsedBlock memories={message.memoriesUsed} />
+            ) : null}
             {!isEditing && parts.length ? (
               parts.map((part, partIndex) => (
                 <MessagePartBlock
@@ -1643,7 +1899,7 @@ const MessageRow = memo(function MessageRow({
                   part={part}
                   reasoningDurationFallbackMs={
                     reasoningPartCount === 1
-                      ? message.metrics?.totalLatencyMs ?? null
+                      ? (message.metrics?.totalLatencyMs ?? null)
                       : null
                   }
                   workspaceId={workspaceId}
@@ -1658,7 +1914,9 @@ const MessageRow = memo(function MessageRow({
             {!isUser ? (
               <ExtractedMemoriesBlock memories={message.extractedMemories} />
             ) : null}
-            {!isUser ? <SpecUpdatesBlock updates={message.specUpdates} /> : null}
+            {!isUser ? (
+              <SpecUpdatesBlock updates={message.specUpdates} />
+            ) : null}
             {!isUser && message.metrics && message.status !== "streaming" ? (
               <ChatReplyMetricsLine
                 helpers={helpers}
@@ -1705,12 +1963,15 @@ function ContextUsageCircle({
   return (
     <div
       aria-label={ariaLabel}
-      className={`context-usage-circle ${toneClass} ${isLoading ? "context-usage-circle-loading" : ""
-        } ${className}`}
+      className={`context-usage-circle ${toneClass} ${
+        isLoading ? "context-usage-circle-loading" : ""
+      } ${className}`}
       role="status"
-      style={{
-        "--context-usage-percent": `${clampedPercent}%`,
-      } as CSSProperties}
+      style={
+        {
+          "--context-usage-percent": `${clampedPercent}%`,
+        } as CSSProperties
+      }
       title={title}
     >
       {percent}%
@@ -1719,6 +1980,7 @@ function ContextUsageCircle({
 }
 
 type ComposerSelectOption = {
+  badge?: string;
   label: string;
   value: string;
 };
@@ -1747,7 +2009,10 @@ function ComposerSelectMenu({
   const selectedLabel = selectedOption?.label ?? emptyLabel;
   const detailsRef = useCloseDetailsOnOutsidePointerDown();
 
-  function handleSelect(value: string, event: ReactMouseEvent<HTMLButtonElement>) {
+  function handleSelect(
+    value: string,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) {
     event.currentTarget.closest("details")?.removeAttribute("open");
     onChange(value);
   }
@@ -1760,8 +2025,11 @@ function ComposerSelectMenu({
       <summary
         aria-disabled={disabled}
         aria-label={ariaLabel}
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "pointer-events-none text-stone-400" : "hover:border-stone-300"
-          }`}
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
+          disabled
+            ? "pointer-events-none text-stone-400"
+            : "hover:border-stone-300"
+        }`}
         title={selectedLabel}
       >
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
@@ -1776,18 +2044,27 @@ function ComposerSelectMenu({
             options.map((option) => (
               <button
                 aria-label={`${ariaLabel}: ${option.label}`}
-                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${option.value === selectedValue
+                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${
+                  option.value === selectedValue
                     ? "font-semibold text-teal-900"
                     : "text-stone-700"
-                  }`}
+                }`}
                 key={option.value}
                 onClick={(event) => handleSelect(option.value, event)}
                 type="button"
               >
                 <Icon aria-hidden="true" className="size-3.5 shrink-0" />
                 <span className="min-w-0 flex-1 truncate">{option.label}</span>
+                {option.badge ? (
+                  <span className="rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
+                    {option.badge}
+                  </span>
+                ) : null}
                 {option.value === selectedValue ? (
-                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0"
+                  />
                 ) : null}
               </button>
             ))
@@ -1838,7 +2115,10 @@ function BranchSelector({
     );
   }
 
-  function handleSelect(value: string, event: ReactMouseEvent<HTMLButtonElement>) {
+  function handleSelect(
+    value: string,
+    event: ReactMouseEvent<HTMLButtonElement>,
+  ) {
     event.currentTarget.closest("details")?.removeAttribute("open");
     onChange(value);
   }
@@ -1855,11 +2135,15 @@ function BranchSelector({
     >
       <summary
         aria-disabled={disabled}
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${disabled ? "text-stone-500" : "text-stone-900 hover:border-stone-300"
-          }`}
+        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
+          disabled ? "text-stone-500" : "text-stone-900 hover:border-stone-300"
+        }`}
         title={t("Git branch")}
       >
-        <GitBranch aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <GitBranch
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-teal-700"
+        />
         <span className="composer-select-label min-w-0 flex-1 truncate">
           {currentBranch}
         </span>
@@ -1878,10 +2162,11 @@ function BranchSelector({
             branches.map((branch) => (
               <button
                 aria-label={t("Switch to branch {name}", { name: branch })}
-                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent ${branch === currentBranch
+                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent ${
+                  branch === currentBranch
                     ? "font-semibold text-teal-900"
                     : "text-stone-700"
-                  }`}
+                }`}
                 disabled={disabled}
                 key={branch}
                 onClick={(event) => handleSelect(branch, event)}
@@ -1890,7 +2175,10 @@ function BranchSelector({
                 <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
                 <span className="min-w-0 flex-1 truncate">{branch}</span>
                 {branch === currentBranch ? (
-                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0"
+                  />
                 ) : null}
               </button>
             ))
@@ -1905,10 +2193,11 @@ function BranchSelector({
           {displayedWorktrees.length ? (
             displayedWorktrees.map((worktree) => (
               <div
-                className={`flex min-h-11 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm ${worktree.isCurrent
+                className={`flex min-h-11 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm ${
+                  worktree.isCurrent
                     ? "font-semibold text-teal-900"
                     : "text-stone-700"
-                  }`}
+                }`}
                 key={worktree.path}
                 title={worktree.path}
               >
@@ -1920,7 +2209,10 @@ function BranchSelector({
                   </span>
                 </span>
                 {worktree.isCurrent ? (
-                  <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                  <CheckCircle2
+                    aria-hidden="true"
+                    className="size-3.5 shrink-0"
+                  />
                 ) : null}
               </div>
             ))
@@ -2005,13 +2297,17 @@ function ReasoningBlock({
   const [isExpanded, setIsExpanded] = useState(isStreaming);
   const preview = compactInlineText(reasoning);
   const durationLabel = formatNullableLatencySeconds(durationMs, language);
-  const durationTitle = t("Thinking duration {duration}", { duration: durationLabel });
+  const durationTitle = t("Thinking duration {duration}", {
+    duration: durationLabel,
+  });
 
   useEffect(() => {
     setIsExpanded(isStreaming);
   }, [isStreaming]);
 
-  const toggleLabel = isExpanded ? t("Collapse thinking") : t("Expand thinking");
+  const toggleLabel = isExpanded
+    ? t("Collapse thinking")
+    : t("Expand thinking");
 
   return (
     <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 p-2 text-stone-600">
@@ -2024,9 +2320,15 @@ function ReasoningBlock({
         type="button"
       >
         {isExpanded ? (
-          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+          <ChevronDown
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-teal-700"
+          />
         ) : (
-          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+          <ChevronRight
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-teal-700"
+          />
         )}
         <span className="shrink-0 font-semibold">{t("Thinking")}</span>
         {isExpanded ? null : (
@@ -2085,9 +2387,7 @@ function MessagePartBlockComponent({
       <ReasoningBlock
         helpers={helpers}
         durationMs={
-          part.liveDurationMs ??
-          part.durationMs ??
-          reasoningDurationFallbackMs
+          part.liveDurationMs ?? part.durationMs ?? reasoningDurationFallbackMs
         }
         isStreaming={isStreaming && isStreamingTail}
         reasoning={part.text}
@@ -2110,7 +2410,13 @@ function MessagePartBlockComponent({
   }
 
   if (part.type === "attachment") {
-    return <AttachmentPartBlock attachment={part.attachment} helpers={helpers} isUser={isUser} />;
+    return (
+      <AttachmentPartBlock
+        attachment={part.attachment}
+        helpers={helpers}
+        isUser={isUser}
+      />
+    );
   }
 
   if (part.type === "error") {
@@ -2138,7 +2444,9 @@ function MessagePartBlockComponent({
       content={part.text}
       isError={isError}
       isUser={isUser}
-      renderMode={!isUser && isStreaming && isStreamingTail ? "streaming" : "full"}
+      renderMode={
+        !isUser && isStreaming && isStreamingTail ? "streaming" : "full"
+      }
       selectedSkillPrefix={helpers.selectedSkillPrefix}
     />
   );
@@ -2171,8 +2479,9 @@ function ComposerAttachmentChip({
 
   return (
     <span
-      className={`composer-attachment-chip ${attachment.previewDataUrl ? "composer-attachment-chip-image" : ""
-        }`}
+      className={`composer-attachment-chip ${
+        attachment.previewDataUrl ? "composer-attachment-chip-image" : ""
+      }`}
       title={title}
     >
       {attachment.previewDataUrl ? (
@@ -2210,8 +2519,9 @@ function AttachmentPartBlock({
 
   return (
     <div
-      className={`message-attachment-part ${isUser ? "message-attachment-part-user" : ""
-        }`}
+      className={`message-attachment-part ${
+        isUser ? "message-attachment-part-user" : ""
+      }`}
       title={title}
     >
       {attachment.previewDataUrl ? (
@@ -2277,7 +2587,11 @@ function memoryMetaLabel(value: string, t: Translate) {
   return t(`memory.${value}`);
 }
 
-function MemoriesUsedBlock({ memories }: { memories: ChatMemoryUsedSummary[] }) {
+function MemoriesUsedBlock({
+  memories,
+}: {
+  memories: ChatMemoryUsedSummary[];
+}) {
   const { t } = useI18n();
   if (!memories.length) {
     return null;
@@ -2362,12 +2676,18 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
     return null;
   }
 
-  const lineCount = updates.reduce((count, update) => count + update.lines.length, 0);
+  const lineCount = updates.reduce(
+    (count, update) => count + update.lines.length,
+    0,
+  );
 
   return (
     <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
       <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
-        <FileText aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <FileText
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-teal-700"
+        />
         <span>{t("Spec updated")}</span>
         <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
           {lineCount}
@@ -2389,10 +2709,11 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
             <div className="panel-scroll max-h-56 overflow-auto py-1 font-mono text-[11px] leading-5">
               {update.lines.map((line, index) => (
                 <div
-                  className={`whitespace-pre-wrap break-words px-2.5 ${line.kind === "added"
-                    ? "bg-emerald-50 text-emerald-800"
-                    : "bg-rose-50 text-rose-800"
-                    }`}
+                  className={`whitespace-pre-wrap break-words px-2.5 ${
+                    line.kind === "added"
+                      ? "bg-emerald-50 text-emerald-800"
+                      : "bg-rose-50 text-rose-800"
+                  }`}
                   key={`${update.id}-${index}`}
                 >
                   <span className="select-none pr-1 font-semibold">
@@ -2421,7 +2742,13 @@ type CompactReplacementDiff = {
 type ToolCallViewMode = "compact" | "raw";
 
 const EMPTY_SELECTED_SKILL_PREFIX: SelectedSkillPrefixResolver = () => null;
-const DIRECT_COMPACT_TEXT_FIELDS = ["content", "text", "message", "note", "error"];
+const DIRECT_COMPACT_TEXT_FIELDS = [
+  "content",
+  "text",
+  "message",
+  "note",
+  "error",
+];
 const ARRAY_COMPACT_SUMMARY_FIELDS = [
   "matches",
   "entries",
@@ -2434,7 +2761,10 @@ const ARRAY_COMPACT_SUMMARY_FIELDS = [
   "results",
 ];
 
-function replacementDiffLines(oldText: string, newText: string): CompactReplacementDiffLine[] {
+function replacementDiffLines(
+  oldText: string,
+  newText: string,
+): CompactReplacementDiffLine[] {
   return [
     ...oldText.split("\n").map((text) => ({
       kind: "removed" as const,
@@ -2451,7 +2781,11 @@ function successfulCompactReplacementDiff(
   toolCall: ChatToolCallSummary,
   input: JsonValue,
 ): CompactReplacementDiff | null {
-  if (toolCall.isError || toolCall.status !== "completed" || !isJsonRecord(input)) {
+  if (
+    toolCall.isError ||
+    toolCall.status !== "completed" ||
+    !isJsonRecord(input)
+  ) {
     return null;
   }
 
@@ -2466,13 +2800,21 @@ function successfulCompactReplacementDiff(
     return { lines: replacementDiffLines(oldStr, newStr) };
   }
 
-  if (toolCall.name !== "update_spec" || !Array.isArray(input.edits) || input.edits.length === 0) {
+  if (
+    toolCall.name !== "update_spec" ||
+    !Array.isArray(input.edits) ||
+    input.edits.length === 0
+  ) {
     return null;
   }
 
   const lines: CompactReplacementDiffLine[] = [];
   for (const edit of input.edits) {
-    if (!isJsonRecord(edit) || typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+    if (
+      !isJsonRecord(edit) ||
+      typeof edit.oldText !== "string" ||
+      typeof edit.newText !== "string"
+    ) {
       return null;
     }
     lines.push(...replacementDiffLines(edit.oldText, edit.newText));
@@ -2481,7 +2823,9 @@ function successfulCompactReplacementDiff(
   return { lines };
 }
 
-function isJsonRecord(value: JsonValue | null | undefined): value is { [key: string]: JsonValue } {
+function isJsonRecord(
+  value: JsonValue | null | undefined,
+): value is { [key: string]: JsonValue } {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -2511,7 +2855,9 @@ function compactArraySummary(
     }
 
     const lines = value
-      .map((item) => compactArrayItemText(item, fieldName, toolName, compactJson))
+      .map((item) =>
+        compactArrayItemText(item, fieldName, toolName, compactJson),
+      )
       .filter(Boolean);
     if (lines.length) {
       return lines.join("\n");
@@ -2534,7 +2880,10 @@ function compactArrayItemText(
   }
 
   const snippetContent = nonEmptyText(item.content);
-  if ((fieldName === "snippets" || toolName === "graph_explore") && snippetContent) {
+  if (
+    (fieldName === "snippets" || toolName === "graph_explore") &&
+    snippetContent
+  ) {
     return snippetContent;
   }
 
@@ -2626,20 +2975,25 @@ function managedCommandPresentation(
 
   const chunks = Array.isArray(output?.chunks)
     ? output.chunks.flatMap((chunk): ManagedCommandChunk[] => {
-      if (!isJsonRecord(chunk)) {
-        return [];
-      }
-      const stream = chunk.stream;
-      const text = chunk.text;
-      if ((stream !== "stdout" && stream !== "stderr") || typeof text !== "string") {
-        return [];
-      }
-      return [{
-        cursor: finiteNumber(chunk.cursor),
-        stream,
-        text,
-      }];
-    })
+        if (!isJsonRecord(chunk)) {
+          return [];
+        }
+        const stream = chunk.stream;
+        const text = chunk.text;
+        if (
+          (stream !== "stdout" && stream !== "stderr") ||
+          typeof text !== "string"
+        ) {
+          return [];
+        }
+        return [
+          {
+            cursor: finiteNumber(chunk.cursor),
+            stream,
+            text,
+          },
+        ];
+      })
     : [];
 
   return {
@@ -2656,7 +3010,8 @@ function managedCommandPresentation(
     nextCursor: finiteNumber(output?.nextCursor),
     pid: finiteNumber(output?.pid),
     processId:
-      nonEmptyText(output?.processId) ?? (inputRecord ? nonEmptyText(inputRecord.processId) : null),
+      nonEmptyText(output?.processId) ??
+      (inputRecord ? nonEmptyText(inputRecord.processId) : null),
     startedAt: timestampMilliseconds(output?.startedAt),
     status: nonEmptyText(output?.status),
     terminationReason: nonEmptyText(output?.terminationReason),
@@ -2678,7 +3033,10 @@ function timestampMilliseconds(value: unknown) {
   return null;
 }
 
-function managedCommandDuration(startedAt: number | null, endedAt: number | null) {
+function managedCommandDuration(
+  startedAt: number | null,
+  endedAt: number | null,
+) {
   if (startedAt === null) {
     return null;
   }
@@ -2692,7 +3050,10 @@ function managedCommandDuration(startedAt: number | null, endedAt: number | null
   return `${Math.floor(elapsed / 60_000)}m ${Math.floor((elapsed % 60_000) / 1_000)}s`;
 }
 
-function managedCommandStatusLabel(presentation: ManagedCommandPresentation, t: Translate) {
+function managedCommandStatusLabel(
+  presentation: ManagedCommandPresentation,
+  t: Translate,
+) {
   switch (presentation.status) {
     case "running":
       return t("Background running");
@@ -2733,11 +3094,21 @@ function CommandChunkLog({ chunks }: { chunks: ManagedCommandChunk[] }) {
   }
 
   return (
-    <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}>
+    <div
+      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}
+    >
       {chunks.map((chunk, index) => (
-        <div className="mb-2 last:mb-0" key={`${chunk.cursor ?? "unknown"}-${index}`}>
-          <span className={chunk.stream === "stderr" ? "text-rose-700" : "text-teal-700"}>
-            [{chunk.stream}{chunk.cursor === null ? "" : ` · ${chunk.cursor}`}]
+        <div
+          className="mb-2 last:mb-0"
+          key={`${chunk.cursor ?? "unknown"}-${index}`}
+        >
+          <span
+            className={
+              chunk.stream === "stderr" ? "text-rose-700" : "text-teal-700"
+            }
+          >
+            [{chunk.stream}
+            {chunk.cursor === null ? "" : ` · ${chunk.cursor}`}]
           </span>
           <pre className="whitespace-pre-wrap break-words">{chunk.text}</pre>
         </div>
@@ -2756,9 +3127,12 @@ function ManagedCommandSummary({
   t: Translate;
 }) {
   const statusLabel = managedCommandStatusLabel(presentation, t);
-  const duration = managedCommandDuration(presentation.startedAt, presentation.endedAt);
+  const duration = managedCommandDuration(
+    presentation.startedAt,
+    presentation.endedAt,
+  );
   const cursorRangeStart = presentation.cursorExpired
-    ? presentation.availableFromCursor ?? presentation.fromCursor
+    ? (presentation.availableFromCursor ?? presentation.fromCursor)
     : presentation.fromCursor;
   const cursorRange =
     cursorRangeStart === null
@@ -2766,24 +3140,36 @@ function ManagedCommandSummary({
       : presentation.nextCursor === null
         ? String(cursorRangeStart)
         : `${cursorRangeStart}–${presentation.nextCursor}`;
-  const terminal = presentation.status !== null && presentation.status !== "running";
+  const terminal =
+    presentation.status !== null && presentation.status !== "running";
 
   return (
     <div className="grid min-w-0 gap-2">
-      <div className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation.status)}`}>
-        {statusLabel ? <span className="font-semibold">{statusLabel}</span> : null}
-        {presentation.processId ? <span className="font-mono">{presentation.processId}</span> : null}
+      <div
+        className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation.status)}`}
+      >
+        {statusLabel ? (
+          <span className="font-semibold">{statusLabel}</span>
+        ) : null}
+        {presentation.processId ? (
+          <span className="font-mono">{presentation.processId}</span>
+        ) : null}
         {presentation.pid !== null ? <span>PID {presentation.pid}</span> : null}
         {duration ? <span>{duration}</span> : null}
-        {presentation.terminationReason ? <span>{presentation.terminationReason}</span> : null}
+        {presentation.terminationReason ? (
+          <span>{presentation.terminationReason}</span>
+        ) : null}
       </div>
       {presentation.command ? (
         <div className="min-w-0 font-mono text-[11px] text-stone-600">
-          {presentation.command}{presentation.cwd ? ` · cwd: ${presentation.cwd}` : ""}
+          {presentation.command}
+          {presentation.cwd ? ` · cwd: ${presentation.cwd}` : ""}
         </div>
       ) : null}
       {toolName === "get_command_output" && cursorRange ? (
-        <div className="font-mono text-[11px] text-stone-500">cursor {cursorRange}</div>
+        <div className="font-mono text-[11px] text-stone-500">
+          cursor {cursorRange}
+        </div>
       ) : null}
       {presentation.cursorExpired ? (
         <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
@@ -2792,11 +3178,15 @@ function ManagedCommandSummary({
       ) : null}
       <CommandChunkLog chunks={presentation.chunks} />
       {!presentation.chunks.length && presentation.isBackgroundStart ? (
-        <div className="font-mono text-[11px] text-stone-500">{t("Background process started, no output yet")}</div>
+        <div className="font-mono text-[11px] text-stone-500">
+          {t("Background process started, no output yet")}
+        </div>
       ) : null}
       {!presentation.chunks.length && toolName === "get_command_output" ? (
         <div className="font-mono text-[11px] text-stone-500">
-          {terminal ? t("Process ended, no more output") : t("Still running, no new output")}
+          {terminal
+            ? t("Process ended, no more output")
+            : t("Still running, no new output")}
         </div>
       ) : null}
       {presentation.hasMore ? (
@@ -2864,7 +3254,11 @@ function compactToolCallText(
   }
 
   if (toolCall.name === "run_command") {
-    return commandOutputText(output) ?? liveOutputText ?? (output === null ? compactJson(input) : compactJson(output));
+    return (
+      commandOutputText(output) ??
+      liveOutputText ??
+      (output === null ? compactJson(input) : compactJson(output))
+    );
   }
 
   if (typeof output === "string" && output.trim()) {
@@ -2876,7 +3270,11 @@ function compactToolCallText(
     if (directText) {
       return directText;
     }
-    const arraySummary = compactArraySummary(output, toolCall.name, compactJson);
+    const arraySummary = compactArraySummary(
+      output,
+      toolCall.name,
+      compactJson,
+    );
     if (arraySummary) {
       return arraySummary;
     }
@@ -2885,20 +3283,29 @@ function compactToolCallText(
   return output === null ? compactJson(input) : compactJson(output);
 }
 
-function CompactReplacementDiffBlock({ diff }: { diff: CompactReplacementDiff }) {
+function CompactReplacementDiffBlock({
+  diff,
+}: {
+  diff: CompactReplacementDiff;
+}) {
   return (
     <div className="min-w-0">
       <div className="mb-1 font-semibold text-stone-500">Diff</div>
-      <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5`}>
+      <div
+        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5`}
+      >
         {diff.lines.map((line, index) => (
           <div
-            className={`edit-file-diff-line grid grid-cols-[1.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${line.kind === "added"
-              ? "bg-emerald-50 text-emerald-800"
-              : "bg-rose-50 text-rose-800"
-              }`}
+            className={`edit-file-diff-line grid grid-cols-[1.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${
+              line.kind === "added"
+                ? "bg-emerald-50 text-emerald-800"
+                : "bg-rose-50 text-rose-800"
+            }`}
             key={`${line.kind}-${index}`}
           >
-            <span className="select-none font-semibold">{line.kind === "added" ? "+" : "-"}</span>
+            <span className="select-none font-semibold">
+              {line.kind === "added" ? "+" : "-"}
+            </span>
             <span>{line.text}</span>
           </div>
         ))}
@@ -2924,7 +3331,9 @@ function RawToolCallView({
     <>
       <div className="min-w-0">
         <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
-        <pre className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5`}>
+        <pre
+          className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5`}
+        >
           {formatJsonValue(input)}
         </pre>
       </div>
@@ -2932,10 +3341,11 @@ function RawToolCallView({
         <div className="min-w-0">
           <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
           <pre
-            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
-              ? "border-rose-200 text-rose-700"
-              : "border-stone-200"
-              }`}
+            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+              toolCall.isError
+                ? "border-rose-200 text-rose-700"
+                : "border-stone-200"
+            }`}
           >
             {formatJsonValue(toolCall.output)}
           </pre>
@@ -2945,12 +3355,13 @@ function RawToolCallView({
           <div className="mb-1 font-semibold text-stone-500">
             {t("Live output")}
           </div>
-          <pre className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}>
+          <pre
+            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}
+          >
             {liveOutputText}
           </pre>
         </div>
       ) : null}
-
     </>
   );
 }
@@ -2974,15 +3385,25 @@ function CompactToolCallView({
     return <CompactReplacementDiffBlock diff={diff} />;
   }
 
-  const managedCommand = toolCall.isError ? null : managedCommandPresentation(toolCall, input);
+  const managedCommand = toolCall.isError
+    ? null
+    : managedCommandPresentation(toolCall, input);
   if (managedCommand) {
-    return <ManagedCommandSummary presentation={managedCommand} t={t} toolName={toolCall.name} />;
+    return (
+      <ManagedCommandSummary
+        presentation={managedCommand}
+        t={t}
+        toolName={toolCall.name}
+      />
+    );
   }
 
   const specMarkdown = successfulSpecMarkdown(toolCall);
   if (specMarkdown !== null) {
     return (
-      <div className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3`}>
+      <div
+        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3`}
+      >
         <MarkdownContent
           content={specMarkdown}
           isUser={false}
@@ -2992,18 +3413,29 @@ function CompactToolCallView({
     );
   }
 
-  const text = compactToolCallText(toolCall, input, liveOutputText, compactJson);
+  const text = compactToolCallText(
+    toolCall,
+    input,
+    liveOutputText,
+    compactJson,
+  );
   return (
     <pre
-      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${toolCall.isError
-        ? "border-rose-200 text-rose-700"
-        : "border-stone-200 text-stone-700"
-        }`}
-    >{text}</pre>
+      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
+        toolCall.isError
+          ? "border-rose-200 text-rose-700"
+          : "border-stone-200 text-stone-700"
+      }`}
+    >
+      {text}
+    </pre>
   );
 }
 
-function contextCompressionKindLabel(kind: "rule" | "llm" | "runtimeToolState", t: Translate) {
+function contextCompressionKindLabel(
+  kind: "rule" | "llm" | "runtimeToolState",
+  t: Translate,
+) {
   if (kind === "llm") {
     return t("LLM");
   }
@@ -3028,7 +3460,10 @@ function formatContextCompressionTokenDelta(
   summaryTokenCount: number | null | undefined,
   t: Translate,
 ) {
-  if (typeof originalTokenCount !== "number" || typeof summaryTokenCount !== "number") {
+  if (
+    typeof originalTokenCount !== "number" ||
+    typeof summaryTokenCount !== "number"
+  ) {
     return "-";
   }
   const savedTokens = Math.max(0, originalTokenCount - summaryTokenCount);
@@ -3054,12 +3489,19 @@ function ContextCompressionBlock({
     summaryTokenCount,
     t,
   );
-  const modelLabel = [detail.providerId, detail.modelId].filter(Boolean).join(" / ") || "-";
+  const modelLabel =
+    [detail.providerId, detail.modelId].filter(Boolean).join(" / ") || "-";
   const fields = [
     [t("Original tokens"), originalTokenCount?.toLocaleString() ?? "-"],
     [t("Compressed tokens"), summaryTokenCount?.toLocaleString() ?? "-"],
-    [t("Started"), detail.startedAt ? formatChatCreatedAt(detail.startedAt) : "-"],
-    [t("Ended"), detail.completedAt ? formatChatCreatedAt(detail.completedAt) : "-"],
+    [
+      t("Started"),
+      detail.startedAt ? formatChatCreatedAt(detail.startedAt) : "-",
+    ],
+    [
+      t("Ended"),
+      detail.completedAt ? formatChatCreatedAt(detail.completedAt) : "-",
+    ],
     [t("Provider"), detail.providerId || "-"],
     [t("Model"), detail.modelId || "-"],
     ["snapshotId", detail.snapshotId ?? "-"],
@@ -3072,8 +3514,13 @@ function ContextCompressionBlock({
       className="tool-call-block group min-w-0"
     >
       <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
-        <Shrink aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="min-w-0 shrink-0 truncate">{t("Context compression")}</span>
+        <Shrink
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-teal-700"
+        />
+        <span className="min-w-0 shrink-0 truncate">
+          {t("Context compression")}
+        </span>
         <span className="shrink-0 text-stone-300">·</span>
         <span className="shrink-0 text-stone-500">{kindLabel}</span>
         <span
@@ -3084,12 +3531,13 @@ function ContextCompressionBlock({
         </span>
         <span
           aria-live={compression.status === "start" ? "polite" : undefined}
-          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${compression.status === "completed"
+          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${
+            compression.status === "completed"
               ? "bg-emerald-50 text-emerald-700"
               : compression.status === "start"
                 ? "bg-amber-50 text-amber-800"
                 : "bg-stone-100 text-stone-600"
-            }`}
+          }`}
         >
           {statusLabel}
         </span>
@@ -3104,7 +3552,9 @@ function ContextCompressionBlock({
       <div className="mt-2 grid gap-1.5 border-l border-stone-200 pl-3 text-[11px] text-stone-600">
         {fields.map(([label, value]) => (
           <div className="flex min-w-0 gap-2" key={label}>
-            <span className="w-32 shrink-0 font-semibold text-stone-500">{label}</span>
+            <span className="w-32 shrink-0 font-semibold text-stone-500">
+              {label}
+            </span>
             <span className="min-w-0 flex-1 truncate font-mono" title={value}>
               {value}
             </span>
@@ -3138,14 +3588,21 @@ function ToolCallBlock({
   const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
   const toolCallRootRef = useRef<HTMLDivElement>(null);
   const input = normalizedToolInput(toolCall.input);
-  const compactReplacementDiff = successfulCompactReplacementDiff(toolCall, input);
+  const compactReplacementDiff = successfulCompactReplacementDiff(
+    toolCall,
+    input,
+  );
   const detailText = toolCallDetailText(toolCall);
   const changeStats = toolCallChangeStats(toolCall);
   const liveOutputText = toolLiveOutputText(toolCall.liveOutput);
   const managedCommand = managedCommandPresentation(toolCall, input);
-  const managedStatusLabel = managedCommand ? managedCommandStatusLabel(managedCommand, t) : null;
+  const managedStatusLabel = managedCommand
+    ? managedCommandStatusLabel(managedCommand, t)
+    : null;
   const summaryStatusLabel =
-    !toolCall.isError && managedStatusLabel ? managedStatusLabel : toolStatusText(toolCall, t);
+    !toolCall.isError && managedStatusLabel
+      ? managedStatusLabel
+      : toolStatusText(toolCall, t);
   const summaryStatusClass = toolCall.isError
     ? "bg-rose-50 text-rose-700"
     : managedCommand && managedStatusLabel
@@ -3197,11 +3654,16 @@ function ToolCallBlock({
           className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden"
           title={toolCall.name}
         >
-          <ToolIcon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+          <ToolIcon
+            aria-hidden="true"
+            className="size-3.5 shrink-0 text-teal-700"
+          />
           <span className="min-w-0 shrink-0 truncate">{displayName}</span>
           {changeStats ? (
             <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
-              <span className="text-emerald-700">+{changeStats.linesAdded}</span>{" "}
+              <span className="text-emerald-700">
+                +{changeStats.linesAdded}
+              </span>{" "}
               <span className="text-rose-700">-{changeStats.linesRemoved}</span>
             </span>
           ) : null}
@@ -3226,18 +3688,32 @@ function ToolCallBlock({
           <div className="flex min-w-0 items-start justify-between gap-2 text-[11px] text-stone-500">
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
               <span>
-                <span className="font-semibold text-stone-500">{t("Started")}</span>{" "}
-                <span>{toolCall.startedAt ? formatChatCreatedAt(toolCall.startedAt) : "-"}</span>
+                <span className="font-semibold text-stone-500">
+                  {t("Started")}
+                </span>{" "}
+                <span>
+                  {toolCall.startedAt
+                    ? formatChatCreatedAt(toolCall.startedAt)
+                    : "-"}
+                </span>
               </span>
               <span>
-                <span className="font-semibold text-stone-500">{t("Ended")}</span>{" "}
-                <span>{toolCall.completedAt ? formatChatCreatedAt(toolCall.completedAt) : "-"}</span>
+                <span className="font-semibold text-stone-500">
+                  {t("Ended")}
+                </span>{" "}
+                <span>
+                  {toolCall.completedAt
+                    ? formatChatCreatedAt(toolCall.completedAt)
+                    : "-"}
+                </span>
               </span>
             </div>
             <button
               aria-label={toggleLabel}
               className="shrink-0 rounded border border-stone-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-stone-600 hover:border-stone-300 hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
-              onClick={() => setViewMode(viewMode === "compact" ? "raw" : "compact")}
+              onClick={() =>
+                setViewMode(viewMode === "compact" ? "raw" : "compact")
+              }
               type="button"
             >
               {toggleLabel}
