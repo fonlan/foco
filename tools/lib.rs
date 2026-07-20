@@ -1,4 +1,5 @@
 mod agent_tools;
+mod background_command;
 mod command_tools;
 mod definitions;
 mod errors;
@@ -10,6 +11,13 @@ mod spec_patch;
 mod spec_tools;
 mod todo_tools;
 
+pub use background_command::{
+    BACKGROUND_COMMAND_RETENTION, BackgroundCommandError, BackgroundCommandLimits,
+    BackgroundCommandOutput, BackgroundCommandOutputChunk, BackgroundCommandOutputStream,
+    BackgroundCommandRegistry, BackgroundCommandRequest, BackgroundCommandSnapshot,
+    BackgroundCommandStatus, BackgroundCommandTermination, MAX_BACKGROUND_COMMAND_OUTPUT_BYTES,
+    MAX_BACKGROUND_COMMANDS_PER_WORKSPACE,
+};
 pub use spec_patch::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
 
 use std::{
