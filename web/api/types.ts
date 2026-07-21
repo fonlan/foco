@@ -477,6 +477,7 @@ export type ChatContextCompressionKind = "rule" | "llm" | "runtimeToolState";
 export type ChatContextCompressionDetail = {
   status?: string;
   kind?: ChatContextCompressionKind;
+  compressionId?: string | null;
   snapshotId?: string | null;
   originalTokenCount?: number | null;
   summaryTokenCount?: number | null;
@@ -726,6 +727,7 @@ export type ChatStreamEvent =
   | {
       type: "contextCompression";
       assistantMessageId: string;
+      compressionId?: string;
       snapshotId?: string;
       kind: ChatContextCompressionKind;
       status: string;

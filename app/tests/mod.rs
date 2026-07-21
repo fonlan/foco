@@ -7446,6 +7446,7 @@ fn assistant_parts_checkpoint_replay_start_index_uses_last_active_llm_part() {
             detail: ContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: "llm".to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-old".to_string()),
                 original_token_count: Some(10),
                 summary_token_count: Some(2),
@@ -7465,6 +7466,7 @@ fn assistant_parts_checkpoint_replay_start_index_uses_last_active_llm_part() {
             detail: ContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: "llm".to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-new".to_string()),
                 original_token_count: Some(20),
                 summary_token_count: Some(3),
@@ -9339,7 +9341,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
-    assert!(metadata_json.contains(r#""partsVersion":5"#));
+    assert!(metadata_json.contains(r#""partsVersion":6"#));
     assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
@@ -9523,6 +9525,73 @@ fn finalized_assistant_parts_keep_start_only_compression_without_completed() {
 }
 
 #[test]
+fn stable_compression_ids_keep_same_second_events_distinct() {
+    let mut parts = Vec::new();
+    for value in [
+        json!({
+            "type": "contextCompression",
+            "kind": "llm",
+            "status": "start",
+            "detail": {
+                "status": "start",
+                "kind": "llm",
+                "compressionId": "compression-interrupted",
+                "startedAt": "2026-06-18T10:00:00Z",
+                "providerId": "provider",
+                "modelId": "model"
+            }
+        }),
+        json!({
+            "type": "contextCompression",
+            "kind": "llm",
+            "status": "start",
+            "detail": {
+                "status": "start",
+                "kind": "llm",
+                "compressionId": "compression-success",
+                "startedAt": "2026-06-18T10:00:00Z",
+                "providerId": "provider",
+                "modelId": "model"
+            }
+        }),
+        json!({
+            "type": "contextCompression",
+            "kind": "llm",
+            "status": "completed",
+            "snapshotId": "snapshot-success",
+            "detail": {
+                "status": "completed",
+                "kind": "llm",
+                "compressionId": "compression-success",
+                "snapshotId": "snapshot-success",
+                "startedAt": "2026-06-18T10:00:00Z",
+                "completedAt": "2026-06-18T10:00:01Z",
+                "providerId": "provider",
+                "modelId": "model"
+            }
+        }),
+    ] {
+        push_context_compression_part(&mut parts, &value);
+    }
+
+    assert_eq!(parts.len(), 2);
+    assert!(matches!(
+        &parts[0],
+        ChatMessagePart::ContextCompression { id, status, detail, .. }
+            if id == "compression-interrupted"
+                && status == "start"
+                && detail.snapshot_id.is_none()
+    ));
+    assert!(matches!(
+        &parts[1],
+        ChatMessagePart::ContextCompression { id, status, detail, .. }
+            if id == "compression-success"
+                && status == "completed"
+                && detail.snapshot_id.as_deref() == Some("snapshot-success")
+    ));
+}
+
+#[test]
 fn historical_chat_materializes_start_and_completed_compression_from_run_events() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-history-compression-parts-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -9602,21 +9671,54 @@ fn historical_chat_materializes_start_and_completed_compression_from_run_events(
             .expect("run event insert");
     }
 
+    for (id, sequence, original_token_count, summary_token_count) in [
+        ("llm-snapshot-1", 1, 5000, 1200),
+        ("llm-snapshot-2", 2, 4100, 900),
+        ("llm-snapshot-3", 3, 3600, 700),
+    ] {
+        database
+            .insert_context_compression_snapshot(NewContextCompressionSnapshot {
+                id,
+                chat_id: "chat-1",
+                run_id: "run-1",
+                sequence,
+                summary: "Checkpoint summary.",
+                source_message_start_sequence: 0,
+                source_message_end_sequence: sequence,
+                original_token_count,
+                summary_token_count,
+                metadata_json: None,
+            })
+            .expect("context compression snapshot insert");
+    }
+
     let messages = database.messages_for_chat("chat-1").expect("messages");
     let summary = chat_message_summaries(&mut database, &workspace_dir, None, "chat-1", messages)
         .expect("message summaries")
         .into_iter()
         .next()
         .expect("assistant summary");
-    assert_eq!(summary.parts.len(), 2);
-    assert!(matches!(
-        &summary.parts[0],
-        ChatMessagePart::ContextCompression { status, detail, .. }
-            if status == "completed"
-                && detail.snapshot_id.as_deref() == Some("llm-snapshot-1")
-                && detail.summary_token_count == Some(1200)
-    ));
-    assert!(matches!(&summary.parts[1], ChatMessagePart::Text { text } if text == "Answer."));
+    assert_eq!(summary.parts.len(), 4);
+    let compression_snapshot_ids = summary
+        .parts
+        .iter()
+        .filter_map(|part| match part {
+            ChatMessagePart::ContextCompression { status, detail, .. } if status == "completed" => {
+                detail.snapshot_id.as_deref()
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        compression_snapshot_ids,
+        BTreeSet::from(["llm-snapshot-1", "llm-snapshot-2", "llm-snapshot-3"])
+    );
+    assert!(
+        summary
+            .parts
+            .iter()
+            .any(|part| matches!(part, ChatMessagePart::Text { text } if text == "Answer."))
+    );
 
     // Idempotent: second load prefers current-version parts and does not duplicate.
     let messages = database
@@ -9628,7 +9730,7 @@ fn historical_chat_materializes_start_and_completed_compression_from_run_events(
             .into_iter()
             .next()
             .expect("assistant summary reload");
-    assert_eq!(summary_again.parts.len(), 2);
+    assert_eq!(summary_again.parts.len(), 4);
     assert!(matches!(
         &summary_again.parts[0],
         ChatMessagePart::ContextCompression { status, .. } if status == "completed"
@@ -9638,7 +9740,7 @@ fn historical_chat_materializes_start_and_completed_compression_from_run_events(
         .message("assistant-1")
         .expect("saved message read")
         .expect("saved message");
-    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":6"#));
     assert!(
         saved
             .metadata_json
@@ -9721,7 +9823,7 @@ fn historical_chat_prefers_current_live_sse_parts_without_rematerializing() {
     database
         .insert_chat("chat-1", "Live parts")
         .expect("chat insert");
-    let live_metadata = r#"{"parts":[{"type":"contextCompression","id":"llm-snapshot-live","status":"completed","kind":"llm","detail":{"status":"completed","kind":"llm","snapshotId":"llm-snapshot-live","originalTokenCount":100,"summaryTokenCount":10,"startedAt":"2026-06-18T10:00:00Z","completedAt":"2026-06-18T10:00:01Z","providerId":"openai","modelId":"gpt-test"}},{"type":"text","text":"From live."}],"partsVersion":5,"partsSource":"live_sse"}"#;
+    let live_metadata = r#"{"parts":[{"type":"contextCompression","id":"llm-snapshot-live","status":"completed","kind":"llm","detail":{"status":"completed","kind":"llm","snapshotId":"llm-snapshot-live","originalTokenCount":100,"summaryTokenCount":10,"startedAt":"2026-06-18T10:00:00Z","completedAt":"2026-06-18T10:00:01Z","providerId":"openai","modelId":"gpt-test"}},{"type":"text","text":"From live."}],"partsVersion":6,"partsSource":"live_sse"}"#;
     database
         .insert_message(NewMessage {
             id: "assistant-1",
@@ -10171,7 +10273,7 @@ fn historical_chat_materializes_interleaved_parts_once_from_run_events() {
         .expect("saved message read")
         .expect("saved message");
     assert!(saved.metadata_json.contains(r#""tool_call_id":"tool-1""#));
-    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":6"#));
     assert!(
         saved
             .metadata_json
@@ -10333,7 +10435,7 @@ fn historical_chat_materializes_streaming_draft_parts_from_run_events() {
             .metadata_json
             .contains(r#""partsSource":"run_events""#)
     );
-    assert!(saved.metadata_json.contains(r#""partsVersion":5"#));
+    assert!(saved.metadata_json.contains(r#""partsVersion":6"#));
 
     drop(database);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");

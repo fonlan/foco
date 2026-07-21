@@ -554,12 +554,14 @@ impl RemoteSidecarRuntimeToolState {
         if !compressed {
             return Ok(false);
         }
+        let compression_id = unique_id("compression");
         remote_push_context_compression_event(
             events,
             event_tx,
             RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                compression_id: Some(compression_id.clone()),
                 snapshot_id: None,
                 original_token_count: None,
                 summary_token_count: None,
@@ -575,6 +577,7 @@ impl RemoteSidecarRuntimeToolState {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE.to_string(),
+                compression_id: Some(compression_id.clone()),
                 snapshot_id: None,
                 original_token_count: None,
                 summary_token_count: None,
@@ -623,6 +626,7 @@ impl RemoteSidecarRuntimeToolState {
         let checkpoint_messages = plan.checkpoint_messages;
         let covered_snapshot_ids = plan.covered_snapshot_ids;
         let covered_sequences = plan.covered_sequences;
+        let compression_id = unique_id("compression");
         let compression_started_at = utc_timestamp();
         // Live start before the first broker contextCompression request.
         remote_push_context_compression_event(
@@ -631,6 +635,7 @@ impl RemoteSidecarRuntimeToolState {
             RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: Some(compression_id.clone()),
                 snapshot_id: None,
                 original_token_count: Some(i64::try_from(original_tokens).map_err(|_| {
                     ApiError::internal("context compression original token count exceeds i64")
@@ -799,6 +804,7 @@ impl RemoteSidecarRuntimeToolState {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: Some(compression_id),
                 snapshot_id: Some(prepared.snapshot.id.clone()),
                 original_token_count: Some(prepared.snapshot.original_token_count),
                 summary_token_count: Some(prepared.snapshot.summary_token_count),
@@ -8399,13 +8405,17 @@ fn remote_chat_parts(content: &str, reasoning: Option<&str>) -> Vec<Value> {
 fn remote_context_compression_part_id(
     detail: &RemoteSidecarContextCompressionEventDetail,
 ) -> String {
-    detail.snapshot_id.clone().unwrap_or_else(|| {
-        format!(
-            "{}:{}",
-            detail.kind,
-            detail.started_at.as_deref().unwrap_or("pending")
-        )
-    })
+    detail
+        .compression_id
+        .clone()
+        .or_else(|| detail.snapshot_id.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                detail.kind,
+                detail.started_at.as_deref().unwrap_or("pending")
+            )
+        })
 }
 
 fn remote_context_compression_part(detail: &RemoteSidecarContextCompressionEventDetail) -> Value {
@@ -8417,6 +8427,7 @@ fn remote_context_compression_part(detail: &RemoteSidecarContextCompressionEvent
         "detail": {
             "status": detail.status,
             "kind": detail.kind,
+            "compressionId": detail.compression_id,
             "snapshotId": detail.snapshot_id,
             "originalTokenCount": detail.original_token_count,
             "summaryTokenCount": detail.summary_token_count,
@@ -8434,34 +8445,39 @@ fn remote_context_compression_parts_match(current: &Value, next: &Value) -> bool
     {
         return false;
     }
-    let current_id = current.get("id").and_then(Value::as_str);
-    let next_id = next.get("id").and_then(Value::as_str);
-    if current_id.is_some() && current_id == next_id {
-        return true;
+    let current_detail = current.get("detail");
+    let next_detail = next.get("detail");
+    let current_compression_id = current_detail
+        .and_then(|detail| detail.get("compressionId"))
+        .and_then(Value::as_str);
+    let next_compression_id = next_detail
+        .and_then(|detail| detail.get("compressionId"))
+        .and_then(Value::as_str);
+    match (current_compression_id, next_compression_id) {
+        (Some(current_id), Some(next_id)) => return current_id == next_id,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
     }
+
     let current_kind = current.get("kind").and_then(Value::as_str);
     let next_kind = next.get("kind").and_then(Value::as_str);
-    let current_started = current
-        .get("detail")
+    let current_started = current_detail
         .and_then(|detail| detail.get("startedAt"))
         .and_then(Value::as_str);
-    let next_started = next
-        .get("detail")
+    let next_started = next_detail
         .and_then(|detail| detail.get("startedAt"))
         .and_then(Value::as_str);
-    if current_kind == next_kind && current_started.is_some() && current_started == next_started {
-        return true;
-    }
     let current_status = current.get("status").and_then(Value::as_str);
     let next_status = next.get("status").and_then(Value::as_str);
-    let current_snapshot = current
-        .get("detail")
+    let current_snapshot = current_detail
         .and_then(|detail| detail.get("snapshotId"))
         .filter(|value| !value.is_null());
     current_kind == next_kind
         && current_status == Some("start")
         && next_status == Some("completed")
         && current_snapshot.is_none()
+        && current_started.is_some()
+        && current_started == next_started
 }
 
 fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
@@ -8493,6 +8509,7 @@ fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
         (detail.as_object_mut(), next_detail.as_object())
     {
         for key in [
+            "compressionId",
             "snapshotId",
             "originalTokenCount",
             "summaryTokenCount",
@@ -8525,7 +8542,8 @@ fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
     }
 
     let id = detail
-        .get("snapshotId")
+        .get("compressionId")
+        .or_else(|| detail.get("snapshotId"))
         .and_then(Value::as_str)
         .map(|value| Value::String(value.to_string()))
         .unwrap_or(next_id);
@@ -8819,6 +8837,7 @@ fn remote_assistant_has_usable_parts(metadata: &Value) -> bool {
         .get("parts")
         .and_then(Value::as_array)
         .is_some_and(|parts| !parts.is_empty())
+        && metadata.get("partsVersion").and_then(Value::as_i64) == Some(6)
 }
 
 fn remote_tool_call_part_id(part: &Value) -> Option<&str> {
@@ -8997,6 +9016,7 @@ fn remote_materialize_missing_assistant_parts(
     let mut event_parts_by_message = HashMap::<String, Vec<Value>>::new();
     let mut seen_tool_call_ids_by_message = HashMap::<String, HashSet<String>>::new();
     let mut had_stream_parts_by_message = HashMap::<String, bool>::new();
+    let mut run_ids_by_message = HashMap::<String, HashSet<String>>::new();
 
     for event in &events {
         let Ok(value) = serde_json::from_str::<Value>(&event.payload_json) else {
@@ -9019,6 +9039,10 @@ fn remote_materialize_missing_assistant_parts(
         if !missing_message_ids.iter().any(|id| id == message_id) {
             continue;
         }
+        run_ids_by_message
+            .entry(message_id.to_string())
+            .or_default()
+            .insert(event.run_id.clone());
 
         match event.event_type.as_str() {
             "text_delta" => {
@@ -9134,6 +9158,44 @@ fn remote_materialize_missing_assistant_parts(
         }
     }
 
+    for snapshot in database.context_compression_snapshots_for_chat(chat_id)? {
+        for (message_id, run_ids) in &run_ids_by_message {
+            if !run_ids.contains(&snapshot.run_id) {
+                continue;
+            }
+            let parts = event_parts_by_message
+                .entry(message_id.clone())
+                .or_default();
+            if parts.iter().any(|part| {
+                part.get("detail")
+                    .and_then(|detail| detail.get("snapshotId"))
+                    .and_then(Value::as_str)
+                    == Some(snapshot.id.as_str())
+            }) {
+                continue;
+            }
+            remote_push_context_compression_part_value(
+                parts,
+                json!({
+                    "type": "contextCompression",
+                    "id": snapshot.id,
+                    "status": "completed",
+                    "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                    "detail": {
+                        "status": "completed",
+                        "kind": CONTEXT_COMPRESSION_KIND_LLM,
+                        "compressionId": snapshot.id,
+                        "snapshotId": snapshot.id,
+                        "originalTokenCount": snapshot.original_token_count,
+                        "summaryTokenCount": snapshot.summary_token_count,
+                        "startedAt": snapshot.created_at,
+                        "completedAt": snapshot.created_at,
+                    }
+                }),
+            );
+        }
+    }
+
     for message in messages
         .iter_mut()
         .filter(|message| message.role == "assistant")
@@ -9192,7 +9254,7 @@ fn remote_materialize_missing_assistant_parts(
             &message.id,
             MessageMetadataMutation::SetParts {
                 parts: json!(event_parts),
-                parts_version: 5,
+                parts_version: 6,
                 parts_source: "run_events".to_string(),
             },
         )?;
@@ -13682,7 +13744,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         compression_events,
                         content_parts_prefix,
                     ),
-                    "partsVersion": 5,
+                    "partsVersion": 6,
                     "partsSource": "live_sse",
                     "metrics": metrics,
                 });
@@ -14222,6 +14284,7 @@ enum RemoteSidecarContextCompressionOutcome {
 struct RemoteSidecarContextCompressionEventDetail {
     status: String,
     kind: String,
+    compression_id: Option<String>,
     snapshot_id: Option<String>,
     original_token_count: Option<i64>,
     summary_token_count: Option<i64>,
@@ -14249,12 +14312,14 @@ fn remote_sidecar_context_compression_sse_event(
     json!({
         "type": "contextCompression",
         "assistantMessageId": assistant_message_id,
+        "compressionId": detail.compression_id,
         "snapshotId": detail.snapshot_id,
         "kind": detail.kind,
         "status": detail.status,
         "detail": {
             "status": detail.status,
             "kind": detail.kind,
+            "compressionId": detail.compression_id,
             "snapshotId": detail.snapshot_id,
             "originalTokenCount": detail.original_token_count,
             "summaryTokenCount": detail.summary_token_count,
@@ -15638,7 +15703,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             &run_compression_events,
                             &content_parts_prefix,
                         ),
-                        "partsVersion": 5,
+                        "partsVersion": 6,
                         "partsSource": "live_sse",
                         "streamingState": "failed",
                     });
@@ -15793,7 +15858,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 let metadata = json!({
                     "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
                     "parts": parts,
-                    "partsVersion": 5,
+                    "partsVersion": 6,
                     "partsSource": "live_sse",
                     "streamingState": "failed",
                     "runFailure": {
@@ -16320,7 +16385,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 let metadata = json!({
                     "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
                     "parts": parts,
-                    "partsVersion": 5,
+                    "partsVersion": 6,
                     "partsSource": "live_sse",
                     "streamingState": "failed",
                     "runFailure": {
@@ -17265,7 +17330,7 @@ fn remote_sidecar_fail_reserved_start(
             "message": user_message,
         },
         "parts": [{ "type": "error", "text": user_message }],
-        "partsVersion": 5,
+        "partsVersion": 6,
         "partsSource": "pre_stream_failure",
     })
     .to_string();
@@ -33333,6 +33398,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: Some("compression-1".to_string()),
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -33349,6 +33415,10 @@ mod tests {
         assert_eq!(
             event.get("assistantMessageId").and_then(Value::as_str),
             Some("assistant-1")
+        );
+        assert_eq!(
+            event.get("compressionId").and_then(Value::as_str),
+            Some("compression-1")
         );
         assert_eq!(
             event.get("snapshotId").and_then(Value::as_str),
@@ -33380,6 +33450,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: None,
                 original_token_count: Some(1200),
                 summary_token_count: None,
@@ -33391,6 +33462,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -33429,6 +33501,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1000),
                 summary_token_count: Some(100),
@@ -33440,6 +33513,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-2".to_string()),
                 original_token_count: Some(900),
                 summary_token_count: Some(90),
@@ -33480,6 +33554,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -33631,6 +33706,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -33941,6 +34017,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-legacy".to_string()),
                 original_token_count: Some(900),
                 summary_token_count: Some(90),
@@ -34069,6 +34146,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: None,
                 original_token_count: Some(1200),
                 summary_token_count: None,
@@ -34083,6 +34161,7 @@ mod tests {
             &RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-active".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -34111,6 +34190,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: None,
                 original_token_count: Some(1200),
                 summary_token_count: None,
@@ -34122,6 +34202,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: None,
                 snapshot_id: Some("ctx-active".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),

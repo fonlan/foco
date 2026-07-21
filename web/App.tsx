@@ -15939,6 +15939,8 @@ function contextCompressionEventPart(
     kind: streamEvent.detail?.kind ?? streamEvent.kind,
     snapshotId:
       streamEvent.detail?.snapshotId ?? streamEvent.snapshotId ?? null,
+    compressionId:
+      streamEvent.detail?.compressionId ?? streamEvent.compressionId ?? null,
   });
   return {
     type: "contextCompression",
@@ -15953,7 +15955,11 @@ function contextCompressionPartId(
   kind: ChatContextCompressionKind,
   detail: ChatContextCompressionDetail,
 ) {
-  return detail.snapshotId ?? `${kind}:${detail.startedAt ?? "pending"}`;
+  return (
+    detail.compressionId ??
+    detail.snapshotId ??
+    `${kind}:${detail.startedAt ?? "pending"}`
+  );
 }
 
 function upsertContextCompressionPart(
@@ -15965,9 +15971,7 @@ function upsertContextCompressionPart(
     if (part.type !== "contextCompression") {
       return false;
     }
-    return (
-      part.id === nextPart.id || contextCompressionPartsMatch(part, nextPart)
-    );
+    return contextCompressionPartsMatch(part, nextPart);
   });
 
   if (existingIndex === -1) {
@@ -15985,20 +15989,22 @@ function contextCompressionPartsMatch(
   current: ChatContextCompressionPart,
   next: ChatContextCompressionPart,
 ) {
-  if (current.kind !== next.kind) {
-    return false;
-  }
-  if (
-    current.detail.startedAt &&
-    next.detail.startedAt &&
-    current.detail.startedAt === next.detail.startedAt
-  ) {
-    return true;
+  const currentCompressionId = current.detail.compressionId;
+  const nextCompressionId = next.detail.compressionId;
+  if (currentCompressionId || nextCompressionId) {
+    return Boolean(
+      currentCompressionId &&
+        nextCompressionId &&
+        currentCompressionId === nextCompressionId,
+    );
   }
   return (
+    current.kind === next.kind &&
     current.status === "start" &&
     next.status === "completed" &&
-    !current.detail.snapshotId
+    !current.detail.snapshotId &&
+    Boolean(current.detail.startedAt) &&
+    current.detail.startedAt === next.detail.startedAt
   );
 }
 
@@ -16009,6 +16015,8 @@ function mergeContextCompressionPart(
   const detail = normalizedContextCompressionDetail({
     ...current.detail,
     ...next.detail,
+    compressionId:
+      next.detail.compressionId ?? current.detail.compressionId ?? null,
     snapshotId: next.detail.snapshotId ?? current.detail.snapshotId ?? null,
     originalTokenCount:
       next.detail.originalTokenCount ??
@@ -16023,7 +16031,7 @@ function mergeContextCompressionPart(
   });
   return {
     ...next,
-    id: detail.snapshotId ?? current.id,
+    id: detail.compressionId ?? detail.snapshotId ?? current.id,
     detail,
   };
 }
@@ -16034,6 +16042,7 @@ function normalizedContextCompressionDetail(
   return {
     status: detail.status,
     kind: detail.kind,
+    compressionId: detail.compressionId ?? null,
     snapshotId: detail.snapshotId ?? null,
     originalTokenCount: detail.originalTokenCount ?? null,
     summaryTokenCount: detail.summaryTokenCount ?? null,
@@ -18310,6 +18319,11 @@ function parseContextCompressionDetail(
 
   const kind = parseContextCompressionKind(fieldValue(value, "kind"));
   const status = optionalStringField(value, "status");
+  const compressionId = optionalNullableStringField(
+    value,
+    "compressionId",
+    "compression_id",
+  );
   const snapshotId = optionalNullableStringField(
     value,
     "snapshotId",
@@ -18345,6 +18359,7 @@ function parseContextCompressionDetail(
   if (
     !kind ||
     status === null ||
+    compressionId === false ||
     snapshotId === false ||
     startedAt === false ||
     completedAt === false ||
@@ -18359,6 +18374,7 @@ function parseContextCompressionDetail(
   return normalizedContextCompressionDetail({
     ...(status ? { status } : {}),
     kind,
+    compressionId: compressionId ?? null,
     snapshotId: snapshotId ?? null,
     originalTokenCount: originalTokenCount ?? null,
     summaryTokenCount: summaryTokenCount ?? null,

@@ -218,6 +218,7 @@ pub(crate) async fn ensure_context_compression(
 fn context_compression_event_detail(
     status: &str,
     kind: &str,
+    compression_id: Option<String>,
     snapshot_id: Option<String>,
     original_token_count: Option<i64>,
     summary_token_count: Option<i64>,
@@ -228,6 +229,7 @@ fn context_compression_event_detail(
     ContextCompressionEventDetail {
         status: status.to_string(),
         kind: kind.to_string(),
+        compression_id,
         snapshot_id,
         original_token_count,
         summary_token_count,
@@ -261,6 +263,7 @@ fn compress_runtime_tool_state_with_events_if_needed(
     if !compressed {
         return Ok(false);
     }
+    let compression_id = unique_id("compression");
 
     push_context_compression_event(
         events,
@@ -268,6 +271,7 @@ fn compress_runtime_tool_state_with_events_if_needed(
         context_compression_event_detail(
             "start",
             CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+            Some(compression_id.clone()),
             None,
             None,
             None,
@@ -282,6 +286,7 @@ fn compress_runtime_tool_state_with_events_if_needed(
         context_compression_event_detail(
             "completed",
             CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE,
+            Some(compression_id),
             None,
             None,
             None,
@@ -466,6 +471,7 @@ async fn ensure_llm_context_compression(
     let checkpoint_messages = plan.checkpoint_messages;
     let covered_snapshot_ids = plan.covered_snapshot_ids;
     let covered_sequences = plan.covered_sequences;
+    let compression_id = unique_id("compression");
     let compression_started_at = utc_timestamp();
     // Emit start before the summary provider request so the UI can show the compression block
     // while the dedicated checkpoint LLM call is still in flight.
@@ -475,6 +481,7 @@ async fn ensure_llm_context_compression(
         context_compression_event_detail(
             "start",
             CONTEXT_COMPRESSION_KIND_LLM,
+            Some(compression_id.clone()),
             None,
             Some(i64::try_from(original_tokens).map_err(|_| {
                 ApiError::internal("context compression original token count exceeds i64")
@@ -582,6 +589,7 @@ async fn ensure_llm_context_compression(
         context_compression_event_detail(
             "completed",
             CONTEXT_COMPRESSION_KIND_LLM,
+            Some(compression_id),
             Some(snapshot.id.clone()),
             Some(snapshot.original_token_count),
             Some(snapshot.summary_token_count),

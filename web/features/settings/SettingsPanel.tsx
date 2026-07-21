@@ -6734,7 +6734,7 @@ export function SettingsPanel({
                               }
                             }
                           }}
-                          placeholder="120000"
+                          placeholder="300000"
                           type="text"
                           value={specSettingsForm.llmTimeoutMs}
                         />
@@ -7824,7 +7824,7 @@ export function SettingsPanel({
                                 extractionLlmTimeoutMs: value,
                               }))
                             }
-                            placeholder="120000"
+                            placeholder="300000"
                             value={memorySettingsForm.extractionLlmTimeoutMs}
                           />
                         </div>
@@ -7898,7 +7898,7 @@ export function SettingsPanel({
                                 retrievalLlmTimeoutMs: value,
                               }))
                             }
-                            placeholder="60000"
+                            placeholder="300000"
                             value={memorySettingsForm.retrievalLlmTimeoutMs}
                           />
                         </div>
@@ -8114,7 +8114,7 @@ export function SettingsPanel({
                             llmTimeoutMs: value,
                           })
                         }
-                        placeholder="120000"
+                        placeholder="300000"
                         value={memorySettingsForm.dream.llmTimeoutMs}
                       />
                     </div>
@@ -14036,7 +14036,7 @@ function emptySpecSettingsForm(): SpecSettingsFormState {
   return {
     autoEnabled: true,
     generationModelId: "",
-    llmTimeoutMs: "120000",
+    llmTimeoutMs: "300000",
   };
 }
 
@@ -14232,8 +14232,8 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
     retrievalMode: "fts",
     extractionModelId: "",
     retrievalModelId: "",
-    extractionLlmTimeoutMs: "120000",
-    retrievalLlmTimeoutMs: "60000",
+    extractionLlmTimeoutMs: "300000",
+    retrievalLlmTimeoutMs: "300000",
     contextBudgetPercent: "12",
     retentionDays: "",
     dream: {
@@ -14247,7 +14247,7 @@ function emptyMemorySettingsForm(): MemorySettingsFormState {
       maxFactsPerRun: "200",
       maxChangesPerRun: "50",
       schedulerScanMinutes: "60",
-      llmTimeoutMs: "120000",
+      llmTimeoutMs: "300000",
     },
   };
 }

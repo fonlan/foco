@@ -221,8 +221,8 @@ export const settings = {
     retrievalMode: "fts",
     extractionModelId: null,
     retrievalModelId: null,
-    extractionLlmTimeoutMs: 120000,
-    retrievalLlmTimeoutMs: 60000,
+    extractionLlmTimeoutMs: 300000,
+    retrievalLlmTimeoutMs: 300000,
     contextBudgetPercent: 12,
     dream: {
       enabled: false,
@@ -237,7 +237,7 @@ export const settings = {
       schedulerScanMinutes: 60,
       workspaceThresholdFacts: 50,
       globalThresholdFacts: 50,
-      llmTimeoutMs: 120000,
+      llmTimeoutMs: 300000,
     },
     extractionModes: [
       { label: "Manual", value: "manual" },
@@ -280,7 +280,7 @@ export const settings = {
     generationModelId: null as string | null,
     generationSystemPrompt: null as string | null,
     updateSystemPrompt: null as string | null,
-    llmTimeoutMs: 120000,
+    llmTimeoutMs: 300000,
     defaultGenerationSystemPrompt:
       "Generate a concise Project Spec Markdown document from provided evidence.",
     defaultUpdateSystemPrompt:

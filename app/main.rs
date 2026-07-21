@@ -2027,7 +2027,7 @@ enum StoredChatMessagePart {
 }
 
 // ponytail: invalidate all stored assistant parts instead of a one-off SQL repair; add a targeted migration if parts ever get too large.
-const STORED_CHAT_PARTS_VERSION: i64 = 5;
+const STORED_CHAT_PARTS_VERSION: i64 = 6;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2123,6 +2123,8 @@ enum ChatSseEvent {
     },
     ContextCompression {
         assistant_message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        compression_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         snapshot_id: Option<String>,
         kind: String,
@@ -2574,6 +2576,9 @@ pub(crate) struct ContextMessageGroup {
 struct ContextCompressionEventDetail {
     status: String,
     kind: String,
+    /// Stable identity shared by the live start and terminal completion of one compression.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     snapshot_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3253,6 +3258,7 @@ impl PreparedChatContext {
                                 while let Ok(detail) = compression_event_rx.try_recv() {
                                     let event = ChatSseEvent::ContextCompression {
                                         assistant_message_id: assistant_message_id_for_compression.clone(),
+                                        compression_id: detail.compression_id.clone(),
                                         snapshot_id: detail.snapshot_id.clone(),
                                         kind: detail.kind.clone(),
                                         status: detail.status.clone(),
@@ -3269,6 +3275,7 @@ impl PreparedChatContext {
                                 };
                                 let event = ChatSseEvent::ContextCompression {
                                     assistant_message_id: assistant_message_id_for_compression.clone(),
+                                    compression_id: detail.compression_id.clone(),
                                     snapshot_id: detail.snapshot_id.clone(),
                                     kind: detail.kind.clone(),
                                     status: detail.status.clone(),
@@ -11197,6 +11204,7 @@ fn materialize_missing_assistant_parts(
     let mut stream_attempt_snapshots_by_message =
         HashMap::<String, (Vec<ChatMessagePart>, HashSet<String>, Option<String>)>::new();
     let mut reasoning_started_at_by_message = HashMap::<String, String>::new();
+    let mut run_ids_by_message = HashMap::<String, HashSet<String>>::new();
     for event in &events {
         let value = parse_json_value(&event.payload_json, "chat run event")?;
         let message_id = if event.event_type == "guidance_applied" {
@@ -11210,6 +11218,10 @@ fn materialize_missing_assistant_parts(
         if !missing_message_ids.contains(message_id) {
             continue;
         }
+        run_ids_by_message
+            .entry(message_id.to_string())
+            .or_default()
+            .insert(event.run_id.clone());
 
         match event.event_type.as_str() {
             "text_delta" => {
@@ -11377,6 +11389,52 @@ fn materialize_missing_assistant_parts(
         }
     }
 
+    for snapshot in database
+        .context_compression_snapshots_for_chat(chat_id)
+        .map_err(ApiError::from_workspace_error)?
+    {
+        for (message_id, run_ids) in &run_ids_by_message {
+            if !run_ids.contains(&snapshot.run_id) {
+                continue;
+            }
+            let next_part = ChatMessagePart::ContextCompression {
+                id: snapshot.id.clone(),
+                status: "completed".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                detail: ContextCompressionEventDetail {
+                    status: "completed".to_string(),
+                    kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                    compression_id: Some(snapshot.id.clone()),
+                    snapshot_id: Some(snapshot.id.clone()),
+                    original_token_count: Some(snapshot.original_token_count),
+                    summary_token_count: Some(snapshot.summary_token_count),
+                    started_at: Some(snapshot.created_at.clone()),
+                    completed_at: Some(snapshot.created_at.clone()),
+                    provider_id: String::new(),
+                    model_id: String::new(),
+                },
+            };
+            let parts = parts_by_message.entry(message_id.clone()).or_default();
+            if parts.iter().any(|part| {
+                matches!(
+                    part,
+                    ChatMessagePart::ContextCompression { detail, .. }
+                        if detail.snapshot_id.as_deref() == Some(snapshot.id.as_str())
+                )
+            }) {
+                continue;
+            }
+            if let Some(existing) = parts
+                .iter_mut()
+                .find(|part| context_compression_parts_match(part, &next_part))
+            {
+                merge_context_compression_part(existing, next_part);
+            } else {
+                parts.push(next_part);
+            }
+        }
+    }
+
     for (message_id, started_at) in reasoning_started_at_by_message {
         let ended_at = events
             .iter()
@@ -11480,6 +11538,7 @@ fn context_compression_part_from_value(value: &Value) -> Option<ChatMessagePart>
         .unwrap_or_else(|| ContextCompressionEventDetail {
             status: status.clone(),
             kind: kind.clone(),
+            compression_id: None,
             snapshot_id: top_snapshot_id.clone(),
             original_token_count: None,
             summary_token_count: None,
@@ -11514,42 +11573,50 @@ fn normalize_context_compression_kind(kind: &str) -> String {
 }
 
 fn context_compression_part_id(kind: &str, detail: &ContextCompressionEventDetail) -> String {
-    detail.snapshot_id.clone().unwrap_or_else(|| {
-        format!(
-            "{kind}:{}",
-            detail.started_at.as_deref().unwrap_or("pending")
-        )
-    })
+    detail
+        .compression_id
+        .clone()
+        .or_else(|| detail.snapshot_id.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "{kind}:{}",
+                detail.started_at.as_deref().unwrap_or("pending")
+            )
+        })
 }
 
 fn context_compression_parts_match(current: &ChatMessagePart, next: &ChatMessagePart) -> bool {
     let ChatMessagePart::ContextCompression {
-        id: current_id,
         status: current_status,
         kind: current_kind,
         detail: current_detail,
+        ..
     } = current
     else {
         return false;
     };
     let ChatMessagePart::ContextCompression {
-        id: next_id,
         status: next_status,
         kind: next_kind,
         detail: next_detail,
+        ..
     } = next
     else {
         return false;
     };
 
-    current_id == next_id
-        || (current_kind == next_kind
-            && current_detail.started_at.is_some()
-            && current_detail.started_at == next_detail.started_at)
-        || (current_kind == next_kind
-            && current_status == "start"
-            && next_status == "completed"
-            && current_detail.snapshot_id.is_none())
+    match (&current_detail.compression_id, &next_detail.compression_id) {
+        (Some(current_id), Some(next_id)) => return current_id == next_id,
+        (Some(_), None) | (None, Some(_)) => return false,
+        (None, None) => {}
+    }
+
+    current_kind == next_kind
+        && current_status == "start"
+        && next_status == "completed"
+        && current_detail.snapshot_id.is_none()
+        && current_detail.started_at.is_some()
+        && current_detail.started_at == next_detail.started_at
 }
 
 fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessagePart) {
@@ -11572,6 +11639,9 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
         return;
     };
 
+    detail.compression_id = next_detail
+        .compression_id
+        .or_else(|| detail.compression_id.clone());
     detail.snapshot_id = next_detail
         .snapshot_id
         .or_else(|| detail.snapshot_id.clone());
@@ -11593,7 +11663,11 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
     }
     detail.status = next_status.clone();
     detail.kind = next_kind.clone();
-    *id = detail.snapshot_id.clone().unwrap_or(next_id);
+    *id = detail
+        .compression_id
+        .clone()
+        .or_else(|| detail.snapshot_id.clone())
+        .unwrap_or(next_id);
     *status = next_status;
     *kind = next_kind;
 }

@@ -1577,10 +1577,12 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-live",
         kind: "llm",
         status: "start",
         type: "contextCompression",
         detail: {
+          compressionId: "compression-live",
           kind: "llm",
           originalTokenCount: 5000,
           providerId: "openai",
@@ -1597,11 +1599,13 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-live",
         kind: "llm",
         snapshotId: "llm-snapshot-live",
         status: "completed",
         type: "contextCompression",
         detail: {
+          compressionId: "compression-live",
           kind: "llm",
           snapshotId: "llm-snapshot-live",
           originalTokenCount: 5000,
@@ -1621,6 +1625,83 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       screen.getByText(/Saved 4,100 tokens|Saved 4100 tokens/),
     ).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("keeps same-second compression attempts distinct by compression ID", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "compress twice",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const startedAt = "2026-07-06T07:00:00Z";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-interrupted",
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          compressionId: "compression-interrupted",
+          kind: "llm",
+          originalTokenCount: 5000,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt,
+          status: "start",
+        },
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-success",
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          compressionId: "compression-success",
+          kind: "llm",
+          originalTokenCount: 4200,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt,
+          status: "start",
+        },
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-success",
+        kind: "llm",
+        snapshotId: "llm-snapshot-success",
+        status: "completed",
+        type: "contextCompression",
+        detail: {
+          compressionId: "compression-success",
+          kind: "llm",
+          snapshotId: "llm-snapshot-success",
+          originalTokenCount: 4200,
+          summaryTokenCount: 800,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt,
+          completedAt: "2026-07-06T07:00:02Z",
+          status: "completed",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Compressed")).toBeInTheDocument();
+    expect(screen.getByText("Compressing")).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(2);
 
     await act(async () => {
       appTestState.activeChatStreamController?.close();
