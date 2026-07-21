@@ -30660,6 +30660,59 @@ async fn serve_main_chat_responses_failure_fixture() -> (String, tokio::task::Jo
     (format!("http://{addr}/v1"), task)
 }
 
+async fn serve_main_chat_responses_retry_failure_fixture() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_route = Arc::clone(&attempts);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || {
+            let attempts = Arc::clone(&attempts_for_route);
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                response_headers.insert(
+                    header::HeaderName::from_static("x-cpa-trace-id"),
+                    header::HeaderValue::from_static("trace-main-chat-retry-failure"),
+                );
+                let failure = json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": format!("resp-retry-{attempt}"),
+                        "status": "failed",
+                        "model": "model",
+                        "error": {
+                            "code": "rate_limit",
+                            "type": "rate_limit_error",
+                            "message": format!("retry diagnostic attempt {attempt}"),
+                        },
+                    },
+                });
+                let body = format!("event: response.failed\ndata: {failure}\n\n");
+                (response_headers, body).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat retry Responses fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("main chat retry Responses fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), attempts, task)
+}
+
 async fn serve_main_chat_reasoning_loop_fixture()
 -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     serve_main_chat_reasoning_loop_fixture_with_loop_count(1).await
@@ -31878,6 +31931,98 @@ async fn main_chat_responses_failed_stream_persists_diagnostic_and_http_head() {
         !response_body.to_string().contains("failed-frame-secret"),
         "diagnostic must be persisted through the normal provider redaction path"
     );
+}
+
+#[tokio::test]
+async fn main_chat_retry_attempts_keep_independent_failed_stream_diagnostics() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, attempts, server_task) = serve_main_chat_responses_retry_failure_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 1;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.kind = foco_providers::OPENAI_RESPONSES_KIND.to_string();
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Keep a failed diagnostic for every retry attempt".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare retrying failed Responses main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_ids = Vec::new();
+    let mut failure_message = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_ids.push(id),
+            ChatSseEvent::Error { message } => failure_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(llm_request_ids.len(), 2);
+    assert!(
+        failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("retry diagnostic attempt 2")),
+        "the final attempt remains user-visible"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    for (index, request_id) in llm_request_ids.iter().enumerate() {
+        let request = database
+            .llm_request(request_id)
+            .expect("retry attempt audit lookup")
+            .expect("retry attempt audit exists");
+        assert_eq!(request.final_state, "failed");
+        assert_eq!(request.status_code, Some(200));
+        let response_body: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("retry attempt response detail"),
+        )
+        .expect("parse retry attempt response detail");
+        assert_eq!(response_body["streamDiagnostic"]["kind"], "response_failed");
+        assert_eq!(
+            response_body["streamDiagnostic"]["provider_error"]["message"],
+            format!("retry diagnostic attempt {}", index + 1)
+        );
+        assert_eq!(
+            response_body["http"]["headers"]["x-cpa-trace-id"][0],
+            "trace-main-chat-retry-failure"
+        );
+    }
 }
 
 #[tokio::test]

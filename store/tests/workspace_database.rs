@@ -9387,7 +9387,7 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() 
         plant(
             "request-valid-v1",
             r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{"authorization":["********"]},"body":null}"#,
-            r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"ok","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":{"status":200,"version":"HTTP/1.1","headers":{"authorization":["********"],"x-multi":["a","b"]}}}"#,
+            r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"error":"provider stream failed","statusCode":200,"streamDiagnostic":{"kind":"response_failed","transport":"http_sse","providerError":{"code":"rate_limit","message":"retry later"},"payload":{"encoding":"json","value":{"api_key":"********"}}},"http":{"status":200,"version":"HTTP/1.1","headers":{"authorization":["********"],"x-multi":["a","b"]}}}"#,
         );
         plant(
             "request-valid-websocket-v1",
@@ -9454,6 +9454,14 @@ fn rejects_non_v1_audit_details_and_prunes_legacy_during_explicit_maintenance() 
     assert_eq!(
         valid_response["http"]["headers"]["x-multi"],
         json!(["a", "b"])
+    );
+    assert_eq!(
+        valid_response["streamDiagnostic"]["kind"],
+        "response_failed"
+    );
+    assert_eq!(
+        valid_response["streamDiagnostic"]["providerError"]["code"],
+        "rate_limit"
     );
     let valid_ws = database
         .llm_request("request-valid-websocket-v1")
@@ -12148,7 +12156,7 @@ fn versioned_provider_http_headers_only_mask_authorization() {
             first_token_latency_ms: None,
             total_latency_ms: Some(1000),
             status_code: Some(200),
-            final_state: "succeeded",
+            final_state: "failed",
             request_body_json: Some(
                 r#"{
                     "format":"provider_request_v1",
@@ -13145,7 +13153,7 @@ fn prunes_llm_request_details_without_deleting_statistics() {
                 r#"{"format":"provider_request_v1","version":1,"method":"POST","url":"https://example.test","headers":{},"body":"old"}"#,
             ),
             response_body_json: Some(
-                r#"{"format":"provider_final_response_v1","version":1,"state":"succeeded","partial":false,"text":"old","reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":null,"http":null}"#,
+                r#"{"format":"provider_final_response_v1","version":1,"state":"failed","partial":false,"text":null,"reasoning":null,"toolCalls":[],"usage":null,"stopReason":null,"responseId":null,"error":"old stream failed","http":{"status":200},"streamDiagnostic":{"kind":"response_failed","transport":"http_sse","providerError":{"code":"rate_limit","message":"retry later"},"payload":{"encoding":"json","value":{"api_key":"********"}}}}"#,
             ),
         })
         .expect("old request insert");

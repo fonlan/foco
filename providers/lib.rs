@@ -4262,6 +4262,97 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn websocket_failed_provider_event_preserves_decoder_diagnostic_and_handshake_head() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let mut ws = accept_async(stream).await.expect("ws accept");
+            let create = ws
+                .next()
+                .await
+                .expect("create frame")
+                .expect("create frame ok");
+            assert!(matches!(create, Message::Text(_)));
+            ws.send(Message::Text(
+                r#"{"type":"error","api_key":"websocket-frame-secret","error":{"code":"rate_limit","type":"rate_limit_error","message":"retry via websocket","param":"model"}}"#.into(),
+            ))
+            .await
+            .expect("send failed event");
+            let _ = ws.close(None).await;
+        });
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
+            base_url: Some(format!("http://{addr}/v1/")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let request = neutral_request(vec![neutral_text_message(NeutralChatRole::User, "hi")]);
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open websocket stream");
+
+        let stream_error = loop {
+            match stream.next_event().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("expected WebSocket stream error"),
+            }
+        };
+        assert!(stream_error.to_string().contains("retry via websocket"));
+
+        let diagnostic = stream.stream_diagnostic().expect("failed frame diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::ProviderErrorEvent
+        );
+        assert_eq!(
+            diagnostic.transport,
+            genai::OpenAIRespStreamTransport::WebSocket
+        );
+        assert_eq!(diagnostic.event_type.as_deref(), Some("error"));
+        assert_eq!(
+            diagnostic.provider_error.code.as_deref(),
+            Some("rate_limit")
+        );
+        assert_eq!(
+            diagnostic.provider_error.message.as_deref(),
+            Some("retry via websocket")
+        );
+
+        let final_dump = stream
+            .failed_final_response_dump(stream_error.to_string(), stream.http_status(), false)
+            .expect("failed final response dump");
+        let final_json = serde_json::to_value(final_dump).expect("final response JSON");
+        assert_eq!(final_json["http"]["status"], 101);
+        assert_eq!(final_json["statusCode"], 101);
+        assert_eq!(
+            final_json["streamDiagnostic"]["kind"],
+            "provider_error_event"
+        );
+        assert_eq!(
+            final_json["streamDiagnostic"]["provider_error"]["code"],
+            "rate_limit"
+        );
+        assert_eq!(
+            final_json["streamDiagnostic"]["payload"]["value"]["api_key"],
+            REDACTED_CREDENTIAL_VALUE
+        );
+        assert!(
+            !final_json.to_string().contains("websocket-frame-secret"),
+            "WebSocket diagnostic must retain the decoder's redacted payload"
+        );
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
     async fn websocket_session_reuses_connection_and_previous_response_id() {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};

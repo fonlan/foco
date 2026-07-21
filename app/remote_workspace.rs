@@ -27770,6 +27770,16 @@ mod tests {
                 ),
             })
             .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-ssh",
+                chat_id: "chat-ssh-wire",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant message");
         drop(database);
 
         let (sidecar_state, _broker_rx) =
@@ -28083,6 +28093,292 @@ mod tests {
             list.requests[0].status_code,
             Some(200),
             "list API must surface structured status_code from remote-workspace-audit"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_ssh_sidecar_failed_responses_stream_persists_diagnostic_only_in_main_audit_mirror()
+     {
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let sidecar_workspace = tempfile::tempdir().expect("sidecar workspace tempdir");
+        let provider_app = Router::new().route(
+            "/v1/responses",
+            post(|| async {
+                let mut response = axum::response::Response::new(axum::body::Body::from(
+                    concat!(
+                        "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
+                        "event: response.failed\ndata: {\"type\":\"response.failed\",\"api_key\":\"remote-failed-frame-secret\",\"response\":{\"id\":\"resp-ssh-failed\",\"status\":\"failed\",\"model\":\"model-1\",\"error\":{\"code\":\"rate_limit\",\"type\":\"rate_limit_error\",\"message\":\"retry remote later\",\"param\":\"input\"}}}\n\n"
+                    ),
+                ));
+                let headers = response.headers_mut();
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                headers.insert(
+                    header::HeaderName::from_static("x-cpa-trace-id"),
+                    header::HeaderValue::from_static("trace-ssh-responses-failure"),
+                );
+                response
+            }),
+        );
+        let provider_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind provider fixture");
+        let provider_address = provider_listener
+            .local_addr()
+            .expect("provider fixture address");
+        let provider_task = tokio::spawn(async move {
+            axum::serve(provider_listener, provider_app)
+                .await
+                .expect("serve provider fixture");
+        });
+
+        let mut config = remote_test_config(sidecar_workspace.path());
+        config.app.api_audit.save_request_response_details = true;
+        config.app.llm_request_retry_count = 0;
+        let workspace_id = config.workspaces[0].id.clone();
+        config.workspaces[0].path = PathBuf::new();
+        config.workspaces[0].location = WorkspaceLocation::Ssh {
+            server_id: "server-1".to_string(),
+            remote_path: sidecar_workspace.path().display().to_string(),
+        };
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "provider-1".to_string(),
+            name: "Provider 1".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("ssh-provider-test-key".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: foco_store::config::ApiProxySettings::default(),
+        });
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(sidecar_workspace.path()).expect("sidecar db");
+        database
+            .insert_chat_with_metadata("chat-ssh-diagnostic", "SSH diagnostic chat", "{}")
+            .expect("insert chat");
+        database
+            .insert_message(NewMessage {
+                id: "msg-user-ssh-diagnostic",
+                chat_id: "chat-ssh-diagnostic",
+                role: "user",
+                content: "Persist the remote failed Responses diagnostic.",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "msg-user-ssh-diagnostic",
+                            "assistantMessageId": "msg-assistant-ssh-diagnostic",
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("insert user message");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-ssh-diagnostic",
+                chat_id: "chat-ssh-diagnostic",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant message");
+        drop(database);
+
+        let (sidecar_state, _broker_rx) =
+            test_sidecar_state(sidecar_workspace.path().to_string_lossy().to_string(), 0);
+        let mut sidecar_state = sidecar_state;
+        sidecar_state.workspace_id = workspace_id.clone();
+        sidecar_state.token = "ssh-control-token".to_string();
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind sidecar control");
+        let control_address = control_listener
+            .local_addr()
+            .expect("control fixture address");
+        let control_app = Router::new()
+            .route(CONTROL_WS_PATH, get(remote_control_ws))
+            .layer(axum::middleware::from_fn_with_state(
+                sidecar_state.clone(),
+                sidecar_bearer_auth,
+            ))
+            .with_state(sidecar_state.clone());
+        let control_task = tokio::spawn(async move {
+            axum::serve(control_listener, control_app)
+                .await
+                .expect("serve sidecar control");
+        });
+
+        let connection_task = connect_control_ws(
+            state.clone(),
+            control_address.port(),
+            "ssh-control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(RemoteSessionStatus::new(
+                RemoteConnectionState::Disconnected,
+                None,
+            ))),
+        )
+        .await
+        .expect("connect main-process control websocket");
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if sidecar_state
+                    .runtime_config
+                    .lock()
+                    .expect("runtime config")
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("sidecar runtime config sync timeout");
+
+        let response = remote_sidecar_chat_stream(
+            State(sidecar_state.clone()),
+            Json(json!({
+                "chatId": "chat-ssh-diagnostic",
+                "queuedUserMessageId": "msg-user-ssh-diagnostic",
+                "visibleAssistantMessageId": "msg-assistant-ssh-diagnostic",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("sidecar chat SSE");
+        let bytes = timeout(
+            Duration::from_secs(15),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await
+        .expect("SSH sidecar failed chat should finish")
+        .expect("SSE bytes");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        assert!(text.contains("\"type\":\"error\""), "SSE error: {text}");
+        assert!(
+            text.contains("retry remote later"),
+            "SSE must expose the provider failure message: {text}"
+        );
+
+        connection_task.abort();
+        let _ = connection_task.await;
+        control_task.abort();
+        let _ = control_task.await;
+        provider_task.abort();
+        let _ = provider_task.await;
+
+        let sidecar_db =
+            WorkspaceDatabase::open_or_create(sidecar_workspace.path()).expect("sidecar audit db");
+        let assistant = sidecar_db
+            .message("msg-assistant-ssh-diagnostic")
+            .expect("failed assistant lookup")
+            .expect("failed assistant message");
+        let metadata = serde_json::from_str::<Value>(&assistant.metadata_json)
+            .expect("failed assistant metadata");
+        let llm_request_ids = metadata["metrics"]["llmRequestIds"]
+            .as_array()
+            .expect("failed assistant llmRequestIds");
+        assert_eq!(
+            llm_request_ids.len(),
+            1,
+            "one broker id for a single failed Responses turn"
+        );
+        let broker_request_id = llm_request_ids[0]
+            .as_str()
+            .expect("broker request id string")
+            .to_string();
+        assert!(
+            !broker_request_id.is_empty() && !broker_request_id.starts_with("run-"),
+            "metrics.llmRequestIds must use the broker request id, not a run id"
+        );
+        let sidecar_rows = sidecar_db
+            .llm_request_audit_rows(LlmRequestAuditFilters {
+                chat_id: Some("chat-ssh-diagnostic"),
+                ..LlmRequestAuditFilters::default()
+            })
+            .expect("sidecar audit rows");
+        assert_eq!(sidecar_rows.len(), 1);
+        assert_eq!(sidecar_rows[0].id, broker_request_id);
+        let sidecar_request = sidecar_db
+            .llm_request(&broker_request_id)
+            .expect("sidecar request lookup")
+            .expect("sidecar request");
+        assert_eq!(sidecar_request.final_state, "failed");
+        assert_eq!(sidecar_request.request_body_json, None);
+        assert_eq!(sidecar_request.response_body_json, None);
+        drop(sidecar_db);
+
+        let audit_path =
+            workspace_audit_path(profile.path(), &config.workspaces[0]).expect("ssh audit path");
+        let audit_db = WorkspaceDatabase::open_or_create(&audit_path).expect("main audit db");
+        let request = audit_db
+            .llm_request(&broker_request_id)
+            .expect("main audit lookup")
+            .expect("main audit row");
+        assert_eq!(request.chat_id.as_deref(), Some("chat-ssh-diagnostic"));
+        assert_eq!(request.final_state, "failed");
+        assert_eq!(request.status_code, Some(200));
+        let response_wire: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("main failed response wire"),
+        )
+        .expect("parse main failed response wire");
+        assert_eq!(response_wire["format"], "provider_final_response_v1");
+        assert_eq!(response_wire["state"], "failed");
+        assert_eq!(response_wire["http"]["status"], 200);
+        assert_eq!(
+            response_wire["http"]["headers"]["x-cpa-trace-id"][0],
+            "trace-ssh-responses-failure"
+        );
+        assert_eq!(response_wire["streamDiagnostic"]["kind"], "response_failed");
+        assert_eq!(
+            response_wire["streamDiagnostic"]["provider_error"]["code"],
+            "rate_limit"
+        );
+        assert!(
+            !response_wire
+                .to_string()
+                .contains("remote-failed-frame-secret"),
+            "main audit diagnostic must be redacted"
+        );
+        drop(audit_db);
+
+        let Json(detail) = crate::http::chat::ai_statistics_detail(
+            State(state),
+            AxumPath((workspace_id, broker_request_id)),
+        )
+        .await
+        .expect("SSH failed-stream AI statistics detail");
+        assert_eq!(detail.request.final_state, "failed");
+        assert_eq!(detail.request.status_code, Some(200));
+        assert_eq!(detail.request.response_detail_status, "partial");
+        assert_eq!(
+            detail
+                .request
+                .response_body
+                .as_ref()
+                .expect("detail response")["streamDiagnostic"]["provider_error"]["message"],
+            "retry remote later"
         );
     }
 
