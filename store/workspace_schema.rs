@@ -1446,6 +1446,18 @@ CREATE INDEX llm_requests_structured_outcome_idx
 ON llm_requests (request_kind, structured_outcome, attempt_index);
 "#;
 
+// Durable id linking stream attempts of one audited structured call (job).
+// Nullable for historical rows and non-structured traffic.
+pub(crate) const MIGRATION_042: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN structured_call_id TEXT
+    CHECK (structured_call_id IS NULL OR length(structured_call_id) > 0);
+
+CREATE INDEX llm_requests_structured_call_id_idx
+ON llm_requests (structured_call_id, attempt_index)
+WHERE structured_call_id IS NOT NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

@@ -90,13 +90,13 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    MIGRATION_039, MIGRATION_040, MIGRATION_041, Migration,
+    MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 41;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 42;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -436,6 +436,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 41,
         sql: MIGRATION_041,
+    },
+    Migration {
+        version: 42,
+        sql: MIGRATION_042,
     },
 ];
 
@@ -7846,6 +7850,7 @@ impl WorkspaceDatabase {
                     structured_outcome: None,
                     recovery_source: None,
                     attempt_index: None,
+                    structured_call_id: None,
                     request_body_json: None,
                     response_body_json: None,
                     invalidated_at: None,
@@ -9390,7 +9395,7 @@ impl WorkspaceDatabase {
                     request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
-                    structured_outcome, recovery_source, attempt_index,
+                    structured_outcome, recovery_source, attempt_index, structured_call_id,
                     request_body_json, response_body_json, invalidated_at, invalidated_reason
                  FROM llm_requests
                  WHERE id = ?1",
@@ -9403,7 +9408,9 @@ impl WorkspaceDatabase {
 
     /// Persist structured single-tool outcome classification without sensitive body text.
     ///
-    /// Safe to call after terminal `update_llm_request_outcome`. Overwrites previous values.
+    /// Safe to call after terminal `update_llm_request_outcome`. Overwrites previous outcome
+    /// fields. When `structured_call_id` is `None`, any existing call id on the row is preserved
+    /// so caller re-classification after parse failure keeps the audited job link.
     pub fn set_llm_request_structured_classification(
         &mut self,
         id: &str,
@@ -9421,6 +9428,13 @@ impl WorkspaceDatabase {
                 message: "structured LLM outcome fields must be non-empty".to_string(),
             });
         }
+        if let Some(call_id) = classification.structured_call_id {
+            if call_id.trim().is_empty() {
+                return Err(WorkspaceDatabaseError::InvalidAuditData {
+                    message: "structured_call_id must be non-empty when provided".to_string(),
+                });
+            }
+        }
 
         let updated = self
             .connection
@@ -9428,13 +9442,15 @@ impl WorkspaceDatabase {
                 "UPDATE llm_requests
                  SET structured_outcome = ?2,
                      recovery_source = ?3,
-                     attempt_index = ?4
+                     attempt_index = ?4,
+                     structured_call_id = COALESCE(?5, structured_call_id)
                  WHERE id = ?1",
                 params![
                     id,
                     classification.structured_outcome,
                     classification.recovery_source,
-                    classification.attempt_index
+                    classification.attempt_index,
+                    classification.structured_call_id
                 ],
             )
             .map_err(|source| self.sqlite_error(source))?;
@@ -9539,8 +9555,36 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
-    /// First-attempt vs terminal success rates for structured baseline request kinds.
+    /// First-attempt vs **job-level** terminal success rates for structured baseline request kinds.
+    ///
+    /// Each audited call writes one `llm_requests` row per stream attempt. Jobs are counted via
+    /// `attempt_index = 1` rows (`first_attempt_requests`). Structured successes on any attempt
+    /// of the same job (including repair) count toward `terminal_successes` (at most one success
+    /// row per job in production). Rates therefore use the job denominator, not total attempt
+    /// rows — e.g. fail then repair-success is `terminal_success_rate = 1.0`, not `0.5`.
+    ///
+    /// **Time windows:** when `started_after` / `started_before` are set, jobs are attributed by
+    /// the **first attempt's** `request_started_at`. Terminal success then considers **all**
+    /// attempts sharing `structured_call_id` (including attempts outside the window). Without a
+    /// call id, only the first-attempt row itself can count as terminal success under a window
+    /// (conservative; multi-attempt jobs without ids cannot be joined across the boundary).
+    ///
+    /// Without a durable per-job call id, this summary does **not** invent a protocol terminal
+    /// failure rate by subtracting aggregate first-attempt provider failures from job terminal
+    /// failures. See `StructuredLlmOutcomeKindSummary` docs.
     pub fn structured_llm_outcome_kind_summaries(
+        &self,
+        filters: StructuredLlmOutcomeFilters<'_>,
+    ) -> Result<Vec<StructuredLlmOutcomeKindSummary>, WorkspaceDatabaseError> {
+        if filters.started_after.is_some() || filters.started_before.is_some() {
+            return self.structured_llm_outcome_kind_summaries_job_cohort(filters);
+        }
+        self.structured_llm_outcome_kind_summaries_from_breakdown(filters)
+    }
+
+    /// Full-population summary: aggregate filtered attempt rows (no time window).
+    /// Exact under production invariants when every attempt of each job is present.
+    fn structured_llm_outcome_kind_summaries_from_breakdown(
         &self,
         filters: StructuredLlmOutcomeFilters<'_>,
     ) -> Result<Vec<StructuredLlmOutcomeKindSummary>, WorkspaceDatabaseError> {
@@ -9559,41 +9603,266 @@ impl WorkspaceDatabase {
                     extra_request_count: 0,
                     first_attempt_success_rate: 0.0,
                     terminal_success_rate: 0.0,
+                    job_terminal_failures: 0,
+                    job_terminal_failure_rate: 0.0,
+                    first_attempt_provider_failures: 0,
+                    first_attempt_protocol_failures: 0,
                 });
             entry.total_requests += row.request_count;
-            entry.terminal_successes += row.success_count;
+            // Prefer structured_outcome over final_state so schema_invalid rows are not
+            // treated as terminal reliability successes.
+            let structured_success_count =
+                structured_success_count_for_breakdown_row(&row);
+            entry.terminal_successes += structured_success_count;
             if row.attempt_index <= 1 {
                 entry.first_attempt_requests += row.request_count;
-                let success_for_attempt = if row.structured_outcome == "unclassified_success"
-                    || row.structured_outcome == "unclassified_failure"
-                {
-                    row.success_count
-                } else if structured_outcome_counts_as_success(&row.structured_outcome) {
-                    row.request_count
-                } else {
-                    0
-                };
-                entry.first_attempt_successes += success_for_attempt;
+                entry.first_attempt_successes += structured_success_count;
+                let non_success_count = row.request_count - structured_success_count;
+                if is_provider_structured_outcome(&row.structured_outcome) {
+                    entry.first_attempt_provider_failures += non_success_count;
+                } else if is_protocol_structured_outcome(&row.structured_outcome) {
+                    entry.first_attempt_protocol_failures += non_success_count;
+                }
             } else {
                 entry.extra_request_count += row.request_count;
             }
         }
 
-        let mut summaries = by_kind.into_values().collect::<Vec<_>>();
-        for summary in &mut summaries {
-            summary.first_attempt_success_rate = if summary.first_attempt_requests > 0 {
-                summary.first_attempt_successes as f64 / summary.first_attempt_requests as f64
-            } else {
-                0.0
-            };
-            summary.terminal_success_rate = if summary.total_requests > 0 {
-                summary.terminal_successes as f64 / summary.total_requests as f64
-            } else {
-                0.0
-            };
+        finalize_structured_llm_outcome_kind_summaries(by_kind)
+    }
+
+    /// Windowed job-cohort summary: attribute jobs by first-attempt start time.
+    ///
+    /// With `structured_call_id`, later attempts of the same job contribute to terminal success
+    /// even when their `request_started_at` is outside the filter window. Without call ids,
+    /// terminal success falls back to the first-attempt row only (never credits an orphan
+    /// repair success that lacks a first attempt in the window).
+    fn structured_llm_outcome_kind_summaries_job_cohort(
+        &self,
+        filters: StructuredLlmOutcomeFilters<'_>,
+    ) -> Result<Vec<StructuredLlmOutcomeKindSummary>, WorkspaceDatabaseError> {
+        let request_kinds = if filters.request_kinds.is_empty() {
+            STRUCTURED_LLM_BASELINE_REQUEST_KINDS
+        } else {
+            filters.request_kinds
+        };
+
+        let mut query = String::from(
+            "SELECT
+                request_kind,
+                COALESCE(attempt_index, 1) AS attempt_index,
+                COALESCE(structured_outcome, CASE
+                    WHEN final_state IN ('succeeded', 'completed') THEN 'unclassified_success'
+                    ELSE 'unclassified_failure'
+                END) AS structured_outcome,
+                structured_call_id
+             FROM llm_requests
+             WHERE final_state != 'running'",
+        );
+        let mut params: Vec<SqlValue> = Vec::new();
+        if !request_kinds.is_empty() {
+            query.push_str(" AND request_kind IN (");
+            for (index, kind) in request_kinds.iter().enumerate() {
+                if index > 0 {
+                    query.push_str(", ");
+                }
+                query.push('?');
+                params.push(SqlValue::Text(kind.to_string()));
+            }
+            query.push(')');
         }
-        summaries.sort_by(|left, right| left.request_kind.cmp(&right.request_kind));
-        Ok(summaries)
+        if let Some(provider_id) = filters.provider_id {
+            query.push_str(" AND provider_id = ?");
+            params.push(SqlValue::Text(provider_id.to_string()));
+        }
+        if let Some(model_id) = filters.model_id {
+            query.push_str(" AND model_id = ?");
+            params.push(SqlValue::Text(model_id.to_string()));
+        }
+        // Window applies only to first-attempt job attribution. Later attempts of linked jobs
+        // are loaded separately by call id without this time predicate.
+        if let Some(started_after) = filters.started_after {
+            query.push_str(" AND request_started_at >= ?");
+            params.push(SqlValue::Text(started_after.to_string()));
+        }
+        if let Some(started_before) = filters.started_before {
+            query.push_str(" AND request_started_at < ?");
+            params.push(SqlValue::Text(started_before.to_string()));
+        }
+        if filters.valid_only {
+            query.push_str(" AND invalidated_at IS NULL");
+        }
+
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let first_window_rows = statement
+            .query_map(params_from_iter(params), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        let first_window_rows = collect_rows(first_window_rows, &self.database_path)?;
+
+        // Collect call ids whose first attempt is in the window (job cohort).
+        let mut call_ids: Vec<String> = Vec::new();
+        let mut by_kind: HashMap<String, StructuredLlmOutcomeKindSummary> = HashMap::new();
+        // Jobs with call_id pending terminal resolution.
+        let mut linked_jobs: Vec<(String, String)> = Vec::new(); // (request_kind, call_id)
+
+        for (request_kind, attempt_index, structured_outcome, structured_call_id) in
+            first_window_rows
+        {
+            let entry = by_kind
+                .entry(request_kind.clone())
+                .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+                    request_kind: request_kind.clone(),
+                    total_requests: 0,
+                    first_attempt_requests: 0,
+                    first_attempt_successes: 0,
+                    terminal_successes: 0,
+                    extra_request_count: 0,
+                    first_attempt_success_rate: 0.0,
+                    terminal_success_rate: 0.0,
+                    job_terminal_failures: 0,
+                    job_terminal_failure_rate: 0.0,
+                    first_attempt_provider_failures: 0,
+                    first_attempt_protocol_failures: 0,
+                });
+
+            if attempt_index > 1 {
+                // Orphan later attempts in the window (no first attempt in window, or unlinked).
+                // Do not credit them as jobs or as terminal successes for other jobs.
+                if structured_call_id.is_none() {
+                    entry.total_requests += 1;
+                    entry.extra_request_count += 1;
+                }
+                // Linked orphans are counted via call-id expansion below when their job is
+                // in cohort; if their first attempt is outside the window they are ignored.
+                continue;
+            }
+
+            entry.first_attempt_requests += 1;
+            entry.total_requests += 1;
+            let first_success =
+                structured_outcome_or_unclassified_counts_as_success(&structured_outcome);
+            if first_success {
+                entry.first_attempt_successes += 1;
+            } else if is_provider_structured_outcome(&structured_outcome) {
+                entry.first_attempt_provider_failures += 1;
+            } else if is_protocol_structured_outcome(&structured_outcome) {
+                entry.first_attempt_protocol_failures += 1;
+            }
+
+            if let Some(call_id) = structured_call_id {
+                linked_jobs.push((request_kind, call_id.clone()));
+                if !call_ids.iter().any(|id| id == &call_id) {
+                    call_ids.push(call_id);
+                }
+            } else if first_success {
+                // Legacy single-row / unlinked job: terminal success = first-attempt success only.
+                entry.terminal_successes += 1;
+            }
+        }
+
+        if !call_ids.is_empty() {
+            // Load every attempt for cohort call ids (no time window) so repair outside the
+            // window still counts toward terminal success of jobs that started in-window.
+            let mut expand = String::from(
+                "SELECT request_kind, structured_call_id,
+                        COALESCE(attempt_index, 1) AS attempt_index,
+                        COALESCE(structured_outcome, CASE
+                            WHEN final_state IN ('succeeded', 'completed') THEN 'unclassified_success'
+                            ELSE 'unclassified_failure'
+                        END) AS structured_outcome
+                 FROM llm_requests
+                 WHERE final_state != 'running'
+                   AND structured_call_id IN (",
+            );
+            let mut expand_params: Vec<SqlValue> = Vec::new();
+            for (index, call_id) in call_ids.iter().enumerate() {
+                if index > 0 {
+                    expand.push_str(", ");
+                }
+                expand.push('?');
+                expand_params.push(SqlValue::Text(call_id.clone()));
+            }
+            expand.push(')');
+            if filters.valid_only {
+                expand.push_str(" AND invalidated_at IS NULL");
+            }
+
+            let mut expand_stmt = self
+                .connection
+                .prepare(&expand)
+                .map_err(|source| self.sqlite_error(source))?;
+            let expand_rows = expand_stmt
+                .query_map(params_from_iter(expand_params), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            let expand_rows = collect_rows(expand_rows, &self.database_path)?;
+
+            // Per call_id: did any attempt succeed? How many attempts (for totals)?
+            let mut call_terminal_success: HashMap<String, bool> = HashMap::new();
+            let mut call_attempt_count: HashMap<String, i64> = HashMap::new();
+            for (_kind, call_id, attempt_index, outcome) in expand_rows {
+                *call_attempt_count.entry(call_id.clone()).or_insert(0) += 1;
+                if structured_outcome_or_unclassified_counts_as_success(&outcome) {
+                    call_terminal_success.insert(call_id.clone(), true);
+                } else {
+                    call_terminal_success.entry(call_id).or_insert(false);
+                }
+                let _ = attempt_index;
+            }
+
+            // One terminal success credit per linked job in the first-attempt cohort.
+            let mut credited_calls: HashMap<String, bool> = HashMap::new();
+            for (request_kind, call_id) in &linked_jobs {
+                if credited_calls.contains_key(call_id) {
+                    // Duplicate first-attempt rows for same call_id (should not happen).
+                    continue;
+                }
+                credited_calls.insert(call_id.clone(), true);
+                let entry = by_kind
+                    .entry(request_kind.clone())
+                    .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+                        request_kind: request_kind.clone(),
+                        total_requests: 0,
+                        first_attempt_requests: 0,
+                        first_attempt_successes: 0,
+                        terminal_successes: 0,
+                        extra_request_count: 0,
+                        first_attempt_success_rate: 0.0,
+                        terminal_success_rate: 0.0,
+                        job_terminal_failures: 0,
+                        job_terminal_failure_rate: 0.0,
+                        first_attempt_provider_failures: 0,
+                        first_attempt_protocol_failures: 0,
+                    });
+                if *call_terminal_success.get(call_id).unwrap_or(&false) {
+                    entry.terminal_successes += 1;
+                }
+                // total_requests already counted the first attempt; add extras for this call.
+                let attempts = *call_attempt_count.get(call_id).unwrap_or(&1);
+                if attempts > 1 {
+                    entry.total_requests += attempts - 1;
+                    entry.extra_request_count += attempts - 1;
+                }
+            }
+        }
+
+        finalize_structured_llm_outcome_kind_summaries(by_kind)
     }
 
     pub fn invalidate_llm_request(
@@ -16774,7 +17043,7 @@ fn select_llm_request_record(
                 request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
-                structured_outcome, recovery_source, attempt_index,
+                structured_outcome, recovery_source, attempt_index, structured_call_id,
                 request_body_json, response_body_json, invalidated_at, invalidated_reason
              FROM llm_requests
              WHERE id = ?1",
@@ -16813,10 +17082,11 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         structured_outcome: row.get(24)?,
         recovery_source: row.get(25)?,
         attempt_index: row.get(26)?,
-        request_body_json: row.get(27)?,
-        response_body_json: row.get(28)?,
-        invalidated_at: row.get(29)?,
-        invalidated_reason: row.get(30)?,
+        structured_call_id: row.get(27)?,
+        request_body_json: row.get(28)?,
+        response_body_json: row.get(29)?,
+        invalidated_at: row.get(30)?,
+        invalidated_reason: row.get(31)?,
     })
 }
 
@@ -16840,6 +17110,75 @@ fn structured_outcome_counts_as_success(outcome: &str) -> bool {
         outcome,
         STRUCTURED_LLM_OUTCOME_SUCCEEDED | STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED
     )
+}
+
+/// Includes historical unclassified successes used by windowed job-cohort aggregation.
+fn structured_outcome_or_unclassified_counts_as_success(outcome: &str) -> bool {
+    structured_outcome_counts_as_success(outcome) || outcome == "unclassified_success"
+}
+
+fn is_provider_structured_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT | STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR
+    )
+}
+
+fn is_protocol_structured_outcome(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        STRUCTURED_LLM_OUTCOME_MISSING_TOOL
+            | STRUCTURED_LLM_OUTCOME_WRONG_TOOL
+            | STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID
+    )
+}
+
+/// Structured success count for one breakdown bucket (not raw `final_state`).
+fn structured_success_count_for_breakdown_row(row: &StructuredLlmOutcomeBreakdownRow) -> i64 {
+    if row.structured_outcome == "unclassified_success"
+        || row.structured_outcome == "unclassified_failure"
+    {
+        // Historical rows without classification: fall back to final_state success_count.
+        row.success_count
+    } else if structured_outcome_counts_as_success(&row.structured_outcome) {
+        row.request_count
+    } else {
+        0
+    }
+}
+
+fn finalize_structured_llm_outcome_kind_summaries(
+    by_kind: HashMap<String, StructuredLlmOutcomeKindSummary>,
+) -> Result<Vec<StructuredLlmOutcomeKindSummary>, WorkspaceDatabaseError> {
+    let mut summaries = by_kind.into_values().collect::<Vec<_>>();
+    for summary in &mut summaries {
+        summary.first_attempt_success_rate = if summary.first_attempt_requests > 0 {
+            summary.first_attempt_successes as f64 / summary.first_attempt_requests as f64
+        } else {
+            0.0
+        };
+        // Job-level terminal success: successes / jobs (first attempts).
+        // Fallback to total_requests only when attempt_index=1 rows are missing.
+        let job_denominator = if summary.first_attempt_requests > 0 {
+            summary.first_attempt_requests
+        } else {
+            summary.total_requests
+        };
+        summary.terminal_success_rate = if job_denominator > 0 {
+            summary.terminal_successes as f64 / job_denominator as f64
+        } else {
+            0.0
+        };
+        summary.job_terminal_failures = (summary.first_attempt_requests - summary.terminal_successes)
+            .max(0);
+        summary.job_terminal_failure_rate = if summary.first_attempt_requests > 0 {
+            summary.job_terminal_failures as f64 / summary.first_attempt_requests as f64
+        } else {
+            0.0
+        };
+    }
+    summaries.sort_by(|left, right| left.request_kind.cmp(&right.request_kind));
+    Ok(summaries)
 }
 
 fn llm_request_usage_rollup_delta(

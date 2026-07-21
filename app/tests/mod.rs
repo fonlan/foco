@@ -32164,6 +32164,69 @@ fn audited_single_tool_text_json_fallback_feeds_memory_and_spec_parsers() {
     );
 }
 
+/// Local recovery fault matrix (parity with broker recover_broker_single_tool_call_from_text):
+/// real ToolCall > bare/fenced JSON > prose/empty/multi-tool (no recovery).
+#[test]
+fn audited_single_tool_fault_matrix_local_recovery_paths() {
+    let tool_args = json!({"facts": []});
+
+    // Real ToolCall always preferred over recoverable text JSON.
+    assert_eq!(
+        resolve_audited_single_tool_arguments(
+            Some(tool_args.clone()),
+            r#"{"facts":[{"scope":"chat"}]}"#,
+            1
+        ),
+        Some(ResolvedAuditedToolArguments::FromToolCall(tool_args))
+    );
+
+    // Bare JSON recovery (single tool only).
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, r#"{"factKeys":[]}"#, 1),
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(json!({
+            "factKeys": []
+        })))
+    );
+
+    // Fenced JSON recovery.
+    assert_eq!(
+        resolve_audited_single_tool_arguments(
+            None,
+            "```json\n{\"updateNeeded\":false,\"edits\":null}\n```",
+            1
+        ),
+        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(json!({
+            "updateNeeded": false,
+            "edits": null
+        })))
+    );
+
+    // Empty / whitespace → missing_tool path (no recovery).
+    assert_eq!(resolve_audited_single_tool_arguments(None, "", 1), None);
+    assert_eq!(resolve_audited_single_tool_arguments(None, "  \n", 1), None);
+
+    // Prose / prose+JSON → no recovery (caller classifies as prose).
+    assert_eq!(
+        resolve_audited_single_tool_arguments(
+            None,
+            "Here is the result:\n{\"facts\":[]}",
+            1
+        ),
+        None
+    );
+
+    // Multi-tool / zero-tool: normal chat and multi-tool requests must not synthesize.
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, r#"{"facts":[]}"#, 0),
+        None
+    );
+    assert_eq!(
+        resolve_audited_single_tool_arguments(None, r#"{"facts":[]}"#, 2),
+        None,
+        "multi-tool chat must not synthesize tool arguments from text"
+    );
+}
+
 fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
     let mut config = GlobalConfig::first_run(workspace_dir);
     config.providers.push(ProviderSettings {

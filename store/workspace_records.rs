@@ -1054,6 +1054,8 @@ pub struct LlmRequestRecord {
     pub recovery_source: Option<String>,
     /// 1-based attempt within the audited provider request loop.
     pub attempt_index: Option<i64>,
+    /// Durable id linking all stream attempts of one audited structured call (job).
+    pub structured_call_id: Option<String>,
     pub request_body_json: Option<String>,
     pub response_body_json: Option<String>,
     pub invalidated_at: Option<String>,
@@ -1280,6 +1282,8 @@ pub struct StructuredLlmRequestClassification<'a> {
     pub structured_outcome: &'a str,
     pub recovery_source: &'a str,
     pub attempt_index: i64,
+    /// Shared across attempts of one audited call. `None` preserves an existing id on update.
+    pub structured_call_id: Option<&'a str>,
 }
 
 /// Filters for structured outcome breakdown queries.
@@ -1308,7 +1312,33 @@ pub struct StructuredLlmOutcomeBreakdownRow {
     pub failed_count: i64,
 }
 
-/// Per-kind first-attempt vs terminal success summary for structured requests.
+/// Per-kind first-attempt vs **job-level** terminal success summary for structured requests.
+///
+/// - `first_attempt_requests` ≈ number of audited jobs (rows with `attempt_index = 1`).
+/// - `terminal_successes` counts structured successes (`succeeded` / `text_json_recovered`) on any
+///   attempt of a job; production writes at most one success row per job.
+/// - `terminal_success_rate` = `terminal_successes / first_attempt_requests` (not `/ total_requests`).
+/// - Average attempts per job ≈ `total_requests / first_attempt_requests`.
+/// - `job_terminal_failures` = `first_attempt_requests - terminal_successes` (exact under the
+///   production invariant of one `attempt_index=1` row and ≤1 structured success per job).
+/// - `job_terminal_failure_rate` = `job_terminal_failures / first_attempt_requests`.
+/// - `first_attempt_provider_failures` = first-attempt rows with `provider_timeout` /
+///   `provider_error` outcomes (exact first-attempt slice).
+/// - `first_attempt_protocol_failures` = first-attempt rows with protocol-class outcomes
+///   (`missing_tool` / `wrong_tool` / `schema_invalid`) (exact first-attempt slice).
+///
+/// **Job linking:** production audited paths write `structured_call_id` on every attempt. Fixed
+/// observation windows attribute a job to the window by the **first attempt's**
+/// `request_started_at`, then include **all** later attempts of that call id (even outside the
+/// window) when deciding terminal success. Without call ids, multi-attempt jobs cannot be joined
+/// across a window boundary; see rollout docs.
+///
+/// Summaries **must not** subtract first-attempt provider counts from job terminal failures to
+/// invent a "protocol terminal failure rate". That cross-job aggregate is wrong both when a job
+/// recovers after a first-attempt provider error and when a job starts as protocol then ends as
+/// provider. Until call-level terminal outcomes are labeled by class, use
+/// `job_terminal_failure_rate` as a conservative upper bound on any terminal-failure slice, and
+/// use the first-attempt protocol/provider counts only as diagnostic first-attempt signals.
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructuredLlmOutcomeKindSummary {
     pub request_kind: String,
@@ -1319,6 +1349,10 @@ pub struct StructuredLlmOutcomeKindSummary {
     pub extra_request_count: i64,
     pub first_attempt_success_rate: f64,
     pub terminal_success_rate: f64,
+    pub job_terminal_failures: i64,
+    pub job_terminal_failure_rate: f64,
+    pub first_attempt_provider_failures: i64,
+    pub first_attempt_protocol_failures: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

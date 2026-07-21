@@ -21324,9 +21324,10 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
     use foco_store::workspace::{
         STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
         STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
-        STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED, STRUCTURED_LLM_RECOVERY_NONE,
-        STRUCTURED_LLM_RECOVERY_TEXT_JSON, STRUCTURED_LLM_RECOVERY_TOOL_CALL,
-        StructuredLlmOutcomeFilters, StructuredLlmRequestClassification,
+        STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED, STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
+        STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TEXT_JSON,
+        STRUCTURED_LLM_RECOVERY_TOOL_CALL, StructuredLlmOutcomeFilters,
+        StructuredLlmRequestClassification,
     };
 
     let workspace = tempfile::tempdir().expect("workspace");
@@ -21389,6 +21390,7 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
                 structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
                 recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
                 attempt_index: 1,
+                structured_call_id: None,
             },
         )
         .expect("classify succeeded tool call");
@@ -21409,6 +21411,7 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
                 structured_outcome: STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
                 recovery_source: STRUCTURED_LLM_RECOVERY_TEXT_JSON,
                 attempt_index: 1,
+                structured_call_id: None,
             },
         )
         .expect("classify text json recovery");
@@ -21429,6 +21432,7 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
                 structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
                 recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
                 attempt_index: 1,
+                structured_call_id: None,
             },
         )
         .expect("classify missing tool");
@@ -21449,9 +21453,31 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
                 structured_outcome: STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID,
                 recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
                 attempt_index: 1,
+                structured_call_id: None,
             },
         )
         .expect("classify schema invalid after tool args");
+
+    insert(
+        &mut database,
+        "req-spec-1",
+        "workspace spec update",
+        "provider-b",
+        "model-b",
+        "failed",
+        "2026-07-21T10:03:30Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-spec-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify attempt 1 missing tool");
 
     insert(
         &mut database,
@@ -21467,8 +21493,9 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
             "req-spec-2",
             StructuredLlmRequestClassification {
                 structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
-                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
                 attempt_index: 2,
+                structured_call_id: None,
             },
         )
         .expect("classify attempt 2 success");
@@ -21528,23 +21555,545 @@ fn structured_llm_outcome_classification_and_breakdown_baseline() {
     assert_eq!(retrieval.first_attempt_successes, 2);
     assert!((retrieval.first_attempt_success_rate - (2.0 / 3.0)).abs() < f64::EPSILON);
     assert_eq!(retrieval.total_requests, 3);
-    // terminal_successes counts protocol final_state success (includes schema_invalid overwrite cases elsewhere)
+    // Job-level terminal successes use structured outcomes, not final_state alone.
     assert_eq!(retrieval.terminal_successes, 2);
+    assert!((retrieval.terminal_success_rate - (2.0 / 3.0)).abs() < f64::EPSILON);
+    assert_eq!(retrieval.job_terminal_failures, 1);
+    assert!((retrieval.job_terminal_failure_rate - (1.0 / 3.0)).abs() < f64::EPSILON);
+    // The single failed job is missing_tool (protocol), not provider_*.
+    assert_eq!(retrieval.first_attempt_provider_failures, 0);
+    assert_eq!(retrieval.first_attempt_protocol_failures, 1);
 
     let extract = summaries
         .iter()
         .find(|row| row.request_kind == "memory extraction")
         .expect("memory extraction summary");
-    // schema_invalid is not counted as structured success even if final_state is succeeded
+    // schema_invalid is not a structured success even if final_state is succeeded
     assert_eq!(extract.first_attempt_requests, 1);
     assert_eq!(extract.first_attempt_successes, 0);
-    assert_eq!(extract.terminal_successes, 1);
+    assert_eq!(extract.terminal_successes, 0);
+    assert!((extract.terminal_success_rate - 0.0).abs() < f64::EPSILON);
+    assert_eq!(extract.job_terminal_failures, 1);
+    assert!((extract.job_terminal_failure_rate - 1.0).abs() < f64::EPSILON);
+    assert_eq!(extract.first_attempt_provider_failures, 0);
+    assert_eq!(extract.first_attempt_protocol_failures, 1);
 
     let spec = summaries
         .iter()
         .find(|row| row.request_kind == "workspace spec update")
         .expect("workspace spec update summary");
-    assert_eq!(spec.first_attempt_requests, 0);
+    // One job: attempt 1 missing_tool + attempt 2 correction success → job terminal 100%.
+    assert_eq!(spec.first_attempt_requests, 1);
+    assert_eq!(spec.first_attempt_successes, 0);
     assert_eq!(spec.extra_request_count, 1);
-    assert_eq!(spec.total_requests, 1);
+    assert_eq!(spec.total_requests, 2);
+    assert_eq!(spec.terminal_successes, 1);
+    assert!((spec.terminal_success_rate - 1.0).abs() < f64::EPSILON);
+    // Must not report 1/2 = 0.5 for job-level terminal success after repair.
+    assert!((spec.terminal_successes as f64 / spec.total_requests as f64 - 0.5).abs() < f64::EPSILON);
+    // Recovered job must not count as terminal failure.
+    assert_eq!(spec.job_terminal_failures, 0);
+    assert!((spec.job_terminal_failure_rate - 0.0).abs() < f64::EPSILON);
+    // First attempt was protocol-class; recovery is visible via terminal_successes.
+    assert_eq!(spec.first_attempt_protocol_failures, 1);
+}
+
+/// Cross-job regression: never subtract aggregate first-attempt provider failures from
+/// job_terminal_failures. That invents a false "protocol terminal" rate.
+///
+/// Job A: attempt1 provider_error, attempt2 succeeded → recovered (not a terminal failure).
+/// Job B: attempt1 missing_tool only → protocol terminal failure.
+/// Old formula: max(0, 1 - 1) / 2 = 0% (wrong). Real protocol terminal share among jobs is 50%.
+/// New API: exact job_terminal_failure_rate = 50%, first_attempt_* slices stay diagnostic only.
+#[test]
+fn structured_llm_outcome_summaries_do_not_cross_job_subtract_provider_failures() {
+    use foco_store::workspace::{
+        STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+        STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+        STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+        StructuredLlmOutcomeFilters, StructuredLlmRequestClassification,
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let insert = |database: &mut WorkspaceDatabase,
+                  id: &str,
+                  final_state: &str,
+                  started_at: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "memory retrieval",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-a",
+                model_id: "model-a",
+                thinking_level: None,
+                request_started_at: started_at,
+                first_token_at: None,
+                completed_at: Some(started_at),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state,
+                request_body_json: Some(
+                    r#"{"format":"provider_request_v1","version":1,"method":"POST"}"#,
+                ),
+                response_body_json: None,
+            })
+            .expect("insert llm request");
+    };
+
+    // Job A attempt 1: provider failure (later recovers).
+    insert(
+        &mut database,
+        "req-a-1",
+        "failed",
+        "2026-07-21T11:00:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-a-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify provider error");
+
+    // Job A attempt 2: success after provider retry.
+    insert(
+        &mut database,
+        "req-a-2",
+        "succeeded",
+        "2026-07-21T11:00:01Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-a-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 2,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify recovered success");
+
+    // Job B: first-attempt protocol failure, no recovery.
+    insert(
+        &mut database,
+        "req-b-1",
+        "failed",
+        "2026-07-21T11:00:02Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-b-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify missing tool");
+
+    let summaries = database
+        .structured_llm_outcome_kind_summaries(StructuredLlmOutcomeFilters {
+            request_kinds: STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+            valid_only: true,
+            ..StructuredLlmOutcomeFilters::default()
+        })
+        .expect("summaries");
+    let retrieval = summaries
+        .iter()
+        .find(|row| row.request_kind == "memory retrieval")
+        .expect("memory retrieval summary");
+
+    assert_eq!(retrieval.first_attempt_requests, 2);
+    assert_eq!(retrieval.terminal_successes, 1);
+    assert_eq!(retrieval.job_terminal_failures, 1);
+    assert!((retrieval.job_terminal_failure_rate - 0.5).abs() < f64::EPSILON);
+    // First-attempt slices: one provider, one protocol — exact and independent of terminal outcome.
+    assert_eq!(retrieval.first_attempt_provider_failures, 1);
+    assert_eq!(retrieval.first_attempt_protocol_failures, 1);
+    // Old broken formula would report max(0, 1 - 1) / 2 = 0. That must never be reintroduced
+    // as a protocol-terminal gate.
+    let broken_cross_job_subtraction = (retrieval.job_terminal_failures
+        - retrieval.first_attempt_provider_failures)
+        .max(0) as f64
+        / retrieval.first_attempt_requests as f64;
+    assert!((broken_cross_job_subtraction - 0.0).abs() < f64::EPSILON);
+    assert!(
+        (retrieval.job_terminal_failure_rate - broken_cross_job_subtraction).abs() > f64::EPSILON,
+        "job terminal failure rate must not collapse to the broken cross-job subtraction"
+    );
+}
+
+/// Fixed observation windows attribute jobs by first-attempt start time and join later attempts
+/// via `structured_call_id`. Without call ids, an orphan repair success inside the window would
+/// undercount failures; with call ids the recovered job that started *before* the window is
+/// excluded and the in-window protocol failure is not cancelled by it.
+#[test]
+fn structured_llm_outcome_windowed_summaries_use_first_attempt_job_cohort_with_call_id() {
+    use foco_store::workspace::{
+        STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+        STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+        STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TOOL_CALL, StructuredLlmOutcomeFilters,
+        StructuredLlmRequestClassification,
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let insert = |database: &mut WorkspaceDatabase, id: &str, final_state: &str, started_at: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "memory retrieval",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-a",
+                model_id: "model-a",
+                thinking_level: None,
+                request_started_at: started_at,
+                first_token_at: None,
+                completed_at: Some(started_at),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state,
+                request_body_json: Some(
+                    r#"{"format":"provider_request_v1","version":1,"method":"POST"}"#,
+                ),
+                response_body_json: None,
+            })
+            .expect("insert llm request");
+    };
+
+    // Job A: first attempt before window (provider error), repair success inside window.
+    insert(
+        &mut database,
+        "req-a-1",
+        "failed",
+        "2026-07-20T23:59:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-a-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: Some("call-a"),
+            },
+        )
+        .expect("classify a1");
+    insert(
+        &mut database,
+        "req-a-2",
+        "succeeded",
+        "2026-07-21T10:00:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-a-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 2,
+                structured_call_id: Some("call-a"),
+            },
+        )
+        .expect("classify a2");
+
+    // Job B: first attempt inside window, protocol terminal failure (no recovery).
+    insert(
+        &mut database,
+        "req-b-1",
+        "failed",
+        "2026-07-21T10:01:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-b-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: Some("call-b"),
+            },
+        )
+        .expect("classify b1");
+
+    // Job C: first attempt inside window, later repair outside window still counts as terminal success.
+    insert(
+        &mut database,
+        "req-c-1",
+        "failed",
+        "2026-07-21T10:02:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-c-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: Some("call-c"),
+            },
+        )
+        .expect("classify c1");
+    insert(
+        &mut database,
+        "req-c-2",
+        "succeeded",
+        "2026-07-22T00:00:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-c-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 2,
+                structured_call_id: Some("call-c"),
+            },
+        )
+        .expect("classify c2");
+
+    let summaries = database
+        .structured_llm_outcome_kind_summaries(StructuredLlmOutcomeFilters {
+            request_kinds: STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+            valid_only: true,
+            started_after: Some("2026-07-21T00:00:00Z"),
+            started_before: Some("2026-07-22T00:00:00Z"),
+            ..StructuredLlmOutcomeFilters::default()
+        })
+        .expect("windowed summaries");
+    let retrieval = summaries
+        .iter()
+        .find(|row| row.request_kind == "memory retrieval")
+        .expect("memory retrieval summary");
+
+    // Only jobs B and C started in the window. Job A's orphan repair must not cancel B's failure.
+    assert_eq!(retrieval.first_attempt_requests, 2);
+    assert_eq!(retrieval.terminal_successes, 1); // C recovered; B failed
+    assert_eq!(retrieval.job_terminal_failures, 1);
+    assert!((retrieval.job_terminal_failure_rate - 0.5).abs() < f64::EPSILON);
+    assert_eq!(retrieval.first_attempt_protocol_failures, 2); // B and C first attempts
+    // C's out-of-window repair still counts as extra request for the in-window job.
+    assert_eq!(retrieval.extra_request_count, 1);
+    assert_eq!(retrieval.total_requests, 3); // B1 + C1 + C2
+}
+
+/// Without structured_call_id, windowed aggregation must not credit an orphan later-attempt
+/// success as a job terminal success (would undercount failures vs the gate).
+#[test]
+fn structured_llm_outcome_windowed_summaries_ignore_orphan_success_without_call_id() {
+    use foco_store::workspace::{
+        STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+        STRUCTURED_LLM_OUTCOME_SUCCEEDED, STRUCTURED_LLM_RECOVERY_NONE,
+        STRUCTURED_LLM_RECOVERY_TOOL_CALL, StructuredLlmOutcomeFilters,
+        StructuredLlmRequestClassification,
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let insert = |database: &mut WorkspaceDatabase, id: &str, final_state: &str, started_at: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind: "memory retrieval",
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id: "provider-a",
+                model_id: "model-a",
+                thinking_level: None,
+                request_started_at: started_at,
+                first_token_at: None,
+                completed_at: Some(started_at),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state,
+                request_body_json: Some(
+                    r#"{"format":"provider_request_v1","version":1,"method":"POST"}"#,
+                ),
+                response_body_json: None,
+            })
+            .expect("insert llm request");
+    };
+
+    // Orphan repair success inside window (first attempt outside; no call id).
+    insert(
+        &mut database,
+        "req-orphan-2",
+        "succeeded",
+        "2026-07-21T10:00:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-orphan-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 2,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify orphan");
+
+    // In-window protocol failure job.
+    insert(
+        &mut database,
+        "req-fail-1",
+        "failed",
+        "2026-07-21T10:01:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-fail-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: None,
+            },
+        )
+        .expect("classify fail");
+
+    let summaries = database
+        .structured_llm_outcome_kind_summaries(StructuredLlmOutcomeFilters {
+            request_kinds: STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+            valid_only: true,
+            started_after: Some("2026-07-21T00:00:00Z"),
+            started_before: Some("2026-07-22T00:00:00Z"),
+            ..StructuredLlmOutcomeFilters::default()
+        })
+        .expect("windowed summaries");
+    let retrieval = summaries
+        .iter()
+        .find(|row| row.request_kind == "memory retrieval")
+        .expect("memory retrieval summary");
+
+    assert_eq!(retrieval.first_attempt_requests, 1);
+    assert_eq!(retrieval.terminal_successes, 0);
+    assert_eq!(retrieval.job_terminal_failures, 1);
+    assert!((retrieval.job_terminal_failure_rate - 1.0).abs() < f64::EPSILON);
+}
+
+/// Caller re-classification with `structured_call_id=None` must preserve an existing call id
+/// so parse-time schema/semantic upgrades keep the audited job link.
+#[test]
+fn structured_llm_outcome_classification_preserves_call_id_when_none() {
+    use foco_store::workspace::{
+        STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+        STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+        StructuredLlmRequestClassification,
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "req-call-id",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "workspace spec update",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "provider-a",
+            model_id: "model-a",
+            thinking_level: None,
+            request_started_at: "2026-07-21T12:00:00Z",
+            first_token_at: None,
+            completed_at: Some("2026-07-21T12:00:01Z"),
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: None,
+            total_latency_ms: Some(100),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: Some(
+                r#"{"format":"provider_request_v1","version":1,"method":"POST"}"#,
+            ),
+            response_body_json: None,
+        })
+        .expect("insert llm request");
+
+    database
+        .set_llm_request_structured_classification(
+            "req-call-id",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 1,
+                structured_call_id: Some("call-preserved"),
+            },
+        )
+        .expect("stamp call id");
+
+    database
+        .set_llm_request_structured_classification(
+            "req-call-id",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+                structured_call_id: None,
+            },
+        )
+        .expect("reclassify without call id");
+
+    let row = database
+        .llm_request("req-call-id")
+        .expect("read llm request")
+        .expect("row exists");
+    assert_eq!(row.structured_outcome.as_deref(), Some(STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID));
+    assert_eq!(row.recovery_source.as_deref(), Some(STRUCTURED_LLM_RECOVERY_NONE));
+    assert_eq!(row.attempt_index, Some(1));
+    assert_eq!(row.structured_call_id.as_deref(), Some("call-preserved"));
 }

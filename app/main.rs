@@ -5918,6 +5918,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     // Provider transport retries and output-protocol repair are independent budgets.
     // - Provider: same prompt, up to `retry_count` additional attempts (timeout/429/5xx).
     // - Output repair: at most one attempt with a short deterministic correction message.
+    // No outer extraction/retrieval loop multiplies this budget (Phase 3 P1).
     let base_request = request;
     let mut active_request = base_request.clone();
     let mut provider_attempts_used: u32 = 0;
@@ -5927,10 +5928,10 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     // Once repair is scheduled, later transport retries of the repaired body stay provider_retry.
     let mut next_retry_kind = structured_llm_outcome::StructuredLlmRetryKind::Initial;
     // Cap total stream attempts so pathological combinations cannot spin.
-    let max_stream_attempts = retry_count
-        .saturating_add(1) // initial + provider retries
-        .saturating_add(1) // one output repair
-        .saturating_add(retry_count); // provider retries of the repaired request
+    let max_stream_attempts =
+        structured_llm_outcome::audited_max_stream_attempts(retry_count);
+    // Links all attempt rows of this audited call for job-level windowed metrics.
+    let structured_call_id = unique_id("structured-call");
 
     for _ in 0..max_stream_attempts {
         let attempt_index = next_attempt_index;
@@ -6087,7 +6088,10 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                         let _ = structured_llm_outcome::persist_structured_classification_on_database(
                             &mut database,
                             &request_id,
-                            failure_kind.classification(attempt_number),
+                            structured_llm_outcome::with_structured_call_id(
+                                failure_kind.classification(attempt_number),
+                                &structured_call_id,
+                            ),
                         );
                         persist_audited_provider_events(
                             &mut database,
@@ -6190,6 +6194,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                         structured_outcome: final_outcome,
                         recovery_source: final_recovery,
                         attempt_index: attempt_number,
+                        structured_call_id: Some(&structured_call_id),
                     },
                 );
                 persist_audited_provider_events(
@@ -6231,7 +6236,10 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                 let _ = structured_llm_outcome::persist_structured_classification_on_database(
                     &mut database,
                     &request_id,
-                    failure_kind.classification(attempt_number),
+                    structured_llm_outcome::with_structured_call_id(
+                        failure_kind.classification(attempt_number),
+                        &structured_call_id,
+                    ),
                 );
                 drop(database);
 

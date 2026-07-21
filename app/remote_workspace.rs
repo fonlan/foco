@@ -164,7 +164,7 @@ use crate::{
         parse_workspace_spec_update_output, prepare_remote_workspace_spec_generation_job,
         prepare_remote_workspace_spec_update_job,
         recover_stale_running_workspace_spec_job_for_path,
-        run_workspace_spec_job_with_lease_heartbeat,
+        run_workspace_spec_job_with_lease_heartbeat, validate_workspace_spec_update_tool_arguments,
     },
     ssh_client::{
         ResolveSshOptions, SshCommandResult, SshSession, SshSpawnedExec, resolve_ssh_profile,
@@ -19740,7 +19740,7 @@ async fn run_remote_sidecar_spec_update_job(
         return Ok(());
     };
 
-    let tool_arguments = remote_sidecar_broker_tool_request(
+    let tool_arguments = remote_sidecar_broker_tool_request_with_args_validate(
         state,
         &prepared.provider_id,
         &prepared.model_id,
@@ -19749,6 +19749,7 @@ async fn run_remote_sidecar_spec_update_job(
         payload.spec.llm_timeout_ms,
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
         "submit_workspace_spec_update",
+        Some(validate_workspace_spec_update_tool_arguments),
     )
     .await?;
     let update_output =
@@ -19807,6 +19808,10 @@ async fn run_remote_sidecar_spec_update_job(
     Ok(())
 }
 
+/// Optional schema validation for remote single-tool args (parity with local
+/// `audited_provider_tool_request_with_args_validate`). Schema failures are repair-eligible once.
+type RemoteSingleToolArgsValidate = fn(&Value) -> Result<(), String>;
+
 async fn remote_sidecar_broker_tool_request(
     state: &RemoteSidecarState,
     provider_id: &str,
@@ -19817,6 +19822,209 @@ async fn remote_sidecar_broker_tool_request(
     request_kind: &str,
     expected_tool_name: &str,
 ) -> Result<Value, ApiError> {
+    remote_sidecar_broker_tool_request_with_args_validate(
+        state,
+        provider_id,
+        model_id,
+        request,
+        chat_id,
+        timeout_ms,
+        request_kind,
+        expected_tool_name,
+        None,
+    )
+    .await
+}
+
+async fn remote_sidecar_broker_tool_request_with_args_validate(
+    state: &RemoteSidecarState,
+    provider_id: &str,
+    model_id: &str,
+    request: NeutralChatRequest,
+    chat_id: Option<&str>,
+    timeout_ms: u64,
+    request_kind: &str,
+    expected_tool_name: &str,
+    validate_arguments: Option<RemoteSingleToolArgsValidate>,
+) -> Result<Value, ApiError> {
+    // Match local audited_provider_tool_request: at most one output-protocol repair after
+    // missing/wrong tool / prose / schema_invalid (text-JSON recovery already runs on the broker).
+    let base_request = request;
+    let mut active_request = base_request.clone();
+    let mut output_repair_used = false;
+
+    loop {
+        match remote_sidecar_broker_tool_request_once(
+            state,
+            provider_id,
+            model_id,
+            active_request.clone(),
+            chat_id,
+            timeout_ms,
+            request_kind,
+            expected_tool_name,
+        )
+        .await
+        {
+            Ok(arguments) => {
+                if let Some(validate) = validate_arguments {
+                    if let Err(validation_message) = validate(&arguments) {
+                        let failure_kind = crate::structured_llm_outcome::classify_caller_structured_failure_kind(
+                            &validation_message,
+                        )
+                        .unwrap_or(
+                            crate::structured_llm_outcome::StructuredLlmFailureKind::SchemaInvalid,
+                        );
+                        match crate::structured_llm_outcome::next_audited_stream_action(
+                            failure_kind,
+                            None,
+                            output_repair_used,
+                            0,
+                            0, // provider transport retries stay on the broker stream path
+                        ) {
+                            crate::structured_llm_outcome::StructuredLlmNextAction::Continue {
+                                retry_kind,
+                                output_repair_used: next_output_repair_used,
+                                ..
+                            } if matches!(
+                                retry_kind,
+                                crate::structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+                            ) =>
+                            {
+                                output_repair_used = next_output_repair_used;
+                                active_request = append_remote_output_repair_message(
+                                    &base_request,
+                                    expected_tool_name,
+                                    failure_kind,
+                                );
+                                tracing::debug!(
+                                    request_kind,
+                                    expected_tool_name,
+                                    failure_category = failure_kind.category_label(),
+                                    "scheduling remote single-tool output repair after schema validation failure"
+                                );
+                                continue;
+                            }
+                            _ => {
+                                return Err(ApiError::bad_request(validation_message));
+                            }
+                        }
+                    }
+                }
+                return Ok(arguments);
+            }
+            Err(RemoteSidecarBrokerToolFailure::Protocol {
+                failure_kind,
+                message,
+            }) => {
+                match crate::structured_llm_outcome::next_audited_stream_action(
+                    failure_kind,
+                    None,
+                    output_repair_used,
+                    0,
+                    0, // provider transport retries stay on the broker stream path
+                ) {
+                    crate::structured_llm_outcome::StructuredLlmNextAction::Continue {
+                        retry_kind,
+                        output_repair_used: next_output_repair_used,
+                        ..
+                    } if matches!(
+                        retry_kind,
+                        crate::structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+                    ) =>
+                    {
+                        output_repair_used = next_output_repair_used;
+                        active_request = append_remote_output_repair_message(
+                            &base_request,
+                            expected_tool_name,
+                            failure_kind,
+                        );
+                        tracing::debug!(
+                            request_kind,
+                            expected_tool_name,
+                            failure_category = failure_kind.category_label(),
+                            "scheduling remote single-tool output repair after protocol failure"
+                        );
+                        continue;
+                    }
+                    _ => {
+                        return Err(ApiError::bad_request(message));
+                    }
+                }
+            }
+            Err(RemoteSidecarBrokerToolFailure::Transport { message }) => {
+                return Err(ApiError::bad_gateway(message));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum RemoteSidecarBrokerToolFailure {
+    Protocol {
+        failure_kind: crate::structured_llm_outcome::StructuredLlmFailureKind,
+        message: String,
+    },
+    Transport {
+        message: String,
+    },
+}
+
+fn append_remote_output_repair_message(
+    base_request: &NeutralChatRequest,
+    expected_tool_name: &str,
+    failure_kind: crate::structured_llm_outcome::StructuredLlmFailureKind,
+) -> NeutralChatRequest {
+    let mut repaired = base_request.clone();
+    repaired.messages.push(neutral_text_message(
+        NeutralChatRole::User,
+        crate::structured_llm_outcome::build_output_repair_user_message(
+            expected_tool_name,
+            failure_kind,
+        ),
+    ));
+    repaired
+}
+
+/// Classify missing/wrong-tool outcomes for remote single-tool broker responses.
+///
+/// Matches local `run_provider_stream_for_tool`: **any** non-expected tool is `WrongTool`,
+/// including mixed sets that also contain the expected tool. Only pure expected-tool sets
+/// succeed. Broker text-JSON recovery already ran; residual text without a tool is prose
+/// (repair-eligible); empty completion is missing_tool.
+fn classify_remote_single_tool_protocol_failure(
+    expected_tool_name: &str,
+    tool_calls: &[NeutralToolCall],
+    final_text: &str,
+) -> Option<crate::structured_llm_outcome::StructuredLlmFailureKind> {
+    if tool_calls
+        .iter()
+        .any(|tool_call| tool_call.name != expected_tool_name)
+    {
+        return Some(crate::structured_llm_outcome::StructuredLlmFailureKind::WrongTool);
+    }
+    if tool_calls
+        .iter()
+        .any(|tool_call| tool_call.name == expected_tool_name)
+    {
+        return None;
+    }
+    if !final_text.trim().is_empty() {
+        return Some(crate::structured_llm_outcome::StructuredLlmFailureKind::Prose);
+    }
+    Some(crate::structured_llm_outcome::StructuredLlmFailureKind::MissingTool)
+}
+
+async fn remote_sidecar_broker_tool_request_once(
+    state: &RemoteSidecarState,
+    provider_id: &str,
+    model_id: &str,
+    request: NeutralChatRequest,
+    chat_id: Option<&str>,
+    timeout_ms: u64,
+    request_kind: &str,
+    expected_tool_name: &str,
+) -> Result<Value, RemoteSidecarBrokerToolFailure> {
     let broker_request_id = unique_id("broker-spec");
     let request_started_at = Instant::now();
     let broker_payload = json!({
@@ -19834,12 +20042,13 @@ async fn remote_sidecar_broker_tool_request(
         remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
     )
     .await
-    .map_err(|_| {
-        ApiError::bad_gateway(crate::llm_request_timeout_message(request_kind, timeout_ms))
+    .map_err(|_| RemoteSidecarBrokerToolFailure::Transport {
+        message: crate::llm_request_timeout_message(request_kind, timeout_ms),
     })?
-    .map_err(api_error_from_response)?;
+    .map_err(remote_sidecar_broker_tool_failure_from_response)?;
 
     let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
+    let mut final_text = String::new();
     loop {
         let envelope = match timeout(
             crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
@@ -19849,17 +20058,16 @@ async fn remote_sidecar_broker_tool_request(
         {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
-                return Err(ApiError::bad_gateway(
-                    "remote broker closed before tool request completed",
-                ));
+                return Err(RemoteSidecarBrokerToolFailure::Transport {
+                    message: "remote broker closed before tool request completed".to_string(),
+                });
             }
             Err(_) => {
                 remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
                 state.broker_pending.lock().await.remove(&broker_request_id);
-                return Err(ApiError::bad_gateway(crate::llm_request_timeout_message(
-                    request_kind,
-                    timeout_ms,
-                )));
+                return Err(RemoteSidecarBrokerToolFailure::Transport {
+                    message: crate::llm_request_timeout_message(request_kind, timeout_ms),
+                });
             }
         };
         match envelope.message_type.as_str() {
@@ -19880,9 +20088,18 @@ async fn remote_sidecar_broker_tool_request(
                             );
                         }
                     }
+                } else if kind == "textDelta" {
+                    if let Some(delta) = envelope.payload.get("text").and_then(Value::as_str) {
+                        final_text.push_str(delta);
+                    }
                 }
             }
             "response" => {
+                if let Some(text) = envelope.payload.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        final_text = text.to_string();
+                    }
+                }
                 let response_tool_calls = envelope
                     .payload
                     .get("toolCalls")
@@ -19896,14 +20113,22 @@ async fn remote_sidecar_broker_tool_request(
                 } else {
                     merge_remote_tool_calls(&collected_tool_calls, &response_tool_calls)
                 };
+                if let Some(failure_kind) = classify_remote_single_tool_protocol_failure(
+                    expected_tool_name,
+                    &tool_calls,
+                    &final_text,
+                ) {
+                    return Err(RemoteSidecarBrokerToolFailure::Protocol {
+                        failure_kind,
+                        message: format!(
+                            "workspace spec job completed without {expected_tool_name} tool call"
+                        ),
+                    });
+                }
                 let submit = tool_calls
                     .into_iter()
                     .find(|tool_call| tool_call.name == expected_tool_name)
-                    .ok_or_else(|| {
-                        ApiError::bad_request(format!(
-                            "workspace spec job completed without {expected_tool_name} tool call"
-                        ))
-                    })?;
+                    .expect("expected tool present after protocol classify");
                 return Ok(submit.arguments);
             }
             "error" => {
@@ -19912,23 +20137,30 @@ async fn remote_sidecar_broker_tool_request(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("remote broker unavailable");
-                return Err(ApiError::bad_gateway(message.to_string()));
+                return Err(RemoteSidecarBrokerToolFailure::Transport {
+                    message: message.to_string(),
+                });
             }
             _ => {}
         }
     }
 }
 
-fn api_error_from_response(response: axum::response::Response) -> ApiError {
+fn remote_sidecar_broker_tool_failure_from_response(
+    response: axum::response::Response,
+) -> RemoteSidecarBrokerToolFailure {
     let status = response.status();
     let message = format!(
         "remote broker request failed with status {}",
         status.as_u16()
     );
     if status.as_u16() >= 500 {
-        ApiError::bad_gateway(message)
+        RemoteSidecarBrokerToolFailure::Transport { message }
     } else {
-        ApiError::bad_request(message)
+        RemoteSidecarBrokerToolFailure::Protocol {
+            failure_kind: crate::structured_llm_outcome::StructuredLlmFailureKind::Other,
+            message,
+        }
     }
 }
 
@@ -37259,6 +37491,176 @@ mod tests {
         assert_eq!(
             broker_retryable_completion_failure(true, true, "ignored prose", &[real]),
             None
+        );
+    }
+
+    #[test]
+    fn classify_remote_single_tool_protocol_failure_matrix() {
+        let expected = "submit_workspace_spec_update";
+        let real = NeutralToolCall {
+            call_id: "c1".to_string(),
+            name: expected.to_string(),
+            arguments: json!({ "updateNeeded": false, "edits": null }),
+            thought_signatures: None,
+        };
+        let wrong = NeutralToolCall {
+            call_id: "c2".to_string(),
+            name: "other_tool".to_string(),
+            arguments: json!({}),
+            thought_signatures: None,
+        };
+
+        assert_eq!(
+            classify_remote_single_tool_protocol_failure(expected, &[real.clone()], "ignored"),
+            None
+        );
+        assert_eq!(
+            classify_remote_single_tool_protocol_failure(expected, &[], ""),
+            Some(crate::structured_llm_outcome::StructuredLlmFailureKind::MissingTool)
+        );
+        assert_eq!(
+            classify_remote_single_tool_protocol_failure(expected, &[], "sorry, here is prose"),
+            Some(crate::structured_llm_outcome::StructuredLlmFailureKind::Prose)
+        );
+        assert_eq!(
+            classify_remote_single_tool_protocol_failure(expected, &[wrong.clone()], ""),
+            Some(crate::structured_llm_outcome::StructuredLlmFailureKind::WrongTool)
+        );
+        // Mixed expected + wrong tool must reject (local parity), not silently accept.
+        assert_eq!(
+            classify_remote_single_tool_protocol_failure(expected, &[real, wrong], ""),
+            Some(crate::structured_llm_outcome::StructuredLlmFailureKind::WrongTool)
+        );
+    }
+
+    #[test]
+    fn remote_single_tool_protocol_failure_schedules_one_output_repair() {
+        use crate::structured_llm_outcome::{
+            StructuredLlmFailureKind, StructuredLlmNextAction, StructuredLlmRetryKind,
+            next_audited_stream_action,
+        };
+
+        for kind in [
+            StructuredLlmFailureKind::MissingTool,
+            StructuredLlmFailureKind::Prose,
+            StructuredLlmFailureKind::WrongTool,
+            StructuredLlmFailureKind::SchemaInvalid,
+        ] {
+            assert_eq!(
+                next_audited_stream_action(kind, None, false, 0, 0),
+                StructuredLlmNextAction::Continue {
+                    retry_kind: StructuredLlmRetryKind::OutputRepair,
+                    provider_retry_index: 0,
+                    output_repair_used: true,
+                }
+            );
+            // Second protocol failure after repair is exhausted → stop (no retry storm).
+            assert_eq!(
+                next_audited_stream_action(kind, None, true, 0, 0),
+                StructuredLlmNextAction::Stop
+            );
+        }
+
+        let repaired = append_remote_output_repair_message(
+            &NeutralChatRequest {
+                model_id: "m".to_string(),
+                messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],
+                tools: vec![],
+                thinking_level: None,
+                max_output_tokens: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::Auto,
+            },
+            "submit_workspace_spec_update",
+            StructuredLlmFailureKind::Prose,
+        );
+        assert_eq!(repaired.messages.len(), 2);
+        assert_eq!(repaired.messages[1].role, NeutralChatRole::User);
+        assert!(
+            repaired.messages[1]
+                .content
+                .contains("submit_workspace_spec_update")
+        );
+        assert!(repaired.messages[1].content.contains("prose"));
+    }
+
+    #[test]
+    fn remote_spec_update_schema_invalid_schedules_one_output_repair() {
+        use crate::structured_llm_outcome::{
+            StructuredLlmFailureKind, StructuredLlmNextAction, StructuredLlmRetryKind,
+            next_audited_stream_action,
+        };
+
+        // Mirrors remote_sidecar_broker_tool_request_with_args_validate: schema failure
+        // uses the same state machine as missing/wrong tool (at most one repair).
+        assert_eq!(
+            next_audited_stream_action(
+                StructuredLlmFailureKind::SchemaInvalid,
+                None,
+                false,
+                0,
+                0
+            ),
+            StructuredLlmNextAction::Continue {
+                retry_kind: StructuredLlmRetryKind::OutputRepair,
+                provider_retry_index: 0,
+                output_repair_used: true,
+            }
+        );
+        assert_eq!(
+            next_audited_stream_action(
+                StructuredLlmFailureKind::SchemaInvalid,
+                None,
+                true,
+                0,
+                0
+            ),
+            StructuredLlmNextAction::Stop
+        );
+
+        // Shared validator rejects malformed args with a schema-class message.
+        let err = validate_workspace_spec_update_tool_arguments(&json!({
+            "notAValidField": true
+        }))
+        .expect_err("deny_unknown_fields should fail");
+        assert!(
+            err.contains("malformed workspace spec update JSON"),
+            "unexpected message: {err}"
+        );
+        assert_eq!(
+            crate::structured_llm_outcome::classify_caller_structured_failure_kind(&err),
+            Some(StructuredLlmFailureKind::SchemaInvalid)
+        );
+
+        assert!(
+            validate_workspace_spec_update_tool_arguments(&json!({
+                "updateNeeded": false,
+                "edits": null
+            }))
+            .is_ok()
+        );
+
+        let repaired = append_remote_output_repair_message(
+            &NeutralChatRequest {
+                model_id: "m".to_string(),
+                messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],
+                tools: vec![],
+                thinking_level: None,
+                max_output_tokens: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::Auto,
+            },
+            "submit_workspace_spec_update",
+            StructuredLlmFailureKind::SchemaInvalid,
+        );
+        assert!(
+            repaired.messages[1]
+                .content
+                .contains("schema_invalid")
         );
     }
 

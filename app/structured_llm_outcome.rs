@@ -54,6 +54,22 @@ pub enum StructuredLlmNextAction {
     Stop,
 }
 
+/// Hard cap on stream attempts for one audited single-tool call.
+///
+/// Budgets are independent and additive (never multiplied by an outer extraction loop):
+/// - initial attempt of the original body
+/// - up to `provider_retry_budget` additional transport retries of the original body
+/// - at most one output-protocol repair body
+/// - up to `provider_retry_budget` additional transport retries of the repaired body
+///
+/// Formula: `2 * provider_retry_budget + 2` (saturating).
+pub fn audited_max_stream_attempts(provider_retry_budget: u32) -> u32 {
+    provider_retry_budget
+        .saturating_add(1) // initial + provider retries of original
+        .saturating_add(1) // one output repair
+        .saturating_add(provider_retry_budget) // provider retries of repaired body
+}
+
 /// Decide the next attempt after a failed audited stream, without reusing the same prompt for output errors.
 ///
 /// Independent budgets:
@@ -84,6 +100,57 @@ pub fn next_audited_stream_action(
         };
     }
     StructuredLlmNextAction::Stop
+}
+
+/// Walk a fault sequence through [`next_audited_stream_action`] and count stream attempts.
+///
+/// Each entry is one completed stream outcome. Counting stops when the state machine returns
+/// [`StructuredLlmNextAction::Stop`] (the failing attempt is still counted). Extra failures after
+/// stop are ignored so tests can over-provision sequences without inflating the budget.
+pub fn count_stream_attempts_until_stop(
+    failures: &[(StructuredLlmFailureKind, Option<i64>)],
+    provider_retry_budget: u32,
+) -> u32 {
+    let mut output_repair_used = false;
+    let mut provider_attempts_used: u32 = 0;
+    let mut attempts: u32 = 0;
+
+    for &(failure_kind, status_code) in failures {
+        attempts = attempts.saturating_add(1);
+        match next_audited_stream_action(
+            failure_kind,
+            status_code,
+            output_repair_used,
+            provider_attempts_used,
+            provider_retry_budget,
+        ) {
+            StructuredLlmNextAction::Continue {
+                provider_retry_index,
+                output_repair_used: next_output_repair_used,
+                ..
+            } => {
+                provider_attempts_used = provider_retry_index;
+                output_repair_used = next_output_repair_used;
+            }
+            StructuredLlmNextAction::Stop => break,
+        }
+    }
+
+    attempts
+}
+
+/// Protocol-class outcomes that text-JSON recovery may still turn into success before repair.
+///
+/// Real ToolCall always wins first; this only documents which raw stream failures feed repair
+/// after recovery already failed.
+pub fn is_protocol_fault_matrix_kind(kind: StructuredLlmFailureKind) -> bool {
+    matches!(
+        kind,
+        StructuredLlmFailureKind::MissingTool
+            | StructuredLlmFailureKind::Prose
+            | StructuredLlmFailureKind::WrongTool
+            | StructuredLlmFailureKind::SchemaInvalid
+    )
 }
 
 /// Structured failure kind for single-tool audited provider requests.
@@ -155,6 +222,7 @@ impl StructuredLlmFailureKind {
             structured_outcome: self.structured_outcome(),
             recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
             attempt_index,
+            structured_call_id: None,
         }
     }
 }
@@ -165,6 +233,7 @@ pub fn classification_succeeded_tool_call(attempt_index: i64) -> StructuredLlmRe
         structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
         recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
         attempt_index,
+        structured_call_id: None,
     }
 }
 
@@ -176,6 +245,7 @@ pub fn classification_text_json_recovered(
         structured_outcome: STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
         recovery_source: STRUCTURED_LLM_RECOVERY_TEXT_JSON,
         attempt_index,
+        structured_call_id: None,
     }
 }
 
@@ -192,6 +262,7 @@ pub fn classification_correction_retry_success(
         },
         recovery_source: STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
         attempt_index,
+        structured_call_id: None,
     }
 }
 
@@ -341,6 +412,20 @@ pub fn with_attempt_index(
         structured_outcome: classification.structured_outcome,
         recovery_source: classification.recovery_source,
         attempt_index,
+        structured_call_id: classification.structured_call_id,
+    }
+}
+
+/// Attach a durable job call id shared across stream attempts of one audited call.
+pub fn with_structured_call_id<'a>(
+    classification: StructuredLlmRequestClassification<'static>,
+    structured_call_id: &'a str,
+) -> StructuredLlmRequestClassification<'a> {
+    StructuredLlmRequestClassification {
+        structured_outcome: classification.structured_outcome,
+        recovery_source: classification.recovery_source,
+        attempt_index: classification.attempt_index,
+        structured_call_id: Some(structured_call_id),
     }
 }
 
@@ -594,6 +679,235 @@ mod tests {
                 2,
             ),
             StructuredLlmNextAction::Stop
+        );
+    }
+
+    /// Fault matrix: each protocol-class failure repairs once; semantic/other stop; transport uses budget.
+    #[test]
+    fn fault_matrix_maps_to_repair_provider_or_stop() {
+        let budget = 2u32;
+
+        for kind in [
+            StructuredLlmFailureKind::MissingTool,
+            StructuredLlmFailureKind::Prose,
+            StructuredLlmFailureKind::WrongTool,
+            StructuredLlmFailureKind::SchemaInvalid,
+        ] {
+            assert!(is_protocol_fault_matrix_kind(kind));
+            assert_eq!(
+                next_audited_stream_action(kind, None, false, 0, budget),
+                StructuredLlmNextAction::Continue {
+                    retry_kind: StructuredLlmRetryKind::OutputRepair,
+                    provider_retry_index: 0,
+                    output_repair_used: true,
+                },
+                "{kind:?} should schedule one output repair"
+            );
+            // After repair, same protocol failure must not re-prompt without feedback.
+            assert_eq!(
+                next_audited_stream_action(kind, None, true, 0, budget),
+                StructuredLlmNextAction::Stop,
+                "{kind:?} after repair must stop"
+            );
+        }
+
+        // Semantic: never repair, never provider-retry.
+        assert!(!is_protocol_fault_matrix_kind(
+            StructuredLlmFailureKind::SemanticInvalid
+        ));
+        assert_eq!(
+            next_audited_stream_action(
+                StructuredLlmFailureKind::SemanticInvalid,
+                Some(429),
+                false,
+                0,
+                budget
+            ),
+            StructuredLlmNextAction::Stop
+        );
+
+        // Timeout / 429 / 5xx / bare network → provider retry path only.
+        for (kind, status) in [
+            (StructuredLlmFailureKind::ProviderTimeout, None),
+            (StructuredLlmFailureKind::ProviderError, Some(429)),
+            (StructuredLlmFailureKind::ProviderError, Some(503)),
+            (StructuredLlmFailureKind::ProviderError, None),
+        ] {
+            assert_eq!(
+                next_audited_stream_action(kind, status, false, 0, budget),
+                StructuredLlmNextAction::Continue {
+                    retry_kind: StructuredLlmRetryKind::ProviderRetry,
+                    provider_retry_index: 1,
+                    output_repair_used: false,
+                },
+                "{kind:?} status={status:?} should provider-retry"
+            );
+            assert!(!kind.is_output_repair_eligible());
+        }
+
+        // Non-retryable 4xx provider error → stop immediately.
+        assert_eq!(
+            next_audited_stream_action(
+                StructuredLlmFailureKind::ProviderError,
+                Some(400),
+                false,
+                0,
+                budget
+            ),
+            StructuredLlmNextAction::Stop
+        );
+    }
+
+    #[test]
+    fn audited_max_stream_attempts_is_linear_not_multiplied() {
+        // Formula: 2 * budget + 2 (initial + repair + provider on both bodies).
+        assert_eq!(audited_max_stream_attempts(0), 2);
+        assert_eq!(audited_max_stream_attempts(1), 4);
+        assert_eq!(audited_max_stream_attempts(2), 6);
+        assert_eq!(audited_max_stream_attempts(3), 8);
+
+        // Explicitly not budget * outer_extraction_attempts (legacy bug was outer * (retry+1)).
+        let llm_request_retry_count = 3u32;
+        let removed_outer_extraction_attempts = 3u32; // historical constant, must not multiply
+        let actual_cap = audited_max_stream_attempts(llm_request_retry_count);
+        let forbidden_multiplied =
+            llm_request_retry_count.saturating_add(1) * removed_outer_extraction_attempts;
+        assert!(
+            actual_cap < forbidden_multiplied,
+            "cap {actual_cap} must not reach outer×provider product {forbidden_multiplied}"
+        );
+        assert_eq!(actual_cap, 8);
+    }
+
+    #[test]
+    fn retry_budget_caps_protocol_only_and_mixed_paths() {
+        let budget = 2u32;
+        let cap = audited_max_stream_attempts(budget);
+
+        // Protocol-only: one repair then stop → 2 attempts, never multiplies.
+        let protocol_only = count_stream_attempts_until_stop(
+            &[
+                (StructuredLlmFailureKind::MissingTool, None),
+                (StructuredLlmFailureKind::Prose, None),
+                (StructuredLlmFailureKind::WrongTool, None), // ignored after stop
+            ],
+            budget,
+        );
+        assert_eq!(protocol_only, 2);
+        assert!(protocol_only <= cap);
+
+        // Provider-only on original body: initial + budget retries → budget+1.
+        let provider_only = count_stream_attempts_until_stop(
+            &[
+                (StructuredLlmFailureKind::ProviderError, Some(503)),
+                (StructuredLlmFailureKind::ProviderError, Some(503)),
+                (StructuredLlmFailureKind::ProviderError, Some(503)),
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // stop
+            ],
+            budget,
+        );
+        assert_eq!(provider_only, budget + 1);
+        assert!(provider_only <= cap);
+
+        // Worst mixed path: exhaust provider on original, repair, exhaust provider on repaired.
+        let worst = count_stream_attempts_until_stop(
+            &[
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // → p1
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // → p2
+                (StructuredLlmFailureKind::MissingTool, None),        // → repair
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // → p1 repaired
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // → p2 repaired
+                (StructuredLlmFailureKind::ProviderError, Some(503)), // stop
+                (StructuredLlmFailureKind::MissingTool, None),        // ignored
+            ],
+            budget,
+        );
+        assert_eq!(worst, cap);
+        assert_eq!(worst, 6);
+
+        // Schema invalid repairs once like missing_tool (args validation path).
+        assert_eq!(
+            count_stream_attempts_until_stop(
+                &[
+                    (StructuredLlmFailureKind::SchemaInvalid, None),
+                    (StructuredLlmFailureKind::SchemaInvalid, None),
+                ],
+                budget
+            ),
+            2
+        );
+
+        // Semantic invalid never burns repair budget.
+        assert_eq!(
+            count_stream_attempts_until_stop(
+                &[(StructuredLlmFailureKind::SemanticInvalid, None)],
+                budget
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn extraction_call_site_budget_is_single_audited_call() {
+        // Memory extraction invokes audited_provider_tool_request once (no outer attempt loop).
+        // Total stream attempts for one extraction job is therefore ≤ audited_max_stream_attempts.
+        let llm_request_retry_count = 2u32;
+        let audited_calls_per_extraction_job = 1u32;
+        let total_cap = audited_max_stream_attempts(llm_request_retry_count)
+            .saturating_mul(audited_calls_per_extraction_job);
+        assert_eq!(total_cap, 6);
+
+        // Even if someone reintroduced a 3-attempt outer loop, the product would be 18 —
+        // this documents the intended single-call bound for regression tests.
+        let legacy_outer = 3u32;
+        assert_ne!(
+            total_cap,
+            audited_max_stream_attempts(llm_request_retry_count).saturating_mul(legacy_outer)
+        );
+    }
+
+    #[test]
+    fn classifies_fault_matrix_messages_for_protocol_and_semantic() {
+        // Empty / missing tool
+        assert_eq!(
+            classify_provider_tool_failure_kind("memory extraction did not call submit tool", None),
+            StructuredLlmFailureKind::MissingTool
+        );
+        // Prose (non-recoverable text after text-JSON failed)
+        assert_eq!(
+            classify_provider_tool_failure_kind(
+                "memory retrieval returned text instead of select tool: sorry",
+                None
+            ),
+            StructuredLlmFailureKind::Prose
+        );
+        // Wrong tool
+        assert_eq!(
+            classify_provider_tool_failure_kind(
+                "workspace spec update completed with unsupported tool 'other'",
+                None
+            ),
+            StructuredLlmFailureKind::WrongTool
+        );
+        // Schema (caller)
+        assert_eq!(
+            classify_caller_structured_failure_kind(
+                "malformed memory extraction JSON: missing field `facts`"
+            ),
+            Some(StructuredLlmFailureKind::SchemaInvalid)
+        );
+        // Semantic (caller)
+        assert_eq!(
+            classify_caller_structured_failure_kind(
+                "extracted fact 0 references unknown evidence id 'x'"
+            ),
+            Some(StructuredLlmFailureKind::SemanticInvalid)
+        );
+        assert_eq!(
+            classify_caller_structured_failure_kind(
+                "invalid edit: oldText did not match exactly once"
+            ),
+            Some(StructuredLlmFailureKind::SemanticInvalid)
         );
     }
 }

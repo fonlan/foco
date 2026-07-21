@@ -172,6 +172,17 @@ struct WorkspaceSpecUpdateToolOutput {
     edits: Option<Vec<SpecTextEdit>>,
 }
 
+/// Schema-only validation for remote sidecar Spec update (parity with local
+/// `audited_provider_tool_request_with_args_validate` serde check). Semantic edit
+/// application stays outside so invalid `oldText` still fails without writing.
+pub(crate) fn validate_workspace_spec_update_tool_arguments(
+    value: &Value,
+) -> Result<(), String> {
+    serde_json::from_value::<WorkspaceSpecUpdateToolOutput>(value.clone())
+        .map(|_| ())
+        .map_err(|source| format!("malformed workspace spec update JSON: {source}"))
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorkspaceSpecUpdateCompactionToolOutput {
@@ -913,9 +924,7 @@ async fn run_workspace_spec_update_job_inner(
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
         Some(Box::new(|value: &Value| {
-            serde_json::from_value::<WorkspaceSpecUpdateToolOutput>(value.clone())
-                .map(|_| ())
-                .map_err(|source| format!("malformed workspace spec update JSON: {source}"))
+            validate_workspace_spec_update_tool_arguments(value)
         })),
     )
     .await?;
