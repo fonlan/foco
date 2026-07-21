@@ -6271,6 +6271,27 @@ export function App() {
     };
   }
 
+  function reportChatStreamOwnershipConflict(
+    kind: "duplicateWritableSession" | "assistantIdentityMismatch",
+    details: {
+      workspaceId: string;
+      chatId: string;
+      runId: string;
+      canonicalAssistantMessageId: string | null;
+      incomingAssistantMessageId: string | null;
+      epoch: number | null;
+    },
+  ) {
+    // Deliberately keep this identity-only: a stream ownership diagnostic must
+    // never capture assistant text, tool output, or credentials in the console.
+    const diagnostic = { kind, ...details };
+    if (import.meta.env.DEV) {
+      console.warn("[chat-stream] ownership invariant", diagnostic);
+      return;
+    }
+    console.debug("[chat-stream] ownership conflict; reconciling", diagnostic);
+  }
+
   function claimChatStreamSession(
     chatKey: string,
     runId: string | null,
@@ -10350,6 +10371,34 @@ export function App() {
       );
       return;
     }
+    const existingSession = chatStreamSessionsByChatKeyRef.current.get(chatKey);
+    const existingAssistantMessageId = existingSession?.assistantMessageId ?? null;
+    const incomingAssistantMessageId = activeRun.assistantMessageId ?? null;
+    if (
+      existingSession?.runId === activeRun.runId &&
+      existingAssistantMessageId &&
+      incomingAssistantMessageId &&
+      existingAssistantMessageId !== incomingAssistantMessageId
+    ) {
+      reportChatStreamOwnershipConflict("assistantIdentityMismatch", {
+        canonicalAssistantMessageId: incomingAssistantMessageId,
+        chatId: activeRun.chatId,
+        epoch: existingSession.epoch,
+        incomingAssistantMessageId: existingAssistantMessageId,
+        runId: activeRun.runId,
+        workspaceId: activeRun.workspaceId,
+      });
+      // The server summary is authoritative. Merge the retired local alias before
+      // retiring its epoch so a same-run identity correction cannot leave two
+      // assistant bubbles visible while the replacement subscription connects.
+      setMessagesForChatKey(chatKey, (current) =>
+        canonicalizeAssistantMessage(current, incomingAssistantMessageId, [
+          existingAssistantMessageId,
+        ]),
+      );
+      chatStreamSessionsByChatKeyRef.current.delete(chatKey);
+      existingSession.abortController.abort();
+    }
     const abortController = new AbortController();
     const session = claimChatStreamSession(
       chatKey,
@@ -10362,6 +10411,15 @@ export function App() {
       },
     );
     if (!session) {
+      const existing = chatStreamSessionsByChatKeyRef.current.get(chatKey);
+      reportChatStreamOwnershipConflict("duplicateWritableSession", {
+        canonicalAssistantMessageId: existing?.assistantMessageId ?? null,
+        chatId: activeRun.chatId,
+        epoch: existing?.epoch ?? null,
+        incomingAssistantMessageId: activeRun.assistantMessageId ?? null,
+        runId: activeRun.runId,
+        workspaceId: activeRun.workspaceId,
+      });
       return;
     }
     session.assistantMessageId = activeRun.assistantMessageId ?? null;
@@ -10650,16 +10708,14 @@ export function App() {
         currentAssistantMessageId &&
         eventAssistantMessageId !== currentAssistantMessageId
       ) {
-        console.warn(
-          "[chat-stream] event used a different assistant identity; reloading",
-          {
-            chatId: activeRun.chatId,
-            expectedAssistantMessageId: currentAssistantMessageId,
-            receivedAssistantMessageId: eventAssistantMessageId,
-            runId: activeRun.runId,
-            workspaceId: activeRun.workspaceId,
-          },
-        );
+        reportChatStreamOwnershipConflict("assistantIdentityMismatch", {
+          canonicalAssistantMessageId: currentAssistantMessageId,
+          chatId: activeRun.chatId,
+          epoch: session.epoch,
+          incomingAssistantMessageId: eventAssistantMessageId,
+          runId: activeRun.runId,
+          workspaceId: activeRun.workspaceId,
+        });
         void loadChatMessages(
           activeRun.workspaceId,
           activeRun.chatId,
@@ -10805,16 +10861,14 @@ export function App() {
               previousAssistantMessageId &&
               previousAssistantMessageId !== streamEvent.assistantMessageId
             ) {
-              console.warn(
-                "[chat-stream] active run changed durable assistant identity; reloading",
-                {
-                  chatId: activeRun.chatId,
-                  expectedAssistantMessageId: previousAssistantMessageId,
-                  receivedAssistantMessageId: streamEvent.assistantMessageId,
-                  runId: activeRun.runId,
-                  workspaceId: activeRun.workspaceId,
-                },
-              );
+              reportChatStreamOwnershipConflict("assistantIdentityMismatch", {
+                canonicalAssistantMessageId: previousAssistantMessageId,
+                chatId: activeRun.chatId,
+                epoch: session.epoch,
+                incomingAssistantMessageId: streamEvent.assistantMessageId,
+                runId: activeRun.runId,
+                workspaceId: activeRun.workspaceId,
+              });
               void loadChatMessages(
                 activeRun.workspaceId,
                 activeRun.chatId,
@@ -19270,6 +19324,21 @@ function normalizeActiveChatRunSummary(
   const workspaceId = stringField(value, "workspaceId", "workspace_id");
   const chatId = stringField(value, "chatId", "chat_id");
   const lastSequenceValue = fieldValue(value, "lastSequence", "last_sequence");
+  const assistantMessageId = stringField(
+    value,
+    "assistantMessageId",
+    "assistant_message_id",
+  );
+  const assistantSequenceValue = fieldValue(
+    value,
+    "assistantSequence",
+    "assistant_sequence",
+  );
+  const queuedUserMessageId = stringField(
+    value,
+    "queuedUserMessageId",
+    "queued_user_message_id",
+  );
   const acceptingGuidanceValue = fieldValue(
     value,
     "acceptingGuidance",
@@ -19286,6 +19355,12 @@ function normalizeActiveChatRunSummary(
     chatId,
     lastSequence:
       typeof lastSequenceValue === "number" ? lastSequenceValue : null,
+    assistantMessageId: assistantMessageId ?? null,
+    assistantSequence:
+      typeof assistantSequenceValue === "number"
+        ? assistantSequenceValue
+        : null,
+    queuedUserMessageId: queuedUserMessageId ?? null,
     acceptingGuidance: acceptingGuidanceValue === true,
   };
 }

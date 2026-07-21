@@ -7793,6 +7793,299 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBe(1);
   });
 
+  it("keeps one durable assistant row when refresh restores an active streaming message", async () => {
+    const durableAssistantId = "message-assistant-durable";
+    const encoder = new TextEncoder();
+    const streamControllerRef: {
+      current: ReadableStreamDefaultController<Uint8Array> | null;
+    } = { current: null };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "",
+                id: durableAssistantId,
+                parts: [],
+                status: "streaming",
+              },
+            ],
+            activeRun: {
+              assistantMessageId: durableAssistantId,
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "refresh-durable-run",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        if (
+          path ===
+          "/api/workspaces/workspace-1/chat/runs/refresh-durable-run/stream"
+        ) {
+          const stream = new ReadableStream<Uint8Array>({
+            start(nextController) {
+              streamControllerRef.current = nextController;
+            },
+          });
+          return new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    try {
+      renderApp();
+
+      await waitFor(() => expect(streamControllerRef.current).not.toBeNull());
+      await act(async () => {
+        streamControllerRef.current?.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              assistantMessageId: durableAssistantId,
+              chatId: "chat-1",
+              memoriesUsed: [],
+              type: "start",
+              userMessageId: "message-user-stream",
+            })}\n\n`,
+          ),
+        );
+        streamControllerRef.current?.enqueue(
+          encoder.encode(
+            `data: ${JSON.stringify({
+              assistantMessageId: durableAssistantId,
+              delta: "Refreshed durable delta.",
+              type: "textDelta",
+            })}\n\n`,
+          ),
+        );
+      });
+
+      const delta = await screen.findByText("Refreshed durable delta.");
+      const assistantRow = delta.closest(".message-row");
+      expect(assistantRow).not.toBeNull();
+      expect(document.querySelectorAll(".message-row")).toHaveLength(2);
+      expect(
+        screen
+          .getAllByText("Refreshed durable delta.")
+          .map((node) => node.closest(".message-row")),
+      ).toEqual([assistantRow]);
+    } finally {
+      try {
+        await act(async () => {
+          streamControllerRef.current?.close();
+        });
+      } catch {
+        // The stream may already be cancelled when the test cleanup runs.
+      }
+    }
+  });
+
+  it("ignores late events from a displaced active-run session", async () => {
+    const encoder = new TextEncoder();
+    let serveReplacementRun = false;
+    let sharedRunStreamRequests = 0;
+    let oldController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    let replacementController: ReadableStreamDefaultController<Uint8Array> | null =
+      null;
+    const emit = (
+      controller: ReadableStreamDefaultController<Uint8Array>,
+      event: Record<string, unknown>,
+    ) => {
+      controller.enqueue(
+        encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
+      );
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          const activeRun = serveReplacementRun
+            ? {
+                assistantMessageId: "replacement-assistant",
+                chatId: "chat-1",
+                lastSequence: 0,
+                runId: "shared-run",
+                workspaceId: "workspace-1",
+              }
+            : {
+                assistantMessageId: "old-assistant",
+                chatId: "chat-1",
+                lastSequence: 0,
+                runId: "shared-run",
+                workspaceId: "workspace-1",
+              };
+          const assistant = {
+            ...chatMessages.messages[1],
+            content: "",
+            id: activeRun.assistantMessageId,
+            parts: [],
+            status: "streaming",
+          };
+          return jsonResponse({
+            activeRun,
+            messages: [chatMessages.messages[0], assistant],
+          });
+        }
+
+        if (
+          path === "/api/workspaces/workspace-1/chat/runs/shared-run/stream"
+        ) {
+          sharedRunStreamRequests += 1;
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              if (sharedRunStreamRequests === 1) {
+                oldController = controller;
+              } else {
+                replacementController = controller;
+              }
+            },
+          });
+          return new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    try {
+      renderApp();
+      await waitFor(() => expect(oldController).not.toBeNull());
+
+      await act(async () => {
+        emit(oldController as ReadableStreamDefaultController<Uint8Array>, {
+          assistantMessageId: "old-assistant",
+          chatId: "chat-1",
+          memoriesUsed: [],
+          type: "start",
+          userMessageId: "message-user-stream",
+        });
+      });
+
+      serveReplacementRun = true;
+      await act(async () => {
+        emit(oldController as ReadableStreamDefaultController<Uint8Array>, {
+          assistantMessageId: "old-assistant-alias",
+          chatId: "chat-1",
+          memoriesUsed: [],
+          type: "start",
+          userMessageId: "message-user-stream",
+        });
+      });
+
+      await waitFor(() => expect(replacementController).not.toBeNull());
+      await act(async () => {
+        emit(
+          replacementController as ReadableStreamDefaultController<Uint8Array>,
+          {
+            assistantMessageId: "replacement-assistant",
+            chatId: "chat-1",
+            memoriesUsed: [],
+            type: "start",
+            userMessageId: "message-user-stream",
+          },
+        );
+        emit(
+          replacementController as ReadableStreamDefaultController<Uint8Array>,
+          {
+            assistantMessageId: "replacement-assistant",
+            delta: "Replacement owner text.",
+            type: "textDelta",
+          },
+        );
+      });
+      expect(await screen.findByText("Replacement owner text.")).toBeInTheDocument();
+
+      await act(async () => {
+        const controller = oldController as ReadableStreamDefaultController<Uint8Array>;
+        emit(controller, {
+          assistantMessageId: "old-assistant",
+          delta: "Late old text.",
+          type: "textDelta",
+        });
+        emit(controller, {
+          assistantMessageId: "old-assistant",
+          delta: "Late old reasoning.",
+          type: "reasoningDelta",
+        });
+        emit(controller, {
+          assistantMessageId: "old-assistant",
+          toolCall: {
+            id: "late-old-tool",
+            input: {},
+            isError: false,
+            name: "late_old_tool",
+            output: null,
+            status: "running",
+          },
+          type: "toolCall",
+        });
+        emit(controller, {
+          assistantMessageId: "old-assistant",
+          metrics: {
+            modelId: "gpt-test",
+            providerId: "openai",
+            totalLatencyMs: 1,
+          },
+          reasoning: null,
+          stopReason: "completed",
+          text: "Late old completion.",
+          type: "complete",
+          usage: {
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            inputTokens: 1,
+            outputTokens: 1,
+          },
+        });
+        emit(controller, { type: "streamEnd" });
+      });
+
+      expect(screen.getByText("Replacement owner text.")).toBeInTheDocument();
+      expect(screen.queryByText("Late old text.")).not.toBeInTheDocument();
+      expect(screen.queryByText("Late old reasoning.")).not.toBeInTheDocument();
+      expect(screen.queryByText("late_old_tool")).not.toBeInTheDocument();
+      expect(screen.queryByText("Late old completion.")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();
+      expect(document.querySelectorAll(".message-row")).toHaveLength(2);
+    } finally {
+      await act(async () => {
+        for (const controller of [oldController, replacementController]) {
+          try {
+            controller?.close();
+          } catch {
+            // A displaced stream may already have been cancelled by the client.
+          }
+        }
+      });
+    }
+  });
+
   it("reattaches to an active run when loading chat messages", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
