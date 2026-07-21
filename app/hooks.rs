@@ -877,6 +877,7 @@ async fn run_prompt_hook_attempt(
 
 struct AuditedPromptHookStream {
     stream: NeutralChatStream,
+    capture: ProviderAuditCapture,
     workspace_id: String,
     workspace_path: PathBuf,
     request_id: String,
@@ -915,11 +916,9 @@ impl AuditedPromptHookStream {
         _output: &str,
     ) -> Result<(), String> {
         let response_body_json = self
-            .stream
-            .final_response_dump()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|source| format!("failed to serialize prompt hook response dump: {source}"))?;
+            .capture
+            .response_json(self.stream.final_response_dump())
+            .map_err(|error| error.message)?;
         let events = self.serialized_events()?;
         let completed_at = utc_timestamp();
         let input_tokens = usage.as_ref().and_then(|usage| usage.input_tokens);
@@ -970,11 +969,9 @@ impl AuditedPromptHookStream {
 
     fn fail(&self, message: &str) -> Result<(), String> {
         let response_body_json = self
-            .stream
-            .interrupted_final_response_dump(message)
-            .map(|dump| serde_json::to_string(&dump))
-            .transpose()
-            .map_err(|source| format!("failed to serialize prompt hook failure dump: {source}"))?;
+            .capture
+            .interrupted_stream_response_json(&self.stream, message)
+            .map_err(|error| error.message)?;
         let events = self.serialized_events()?;
         fail_prompt_hook_audit(
             &self.workspace_path,
@@ -1118,6 +1115,7 @@ async fn audited_prompt_hook_stream(
     {
         Ok(Ok(stream)) => Ok(AuditedPromptHookStream {
             stream,
+            capture,
             workspace_id: request.workspace_id.clone(),
             workspace_path: request.workspace_path.to_path_buf(),
             request_id,

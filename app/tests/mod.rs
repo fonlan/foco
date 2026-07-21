@@ -30620,6 +30620,46 @@ async fn serve_main_chat_wire_fixture() -> (
     (format!("http://{addr}/v1"), seen, task)
 }
 
+async fn serve_main_chat_responses_failure_fixture() -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(|| async move {
+            let mut response_headers = HeaderMap::new();
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/event-stream"),
+            );
+            response_headers.insert(
+                header::AUTHORIZATION,
+                header::HeaderValue::from_static("Bearer response-secret"),
+            );
+            response_headers.insert(
+                header::HeaderName::from_static("x-cpa-trace-id"),
+                header::HeaderValue::from_static("trace-main-chat-responses-failure"),
+            );
+            (
+                response_headers,
+                concat!(
+                    "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
+                    "event: response.failed\ndata: {\"type\":\"response.failed\",\"api_key\":\"failed-frame-secret\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"model\":\"model\",\"error\":{\"code\":\"rate_limit\",\"type\":\"rate_limit_error\",\"message\":\"retry later\"}}}\n\n"
+                ),
+            )
+                .into_response()
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat Responses failure fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("main chat Responses failure fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), task)
+}
+
 async fn serve_main_chat_reasoning_loop_fixture()
 -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     serve_main_chat_reasoning_loop_fixture_with_loop_count(1).await
@@ -31744,6 +31784,100 @@ async fn main_chat_real_http_bytes_persist_as_wire_and_detail_api_returns_wire()
     assert_eq!(list.requests.len(), 1);
     assert_eq!(list.requests[0].id, llm_request_id);
     assert_eq!(list.requests[0].final_state, "succeeded");
+}
+
+#[tokio::test]
+async fn main_chat_responses_failed_stream_persists_diagnostic_and_http_head() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, server_task) = serve_main_chat_responses_failure_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.kind = foco_providers::OPENAI_RESPONSES_KIND.to_string();
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Persist a failed Responses stream diagnostic".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare failed Responses main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_id = None;
+    let mut failure_message = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_id = Some(id),
+            ChatSseEvent::Error { message } => failure_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+    assert!(
+        failure_message
+            .as_deref()
+            .is_some_and(|message| message.contains("retry later")),
+        "failed stream should surface its safe provider error"
+    );
+
+    let request = WorkspaceDatabase::open_or_create(workspace.path())
+        .expect("workspace database")
+        .llm_request(&llm_request_id.expect("failed Responses request id"))
+        .expect("read failed Responses audit")
+        .expect("failed Responses audit exists");
+    assert_eq!(request.final_state, "failed");
+    assert_eq!(request.status_code, Some(200));
+    let response_body: Value = serde_json::from_str(
+        request
+            .response_body_json
+            .as_deref()
+            .expect("failed Responses response detail"),
+    )
+    .expect("parse failed Responses response detail");
+    assert_eq!(response_body["format"], "provider_final_response_v1");
+    assert_eq!(response_body["state"], "failed");
+    assert_eq!(response_body["http"]["status"], 200);
+    assert_eq!(
+        response_body["http"]["headers"]["x-cpa-trace-id"][0],
+        "trace-main-chat-responses-failure"
+    );
+    assert_eq!(response_body["streamDiagnostic"]["kind"], "response_failed");
+    assert_eq!(
+        response_body["streamDiagnostic"]["provider_error"]["code"],
+        "rate_limit"
+    );
+    assert!(
+        !response_body.to_string().contains("failed-frame-secret"),
+        "diagnostic must be persisted through the normal provider redaction path"
+    );
 }
 
 #[tokio::test]

@@ -3003,11 +3003,6 @@ impl PreparedChatContext {
         status_code: Option<i64>,
         partial: bool,
     ) {
-        let request_body_json = capture
-            .captured_request_json()
-            .ok()
-            .flatten()
-            .unwrap_or_default();
         let response_body_json = capture
             .failed_response_json(
                 message,
@@ -3016,6 +3011,71 @@ impl PreparedChatContext {
             )
             .ok()
             .flatten();
+        self.capture_failed_llm_request_with_response_json(
+            capture,
+            request_id,
+            request_started_at,
+            events,
+            started_at,
+            message,
+            status_code,
+            response_body_json,
+        );
+    }
+
+    fn capture_failed_stream_llm_request(
+        &mut self,
+        capture: &ProviderAuditCapture,
+        stream: &foco_providers::NeutralChatStream,
+        request_id: String,
+        request_started_at: String,
+        events: Vec<CapturedAuditEvent>,
+        started_at: Instant,
+        message: &str,
+        status_code: Option<i64>,
+        partial: bool,
+    ) {
+        let response_body_json = capture
+            .failed_stream_response_json(
+                stream,
+                message,
+                status_code.and_then(|value| u16::try_from(value).ok()),
+                partial,
+            )
+            .ok()
+            .flatten();
+        self.capture_failed_llm_request_with_response_json(
+            capture,
+            request_id,
+            request_started_at,
+            events,
+            started_at,
+            message,
+            status_code,
+            response_body_json,
+        );
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the durable audit row fields intentionally stay explicit at the common terminal-write boundary"
+    )]
+    fn capture_failed_llm_request_with_response_json(
+        &mut self,
+        capture: &ProviderAuditCapture,
+        request_id: String,
+        request_started_at: String,
+        events: Vec<CapturedAuditEvent>,
+        started_at: Instant,
+        message: &str,
+        status_code: Option<i64>,
+        response_body_json: Option<String>,
+    ) {
+        let request_body_json = capture
+            .captured_request_json()
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         self.record_finished_llm_request(CapturedLlmRequest {
             id: request_id,
             request_kind: "chat completion",
@@ -3686,21 +3746,27 @@ impl PreparedChatContext {
                     let provider_event = match event_result {
                         Ok(provider_event) => provider_event,
                         Err(error) => {
-                            let status_code = provider_status_code(&error);
+                            // Keep retry classification bound to the provider error itself.
+                            // For audit persistence, an SSE decoder error can still have an
+                            // observed successful HTTP response head (such as HTTP 200).
+                            let provider_status_code = provider_status_code(&error);
+                            let audit_status_code = provider_status_code
+                                .or_else(|| provider_stream.http_status().map(i64::from));
                             let message = error.to_string();
                             if should_retry_provider_stream_error(
                                 &error,
                                 turn_retry_count,
                                 self.global_config.app.llm_request_retry_count,
                             ) {
-                                self.capture_failed_llm_request(
+                                self.capture_failed_stream_llm_request(
                                     &turn_capture,
+                                    &provider_stream,
                                     turn_llm_request_id,
                                     turn_request_started_at,
                                     turn_events,
                                     turn_started_at,
                                     &message,
-                                    status_code,
+                                    audit_status_code,
                                     true,
                                 );
                                 turn_retry_count = turn_retry_count.saturating_add(1);
@@ -3736,13 +3802,18 @@ impl PreparedChatContext {
                                 turn_started_at,
                                 &mut events,
                                 &message,
-                                status_code,
+                                audit_status_code,
                             )
                             .await;
                             let response_body_json = best_effort_chat_audit_detail(
                                 &self,
                                 &turn_llm_request_id,
-                                turn_capture.response_json(provider_stream.final_response_dump()),
+                                turn_capture.failed_stream_response_json(
+                                    &provider_stream,
+                                    &message,
+                                    audit_status_code.and_then(|value| u16::try_from(value).ok()),
+                                    false,
+                                ),
                             );
                             let captured_request_json = best_effort_chat_audit_detail(
                                 &self,
@@ -4841,16 +4912,18 @@ impl PreparedChatContext {
                             break;
                         }
                         NeutralChatStreamEvent::Error { message } => {
+                            let audit_status_code = provider_stream.http_status().map(i64::from);
                             if turn_retry_count < self.global_config.app.llm_request_retry_count {
-                                self.capture_failed_llm_request(
+                                self.capture_failed_stream_llm_request(
                                     &turn_capture,
+                                    &provider_stream,
                                     turn_llm_request_id,
                                     turn_request_started_at,
                                     turn_events,
                                     turn_started_at,
                                     &message,
-                                    None,
-                                true,
+                                    audit_status_code,
+                                    true,
                                 );
                                 turn_retry_count = turn_retry_count.saturating_add(1);
                                 assistant_text = attempt_assistant_text;
@@ -4888,14 +4961,15 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
-                            self.capture_failed_llm_request(
+                            self.capture_failed_stream_llm_request(
                                 &turn_capture,
+                                &provider_stream,
                                 turn_llm_request_id,
                                 turn_request_started_at,
                                 turn_events,
                                 turn_started_at,
                                 &message,
-                                None,
+                                audit_status_code,
                                 true,
                             );
 
@@ -4920,16 +4994,18 @@ impl PreparedChatContext {
                 }
 
                 let message = "provider stream ended without a completion event".to_string();
+                let audit_status_code = provider_stream.http_status().map(i64::from);
                 if turn_retry_count < self.global_config.app.llm_request_retry_count {
-                    self.capture_failed_llm_request(
+                    self.capture_failed_stream_llm_request(
                         &turn_capture,
+                        &provider_stream,
                         turn_llm_request_id,
                         turn_request_started_at,
                         turn_events,
                         turn_started_at,
                         &message,
-                        None,
-                                true,
+                        audit_status_code,
+                        true,
                     );
                     turn_retry_count = turn_retry_count.saturating_add(1);
                     assistant_text = attempt_assistant_text;
@@ -4967,14 +5043,15 @@ impl PreparedChatContext {
                             None,
                         )
                         .await;
-                self.capture_failed_llm_request(
+                self.capture_failed_stream_llm_request(
                     &turn_capture,
+                    &provider_stream,
                     turn_llm_request_id,
                     turn_request_started_at,
                     turn_events,
                     turn_started_at,
                     &message,
-                    None,
+                    audit_status_code,
                     true,
                 );
 
@@ -5846,7 +5923,7 @@ pub(crate) async fn audited_provider_text_request(
                             reasoning_tokens: None,
                             first_token_latency_ms: None,
                             total_latency_ms: Some(elapsed_millis(started_at)),
-                            status_code: error.status_code,
+                            status_code: error.audit_status_code,
                             final_state: "failed",
                             response_body_json: error.response_body_json.as_deref(),
                         },
@@ -6231,7 +6308,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                             reasoning_tokens: None,
                             first_token_latency_ms: None,
                             total_latency_ms: Some(elapsed_millis(started_at)),
-                            status_code: error.status_code,
+                            status_code: error.audit_status_code,
                             final_state: "failed",
                             response_body_json: error.response_body_json.as_deref(),
                         },
@@ -6349,7 +6426,10 @@ pub(crate) struct AuditedProviderToolResult {
 
 struct AuditedProviderError {
     message: String,
+    /// Raw provider status used by the structured-request retry classifier.
     status_code: Option<i64>,
+    /// Status persisted with the audit row, including an observed successful HTTP head.
+    audit_status_code: Option<i64>,
     response_body_json: Option<String>,
     failure_kind: structured_llm_outcome::StructuredLlmFailureKind,
 }
@@ -6362,6 +6442,7 @@ impl AuditedProviderError {
         Self {
             message,
             status_code,
+            audit_status_code: status_code,
             response_body_json: None,
             failure_kind,
         }
@@ -6381,10 +6462,16 @@ impl AuditedProviderError {
     }
 
     fn with_stream_final_response(
-        self,
+        mut self,
         capture: &ProviderAuditCapture,
         stream: &foco_providers::NeutralChatStream,
     ) -> Self {
+        // `failure_kind` was classified from the original ProviderConfigError. Only
+        // enrich the persisted status with an observed response head; do not alter
+        // the retry classification for a decoder error after HTTP 200.
+        self.audit_status_code = self
+            .audit_status_code
+            .or_else(|| stream.http_status().map(i64::from));
         if self.response_body_json.is_some() {
             return self;
         }
@@ -6396,11 +6483,14 @@ impl AuditedProviderError {
     }
 
     fn with_interrupted_stream_response(
-        self,
+        mut self,
         capture: &ProviderAuditCapture,
         stream: &foco_providers::NeutralChatStream,
         message: &str,
     ) -> Self {
+        self.audit_status_code = self
+            .audit_status_code
+            .or_else(|| stream.http_status().map(i64::from));
         if self.response_body_json.is_some() {
             return self;
         }

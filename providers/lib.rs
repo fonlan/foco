@@ -26,7 +26,8 @@ use genai::{
 };
 use reqwest::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 pub const PROVIDER_WIRE_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_VERSION: u32 = 1;
@@ -34,6 +35,14 @@ pub const PROVIDER_WIRE_REQUEST_DUMP_FORMAT: &str = "provider_request_v1";
 pub const PROVIDER_WEBSOCKET_REQUEST_DUMP_FORMAT: &str = "provider_websocket_request_v1";
 pub const PROVIDER_WEBSOCKET_REQUEST_DUMP_VERSION: u32 = 1;
 pub const PROVIDER_FINAL_RESPONSE_DUMP_FORMAT: &str = "provider_final_response_v1";
+/// Maximum persisted JSON size for a failed final provider response envelope.
+///
+/// The bounded decoder diagnostic is compacted first, then non-correlation response
+/// headers and the error message if necessary. This keeps the v1 envelope useful for
+/// upstream correlation without creating an unbounded second stream archive.
+pub const MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES: usize = 32 * 1024;
+const MAX_CORRELATION_RESPONSE_HEADER_VALUES: usize = 8;
+const TRUNCATION_SUFFIX: &str = "…[truncated]";
 const REDACTED_CREDENTIAL_VALUE: &str = "[REDACTED]";
 pub(crate) const MASKED_AUTHORIZATION_VALUE: &str = "********";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
@@ -181,6 +190,12 @@ pub enum ProviderFinalResponseDump {
         partial: bool,
         error: String,
         status_code: Option<u16>,
+        /// Optional, bounded diagnostic from the OpenAI Responses stream decoder.
+        ///
+        /// Stored as JSON so an oversized diagnostic can be summarized without making
+        /// historical v1 envelopes or future decoder additions impossible to read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream_diagnostic: Option<Value>,
     },
 }
 
@@ -217,6 +232,16 @@ impl ProviderFinalResponseDump {
         status_code: Option<u16>,
         partial: bool,
     ) -> Self {
+        Self::failed_with_http_and_stream_diagnostic(http, error, status_code, partial, None)
+    }
+
+    fn failed_with_http_and_stream_diagnostic(
+        http: Option<ProviderHttpResponseHeadDump>,
+        error: impl Into<String>,
+        status_code: Option<u16>,
+        partial: bool,
+        stream_diagnostic: Option<genai::OpenAIRespStreamDiagnostic>,
+    ) -> Self {
         Self::Failed {
             format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
             version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
@@ -224,8 +249,244 @@ impl ProviderFinalResponseDump {
             partial,
             error: error.into(),
             status_code,
+            stream_diagnostic: stream_diagnostic.and_then(provider_stream_diagnostic_value),
         }
     }
+
+    /// Serializes the terminal provider envelope for audit persistence.
+    ///
+    /// Successful envelopes retain the existing behavior. Failed envelopes are capped
+    /// so a malformed upstream response cannot make a single audit record unbounded.
+    pub fn audit_json(&self) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        let serialized = serde_json::to_string(&value)?;
+        if !matches!(self, Self::Failed { .. })
+            || serialized.len() <= MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES
+        {
+            return Ok(serialized);
+        }
+
+        let original_bytes = serialized.len();
+        let original_sha256 = sha256_hex(serialized.as_bytes());
+        compact_failed_stream_diagnostic(&mut value)?;
+        record_audit_truncation(
+            &mut value,
+            "originalBytes",
+            Value::from(original_bytes as u64),
+        );
+        record_audit_truncation(&mut value, "sha256", Value::String(original_sha256));
+        record_audit_truncation(
+            &mut value,
+            "maxBytes",
+            Value::from(MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES as u64),
+        );
+
+        let serialized = serde_json::to_string(&value)?;
+        if serialized.len() <= MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES {
+            return Ok(serialized);
+        }
+
+        compact_failed_error_message(&mut value);
+        compact_failed_response_headers(&mut value);
+        record_audit_truncation(&mut value, "envelopeTruncated", Value::Bool(true));
+
+        let serialized = serde_json::to_string(&value)?;
+        if serialized.len() <= MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES {
+            return Ok(serialized);
+        }
+
+        // A malicious upstream can still repeat correlation headers enough times to
+        // exceed the cap. Fall back to the irreducible audit fields rather than
+        // persisting an oversized row or dropping the diagnostic entirely.
+        let compacted = emergency_compact_failed_response(&value);
+        let serialized = serde_json::to_string(&compacted)?;
+        debug_assert!(
+            serialized.len() <= MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES,
+            "emergency-compacted failed provider audit envelope must stay bounded"
+        );
+        Ok(serialized)
+    }
+}
+
+fn provider_stream_diagnostic_value(
+    diagnostic: genai::OpenAIRespStreamDiagnostic,
+) -> Option<Value> {
+    let mut value = serde_json::to_value(diagnostic).ok()?;
+    // The decoder already redacts its bounded payload snapshot. Reuse Foco's
+    // provider credential-key redactor before the diagnostic joins a v1 envelope.
+    redact_json_credentials(&mut value);
+    Some(value)
+}
+
+fn compact_failed_stream_diagnostic(value: &mut Value) -> Result<(), serde_json::Error> {
+    let Some(object) = value.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(diagnostic) = object.remove("streamDiagnostic") else {
+        return Ok(());
+    };
+    let diagnostic = serde_json::to_vec(&diagnostic)?;
+    object.insert(
+        "streamDiagnostic".to_string(),
+        json!({
+            "truncated": true,
+            "originalBytes": diagnostic.len(),
+            "sha256": sha256_hex(&diagnostic),
+        }),
+    );
+    record_audit_truncation(value, "streamDiagnosticTruncated", Value::Bool(true));
+    Ok(())
+}
+
+fn compact_failed_error_message(value: &mut Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let Some(error) = object.get("error").and_then(Value::as_str) else {
+        return;
+    };
+    let original_bytes = error.len();
+    let original_sha256 = sha256_hex(error.as_bytes());
+    object.insert(
+        "error".to_string(),
+        Value::String(truncate_utf8(error, 512)),
+    );
+    record_audit_truncation(
+        value,
+        "errorOriginalBytes",
+        Value::from(original_bytes as u64),
+    );
+    record_audit_truncation(value, "errorSha256", Value::String(original_sha256));
+}
+
+fn compact_failed_response_headers(value: &mut Value) {
+    let Some(headers) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("http"))
+        .and_then(Value::as_object_mut)
+        .and_then(|http| http.remove("headers"))
+    else {
+        return;
+    };
+
+    let mut correlation_headers = Map::new();
+    if let Some(headers) = headers.as_object() {
+        for (name, value) in headers {
+            if is_correlation_response_header(name) {
+                correlation_headers.insert(name.clone(), truncate_header_value(value));
+            }
+        }
+    }
+    if let Some(http) = value
+        .as_object_mut()
+        .and_then(|object| object.get_mut("http"))
+        .and_then(Value::as_object_mut)
+    {
+        http.insert("headers".to_string(), Value::Object(correlation_headers));
+    }
+    record_audit_truncation(value, "responseHeadersTruncated", Value::Bool(true));
+}
+
+fn record_audit_truncation(value: &mut Value, key: &str, field: Value) {
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let truncation = object
+        .entry("auditTruncation".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Some(truncation) = truncation.as_object_mut() {
+        truncation.insert(key.to_string(), field);
+    }
+}
+
+fn is_correlation_response_header(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "x-cpa-trace-id"
+            | "x-request-id"
+            | "x-correlation-id"
+            | "traceparent"
+            | "tracestate"
+            | "x-amzn-trace-id"
+            | "content-type"
+    )
+}
+
+fn truncate_header_value(value: &Value) -> Value {
+    match value {
+        Value::Array(values) => Value::Array(
+            values
+                .iter()
+                .take(MAX_CORRELATION_RESPONSE_HEADER_VALUES)
+                .filter_map(Value::as_str)
+                .map(|value| Value::String(truncate_utf8(value, 256)))
+                .collect(),
+        ),
+        Value::String(value) => Value::String(truncate_utf8(value, 256)),
+        _ => Value::Null,
+    }
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    if max_bytes <= TRUNCATION_SUFFIX.len() {
+        return TRUNCATION_SUFFIX[..utf8_prefix_end(TRUNCATION_SUFFIX, max_bytes)].to_string();
+    }
+    let end = utf8_prefix_end(value, max_bytes - TRUNCATION_SUFFIX.len());
+    format!("{}{TRUNCATION_SUFFIX}", &value[..end])
+}
+
+fn utf8_prefix_end(value: &str, max_bytes: usize) -> usize {
+    value
+        .char_indices()
+        .take_while(|(index, character)| *index + character.len_utf8() <= max_bytes)
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or_default()
+}
+
+fn emergency_compact_failed_response(value: &Value) -> Value {
+    let object = value.as_object();
+    let mut compacted = Map::new();
+    for key in ["format", "version", "state", "partial", "statusCode"] {
+        if let Some(field) = object.and_then(|object| object.get(key)) {
+            compacted.insert(key.to_string(), field.clone());
+        }
+    }
+    if let Some(status) = object
+        .and_then(|object| object.get("http"))
+        .and_then(Value::as_object)
+        .and_then(|http| http.get("status"))
+    {
+        compacted.insert("http".to_string(), json!({ "status": status }));
+    }
+    if let Some(error) = object
+        .and_then(|object| object.get("error"))
+        .and_then(Value::as_str)
+    {
+        compacted.insert(
+            "error".to_string(),
+            Value::String(truncate_utf8(error, 256)),
+        );
+    }
+    if let Some(diagnostic) = object.and_then(|object| object.get("streamDiagnostic")) {
+        compacted.insert("streamDiagnostic".to_string(), diagnostic.clone());
+    }
+    let mut truncation = object
+        .and_then(|object| object.get("auditTruncation"))
+        .cloned()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if let Some(truncation) = truncation.as_object_mut() {
+        truncation.insert("emergencyCompacted".to_string(), Value::Bool(true));
+    }
+    compacted.insert("auditTruncation".to_string(), truncation);
+    Value::Object(compacted)
+}
+
+fn sha256_hex(value: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(value))
 }
 
 pub const GEMINI_KIND: &str = "gemini";
@@ -1375,18 +1636,45 @@ impl NeutralChatStream {
             .and_then(|response_head| response_head.lock().ok()?.clone())
     }
 
+    fn synthetic_failed_final_response_dump(
+        &self,
+        message: impl Into<String>,
+        status_code: Option<u16>,
+        partial: bool,
+    ) -> Option<ProviderFinalResponseDump> {
+        self.wire_request_dump.as_ref().map(|_| {
+            ProviderFinalResponseDump::failed_with_http_and_stream_diagnostic(
+                self.response_head_dump(),
+                message,
+                status_code,
+                partial,
+                self.stream_diagnostic(),
+            )
+        })
+    }
+
+    /// Returns the observed terminal dump, or creates a bounded failed envelope from
+    /// the current stream state when cancellation/timeout interrupted the decoder.
+    pub fn failed_final_response_dump(
+        &self,
+        message: impl Into<String>,
+        status_code: Option<u16>,
+        partial: bool,
+    ) -> Option<ProviderFinalResponseDump> {
+        self.final_response_dump
+            .clone()
+            .or_else(|| self.synthetic_failed_final_response_dump(message, status_code, partial))
+    }
+
     pub fn interrupted_final_response_dump(
         &self,
         message: impl Into<String>,
     ) -> Option<ProviderFinalResponseDump> {
-        self.wire_request_dump.as_ref().map(|_| {
-            ProviderFinalResponseDump::failed_with_http(
-                self.response_head_dump(),
-                message,
-                None,
-                self.saw_response_event,
-            )
-        })
+        self.synthetic_failed_final_response_dump(
+            message,
+            self.http_status(),
+            self.saw_response_event,
+        )
     }
 
     pub async fn next_event(
@@ -1434,24 +1722,23 @@ impl NeutralChatStream {
                 }
             }
             Ok(NeutralChatStreamEvent::Error { message }) => {
-                if self.wire_request_dump.is_some() {
-                    self.final_response_dump = Some(ProviderFinalResponseDump::failed_with_http(
-                        self.response_head_dump(),
-                        message.clone(),
-                        None,
-                        self.saw_response_event,
-                    ));
-                }
+                self.final_response_dump = self.synthetic_failed_final_response_dump(
+                    message.clone(),
+                    None,
+                    self.saw_response_event,
+                );
             }
             Err(error) => {
-                if self.wire_request_dump.is_some() {
-                    self.final_response_dump = Some(ProviderFinalResponseDump::failed_with_http(
-                        self.response_head_dump(),
-                        error.to_string(),
-                        error.status_code(),
-                        self.saw_response_event,
-                    ));
-                }
+                // A decoder error after a successful HTTP response (for example a 200
+                // SSE `response.failed`) has no error status of its own. Preserve the
+                // observed response status in the terminal audit envelope without
+                // changing ProviderConfigError, which callers use for retry policy.
+                let status_code = error.status_code().or_else(|| self.http_status());
+                self.final_response_dump = self.synthetic_failed_final_response_dump(
+                    error.to_string(),
+                    status_code,
+                    self.saw_response_event,
+                );
             }
         }
 
@@ -6301,7 +6588,7 @@ mod tests {
     async fn openai_resp_detail_stream_exposes_failed_frame_diagnostic() {
         let openai_responses = concat!(
             "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
-            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"model\":\"fixture-responses-model\",\"error\":{\"code\":\"rate_limit\",\"type\":\"rate_limit_error\",\"message\":\"retry later\",\"param\":\"model\"}}}\n\n"
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"api_key\":\"failed-frame-secret\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"model\":\"fixture-responses-model\",\"error\":{\"code\":\"rate_limit\",\"type\":\"rate_limit_error\",\"message\":\"retry later\",\"param\":\"model\"}}}\n\n"
         );
         let (fixture_root, fixture) =
             spawn_raw_http_fixture("200 OK", "text/event-stream", openai_responses).await;
@@ -6357,9 +6644,82 @@ mod tests {
             diagnostic.provider_error.message.as_deref(),
             Some("retry later")
         );
+        let final_dump = stream
+            .final_response_dump()
+            .expect("failed final response dump");
+        let final_json = serde_json::to_value(final_dump).expect("final response JSON");
+        assert_eq!(final_json["http"]["status"], 200);
+        assert_eq!(final_json["statusCode"], 200);
+        assert_eq!(final_json["streamDiagnostic"]["kind"], "response_failed");
+        assert_eq!(
+            final_json["streamDiagnostic"]["provider_error"]["code"],
+            "rate_limit"
+        );
+        assert_eq!(
+            final_json["streamDiagnostic"]["payload"]["value"]["api_key"],
+            REDACTED_CREDENTIAL_VALUE
+        );
+        assert!(
+            !final_json.to_string().contains("failed-frame-secret"),
+            "stream diagnostic must use the provider credential redactor"
+        );
 
         let requests = fixture.await.expect("fixture task");
         assert_eq!(requests.len(), 1);
+    }
+
+    #[test]
+    fn failed_response_dump_deserializes_legacy_v1_without_stream_diagnostic() {
+        let dump: ProviderFinalResponseDump = serde_json::from_str(
+            r#"{"state":"failed","format":"provider_final_response_v1","version":1,"http":null,"partial":false,"error":"upstream","statusCode":502}"#,
+        )
+        .expect("legacy v1 response dump");
+
+        assert!(matches!(
+            dump,
+            ProviderFinalResponseDump::Failed {
+                stream_diagnostic: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_response_audit_json_caps_oversized_diagnostic_without_losing_trace_header() {
+        let dump = ProviderFinalResponseDump::Failed {
+            format: PROVIDER_FINAL_RESPONSE_DUMP_FORMAT.to_string(),
+            version: PROVIDER_FINAL_RESPONSE_DUMP_VERSION,
+            http: Some(ProviderHttpResponseHeadDump {
+                status: 200,
+                version: "HTTP/1.1".to_string(),
+                headers: BTreeMap::from([
+                    ("x-cpa-trace-id".to_string(), vec!["trace-123".to_string()]),
+                    (
+                        "x-upstream-noise".to_string(),
+                        vec!["n".repeat(MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES)],
+                    ),
+                ]),
+            }),
+            partial: false,
+            error: "e".repeat(MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES),
+            status_code: Some(200),
+            stream_diagnostic: Some(json!({
+                "kind": "invalid_json",
+                "payload": "p".repeat(MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES),
+            })),
+        };
+
+        let audit_json = dump.audit_json().expect("bounded audit JSON");
+        assert!(
+            audit_json.len() <= MAX_PROVIDER_FAILED_RESPONSE_AUDIT_BYTES,
+            "failed audit detail must be bounded"
+        );
+        let value: Value = serde_json::from_str(&audit_json).expect("bounded JSON value");
+        assert_eq!(value["http"]["status"], 200);
+        assert_eq!(value["http"]["headers"]["x-cpa-trace-id"][0], "trace-123");
+        assert!(value["http"]["headers"]["x-upstream-noise"].is_null());
+        assert_eq!(value["streamDiagnostic"]["truncated"], true);
+        assert_eq!(value["auditTruncation"]["maxBytes"], 32 * 1024);
     }
 
     #[tokio::test]

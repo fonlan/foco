@@ -1470,12 +1470,18 @@ async fn llm_context_compression_summary_once(
                 let message = format!(
                     "context compression summary timed out after {LLM_REQUEST_TIMEOUT_MS} ms"
                 );
+                let audit_status_code = stream.http_status().map(i64::from);
                 let request_body_json =
                     captured_context_compression_request_body(context, &capture, &request_id);
                 let response_body_json = best_effort_context_compression_audit_detail(
                     context,
                     &request_id,
-                    capture.failed_response_json(message.clone(), None, true),
+                    capture.failed_stream_response_json(
+                        &stream,
+                        message.clone(),
+                        stream.http_status(),
+                        true,
+                    ),
                 );
                 context.record_finished_llm_request(CapturedLlmRequest {
                     id: request_id,
@@ -1485,7 +1491,7 @@ async fn llm_context_compression_summary_once(
                     events,
                     outcome: ChatAuditOutcome {
                         response_body_json,
-                        ..failed_provider_audit_outcome(started_at, &message, None)
+                        ..failed_provider_audit_outcome(started_at, &message, audit_status_code)
                     },
                     terminal_persisted: false,
                 });
@@ -1494,12 +1500,13 @@ async fn llm_context_compression_summary_once(
         };
         let Some(event_result) = event_result else {
             let message = "context compression summary stream ended without a completion event";
+            let audit_status_code = stream.http_status().map(i64::from);
             let request_body_json =
                 captured_context_compression_request_body(context, &capture, &request_id);
             let response_body_json = best_effort_context_compression_audit_detail(
                 context,
                 &request_id,
-                capture.failed_response_json(message, None, true),
+                capture.failed_stream_response_json(&stream, message, stream.http_status(), true),
             );
             context.record_finished_llm_request(CapturedLlmRequest {
                 id: request_id,
@@ -1509,7 +1516,7 @@ async fn llm_context_compression_summary_once(
                 events,
                 outcome: ChatAuditOutcome {
                     response_body_json,
-                    ..failed_provider_audit_outcome(started_at, message, None)
+                    ..failed_provider_audit_outcome(started_at, message, audit_status_code)
                 },
                 terminal_persisted: false,
             });

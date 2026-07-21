@@ -4,8 +4,8 @@ use std::{
 };
 
 use foco_providers::{
-    ProviderAuditRequestDump, ProviderFinalResponseDump, ProviderRequestDumpObserver,
-    ProviderRequestFailure,
+    NeutralChatStream, ProviderAuditRequestDump, ProviderFinalResponseDump,
+    ProviderRequestDumpObserver, ProviderRequestFailure,
 };
 use serde::Serialize;
 
@@ -78,7 +78,17 @@ impl ProviderAuditCapture {
         &self,
         dump: Option<&ProviderFinalResponseDump>,
     ) -> Result<Option<String>, ApiError> {
-        self.serialize_detail(dump)
+        if !self.save_details {
+            return Ok(None);
+        }
+        dump.map(|dump| {
+            dump.audit_json().map_err(|source| {
+                ApiError::internal(format!(
+                    "failed to serialize provider audit response detail: {source}"
+                ))
+            })
+        })
+        .transpose()
     }
 
     pub(crate) fn failed_response_json(
@@ -89,6 +99,26 @@ impl ProviderAuditCapture {
     ) -> Result<Option<String>, ApiError> {
         let dump = ProviderFinalResponseDump::failed(message, status_code, partial);
         self.response_json(Some(&dump))
+    }
+
+    pub(crate) fn failed_stream_response_json(
+        &self,
+        stream: &NeutralChatStream,
+        message: impl Into<String>,
+        status_code: Option<u16>,
+        partial: bool,
+    ) -> Result<Option<String>, ApiError> {
+        let dump = stream.failed_final_response_dump(message, status_code, partial);
+        self.response_json(dump.as_ref())
+    }
+
+    pub(crate) fn interrupted_stream_response_json(
+        &self,
+        stream: &NeutralChatStream,
+        message: impl Into<String>,
+    ) -> Result<Option<String>, ApiError> {
+        let dump = stream.interrupted_final_response_dump(message);
+        self.response_json(dump.as_ref())
     }
 
     fn persist_request_dump(&self, dump: &ProviderAuditRequestDump) -> Result<(), ApiError> {
