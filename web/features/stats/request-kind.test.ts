@@ -17,6 +17,7 @@ describe("request-kind", () => {
       ["chat title generation", "Chat title generation", "会话标题生成"],
       ["memory extraction", "Memory extraction", "记忆抽取"],
       ["memory retrieval", "Memory retrieval", "记忆匹配"],
+      ["memory Dream planner", "Memory Dream planner", "记忆 Dream 规划"],
       ["model availability test", "Model availability test", "模型可用性测试"],
       ["workspace spec generation", "Workspace Spec generation", "Workspace Spec 生成"],
       ["workspace spec update", "Workspace Spec update", "Workspace Spec 更新"],
