@@ -40,7 +40,6 @@ const TEAM_CHAT_TASK_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(100)
 const TEAM_CHAT_TASK_STREAM_EVENT_BATCH_LIMIT: usize = 256;
 const MAX_CHAT_MESSAGES_PAGE_LIMIT: usize = 500;
 const CHAT_TITLE_GENERATION_REQUEST_KIND: &str = "chat title generation";
-const CHAT_TITLE_GENERATION_TIMEOUT_MS: u64 = 15_000;
 const CHAT_TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 64;
 const CHAT_TITLE_GENERATION_MAX_INPUT_CHARS: usize = 4_000;
 const CHAT_TITLE_MAX_CHARS: usize = 60;
@@ -1200,7 +1199,7 @@ async fn run_chat_title_generation(input: ChatTitleGenerationInput) -> Result<()
         &provider_config,
         request,
         CHAT_TITLE_GENERATION_REQUEST_KIND,
-        CHAT_TITLE_GENERATION_TIMEOUT_MS,
+        LLM_REQUEST_TIMEOUT_MS,
         0,
         api_audit_save_details(&config),
     )

@@ -33,7 +33,6 @@ use crate::*;
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 const MODEL_TEST_MAX_OUTPUT_TOKENS: u32 = 8;
 const MODEL_TEST_REQUEST_KIND: &str = "model availability test";
-const MODEL_TEST_TIMEOUT_MS: u64 = 15_000;
 pub(crate) const REVIEW_AGENT_DEFINITION_ID: &str = "agent-definition-review";
 pub(crate) const IMAGE_AGENT_DEFINITION_ID: &str = "agent-definition-image-gen";
 pub(crate) const IMAGE_AGENT_SYSTEM_PROMPT_NAME: &str = IMAGE_GENERATION_SYSTEM_PROMPT_NAME;
@@ -2443,7 +2442,7 @@ pub(crate) struct ModelTestExecutionOptions {
 pub(crate) fn model_test_execution_options() -> ModelTestExecutionOptions {
     ModelTestExecutionOptions {
         request_kind: MODEL_TEST_REQUEST_KIND,
-        timeout_ms: MODEL_TEST_TIMEOUT_MS,
+        timeout_ms: LLM_REQUEST_TIMEOUT_MS,
         retry_count: 0,
     }
 }

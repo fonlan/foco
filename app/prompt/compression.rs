@@ -1370,7 +1370,7 @@ async fn llm_context_compression_summary_once(
     let observer = capture.observer();
     let capture_details = observer.is_some();
     let mut stream = match timeout(
-        Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
+        remaining_llm_request_timeout(started_at, LLM_REQUEST_TIMEOUT_MS),
         stream_chat_with_capture_observer(
             &context.provider_config,
             request,
@@ -1420,9 +1420,8 @@ async fn llm_context_compression_summary_once(
             return Err(ApiError::internal(message));
         }
         Err(_) => {
-            let message = format!(
-                "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
-            );
+            let message =
+                format!("context compression summary timed out after {LLM_REQUEST_TIMEOUT_MS} ms");
             let request_body_json =
                 captured_context_compression_request_body(context, &capture, &request_id);
             let response_body_json = best_effort_context_compression_audit_detail(
@@ -1452,7 +1451,7 @@ async fn llm_context_compression_summary_once(
 
     loop {
         let event_result = match timeout(
-            Duration::from_millis(LLM_CONTEXT_COMPRESSION_TIMEOUT_MS),
+            remaining_llm_request_timeout(started_at, LLM_REQUEST_TIMEOUT_MS),
             stream.next_event(),
         )
         .await
@@ -1460,7 +1459,7 @@ async fn llm_context_compression_summary_once(
             Ok(event_result) => event_result,
             Err(_) => {
                 let message = format!(
-                    "context compression summary timed out after {LLM_CONTEXT_COMPRESSION_TIMEOUT_MS} ms"
+                    "context compression summary timed out after {LLM_REQUEST_TIMEOUT_MS} ms"
                 );
                 let request_body_json =
                     captured_context_compression_request_body(context, &capture, &request_id);

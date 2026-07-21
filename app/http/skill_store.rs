@@ -20,11 +20,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    ApiError, AppState, api_audit_save_details, audited_provider_tool_request, config_snapshot,
-    config_update_snapshot, discover_skills, markdown_code_block, merge_disabled_skill_keys,
-    neutral_text_message, preserve_disabled_skill_keys_for_hidden_locations,
-    provider_connection_config, refresh_derived_enabled_skills, save_config, settings_response,
-    skills::parse_skill_markdown, unique_id, workspace_by_id,
+    ApiError, AppState, LLM_REQUEST_TIMEOUT_MS, api_audit_save_details,
+    audited_provider_tool_request, config_snapshot, config_update_snapshot, discover_skills,
+    markdown_code_block, merge_disabled_skill_keys, neutral_text_message,
+    preserve_disabled_skill_keys_for_hidden_locations, provider_connection_config,
+    refresh_derived_enabled_skills, save_config, settings_response, skills::parse_skill_markdown,
+    unique_id, workspace_by_id,
 };
 
 const DEFAULT_SKILLS_SH_BASE_URL: &str = "https://skills.sh";
@@ -38,7 +39,6 @@ pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_EXTRACTED_BYTES: u64 = 128 * 1024 * 10
 pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 pub(crate) const GITHUB_SKILL_ARCHIVE_MAX_FILES: usize = 4_096;
 const SKILL_TRANSLATION_TOOL_NAME: &str = "submit_skill_translation";
-const SKILL_TRANSLATION_TIMEOUT_MS: u64 = 120_000;
 const SKILL_TRANSLATION_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 #[derive(Deserialize)]
@@ -905,7 +905,7 @@ pub(crate) async fn skill_store_translate(
         "skill store translation",
         SKILL_TRANSLATION_TOOL_NAME,
         "submit skill translation tool",
-        SKILL_TRANSLATION_TIMEOUT_MS,
+        LLM_REQUEST_TIMEOUT_MS,
         config.app.llm_request_retry_count,
         api_audit_save_details(&config),
     )

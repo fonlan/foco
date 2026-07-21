@@ -28,7 +28,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
 
-use crate::{persistable_audit_response_body_json, runtime::ProviderAuditCapture};
+use crate::{
+    LLM_REQUEST_TIMEOUT_MS, persistable_audit_response_body_json, remaining_llm_request_timeout,
+    runtime::ProviderAuditCapture,
+};
 
 const DEFAULT_HOOK_TIMEOUT_MS: u64 = 60_000;
 const HOOK_OUTPUT_PREVIEW_CHARS: usize = 4000;
@@ -236,7 +239,13 @@ impl HookRuntime {
                 );
             }
         };
-        let timeout_ms = handler.timeout.unwrap_or(DEFAULT_HOOK_TIMEOUT_MS);
+        let timeout_ms = handler.timeout.unwrap_or_else(|| {
+            if handler.handler_type == HOOK_HANDLER_PROMPT {
+                LLM_REQUEST_TIMEOUT_MS
+            } else {
+                DEFAULT_HOOK_TIMEOUT_MS
+            }
+        });
         let execution = match handler.handler_type.as_str() {
             HOOK_HANDLER_COMMAND => {
                 run_command_hook(handler, request.workspace_path, &input_json, timeout_ms).await
@@ -780,7 +789,7 @@ async fn run_prompt_hook_attempt(
 
     loop {
         let Some(event) = timeout(
-            Duration::from_millis(timeout_ms),
+            remaining_llm_request_timeout(audited_stream.started_at, timeout_ms),
             audited_stream.stream.next_event(),
         )
         .await
@@ -1095,7 +1104,7 @@ async fn audited_prompt_hook_stream(
     }
     let started_at = std::time::Instant::now();
     match timeout(
-        Duration::from_millis(request.timeout_ms),
+        remaining_llm_request_timeout(started_at, request.timeout_ms),
         stream_chat_with_capture_observer(
             provider_config,
             hook_request,

@@ -965,11 +965,12 @@ pub struct HookConfig {
     pub hooks: HookEventMap,
 }
 
-pub const DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS: u64 = 60_000;
-pub const DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS: u64 = 120_000;
-pub const DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_LLM_REQUEST_TIMEOUT_MS: u64 = 300_000;
+pub const DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS: u64 = DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+pub const DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS: u64 = DEFAULT_LLM_REQUEST_TIMEOUT_MS;
+pub const DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS: u64 = DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 pub const DEFAULT_MEMORY_CONTEXT_BUDGET_PERCENT: u32 = 12;
-pub const DEFAULT_SPEC_LLM_TIMEOUT_MS: u64 = 120_000;
+pub const DEFAULT_SPEC_LLM_TIMEOUT_MS: u64 = DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 const MAX_BACKGROUND_LLM_TIMEOUT_MS: u64 = 600_000;
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -3115,13 +3116,21 @@ fn validate_hook_handler(
         );
     }
 
-    if let Some(timeout) = handler.timeout
-        && timeout == 0
-    {
-        return invalid_config(
-            config_path,
-            format!("{field}.timeout must be greater than 0"),
-        );
+    if let Some(timeout) = handler.timeout {
+        if timeout == 0 {
+            return invalid_config(
+                config_path,
+                format!("{field}.timeout must be greater than 0"),
+            );
+        }
+        if handler.handler_type == HOOK_HANDLER_PROMPT && timeout > MAX_BACKGROUND_LLM_TIMEOUT_MS {
+            return invalid_config(
+                config_path,
+                format!(
+                    "{field}.timeout for prompt hooks must not exceed {MAX_BACKGROUND_LLM_TIMEOUT_MS} ms"
+                ),
+            );
+        }
     }
 
     match handler.handler_type.as_str() {
@@ -3379,6 +3388,28 @@ fn invalid_config<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_llm_timeouts_share_the_five_minute_contract() {
+        assert_eq!(DEFAULT_LLM_REQUEST_TIMEOUT_MS, 300_000);
+        assert_eq!(
+            DEFAULT_MEMORY_EXTRACTION_LLM_TIMEOUT_MS,
+            DEFAULT_LLM_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            DEFAULT_MEMORY_RETRIEVAL_LLM_TIMEOUT_MS,
+            DEFAULT_LLM_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            DEFAULT_MEMORY_DREAM_LLM_TIMEOUT_MS,
+            DEFAULT_LLM_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(DEFAULT_SPEC_LLM_TIMEOUT_MS, DEFAULT_LLM_REQUEST_TIMEOUT_MS);
+        assert_eq!(MemorySettings::default().extraction_llm_timeout_ms, 300_000);
+        assert_eq!(MemorySettings::default().retrieval_llm_timeout_ms, 300_000);
+        assert_eq!(MemoryDreamSettings::default().llm_timeout_ms, 300_000);
+        assert_eq!(SpecSettings::default().llm_timeout_ms, 300_000);
+    }
 
     #[test]
     fn default_terminal_shell_matches_platform_family() {
@@ -4557,7 +4588,7 @@ mod tests {
     }
 
     #[test]
-    fn hook_config_rejects_unsupported_events_and_non_tool_if_filters() {
+    fn hook_config_rejects_invalid_events_filters_and_prompt_timeout_limits() {
         let profile = tempfile::tempdir().expect("temp profile");
         let mut loaded =
             load_or_create_global_config_at(profile.path()).expect("first-run config should load");
@@ -4617,6 +4648,35 @@ mod tests {
         let error = save_global_config(&loaded.paths.config_file, &loaded.config)
             .expect_err("non-tool if filter should fail");
         assert!(error.to_string().contains("if is only supported"));
+
+        loaded.config.hooks.hooks.clear();
+        loaded.config.hooks.hooks.insert(
+            "SessionStart".to_string(),
+            vec![HookMatcherGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![HookHandler {
+                    enabled: true,
+                    handler_type: HOOK_HANDLER_PROMPT.to_string(),
+                    if_filter: None,
+                    command: None,
+                    args: Vec::new(),
+                    shell: None,
+                    url: None,
+                    server_id: None,
+                    tool_name: None,
+                    prompt: Some("Review the event.".to_string()),
+                    timeout: Some(MAX_BACKGROUND_LLM_TIMEOUT_MS + 1),
+                    async_hook: false,
+                    async_rewake: false,
+                    status_message: None,
+                    input: None,
+                }],
+            }],
+        );
+        let error = save_global_config(&loaded.paths.config_file, &loaded.config)
+            .expect_err("prompt timeout above broker maximum should fail");
+        assert!(error.to_string().contains("must not exceed 600000 ms"));
     }
 
     #[test]

@@ -37,9 +37,10 @@ use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
     NeutralChatAttachment, NeutralChatMessage, NeutralChatRequest, NeutralChatRole,
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
-    OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderRequestDumpObserver,
-    ProviderRequestFailure, ProviderWireRequestDump, ProviderWsSessionContext,
-    recover_model_json_from_text, stream_chat_with_capture_observer_runtime_options,
+    OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderConfigError,
+    ProviderRequestDumpObserver, ProviderRequestFailure, ProviderWireRequestDump,
+    ProviderWsSessionContext, recover_model_json_from_text,
+    stream_chat_with_capture_observer_runtime_options,
 };
 use foco_store::{
     config::{
@@ -80,7 +81,7 @@ use tungstenite::client::IntoClientRequest;
 use crate::{
     ApiError, AppResult, AppState, CONTEXT_COMPRESSION_KIND_LLM,
     CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE, GIT_COMMIT_MESSAGE_REQUEST_KIND,
-    GIT_COMMIT_MESSAGE_TIMEOUT_MS, GitCommitMessageResponse, GitDiffResponse, GitStatusResponse,
+    GitCommitMessageResponse, GitDiffResponse, GitStatusResponse, LLM_REQUEST_TIMEOUT_MS,
     MAX_AGENT_TOOL_ROUNDS, PromptContextSource, api_audit_save_details,
     append_hook_context_messages, append_pending_tool_state_messages, config_snapshot,
     config_update_snapshot, estimate_tool_schema_tokens,
@@ -1149,6 +1150,22 @@ fn broker_llm_request_kind_from_payload(payload: &Value) -> Result<String, Strin
         Ok(raw.to_string())
     } else {
         Err(format!("unsupported broker llm requestKind: {raw}"))
+    }
+}
+
+fn broker_llm_timeout_ms_from_payload(payload: &Value) -> Result<u64, String> {
+    match payload.get("timeoutMs") {
+        None | Some(Value::Null) => Ok(LLM_REQUEST_TIMEOUT_MS),
+        Some(Value::Number(value)) => {
+            let timeout_ms = value
+                .as_u64()
+                .ok_or_else(|| "broker llm timeoutMs must be an integer".to_string())?;
+            if timeout_ms == 0 || timeout_ms > 600_000 {
+                return Err("broker llm timeoutMs must be between 1 and 600000 ms".to_string());
+            }
+            Ok(timeout_ms)
+        }
+        Some(_) => Err("broker llm timeoutMs must be an integer or null".to_string()),
     }
 }
 
@@ -5911,6 +5928,13 @@ async fn broker_llm_stream(
             return;
         }
     };
+    let timeout_ms = match broker_llm_timeout_ms_from_payload(&payload) {
+        Ok(timeout_ms) => timeout_ms,
+        Err(message) => {
+            let _ = send_broker_error(write, Some(id), "bad_request", message).await;
+            return;
+        }
+    };
     let requested_model_id = match payload.get("modelId").and_then(Value::as_str) {
         Some(id) if !id.trim().is_empty() => id.trim(),
         _ => {
@@ -6158,7 +6182,36 @@ async fn broker_llm_stream(
                 .await;
                 return;
             }
-            result = stream_chat_with_capture_observer_runtime_options(
+            result = timeout(
+                crate::remaining_llm_request_timeout(request_started_instant, timeout_ms),
+                stream_chat_with_capture_observer_runtime_options(
+                    &provider_config,
+                    request,
+                    foco_providers::ChatRequestRuntimeOptions { latency_mode },
+                    save_details,
+                    audit_writer.observer(),
+                    broker_openai_resp_ws_session_context(
+                        state,
+                        workspace_id,
+                        &payload,
+                        &request_kind,
+                        provider_id.as_str(),
+                        model_id.as_str(),
+                        provider_config.kind.uses_websocket(),
+                    ),
+                ),
+            ) => result.unwrap_or_else(|_| Err(ProviderRequestFailure {
+                error: ProviderConfigError::Connection {
+                    message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
+                    status_code: None,
+                },
+                request_dump: None,
+            })),
+        }
+    } else {
+        timeout(
+            crate::remaining_llm_request_timeout(request_started_instant, timeout_ms),
+            stream_chat_with_capture_observer_runtime_options(
                 &provider_config,
                 request,
                 foco_providers::ChatRequestRuntimeOptions { latency_mode },
@@ -6173,26 +6226,18 @@ async fn broker_llm_stream(
                     model_id.as_str(),
                     provider_config.kind.uses_websocket(),
                 ),
-            ) => result,
-        }
-    } else {
-        stream_chat_with_capture_observer_runtime_options(
-            &provider_config,
-            request,
-            foco_providers::ChatRequestRuntimeOptions { latency_mode },
-            save_details,
-            audit_writer.observer(),
-            broker_openai_resp_ws_session_context(
-                state,
-                workspace_id,
-                &payload,
-                &request_kind,
-                provider_id.as_str(),
-                model_id.as_str(),
-                provider_config.kind.uses_websocket(),
             ),
         )
         .await
+        .unwrap_or_else(|_| {
+            Err(ProviderRequestFailure {
+                error: ProviderConfigError::Connection {
+                    message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
+                    status_code: None,
+                },
+                request_dump: None,
+            })
+        })
     } {
         Ok(s) => s,
         Err(failure) => {
@@ -6319,10 +6364,26 @@ async fn broker_llm_stream(
                 .await;
                     return;
                 }
-                event = stream.next_event() => event,
+                event = timeout(
+                    crate::remaining_llm_request_timeout(request_started_instant, timeout_ms),
+                    stream.next_event(),
+                ) => event.unwrap_or_else(|_| Some(Err(ProviderConfigError::Connection {
+                    message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
+                    status_code: None,
+                }))),
             }
         } else {
-            stream.next_event().await
+            timeout(
+                crate::remaining_llm_request_timeout(request_started_instant, timeout_ms),
+                stream.next_event(),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                Some(Err(ProviderConfigError::Connection {
+                    message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
+                    status_code: None,
+                }))
+            })
         } {
             Some(Ok(e)) => e,
             Some(Err(e)) => {
@@ -13218,13 +13279,45 @@ async fn remote_sidecar_run_broker_llm_turn(
     flushed_text_len: usize,
     flushed_reasoning_len: usize,
 ) -> Result<RemoteSidecarBrokerLlmTurnOutcome, ()> {
-    let mut broker_rx =
-        remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload)
-            .await
-            .map_err(|_| ())?;
-    run_metrics.record_llm_request_id(broker_request_id);
+    let timeout_ms = broker_payload
+        .get("timeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(LLM_REQUEST_TIMEOUT_MS);
+    let request_started_at = Instant::now();
     let mut turn_metrics = RemoteSidecarRunMetrics::new();
     let mut resolved_provider_id = provider_id.to_string();
+    let mut broker_rx = match timeout(
+        crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
+        remote_sidecar_broker_request(state, broker_request_id, "llm.stream", broker_payload),
+    )
+    .await
+    {
+        Ok(Ok(broker_rx)) => broker_rx,
+        Ok(Err(_)) => return Err(()),
+        Err(_) => {
+            let message =
+                crate::llm_request_timeout_message(BROKER_DEFAULT_LLM_REQUEST_KIND, timeout_ms);
+            let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+            let total_latency_ms = turn_metrics.total_latency_ms();
+            remote_sidecar_cancel_broker_request_id(state, broker_request_id);
+            state.broker_pending.lock().await.remove(broker_request_id);
+            let _ = persist_sidecar_llm_audit_for_state(
+                state,
+                &state.workspace_id,
+                chat_id,
+                broker_request_id,
+                resolved_provider_id.as_str(),
+                model_id,
+                &turn_metrics,
+                &completed_at,
+                total_latency_ms,
+                "failed",
+                json!({ "error": { "message": message } }),
+            );
+            return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message });
+        }
+    };
+    run_metrics.record_llm_request_id(broker_request_id);
 
     let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
     let mut emitted_attempt_start = false;
@@ -13238,22 +13331,25 @@ async fn remote_sidecar_run_broker_llm_turn(
             state.broker_pending.lock().await.remove(broker_request_id);
             return Err(());
         }
-        let envelope = match timeout(BROKER_REQUEST_TIMEOUT, async {
-            loop {
-                tokio::select! {
-                    biased;
-                    changed = cancel_rx.changed() => {
-                        let _ = changed;
-                        if run_stream.is_cancel_requested() || run_stream.is_finished() {
-                            return None::<ControlEnvelope>;
+        let envelope = match timeout(
+            crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
+            async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        changed = cancel_rx.changed() => {
+                            let _ = changed;
+                            if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                                return None::<ControlEnvelope>;
+                            }
+                        }
+                        envelope = broker_rx.recv() => {
+                            return envelope;
                         }
                     }
-                    envelope = broker_rx.recv() => {
-                        return envelope;
-                    }
                 }
-            }
-        })
+            },
+        )
         .await
         {
             Ok(Some(envelope)) => envelope,
@@ -13289,7 +13385,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     return Err(());
                 }
                 let message =
-                    "remote broker request timed out; retry to resume from persisted messages";
+                    crate::llm_request_timeout_message(BROKER_DEFAULT_LLM_REQUEST_KIND, timeout_ms);
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = turn_metrics.total_latency_ms();
                 remote_sidecar_cancel_broker_request_id(state, broker_request_id);
@@ -13819,7 +13915,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
         .as_deref()
         .and_then(|run_id| remote_sidecar_active_run_stream(state, run_id));
     let mut metrics = RemoteSidecarRunMetrics::new();
-    let timeout_duration = Duration::from_millis(request.timeout_ms);
+    let request_started_at = Instant::now();
     if run_stream
         .as_ref()
         .is_some_and(RemoteActiveRunStream::is_finished)
@@ -13849,12 +13945,13 @@ async fn remote_sidecar_run_broker_prompt_hook(
         "runId": request.run_id,
         "requestId": broker_request_id,
         "requestKind": BROKER_PROMPT_HOOK_REQUEST_KIND,
+        "timeoutMs": request.timeout_ms,
         "providerId": provider_id,
         "modelId": request.hook_request.model_id,
         "request": request.hook_request,
     });
     let mut broker_rx = match timeout(
-        timeout_duration,
+        crate::remaining_llm_request_timeout(request_started_at, request.timeout_ms),
         remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
     )
     .await
@@ -13877,7 +13974,12 @@ async fn remote_sidecar_run_broker_prompt_hook(
             return Err(message);
         }
         Err(_) => {
-            let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
+            let message = crate::llm_request_timeout_message(
+                BROKER_PROMPT_HOOK_REQUEST_KIND,
+                request.timeout_ms,
+            );
+            remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+            state.broker_pending.lock().await.remove(&broker_request_id);
             persist_remote_prompt_hook_audit(
                 state,
                 &request,
@@ -13917,10 +14019,16 @@ async fn remote_sidecar_run_broker_prompt_hook(
                 }),
             );
             remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+            state.broker_pending.lock().await.remove(&broker_request_id);
             return Err(message);
         }
 
-        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+        let envelope = match timeout(
+            crate::remaining_llm_request_timeout(request_started_at, request.timeout_ms),
+            broker_rx.recv(),
+        )
+        .await
+        {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 let message =
@@ -13940,7 +14048,10 @@ async fn remote_sidecar_run_broker_prompt_hook(
                 return Err(message);
             }
             Err(_) => {
-                let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
+                let message = crate::llm_request_timeout_message(
+                    BROKER_PROMPT_HOOK_REQUEST_KIND,
+                    request.timeout_ms,
+                );
                 persist_remote_prompt_hook_audit(
                     state,
                     &request,
@@ -13955,6 +14066,7 @@ async fn remote_sidecar_run_broker_prompt_hook(
                     }),
                 );
                 remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+                state.broker_pending.lock().await.remove(&broker_request_id);
                 return Err(message);
             }
         };
@@ -14368,6 +14480,7 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         compression_system_prompt,
     );
     let broker_request_id = unique_id("broker-ctx-compress");
+    let request_started_at = Instant::now();
     if let Some(run_stream) = run_stream {
         run_stream.set_broker_request_id(broker_request_id.clone());
     }
@@ -14377,6 +14490,7 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         "runId": run_id,
         "requestId": broker_request_id,
         "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+        "timeoutMs": LLM_REQUEST_TIMEOUT_MS,
         "userMessageId": user_message_id,
         "assistantMessageId": assistant_message_id,
         "providerId": provider_id,
@@ -14384,16 +14498,24 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         "request": request,
     });
 
-    let mut broker_rx = match remote_sidecar_broker_request(
-        state,
-        &broker_request_id,
-        "llm.stream",
-        broker_payload,
+    let mut broker_rx = match timeout(
+        crate::remaining_llm_request_timeout(request_started_at, LLM_REQUEST_TIMEOUT_MS),
+        remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
     )
     .await
     {
-        Ok(rx) => rx,
         Err(_) => {
+            remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+            state.broker_pending.lock().await.remove(&broker_request_id);
+            return RemoteSidecarContextCompressionOutcome::Failed {
+                message: crate::llm_request_timeout_message(
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    LLM_REQUEST_TIMEOUT_MS,
+                ),
+            };
+        }
+        Ok(Ok(rx)) => rx,
+        Ok(Err(_)) => {
             return RemoteSidecarContextCompressionOutcome::Failed {
                 message: "context compression summary failed: remote broker is unavailable"
                     .to_string(),
@@ -14405,7 +14527,6 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
     let mut output_text = String::new();
     let mut saw_tool_call = false;
     let mut resolved_provider_id = provider_id.to_string();
-    let timeout_duration = Duration::from_millis(crate::LLM_CONTEXT_COMPRESSION_TIMEOUT_MS);
 
     loop {
         if run_stream.is_some_and(|stream| stream.is_finished()) {
@@ -14432,10 +14553,16 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
             if let Some(run_stream) = run_stream {
                 remote_sidecar_cancel_broker_request(state, run_stream);
             }
+            state.broker_pending.lock().await.remove(&broker_request_id);
             return RemoteSidecarContextCompressionOutcome::Cancelled;
         }
 
-        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+        let envelope = match timeout(
+            crate::remaining_llm_request_timeout(request_started_at, LLM_REQUEST_TIMEOUT_MS),
+            broker_rx.recv(),
+        )
+        .await
+        {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 let message =
@@ -14464,9 +14591,9 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                 };
             }
             Err(_) => {
-                let message = format!(
-                    "context compression summary timed out after {} ms",
-                    crate::LLM_CONTEXT_COMPRESSION_TIMEOUT_MS
+                let message = crate::llm_request_timeout_message(
+                    BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
+                    LLM_REQUEST_TIMEOUT_MS,
                 );
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
@@ -14490,7 +14617,10 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                 );
                 if let Some(run_stream) = run_stream {
                     remote_sidecar_cancel_broker_request(state, run_stream);
+                } else {
+                    remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
                 }
+                state.broker_pending.lock().await.remove(&broker_request_id);
                 return RemoteSidecarContextCompressionOutcome::Failed { message };
             }
         };
@@ -15583,6 +15713,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             "chatTitle": chat_title,
             "runId": run_id,
             "requestKind": BROKER_DEFAULT_LLM_REQUEST_KIND,
+            "timeoutMs": LLM_REQUEST_TIMEOUT_MS,
             "providerId": provider_id,
             "modelId": model_id,
             "latencyMode": latency_mode,
@@ -18811,7 +18942,7 @@ async fn remote_sidecar_git_commit_message(
         &model.id,
         broker_request,
         None,
-        GIT_COMMIT_MESSAGE_TIMEOUT_MS,
+        LLM_REQUEST_TIMEOUT_MS,
         GIT_COMMIT_MESSAGE_REQUEST_KIND,
         "submit_commit_message",
     )
@@ -19409,6 +19540,7 @@ async fn remote_sidecar_broker_tool_request(
     expected_tool_name: &str,
 ) -> Result<Value, ApiError> {
     let broker_request_id = unique_id("broker-spec");
+    let request_started_at = Instant::now();
     let broker_payload = json!({
         "workspaceId": state.workspace_id,
         "chatId": chat_id,
@@ -19416,17 +19548,27 @@ async fn remote_sidecar_broker_tool_request(
         "providerId": provider_id,
         "modelId": model_id,
         "requestKind": request_kind,
+        "timeoutMs": timeout_ms,
         "request": request,
     });
-    let mut broker_rx =
-        remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload)
-            .await
-            .map_err(api_error_from_response)?;
+    let mut broker_rx = timeout(
+        crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
+        remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
+    )
+    .await
+    .map_err(|_| {
+        ApiError::bad_gateway(crate::llm_request_timeout_message(request_kind, timeout_ms))
+    })?
+    .map_err(api_error_from_response)?;
 
-    let timeout_duration = Duration::from_millis(timeout_ms.max(1_000));
     let mut collected_tool_calls = Vec::<NeutralToolCall>::new();
     loop {
-        let envelope = match timeout(timeout_duration, broker_rx.recv()).await {
+        let envelope = match timeout(
+            crate::remaining_llm_request_timeout(request_started_at, timeout_ms),
+            broker_rx.recv(),
+        )
+        .await
+        {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
                 return Err(ApiError::bad_gateway(
@@ -19434,9 +19576,12 @@ async fn remote_sidecar_broker_tool_request(
                 ));
             }
             Err(_) => {
-                return Err(ApiError::bad_gateway(
-                    "remote broker timed out while waiting for a tool response",
-                ));
+                remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
+                state.broker_pending.lock().await.remove(&broker_request_id);
+                return Err(ApiError::bad_gateway(crate::llm_request_timeout_message(
+                    request_kind,
+                    timeout_ms,
+                )));
             }
         };
         match envelope.message_type.as_str() {
@@ -27210,6 +27355,27 @@ mod tests {
             broker_llm_request_kind_from_payload(&json!({ "requestKind": "memory extraction" })),
             Err("unsupported broker llm requestKind: memory extraction".to_string())
         );
+    }
+
+    #[test]
+    fn broker_llm_timeout_defaults_and_rejects_invalid_values() {
+        assert_eq!(
+            broker_llm_timeout_ms_from_payload(&json!({})).expect("default timeout"),
+            LLM_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            broker_llm_timeout_ms_from_payload(&json!({ "timeoutMs": null }))
+                .expect("null timeout"),
+            LLM_REQUEST_TIMEOUT_MS
+        );
+        assert_eq!(
+            broker_llm_timeout_ms_from_payload(&json!({ "timeoutMs": 600_000 }))
+                .expect("maximum configured timeout"),
+            600_000
+        );
+        assert!(broker_llm_timeout_ms_from_payload(&json!({ "timeoutMs": 0 })).is_err());
+        assert!(broker_llm_timeout_ms_from_payload(&json!({ "timeoutMs": 600_001 })).is_err());
+        assert!(broker_llm_timeout_ms_from_payload(&json!({ "timeoutMs": "300000" })).is_err());
     }
 
     #[test]

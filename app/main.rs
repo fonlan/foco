@@ -45,13 +45,14 @@ use foco_store::config::DEFAULT_TERMINAL_SHELL;
 use foco_store::{
     config::{
         AGENT_DEFINITION_INITIAL_REVISION, AgentDefinitionSettings, AgentModelOptions,
-        ApiAuditSettings, ApiProxySettings, DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig,
-        HookConfig, LoadedGlobalConfig, McpServerConfig, MemoryDreamSettings, MemorySettings,
-        ModelLimits, ModelSettings, PromptSettings, ProviderSettings,
-        SUPPORTED_AGENT_THINKING_LEVELS, SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES,
-        SUPPORTED_APP_THEMES, SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS,
-        SkillSettings, SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand,
-        WorkspaceConfig, WorkspaceLocation, default_agent_execution_workspace_modes,
+        ApiAuditSettings, ApiProxySettings, DEFAULT_LLM_REQUEST_TIMEOUT_MS,
+        DEFAULT_SYSTEM_PROMPT_NAME, FocoPaths, GlobalConfig, HookConfig, LoadedGlobalConfig,
+        McpServerConfig, MemoryDreamSettings, MemorySettings, ModelLimits, ModelSettings,
+        PromptSettings, ProviderSettings, SUPPORTED_AGENT_THINKING_LEVELS,
+        SUPPORTED_API_PROXY_TYPES, SUPPORTED_APP_LANGUAGES, SUPPORTED_APP_THEMES,
+        SUPPORTED_TERMINAL_SHELLS, SUPPORTED_WEB_SEARCH_PROVIDERS, SkillSettings,
+        SystemPromptSettings, WebServerSettings, WorkspaceCommonCommand, WorkspaceConfig,
+        WorkspaceLocation, default_agent_execution_workspace_modes,
         default_terminal_shell_for_current_platform, load_global_config,
         load_or_create_global_config_at_paths, save_global_config,
         validate_agent_definition_tool_references,
@@ -252,8 +253,9 @@ const CONTEXT_COMPRESSION_KIND_RULE: &str = "rule";
 pub(crate) const CONTEXT_COMPRESSION_KIND_LLM: &str = "llm";
 // Event kind for lossy in-progress tool-state compression.
 pub(crate) const CONTEXT_COMPRESSION_KIND_RUNTIME_TOOL_STATE: &str = "runtimeToolState";
-// Timeout for model-generated fallback compression requests.
-pub(crate) const LLM_CONTEXT_COMPRESSION_TIMEOUT_MS: u64 = 120_000;
+// Fixed end-to-end deadline for a single provider request. Configurable Spec and Memory
+// requests may supply a different validated effective timeout.
+pub(crate) const LLM_REQUEST_TIMEOUT_MS: u64 = DEFAULT_LLM_REQUEST_TIMEOUT_MS;
 // Maximum output tokens requested for model-generated fallback compression summaries.
 pub(crate) const LLM_CONTEXT_COMPRESSION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Hard cap on provider requests for one hierarchical checkpoint (chunks + merge levels).
@@ -278,8 +280,6 @@ const PROJECT_SPEC_CONTEXT_MESSAGE_PREFIX: &str = "Project Spec snapshot for thi
 const STABLE_MEMORY_CONFIDENCE_THRESHOLD: f64 = 0.85;
 // OpenAI prompt cache retention requested for main chat runs.
 const PROMPT_CACHE_RETENTION_24H: &str = "24h";
-// Maximum time to wait for a provider stream to open or yield its next event.
-const CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS: u64 = 120_000;
 // Agent tool name exposed for searching memory facts.
 const MEMORY_SEARCH_TOOL_NAME: &str = "memory_search";
 // Agent tool name exposed for writing manual memory notes.
@@ -298,7 +298,6 @@ const MEMORY_EXTRACTION_TOOL_NAME: &str = "submit_memory_extraction";
 const MEMORY_RETRIEVAL_TOOL_NAME: &str = "select_relevant_memory";
 const GIT_COMMIT_MESSAGE_TOOL_NAME: &str = "submit_commit_message";
 pub(crate) const GIT_COMMIT_MESSAGE_REQUEST_KIND: &str = "git_commit_message_generation";
-pub(crate) const GIT_COMMIT_MESSAGE_TIMEOUT_MS: u64 = 60_000;
 const GIT_COMMIT_MESSAGE_MAX_OUTPUT_TOKENS: u32 = 256;
 const GIT_COMMIT_MESSAGE_MAX_DIFF_CHARS: usize = 60_000;
 const API_AUDIT_CLEANUP_STARTUP_DELAY_SECS: u64 = 30;
@@ -3499,7 +3498,7 @@ impl PreparedChatContext {
                         continue;
                     }
                     provider_stream = timeout(
-                        Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                        remaining_llm_request_timeout(turn_started_at, LLM_REQUEST_TIMEOUT_MS),
                         stream_chat_with_capture_observer_runtime_options(
                             &self.provider_config,
                             turn_request,
@@ -3672,7 +3671,7 @@ impl PreparedChatContext {
                             continue;
                         }
                         event_result = timeout(
-                            Duration::from_millis(CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS),
+                            remaining_llm_request_timeout(turn_started_at, LLM_REQUEST_TIMEOUT_MS),
                             provider_stream.next_event(),
                         ) => event_result
                             .unwrap_or_else(|_| Some(Err(provider_stream_idle_timeout_error()))),
@@ -5680,7 +5679,7 @@ pub(crate) async fn generate_git_commit_message(
         GIT_COMMIT_MESSAGE_REQUEST_KIND,
         GIT_COMMIT_MESSAGE_TOOL_NAME,
         "commit message submission tool",
-        GIT_COMMIT_MESSAGE_TIMEOUT_MS,
+        LLM_REQUEST_TIMEOUT_MS,
         0,
         api_audit_save_details(config),
     )
@@ -6113,7 +6112,7 @@ async fn run_provider_stream_for_text(
     let observer = capture.observer();
     let capture_details = observer.is_some();
     let mut stream = timeout(
-        Duration::from_millis(timeout_ms),
+        remaining_llm_request_timeout(started_at, timeout_ms),
         stream_chat_with_capture_observer(
             provider_config,
             request,
@@ -6147,13 +6146,16 @@ async fn run_provider_stream_for_text(
     let mut first_token_latency_ms = None;
 
     loop {
-        let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
-            .await
-            .map_err(|_| {
-                let message = format!("{request_kind} timed out after {timeout_ms} ms");
-                AuditedProviderError::new(message.clone(), None)
-                    .with_interrupted_stream_response(capture, &stream, &message)
-            })?
+        let Some(event_result) = timeout(
+            remaining_llm_request_timeout(started_at, timeout_ms),
+            stream.next_event(),
+        )
+        .await
+        .map_err(|_| {
+            let message = format!("{request_kind} timed out after {timeout_ms} ms");
+            AuditedProviderError::new(message.clone(), None)
+                .with_interrupted_stream_response(capture, &stream, &message)
+        })?
         else {
             break;
         };
@@ -6263,7 +6265,7 @@ async fn run_provider_stream_for_tool(
     let observer = capture.observer();
     let capture_details = observer.is_some();
     let mut stream = timeout(
-        Duration::from_millis(timeout_ms),
+        remaining_llm_request_timeout(started_at, timeout_ms),
         stream_chat_with_capture_observer(
             provider_config,
             request,
@@ -6298,13 +6300,16 @@ async fn run_provider_stream_for_tool(
     let mut first_token_latency_ms = None;
 
     loop {
-        let Some(event_result) = timeout(Duration::from_millis(timeout_ms), stream.next_event())
-            .await
-            .map_err(|_| {
-                let message = format!("{request_kind} timed out after {timeout_ms} ms");
-                AuditedProviderError::new(message.clone(), None)
-                    .with_interrupted_stream_response(capture, &stream, &message)
-            })?
+        let Some(event_result) = timeout(
+            remaining_llm_request_timeout(started_at, timeout_ms),
+            stream.next_event(),
+        )
+        .await
+        .map_err(|_| {
+            let message = format!("{request_kind} timed out after {timeout_ms} ms");
+            AuditedProviderError::new(message.clone(), None)
+                .with_interrupted_stream_response(capture, &stream, &message)
+        })?
         else {
             break;
         };
@@ -7067,11 +7072,17 @@ fn provider_status_code(error: &ProviderConfigError) -> Option<i64> {
     error.status_code().map(i64::from)
 }
 
+pub(crate) fn llm_request_timeout_message(request_kind: &str, timeout_ms: u64) -> String {
+    format!("{request_kind} timed out after {timeout_ms} ms")
+}
+
+pub(crate) fn remaining_llm_request_timeout(started_at: Instant, timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms).saturating_sub(started_at.elapsed())
+}
+
 fn provider_stream_idle_timeout_error() -> ProviderConfigError {
     ProviderConfigError::Connection {
-        message: format!(
-            "provider stream timed out after {CHAT_PROVIDER_STREAM_IDLE_TIMEOUT_MS} ms without an event"
-        ),
+        message: llm_request_timeout_message("chat completion", LLM_REQUEST_TIMEOUT_MS),
         status_code: None,
     }
 }
