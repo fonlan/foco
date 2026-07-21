@@ -31,8 +31,9 @@ use crate::http::settings::{
     PromptSettingsSummary, ProviderKindSummary, SettingsResponse, SkillsSettingsSummary,
     SpecSettingsSummary, SystemPromptSummary, TerminalShellSummary, ThinkingLevelSummary,
     WebSearchProviderSummary, WebSearchSettingsSummary, WebServerSettingsSummary,
-    WorkspaceCommonCommandSummary, default_image_agent_system_prompt_for_config,
-    default_plan_mode_system_prompt, default_review_system_prompt, known_agent_tool_names,
+    WorkspaceCommonCommandSummary, WorkspaceSkillsDiscoveryResponse,
+    default_image_agent_system_prompt_for_config, default_plan_mode_system_prompt,
+    default_review_system_prompt, known_agent_tool_names,
 };
 use crate::platform::autostart_windows::auto_start_enabled_for_response;
 use crate::*;
@@ -672,6 +673,48 @@ pub(crate) fn skills_settings_summary(
             .collect(),
         errors: discovery.errors,
         translation_model_id: config.skills.translation_model_id.clone(),
+    }
+}
+
+/// Browser-facing skill menu catalog for one local workspace: host global Skills
+/// plus Skills that belong to `workspace_id`. Enabled/canEnable/warnings match
+/// settings and prompt selection rules for that workspace.
+pub(crate) fn workspace_skills_discovery_response(
+    config: &GlobalConfig,
+    user_profile_dir: &Path,
+    workspace_id: &str,
+) -> WorkspaceSkillsDiscoveryResponse {
+    let disabled_skill_ids = config
+        .skills
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let discovery =
+        crate::skills::discover_skills_for_workspace(user_profile_dir, config, workspace_id);
+    let required_disabled_skill_ids = discovery
+        .required_disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+
+    let skills = discovery
+        .skills
+        .iter()
+        .map(|skill| {
+            let can_enable = !skill_is_required_disabled(skill, &required_disabled_skill_ids)
+                && !crate::skills::skill_has_duplicate_declaration(&discovery.errors, &skill.id);
+            configured_skill_summary(
+                skill,
+                can_enable && !skill_is_disabled(skill, &disabled_skill_ids),
+                can_enable,
+            )
+        })
+        .collect();
+
+    WorkspaceSkillsDiscoveryResponse {
+        skills,
+        errors: discovery.errors,
     }
 }
 

@@ -236,7 +236,6 @@ import {
   composerAttachmentFromSelectedFile,
   fileToComposerAttachment,
   formatFileSize,
-  isSkillAvailableForWorkspace,
   messageWithSelectedSkills,
   removeActiveSkillToken,
   selectedSkillPrefix,
@@ -246,6 +245,7 @@ import {
   unsupportedFileAttachmentMessage,
   userMessageParts,
 } from "./features/chat/chat-helpers";
+import { useWorkspaceSkillCatalog } from "./features/chat/use-workspace-skill-catalog";
 import {
   isHtmlFilePath,
   isWorkspaceImageFilePath,
@@ -2420,17 +2420,25 @@ export function App() {
       thinkingLevel: defaultThinkingLevelForModel(model),
     };
   }, [availableModels, defaultAgentDefinition]);
-  const detectedSkills = useMemo(
-    () => settings?.skills.detected ?? [],
-    [settings],
-  );
-  const availableSkills = useMemo(
-    () =>
-      detectedSkills.filter((skill) =>
-        isSkillAvailableForWorkspace(skill, activeWorkspace?.id ?? null),
-      ),
-    [activeWorkspace?.id, detectedSkills],
-  );
+  const {
+    skills: availableSkills,
+    status: skillCatalogStatus,
+    error: skillCatalogError,
+    refreshError: skillCatalogRefreshError,
+    reload: reloadWorkspaceSkillCatalog,
+  } = useWorkspaceSkillCatalog(activeWorkspace?.id ?? null);
+  // Only emit skillIds that belong to an authoritative ready catalog for the
+  // active workspace. Cross-workspace loading keeps selectedSkillIds in memory
+  // until prune, but must not attach the previous workspace's keys to send,
+  // queue, guidance, or context-usage requests.
+  const effectiveSelectedSkillIds = useMemo(() => {
+    if (skillCatalogStatus !== "ready") {
+      return [] as string[];
+    }
+
+    const enabledSkillIds = new Set(availableSkills.map((skill) => skill.key));
+    return selectedSkillIds.filter((skillId) => enabledSkillIds.has(skillId));
+  }, [availableSkills, selectedSkillIds, skillCatalogStatus]);
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const selectedRequestThinkingLevel = isModelThinkingLevelSupported(
     selectedModel,
@@ -2603,7 +2611,7 @@ export function App() {
       selectedModelId,
       selectedProviderId,
       selectedRequestThinkingLevel,
-      ...selectedSkillIds,
+      ...effectiveSelectedSkillIds,
     ].join("\u0000");
 
     if (!chatKey) {
@@ -2643,7 +2651,7 @@ export function App() {
         chatId: activeChatId,
         modelId: selectedModelId,
         providerId: selectedProviderId,
-        skillIds: selectedSkillIds,
+        skillIds: effectiveSelectedSkillIds,
         thinkingLevel: selectedRequestThinkingLevel,
         workspaceId: activeWorkspaceId,
       });
@@ -2651,10 +2659,10 @@ export function App() {
   }, [
     activeChatId,
     activeWorkspaceId,
+    effectiveSelectedSkillIds,
     isSendingMessage,
     selectedModelId,
     selectedProviderId,
-    selectedSkillIds,
     selectedRequestThinkingLevel,
   ]);
 
@@ -5131,13 +5139,20 @@ export function App() {
   ]);
 
   useEffect(() => {
+    // Only prune selection against an authoritative ready catalog for the
+    // current workspace. Loading/error/empty interim states must not clear
+    // selectedSkillIds.
+    if (skillCatalogStatus !== "ready") {
+      return;
+    }
+
     const enabledSkillIds = new Set(availableSkills.map((skill) => skill.key));
 
     setSelectedSkillIds((current) => {
       const next = current.filter((skillId) => enabledSkillIds.has(skillId));
       return next.length === current.length ? current : next;
     });
-  }, [availableSkills]);
+  }, [availableSkills, skillCatalogStatus]);
 
   async function handleWorkspaceSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -9082,7 +9097,7 @@ export function App() {
       return null;
     }
 
-    const skillIds = [...selectedSkillIds];
+    const skillIds = [...effectiveSelectedSkillIds];
     return {
       attachments,
       chatId:
@@ -9579,7 +9594,7 @@ export function App() {
 
     const queuedRequest = queuedRequests[queuedIndex];
     const visibleUserContent = messageWithSelectedSkills(
-      detectedSkills,
+      availableSkills,
       queuedRequest.skillIds,
       queuedRequest.content,
     );
@@ -10063,7 +10078,7 @@ export function App() {
   ) {
     const pendingUserMessageId = localUiId("pending-guidance-user");
     const visibleUserContent = messageWithSelectedSkills(
-      detectedSkills,
+      availableSkills,
       request.skillIds,
       request.content,
     );
@@ -11169,7 +11184,7 @@ export function App() {
       request.assistantMessageId ?? `local-assistant-${runKey}`;
     const localCreatedAt = new Date().toISOString();
     const visibleUserContent = messageWithSelectedSkills(
-      detectedSkills,
+      availableSkills,
       request.skillIds,
       request.content,
     );
@@ -12564,9 +12579,13 @@ export function App() {
       setSettings(data);
       setUpdateStatus(data.update);
       setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
+      // Skill install/update/refresh mutates settings.skills; re-fetch the
+      // workspace menu catalog so slash menu matches the effective set.
+      // Soft reload keeps the last good catalog until the new response arrives.
+      reloadWorkspaceSkillCatalog();
       void loadAgentDefinitions();
     },
-    [loadAgentDefinitions],
+    [loadAgentDefinitions, reloadWorkspaceSkillCatalog],
   );
 
   async function handleLogin(event: FormEvent<HTMLFormElement>) {
@@ -13937,6 +13956,9 @@ export function App() {
                   selectedThinkingLevel={selectedThinkingLevel}
                   selectedLatencyMode={selectedRequestLatencyMode}
                   settings={settings}
+                  skillCatalogError={skillCatalogError}
+                  skillCatalogRefreshError={skillCatalogRefreshError}
+                  skillCatalogStatus={skillCatalogStatus}
                   skills={availableSkills}
                   thinkingLevels={thinkingLevels}
                   workspaces={workspaces}

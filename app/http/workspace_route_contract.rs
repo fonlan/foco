@@ -907,6 +907,18 @@ pub(crate) const WORKSPACE_ROUTE_CONTRACTS: &[WorkspaceRouteContract] = &[
         "Real provider wire is retained only in the main-process remote audit mirror."
     ),
     route!(
+        "workspace-skills",
+        "/api/workspaces/{workspace_id}/skills",
+        Get,
+        None,
+        None,
+        MainProcess,
+        MainProcessAuthority,
+        None,
+        "502/503 when the remote sidecar is offline or returns an invalid catalog",
+        "Browser skill menus use an explicit main-process handler; remote catalogs are loaded via authenticated skills/discover proxy rather than the generic workspace proxy allowlist."
+    ),
+    route!(
         "scheduled-tasks",
         "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}",
         Patch,

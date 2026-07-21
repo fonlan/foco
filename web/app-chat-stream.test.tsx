@@ -460,6 +460,694 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows remote workspace and remote global skills from the workspace skills API", async () => {
+    const { remoteWorkspace } = configureRemoteChat();
+    const localOnlySkill: ConfiguredSkillSummary = {
+      canEnable: true,
+      description: "Only on host settings.",
+      enabled: true,
+      id: "host-only",
+      key: "global:host-only",
+      name: "Host only skill",
+      path: "C:\\Users\\fonla\\.agents\\skills\\host-only\\SKILL.md",
+      scope: "global",
+      workspaceId: null,
+      workspaceName: null,
+      warnings: [],
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      skills: {
+        ...appTestState.settingsResponse.skills,
+        detected: [
+          ...appTestState.settingsResponse.skills.detected,
+          localOnlySkill,
+        ],
+      },
+    };
+
+    const remoteGlobalSkill: ConfiguredSkillSummary = {
+      canEnable: true,
+      description: "Remote host global skill.",
+      enabled: true,
+      id: "remote-global",
+      key: "global:remote-global",
+      name: "Remote global skill",
+      path: "/home/fonla/.agents/skills/remote-global/SKILL.md",
+      scope: "global",
+      workspaceId: null,
+      workspaceName: null,
+      warnings: [],
+    };
+    const remoteWorkspaceSkill: ConfiguredSkillSummary = {
+      canEnable: true,
+      description: "Remote workspace skill.",
+      enabled: true,
+      id: "remote-ws",
+      key: `workspace:${remoteWorkspaceId}:remote-ws`,
+      name: "Remote workspace skill",
+      path: "/home/fonla/repos/remote-project/.agents/skills/remote-ws/SKILL.md",
+      scope: "workspace",
+      workspaceId: remoteWorkspaceId,
+      workspaceName: remoteWorkspace.name,
+      warnings: [],
+    };
+    const localGlobalFallback: ConfiguredSkillSummary = {
+      canEnable: true,
+      description: "Synced local global fallback.",
+      enabled: true,
+      id: "gitmemo",
+      key: "global:gitmemo",
+      name: "gitmemo",
+      path: "C:\\Users\\fonla\\.agents\\skills\\gitmemo\\SKILL.md",
+      scope: "global",
+      workspaceId: null,
+      workspaceName: null,
+      warnings: [],
+    };
+
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: {
+        skills: appTestState.settingsResponse.skills.detected.filter(
+          (skill) =>
+            skill.scope === "global" ||
+            (skill.scope === "workspace" && skill.workspaceId === workspace.id),
+        ),
+      },
+      [remoteWorkspaceId]: {
+        skills: [localGlobalFallback, remoteGlobalSkill, remoteWorkspaceSkill],
+      },
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText(remoteWorkspace.name));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await userEvent.type(
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      "/",
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Select skill Remote workspace skill" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Select skill Remote global skill" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Select skill gitmemo" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Host only skill" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("lets remote workspace skills be selected from the slash menu", async () => {
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspaceId]: {
+        skills: [
+          {
+            canEnable: true,
+            description: "Remote workspace helper.",
+            enabled: true,
+            id: "remote-ws",
+            key: `workspace:${remoteWorkspaceId}:remote-ws`,
+            name: "Remote workspace skill",
+            path: "/home/fonla/repos/remote-project/.agents/skills/remote-ws/SKILL.md",
+            scope: "workspace",
+            workspaceId: remoteWorkspaceId,
+            workspaceName: "Remote project",
+            warnings: [],
+          },
+        ],
+      },
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    const composer = await screen.findByPlaceholderText(
+      "Ask Foco anything about Remote project...",
+    );
+    await userEvent.type(composer, "/");
+    await userEvent.click(
+      await screen.findByRole("button", {
+        name: "Select skill Remote workspace skill",
+      }),
+    );
+
+    expect(screen.getByText("Remote workspace skill")).toBeInTheDocument();
+    expect(composer).toHaveValue("");
+  });
+
+  it("shows a single remote-global winner for a key (API already deduped)", async () => {
+    configureRemoteChat();
+    // Backend effective catalog merges local-global + remote-global and keeps
+    // only the remote winner for the same global:<id> key. The frontend menu
+    // must render that single API entry without inventing a host-local twin.
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspaceId]: {
+        skills: [
+          {
+            canEnable: true,
+            description: "Remote copy wins.",
+            enabled: true,
+            id: "gitmemo",
+            key: "global:gitmemo",
+            name: "gitmemo",
+            path: "/home/fonla/.agents/skills/gitmemo/SKILL.md",
+            scope: "global",
+            workspaceId: null,
+            workspaceName: null,
+            warnings: [],
+          },
+        ],
+      },
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      skills: {
+        ...appTestState.settingsResponse.skills,
+        detected: [
+          ...appTestState.settingsResponse.skills.detected,
+          {
+            canEnable: true,
+            description: "Local host copy that must not appear via settings fallback.",
+            enabled: true,
+            id: "gitmemo",
+            key: "global:gitmemo",
+            name: "gitmemo",
+            path: "C:\\Users\\fonla\\.agents\\skills\\gitmemo\\SKILL.md",
+            scope: "global",
+            workspaceId: null,
+            workspaceName: null,
+            warnings: [],
+          },
+        ],
+      },
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await userEvent.type(
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      "/",
+    );
+
+    const matches = await screen.findAllByRole("button", {
+      name: "Select skill gitmemo",
+    });
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toHaveAttribute("title", "Remote copy wins.");
+  });
+
+  it("does not flash a cached prior workspace skill when switching workspaces", async () => {
+    const remoteGate = deferred<Response>();
+    configureRemoteChat();
+    const localWorkspaceSkill: ConfiguredSkillSummary = {
+      canEnable: true,
+      description: "Current workspace helper.",
+      enabled: true,
+      id: "current-skill",
+      key: "workspace:workspace-1:current-skill",
+      name: "Current skill",
+      path: "C:\\Users\\fonla\\.foco\\workspace\\.agents\\skills\\current-skill\\SKILL.md",
+      scope: "workspace",
+      workspaceId: workspace.id,
+      workspaceName: workspace.name,
+      warnings: [],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: {
+        skills: [
+          ...settings.skills.detected.filter((skill) => skill.scope === "global"),
+          localWorkspaceSkill,
+        ],
+      },
+      // Same pending promise twice so a remounted effect cannot fall through to
+      // the host-local default catalog and skip the loading gate.
+      [remoteWorkspaceId]: [remoteGate.promise, remoteGate.promise],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "/",
+    );
+    expect(
+      await screen.findByRole("button", { name: "Select skill Current skill" }),
+    ).toBeInTheDocument();
+
+    // Switch while the local catalog is already cached; the remote menu must
+    // never paint the prior workspace-scoped skill.
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    const remoteComposer = await screen.findByPlaceholderText(
+      "Ask Foco anything about Remote project...",
+    );
+    await userEvent.clear(remoteComposer);
+    await userEvent.type(remoteComposer, "/");
+
+    expect(
+      screen.queryByRole("button", { name: "Select skill Current skill" }),
+    ).not.toBeInTheDocument();
+    expect(
+      await screen.findByText("Loading skills..."),
+    ).toBeInTheDocument();
+
+    remoteGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Remote workspace skill.",
+            enabled: true,
+            id: "remote-ws",
+            key: `workspace:${remoteWorkspaceId}:remote-ws`,
+            name: "Remote workspace skill",
+            path: "/home/fonla/repos/remote-project/.agents/skills/remote-ws/SKILL.md",
+            scope: "workspace",
+            workspaceId: remoteWorkspaceId,
+            workspaceName: "Remote project",
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Select skill Remote workspace skill",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Current skill" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not send prior workspace skill ids while the new catalog is loading", async () => {
+    const remoteGate = deferred<Response>();
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: {
+        skills: [
+          {
+            canEnable: true,
+            description: "Project memory.",
+            enabled: true,
+            id: "gitmemo",
+            key: "global:gitmemo",
+            name: "gitmemo",
+            path: settings.skills.detected[0]!.path,
+            scope: "global",
+            workspaceId: null,
+            workspaceName: null,
+            warnings: [],
+          },
+          {
+            canEnable: true,
+            description: "Local only workspace skill.",
+            enabled: true,
+            id: "current-skill",
+            key: "workspace:workspace-1:current-skill",
+            name: "Current skill",
+            path: "C:\\Users\\fonla\\.foco\\workspace\\.agents\\skills\\current-skill\\SKILL.md",
+            scope: "workspace",
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            warnings: [],
+          },
+        ],
+      },
+      [remoteWorkspaceId]: [remoteGate.promise, remoteGate.promise],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "/",
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Select skill Current skill" }),
+    );
+    expect(
+      screen.getByLabelText("Remove skill Current skill"),
+    ).toBeInTheDocument();
+
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    const remoteComposer = await screen.findByPlaceholderText(
+      "Ask Foco anything about Remote project...",
+    );
+    await userEvent.clear(remoteComposer);
+    await userEvent.type(remoteComposer, "Send before catalog ready");
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url === `/api/workspaces/${remoteWorkspaceId}/chat/stream`,
+        ),
+      ).toBe(true);
+    });
+
+    const streamCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+      ([url]) =>
+        typeof url === "string" &&
+        url === `/api/workspaces/${remoteWorkspaceId}/chat/stream`,
+    );
+    const streamBody = JSON.parse(String(streamCall?.[1]?.body)) as {
+      message?: string;
+      skillIds?: string[] | null;
+    };
+    // Empty draft selections serialize as null; the critical assertion is that
+    // the previous workspace-scoped key is never attached to this workspace.
+    expect(streamBody.skillIds ?? []).toEqual([]);
+    expect(streamBody.message).toBe("Send before catalog ready");
+
+    remoteGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Only remote skill.",
+            enabled: true,
+            id: "remote-only",
+            key: `workspace:${remoteWorkspaceId}:remote-only`,
+            name: "Remote only skill",
+            path: "/home/fonla/repos/remote-project/.agents/skills/remote-only/SKILL.md",
+            scope: "workspace",
+            workspaceId: remoteWorkspaceId,
+            workspaceName: "Remote project",
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+  });
+
+  it("ignores late skill catalog responses after a workspace switch", async () => {
+    const localGate = deferred<Response>();
+    const remoteGate = deferred<Response>();
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: [localGate.promise],
+      [remoteWorkspaceId]: [remoteGate.promise],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${workspace.id}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    // Switch away before the first workspace catalog arrives.
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    // Late local response must not paint onto the remote workspace menu.
+    localGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Late local skill.",
+            enabled: true,
+            id: "late-local",
+            key: "workspace:workspace-1:late-local",
+            name: "Late local skill",
+            path: "C:\\Users\\fonla\\.foco\\workspace\\.agents\\skills\\late-local\\SKILL.md",
+            scope: "workspace",
+            workspaceId: workspace.id,
+            workspaceName: workspace.name,
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+
+    await userEvent.type(
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      "/",
+    );
+    expect(await screen.findByText("Loading skills...")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Late local skill" }),
+    ).not.toBeInTheDocument();
+
+    remoteGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Remote workspace skill.",
+            enabled: true,
+            id: "remote-ws",
+            key: `workspace:${remoteWorkspaceId}:remote-ws`,
+            name: "Remote workspace skill",
+            path: "/home/fonla/repos/remote-project/.agents/skills/remote-ws/SKILL.md",
+            scope: "workspace",
+            workspaceId: remoteWorkspaceId,
+            workspaceName: "Remote project",
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+
+    expect(
+      await screen.findByRole("button", {
+        name: "Select skill Remote workspace skill",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill Late local skill" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps selected skills while the catalog is loading and prunes only after ready", async () => {
+    const remoteGate = deferred<Response>();
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: {
+        skills: [
+          {
+            canEnable: true,
+            description: "Project memory.",
+            enabled: true,
+            id: "gitmemo",
+            key: "global:gitmemo",
+            name: "gitmemo",
+            path: settings.skills.detected[0]!.path,
+            scope: "global",
+            workspaceId: null,
+            workspaceName: null,
+            warnings: [],
+          },
+        ],
+      },
+      [remoteWorkspaceId]: [remoteGate.promise],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "/",
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+    );
+    expect(screen.getByLabelText("Remove skill gitmemo")).toBeInTheDocument();
+
+    // Switch to remote while its catalog is still loading.
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await userEvent.type(
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      "/",
+    );
+    expect(await screen.findByText("Loading skills...")).toBeInTheDocument();
+
+    // Authoritative ready catalog without gitmemo prunes the selection.
+    remoteGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Only remote skill.",
+            enabled: true,
+            id: "remote-only",
+            key: `workspace:${remoteWorkspaceId}:remote-only`,
+            name: "Remote only skill",
+            path: "/home/fonla/repos/remote-project/.agents/skills/remote-only/SKILL.md",
+            scope: "workspace",
+            workspaceId: remoteWorkspaceId,
+            workspaceName: "Remote project",
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: "Select skill Remote only skill" }),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        screen.queryByLabelText("Remove skill gitmemo"),
+      ).not.toBeInTheDocument();
+    });
+  });
+
+  it("preserves a still-valid selection across a loading workspace catalog", async () => {
+    const remoteGate = deferred<Response>();
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [workspace.id]: {
+        skills: settings.skills.detected,
+      },
+      [remoteWorkspaceId]: [remoteGate.promise],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "/",
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+    );
+
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${remoteWorkspaceId}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    remoteGate.resolve(
+      jsonResponse({
+        skills: [
+          {
+            canEnable: true,
+            description: "Still available remotely.",
+            enabled: true,
+            id: "gitmemo",
+            key: "global:gitmemo",
+            name: "gitmemo",
+            path: "/home/fonla/.agents/skills/gitmemo/SKILL.md",
+            scope: "global",
+            workspaceId: null,
+            workspaceName: null,
+            warnings: [],
+          },
+        ],
+        errors: [],
+      }),
+    );
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Remove skill gitmemo")).toBeInTheDocument();
+    });
+  });
+
+  it("shows a discovery failure instead of host-local skills only", async () => {
+    configureRemoteChat();
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspaceId]: [
+        jsonResponse({ error: "sidecar skill discovery failed" }, { status: 502 }),
+      ],
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Remote project"));
+    await userEvent.click(await screen.findByText(remoteChatTitle));
+    await userEvent.type(
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      "/",
+    );
+
+    expect(
+      await screen.findByText(/Failed to load skills/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select skill gitmemo" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("reloads the workspace skill catalog after skills refresh from settings", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await waitFor(() => {
+      expect(
+        (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.some(
+          ([url]) => url === `/api/workspaces/${workspace.id}/skills`,
+        ),
+      ).toBe(true);
+    });
+
+    const fetchMock = globalThis.fetch as ReturnType<typeof vi.fn>;
+    const skillsCallsBefore = fetchMock.mock.calls.filter(
+      ([url]) => url === `/api/workspaces/${workspace.id}/skills`,
+    ).length;
+
+    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Refresh skill discovery" }),
+    );
+
+    await waitFor(() => {
+      const skillsCallsAfter = fetchMock.mock.calls.filter(
+        ([url]) => url === `/api/workspaces/${workspace.id}/skills`,
+      ).length;
+      expect(skillsCallsAfter).toBeGreaterThan(skillsCallsBefore);
+    });
+  });
+
   it("lists enabled models in the flat composer model picker", async () => {
     appTestState.settingsResponse = {
       ...settings,

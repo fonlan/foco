@@ -2366,6 +2366,16 @@ export const appTestState: {
   previewSessionFailNext: boolean | string;
   previewSessionCounter: number;
   activePreviewSessions: Array<{ path: string; token: string; workspaceId: string }>;
+  /**
+   * Optional workspace skill discovery overrides for
+   * GET /api/workspaces/{id}/skills. Values may be deferred responses for race tests.
+   */
+  workspaceSkillsResponsesByWorkspaceId: Record<
+    string,
+    | { skills: ConfiguredSkillSummary[]; errors?: Array<{ path: string; message: string }> }
+    | Array<Response | Promise<Response>>
+  >;
+  workspaceSkillsDefaultErrors: Array<{ path: string; message: string }>;
 } = {
   activeChatStreamController: null,
   chatStreamControllers: new Map<string, ReadableStreamDefaultController<Uint8Array>>(),
@@ -2415,6 +2425,8 @@ export const appTestState: {
   previewSessionFailNext: false,
   previewSessionCounter: 0,
   activePreviewSessions: [],
+  workspaceSkillsResponsesByWorkspaceId: {},
+  workspaceSkillsDefaultErrors: [],
 };
 
 function workspaceSpecResponseForWorkspace(workspaceId: string) {
@@ -2912,6 +2924,8 @@ export function resetAppTestEnvironment() {
   appTestState.previewSessionFailNext = false;
   appTestState.previewSessionCounter = 0;
   appTestState.activePreviewSessions = [];
+  appTestState.workspaceSkillsResponsesByWorkspaceId = {};
+  appTestState.workspaceSkillsDefaultErrors = [];
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
   document.documentElement.removeAttribute("data-foco-theme");
@@ -4316,6 +4330,35 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
 
   if (path === "/api/skills/refresh") {
     return jsonResponse(skillStoreRefreshedSettings(null));
+  }
+
+  const workspaceSkillsMatch = path.match(/^\/api\/workspaces\/([^/]+)\/skills$/);
+  if (workspaceSkillsMatch && (!init?.method || init.method === "GET")) {
+    const workspaceId = decodeURIComponent(workspaceSkillsMatch[1]);
+    const override = appTestState.workspaceSkillsResponsesByWorkspaceId[workspaceId];
+    if (Array.isArray(override)) {
+      const next = override.shift();
+      if (next) {
+        return next;
+      }
+    } else if (override) {
+      return jsonResponse({
+        skills: override.skills,
+        errors: override.errors ?? [],
+      });
+    }
+
+    // Default: host settings detection filtered to global + this workspace
+    // (mirrors local discovery; remote tests set explicit overrides).
+    const skills = appTestState.settingsResponse.skills.detected.filter(
+      (skill) =>
+        skill.scope === "global" ||
+        (skill.scope === "workspace" && skill.workspaceId === workspaceId),
+    );
+    return jsonResponse({
+      skills,
+      errors: appTestState.workspaceSkillsDefaultErrors,
+    });
   }
 
   if (path === "/api/skill-store/update") {

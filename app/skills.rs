@@ -8,15 +8,16 @@ use std::{
 use foco_providers::{NeutralChatMessage, NeutralChatRole};
 use foco_store::config::{
     GlobalConfig, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SkillSettings, WorkspaceConfig,
+    WorkspaceLocation,
 };
 use foco_tools::output_budget::{
     SELECTED_SKILLS_MAX_TOTAL_BYTES, SKILL_MD_MAX_BYTES, path_is_skill_md,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{ApiError, markdown_code_block, neutral_text_message};
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct SkillDiscoveryErrorSummary {
     pub(crate) path: String,
@@ -641,10 +642,34 @@ pub(crate) fn skill_is_required_disabled(
     required_disabled_ids.contains(skill.key.as_str())
 }
 
-fn skill_applies_to_workspace(skill: &SkillSettings, workspace_id: &str) -> bool {
+pub(crate) fn skill_applies_to_workspace(skill: &SkillSettings, workspace_id: &str) -> bool {
     skill.scope == SKILL_SCOPE_GLOBAL
         || (skill.scope == SKILL_SCOPE_WORKSPACE
             && skill.workspace_id.as_deref() == Some(workspace_id))
+}
+
+/// Discovery errors that declare a duplicate skill id (same scoped key collision).
+pub(crate) fn skill_has_duplicate_declaration(
+    errors: &[SkillDiscoveryErrorSummary],
+    skill_id: &str,
+) -> bool {
+    let needle = format!("duplicate skill id '{skill_id}'");
+    errors.iter().any(|error| error.message.contains(&needle))
+}
+
+/// Live-discover Skills for one workspace: host global + that workspace only.
+/// Applies the same disabled-key / required-disabled rules used by settings and
+/// routing (disabled locations are already excluded by [`discover_skills`]).
+pub(crate) fn discover_skills_for_workspace(
+    user_profile_dir: &Path,
+    config: &GlobalConfig,
+    workspace_id: &str,
+) -> SkillDiscovery {
+    let mut discovery = discover_skills(user_profile_dir, config);
+    discovery
+        .skills
+        .retain(|skill| skill_applies_to_workspace(skill, workspace_id));
+    discovery
 }
 
 fn unique_skill_by_legacy_id<'a>(
@@ -1415,6 +1440,53 @@ Body.",
         let other =
             available_skills_snapshot_for_workspace(profile.path(), &config, "workspace-other");
         assert!(other.prompt_entries.is_empty());
+    }
+
+    #[test]
+    fn discover_skills_for_workspace_keeps_global_and_current_workspace_only() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace_a = tempfile::tempdir().expect("workspace a");
+        let workspace_b = tempfile::tempdir().expect("workspace b");
+        let global_dir = profile.path().join(".agents").join("skills").join("g1");
+        fs::create_dir_all(&global_dir).expect("global skill dir");
+        fs::write(
+            global_dir.join("SKILL.md"),
+            "---\nname: g1\ndescription: global skill\n---\n\nBody.",
+        )
+        .expect("global skill");
+        for (workspace, id) in [(&workspace_a, "wa"), (&workspace_b, "wb")] {
+            let skill_dir = workspace.path().join(".agents").join("skills").join(id);
+            fs::create_dir_all(&skill_dir).expect("workspace skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: workspace {id}\n---\n\nBody."),
+            )
+            .expect("workspace skill");
+        }
+
+        let mut config = GlobalConfig::first_run(workspace_a.path().to_path_buf());
+        config.workspaces[0].id = "workspace-a".to_string();
+        config.workspaces[0].name = "A".to_string();
+        config.workspaces[0].path = workspace_a.path().to_path_buf();
+        config.workspaces.push(WorkspaceConfig {
+            id: "workspace-b".to_string(),
+            name: "B".to_string(),
+            path: workspace_b.path().to_path_buf(),
+            location: WorkspaceLocation::Local,
+            pinned: false,
+            terminal_shell: config.workspaces[0].terminal_shell.clone(),
+            common_commands: Vec::new(),
+        });
+
+        let discovery = discover_skills_for_workspace(profile.path(), &config, "workspace-a");
+        let keys = discovery
+            .skills
+            .iter()
+            .map(|skill| skill.key.as_str())
+            .collect::<Vec<_>>();
+        assert!(keys.contains(&"global:g1"));
+        assert!(keys.iter().any(|key| key.contains("wa")));
+        assert!(!keys.iter().any(|key| key.contains("wb")));
     }
 
     #[test]

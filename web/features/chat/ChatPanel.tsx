@@ -79,6 +79,7 @@ import {
   MarkdownContent,
   type SelectedSkillPrefixResolver,
 } from "./MarkdownContent";
+import type { WorkspaceSkillCatalogStatus } from "./use-workspace-skill-catalog";
 
 const COMPOSER_EDITOR_MIN_HEIGHT_PX = 68;
 const COMPOSER_EDITOR_KEY_STEP_PX = 24;
@@ -245,6 +246,9 @@ function ChatPanelComponent({
   selectedThinkingLevel,
   selectedLatencyMode,
   settings,
+  skillCatalogError,
+  skillCatalogRefreshError,
+  skillCatalogStatus,
   skills,
   queuedMessageIds,
   thinkingLevels,
@@ -317,6 +321,9 @@ function ChatPanelComponent({
   selectedThinkingLevel: string;
   selectedLatencyMode: "standard" | "fast";
   settings: SettingsResponse | null;
+  skillCatalogError: string | null;
+  skillCatalogRefreshError: string | null;
+  skillCatalogStatus: WorkspaceSkillCatalogStatus;
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
@@ -1218,8 +1225,28 @@ function ChatPanelComponent({
                 {skillQuery !== null ? (
                   <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
                     <div className="panel-scroll max-h-64 overflow-y-auto py-1">
-                      {visibleSkills.length ? (
-                        visibleSkills.map((skill) => (
+                      {skillCatalogStatus === "loading" && !skills.length ? (
+                        <div className="px-3 py-3 text-sm text-stone-500">
+                          {t("Loading skills...")}
+                        </div>
+                      ) : skillCatalogStatus === "error" ? (
+                        <div className="px-3 py-3 text-sm text-rose-600">
+                          {skillCatalogError
+                            ? t("Failed to load skills: {error}", {
+                                error: skillCatalogError,
+                              })
+                            : t("Failed to load skills")}
+                        </div>
+                      ) : visibleSkills.length ? (
+                        <>
+                          {skillCatalogRefreshError ? (
+                            <div className="border-b border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                              {t("Skill list refresh failed: {error}", {
+                                error: skillCatalogRefreshError,
+                              })}
+                            </div>
+                          ) : null}
+                          {visibleSkills.map((skill) => (
                           <button
                             aria-label={t("Select skill {name}", {
                               name: skill.name,
@@ -1249,10 +1276,15 @@ function ChatPanelComponent({
                                 : t("disabled")}
                             </span>
                           </button>
-                        ))
+                          ))}
+                        </>
                       ) : (
                         <div className="px-3 py-3 text-sm text-stone-500">
-                          {t("No matching skills")}
+                          {skillCatalogRefreshError
+                            ? t("Skill list refresh failed: {error}", {
+                                error: skillCatalogRefreshError,
+                              })
+                            : t("No matching skills")}
                         </div>
                       )}
                     </div>

@@ -2091,9 +2091,15 @@ type ConfiguredSkillStoreSummary = {
   updateable: boolean;
 };
 
-type SkillDiscoveryErrorSummary = {
+export type SkillDiscoveryErrorSummary = {
   path: string;
   message: string;
+};
+
+/** Workspace-scoped skill menu catalog from GET /api/workspaces/{id}/skills */
+export type WorkspaceSkillsDiscoveryResponse = {
+  skills: ConfiguredSkillSummary[];
+  errors: SkillDiscoveryErrorSummary[];
 };
 
 // Hooks types

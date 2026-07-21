@@ -693,7 +693,7 @@ pub(crate) struct SkillLocationSummary {
     pub(crate) enabled: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfiguredSkillSummary {
     pub(crate) key: String,
@@ -707,15 +707,25 @@ pub(crate) struct ConfiguredSkillSummary {
     pub(crate) enabled: bool,
     pub(crate) can_enable: bool,
     pub(crate) warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) store: Option<ConfiguredSkillStoreSummary>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ConfiguredSkillStoreSummary {
     pub(crate) skill_id: String,
     pub(crate) source: String,
     pub(crate) updateable: bool,
+}
+
+/// Workspace-scoped skill menu catalog returned by
+/// `GET /api/workspaces/{workspace_id}/skills` (local and remote).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WorkspaceSkillsDiscoveryResponse {
+    pub(crate) skills: Vec<ConfiguredSkillSummary>,
+    pub(crate) errors: Vec<crate::skills::SkillDiscoveryErrorSummary>,
 }
 
 #[derive(Serialize)]
@@ -2399,6 +2409,28 @@ pub(crate) async fn delete_skill(
     save_config(&state, &mut config)?;
 
     settings_response(&state, &config).await
+}
+
+/// Workspace-scoped skill catalog for slash menus and explicit selection.
+/// Local: host global + current workspace Skills with enabled/canEnable rules.
+/// Remote: explicit proxy to sidecar `skills/discover` (not the generic workspace proxy).
+pub(crate) async fn workspace_skills(
+    State(state): State<AppState>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+) -> Result<Json<WorkspaceSkillsDiscoveryResponse>, ApiError> {
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    if workspace.is_remote() {
+        return crate::remote_workspace::discover_remote_workspace_skills(&state, &workspace_id)
+            .await;
+    }
+    Ok(Json(
+        crate::settings_runtime::workspace_skills_discovery_response(
+            &config,
+            &state.user_profile_dir,
+            &workspace_id,
+        ),
+    ))
 }
 
 pub(crate) async fn test_provider(
