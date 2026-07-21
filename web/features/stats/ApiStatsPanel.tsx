@@ -40,7 +40,9 @@ import type {
   AppLanguageId,
   JsonValue,
   ProviderAuditRequestDump,
+  ProviderCompactedStreamDiagnosticDump,
   ProviderFinalResponseDump,
+  ProviderStreamDiagnosticDump,
   ProviderWebSocketRequestDump,
   ProviderWireRequestDump,
   SettingsResponse,
@@ -954,6 +956,9 @@ function AiRequestDetailDialog({
 }) {
   const { language, t } = useI18n();
   const request = detail?.request ?? null;
+  const streamDiagnostic = request
+    ? streamDiagnosticForResponse(request.responseBody)
+    : null;
 
   return (
     <div
@@ -1092,6 +1097,13 @@ function AiRequestDetailDialog({
                   responseBody={request.responseBody}
                 />
               </div>
+              {streamDiagnostic ? (
+                <StreamDiagnosticDetail
+                  copied={copiedKey === "streamDiagnostic"}
+                  onCopy={(text) => onCopy("streamDiagnostic", text)}
+                  streamDiagnostic={streamDiagnostic}
+                />
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -1293,6 +1305,170 @@ function ProviderResponseDetail({
   );
 }
 
+function StreamDiagnosticDetail({
+  copied,
+  onCopy,
+  streamDiagnostic,
+}: {
+  copied: boolean;
+  onCopy: (text: string) => void;
+  streamDiagnostic:
+    | ProviderCompactedStreamDiagnosticDump
+    | ProviderStreamDiagnosticDump;
+}) {
+  const { t } = useI18n();
+  if (isCompactedStreamDiagnostic(streamDiagnostic)) {
+    return (
+      <AuditDetailCard
+        notice={t("The diagnostic was compacted for audit storage.")}
+        noticeTone="warning"
+        title={t("Stream diagnostic")}
+      >
+        <div className="grid gap-3 sm:grid-cols-2">
+          <AuditMeta
+            label={t("Stored diagnostic bytes")}
+            value={diagnosticText(streamDiagnostic.originalBytes, t)}
+          />
+          <AuditMeta
+            label={t("Stored diagnostic SHA-256")}
+            value={diagnosticText(streamDiagnostic.sha256, t)}
+          />
+          <AuditMeta label={t("Payload truncated")} value={t("Yes")} />
+        </div>
+        <AuditJsonBlock
+          copied={copied}
+          label={t("Diagnostic JSON")}
+          onCopy={() => onCopy(auditJsonText(streamDiagnostic))}
+          size="body"
+          value={streamDiagnostic}
+        />
+      </AuditDetailCard>
+    );
+  }
+
+  const payload = streamDiagnostic.payload;
+  const providerError = streamDiagnostic.providerError;
+
+  return (
+    <AuditDetailCard title={t("Stream diagnostic")}>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <AuditMeta
+          label={t("Diagnostic kind")}
+          value={diagnosticText(streamDiagnostic.kind, t)}
+        />
+        <AuditMeta
+          label={t("Stream transport")}
+          value={diagnosticText(streamDiagnostic.transport, t)}
+        />
+        <AuditMeta
+          label={t("Event type")}
+          value={diagnosticText(streamDiagnostic.eventType, t)}
+        />
+        <AuditMeta
+          label={t("Previous event")}
+          value={diagnosticText(streamDiagnostic.previousEventType, t)}
+        />
+        <AuditMeta
+          label={t("Provider code")}
+          value={diagnosticText(providerError?.code, t)}
+        />
+        <AuditMeta
+          label={t("Provider message")}
+          value={diagnosticText(providerError?.message, t)}
+        />
+        <AuditMeta
+          label={t("Frame bytes")}
+          value={diagnosticText(streamDiagnostic.rawPayloadBytes, t)}
+        />
+        <AuditMeta
+          label={t("Payload truncated")}
+          value={
+            streamDiagnostic.payloadTruncated === undefined
+              ? t("Not available")
+              : streamDiagnostic.payloadTruncated
+                ? t("Yes")
+                : t("No")
+          }
+        />
+        {streamDiagnostic.rawPayloadSha256 ? (
+          <AuditMeta
+            label={t("Payload SHA-256")}
+            value={streamDiagnostic.rawPayloadSha256}
+          />
+        ) : null}
+        {providerError?.errorType ?? providerError?.type ? (
+          <AuditMeta
+            label={t("Provider error type")}
+            value={providerError.errorType ?? providerError.type ?? t("Not available")}
+          />
+        ) : null}
+        {providerError?.param ? (
+          <AuditMeta label={t("Provider parameter")} value={providerError.param} />
+        ) : null}
+        {streamDiagnostic.transportError ? (
+          <AuditMeta
+            label={t("Transport error")}
+            value={streamDiagnostic.transportError}
+          />
+        ) : null}
+      </div>
+      {payload?.value !== undefined ? (
+        <AuditJsonBlock
+          copied={false}
+          label={t("Payload excerpt")}
+          onCopy={() => onCopy(auditJsonText(payload.value ?? null))}
+          size="body"
+          value={payload.value ?? null}
+        />
+      ) : null}
+      <AuditJsonBlock
+        copied={copied}
+        label={t("Diagnostic JSON")}
+        onCopy={() => onCopy(auditJsonText(streamDiagnostic))}
+        size="body"
+        value={streamDiagnostic}
+      />
+    </AuditDetailCard>
+  );
+}
+
+function streamDiagnosticForResponse(
+  responseBody: JsonValue | ProviderFinalResponseDump | null,
+):
+  | ProviderCompactedStreamDiagnosticDump
+  | ProviderStreamDiagnosticDump
+  | null {
+  if (
+    !isProviderFinalResponseDump(responseBody) ||
+    responseBody.state !== "failed"
+  ) {
+    return null;
+  }
+  const diagnostic = responseBody.streamDiagnostic;
+  return isJsonObject(diagnostic) ? diagnostic : null;
+}
+
+function isCompactedStreamDiagnostic(
+  streamDiagnostic:
+    | ProviderCompactedStreamDiagnosticDump
+    | ProviderStreamDiagnosticDump,
+): streamDiagnostic is ProviderCompactedStreamDiagnosticDump {
+  return (
+    "truncated" in streamDiagnostic &&
+    streamDiagnostic.truncated === true &&
+    (!("kind" in streamDiagnostic) || !streamDiagnostic.kind)
+  );
+}
+
+function diagnosticText(
+  value: number | string | null | undefined,
+  t: Translate,
+): string {
+  return value === null || value === undefined || value === ""
+    ? t("Not available")
+    : String(value);
+}
+
 function AuditDetailCard({
   children,
   notice,
@@ -1366,7 +1542,10 @@ function AuditMeta({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
       <div className="text-xs font-semibold text-stone-500">{label}</div>
-      <div className="mt-1 truncate text-sm font-medium text-stone-950">
+      <div
+        className="mt-1 truncate text-sm font-medium text-stone-950"
+        title={value}
+      >
         {value}
       </div>
     </div>

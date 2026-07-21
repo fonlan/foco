@@ -2319,6 +2319,52 @@ export type ProviderHttpResponseHeadDump = {
   version: string;
 };
 
+export type ProviderStreamDiagnosticPayloadDump =
+  | {
+      kind: "json";
+      value: JsonValue;
+    }
+  | {
+      kind: "utf8_excerpt";
+      value: string;
+    };
+
+/**
+ * A bounded, failure-only diagnostic captured by the OpenAI Responses stream
+ * decoder. All fields remain optional so historical v1 response envelopes and
+ * future decoder additions continue to load in the audit detail view.
+ */
+export type ProviderStreamDiagnosticDump = {
+  eventType?: string | null;
+  kind?: string;
+  payload?: ProviderStreamDiagnosticPayloadDump;
+  previousEventSequence?: number | null;
+  previousEventType?: string | null;
+  providerError?: {
+    code?: string | null;
+    errorType?: string | null;
+    message?: string | null;
+    param?: string | null;
+    type?: string | null;
+  };
+  payloadTruncated?: boolean;
+  rawPayloadBytes?: number;
+  rawPayloadSha256?: string;
+  transport?: string;
+  transportError?: string;
+};
+
+/**
+ * The audit writer may replace an oversized stream diagnostic with this bounded
+ * sentinel. Its bytes and hash describe the stored diagnostic JSON, not the
+ * original provider frame.
+ */
+export type ProviderCompactedStreamDiagnosticDump = {
+  originalBytes?: number;
+  sha256?: string;
+  truncated: true;
+};
+
 export type ProviderFinalResponseDump =
   | {
       format: "provider_final_response_v1";
@@ -2339,6 +2385,10 @@ export type ProviderFinalResponseDump =
       partial: boolean;
       state: "failed";
       statusCode: number | null;
+      streamDiagnostic?:
+        | ProviderCompactedStreamDiagnosticDump
+        | ProviderStreamDiagnosticDump
+        | null;
       version: number;
     };
 

@@ -5228,6 +5228,182 @@ describe("app-panels-stats verification surfaces", () => {
     expect(within(dialog).queryByText('"cancelled"')).not.toBeInTheDocument();
   });
 
+  it("renders and copies a failed provider stream diagnostic separately from the response envelope", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const streamDiagnostic = {
+      eventType: "response.failed",
+      kind: "response_failed",
+      payload: {
+        kind: "json",
+        value: {
+          error: "malformed upstream frame",
+          type: "response.failed",
+        },
+      },
+      previousEventSequence: 4,
+      previousEventType: "response.created",
+      providerError: {
+        code: "rate_limit",
+        errorType: "rate_limit_error",
+        message: "retry later",
+        param: "model",
+      },
+      payloadTruncated: false,
+      transport: "http_sse",
+      rawPayloadBytes: 183,
+      rawPayloadSha256: "14f8c7d1e1d9a3c5",
+    };
+
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              finalState: "failed",
+              responseBody: {
+                error: "provider stream failed",
+                format: "provider_final_response_v1",
+                http: null,
+                partial: false,
+                state: "failed",
+                statusCode: 200,
+                streamDiagnostic,
+                version: 1,
+              },
+              responseDetailStatus: "failed",
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    const diagnosticCard = within(dialog)
+      .getByText("Stream diagnostic")
+      .closest("section");
+    expect(diagnosticCard).not.toBeNull();
+    const diagnostic = within(diagnosticCard as HTMLElement);
+    expect(diagnostic.getByText("response_failed")).toBeInTheDocument();
+    expect(diagnostic.getByText("http_sse")).toBeInTheDocument();
+    expect(diagnostic.getByText("response.failed")).toBeInTheDocument();
+    expect(diagnostic.getByText("rate_limit")).toBeInTheDocument();
+    expect(diagnostic.getByText("retry later")).toBeInTheDocument();
+    const frameBytesMeta = diagnostic.getByText("Frame bytes")
+      .parentElement as HTMLElement;
+    expect(within(frameBytesMeta).getByText("183")).toBeInTheDocument();
+    expect(diagnostic.getByText("14f8c7d1e1d9a3c5")).toBeInTheDocument();
+    const payloadExcerpt = diagnostic
+      .getByText("Payload excerpt")
+      .closest(".audit-json-block");
+    expect(payloadExcerpt).not.toBeNull();
+    expect(
+      within(payloadExcerpt as HTMLElement).getByText(
+        '"malformed upstream frame"',
+      ),
+    ).toBeInTheDocument();
+
+    const diagnosticJson = diagnostic
+      .getByText("Diagnostic JSON")
+      .closest(".audit-json-block");
+    expect(diagnosticJson).not.toBeNull();
+    await userEvent.click(
+      within(diagnosticJson as HTMLElement).getByRole("button", {
+        name: "Copy Diagnostic JSON",
+      }),
+    );
+    expect(navigator.clipboard.writeText).toHaveBeenLastCalledWith(
+      JSON.stringify(streamDiagnostic, null, 2),
+    );
+  });
+
+  it("labels an audit-compacted diagnostic separately from the original failure frame", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const streamDiagnostic = {
+      originalBytes: 48192,
+      sha256: "a7c96af2ef467b9a",
+      truncated: true,
+    };
+
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              finalState: "failed",
+              responseBody: {
+                error: "provider stream failed",
+                format: "provider_final_response_v1",
+                http: null,
+                partial: false,
+                state: "failed",
+                statusCode: 200,
+                streamDiagnostic,
+                version: 1,
+              },
+              responseDetailStatus: "failed",
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(screen.getByRole("button", { name: "View request details" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    const diagnosticCard = within(dialog)
+      .getByText("Stream diagnostic")
+      .closest("section");
+    expect(diagnosticCard).not.toBeNull();
+    const diagnostic = within(diagnosticCard as HTMLElement);
+    expect(
+      diagnostic.getByText("The diagnostic was compacted for audit storage."),
+    ).toBeInTheDocument();
+    expect(diagnostic.getByText("Stored diagnostic bytes")).toBeInTheDocument();
+    const storedBytesMeta = diagnostic.getByText("Stored diagnostic bytes")
+      .parentElement as HTMLElement;
+    expect(within(storedBytesMeta).getByText("48192")).toBeInTheDocument();
+    const storedHashMeta = diagnostic.getByText("Stored diagnostic SHA-256")
+      .parentElement as HTMLElement;
+    expect(
+      within(storedHashMeta).getByText("a7c96af2ef467b9a"),
+    ).toBeInTheDocument();
+    expect(diagnostic.queryByText("Frame bytes")).not.toBeInTheDocument();
+  });
+
   it("renders provider_websocket_request_v1 create frame and connection reuse", async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockImplementation((input, init) => {
