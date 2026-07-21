@@ -19,6 +19,8 @@ use process_wrap::std::ProcessGroup;
 use process_wrap::std::{ChildWrapper, CommandWrap};
 #[cfg(windows)]
 use process_wrap::std::{CreationFlags, JobObject};
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 /// Maximum number of active commands a registry permits for one execution workspace.
 pub const MAX_BACKGROUND_COMMANDS_PER_WORKSPACE: usize = 16;
@@ -33,7 +35,7 @@ const MAX_OUTPUT_CHUNK_NEWLINES: usize = 1_999;
 const MONITOR_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const TERMINATION_GRACE_PERIOD: Duration = Duration::from_millis(500);
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const CREATE_NO_WINDOW: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x0800_0000);
 
 /// Configurable bounds for a [`BackgroundCommandRegistry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
