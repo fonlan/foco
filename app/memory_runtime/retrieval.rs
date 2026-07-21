@@ -460,10 +460,12 @@ async fn relevant_memory_facts_llm(
     let selected = match parse_memory_retrieval_output(tool_result.arguments.clone()) {
         Ok(selected) => selected,
         Err(error) => {
-            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
-                &error.message,
-                i64::from(tool_result.attempt_index),
-            ) {
+            if let Some(classification) =
+                crate::structured_llm_outcome::classification_for_caller_failure(
+                    &error.message,
+                    i64::from(tool_result.attempt_index),
+                )
+            {
                 let _ = crate::structured_llm_outcome::persist_structured_classification(
                     workspace_path,
                     &tool_result.request_id,

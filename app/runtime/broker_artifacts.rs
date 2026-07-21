@@ -345,9 +345,8 @@ mod tests {
         assert_eq!(packaged.mime_type, BROKERED_WEB_RESULT_MIME);
         assert_eq!(packaged.bytes, 11);
 
-        let bytes =
-            decode_and_verify_transfer_file(&packaged, MAX_BROKERED_WEB_RESULT_FILE_BYTES)
-                .expect("decode");
+        let bytes = decode_and_verify_transfer_file(&packaged, MAX_BROKERED_WEB_RESULT_FILE_BYTES)
+            .expect("decode");
         assert_eq!(bytes, b"hello cache");
     }
 
@@ -379,9 +378,8 @@ mod tests {
             sha256: "deadbeef".to_string(),
             data_base64: BASE64_STANDARD.encode(b"test"),
         };
-        let error =
-            decode_and_verify_transfer_file(&file, MAX_BROKERED_WEB_RESULT_FILE_BYTES)
-                .expect_err("checksum");
+        let error = decode_and_verify_transfer_file(&file, MAX_BROKERED_WEB_RESULT_FILE_BYTES)
+            .expect_err("checksum");
         assert!(error.contains("checksum"), "{error}");
     }
 

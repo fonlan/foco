@@ -32,6 +32,7 @@ pub(crate) use agent_scheduler::{
 #[cfg(test)]
 pub(crate) use api_audit::should_vacuum_workspace_database;
 pub(crate) use api_audit::{spawn_api_audit_cleanup_once, spawn_api_audit_cleanup_scheduler};
+pub(crate) use broker_artifacts::BrokeredTransferFile;
 #[cfg(test)]
 pub(crate) use chat_run::agent_run_event_kind;
 pub(crate) use chat_run::run_chat_context_in_background;
@@ -44,7 +45,6 @@ pub(crate) use image_tools::{
     BrokeredImageFile, execute_image_tool, image_model_available, image_tool_timeout_ms,
     is_image_tool_name, materialize_brokered_image_result,
 };
-pub(crate) use broker_artifacts::BrokeredTransferFile;
 #[cfg(all(test, windows))]
 pub(crate) use native_tools::find_system_ripgrep;
 #[cfg(test)]

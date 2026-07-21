@@ -2086,6 +2086,54 @@ mod tests {
         assert!(body.starts_with("1\t"));
         assert!(body.contains(&long[..32]));
         assert!(!body.contains("trailer"));
+
+        // Continuation from nextStartLine must succeed (real remaining content).
+        let cont = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "longline.txt", "startLine": 2, "endLine": 2 }),
+        );
+        assert!(!cont.is_error, "{:?}", cont.output);
+        assert!(
+            cont.output["content"]
+                .as_str()
+                .expect("content")
+                .contains("trailer")
+        );
+    }
+
+    #[test]
+    fn single_soft_over_entire_file_no_fake_next_start_line() {
+        // Review P2: one soft-over line that is the entire file must not invent nextStartLine=2.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let long = "w".repeat(output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 256);
+        fs::write(workspace.path().join("only-long.txt"), &long).expect("write");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "only-long.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], false);
+        assert_eq!(result.output["softBudgetExceeded"], true);
+        assert!(
+            result.output.get("nextStartLine").is_none()
+                || result.output["nextStartLine"].is_null(),
+            "must not invent nextStartLine past EOF: {:?}",
+            result.output.get("nextStartLine")
+        );
+        assert_eq!(result.output["returnedLines"], 1);
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.contains(&long[..32]));
+
+        let normalized = output_budget::normalize_tool_execution(
+            READ_FILE_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            result.clone(),
+        );
+        assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
+        assert_eq!(normalized.execution.output["softBudgetExceeded"], true);
     }
 
     #[test]
@@ -2105,7 +2153,9 @@ mod tests {
             json!({ "path": "exact-lines.txt", "startLine": null, "endLine": null }),
         );
         assert!(!result.is_error, "{:?}", result.output);
-        let returned = result.output["returnedLines"].as_u64().expect("returnedLines") as usize;
+        let returned = result.output["returnedLines"]
+            .as_u64()
+            .expect("returnedLines") as usize;
         assert!(returned >= 1, "{:?}", result.output);
         // May be full or truncated depending on path/note line overhead, but never a soft error.
         if result.output["truncated"].as_bool() == Some(true) {

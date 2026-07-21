@@ -442,10 +442,12 @@ pub(crate) async fn run_memory_extraction_job_inner(
     let output = match parse_memory_extraction_output(tool_result.arguments.clone()) {
         Ok(output) => output,
         Err(error) => {
-            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
-                &error.message,
-                i64::from(tool_result.attempt_index),
-            ) {
+            if let Some(classification) =
+                crate::structured_llm_outcome::classification_for_caller_failure(
+                    &error.message,
+                    i64::from(tool_result.attempt_index),
+                )
+            {
                 let _ = crate::structured_llm_outcome::persist_structured_classification(
                     &task.workspace_path,
                     &tool_result.request_id,
@@ -455,25 +457,25 @@ pub(crate) async fn run_memory_extraction_job_inner(
             return Err(error);
         }
     };
-    let extracted_memories =
-        match store_extracted_memory_facts(task, &evidence_candidates, &output) {
-            Ok(memories) => memories,
-            Err(error) => {
-                if let Some(classification) =
-                    crate::structured_llm_outcome::classification_for_caller_failure(
-                        &error.message,
-                        i64::from(tool_result.attempt_index),
-                    )
-                {
-                    let _ = crate::structured_llm_outcome::persist_structured_classification(
-                        &task.workspace_path,
-                        &tool_result.request_id,
-                        classification,
-                    );
-                }
-                return Err(error);
+    let extracted_memories = match store_extracted_memory_facts(task, &evidence_candidates, &output)
+    {
+        Ok(memories) => memories,
+        Err(error) => {
+            if let Some(classification) =
+                crate::structured_llm_outcome::classification_for_caller_failure(
+                    &error.message,
+                    i64::from(tool_result.attempt_index),
+                )
+            {
+                let _ = crate::structured_llm_outcome::persist_structured_classification(
+                    &task.workspace_path,
+                    &tool_result.request_id,
+                    classification,
+                );
             }
-        };
+            return Err(error);
+        }
+    };
     let output_json = serde_json::to_string(&output).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize memory extraction output: {source}"

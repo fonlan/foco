@@ -214,10 +214,7 @@ impl StructuredLlmFailureKind {
         )
     }
 
-    pub fn classification(
-        self,
-        attempt_index: i64,
-    ) -> StructuredLlmRequestClassification<'static> {
+    pub fn classification(self, attempt_index: i64) -> StructuredLlmRequestClassification<'static> {
         StructuredLlmRequestClassification {
             structured_outcome: self.structured_outcome(),
             recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
@@ -228,7 +225,9 @@ impl StructuredLlmFailureKind {
 }
 
 /// Successful tool-call path (real ToolCall arguments).
-pub fn classification_succeeded_tool_call(attempt_index: i64) -> StructuredLlmRequestClassification<'static> {
+pub fn classification_succeeded_tool_call(
+    attempt_index: i64,
+) -> StructuredLlmRequestClassification<'static> {
     StructuredLlmRequestClassification {
         structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
         recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
@@ -315,7 +314,9 @@ pub fn classify_tool_stream_failure(
 ///
 /// Prefer structured kinds when available; this string path remains for legacy callers.
 #[allow(dead_code)] // string path kept for external/legacy call sites
-pub fn classify_provider_tool_failure_message(message: &str) -> StructuredLlmRequestClassification<'static> {
+pub fn classify_provider_tool_failure_message(
+    message: &str,
+) -> StructuredLlmRequestClassification<'static> {
     let attempt_index = 1;
     let kind = classify_provider_tool_failure_kind(message, None);
     kind.classification(attempt_index)
@@ -436,10 +437,7 @@ mod tests {
     #[test]
     fn classifies_provider_and_tool_protocol_failures() {
         assert_eq!(
-            classify_provider_tool_failure_kind(
-                "memory extraction timed out after 60000 ms",
-                None
-            ),
+            classify_provider_tool_failure_kind("memory extraction timed out after 60000 ms", None),
             StructuredLlmFailureKind::ProviderTimeout
         );
         assert_eq!(
@@ -584,7 +582,10 @@ mod tests {
             correction.recovery_source,
             STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY
         );
-        assert_eq!(correction.structured_outcome, STRUCTURED_LLM_OUTCOME_SUCCEEDED);
+        assert_eq!(
+            correction.structured_outcome,
+            STRUCTURED_LLM_OUTCOME_SUCCEEDED
+        );
 
         let correction_text = classification_correction_retry_success(3, true);
         assert_eq!(
@@ -619,13 +620,7 @@ mod tests {
     fn next_action_separates_output_repair_from_provider_retry() {
         // missing_tool → one output repair (not provider retry)
         assert_eq!(
-            next_audited_stream_action(
-                StructuredLlmFailureKind::MissingTool,
-                None,
-                false,
-                0,
-                2,
-            ),
+            next_audited_stream_action(StructuredLlmFailureKind::MissingTool, None, false, 0, 2,),
             StructuredLlmNextAction::Continue {
                 retry_kind: StructuredLlmRetryKind::OutputRepair,
                 provider_retry_index: 0,
@@ -634,13 +629,7 @@ mod tests {
         );
         // Second protocol failure after repair → stop (no feedback-less re-prompt)
         assert_eq!(
-            next_audited_stream_action(
-                StructuredLlmFailureKind::Prose,
-                None,
-                true,
-                0,
-                2,
-            ),
+            next_audited_stream_action(StructuredLlmFailureKind::Prose, None, true, 0, 2,),
             StructuredLlmNextAction::Stop
         );
         // 503 after repair → provider_retry with distinct kind

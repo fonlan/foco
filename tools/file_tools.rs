@@ -13,10 +13,11 @@ use serde_json::{Value, json};
 use crate::output_budget::{
     CompleteLinePrefix, CompleteLineTruncateOptions, CompleteLineTruncateOutcome,
     LINE_BOUNDED_LAST_RETURNED_LINE_FIELD, LINE_BOUNDED_NEXT_START_LINE_FIELD,
-    LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_RETURNED_LINES_FIELD, LINE_BOUNDED_TRUNCATED_FIELD,
-    SKILL_MD_MAX_BYTES, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
-    TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count, complete_line_prefix_note, measure_tool_execution,
-    path_is_skill_md, peel_last_complete_line, serialized_json_size,
+    LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_RETURNED_LINES_FIELD,
+    LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD, LINE_BOUNDED_TRUNCATED_FIELD, SKILL_MD_MAX_BYTES,
+    TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+    TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count, complete_line_prefix_note,
+    measure_tool_execution, path_is_skill_md, peel_last_complete_line, serialized_json_size,
     soft_limit_array_prefix_len_with_overhead, truncate_to_complete_lines_with_measure,
 };
 use crate::{
@@ -216,6 +217,7 @@ fn measure_read_file_response_overhead(
         last_returned_line: last,
         next_start_line: Some(next),
         truncated: true,
+        soft_budget_exceeded: false,
     });
     let skeleton = json!({
         "path": request_path,
@@ -261,7 +263,10 @@ fn assemble_read_file_response(
         LINE_BOUNDED_LAST_RETURNED_LINE_FIELD: prefix.last_returned_line,
         LINE_BOUNDED_NEXT_START_LINE_FIELD: prefix.next_start_line,
     });
-    if prefix.truncated {
+    if prefix.soft_budget_exceeded {
+        response[LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD] = Value::Bool(true);
+    }
+    if prefix.truncated || prefix.soft_budget_exceeded {
         response[LINE_BOUNDED_NOTE_FIELD] = Value::String(complete_line_prefix_note(prefix));
     }
     response
@@ -284,6 +289,7 @@ fn build_ordinary_read_file_response(
             last_returned_line: content_start_line,
             next_start_line: None,
             truncated: false,
+            soft_budget_exceeded: false,
         };
         return Ok(assemble_read_file_response(
             request_path,
@@ -332,26 +338,25 @@ fn build_ordinary_read_file_response(
             "read_file path '{request_path}': a single complete line (line {line_number}, {line_bytes} numbered UTF-8 bytes) exceeds the hard output ceiling ({hard_limit_bytes} bytes) and cannot be returned without splitting the line. Refine the source or request a different range."
         ))),
         CompleteLineTruncateOutcome::Full(prefix)
-        | CompleteLineTruncateOutcome::Truncated(prefix) => {
-            fit_read_file_response_to_envelope(
-                request_path,
-                content,
-                content_start_line,
-                line_range,
-                source_bytes,
-                timeout_ms,
-                prefix,
-            )
-        }
+        | CompleteLineTruncateOutcome::Truncated(prefix) => fit_read_file_response_to_envelope(
+            request_path,
+            content,
+            content_start_line,
+            line_range,
+            source_bytes,
+            timeout_ms,
+            prefix,
+        ),
     }
 }
 
 /// Build the final response and, if the serialized ToolExecution still exceeds the soft budget,
-/// peel complete lines until it fits. A single soft-over/hard-under line is kept with
-/// `truncated: true` so normalize preserves the success.
+/// peel complete lines until it fits. A single soft-over/hard-under line is kept: when remaining
+/// content exists, mark `truncated: true` with a continuable `nextStartLine`; when the line is the
+/// entire content, mark `softBudgetExceeded: true` with `truncated: false` (no fake nextStartLine).
 fn fit_read_file_response_to_envelope(
     request_path: &str,
-    full_content: &str,
+    _full_content: &str,
     content_start_line: usize,
     line_range: Option<&LineRange>,
     source_bytes: u64,
@@ -393,10 +398,15 @@ fn fit_read_file_response_to_envelope(
                 )));
             }
         } else if prefix.returned_lines <= 1 {
-            // Soft-over single complete line under hard: force truncated markers and keep.
-            if !prefix.truncated {
-                prefix.truncated = true;
-                prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
+            // Soft-over single complete line under hard.
+            if prefix.truncated {
+                // Remaining content exists; keep truncated markers for continuation.
+                return Ok(response);
+            }
+            // Entire content is this one soft-over line: no fake nextStartLine past EOF.
+            if !prefix.soft_budget_exceeded {
+                prefix.soft_budget_exceeded = true;
+                prefix.next_start_line = None;
                 continue;
             }
             return Ok(response);
@@ -409,14 +419,15 @@ fn fit_read_file_response_to_envelope(
         if peeled.len() == prefix.text.len() {
             return Ok(response);
         }
-        let more_after_peel = peeled.len() < full_content.len();
         prefix.text = peeled.to_string();
         prefix.returned_lines = prefix.returned_lines.saturating_sub(1);
-        prefix.last_returned_line = prefix.last_returned_line.saturating_sub(1).max(content_start_line);
-        prefix.truncated = more_after_peel || prefix.returned_lines > 0;
-        // After peeling there is always remaining content relative to the original request
-        // when we started over budget with multiple lines; mark truncated for continuation.
+        prefix.last_returned_line = prefix
+            .last_returned_line
+            .saturating_sub(1)
+            .max(content_start_line);
+        // After peeling there is remaining content relative to the original request.
         prefix.truncated = true;
+        prefix.soft_budget_exceeded = false;
         prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
         if prefix.returned_lines == 0 {
             return Err(ToolRuntimeError::InvalidArguments(format!(

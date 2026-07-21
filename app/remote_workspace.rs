@@ -7166,8 +7166,10 @@ async fn broker_web_tool(
             return;
         }
     };
-    let transferred_files = match package_brokered_web_result_files(temporary_workspace.path(), &result)
-    {
+    let transferred_files = match package_brokered_web_result_files(
+        temporary_workspace.path(),
+        &result,
+    ) {
         Ok(files) => files,
         Err(error) => {
             // Do not publish success pointing at a host-only cache path.
@@ -7228,22 +7230,20 @@ async fn broker_image_generate(
             return;
         }
     };
-    let temporary_workspace = match BrokerArtifactTransferDirectory::create(
-        &state.user_profile_dir,
-        "image",
-    ) {
-        Ok(directory) => directory,
-        Err(error) => {
-            let _ = send_broker_error(
-                write,
-                Some(id),
-                "internal_error",
-                format!("failed to create image transfer directory: {error}"),
-            )
-            .await;
-            return;
-        }
-    };
+    let temporary_workspace =
+        match BrokerArtifactTransferDirectory::create(&state.user_profile_dir, "image") {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = send_broker_error(
+                    write,
+                    Some(id),
+                    "internal_error",
+                    format!("failed to create image transfer directory: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
     let timeout = Duration::from_millis(
         payload
             .arguments
@@ -36398,9 +36398,9 @@ mod tests {
         assert_eq!(request.method.as_deref(), Some("web.fetch"));
         assert_eq!(output["fullResultPath"], relative);
         assert!(
-            output["fullResultPath"]
-                .as_str()
-                .is_some_and(|path| path.starts_with(".foco/web-results/") && !path.starts_with('/')),
+            output["fullResultPath"].as_str().is_some_and(|path| path
+                .starts_with(".foco/web-results/")
+                && !path.starts_with('/')),
             "fullResultPath must be sidecar workspace-relative: {output}"
         );
         assert_eq!(
@@ -36471,9 +36471,12 @@ mod tests {
             .await;
         assert!(missing_files_error);
         assert!(
-            missing_files_output["error"].as_str().is_some_and(|message| {
-                message.contains("without transferred files") || message.contains("fullResultPath")
-            }),
+            missing_files_output["error"]
+                .as_str()
+                .is_some_and(|message| {
+                    message.contains("without transferred files")
+                        || message.contains("fullResultPath")
+                }),
             "{missing_files_output}"
         );
 
@@ -36554,32 +36557,31 @@ mod tests {
 
         // Oversized transfer rejected.
         let oversized_len = 2 * 1024 * 1024 + 1;
-        let ((oversize_output, oversize_error, _, _), _) =
-            test_execute_remote_sidecar_broker_tool(
-                &state,
-                catalog,
-                &mut broker_rx,
-                "call-web-oversize",
-                "web_fetch",
-                arguments,
-                "response",
-                json!({
-                    "status": "ok",
-                    "result": {
-                        "truncated": true,
-                        "nextStartLine": 1,
-                        "fullResultPath": ".foco/web-results/web-fetch-over-0-abcdef0123456789.txt",
-                    },
-                    "files": [{
-                        "fileName": "web-fetch-over-0-abcdef0123456789.txt",
-                        "mimeType": "text/plain; charset=utf-8",
-                        "bytes": oversized_len,
-                        "sha256": "ab",
-                        "dataBase64": BASE64_STANDARD.encode(b"x"),
-                    }],
-                }),
-            )
-            .await;
+        let ((oversize_output, oversize_error, _, _), _) = test_execute_remote_sidecar_broker_tool(
+            &state,
+            catalog,
+            &mut broker_rx,
+            "call-web-oversize",
+            "web_fetch",
+            arguments,
+            "response",
+            json!({
+                "status": "ok",
+                "result": {
+                    "truncated": true,
+                    "nextStartLine": 1,
+                    "fullResultPath": ".foco/web-results/web-fetch-over-0-abcdef0123456789.txt",
+                },
+                "files": [{
+                    "fileName": "web-fetch-over-0-abcdef0123456789.txt",
+                    "mimeType": "text/plain; charset=utf-8",
+                    "bytes": oversized_len,
+                    "sha256": "ab",
+                    "dataBase64": BASE64_STANDARD.encode(b"x"),
+                }],
+            }),
+        )
+        .await;
         assert!(oversize_error);
         assert!(
             oversize_output["error"]
@@ -38071,13 +38073,7 @@ mod tests {
         // Mirrors remote_sidecar_broker_tool_request_with_args_validate: schema failure
         // uses the same state machine as missing/wrong tool (at most one repair).
         assert_eq!(
-            next_audited_stream_action(
-                StructuredLlmFailureKind::SchemaInvalid,
-                None,
-                false,
-                0,
-                0
-            ),
+            next_audited_stream_action(StructuredLlmFailureKind::SchemaInvalid, None, false, 0, 0),
             StructuredLlmNextAction::Continue {
                 retry_kind: StructuredLlmRetryKind::OutputRepair,
                 provider_retry_index: 0,
@@ -38085,13 +38081,7 @@ mod tests {
             }
         );
         assert_eq!(
-            next_audited_stream_action(
-                StructuredLlmFailureKind::SchemaInvalid,
-                None,
-                true,
-                0,
-                0
-            ),
+            next_audited_stream_action(StructuredLlmFailureKind::SchemaInvalid, None, true, 0, 0),
             StructuredLlmNextAction::Stop
         );
 
@@ -38132,11 +38122,7 @@ mod tests {
             "submit_workspace_spec_update",
             StructuredLlmFailureKind::SchemaInvalid,
         );
-        assert!(
-            repaired.messages[1]
-                .content
-                .contains("schema_invalid")
-        );
+        assert!(repaired.messages[1].content.contains("schema_invalid"));
     }
 
     #[tokio::test]

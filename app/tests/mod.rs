@@ -26970,7 +26970,10 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     // chat (memory / Spec / compression). Main-chat-only exclusion is chat_statistics.
     assert_eq!(ai_stats.total_count, 3);
     assert_eq!(ai_stats.summary.total_requests, 3);
-    assert_eq!(ai_stats.summary.total_tokens, 100 + 25 + 700 + 70 + 500 + 50);
+    assert_eq!(
+        ai_stats.summary.total_tokens,
+        100 + 25 + 700 + 70 + 500 + 50
+    );
     assert_eq!(ai_stats.requests.len(), 3);
     let ai_stats_request_ids = ai_stats
         .requests
@@ -26993,11 +26996,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
         .collect::<HashSet<_>>();
     assert_eq!(
         ai_stats_request_kinds,
-        HashSet::from([
-            "chat completion",
-            "memory retrieval",
-            "contextCompression",
-        ])
+        HashSet::from(["chat completion", "memory retrieval", "contextCompression",])
     );
 
     let Json(chat_filtered_stats) = crate::http::chat::ai_statistics(
@@ -32207,11 +32206,7 @@ fn audited_single_tool_fault_matrix_local_recovery_paths() {
 
     // Prose / prose+JSON → no recovery (caller classifies as prose).
     assert_eq!(
-        resolve_audited_single_tool_arguments(
-            None,
-            "Here is the result:\n{\"facts\":[]}",
-            1
-        ),
+        resolve_audited_single_tool_arguments(None, "Here is the result:\n{\"facts\":[]}", 1),
         None
     );
 

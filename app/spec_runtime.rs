@@ -175,9 +175,7 @@ struct WorkspaceSpecUpdateToolOutput {
 /// Schema-only validation for remote sidecar Spec update (parity with local
 /// `audited_provider_tool_request_with_args_validate` serde check). Semantic edit
 /// application stays outside so invalid `oldText` still fails without writing.
-pub(crate) fn validate_workspace_spec_update_tool_arguments(
-    value: &Value,
-) -> Result<(), String> {
+pub(crate) fn validate_workspace_spec_update_tool_arguments(value: &Value) -> Result<(), String> {
     serde_json::from_value::<WorkspaceSpecUpdateToolOutput>(value.clone())
         .map(|_| ())
         .map_err(|source| format!("malformed workspace spec update JSON: {source}"))
@@ -851,10 +849,12 @@ async fn run_workspace_spec_job_inner(
     let content_markdown = match parse_workspace_spec_output(tool_result.arguments.clone()) {
         Ok(content) => content,
         Err(error) => {
-            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
-                &error.message,
-                i64::from(tool_result.attempt_index),
-            ) {
+            if let Some(classification) =
+                crate::structured_llm_outcome::classification_for_caller_failure(
+                    &error.message,
+                    i64::from(tool_result.attempt_index),
+                )
+            {
                 let _ = crate::structured_llm_outcome::persist_structured_classification(
                     &prepared.workspace_path,
                     &tool_result.request_id,
@@ -935,10 +935,12 @@ async fn run_workspace_spec_update_job_inner(
     ) {
         Ok(output) => output,
         Err(error) => {
-            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
-                &error.message,
-                i64::from(tool_result.attempt_index),
-            ) {
+            if let Some(classification) =
+                crate::structured_llm_outcome::classification_for_caller_failure(
+                    &error.message,
+                    i64::from(tool_result.attempt_index),
+                )
+            {
                 let _ = crate::structured_llm_outcome::persist_structured_classification(
                     workspace_path,
                     &tool_result.request_id,
@@ -3294,7 +3296,11 @@ mod tests {
             )
         );
         assert_eq!(
-            request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            request
+                .tools
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
             vec![WORKSPACE_SPEC_UPDATE_TOOL_NAME]
         );
     }

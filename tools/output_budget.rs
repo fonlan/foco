@@ -196,6 +196,10 @@ pub const LINE_BOUNDED_FULL_RESULT_PATH_FIELD: &str = "fullResultPath";
 pub const LINE_BOUNDED_NOTE_FIELD: &str = "note";
 pub const LINE_BOUNDED_RETURNED_LINES_FIELD: &str = "returnedLines";
 pub const LINE_BOUNDED_LAST_RETURNED_LINE_FIELD: &str = "lastReturnedLine";
+/// Marks an intentional soft-budget overage when the full content was returned (no remaining lines).
+/// Used with `truncated: false` so normalize preserves the success without inventing a fake
+/// `nextStartLine` past EOF. Never set this to bypass multi-line soft limits.
+pub const LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD: &str = "softBudgetExceeded";
 
 /// Budgets for [`truncate_to_complete_lines`] / [`truncate_to_complete_lines_with_measure`].
 ///
@@ -245,9 +249,14 @@ pub struct CompleteLinePrefix {
     /// 1-based line number of the last included line (`content_start_line` when empty).
     pub last_returned_line: usize,
     /// Next 1-based line for continuation when `truncated`; `None` when not truncated.
+    /// Must only be set when remaining content actually exists at that line (never past EOF).
     pub next_start_line: Option<usize>,
-    /// Whether input content was cut after a complete line boundary.
+    /// Whether input content was cut after a complete line boundary (remaining content exists).
     pub truncated: bool,
+    /// True when a single complete line exceeded the soft budget but fit under hard, and the
+    /// returned text is the entire remaining content (no continuation). Normalize preserves this
+    /// success via [`LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD`]; do not invent `nextStartLine`.
+    pub soft_budget_exceeded: bool,
 }
 
 /// Outcome of complete-line truncation for read_file / Web callers.
@@ -276,7 +285,7 @@ impl CompleteLineTruncateOutcome {
     /// Model-facing note for success paths; `None` for hard single-line failures.
     pub fn model_note(&self) -> Option<String> {
         match self {
-            Self::Full(prefix) if !prefix.truncated => None,
+            Self::Full(prefix) if !prefix.truncated && !prefix.soft_budget_exceeded => None,
             Self::Full(prefix) | Self::Truncated(prefix) => Some(complete_line_prefix_note(prefix)),
             Self::SingleLineExceedsHardLimit {
                 line_number,
@@ -401,6 +410,7 @@ where
             last_returned_line: start,
             next_start_line: None,
             truncated: false,
+            soft_budget_exceeded: false,
         });
     }
 
@@ -409,10 +419,9 @@ where
     let mut lines = 0_usize;
     let mut last_line = start;
     let mut remaining_after_prefix = false;
-    // Soft-over single complete line must be marked truncated so normalize preserves the
-    // success under the Phase 1 `truncated == true` contract, even when it is the entire
-    // remaining content (nextStartLine may point past EOF).
-    let mut force_truncated = false;
+    // Soft-over single complete line: mark soft_budget_exceeded. Only set truncated when more
+    // content remains after that line so nextStartLine is always continuable (never past EOF).
+    let mut soft_over_single_line = false;
     let mut hard_limit_failure: Option<(usize, usize)> = None;
 
     for_each_complete_line(content, |offset, line| {
@@ -433,7 +442,7 @@ where
                 lines = 1;
                 last_line = line_no;
                 remaining_after_prefix = end_byte < content.len();
-                force_truncated = true;
+                soft_over_single_line = true;
                 return false;
             }
         }
@@ -464,8 +473,9 @@ where
     }
 
     debug_assert!(end_byte <= content.len());
-    let truncated =
-        force_truncated || (remaining_after_prefix && end_byte < content.len());
+    // truncated only when remaining content exists after the returned prefix.
+    let truncated = remaining_after_prefix && end_byte < content.len();
+    let soft_budget_exceeded = soft_over_single_line;
     let prefix = CompleteLinePrefix {
         text: content[..end_byte].to_string(),
         returned_lines: lines,
@@ -476,6 +486,7 @@ where
             None
         },
         truncated,
+        soft_budget_exceeded,
     };
 
     if truncated {
@@ -487,17 +498,23 @@ where
 
 /// Default model-facing note for a complete-line prefix success/truncation.
 pub fn complete_line_prefix_note(prefix: &CompleteLinePrefix) -> String {
-    if !prefix.truncated {
+    if prefix.truncated {
+        let next = prefix
+            .next_start_line
+            .unwrap_or(prefix.last_returned_line.saturating_add(1));
         return format!(
-            "Returned {} complete line(s) through line {} under the shared output budget.",
+            "Result truncated at a complete line boundary under the shared soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines): returned {} line(s) through line {}. Continue with nextStartLine={next}. This is an explicit truncated success (is_error=false), not hidden data loss.",
             prefix.returned_lines, prefix.last_returned_line
         );
     }
-    let next = prefix
-        .next_start_line
-        .unwrap_or(prefix.last_returned_line.saturating_add(1));
+    if prefix.soft_budget_exceeded {
+        return format!(
+            "Returned {} complete line(s) through line {} under the single complete-line soft-budget exception (line exceeds soft ~{TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes but fits the hard envelope). Full content returned; no continuation is needed (truncated=false, softBudgetExceeded=true).",
+            prefix.returned_lines, prefix.last_returned_line
+        );
+    }
     format!(
-        "Result truncated at a complete line boundary under the shared soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines): returned {} line(s) through line {}. Continue with nextStartLine={next}. This is an explicit truncated success (is_error=false), not hidden data loss.",
+        "Returned {} complete line(s) through line {} under the shared output budget.",
         prefix.returned_lines, prefix.last_returned_line
     )
 }
@@ -508,11 +525,12 @@ pub fn complete_line_prefix_note(prefix: &CompleteLinePrefix) -> String {
 /// - Non-error outputs with **`truncated: true`** and a positive integer `nextStartLine`
 ///   (optional `fullResultPath` / `note`) are treated as actively generated safe truncated
 ///   successes and must not be re-written into a read-only soft-limit error by
-///   [`normalize_tool_execution`].
-/// - **`truncated: false` never bypasses** soft-limit normalization, including single-line
-///   full results. Callers that return one soft-over/hard-under complete line must set
-///   `truncated: true` and a positive `nextStartLine` so the success is preserved.
-/// - Hard envelope limits still apply.
+///   [`normalize_tool_execution`]. `nextStartLine` must point at real remaining content.
+/// - Non-error outputs with **`softBudgetExceeded: true`** and **`truncated: false`** are the
+///   single complete-line soft-over exception when the full content was returned (no remaining
+///   lines). Do not invent a past-EOF `nextStartLine` for this case.
+/// - **`truncated: false` without `softBudgetExceeded: true` never bypasses** soft-limit
+///   normalization. Hard envelope limits still apply.
 pub fn is_line_bounded_budget_success(execution: &ToolExecution) -> bool {
     if execution.is_error {
         return false;
@@ -520,13 +538,26 @@ pub fn is_line_bounded_budget_success(execution: &ToolExecution) -> bool {
     let Some(fields) = execution.output.as_object() else {
         return false;
     };
-    matches!(
+    let truncated_true = matches!(
         fields.get(LINE_BOUNDED_TRUNCATED_FIELD),
         Some(Value::Bool(true))
-    ) && fields
+    );
+    let next_start_ok = fields
         .get(LINE_BOUNDED_NEXT_START_LINE_FIELD)
         .and_then(Value::as_u64)
-        .is_some_and(|line| line >= 1)
+        .is_some_and(|line| line >= 1);
+    if truncated_true && next_start_ok {
+        return true;
+    }
+    let soft_budget_exceeded = matches!(
+        fields.get(LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD),
+        Some(Value::Bool(true))
+    );
+    let truncated_false = matches!(
+        fields.get(LINE_BOUNDED_TRUNCATED_FIELD),
+        Some(Value::Bool(false))
+    );
+    soft_budget_exceeded && truncated_false
 }
 
 pub fn normalize_tool_execution(
@@ -609,10 +640,11 @@ where
         };
     }
 
-    // Tools that already applied complete-line budgeting (`truncated: true` + positive nextStartLine,
-    // optional fullResultPath / note) must not be re-converted into a soft-limit read-only error.
-    // Soft overages (e.g. one long line under the hard ceiling) stay success. `truncated: false`
-    // never bypasses soft-limit normalization. Hard envelope limits still apply.
+    // Tools that already applied complete-line budgeting must not be re-converted into a
+    // soft-limit read-only error:
+    // - `truncated: true` + positive nextStartLine (remaining content exists), or
+    // - `softBudgetExceeded: true` + `truncated: false` (single soft-over line, full content).
+    // Hard envelope limits still apply.
     if !execution.is_error
         && reason != ToolOutputBudgetReason::HardByteLimit
         && is_line_bounded_budget_success(&execution)
@@ -1555,6 +1587,8 @@ mod tests {
                 assert_eq!(prefix.returned_lines, 1);
                 assert_eq!(prefix.last_returned_line, 1);
                 assert_eq!(prefix.next_start_line, Some(2));
+                assert!(prefix.truncated);
+                assert!(prefix.soft_budget_exceeded);
                 assert!(prefix.text.len() > TOOL_OUTPUT_SOFT_BYTE_LIMIT);
                 assert!(prefix.text.len() <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
             }
@@ -1563,23 +1597,24 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_complete_lines_single_soft_over_entire_content_still_truncated_true() {
-        // Soft-over single line that is the entire content must still set truncated=true so
-        // normalize preserves the success (Phase 1: truncated:false never bypasses soft limits).
+    fn truncate_to_complete_lines_single_soft_over_entire_content_no_fake_next_start() {
+        // Soft-over single line that is the entire content: full success with softBudgetExceeded,
+        // truncated=false, and no nextStartLine past EOF (Review P2).
         let long_line = "z".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT + 32);
-        let outcome = truncate_to_complete_lines(
-            &long_line,
-            CompleteLineTruncateOptions::shared_defaults(),
-        );
+        let outcome =
+            truncate_to_complete_lines(&long_line, CompleteLineTruncateOptions::shared_defaults());
         match outcome {
-            CompleteLineTruncateOutcome::Truncated(prefix) => {
+            CompleteLineTruncateOutcome::Full(prefix) => {
                 assert_eq!(prefix.text, long_line);
                 assert_eq!(prefix.returned_lines, 1);
                 assert_eq!(prefix.last_returned_line, 1);
-                assert_eq!(prefix.next_start_line, Some(2));
-                assert!(prefix.truncated);
+                assert_eq!(prefix.next_start_line, None);
+                assert!(!prefix.truncated);
+                assert!(prefix.soft_budget_exceeded);
             }
-            other => panic!("expected truncated soft-over full content, got {other:?}"),
+            other => {
+                panic!("expected full soft-over content without fake nextStartLine, got {other:?}")
+            }
         }
     }
 
@@ -1726,7 +1761,7 @@ mod tests {
             output: json!({ "content": "ok" }),
             is_error: false,
         }));
-        // truncated:false never preserves over-soft (including single-line markers).
+        // truncated:false without softBudgetExceeded never preserves over-soft.
         assert!(!is_line_bounded_budget_success(&ToolExecution {
             output: json!({ "content": "ok", "truncated": false, "nextStartLine": 2 }),
             is_error: false,
@@ -1756,6 +1791,27 @@ mod tests {
             output: json!({ "content": "ok", "truncated": true, "nextStartLine": 2 }),
             is_error: false,
         }));
+        // Single soft-over full content: softBudgetExceeded + truncated:false preserves.
+        assert!(is_line_bounded_budget_success(&ToolExecution {
+            output: json!({
+                "content": "ok",
+                "truncated": false,
+                "softBudgetExceeded": true,
+                "returnedLines": 1,
+                "lastReturnedLine": 1,
+            }),
+            is_error: false,
+        }));
+        // softBudgetExceeded alone with truncated:true but no nextStartLine is not enough
+        // (truncated path requires nextStartLine; soft-over full path requires truncated:false).
+        assert!(!is_line_bounded_budget_success(&ToolExecution {
+            output: json!({
+                "content": "ok",
+                "truncated": true,
+                "softBudgetExceeded": true,
+            }),
+            is_error: false,
+        }));
         // Multi-line full result without truncation marker must not bypass soft limits.
         assert!(!is_line_bounded_budget_success(&ToolExecution {
             output: json!({
@@ -1766,6 +1822,40 @@ mod tests {
             }),
             is_error: false,
         }));
+    }
+
+    #[test]
+    fn normalize_preserves_soft_budget_exceeded_full_content_without_next_start() {
+        let content = "z".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT + 128);
+        let execution = ToolExecution {
+            output: json!({
+                "content": content,
+                "truncated": false,
+                "softBudgetExceeded": true,
+                "returnedLines": 1,
+                "lastReturnedLine": 1,
+                "note": "full soft-over single line",
+            }),
+            is_error: false,
+        };
+        let measured = serialized_json_size(&execution).expect("measure");
+        assert!(measured > TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        assert!(measured <= TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+
+        let budgeted = normalize_tool_execution(
+            "read_file",
+            ToolOutputSemantics::ReadOnly,
+            execution.clone(),
+        );
+        assert_eq!(budgeted.state, ToolOutputBudgetState::WithinBudget);
+        assert!(!budgeted.execution.is_error);
+        assert_eq!(budgeted.execution.output["truncated"], false);
+        assert_eq!(budgeted.execution.output["softBudgetExceeded"], true);
+        assert!(
+            budgeted.execution.output.get("nextStartLine").is_none()
+                || budgeted.execution.output["nextStartLine"].is_null()
+        );
+        assert_eq!(budgeted.execution, execution);
     }
 
     #[test]

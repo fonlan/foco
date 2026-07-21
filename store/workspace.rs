@@ -68,20 +68,20 @@ pub use workspace_records::{
     PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
     PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
     PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
-    RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
-    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+    RewriteChatFromUserMessageResult, RunEventRecord, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
     STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
     STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
     STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID,
     STRUCTURED_LLM_OUTCOME_SUCCEEDED, STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
     STRUCTURED_LLM_OUTCOME_WRONG_TOOL, STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
     STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TEXT_JSON,
-    STRUCTURED_LLM_RECOVERY_TOOL_CALL, StructuredLlmOutcomeBreakdownRow, StructuredLlmOutcomeFilters,
-    StructuredLlmOutcomeKindSummary, StructuredLlmRequestClassification, TerminalSessionRecord,
-    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
-    ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
-    WorkspaceSpecRecord,
+    STRUCTURED_LLM_RECOVERY_TOOL_CALL, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
+    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, StructuredLlmOutcomeBreakdownRow,
+    StructuredLlmOutcomeFilters, StructuredLlmOutcomeKindSummary,
+    StructuredLlmRequestClassification, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord,
+    TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord, ToolCallWithResultRecord,
+    ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord, WorkspaceSpecRecord,
 };
 use workspace_schema::{
     MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004, MIGRATION_005, MIGRATION_006,
@@ -9592,9 +9592,8 @@ impl WorkspaceDatabase {
         let mut by_kind: HashMap<String, StructuredLlmOutcomeKindSummary> = HashMap::new();
 
         for row in rows {
-            let entry = by_kind
-                .entry(row.request_kind.clone())
-                .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+            let entry = by_kind.entry(row.request_kind.clone()).or_insert_with(|| {
+                StructuredLlmOutcomeKindSummary {
                     request_kind: row.request_kind.clone(),
                     total_requests: 0,
                     first_attempt_requests: 0,
@@ -9607,12 +9606,12 @@ impl WorkspaceDatabase {
                     job_terminal_failure_rate: 0.0,
                     first_attempt_provider_failures: 0,
                     first_attempt_protocol_failures: 0,
-                });
+                }
+            });
             entry.total_requests += row.request_count;
             // Prefer structured_outcome over final_state so schema_invalid rows are not
             // treated as terminal reliability successes.
-            let structured_success_count =
-                structured_success_count_for_breakdown_row(&row);
+            let structured_success_count = structured_success_count_for_breakdown_row(&row);
             entry.terminal_successes += structured_success_count;
             if row.attempt_index <= 1 {
                 entry.first_attempt_requests += row.request_count;
@@ -9718,9 +9717,8 @@ impl WorkspaceDatabase {
         for (request_kind, attempt_index, structured_outcome, structured_call_id) in
             first_window_rows
         {
-            let entry = by_kind
-                .entry(request_kind.clone())
-                .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+            let entry = by_kind.entry(request_kind.clone()).or_insert_with(|| {
+                StructuredLlmOutcomeKindSummary {
                     request_kind: request_kind.clone(),
                     total_requests: 0,
                     first_attempt_requests: 0,
@@ -9733,7 +9731,8 @@ impl WorkspaceDatabase {
                     job_terminal_failure_rate: 0.0,
                     first_attempt_provider_failures: 0,
                     first_attempt_protocol_failures: 0,
-                });
+                }
+            });
 
             if attempt_index > 1 {
                 // Orphan later attempts in the window (no first attempt in window, or unlinked).
@@ -9834,9 +9833,8 @@ impl WorkspaceDatabase {
                     continue;
                 }
                 credited_calls.insert(call_id.clone(), true);
-                let entry = by_kind
-                    .entry(request_kind.clone())
-                    .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+                let entry = by_kind.entry(request_kind.clone()).or_insert_with(|| {
+                    StructuredLlmOutcomeKindSummary {
                         request_kind: request_kind.clone(),
                         total_requests: 0,
                         first_attempt_requests: 0,
@@ -9849,7 +9847,8 @@ impl WorkspaceDatabase {
                         job_terminal_failure_rate: 0.0,
                         first_attempt_provider_failures: 0,
                         first_attempt_protocol_failures: 0,
-                    });
+                    }
+                });
                 if *call_terminal_success.get(call_id).unwrap_or(&false) {
                     entry.terminal_successes += 1;
                 }
@@ -17169,8 +17168,8 @@ fn finalize_structured_llm_outcome_kind_summaries(
         } else {
             0.0
         };
-        summary.job_terminal_failures = (summary.first_attempt_requests - summary.terminal_successes)
-            .max(0);
+        summary.job_terminal_failures =
+            (summary.first_attempt_requests - summary.terminal_successes).max(0);
         summary.job_terminal_failure_rate = if summary.first_attempt_requests > 0 {
             summary.job_terminal_failures as f64 / summary.first_attempt_requests as f64
         } else {

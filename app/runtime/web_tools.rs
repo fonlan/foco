@@ -13,8 +13,9 @@ use foco_store::workspace::{WORKSPACE_FOCO_DIR, workspace_foco_dir};
 use foco_tools::output_budget::{
     CompleteLinePrefix, CompleteLineTruncateOptions, CompleteLineTruncateOutcome,
     LINE_BOUNDED_FULL_RESULT_PATH_FIELD, LINE_BOUNDED_NEXT_START_LINE_FIELD,
-    LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_TRUNCATED_FIELD, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT,
-    TOOL_OUTPUT_SOFT_BYTE_LIMIT, TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count,
+    LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD, LINE_BOUNDED_TRUNCATED_FIELD,
+    TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+    TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count, complete_line_prefix_note,
     for_each_complete_line, measure_tool_execution, peel_last_complete_line,
     soft_limit_array_prefix_len_with_overhead, truncate_to_complete_lines_with_measure,
 };
@@ -148,7 +149,8 @@ pub(crate) fn materialize_brokered_web_result(
             file.file_name, file.mime_type
         ));
     }
-    if !is_safe_transfer_file_name(&file.file_name) || !is_valid_web_result_file_name(&file.file_name)
+    if !is_safe_transfer_file_name(&file.file_name)
+        || !is_valid_web_result_file_name(&file.file_name)
     {
         return Err("brokered web result file name is unsafe".to_string());
     }
@@ -444,11 +446,9 @@ fn finalize_web_search_output(
     )?;
 
     // Initial estimate is only a peel starting point; final fit uses measured ToolExecution size.
-    let mut returned_count = soft_limit_array_prefix_len_with_overhead(
-        &results,
-        WEB_RESULT_RESPONSE_OVERHEAD_BYTES,
-    )
-    .map_err(|source| format!("failed to measure web_search results budget: {source}"))?;
+    let mut returned_count =
+        soft_limit_array_prefix_len_with_overhead(&results, WEB_RESULT_RESPONSE_OVERHEAD_BYTES)
+            .map_err(|source| format!("failed to measure web_search results budget: {source}"))?;
     if returned_count == 0 && total_results > 0 {
         returned_count = 1;
     }
@@ -497,7 +497,9 @@ enum WebSearchFitOutcome {
     WithinSoft(Value),
     /// Single complete result record under hard, still over soft after query was reduced to empty.
     SingleRecordSoftOver(Value),
-    HardLimitExceeded { measured_bytes: usize },
+    HardLimitExceeded {
+        measured_bytes: usize,
+    },
     NeedFewerResults,
 }
 
@@ -605,8 +607,7 @@ fn try_fit_web_search_truncated_candidate(
 
     // Even an empty query preview cannot fit soft with this many results.
     let (empty_q_candidate, empty_q_bytes, empty_q_lines) = try_with_query("", 1)?;
-    if empty_q_bytes <= TOOL_OUTPUT_SOFT_BYTE_LIMIT
-        && empty_q_lines <= TOOL_OUTPUT_SOFT_LINE_LIMIT
+    if empty_q_bytes <= TOOL_OUTPUT_SOFT_BYTE_LIMIT && empty_q_lines <= TOOL_OUTPUT_SOFT_LINE_LIMIT
     {
         // Should have been found by binary search at mid=0; keep as a safe fallback.
         return Ok(WebSearchFitOutcome::WithinSoft(empty_q_candidate));
@@ -911,28 +912,26 @@ fn finalize_web_fetch_output(
                 "web_fetch line {line_number} is {line_bytes} UTF-8 bytes and exceeds the hard output ceiling ({hard_limit_bytes} bytes). Cannot return it without splitting a line; refine the source or request a different range."
             ));
         }
-        CompleteLineTruncateOutcome::Full(mut prefix)
-        | CompleteLineTruncateOutcome::Truncated(mut prefix) => {
-            // Full untruncated already over soft: always emit truncated success + cache.
-            if !prefix.truncated {
-                if prefix.returned_lines == 0 {
-                    let text = if numbered {
-                        number_plain_lines(&prefix.text, content_start_line)
-                    } else {
-                        strip_complete_line_endings_for_preview(&prefix.text)
-                    };
-                    return Ok(assemble_web_fetch_response(
-                        &input,
-                        &text,
-                        line_count,
-                        range_start,
-                        range_end,
-                        &prefix,
-                        None,
-                    ));
-                }
-                prefix.truncated = true;
-                prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
+        CompleteLineTruncateOutcome::Full(prefix)
+        | CompleteLineTruncateOutcome::Truncated(prefix) => {
+            // Do not invent truncated/nextStartLine past EOF when the content prefix is already
+            // complete. Envelope fitting peels multi-line Full results or marks softBudgetExceeded
+            // for a single soft-over line that is the entire content.
+            if !prefix.truncated && prefix.returned_lines == 0 {
+                let text = if numbered {
+                    number_plain_lines(&prefix.text, content_start_line)
+                } else {
+                    strip_complete_line_endings_for_preview(&prefix.text)
+                };
+                return Ok(assemble_web_fetch_response(
+                    &input,
+                    &text,
+                    line_count,
+                    range_start,
+                    range_end,
+                    &prefix,
+                    None,
+                ));
             }
             prefix
         }
@@ -951,6 +950,7 @@ fn finalize_web_fetch_output(
         None,
     )?;
 
+    // Full content returned (including single soft-over line under softBudgetExceeded): no cache.
     if !prefix.truncated {
         let text = if numbered {
             number_plain_lines(&prefix.text, content_start_line)
@@ -1021,6 +1021,7 @@ fn complete_line_prefix_from_plain(plain: &str, content_start_line: usize) -> Co
         last_returned_line,
         next_start_line: None,
         truncated: false,
+        soft_budget_exceeded: false,
     }
 }
 
@@ -1047,7 +1048,15 @@ fn assemble_web_fetch_response(
         "endLine": range_end,
         "timeoutMs": input.timeout_ms
     });
-    if prefix.truncated {
+    if prefix.soft_budget_exceeded {
+        response[LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD] = json!(true);
+        response["returnedLines"] = json!(prefix.returned_lines);
+        response["lastReturnedLine"] = json!(prefix.last_returned_line);
+        if let Some(path) = full_result_path.as_ref() {
+            response[LINE_BOUNDED_FULL_RESULT_PATH_FIELD] = json!(path);
+        }
+        response[LINE_BOUNDED_NOTE_FIELD] = json!(complete_line_prefix_note(prefix));
+    } else if prefix.truncated {
         let next_start_line = prefix
             .next_start_line
             .unwrap_or(prefix.last_returned_line.saturating_add(1));
@@ -1085,7 +1094,7 @@ fn fit_web_fetch_response_to_envelope_with_path(
         } else {
             strip_complete_line_endings_for_preview(&prefix.text)
         };
-        let path_for_measure = if prefix.truncated {
+        let path_for_measure = if prefix.truncated || prefix.soft_budget_exceeded {
             Some(
                 full_result_path
                     .map(str::to_string)
@@ -1123,10 +1132,14 @@ fn fit_web_fetch_response_to_envelope_with_path(
                 ));
             }
         } else if prefix.returned_lines <= 1 {
-            // Soft-over single complete line under hard: force truncated markers and keep.
-            if !prefix.truncated {
-                prefix.truncated = true;
-                prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
+            // Soft-over single complete line under hard.
+            if prefix.truncated {
+                return Ok(());
+            }
+            // Entire content is this one soft-over line: no fake nextStartLine past EOF.
+            if !prefix.soft_budget_exceeded {
+                prefix.soft_budget_exceeded = true;
+                prefix.next_start_line = None;
                 continue;
             }
             return Ok(());
@@ -1145,6 +1158,7 @@ fn fit_web_fetch_response_to_envelope_with_path(
             .saturating_sub(1)
             .max(content_start_line);
         prefix.truncated = true;
+        prefix.soft_budget_exceeded = false;
         prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
         if prefix.returned_lines == 0 && !full_preview.is_empty() {
             return Err(
@@ -1203,10 +1217,7 @@ fn number_plain_lines(plain: &str, start_line: usize) -> String {
     let mut parts = Vec::new();
     for_each_complete_line(plain, |offset, line| {
         let body = line.trim_end_matches(['\r', '\n']);
-        parts.push(format!(
-            "{}\t{body}",
-            start_line.saturating_add(offset)
-        ));
+        parts.push(format!("{}\t{body}", start_line.saturating_add(offset)));
         true
     });
     parts.join("\n")
@@ -1229,7 +1240,9 @@ fn extract_plain_line_range(text: &str, range: (usize, usize)) -> String {
 
 fn render_web_search_cache_text(provider: &str, query: &str, results: &[Value]) -> String {
     let mut out = String::new();
-    out.push_str(&format!("# Foco web_search result v{WEB_RESULT_CACHE_VERSION}\n"));
+    out.push_str(&format!(
+        "# Foco web_search result v{WEB_RESULT_CACHE_VERSION}\n"
+    ));
     out.push_str(&format!("provider: {provider}\n"));
     out.push_str(&format!("query: {query}\n"));
     out.push_str(&format!("totalResults: {}\n", results.len()));
@@ -1481,8 +1494,9 @@ fn prune_web_results_dir_inner(results_dir: &Path, room_for_new: usize) {
             continue;
         }
 
-        let is_result_file =
-            file_name.starts_with("web-") && file_name.ends_with(".txt") && !file_name.contains(".tmp");
+        let is_result_file = file_name.starts_with("web-")
+            && file_name.ends_with(".txt")
+            && !file_name.contains(".tmp");
         if !is_result_file {
             continue;
         }
@@ -1628,9 +1642,10 @@ async fn read_web_response_body_limited(
         .await
         .map_err(|source| format!("failed to read {context} response: {source}"))?
     {
-        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
-            format!("{context} response size overflowed while reading")
-        })?;
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{context} response size overflowed while reading"))?;
         if next_len > MAX_WEB_FETCH_BYTES {
             return Err(format!(
                 "{context} response is too large to read (exceeded {MAX_WEB_FETCH_BYTES} bytes)"
@@ -1777,9 +1792,7 @@ mod tests {
 
         assert_eq!(output["truncated"], true);
         assert!(output["is_error"].is_null() || !output["is_error"].as_bool().unwrap_or(false));
-        let full_path = output["fullResultPath"]
-            .as_str()
-            .expect("fullResultPath");
+        let full_path = output["fullResultPath"].as_str().expect("fullResultPath");
         assert!(
             full_path.starts_with(".foco/web-results/web-fetch-"),
             "path={full_path}"
@@ -1798,8 +1811,7 @@ mod tests {
         assert!(!preview.is_empty());
         // Complete lines only: preview is a prefix of full_text at a line boundary.
         assert!(
-            full_text.starts_with(preview.trim_end_matches('\n'))
-                || full_text.starts_with(preview),
+            full_text.starts_with(preview.trim_end_matches('\n')) || full_text.starts_with(preview),
             "preview must be a complete-line prefix of full text"
         );
 
@@ -1814,10 +1826,7 @@ mod tests {
         let all_lines: Vec<&str> = full_text.lines().collect();
         let preview_lines: Vec<&str> = preview.lines().collect();
         assert_eq!(preview_lines.len() + 1, next);
-        assert_eq!(
-            preview_lines.as_slice(),
-            &all_lines[..preview_lines.len()]
-        );
+        assert_eq!(preview_lines.as_slice(), &all_lines[..preview_lines.len()]);
         assert_eq!(all_lines[next - 1], all_lines[preview_lines.len()]);
 
         let execution = ToolExecution {
@@ -1834,11 +1843,8 @@ mod tests {
         );
         // When truncated with fullResultPath, normalize must keep success (not hard-limit fallback).
         assert!(is_line_bounded_budget_success(&execution));
-        let normalized = normalize_tool_execution(
-            WEB_FETCH_TOOL,
-            ToolOutputSemantics::ReadOnly,
-            execution,
-        );
+        let normalized =
+            normalize_tool_execution(WEB_FETCH_TOOL, ToolOutputSemantics::ReadOnly, execution);
         assert!(!normalized.execution.is_error);
         assert_eq!(normalized.execution.output["truncated"], true);
         assert!(
@@ -1889,11 +1895,8 @@ mod tests {
             "escape-heavy response must fit soft after envelope-aware peel: {}",
             measured.serialized_bytes
         );
-        let normalized = normalize_tool_execution(
-            WEB_FETCH_TOOL,
-            ToolOutputSemantics::ReadOnly,
-            execution,
-        );
+        let normalized =
+            normalize_tool_execution(WEB_FETCH_TOOL, ToolOutputSemantics::ReadOnly, execution);
         assert!(!normalized.execution.is_error);
         assert_eq!(normalized.execution.output["truncated"], true);
         assert!(normalized.execution.output.get("fullResultPath").is_some());
@@ -1949,7 +1952,10 @@ mod tests {
         let full_path = output["fullResultPath"].as_str().expect("path");
         let cached = fs::read_to_string(workspace.path().join(full_path)).expect("cache");
         assert_eq!(cached, full_text);
-        assert_eq!(complete_line_count(&cached), complete_line_count(&full_text));
+        assert_eq!(
+            complete_line_count(&cached),
+            complete_line_count(&full_text)
+        );
         // Cache line at nextStartLine must be the first omitted line (1-based).
         let mut line_no = 0_usize;
         let mut omitted = None;
@@ -1961,7 +1967,10 @@ mod tests {
             }
             true
         });
-        assert!(omitted.is_some(), "nextStartLine={next} must exist in cache");
+        assert!(
+            omitted.is_some(),
+            "nextStartLine={next} must exist in cache"
+        );
     }
 
     #[test]
@@ -1996,7 +2005,10 @@ mod tests {
         let preview = output["text"].as_str().expect("text");
         // Numbered absolute lines in ranged mode.
         assert!(
-            preview.lines().next().is_some_and(|line| line.starts_with("50\t")),
+            preview
+                .lines()
+                .next()
+                .is_some_and(|line| line.starts_with("50\t")),
             "first preview line should be numbered from absolute start: {preview:?}"
         );
 
@@ -2240,9 +2252,8 @@ mod tests {
             "publishedAt": null,
             "score": 1.0
         })];
-        let output =
-            finalize_web_search_output(workspace.path(), "brave", "q", results, 1_000)
-                .expect("small search");
+        let output = finalize_web_search_output(workspace.path(), "brave", "q", results, 1_000)
+            .expect("small search");
         assert_eq!(output["truncated"], false);
         assert_eq!(output["returnedResults"], 1);
         assert!(output.get("fullResultPath").is_none() || output["fullResultPath"].is_null());
@@ -2277,11 +2288,9 @@ mod tests {
             }),
         ];
 
-        let estimate = soft_limit_array_prefix_len_with_overhead(
-            &results,
-            WEB_RESULT_RESPONSE_OVERHEAD_BYTES,
-        )
-        .expect("estimate");
+        let estimate =
+            soft_limit_array_prefix_len_with_overhead(&results, WEB_RESULT_RESPONSE_OVERHEAD_BYTES)
+                .expect("estimate");
         assert!(
             estimate < results.len(),
             "fixture requires conservative estimate < total (estimate={estimate})"
@@ -2334,14 +2343,9 @@ mod tests {
             "fixture query must exceed soft line limit"
         );
 
-        let output = finalize_web_search_output(
-            workspace.path(),
-            "tavily",
-            &query,
-            Vec::new(),
-            1_000,
-        )
-        .expect("search finalize with huge query");
+        let output =
+            finalize_web_search_output(workspace.path(), "tavily", &query, Vec::new(), 1_000)
+                .expect("search finalize with huge query");
 
         assert_eq!(output["truncated"], true);
         assert_eq!(output["totalResults"], 0);
@@ -2415,14 +2419,8 @@ mod tests {
             "score": 1.0
         })];
 
-        let output = finalize_web_search_output(
-            workspace.path(),
-            "brave",
-            &query,
-            results,
-            1_000,
-        )
-        .expect("single-record soft-over with huge query");
+        let output = finalize_web_search_output(workspace.path(), "brave", &query, results, 1_000)
+            .expect("single-record soft-over with huge query");
 
         assert_eq!(output["truncated"], true);
         assert_eq!(output["totalResults"], 1);
@@ -2505,14 +2503,9 @@ mod tests {
         fs::create_dir_all(&dir).expect("dir");
         for i in 0..MAX_WEB_RESULT_FILES + 3 {
             // Unique ids via counter.
-            let path = write_web_result_cache(
-                workspace.path(),
-                "fetch",
-                &format!("body-{i}"),
-                None,
-                None,
-            )
-            .expect("write");
+            let path =
+                write_web_result_cache(workspace.path(), "fetch", &format!("body-{i}"), None, None)
+                    .expect("write");
             assert!(workspace.path().join(&path).exists());
         }
         let count = fs::read_dir(&dir)
@@ -2678,9 +2671,8 @@ mod tests {
         let a_dest = dir.join("web-fetch-writer-a.txt");
 
         // B publishes another cache (triggers prune_web_results_dir).
-        let b_rel =
-            write_web_result_cache(workspace.path(), "fetch", "writer-b-body", None, None)
-                .expect("B write");
+        let b_rel = write_web_result_cache(workspace.path(), "fetch", "writer-b-body", None, None)
+            .expect("B write");
         assert!(workspace.path().join(&b_rel).exists());
         assert!(
             a_tmp.exists(),
@@ -2698,9 +2690,7 @@ mod tests {
     async fn execute_web_fetch_integration_soft_truncates_via_local_http() {
         let body = large_body_lines(2_500, 50);
         let body_for_server = body.clone();
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let app = Router::new().route(
@@ -2751,9 +2741,7 @@ mod tests {
     #[tokio::test]
     async fn execute_web_fetch_rejects_over_2mib_raw_response() {
         let huge = vec![b'a'; MAX_WEB_FETCH_BYTES + 8];
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let app = Router::new().route(
@@ -2803,9 +2791,7 @@ mod tests {
     async fn execute_web_fetch_rejects_over_2mib_error_body_without_content_length() {
         // Chunked 4xx/5xx bodies must share the raw response ceiling (no unbounded text()).
         let huge = vec![b'e'; MAX_WEB_FETCH_BYTES + 64];
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
         let app = Router::new().route(
@@ -2868,14 +2854,8 @@ mod tests {
 
         // Seed near the cap so concurrent publishes would race without the write lock.
         for i in 0..15 {
-            write_web_result_cache(
-                workspace.path(),
-                "fetch",
-                &format!("seed-{i}"),
-                None,
-                None,
-            )
-            .expect("seed");
+            write_web_result_cache(workspace.path(), "fetch", &format!("seed-{i}"), None, None)
+                .expect("seed");
         }
 
         let workspace_path = workspace.path().to_path_buf();
@@ -2931,12 +2911,9 @@ mod tests {
         assert_eq!(files[0].mime_type, BROKERED_WEB_RESULT_MIME);
         assert!(!files[0].data_base64.is_empty());
 
-        let materialized = materialize_brokered_web_result(
-            sidecar_workspace.path(),
-            host_result.clone(),
-            files,
-        )
-        .expect("materialize");
+        let materialized =
+            materialize_brokered_web_result(sidecar_workspace.path(), host_result.clone(), files)
+                .expect("materialize");
         assert_eq!(
             materialized["fullResultPath"].as_str().expect("path"),
             relative
@@ -2971,12 +2948,9 @@ mod tests {
             sha256: "00".repeat(32),
             data_base64: BASE64_STANDARD.encode(body.as_bytes()),
         }];
-        let err = materialize_brokered_web_result(
-            sidecar_workspace.path(),
-            host_result.clone(),
-            bad,
-        )
-        .expect_err("checksum");
+        let err =
+            materialize_brokered_web_result(sidecar_workspace.path(), host_result.clone(), bad)
+                .expect_err("checksum");
         assert!(err.contains("checksum"), "{err}");
 
         // Illegal filename / wrong directory.
@@ -3015,7 +2989,10 @@ mod tests {
         }];
         let err = materialize_brokered_web_result(sidecar_workspace.path(), host_result, oversized)
             .expect_err("oversize");
-        assert!(err.contains("invalid size") || err.contains("size"), "{err}");
+        assert!(
+            err.contains("invalid size") || err.contains("size"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3046,8 +3023,8 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(body)),
             data_base64: BASE64_STANDARD.encode(body),
         }];
-        let err = materialize_brokered_web_result(workspace.path(), result, files)
-            .expect_err("mime");
+        let err =
+            materialize_brokered_web_result(workspace.path(), result, files).expect_err("mime");
         assert!(err.contains("MIME"), "{err}");
         assert!(!workspace.path().join(relative).exists());
 
@@ -3231,7 +3208,10 @@ mod tests {
         let err = materialize_brokered_web_result(
             workspace.path(),
             result,
-            vec![brokered_web_file(keep_name, b"different-content-must-not-land")],
+            vec![brokered_web_file(
+                keep_name,
+                b"different-content-must-not-land",
+            )],
         )
         .expect_err("full-cap collision");
         assert!(

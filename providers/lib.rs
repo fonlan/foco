@@ -5900,7 +5900,9 @@ mod tests {
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
-        assert!(!adapter_supports_required_single_tool(AdapterKind::OllamaCloud));
+        assert!(!adapter_supports_required_single_tool(
+            AdapterKind::OllamaCloud
+        ));
         assert!(adapter_supports_required_single_tool(AdapterKind::OpenAI));
     }
 
@@ -5916,8 +5918,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        request.tool_choice =
-            NeutralToolChoice::required_single_tool("select_relevant_memory");
+        request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind"),
@@ -5947,8 +5948,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
         });
-        request.tool_choice =
-            NeutralToolChoice::required_single_tool("select_relevant_memory");
+        request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OLLAMA_KIND).expect("ollama kind"),
@@ -5983,13 +5983,9 @@ mod tests {
             NeutralChatRole::User,
             "use the tool",
         )]);
-        missing.tool_choice =
-            NeutralToolChoice::required_single_tool("select_relevant_memory");
+        missing.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
         let err = genai_chat_options(&config, &missing).expect_err("missing tool");
-        assert!(
-            err.to_string()
-                .contains("is not present in request.tools")
-        );
+        assert!(err.to_string().contains("is not present in request.tools"));
 
         let mut empty = missing;
         empty.tools.push(NeutralToolDefinition {
@@ -6031,8 +6027,7 @@ mod tests {
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
             strict: true,
         });
-        request.tool_choice =
-            NeutralToolChoice::required_single_tool("select_relevant_memory");
+        request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
         let mut stream = stream_chat_with_capture(&config, request, true)
             .await
@@ -6104,9 +6099,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
-            tool_choice: NeutralToolChoice::required_single_tool(
-                "submit_workspace_spec_update",
-            ),
+            tool_choice: NeutralToolChoice::required_single_tool("submit_workspace_spec_update"),
         };
 
         let client = config.genai_client().expect("client");

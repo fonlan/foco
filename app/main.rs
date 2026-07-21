@@ -5928,8 +5928,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     // Once repair is scheduled, later transport retries of the repaired body stay provider_retry.
     let mut next_retry_kind = structured_llm_outcome::StructuredLlmRetryKind::Initial;
     // Cap total stream attempts so pathological combinations cannot spin.
-    let max_stream_attempts =
-        structured_llm_outcome::audited_max_stream_attempts(retry_count);
+    let max_stream_attempts = structured_llm_outcome::audited_max_stream_attempts(retry_count);
     // Links all attempt rows of this audited call for job-level windowed metrics.
     let structured_call_id = unique_id("structured-call");
 
@@ -5938,8 +5937,10 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
         next_attempt_index = next_attempt_index.saturating_add(1);
         let retry_kind = next_retry_kind;
         // True only for the attempt that first uses the repaired request body.
-        let is_output_repair_attempt =
-            matches!(retry_kind, structured_llm_outcome::StructuredLlmRetryKind::OutputRepair);
+        let is_output_repair_attempt = matches!(
+            retry_kind,
+            structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+        );
         // True once any attempt runs after repair was scheduled (repair itself or later provider retries).
         let recovery_uses_correction = output_repair_used;
         let request_id = unique_id("llm");
@@ -6055,7 +6056,9 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                             structured_llm_outcome::classify_caller_structured_failure_kind(
                                 &validation_message,
                             )
-                            .unwrap_or(structured_llm_outcome::StructuredLlmFailureKind::SchemaInvalid);
+                            .unwrap_or(
+                                structured_llm_outcome::StructuredLlmFailureKind::SchemaInvalid,
+                            );
                         database
                             .update_llm_request_outcome(
                                 &request_id,
@@ -6085,14 +6088,15 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                                 },
                             )
                             .map_err(ApiError::from_workspace_error)?;
-                        let _ = structured_llm_outcome::persist_structured_classification_on_database(
-                            &mut database,
-                            &request_id,
-                            structured_llm_outcome::with_structured_call_id(
-                                failure_kind.classification(attempt_number),
-                                &structured_call_id,
-                            ),
-                        );
+                        let _ =
+                            structured_llm_outcome::persist_structured_classification_on_database(
+                                &mut database,
+                                &request_id,
+                                structured_llm_outcome::with_structured_call_id(
+                                    failure_kind.classification(attempt_number),
+                                    &structured_call_id,
+                                ),
+                            );
                         persist_audited_provider_events(
                             &mut database,
                             &request_id,
@@ -6310,7 +6314,6 @@ fn append_output_repair_message(
     ));
     repaired
 }
-
 
 struct AuditedTextStreamOutcome {
     text: String,
@@ -6724,7 +6727,9 @@ async fn run_provider_stream_for_tool(
                         format!("{request_kind} did not call {tool_label}"),
                         None,
                     )
-                    .with_failure_kind(structured_llm_outcome::StructuredLlmFailureKind::MissingTool)
+                    .with_failure_kind(
+                        structured_llm_outcome::StructuredLlmFailureKind::MissingTool,
+                    )
                 } else {
                     AuditedProviderError::new(
                         format!("{request_kind} returned text instead of {tool_label}: {text}"),
