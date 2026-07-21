@@ -5289,10 +5289,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("spins the API details refresh icon while reloading", async () => {
+  it("toggles the API details auto-refresh control without a loading spinner", async () => {
     const fetchMock = vi.mocked(fetch);
-    let holdNextStatsRequest = false;
-    const heldStatsRequests: Deferred<Response>[] = [];
     fetchMock.mockImplementation((input, init) => {
       const url = typeof input === "string" ? input : input.toString();
       const path = url.startsWith("http://127.0.0.1")
@@ -5300,12 +5298,6 @@ describe("app-chat-stream verification surfaces", () => {
         : url.split("?")[0];
 
       if (path === "/api/ai-statistics") {
-        if (holdNextStatsRequest) {
-          const request = deferred<Response>();
-          heldStatsRequests.push(request);
-          return request.promise;
-        }
-
         return Promise.resolve(jsonResponse(aiStatistics));
       }
 
@@ -5317,28 +5309,30 @@ describe("app-chat-stream verification surfaces", () => {
       (await screen.findAllByRole("button", { name: "API details" }))[0],
     );
     expect(await screen.findByText("API details")).toBeInTheDocument();
-    const refreshButton = screen.getByRole("button", {
-      name: "Refresh request audit",
-    });
-    await waitFor(() => expect(refreshButton).not.toBeDisabled());
 
-    holdNextStatsRequest = true;
-    await userEvent.click(refreshButton);
-
-    await waitFor(() => expect(heldStatsRequests).toHaveLength(1));
-    await waitFor(() => {
-      const icon = refreshButton.querySelector("svg");
-      if (!(icon instanceof SVGElement)) {
-        throw new Error("refresh icon was not rendered");
-      }
-      expect(icon).toHaveClass("lucide-refresh-cw");
-      expect(icon).toHaveClass("api-refresh-icon");
-      expect(icon).toHaveAttribute("data-loading", "true");
+    const pauseButton = await screen.findByRole("button", {
+      name: "Pause auto refresh",
     });
+    expect(pauseButton).not.toBeDisabled();
+    const pauseIcon = pauseButton.querySelector("svg");
+    if (!(pauseIcon instanceof SVGElement)) {
+      throw new Error("pause icon was not rendered");
+    }
+    expect(pauseIcon).toHaveClass("lucide-pause");
+    expect(pauseIcon).not.toHaveClass("api-refresh-icon");
+    expect(pauseIcon).not.toHaveAttribute("data-loading");
 
-    await act(async () => {
-      heldStatsRequests[0]?.resolve(jsonResponse(aiStatistics));
+    await userEvent.click(pauseButton);
+
+    const resumeButton = await screen.findByRole("button", {
+      name: "Resume auto refresh",
     });
+    const resumeIcon = resumeButton.querySelector("svg");
+    if (!(resumeIcon instanceof SVGElement)) {
+      throw new Error("resume icon was not rendered");
+    }
+    expect(resumeIcon).toHaveClass("lucide-play");
+    expect(resumeButton).not.toBeDisabled();
   });
 
   it("schedules a new workspace chat until the current workspace run finishes", async () => {

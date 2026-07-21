@@ -751,6 +751,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Git commit message generation": "Git 提交信息生成",
     "Refresh request audit": "刷新请求审计",
     "Refresh request audit to load charts": "刷新请求审计以加载图表",
+    "Pause auto refresh": "暂停自动刷新",
+    "Resume auto refresh": "开始自动刷新",
     Columns: "列",
     Usage: "用量",
     "Usage tokens": "用量 token",

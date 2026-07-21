@@ -4575,7 +4575,6 @@ summary:focus-visible {
   transform-origin: center;
 }
 
-.api-refresh-icon[data-loading="true"],
 .context-refresh-icon[data-loading="true"] {
   animation: refresh-icon-spin 1s linear infinite;
   transform-box: fill-box;
@@ -5148,7 +5147,6 @@ summary:focus-visible {
     transition-duration: 0.01ms !important;
   }
 
-  .api-refresh-icon[data-loading="true"],
   .context-refresh-icon[data-loading="true"],
   .agent-running-status-spinner,
   .chat-tab-running-spinner,

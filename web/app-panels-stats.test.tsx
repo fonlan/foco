@@ -4744,6 +4744,157 @@ describe("app-panels-stats verification surfaces", () => {
     }
   });
 
+  it("toggles the API details auto-refresh control between pause and resume", async () => {
+    renderApp();
+
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+
+    const pauseButton = await screen.findByRole("button", {
+      name: "Pause auto refresh",
+    });
+    expect(pauseButton.querySelector("svg")).toHaveClass("lucide-pause");
+    expect(pauseButton).not.toBeDisabled();
+
+    await userEvent.click(pauseButton);
+
+    const resumeButton = await screen.findByRole("button", {
+      name: "Resume auto refresh",
+    });
+    expect(resumeButton.querySelector("svg")).toHaveClass("lucide-play");
+    expect(screen.queryByRole("button", { name: "Pause auto refresh" })).toBeNull();
+
+    await userEvent.click(resumeButton);
+    expect(
+      await screen.findByRole("button", { name: "Pause auto refresh" }),
+    ).toBeInTheDocument();
+  });
+
+  it("stops API statistics polling and visibility refresh while auto refresh is paused", async () => {
+    renderApp();
+
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    expect(await screen.findByText("API details")).toBeInTheDocument();
+    await waitFor(() => expect(aiStatisticsCallUrls().length).toBeGreaterThan(0));
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Pause auto refresh" }),
+    );
+
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    try {
+      const pausedCount = aiStatisticsCallUrls().length;
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(15_000);
+      });
+      expect(aiStatisticsCallUrls().length).toBe(pausedCount);
+
+      setDocumentVisibility("hidden");
+      fireEvent(document, new Event("visibilitychange"));
+      setDocumentVisibility("visible");
+      fireEvent(document, new Event("visibilitychange"));
+      expect(aiStatisticsCallUrls().length).toBe(pausedCount);
+    } finally {
+      vi.useRealTimers();
+      setDocumentVisibility("visible");
+    }
+
+    const beforeResume = aiStatisticsCallUrls().length;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Resume auto refresh" }),
+    );
+    await waitFor(() =>
+      expect(aiStatisticsCallUrls().length).toBeGreaterThan(beforeResume),
+    );
+  });
+
+  it("pauses running request detail polling and resumes after auto refresh starts", async () => {
+    const fetchMock = vi.mocked(fetch);
+    let detailCalls = 0;
+    fetchMock.mockImplementation((input, init) => {
+      const rawPath =
+        typeof input === "string"
+          ? input
+          : input instanceof URL
+            ? input.toString()
+            : input.url;
+      const path = new URL(rawPath, "http://localhost").pathname;
+
+      if (path === "/api/ai-statistics") {
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatistics,
+            requests: [
+              {
+                ...aiStatistics.requests[0],
+                finalState: "running",
+              },
+            ],
+          }),
+        );
+      }
+
+      if (path === "/api/workspaces/workspace-1/ai-statistics/request-1") {
+        detailCalls += 1;
+        const isFinal = detailCalls >= 3;
+        return Promise.resolve(
+          jsonResponse({
+            ...aiStatisticsDetail,
+            request: {
+              ...aiStatisticsDetail.request,
+              finalState: isFinal ? "succeeded" : "running",
+              responseBody: isFinal
+                ? aiStatisticsDetail.request.responseBody
+                : null,
+            },
+          }),
+        );
+      }
+
+      return Promise.resolve(mockFetch(input, init));
+    });
+
+    renderApp();
+
+    await userEvent.click(
+      (await screen.findAllByRole("button", { name: "API details" }))[0],
+    );
+    await userEvent.click(
+      await screen.findByRole("button", { name: "View request details" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Request details" });
+    await waitFor(() => expect(detailCalls).toBeGreaterThanOrEqual(1));
+    expect(within(dialog).getByText("running")).toBeInTheDocument();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Pause auto refresh" }),
+    );
+
+    const pausedDetailCalls = detailCalls;
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 1500));
+    });
+    expect(detailCalls).toBe(pausedDetailCalls);
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Resume auto refresh" }),
+    );
+    await waitFor(
+      () => {
+        expect(detailCalls).toBeGreaterThan(pausedDetailCalls);
+        expect(
+          within(dialog).getByText("Final provider response"),
+        ).toBeInTheDocument();
+      },
+      { timeout: 4000 },
+    );
+  });
+
   it("updates the stats URL when request audit pagination changes", async () => {
     renderApp();
 

@@ -13,7 +13,8 @@ import {
   Copy,
   Eye,
   LoaderCircle,
-  RefreshCw,
+  Pause,
+  Play,
   SlidersHorizontal,
   X,
   type LucideIcon,
@@ -101,6 +102,7 @@ export function ApiStatsPanel({
 }) {
   const { language, t } = useI18n();
   const {
+    autoRefreshEnabled,
     closeRequestDetail,
     copiedKey,
     copyAuditText,
@@ -111,8 +113,9 @@ export function ApiStatsPanel({
     goToAuditPage: updateAuditPage,
     isLoading,
     isLoadingDetail,
-    loadStats,
     openRequestDetail,
+    pauseAutoRefresh,
+    resumeAutoRefresh,
     selectedRequestId,
     setAuditPage,
     stats,
@@ -514,18 +517,31 @@ export function ApiStatsPanel({
               </div>
             </div>
             <button
-              aria-label={t("Refresh request audit")}
-              className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
-              disabled={isLoading}
-              onClick={() => void loadStats()}
-              title={t("Refresh request audit")}
+              aria-label={
+                autoRefreshEnabled
+                  ? t("Pause auto refresh")
+                  : t("Resume auto refresh")
+              }
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+              onClick={() => {
+                if (autoRefreshEnabled) {
+                  pauseAutoRefresh();
+                } else {
+                  resumeAutoRefresh();
+                }
+              }}
+              title={
+                autoRefreshEnabled
+                  ? t("Pause auto refresh")
+                  : t("Resume auto refresh")
+              }
               type="button"
             >
-              <RefreshCw
-                aria-hidden="true"
-                className="api-refresh-icon size-4"
-                data-loading={isLoading ? "true" : "false"}
-              />
+              {autoRefreshEnabled ? (
+                <Pause aria-hidden="true" className="size-4" />
+              ) : (
+                <Play aria-hidden="true" className="size-4" />
+              )}
             </button>
           </div>
           <div className="mt-4 grid gap-3 border-t border-stone-200 pt-4 md:grid-cols-2 xl:grid-cols-8">

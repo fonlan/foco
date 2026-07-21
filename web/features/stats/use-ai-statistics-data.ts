@@ -11,6 +11,8 @@ import type {
 const AI_STATS_POLL_INTERVAL_MS = 5000;
 const AI_REQUEST_DETAIL_POLL_INTERVAL_MS = 1000;
 
+type StatsLoadSource = "auto" | "user";
+
 export function emptyAiStatsFilters(page = 1): AiStatsFilterState {
   return {
     chatId: "",
@@ -42,16 +44,20 @@ export function useAiStatisticsData(
   const [detailError, setDetailError] = useState<string | null>(null);
   const [isLoadingDetail, setIsLoadingDetail] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [autoRefreshEnabled, setAutoRefreshEnabled] = useState(true);
   const selectedRequestRef = useRef<AiRequestAuditSummary | null>(null);
   const filtersRef = useRef(filters);
   const statsRef = useRef<AiStatisticsResponse | null>(null);
   const isStatsRequestInFlightRef = useRef(false);
   const isDetailRequestInFlightRef = useRef(false);
   const shouldReloadStatsAfterCurrentRequestRef = useRef(false);
+  const pendingStatsReloadSourceRef = useRef<StatsLoadSource>("user");
+  const autoRefreshEnabledRef = useRef(true);
   const copiedTimerRef = useRef<number | null>(null);
 
   filtersRef.current = filters;
   statsRef.current = stats;
+  autoRefreshEnabledRef.current = autoRefreshEnabled;
 
   const loadRequestDetail = useCallback(
     async (request: AiRequestAuditSummary, showLoading: boolean) => {
@@ -91,11 +97,26 @@ export function useAiStatisticsData(
   );
 
   const loadStats = useCallback(
-    async (showLoading = true, queueIfInFlight = false) => {
+    async (
+      showLoading = true,
+      queueIfInFlight = false,
+      source: StatsLoadSource = "user",
+    ) => {
       if (isStatsRequestInFlightRef.current) {
         if (queueIfInFlight) {
-          shouldReloadStatsAfterCurrentRequestRef.current = true;
+          if (!shouldReloadStatsAfterCurrentRequestRef.current) {
+            shouldReloadStatsAfterCurrentRequestRef.current = true;
+            pendingStatsReloadSourceRef.current = source;
+          } else if (source === "user") {
+            // User-driven reloads take precedence over auto-queued ones.
+            pendingStatsReloadSourceRef.current = "user";
+          }
         }
+        return;
+      }
+
+      // Drop auto-originated loads that race past pause.
+      if (source === "auto" && !autoRefreshEnabledRef.current) {
         return;
       }
 
@@ -120,10 +141,15 @@ export function useAiStatisticsData(
                 request.workspaceId === selectedRequest.workspaceId,
             ) ?? selectedRequest;
           selectedRequestRef.current = refreshedRequest;
-          if (
+          const shouldRefreshDetail =
             selectedRequest.finalState === "running" ||
             refreshedRequest.finalState === "running" ||
-            refreshedRequest.finalState !== selectedRequest.finalState
+            refreshedRequest.finalState !== selectedRequest.finalState;
+          // Auto list polls must not start a new detail request after pause.
+          // User-driven loads (filters, open detail follow-up via list) still may.
+          if (
+            shouldRefreshDetail &&
+            (source === "user" || autoRefreshEnabledRef.current)
           ) {
             void loadRequestDetail(refreshedRequest, false);
           }
@@ -137,8 +163,13 @@ export function useAiStatisticsData(
         }
         if (shouldReloadStatsAfterCurrentRequestRef.current) {
           shouldReloadStatsAfterCurrentRequestRef.current = false;
-          if (isAiStatsDocumentVisible()) {
-            void loadStats(false);
+          const pendingSource = pendingStatsReloadSourceRef.current;
+          pendingStatsReloadSourceRef.current = "user";
+          if (
+            isAiStatsDocumentVisible() &&
+            (pendingSource === "user" || autoRefreshEnabledRef.current)
+          ) {
+            void loadStats(false, false, pendingSource);
           }
         }
       }
@@ -163,15 +194,22 @@ export function useAiStatisticsData(
   }, [initialPage, initialFiltersKey]);
 
   useEffect(() => {
+    if (!autoRefreshEnabled) {
+      return;
+    }
+
     const intervalId = window.setInterval(() => {
-      if (!isAiStatsDocumentVisible()) {
+      if (!autoRefreshEnabledRef.current || !isAiStatsDocumentVisible()) {
         return;
       }
-      void loadStats(false);
+      void loadStats(false, false, "auto");
     }, AI_STATS_POLL_INTERVAL_MS);
     const handleVisibilityChange = () => {
+      if (!autoRefreshEnabledRef.current) {
+        return;
+      }
       if (isAiStatsDocumentVisible()) {
-        void loadStats(statsRef.current === null);
+        void loadStats(statsRef.current === null, false, "auto");
       }
     };
 
@@ -180,24 +218,32 @@ export function useAiStatisticsData(
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [loadStats]);
+  }, [autoRefreshEnabled, loadStats]);
 
   useEffect(() => {
     const selectedRequest = selectedRequestRef.current;
-    if (!selectedRequest || detail?.request.finalState !== "running") {
+    if (
+      !autoRefreshEnabled ||
+      !selectedRequest ||
+      detail?.request.finalState !== "running"
+    ) {
       return;
     }
 
     const intervalId = window.setInterval(() => {
       const current = selectedRequestRef.current;
-      if (!current || !isAiStatsDocumentVisible()) {
+      if (
+        !current ||
+        !autoRefreshEnabledRef.current ||
+        !isAiStatsDocumentVisible()
+      ) {
         return;
       }
       void loadRequestDetail(current, false);
     }, AI_REQUEST_DETAIL_POLL_INTERVAL_MS);
 
     return () => window.clearInterval(intervalId);
-  }, [detail?.request.finalState, loadRequestDetail]);
+  }, [autoRefreshEnabled, detail?.request.finalState, loadRequestDetail]);
 
   useEffect(() => {
     return () => {
@@ -265,7 +311,26 @@ export function useAiStatisticsData(
     setCopiedKey(null);
   }, []);
 
+  const pauseAutoRefresh = useCallback(() => {
+    autoRefreshEnabledRef.current = false;
+    // Drop auto-queued reloads so pause cannot be pierced by a pending auto follow-up.
+    if (pendingStatsReloadSourceRef.current === "auto") {
+      shouldReloadStatsAfterCurrentRequestRef.current = false;
+    }
+    setAutoRefreshEnabled(false);
+  }, []);
+
+  const resumeAutoRefresh = useCallback(() => {
+    autoRefreshEnabledRef.current = true;
+    setAutoRefreshEnabled(true);
+    if (isAiStatsDocumentVisible()) {
+      // Queue when a list request is already in flight so resume still syncs once.
+      void loadStats(statsRef.current === null, true, "auto");
+    }
+  }, [loadStats]);
+
   return {
+    autoRefreshEnabled,
     closeRequestDetail,
     copiedKey,
     copyAuditText,
@@ -278,6 +343,8 @@ export function useAiStatisticsData(
     isLoadingDetail,
     loadStats,
     openRequestDetail,
+    pauseAutoRefresh,
+    resumeAutoRefresh,
     selectedRequestId,
     setAuditPage,
     stats,
