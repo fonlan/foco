@@ -7709,6 +7709,90 @@ describe("app-chat-stream verification surfaces", () => {
       appTestState.chatStreamControllers.get("request-stream")?.close();
     });
   });
+
+  it("holds legacy reattach deltas until start resolves the durable assistant id", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "",
+                id: "message-assistant-stream",
+                parts: [],
+                status: "streaming",
+              },
+            ],
+            activeRun: {
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "legacy-reattach-run",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        if (
+          path ===
+          "/api/workspaces/workspace-1/chat/runs/legacy-reattach-run/stream"
+        ) {
+          const encoder = new TextEncoder();
+          const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    delta: "Buffered legacy text.",
+                    type: "textDelta",
+                  })}\n\n`,
+                ),
+              );
+              controller.enqueue(
+                encoder.encode(
+                  `data: ${JSON.stringify({
+                    assistantMessageId: "message-assistant-stream",
+                    chatId: "chat-1",
+                    memoriesUsed: [],
+                    type: "start",
+                    userMessageId: "message-user-stream",
+                  })}\n\n`,
+                ),
+              );
+              controller.close();
+            },
+          });
+          return new Response(stream, {
+            headers: { "Content-Type": "text/event-stream" },
+            status: 200,
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    const legacyText = await screen.findByText("Buffered legacy text.");
+    expect(legacyText.closest(".message-row")).not.toBeNull();
+    expect(
+      new Set(
+        screen
+          .getAllByText("Buffered legacy text.")
+          .map((node) => node.closest(".message-row")),
+      ).size,
+    ).toBe(1);
+  });
+
   it("reattaches to an active run when loading chat messages", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {

@@ -1814,6 +1814,13 @@ export function App() {
   const activeRunAbortByChatKeyRef = useRef<Map<string, AbortController>>(
     new Map(),
   );
+  // A stream can be reattached, retried, or superseded while fetch/readable-stream
+  // callbacks from an older subscription are still queued. Keep one explicit owner
+  // per chat so those callbacks cannot mutate the newer UI state.
+  const chatStreamSessionsByChatKeyRef = useRef<Map<string, ChatStreamSession>>(
+    new Map(),
+  );
+  const chatStreamEpochRef = useRef(0);
   // Assistants that received live stream content for a chat. Survives GET
   // reattach across Coordinator wait handoffs so later `start` events keep
   // history instead of wiping the bubble.
@@ -2695,6 +2702,10 @@ export function App() {
         abortController.abort();
       }
       activeRunAbortByChatKeyRef.current.clear();
+      for (const session of chatStreamSessionsByChatKeyRef.current.values()) {
+        session.abortController.abort();
+      }
+      chatStreamSessionsByChatKeyRef.current.clear();
 
       for (const abortController of loadingChatControllersRef.current.values()) {
         abortController.abort();
@@ -5666,7 +5677,11 @@ export function App() {
     return next;
   }
 
-  function createTextDeltaBuffer() {
+  function createTextDeltaBuffer(
+    canWrite: (chatKey: string) => boolean = () => true,
+    canFlush: (chatKey: string, assistantMessageId: string) => boolean =
+      () => true,
+  ) {
     const bufferedDeltasByChatKey = new Map<string, Map<string, string>>();
     let flushTimer: number | null = null;
 
@@ -5689,13 +5704,24 @@ export function App() {
       bufferedDeltasByChatKey.clear();
 
       for (const [chatKey, messageDeltas] of bufferedDeltas) {
+        if (!canWrite(chatKey)) {
+          continue;
+        }
+        const deferredDeltas = new Map<string, string>();
         setMessagesForChatKey(chatKey, (current) => {
           let next = current;
           for (const [assistantMessageId, delta] of messageDeltas) {
+            if (!canFlush(chatKey, assistantMessageId)) {
+              deferredDeltas.set(assistantMessageId, delta);
+              continue;
+            }
             next = appendBufferedTextDelta(next, assistantMessageId, delta);
           }
           return next;
         });
+        if (deferredDeltas.size) {
+          bufferedDeltasByChatKey.set(chatKey, deferredDeltas);
+        }
       }
     };
 
@@ -5721,10 +5747,36 @@ export function App() {
           flush();
         }, STREAM_DELTA_FLUSH_MS);
       },
+      remapAssistantMessageId(
+        chatKey: string,
+        previousAssistantMessageId: string,
+        canonicalAssistantMessageId: string,
+      ) {
+        if (
+          previousAssistantMessageId === canonicalAssistantMessageId ||
+          !bufferedDeltasByChatKey.has(chatKey)
+        ) {
+          return;
+        }
+        const messageDeltas = bufferedDeltasByChatKey.get(chatKey)!;
+        const previousDelta = messageDeltas.get(previousAssistantMessageId);
+        if (previousDelta === undefined) {
+          return;
+        }
+        messageDeltas.delete(previousAssistantMessageId);
+        messageDeltas.set(
+          canonicalAssistantMessageId,
+          `${messageDeltas.get(canonicalAssistantMessageId) ?? ""}${previousDelta}`,
+        );
+      },
     };
   }
 
-  function createReasoningDeltaBuffer() {
+  function createReasoningDeltaBuffer(
+    canWrite: (chatKey: string) => boolean = () => true,
+    canFlush: (chatKey: string, assistantMessageId: string) => boolean =
+      () => true,
+  ) {
     const bufferedDeltasByChatKey = new Map<
       string,
       Map<string, { delta: string; startedAtMs: number }>
@@ -5750,9 +5802,20 @@ export function App() {
       bufferedDeltasByChatKey.clear();
 
       for (const [chatKey, messageDeltas] of bufferedDeltas) {
+        if (!canWrite(chatKey)) {
+          continue;
+        }
+        const deferredDeltas = new Map<
+          string,
+          { delta: string; startedAtMs: number }
+        >();
         setMessagesForChatKey(chatKey, (current) => {
           let next = current;
           for (const [assistantMessageId, bufferedDelta] of messageDeltas) {
+            if (!canFlush(chatKey, assistantMessageId)) {
+              deferredDeltas.set(assistantMessageId, bufferedDelta);
+              continue;
+            }
             next = appendBufferedReasoningDelta(
               next,
               assistantMessageId,
@@ -5762,6 +5825,9 @@ export function App() {
           }
           return next;
         });
+        if (deferredDeltas.size) {
+          bufferedDeltasByChatKey.set(chatKey, deferredDeltas);
+        }
       }
     };
 
@@ -5792,10 +5858,38 @@ export function App() {
           flush();
         }, STREAM_DELTA_FLUSH_MS);
       },
+      remapAssistantMessageId(
+        chatKey: string,
+        previousAssistantMessageId: string,
+        canonicalAssistantMessageId: string,
+      ) {
+        if (
+          previousAssistantMessageId === canonicalAssistantMessageId ||
+          !bufferedDeltasByChatKey.has(chatKey)
+        ) {
+          return;
+        }
+        const messageDeltas = bufferedDeltasByChatKey.get(chatKey)!;
+        const previousDelta = messageDeltas.get(previousAssistantMessageId);
+        if (previousDelta === undefined) {
+          return;
+        }
+        messageDeltas.delete(previousAssistantMessageId);
+        const canonicalDelta = messageDeltas.get(canonicalAssistantMessageId);
+        messageDeltas.set(canonicalAssistantMessageId, {
+          delta: `${canonicalDelta?.delta ?? ""}${previousDelta.delta}`,
+          startedAtMs:
+            canonicalDelta?.startedAtMs ?? previousDelta.startedAtMs,
+        });
+      },
     };
   }
 
-  function createToolOutputDeltaBuffer() {
+  function createToolOutputDeltaBuffer(
+    canWrite: (chatKey: string) => boolean = () => true,
+    canFlush: (chatKey: string, assistantMessageId: string) => boolean =
+      () => true,
+  ) {
     const bufferedDeltasByChatKey = new Map<
       string,
       Map<string, BufferedToolOutputDelta>
@@ -5821,12 +5915,28 @@ export function App() {
       bufferedDeltasByChatKey.clear();
 
       for (const [chatKey, toolDeltas] of bufferedDeltas) {
+        if (!canWrite(chatKey)) {
+          continue;
+        }
+        const deferredDeltas = new Map<string, BufferedToolOutputDelta>();
         setMessagesForChatKey(chatKey, (current) =>
           appendBufferedToolOutputDeltas(
             current,
-            Array.from(toolDeltas.values()),
+            Array.from(toolDeltas.values()).filter((delta) => {
+              if (canFlush(chatKey, delta.assistantMessageId)) {
+                return true;
+              }
+              deferredDeltas.set(
+                `${delta.toolCallId}\u0000${delta.stream}`,
+                delta,
+              );
+              return false;
+            }),
           ),
         );
+        if (deferredDeltas.size) {
+          bufferedDeltasByChatKey.set(chatKey, deferredDeltas);
+        }
       }
     };
 
@@ -5856,6 +5966,27 @@ export function App() {
           flushTimer = null;
           flush();
         }, STREAM_DELTA_FLUSH_MS);
+      },
+      remapAssistantMessageId(
+        chatKey: string,
+        previousAssistantMessageId: string,
+        canonicalAssistantMessageId: string,
+      ) {
+        if (
+          previousAssistantMessageId === canonicalAssistantMessageId ||
+          !bufferedDeltasByChatKey.has(chatKey)
+        ) {
+          return;
+        }
+        const toolDeltas = bufferedDeltasByChatKey.get(chatKey)!;
+        for (const [key, delta] of toolDeltas) {
+          if (delta.assistantMessageId === previousAssistantMessageId) {
+            toolDeltas.set(key, {
+              ...delta,
+              assistantMessageId: canonicalAssistantMessageId,
+            });
+          }
+        }
       },
     };
   }
@@ -6130,11 +6261,65 @@ export function App() {
 
     return {
       acceptingGuidance: runInfo.acceptingGuidance,
+      assistantMessageId: runInfo.assistantMessageId ?? null,
+      assistantSequence: runInfo.assistantSequence ?? null,
       chatId: runInfo.chatId,
       lastSequence: runInfo.lastSequence ?? null,
+      queuedUserMessageId: runInfo.queuedUserMessageId ?? null,
       runId: runInfo.runId,
       workspaceId: runInfo.workspaceId,
     };
+  }
+
+  function claimChatStreamSession(
+    chatKey: string,
+    runId: string | null,
+    abortController: AbortController,
+    options: { reuseSameRun: boolean },
+  ): ChatStreamSession | null {
+    const existing = chatStreamSessionsByChatKeyRef.current.get(chatKey);
+    if (
+      options.reuseSameRun &&
+      existing?.runId === runId &&
+      !existing.abortController.signal.aborted
+    ) {
+      return null;
+    }
+
+    // Invalidate before aborting: an already-buffered reader callback is allowed
+    // to run after abort(), but it can no longer own state.
+    existing?.abortController.abort();
+    const session: ChatStreamSession = {
+      abortController,
+      assistantMessageId: null,
+      epoch: ++chatStreamEpochRef.current,
+      lastSequence: null,
+      runId,
+    };
+    chatStreamSessionsByChatKeyRef.current.set(chatKey, session);
+    return session;
+  }
+
+  function isCurrentChatStreamSession(
+    chatKey: string,
+    session: ChatStreamSession,
+  ) {
+    return chatStreamSessionsByChatKeyRef.current.get(chatKey) === session;
+  }
+
+  function releaseChatStreamSession(
+    chatKey: string,
+    session: ChatStreamSession,
+  ) {
+    if (isCurrentChatStreamSession(chatKey, session)) {
+      chatStreamSessionsByChatKeyRef.current.delete(chatKey);
+    }
+  }
+
+  function invalidateChatStreamSession(chatKey: string) {
+    const session = chatStreamSessionsByChatKeyRef.current.get(chatKey);
+    chatStreamSessionsByChatKeyRef.current.delete(chatKey);
+    session?.abortController.abort();
   }
 
   function recoverActiveChatStreams(reason: "online" | "visible") {
@@ -6735,7 +6920,11 @@ export function App() {
     });
   }
 
-  async function loadChatMessages(workspaceId: string, chatId: string) {
+  async function loadChatMessages(
+    workspaceId: string,
+    chatId: string,
+    expectedStreamSession?: ChatStreamSession,
+  ) {
     setError(null);
     const chatKey = chatRunKey(workspaceId, chatId);
     const existingController = loadingChatControllersRef.current.get(chatKey);
@@ -6757,7 +6946,11 @@ export function App() {
         { signal: controller.signal },
       );
       // Drop superseded loads for this chatKey before any cache/state mutation.
-      if (loadingChatControllersRef.current.get(chatKey) !== controller) {
+      if (
+        loadingChatControllersRef.current.get(chatKey) !== controller ||
+        (expectedStreamSession &&
+          !isCurrentChatStreamSession(chatKey, expectedStreamSession))
+      ) {
         return;
       }
       const normalizedMessages = expandMessagesWithUserInterruptions(
@@ -6828,7 +7021,11 @@ export function App() {
         !cacheWasTrimmed
           ? existingPagination
           : serverPagination;
-      if (loadingChatControllersRef.current.get(chatKey) !== controller) {
+      if (
+        loadingChatControllersRef.current.get(chatKey) !== controller ||
+        (expectedStreamSession &&
+          !isCurrentChatStreamSession(chatKey, expectedStreamSession))
+      ) {
         return;
       }
       updateOpenChatTabTitle(workspaceId, chatId, data.chat?.title ?? null);
@@ -6886,7 +7083,9 @@ export function App() {
         if (!hadCachedMessagesBeforeLoad) {
           setIsPlanModeEnabled(planModeFromMessages);
           applyComposerModelForPlanMode(planModeFromMessages);
-          setSelectedLatencyMode(resolveCommittedLatencyModeForChatKey(chatKey));
+          setSelectedLatencyMode(
+            resolveCommittedLatencyModeForChatKey(chatKey),
+          );
         }
       }
       if (activeRun) {
@@ -6900,6 +7099,8 @@ export function App() {
       if (
         loadingChatControllersRef.current.get(chatKey) === controller &&
         activeChatKeyRef.current === chatKey &&
+        (!expectedStreamSession ||
+          isCurrentChatStreamSession(chatKey, expectedStreamSession)) &&
         !isAbortError(requestError)
       ) {
         setError(errorMessage(requestError));
@@ -9845,6 +10046,20 @@ export function App() {
       }
     }
 
+    const modelId = selectedModelIdRef.current;
+    const providerId = selectedProviderIdRef.current;
+    if (runInfo?.chatId && modelId && providerId) {
+      void refreshContextUsage({
+        chatId: runInfo.chatId,
+        modelId,
+        providerId,
+        skillIds: [],
+        thinkingLevel: selectedThinkingLevelRef.current,
+        workspaceId: runInfo.workspaceId,
+      });
+    }
+
+    invalidateChatStreamSession(currentChatKey);
     activeRunAbortByChatKeyRef.current.get(currentChatKey)?.abort();
     setChatRunning(currentChatKey, false);
     setActiveRunInfoForChatKey(currentChatKey, null);
@@ -10135,19 +10350,27 @@ export function App() {
       );
       return;
     }
-    const existingAbortController =
-      activeRunAbortByChatKeyRef.current.get(chatKey);
-    if (existingAbortController) {
-      const existingRunId = activeRunInfoByChatKeyRef.current[chatKey]?.runId;
-      if (existingRunId === activeRun.runId && !isReconnect) {
-        return;
-      }
-      existingAbortController.abort();
-    }
-
     const abortController = new AbortController();
-    let assistantMessageId = `active-assistant-${activeRun.runId}`;
-    const placeholderAssistantMessageId = assistantMessageId;
+    const session = claimChatStreamSession(
+      chatKey,
+      activeRun.runId,
+      abortController,
+      {
+        // A live subscription for the same durable run already owns the UI. A
+        // reconnect is only created after its previous owner has released.
+        reuseSameRun: true,
+      },
+    );
+    if (!session) {
+      return;
+    }
+    session.assistantMessageId = activeRun.assistantMessageId ?? null;
+    const ownsSession = () => isCurrentChatStreamSession(chatKey, session);
+    const canFlushBufferedDelta = (
+      _chatKey: string,
+      assistantMessageId: string,
+    ) => ownsSession() && Boolean(assistantMessageId);
+    let assistantMessageId = activeRun.assistantMessageId ?? "";
     let currentAssistantMessageId = assistantMessageId;
     // After guidance, the backend keeps emitting events under the durable
     // interrupted assistant id. Map that id to the latest visible bubble so
@@ -10160,15 +10383,47 @@ export function App() {
     let lastLiveContextUsageRefreshAtMs = Date.now();
     let hasGuidanceTurns = false;
     let terminalContextUsageRefreshRequested = false;
-    const textDeltaBuffer = createTextDeltaBuffer();
-    const reasoningDeltaBuffer = createReasoningDeltaBuffer();
-    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
+    const textDeltaBuffer = createTextDeltaBuffer(
+      () => ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const reasoningDeltaBuffer = createReasoningDeltaBuffer(() =>
+      ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer(() =>
+      ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const remapBufferedAssistantMessageId = (
+      previousAssistantMessageId: string,
+      canonicalAssistantMessageId: string,
+    ) => {
+      textDeltaBuffer.remapAssistantMessageId(
+        chatKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+      reasoningDeltaBuffer.remapAssistantMessageId(
+        chatKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+      toolOutputDeltaBuffer.remapAssistantMessageId(
+        chatKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+    };
     const flushStreamDeltaBuffers = () => {
       textDeltaBuffer.flush();
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
     const refreshRunContextUsage = (): boolean => {
+      if (!ownsSession()) {
+        return false;
+      }
       const modelId = selectedModelIdRef.current;
       const providerId = selectedProviderIdRef.current;
       if (!modelId || !providerId) {
@@ -10226,6 +10481,9 @@ export function App() {
       nextAssistantMessageId: string,
       memoriesUsed: ChatMemoryUsedSummary[] = [],
     ) => {
+      if (!ownsSession() || !nextAssistantMessageId) {
+        return;
+      }
       setMessagesForChatKey(chatKey, (current) => {
         if (current.some((message) => message.id === nextAssistantMessageId)) {
           return current.map((message) =>
@@ -10251,6 +10509,9 @@ export function App() {
     const finishStreamingAssistantMessage = (
       finishedAssistantMessageId: string,
     ) => {
+      if (!ownsSession() || !finishedAssistantMessageId) {
+        return;
+      }
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) =>
           message.role === "assistant" &&
@@ -10290,6 +10551,9 @@ export function App() {
       null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
+      if (!ownsSession()) {
+        return;
+      }
       setMessagesForChatKey(chatKey, (current) =>
         current.map((message) =>
           isCurrentAssistantMessage(message) && message.status === "streaming"
@@ -10374,10 +10638,39 @@ export function App() {
       ) {
         return currentAssistantMessageId;
       }
-      return eventAssistantMessageId ?? currentAssistantMessageId;
+      if (!currentAssistantMessageId && eventAssistantMessageId) {
+        remapBufferedAssistantMessageId("", eventAssistantMessageId);
+        assistantMessageId = eventAssistantMessageId;
+        currentAssistantMessageId = eventAssistantMessageId;
+        session.assistantMessageId = eventAssistantMessageId;
+        return eventAssistantMessageId;
+      }
+      if (
+        eventAssistantMessageId &&
+        currentAssistantMessageId &&
+        eventAssistantMessageId !== currentAssistantMessageId
+      ) {
+        console.warn(
+          "[chat-stream] event used a different assistant identity; reloading",
+          {
+            chatId: activeRun.chatId,
+            expectedAssistantMessageId: currentAssistantMessageId,
+            receivedAssistantMessageId: eventAssistantMessageId,
+            runId: activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          },
+        );
+        void loadChatMessages(
+          activeRun.workspaceId,
+          activeRun.chatId,
+          session,
+        );
+      }
+      return currentAssistantMessageId;
     };
 
     let lastProcessedSequence = activeRun.lastSequence ?? -1;
+    session.lastSequence = activeRun.lastSequence ?? null;
     const lastSequenceForState = () =>
       lastProcessedSequence >= 0 ? lastProcessedSequence : null;
     const activeRunWithCurrentSequence = (): ActiveChatRunSummary => ({
@@ -10389,6 +10682,7 @@ export function App() {
         return;
       }
       lastProcessedSequence = sequence;
+      session.lastSequence = sequence;
       const currentRunInfo = activeRunInfoByChatKeyRef.current[chatKey];
       if (currentRunInfo?.runId === activeRun.runId) {
         setActiveRunInfoForChatKey(chatKey, {
@@ -10416,9 +10710,12 @@ export function App() {
     setChatRunFailed(chatKey, false);
     setActiveRunInfoForChatKey(chatKey, {
       acceptingGuidance: activeRun.acceptingGuidance,
+      assistantMessageId: activeRun.assistantMessageId ?? null,
+      assistantSequence: activeRun.assistantSequence ?? null,
       chatId: activeRun.chatId,
       chatKey,
       lastSequence: lastSequenceForState(),
+      queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
       runId: activeRun.runId,
       workspaceId: activeRun.workspaceId,
     });
@@ -10456,7 +10753,11 @@ export function App() {
             activeRun.workspaceId,
             activeRun.chatId,
           );
-          await loadChatMessages(activeRun.workspaceId, activeRun.chatId);
+          await loadChatMessages(
+            activeRun.workspaceId,
+            activeRun.chatId,
+            session,
+          );
           return;
         }
         console.debug(
@@ -10474,6 +10775,9 @@ export function App() {
       await readChatStream(
         response,
         (streamEvent, meta) => {
+          if (!ownsSession()) {
+            return;
+          }
           const eventSequence = meta.id === null ? null : Number(meta.id);
           updateLastProcessedSequence(
             Number.isFinite(eventSequence) ? eventSequence : null,
@@ -10497,16 +10801,41 @@ export function App() {
               return;
             }
             const previousAssistantMessageId = currentAssistantMessageId;
-            const startsNewAssistantBubble =
-              previousAssistantMessageId !== streamEvent.assistantMessageId &&
-              previousAssistantMessageId !== placeholderAssistantMessageId;
+            if (
+              previousAssistantMessageId &&
+              previousAssistantMessageId !== streamEvent.assistantMessageId
+            ) {
+              console.warn(
+                "[chat-stream] active run changed durable assistant identity; reloading",
+                {
+                  chatId: activeRun.chatId,
+                  expectedAssistantMessageId: previousAssistantMessageId,
+                  receivedAssistantMessageId: streamEvent.assistantMessageId,
+                  runId: activeRun.runId,
+                  workspaceId: activeRun.workspaceId,
+                },
+              );
+              void loadChatMessages(
+                activeRun.workspaceId,
+                activeRun.chatId,
+                session,
+              );
+              return;
+            }
+            remapBufferedAssistantMessageId(
+              previousAssistantMessageId,
+              streamEvent.assistantMessageId,
+            );
             assistantMessageId = streamEvent.assistantMessageId;
             currentAssistantMessageId = streamEvent.assistantMessageId;
-            if (startsNewAssistantBubble) {
-              finishStreamingAssistantMessage(previousAssistantMessageId);
-            }
+            session.assistantMessageId = streamEvent.assistantMessageId;
             setMessagesForChatKey(chatKey, (current) => {
-              const existing = current.find(
+              const canonical = canonicalizeAssistantMessage(
+                current,
+                streamEvent.assistantMessageId,
+                [previousAssistantMessageId, activeRun.assistantMessageId],
+              );
+              const existing = canonical.find(
                 (message) =>
                   message.role === "assistant" &&
                   message.id === streamEvent.assistantMessageId,
@@ -10517,9 +10846,9 @@ export function App() {
                 ),
               );
               if (!existing) {
-                return current;
+                return canonical;
               }
-              return current.map((message) =>
+              return canonical.map((message) =>
                 message.role === "assistant" &&
                 message.id === streamEvent.assistantMessageId
                   ? mergeAssistantMessageOnStreamStart(
@@ -10538,9 +10867,11 @@ export function App() {
             setChatRunning(chatKey, true);
             setActiveRunInfoForChatKey(chatKey, {
               acceptingGuidance: true,
+              assistantMessageId: streamEvent.assistantMessageId,
               chatId: streamEvent.chatId,
               chatKey,
               lastSequence: lastSequenceForState(),
+              queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
               runId: activeRun.runId,
               workspaceId: activeRun.workspaceId,
             });
@@ -10631,9 +10962,12 @@ export function App() {
             });
             setActiveRunInfoForChatKey(chatKey, {
               acceptingGuidance: true,
+              assistantMessageId: session.assistantMessageId,
+              assistantSequence: activeRun.assistantSequence ?? null,
               chatId: activeRun.chatId,
               chatKey,
               lastSequence: lastSequenceForState(),
+              queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
               runId: activeRun.runId,
               workspaceId: activeRun.workspaceId,
             });
@@ -10698,6 +11032,9 @@ export function App() {
                 ? streamEvent.usage
                 : null;
             deferStreamAuxiliaryUpdate(() => {
+              if (!ownsSession()) {
+                return;
+              }
               updateLiveChatStatistics(chatKey, {
                 modelId: selectedModelIdRef.current,
                 providerId: selectedProviderIdRef.current,
@@ -10924,6 +11261,9 @@ export function App() {
               );
             }
             deferStreamAuxiliaryUpdate(() => {
+              if (!ownsSession()) {
+                return;
+              }
               updateLiveChatStatistics(chatKey, {
                 codeChangeStats: streamEvent.codeChangeStats,
                 modelId: selectedModelIdRef.current,
@@ -11053,8 +11393,13 @@ export function App() {
         { signal: abortController.signal },
       );
 
-      await refreshWorkspaces();
+      if (ownsSession()) {
+        await refreshWorkspaces();
+      }
     } catch (requestError) {
+      if (!ownsSession()) {
+        return;
+      }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
@@ -11089,6 +11434,9 @@ export function App() {
         setError(errorMessage(requestError));
       }
     } finally {
+      if (!ownsSession()) {
+        return;
+      }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
@@ -11098,12 +11446,16 @@ export function App() {
       if (activeRunAbortByChatKeyRef.current.get(chatKey) === abortController) {
         activeRunAbortByChatKeyRef.current.delete(chatKey);
         if (shouldReconnect) {
+          releaseChatStreamSession(chatKey, session);
           setChatRunning(chatKey, true);
           setActiveRunInfoForChatKey(chatKey, {
             acceptingGuidance: activeRun.acceptingGuidance,
+            assistantMessageId: session.assistantMessageId,
+            assistantSequence: activeRun.assistantSequence ?? null,
             chatId: activeRun.chatId,
             chatKey,
             lastSequence: lastSequenceForState(),
+            queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
             runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
           });
@@ -11115,6 +11467,7 @@ export function App() {
             activeRun.workspaceId,
             activeRun.chatId,
           );
+          releaseChatStreamSession(chatKey, session);
         }
       }
     }
@@ -11217,16 +11570,61 @@ export function App() {
     let activeRunId: string | null = null;
     let terminalContextUsageRefreshRequested = false;
     const abortController = new AbortController();
-    const textDeltaBuffer = createTextDeltaBuffer();
-    const reasoningDeltaBuffer = createReasoningDeltaBuffer();
-    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer();
+    const session = claimChatStreamSession(
+      runMessagesKey,
+      null,
+      abortController,
+      { reuseSameRun: false },
+    );
+    if (!session) {
+      throw new Error("failed to claim chat stream session");
+    }
+    session.assistantMessageId = localAssistantId;
+    const ownsSession = () =>
+      isCurrentChatStreamSession(runMessagesKey, session);
+    const canFlushBufferedDelta = (
+      _chatKey: string,
+      assistantMessageId: string,
+    ) => ownsSession() && Boolean(assistantMessageId);
+    const textDeltaBuffer = createTextDeltaBuffer(
+      () => ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const reasoningDeltaBuffer = createReasoningDeltaBuffer(() =>
+      ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const toolOutputDeltaBuffer = createToolOutputDeltaBuffer(() =>
+      ownsSession(),
+      canFlushBufferedDelta,
+    );
+    const remapBufferedAssistantMessageId = (
+      previousAssistantMessageId: string,
+      canonicalAssistantMessageId: string,
+    ) => {
+      textDeltaBuffer.remapAssistantMessageId(
+        runMessagesKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+      reasoningDeltaBuffer.remapAssistantMessageId(
+        runMessagesKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+      toolOutputDeltaBuffer.remapAssistantMessageId(
+        runMessagesKey,
+        previousAssistantMessageId,
+        canonicalAssistantMessageId,
+      );
+    };
     const flushStreamDeltaBuffers = () => {
       textDeltaBuffer.flush();
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
     const refreshRunContextUsage = (): boolean => {
-      if (!requestChatId) {
+      if (!ownsSession() || !requestChatId) {
         return false;
       }
 
@@ -11395,6 +11793,9 @@ export function App() {
       nextAssistantMessageId: string,
       memoriesUsed: ChatMemoryUsedSummary[] = [],
     ) => {
+      if (!ownsSession()) {
+        return;
+      }
       setMessagesForChatKey(runMessagesKey, (current) => {
         if (current.some((message) => message.id === nextAssistantMessageId)) {
           return current.map((message) =>
@@ -11420,6 +11821,9 @@ export function App() {
     const finishStreamingAssistantMessage = (
       finishedAssistantMessageId: string,
     ) => {
+      if (!ownsSession()) {
+        return;
+      }
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) =>
           message.role === "assistant" &&
@@ -11474,6 +11878,9 @@ export function App() {
       null;
     const streamAttemptSnapshots = new Map<string, StreamAttemptSnapshot>();
     const updateLiveReasoningDuration = (startedAtMs: number) => {
+      if (!ownsSession()) {
+        return;
+      }
       setMessagesForChatKey(runMessagesKey, (current) =>
         current.map((message) =>
           isCurrentAssistantMessage(message) && message.status === "streaming"
@@ -11574,6 +11981,9 @@ export function App() {
       }
 
       await readChatStream(response, (streamEvent) => {
+        if (!ownsSession()) {
+          return;
+        }
         if (streamEvent.type !== "textDelta") {
           textDeltaBuffer.flush();
         }
@@ -11590,11 +12000,13 @@ export function App() {
 
         if (streamEvent.type === "start") {
           const previousAssistantMessageId = currentAssistantMessageId;
-          const startsNewAssistantBubble =
-            previousAssistantMessageId !== streamEvent.assistantMessageId &&
-            previousAssistantMessageId !== localAssistantId;
+          remapBufferedAssistantMessageId(
+            previousAssistantMessageId,
+            streamEvent.assistantMessageId,
+          );
           assistantMessageId = streamEvent.assistantMessageId;
           currentAssistantMessageId = streamEvent.assistantMessageId;
+          session.assistantMessageId = streamEvent.assistantMessageId;
           requestChatId = streamEvent.chatId;
           currentRunningChatKey = chatRunKey(
             request.workspaceId,
@@ -11609,6 +12021,7 @@ export function App() {
             return;
           }
           activeRunId = startedRunId;
+          session.runId = startedRunId;
           setChatRunFailed(currentRunningChatKey, false);
           if (pendingChatId) {
             replacePendingChatTab(
@@ -11627,6 +12040,21 @@ export function App() {
           }
 
           if (runMessagesKey !== currentRunningChatKey) {
+            if (
+              chatStreamSessionsByChatKeyRef.current.get(runMessagesKey) ===
+              session
+            ) {
+              const replacingSession =
+                chatStreamSessionsByChatKeyRef.current.get(
+                  currentRunningChatKey,
+                );
+              replacingSession?.abortController.abort();
+              chatStreamSessionsByChatKeyRef.current.delete(runMessagesKey);
+              chatStreamSessionsByChatKeyRef.current.set(
+                currentRunningChatKey,
+                session,
+              );
+            }
             setChatRunning(runMessagesKey, false);
             setActiveRunInfoForChatKey(runMessagesKey, null);
             if (
@@ -11677,6 +12105,41 @@ export function App() {
               runMessagesKey,
               currentRunningChatKey,
               (current) =>
+                canonicalizeAssistantMessage(
+                  current.map((message) => {
+                    if (message.id === localUserId) {
+                      return { ...message, id: streamEvent.userMessageId };
+                    }
+
+                    if (
+                      message.role === "assistant" &&
+                      message.id === localAssistantId
+                    ) {
+                      return {
+                        ...message,
+                        id: streamEvent.assistantMessageId,
+                        memoriesUsed: streamEvent.memoriesUsed,
+                      };
+                    }
+
+                    return message;
+                  }),
+                  streamEvent.assistantMessageId,
+                  [localAssistantId, previousAssistantMessageId],
+                ),
+            );
+
+            runMessagesKey = currentRunningChatKey;
+          } else {
+            const liveIds = liveStreamAssistantIdsByChatKeyRef.current.get(
+              currentRunningChatKey,
+            );
+            if (liveIds?.has(localAssistantId)) {
+              liveIds.delete(localAssistantId);
+              liveIds.add(streamEvent.assistantMessageId);
+            }
+            setMessagesForChatKey(currentRunningChatKey, (current) =>
+              canonicalizeAssistantMessage(
                 current.map((message) => {
                   if (message.id === localUserId) {
                     return { ...message, id: streamEvent.userMessageId };
@@ -11695,40 +12158,10 @@ export function App() {
 
                   return message;
                 }),
+                streamEvent.assistantMessageId,
+                [localAssistantId, previousAssistantMessageId],
+              ),
             );
-
-            runMessagesKey = currentRunningChatKey;
-          } else {
-            const liveIds = liveStreamAssistantIdsByChatKeyRef.current.get(
-              currentRunningChatKey,
-            );
-            if (liveIds?.has(localAssistantId)) {
-              liveIds.delete(localAssistantId);
-              liveIds.add(streamEvent.assistantMessageId);
-            }
-            setMessagesForChatKey(currentRunningChatKey, (current) =>
-              current.map((message) => {
-                if (message.id === localUserId) {
-                  return { ...message, id: streamEvent.userMessageId };
-                }
-
-                if (
-                  message.role === "assistant" &&
-                  message.id === localAssistantId
-                ) {
-                  return {
-                    ...message,
-                    id: streamEvent.assistantMessageId,
-                    memoriesUsed: streamEvent.memoriesUsed,
-                  };
-                }
-
-                return message;
-              }),
-            );
-          }
-          if (startsNewAssistantBubble) {
-            finishStreamingAssistantMessage(previousAssistantMessageId);
           }
           ensureStreamingAssistantMessage(
             streamEvent.assistantMessageId,
@@ -11737,8 +12170,10 @@ export function App() {
           setChatRunning(currentRunningChatKey, true);
           setActiveRunInfoForChatKey(currentRunningChatKey, {
             acceptingGuidance: activeRunId !== null,
+            assistantMessageId: streamEvent.assistantMessageId,
             chatId: streamEvent.chatId,
             chatKey: currentRunningChatKey,
+            queuedUserMessageId: request.queuedUserMessageId ?? null,
             runId: activeRunId,
             workspaceId: request.workspaceId,
           });
@@ -11846,8 +12281,10 @@ export function App() {
           });
           setActiveRunInfoForChatKey(runMessagesKey, {
             acceptingGuidance: activeRunId !== null,
+            assistantMessageId: session.assistantMessageId,
             chatId: requestChatId,
             chatKey: runMessagesKey,
+            queuedUserMessageId: request.queuedUserMessageId ?? null,
             runId: activeRunId,
             workspaceId: request.workspaceId,
           });
@@ -11906,6 +12343,9 @@ export function App() {
               ? streamEvent.usage
               : null;
           deferStreamAuxiliaryUpdate(() => {
+            if (!ownsSession()) {
+              return;
+            }
             updateLiveChatStatistics(runMessagesKey, {
               modelId: request.modelId,
               providerId: request.providerId,
@@ -12134,6 +12574,9 @@ export function App() {
             );
           }
           deferStreamAuxiliaryUpdate(() => {
+            if (!ownsSession()) {
+              return;
+            }
             updateLiveChatStatistics(runMessagesKey, {
               codeChangeStats: streamEvent.codeChangeStats,
               modelId: request.modelId,
@@ -12252,9 +12695,14 @@ export function App() {
         }
       });
 
-      await refreshWorkspaces();
-      runSucceeded = !streamHadError;
+      if (ownsSession()) {
+        await refreshWorkspaces();
+        runSucceeded = !streamHadError;
+      }
     } catch (requestError) {
+      if (!ownsSession()) {
+        return null;
+      }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
@@ -12283,6 +12731,9 @@ export function App() {
         ),
       );
     } finally {
+      if (!ownsSession()) {
+        return null;
+      }
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
@@ -12298,6 +12749,7 @@ export function App() {
           request.workspaceId,
           requestChatId,
         );
+        releaseChatStreamSession(currentRunningChatKey, session);
       }
     }
 
@@ -16006,8 +16458,8 @@ function contextCompressionPartsMatch(
   if (currentCompressionId || nextCompressionId) {
     return Boolean(
       currentCompressionId &&
-        nextCompressionId &&
-        currentCompressionId === nextCompressionId,
+      nextCompressionId &&
+      currentCompressionId === nextCompressionId,
     );
   }
   return (
@@ -16301,6 +16753,139 @@ function isEmptyStreamingAssistantMessage(message: ShellMessage) {
     message.parts.length === 0 &&
     message.toolCalls.length === 0
   );
+}
+
+type ChatStreamSession = {
+  runId: string | null;
+  epoch: number;
+  abortController: AbortController;
+  lastSequence: number | null;
+  assistantMessageId: string | null;
+};
+
+/**
+ * Moves local/legacy stream aliases onto the server's durable assistant id in a
+ * single state update. A reconnect can observe both forms briefly; rendering
+ * either as independent messages is what produces duplicate assistant bubbles.
+ */
+function canonicalizeAssistantMessage(
+  current: ShellMessage[],
+  canonicalId: string,
+  aliases: Iterable<string | null | undefined>,
+): ShellMessage[] {
+  const aliasIds = new Set<string>([canonicalId]);
+  for (const alias of aliases) {
+    if (alias) {
+      aliasIds.add(alias);
+    }
+  }
+
+  const matching = current.filter(
+    (message) => message.role === "assistant" && aliasIds.has(message.id),
+  );
+  if (!matching.length) {
+    return current;
+  }
+
+  const canonical =
+    matching.find((message) => message.id === canonicalId) ?? matching[0];
+  const merged = matching.reduce<ShellMessage>((result, message) => {
+    if (message === canonical) {
+      return result;
+    }
+    const content = mergeAssistantStreamText(result.content, message.content);
+    const reasoning = mergeAssistantStreamText(
+      result.reasoning ?? "",
+      message.reasoning ?? "",
+    );
+    const toolCallsById = new Map(
+      result.toolCalls.map((call) => [call.id, call]),
+    );
+    for (const toolCall of message.toolCalls) {
+      toolCallsById.set(toolCall.id, toolCall);
+    }
+    return {
+      ...result,
+      content,
+      extractedMemories:
+        result.extractedMemories.length >= message.extractedMemories.length
+          ? result.extractedMemories
+          : message.extractedMemories,
+      memoriesUsed:
+        result.memoriesUsed.length >= message.memoriesUsed.length
+          ? result.memoriesUsed
+          : message.memoriesUsed,
+      metrics: result.metrics ?? message.metrics,
+      parts: mergeAssistantMessageParts(result.parts, message.parts),
+      reasoning: reasoning || null,
+      status:
+        result.status === "streaming" || message.status === "streaming"
+          ? "streaming"
+          : (result.status ?? message.status),
+      toolCalls: Array.from(toolCallsById.values()),
+    };
+  }, canonical);
+  const canonicalMessage = { ...merged, id: canonicalId };
+  const firstMatchingIndex = current.findIndex((message) =>
+    matching.includes(message),
+  );
+  const next = current.filter((message) => !matching.includes(message));
+  next.splice(firstMatchingIndex, 0, canonicalMessage);
+  return next;
+}
+
+function mergeAssistantStreamText(current: string, next: string) {
+  if (!current) {
+    return next;
+  }
+  if (!next || current === next || current.includes(next)) {
+    return current;
+  }
+  if (next.includes(current)) {
+    return next;
+  }
+  return `${current}${next}`;
+}
+
+/**
+ * Keep every distinct part while collapsing the shared suffix/prefix produced
+ * when a temporary local assistant and its durable server counterpart overlap.
+ * Choosing the longer array is unsafe: two aliases can contain equally many,
+ * but different, text, reasoning, or tool parts.
+ */
+function mergeAssistantMessageParts(
+  current: ChatMessagePart[],
+  next: ChatMessagePart[],
+): ChatMessagePart[] {
+  if (!current.length) {
+    return next;
+  }
+  if (!next.length) {
+    return current;
+  }
+
+  const currentSignatures = current.map(chatMessagePartSignature);
+  const nextSignatures = next.map(chatMessagePartSignature);
+  const maxOverlap = Math.min(current.length, next.length);
+  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
+    const currentOffset = current.length - overlap;
+    let matches = true;
+    for (let index = 0; index < overlap; index += 1) {
+      if (currentSignatures[currentOffset + index] !== nextSignatures[index]) {
+        matches = false;
+        break;
+      }
+    }
+    if (matches) {
+      return [...current, ...next.slice(overlap)];
+    }
+  }
+
+  return [...current, ...next];
+}
+
+function chatMessagePartSignature(part: ChatMessagePart) {
+  return JSON.stringify(part);
 }
 
 function missingFinalSuffix(current: string, next: string) {

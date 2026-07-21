@@ -2677,6 +2677,11 @@ export type ActiveRunInfo = {
   // Backend active-run registry id. Do not replace it with per-provider llmRequestId attempts.
   runId: string | null;
   chatKey: string;
+  // Durable assistant identity from the active-run owner. Optional while a
+  // local POST is still waiting for its first start event.
+  assistantMessageId?: string | null;
+  assistantSequence?: number | null;
+  queuedUserMessageId?: string | null;
   lastSequence?: number | null;
   acceptingGuidance: boolean;
 };
