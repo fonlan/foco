@@ -1476,7 +1476,7 @@ dependencies = [
 [[package]]
 name = "genai"
 version = "0.6.4"
-source = "git+https://github.com/fonlan/rust-genai.git?rev=bcd5c2e0f68793bbc1af18ffa2fa2c4792fbeeb5#bcd5c2e0f68793bbc1af18ffa2fa2c4792fbeeb5"
+source = "git+https://github.com/fonlan/rust-genai.git?rev=ed7419a1f10f532992e31f468910aadeed6daaf6#ed7419a1f10f532992e31f468910aadeed6daaf6"
 dependencies = [
  "base64",
  "bytes",
@@ -1490,6 +1490,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "sha2 0.10.9",
  "strum",
  "tokio",
  "tokio-stream",

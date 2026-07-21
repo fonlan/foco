@@ -663,6 +663,7 @@ async fn run_create_stream(
     );
 
     let mut decoder = OpenAIRespEventDecoder::from_chat_options(model, options);
+    let stream_diagnostics = capture_details.then(|| decoder.diagnostics());
     let stream_error_context = error_context.with_phase("reading provider stream");
     let turn_slot = Arc::new(tokio::sync::Mutex::new(turn));
     let halves = Arc::new(tokio::sync::Mutex::new(Some((
@@ -731,7 +732,19 @@ async fn run_create_stream(
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         let Ok(text) = std::str::from_utf8(&bytes) else {
-                            continue;
+                            decoder.record_transport_error(
+                                "received a non-UTF-8 WebSocket binary provider frame",
+                            );
+                            mark_stream_broken(&outcome);
+                            yield Err(genai::Error::WebStream {
+                                model_iden: decoder.model_iden().clone(),
+                                cause: "received a non-UTF-8 WebSocket binary provider frame".to_string(),
+                                error: Box::new(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    "WebSocket binary frame is not UTF-8",
+                                )),
+                            });
+                            break;
                         };
                         mark_previous_not_found_if_needed(&outcome, text);
                         match decoder.decode_json_to_chat_event(text) {
@@ -761,6 +774,9 @@ async fn run_create_stream(
                             }
                         };
                         if let Err(error) = send_result {
+                            decoder.record_transport_error(format!(
+                                "failed to reply to WebSocket ping: {error}"
+                            ));
                             mark_stream_broken(&outcome);
                             yield Err(genai::Error::WebStream {
                                 model_iden: decoder.model_iden().clone(),
@@ -781,6 +797,7 @@ async fn run_create_stream(
                         break;
                     }
                     Some(Err(error)) => {
+                        decoder.record_transport_error(error.to_string());
                         mark_stream_broken(&outcome);
                         yield Err(genai::Error::WebStream {
                             model_iden: decoder.model_iden().clone(),
@@ -806,6 +823,7 @@ async fn run_create_stream(
         response_head,
         saw_response_event: false,
         final_response_dump: None,
+        stream_diagnostics,
     })
 }
 

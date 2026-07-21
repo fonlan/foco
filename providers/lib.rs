@@ -1337,6 +1337,8 @@ pub struct NeutralChatStream {
     pub(crate) response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
     pub(crate) saw_response_event: bool,
     pub(crate) final_response_dump: Option<ProviderFinalResponseDump>,
+    /// Bounded OpenAI Responses decoder diagnostics, retained only for detail-enabled turns.
+    pub(crate) stream_diagnostics: Option<genai::OpenAIRespStreamDiagnostics>,
 }
 
 impl NeutralChatStream {
@@ -1346,6 +1348,13 @@ impl NeutralChatStream {
 
     pub fn final_response_dump(&self) -> Option<&ProviderFinalResponseDump> {
         self.final_response_dump.as_ref()
+    }
+
+    /// Returns the bounded OpenAI Responses stream diagnostic captured for this detail-enabled turn.
+    pub fn stream_diagnostic(&self) -> Option<genai::OpenAIRespStreamDiagnostic> {
+        self.stream_diagnostics
+            .as_ref()
+            .and_then(genai::OpenAIRespStreamDiagnostics::latest)
     }
 
     /// Observed HTTP response status from the provider Response head, if any.
@@ -1603,19 +1612,37 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
             }
         }) as genai::ResponseHeadObserver)
     };
-    let response = client
-        .exec_chat_stream_observed_with_response(
-            model,
-            chat_request,
-            Some(&options),
-            observer,
-            response_observer,
-        )
-        .await
-        .map_err(|source| ProviderRequestFailure {
-            error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
-            request_dump: take_captured_request_dump(&captured_request),
-        })?;
+    let (response, stream_diagnostics) = if capture_details {
+        let response = client
+            .exec_chat_stream_observed_with_response_and_diagnostics(
+                model,
+                chat_request,
+                Some(&options),
+                observer,
+                response_observer,
+            )
+            .await
+            .map_err(|source| ProviderRequestFailure {
+                error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
+                request_dump: take_captured_request_dump(&captured_request),
+            })?;
+        (response.response, Some(response.diagnostics))
+    } else {
+        let response = client
+            .exec_chat_stream_observed_with_response(
+                model,
+                chat_request,
+                Some(&options),
+                observer,
+                response_observer,
+            )
+            .await
+            .map_err(|source| ProviderRequestFailure {
+                error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
+                request_dump: take_captured_request_dump(&captured_request),
+            })?;
+        (response, None)
+    };
     let wire_request_dump = take_captured_request_dump(&captured_request);
 
     Ok(NeutralChatStream {
@@ -1626,6 +1653,7 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
         response_head: captured_response_head,
         saw_response_event: false,
         final_response_dump: None,
+        stream_diagnostics,
     })
 }
 
@@ -6267,6 +6295,71 @@ mod tests {
             raw_header_value(&raw, OPENAI_RESP_WS_BETA_HEADER).is_none(),
             "raw HTTP must not include OpenAI-Beta websocket header"
         );
+    }
+
+    #[tokio::test]
+    async fn openai_resp_detail_stream_exposes_failed_frame_diagnostic() {
+        let openai_responses = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
+            "event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"model\":\"fixture-responses-model\",\"error\":{\"code\":\"rate_limit\",\"type\":\"rate_limit_error\",\"message\":\"retry later\",\"param\":\"model\"}}}\n\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", openai_responses).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "capture the failed responses frame",
+        )]);
+        request.model_id = "fixture-responses-model".to_string();
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open failed OpenAI Responses stream");
+        let stream_error = loop {
+            match stream.next_event().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("expected a stream error"),
+            }
+        };
+
+        assert!(stream_error.to_string().contains("retry later"));
+        let diagnostic = stream.stream_diagnostic().expect("failed frame diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::ResponseFailed
+        );
+        assert_eq!(
+            diagnostic.transport,
+            genai::OpenAIRespStreamTransport::HttpSse
+        );
+        assert_eq!(diagnostic.event_type.as_deref(), Some("response.failed"));
+        assert_eq!(
+            diagnostic.previous_event_type.as_deref(),
+            Some("response.created")
+        );
+        assert_eq!(
+            diagnostic.provider_error.code.as_deref(),
+            Some("rate_limit")
+        );
+        assert_eq!(
+            diagnostic.provider_error.error_type.as_deref(),
+            Some("rate_limit_error")
+        );
+        assert_eq!(
+            diagnostic.provider_error.message.as_deref(),
+            Some("retry later")
+        );
+
+        let requests = fixture.await.expect("fixture task");
+        assert_eq!(requests.len(), 1);
     }
 
     #[tokio::test]
