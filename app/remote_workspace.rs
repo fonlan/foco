@@ -137,14 +137,16 @@ use crate::{
     runtime::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
-        AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
-        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
-        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
-        SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
-        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
-        open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
-        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
+        AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, BrokeredTransferFile,
+        MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionRegistry,
+        REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
+        ReasoningLoopDetector, SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent,
+        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
+        execute_tool_with_runtime, execute_web_tool, image_tool_timeout_ms,
+        materialize_brokered_image_result, materialize_brokered_web_result,
+        open_workspace_database_ordinary_with_pre_stream_retry, package_brokered_web_result_files,
+        pre_stream_failure_user_message, reasoning_loop_guard_message, run_post_tool_hooks,
+        web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -2505,15 +2507,30 @@ fn broker_tool_call_payload(payload: Value) -> BrokerToolCallPayload {
     )
 }
 
-struct BrokerImageTransferDirectory {
+struct BrokerArtifactTransferDirectory {
     path: PathBuf,
 }
 
-impl BrokerImageTransferDirectory {
-    fn create(root: &Path) -> Result<Self, io::Error> {
+impl BrokerArtifactTransferDirectory {
+    fn create(root: &Path, kind: &str) -> Result<Self, io::Error> {
+        let kind = kind
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        let kind = if kind.is_empty() {
+            "artifact".to_string()
+        } else {
+            kind
+        };
         let path = root
             .join(".foco")
-            .join("broker-image-transfer")
+            .join(format!("broker-{kind}-transfer"))
             .join(unique_id("transfer"));
         fs::create_dir_all(&path)?;
         Ok(Self { path })
@@ -2524,7 +2541,7 @@ impl BrokerImageTransferDirectory {
     }
 }
 
-impl Drop for BrokerImageTransferDirectory {
+impl Drop for BrokerArtifactTransferDirectory {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
     }
@@ -7118,22 +7135,74 @@ async fn broker_web_tool(
             return;
         }
     };
-    match execute_web_tool(
+    // Host-only temp workspace: Web provider credentials stay on the main process.
+    // Cache files are packaged and transferred to the sidecar; never expose host paths.
+    let temporary_workspace =
+        match BrokerArtifactTransferDirectory::create(&state.user_profile_dir, "web") {
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = send_broker_error(
+                    write,
+                    Some(id),
+                    "internal_error",
+                    format!("failed to create web transfer directory: {error}"),
+                )
+                .await;
+                return;
+            }
+        };
+    let result = match execute_web_tool(
         &config.web_search,
         tool_name,
         arguments,
         Duration::from_millis(timeout_ms),
-        // Phase 3: local cache path for main-process execution. SSH materialization of
-        // fullResultPath into the sidecar workspace is handled in a later phase.
-        Path::new(&state.user_profile_dir),
+        temporary_workspace.path(),
     )
     .await
     {
-        Ok(result) => {
-            send_broker_tool_execution(write, id, tool_name, result, false).await;
-        }
+        Ok(result) => result,
         Err(error) => {
             send_broker_tool_execution(write, id, tool_name, json!({ "error": error }), true).await;
+            return;
+        }
+    };
+    let transferred_files = match package_brokered_web_result_files(temporary_workspace.path(), &result)
+    {
+        Ok(files) => files,
+        Err(error) => {
+            // Do not publish success pointing at a host-only cache path.
+            send_broker_tool_execution(
+                write,
+                id,
+                tool_name,
+                json!({ "error": format!("failed to package web result cache for sidecar: {error}") }),
+                true,
+            )
+            .await;
+            return;
+        }
+    };
+    match transferred_files {
+        None => {
+            // Within soft budget: no cache file; model-facing result has no fullResultPath.
+            send_broker_tool_execution(write, id, tool_name, result, false).await;
+        }
+        Some(files) => {
+            let execution = normalize_broker_tool_execution(tool_name, result, false);
+            let response = ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id.to_string()),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "result": execution.output,
+                    "isError": execution.is_error,
+                    "files": files,
+                }),
+                timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
+            };
+            let _ = send_broker_envelope(write, &response).await;
         }
     }
 }
@@ -7159,7 +7228,10 @@ async fn broker_image_generate(
             return;
         }
     };
-    let temporary_workspace = match BrokerImageTransferDirectory::create(&state.user_profile_dir) {
+    let temporary_workspace = match BrokerArtifactTransferDirectory::create(
+        &state.user_profile_dir,
+        "image",
+    ) {
         Ok(directory) => directory,
         Err(error) => {
             let _ = send_broker_error(
@@ -13059,6 +13131,7 @@ fn remote_memory_arguments_with_scope(arguments: &Value, scope: &str) -> Result<
 
 async fn remote_sidecar_execute_memory_tool(
     state: &RemoteSidecarState,
+    tool_workspace_path: &Path,
     run_stream: &RemoteActiveRunStream,
     tool_call: &NeutralToolCall,
     context: BrokerToolContext,
@@ -13083,6 +13156,7 @@ async fn remote_sidecar_execute_memory_tool(
         if scope == "global" {
             return remote_sidecar_execute_broker_tool(
                 state,
+                tool_workspace_path,
                 run_stream,
                 tool_call,
                 "memory.global.write",
@@ -13106,6 +13180,7 @@ async fn remote_sidecar_execute_memory_tool(
         MemoryToolSearchScope::Global => {
             remote_sidecar_execute_broker_tool(
                 state,
+                tool_workspace_path,
                 run_stream,
                 tool_call,
                 "memory.global.search",
@@ -13139,6 +13214,7 @@ async fn remote_sidecar_execute_memory_tool(
             .await?;
             let (global, global_is_error) = remote_sidecar_execute_broker_tool(
                 state,
+                tool_workspace_path,
                 run_stream,
                 tool_call,
                 "memory.global.search",
@@ -13160,6 +13236,7 @@ async fn remote_sidecar_execute_memory_tool(
 
 async fn remote_sidecar_execute_broker_tool(
     state: &RemoteSidecarState,
+    tool_workspace_path: &Path,
     run_stream: &RemoteActiveRunStream,
     tool_call: &NeutralToolCall,
     method: &str,
@@ -13268,6 +13345,7 @@ async fn remote_sidecar_execute_broker_tool(
             .ok_or_else(|| "image broker response is missing transferred files".to_string())?;
         let files = serde_json::from_value::<Vec<BrokeredImageFile>>(files)
             .map_err(|source| format!("image broker response is invalid: {source}"))?;
+        // Images land in the canonical remote workspace (shared output dir contract).
         output = materialize_brokered_image_result(
             Path::new(&state.workspace_path),
             &context.chat_id,
@@ -13276,6 +13354,39 @@ async fn remote_sidecar_execute_broker_tool(
             output,
             files,
         )?;
+    }
+    if matches!(method, "web.search" | "web.fetch") && !is_error {
+        let has_full_result_path = output
+            .get("fullResultPath")
+            .and_then(Value::as_str)
+            .is_some();
+        let files_value = response.payload.get("files").cloned();
+        match (has_full_result_path, files_value) {
+            (true, Some(files)) => {
+                let files = serde_json::from_value::<Vec<BrokeredTransferFile>>(files)
+                    .map_err(|source| format!("web broker response files are invalid: {source}"))?;
+                // Cache must land in the current tool execution workspace (shared or
+                // isolated agent worktree) so subsequent read_file(fullResultPath) resolves.
+                output = materialize_brokered_web_result(tool_workspace_path, output, files)?;
+            }
+            (true, None) => {
+                return Err(
+                    "web broker response claims fullResultPath without transferred files"
+                        .to_string(),
+                );
+            }
+            (false, Some(files)) => {
+                // Host must not send files without a model-facing path.
+                let files = serde_json::from_value::<Vec<BrokeredTransferFile>>(files)
+                    .map_err(|source| format!("web broker response files are invalid: {source}"))?;
+                if !files.is_empty() {
+                    return Err(
+                        "web broker response transferred files without fullResultPath".to_string(),
+                    );
+                }
+            }
+            (false, None) => {}
+        }
     }
     let execution = normalize_broker_tool_execution(&tool_call.name, output, is_error);
     Ok((execution.output, execution.is_error))
@@ -13331,6 +13442,7 @@ async fn remote_sidecar_execute_tool_call(
         let result = if matches!(tool_call.name.as_str(), "memory_search" | "memory_write") {
             remote_sidecar_execute_memory_tool(
                 state,
+                tool_workspace_path,
                 run_stream,
                 &tool_call,
                 context,
@@ -13345,6 +13457,7 @@ async fn remote_sidecar_execute_tool_call(
             };
             remote_sidecar_execute_broker_tool(
                 state,
+                tool_workspace_path,
                 run_stream,
                 &tool_call,
                 method,
@@ -35107,12 +35220,39 @@ mod tests {
         response_type: &str,
         response_payload: Value,
     ) -> ((Value, bool, Vec<Value>, Vec<String>), ControlEnvelope) {
+        test_execute_remote_sidecar_broker_tool_at_workspace(
+            state,
+            sidecar_workspace_path(state),
+            catalog,
+            broker_rx,
+            call_id,
+            tool_name,
+            arguments,
+            response_type,
+            response_payload,
+        )
+        .await
+    }
+
+    async fn test_execute_remote_sidecar_broker_tool_at_workspace(
+        state: &RemoteSidecarState,
+        tool_workspace_path: &Path,
+        catalog: Arc<RemoteToolCatalog>,
+        broker_rx: &mut tokio::sync::broadcast::Receiver<ControlEnvelope>,
+        call_id: &str,
+        tool_name: &str,
+        arguments: Value,
+        response_type: &str,
+        response_payload: Value,
+    ) -> ((Value, bool, Vec<Value>, Vec<String>), ControlEnvelope) {
         let execution_state = state.clone();
         let call_id = call_id.to_string();
         let tool_name = tool_name.to_string();
+        let tool_workspace_path = tool_workspace_path.to_path_buf();
         let execution = tokio::spawn(async move {
-            test_execute_remote_sidecar_local_tool(
+            test_execute_remote_sidecar_local_tool_at_workspace(
                 &execution_state,
+                &tool_workspace_path,
                 &catalog,
                 &call_id,
                 &tool_name,
@@ -36203,6 +36343,338 @@ mod tests {
                 .path()
                 .join(".foco/image-gen/partial.png")
                 .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_web_transfer_materializes_only_validated_web_results() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let body = "cached line 1\ncached line 2\n";
+        let relative = ".foco/web-results/web-fetch-123-0-abcdef0123456789.txt";
+        let file_name = "web-fetch-123-0-abcdef0123456789.txt";
+        let sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let arguments = json!({ "url": "https://example.test/page", "timeoutMs": 1_000 });
+
+        let ((output, is_error, _, _), request) = test_execute_remote_sidecar_broker_tool(
+            &state,
+            catalog.clone(),
+            &mut broker_rx,
+            "call-web-valid",
+            "web_fetch",
+            arguments.clone(),
+            "response",
+            json!({
+                "status": "ok",
+                "result": {
+                    "url": "https://example.test/page",
+                    "truncated": true,
+                    "nextStartLine": 2,
+                    "fullResultPath": relative,
+                    "note": format!("cache at '{relative}'"),
+                    "text": "cached line 1",
+                },
+                "files": [{
+                    "fileName": file_name,
+                    "mimeType": "text/plain; charset=utf-8",
+                    "bytes": body.len(),
+                    "sha256": sha256,
+                    "dataBase64": BASE64_STANDARD.encode(body.as_bytes()),
+                }],
+            }),
+        )
+        .await;
+        assert!(!is_error, "{output}");
+        assert_eq!(request.method.as_deref(), Some("web.fetch"));
+        assert_eq!(output["fullResultPath"], relative);
+        assert!(
+            output["fullResultPath"]
+                .as_str()
+                .is_some_and(|path| path.starts_with(".foco/web-results/") && !path.starts_with('/')),
+            "fullResultPath must be sidecar workspace-relative: {output}"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(relative)).expect("sidecar cache"),
+            body
+        );
+
+        // Checksum mismatch: error, no partial file for a different name.
+        let ((partial_output, partial_is_error, _, _), _) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog.clone(),
+                &mut broker_rx,
+                "call-web-bad-hash",
+                "web_fetch",
+                arguments.clone(),
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "truncated": true,
+                        "nextStartLine": 1,
+                        "fullResultPath": ".foco/web-results/web-fetch-bad-0-abcdef0123456789.txt",
+                    },
+                    "files": [{
+                        "fileName": "web-fetch-bad-0-abcdef0123456789.txt",
+                        "mimeType": "text/plain; charset=utf-8",
+                        "bytes": body.len(),
+                        "sha256": "invalid",
+                        "dataBase64": BASE64_STANDARD.encode(body.as_bytes()),
+                    }],
+                }),
+            )
+            .await;
+        assert!(partial_is_error);
+        assert!(
+            partial_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("checksum")),
+            "{partial_output}"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".foco/web-results/web-fetch-bad-0-abcdef0123456789.txt")
+                .exists()
+        );
+
+        // fullResultPath without files: hard error (do not advertise missing cache).
+        let ((missing_files_output, missing_files_error, _, _), _) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog.clone(),
+                &mut broker_rx,
+                "call-web-missing-files",
+                "web_fetch",
+                arguments.clone(),
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "truncated": true,
+                        "nextStartLine": 1,
+                        "fullResultPath": ".foco/web-results/web-fetch-missing-0-abcdef0123456789.txt",
+                    },
+                }),
+            )
+            .await;
+        assert!(missing_files_error);
+        assert!(
+            missing_files_output["error"].as_str().is_some_and(|message| {
+                message.contains("without transferred files") || message.contains("fullResultPath")
+            }),
+            "{missing_files_output}"
+        );
+
+        // Host absolute path must not materialize.
+        let ((host_path_output, host_path_error, _, _), _) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog.clone(),
+                &mut broker_rx,
+                "call-web-host-path",
+                "web_fetch",
+                arguments.clone(),
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "truncated": true,
+                        "nextStartLine": 1,
+                        "fullResultPath": "/tmp/host-only/web-fetch-1-0-abcdef0123456789.txt",
+                    },
+                    "files": [{
+                        "fileName": "web-fetch-1-0-abcdef0123456789.txt",
+                        "mimeType": "text/plain; charset=utf-8",
+                        "bytes": body.len(),
+                        "sha256": format!("{:x}", Sha256::digest(body.as_bytes())),
+                        "dataBase64": BASE64_STANDARD.encode(body.as_bytes()),
+                    }],
+                }),
+            )
+            .await;
+        assert!(host_path_error);
+        assert!(
+            host_path_output["error"].as_str().is_some_and(|message| {
+                message.contains("workspace-relative") || message.contains("outside")
+            }),
+            "{host_path_output}"
+        );
+
+        // Illegal file name / wrong directory must fail.
+        let ((escape_output, escape_error, _, _), _) = test_execute_remote_sidecar_broker_tool(
+            &state,
+            catalog.clone(),
+            &mut broker_rx,
+            "call-web-escape",
+            "web_fetch",
+            arguments.clone(),
+            "response",
+            json!({
+                "status": "ok",
+                "result": {
+                    "truncated": true,
+                    "nextStartLine": 1,
+                    "fullResultPath": ".foco/image-gen/web-fetch-1-0-abcdef0123456789.txt",
+                },
+                "files": [{
+                    "fileName": "web-fetch-1-0-abcdef0123456789.txt",
+                    "mimeType": "text/plain; charset=utf-8",
+                    "bytes": body.len(),
+                    "sha256": format!("{:x}", Sha256::digest(body.as_bytes())),
+                    "dataBase64": BASE64_STANDARD.encode(body.as_bytes()),
+                }],
+            }),
+        )
+        .await;
+        assert!(escape_error);
+        assert!(
+            escape_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("outside") || message.contains("invalid")),
+            "{escape_output}"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".foco/image-gen/web-fetch-1-0-abcdef0123456789.txt")
+                .exists()
+        );
+
+        // Oversized transfer rejected.
+        let oversized_len = 2 * 1024 * 1024 + 1;
+        let ((oversize_output, oversize_error, _, _), _) =
+            test_execute_remote_sidecar_broker_tool(
+                &state,
+                catalog,
+                &mut broker_rx,
+                "call-web-oversize",
+                "web_fetch",
+                arguments,
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "truncated": true,
+                        "nextStartLine": 1,
+                        "fullResultPath": ".foco/web-results/web-fetch-over-0-abcdef0123456789.txt",
+                    },
+                    "files": [{
+                        "fileName": "web-fetch-over-0-abcdef0123456789.txt",
+                        "mimeType": "text/plain; charset=utf-8",
+                        "bytes": oversized_len,
+                        "sha256": "ab",
+                        "dataBase64": BASE64_STANDARD.encode(b"x"),
+                    }],
+                }),
+            )
+            .await;
+        assert!(oversize_error);
+        assert!(
+            oversize_output["error"]
+                .as_str()
+                .is_some_and(|message| message.contains("size") || message.contains("invalid")),
+            "{oversize_output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_web_transfer_materializes_into_tool_workspace_not_canonical() {
+        let shared = tempfile::tempdir().expect("shared workspace");
+        let tool_workspace = tempfile::tempdir().expect("isolated tool workspace");
+        let (state, mut broker_rx) =
+            test_sidecar_state(shared.path().to_string_lossy().to_string(), 1);
+        let catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+        )
+        .await;
+        let body = "isolated cache line 1\nisolated cache line 2\n";
+        let relative = ".foco/web-results/web-fetch-isolated-0-abcdef0123456789.txt";
+        let file_name = "web-fetch-isolated-0-abcdef0123456789.txt";
+        let sha256 = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let arguments = json!({ "url": "https://example.test/page", "timeoutMs": 1_000 });
+
+        let ((output, is_error, _, _), request) =
+            test_execute_remote_sidecar_broker_tool_at_workspace(
+                &state,
+                tool_workspace.path(),
+                catalog.clone(),
+                &mut broker_rx,
+                "call-web-isolated",
+                "web_fetch",
+                arguments,
+                "response",
+                json!({
+                    "status": "ok",
+                    "result": {
+                        "url": "https://example.test/page",
+                        "truncated": true,
+                        "nextStartLine": 2,
+                        "fullResultPath": relative,
+                        "note": format!("cache at '{relative}'"),
+                        "text": "isolated cache line 1",
+                    },
+                    "files": [{
+                        "fileName": file_name,
+                        "mimeType": "text/plain; charset=utf-8",
+                        "bytes": body.len(),
+                        "sha256": sha256,
+                        "dataBase64": BASE64_STANDARD.encode(body.as_bytes()),
+                    }],
+                }),
+            )
+            .await;
+
+        assert!(!is_error, "{output}");
+        assert_eq!(request.method.as_deref(), Some("web.fetch"));
+        assert_eq!(output["fullResultPath"], relative);
+        // File must land in the isolated tool workspace, not the canonical shared root.
+        assert_eq!(
+            fs::read_to_string(tool_workspace.path().join(relative)).expect("tool workspace cache"),
+            body
+        );
+        assert!(
+            !shared.path().join(relative).exists(),
+            "must not write web cache into canonical shared workspace when tool workspace differs"
+        );
+
+        // Subsequent read_file from the tool workspace must resolve fullResultPath.
+        let (read_output, read_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
+            &state,
+            tool_workspace.path(),
+            &catalog,
+            "call-read-cache",
+            "read_file",
+            json!({
+                "path": relative,
+                "startLine": 2,
+                "endLine": 2,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!read_error, "{read_output}");
+        let text = read_output["content"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("isolated cache line 2"),
+            "read_file should open fullResultPath from tool workspace: {read_output}"
         );
     }
 

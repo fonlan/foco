@@ -1,5 +1,6 @@
 mod agent_scheduler;
 mod api_audit;
+mod broker_artifacts;
 mod chat_run;
 mod code_graph;
 mod image_tools;
@@ -43,6 +44,7 @@ pub(crate) use image_tools::{
     BrokeredImageFile, execute_image_tool, image_model_available, image_tool_timeout_ms,
     is_image_tool_name, materialize_brokered_image_result,
 };
+pub(crate) use broker_artifacts::BrokeredTransferFile;
 #[cfg(all(test, windows))]
 pub(crate) use native_tools::find_system_ripgrep;
 #[cfg(test)]
@@ -92,5 +94,6 @@ pub(crate) use tool_locks::{
 };
 pub(crate) use tool_loop::ToolLoopGuard;
 pub(crate) use web_tools::{
-    execute_web_tool, is_web_tool_name, web_search_enabled, web_tool_timeout_ms,
+    execute_web_tool, is_web_tool_name, materialize_brokered_web_result,
+    package_brokered_web_result_files, web_search_enabled, web_tool_timeout_ms,
 };

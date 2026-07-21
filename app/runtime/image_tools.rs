@@ -16,12 +16,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use super::broker_artifacts::{
+    BrokeredTransferFile, MAX_BROKERED_IMAGE_FILE_BYTES, MAX_BROKERED_IMAGE_FILE_COUNT,
+    MAX_BROKERED_IMAGE_TOTAL_BYTES, atomic_write_bytes, decode_and_verify_transfer_file,
+    is_safe_transfer_file_name,
+};
+
 const DEFAULT_IMAGE_GEN_MODEL_ID: &str = "gpt-image-2";
 const DEFAULT_IMAGE_GEN_TIMEOUT_MS: u64 = 300_000;
 const MAX_IMAGE_GEN_TIMEOUT_MS: u64 = 600_000;
 const MAX_IMAGE_GEN_COUNT: u8 = 4;
 const IMAGE_OUTPUT_MODALITY: &str = "image";
 const DEFAULT_IMAGE_OUTPUT_FORMAT: &str = "png";
+
+/// Image broker transfer wire type (shared envelope with web artifacts).
+pub(crate) type BrokeredImageFile = BrokeredTransferFile;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -117,19 +126,6 @@ pub(crate) fn image_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
         Some(_) => Err("timeoutMs must be an integer or null".to_string()),
     }
 }
-const MAX_BROKERED_IMAGE_FILE_BYTES: usize = 10 * 1024 * 1024;
-const MAX_BROKERED_IMAGE_TOTAL_BYTES: usize = 24 * 1024 * 1024;
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct BrokeredImageFile {
-    pub(crate) file_name: String,
-    pub(crate) mime_type: String,
-    pub(crate) bytes: usize,
-    pub(crate) sha256: String,
-    pub(crate) data_base64: String,
-}
-
 pub(crate) fn materialize_brokered_image_result(
     workspace_path: &Path,
     chat_id: &str,
@@ -141,6 +137,11 @@ pub(crate) fn materialize_brokered_image_result(
     if files.is_empty() || files.len() > usize::from(MAX_IMAGE_GEN_COUNT) {
         return Err(format!(
             "brokered image transfer must contain between 1 and {MAX_IMAGE_GEN_COUNT} files"
+        ));
+    }
+    if files.len() > MAX_BROKERED_IMAGE_FILE_COUNT {
+        return Err(format!(
+            "brokered image transfer must contain at most {MAX_BROKERED_IMAGE_FILE_COUNT} files"
         ));
     }
     let output_dir = image_output_dir(
@@ -157,26 +158,12 @@ pub(crate) fn materialize_brokered_image_result(
     let mut written_paths = Vec::new();
     let materialized = (|| {
         let mut output_files = Vec::with_capacity(files.len());
-        for (index, file) in files.into_iter().enumerate() {
-            if file.bytes == 0 || file.bytes > MAX_BROKERED_IMAGE_FILE_BYTES {
-                return Err(format!(
-                    "brokered image file '{}' has invalid size {}",
-                    file.file_name, file.bytes
-                ));
-            }
+        for file in files.into_iter() {
             total_bytes = total_bytes.saturating_add(file.bytes);
             if total_bytes > MAX_BROKERED_IMAGE_TOTAL_BYTES {
                 return Err("brokered image transfer exceeds 24 MiB".to_string());
             }
-            let bytes = BASE64_STANDARD
-                .decode(&file.data_base64)
-                .map_err(|source| format!("failed to decode brokered image: {source}"))?;
-            if bytes.len() != file.bytes {
-                return Err(format!(
-                    "brokered image file '{}' size does not match transfer metadata",
-                    file.file_name
-                ));
-            }
+            let bytes = decode_and_verify_transfer_file(&file, MAX_BROKERED_IMAGE_FILE_BYTES)?;
             let detected_format = detect_image_format(&bytes).ok_or_else(|| {
                 format!(
                     "brokered image file '{}' has unsupported format",
@@ -189,29 +176,16 @@ pub(crate) fn materialize_brokered_image_result(
                     file.file_name
                 ));
             }
-            let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
-            if actual_sha256 != file.sha256 {
-                return Err(format!(
-                    "brokered image file '{}' checksum does not match",
-                    file.file_name
-                ));
-            }
-            let file_name = safe_path_component(&file.file_name);
-            if file_name.is_empty() || file_name != file.file_name {
+            if !is_safe_transfer_file_name(&file.file_name) {
                 return Err("brokered image file name is unsafe".to_string());
             }
-            let path = output_dir.join(&file_name);
-            let temporary_path = output_dir.join(format!(".{file_name}.{index}.tmp"));
-            if let Err(source) = fs::write(&temporary_path, &bytes) {
-                let _ = fs::remove_file(&temporary_path);
-                return Err(format!(
-                    "failed to write remote image temporary file: {source}"
-                ));
+            // Reject names that safe_path_component would rewrite (legacy strict equality).
+            let sanitized = safe_path_component(&file.file_name);
+            if sanitized.is_empty() || sanitized != file.file_name {
+                return Err("brokered image file name is unsafe".to_string());
             }
-            if let Err(source) = fs::rename(&temporary_path, &path) {
-                let _ = fs::remove_file(&temporary_path);
-                return Err(format!("failed to finalize remote image file: {source}"));
-            }
+            let path = output_dir.join(&file.file_name);
+            atomic_write_bytes(&path, &bytes)?;
             written_paths.push(path.clone());
             output_files.push(json!({
                 "path": workspace_relative_path(workspace_path, &path)?,

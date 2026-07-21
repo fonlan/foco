@@ -22,6 +22,13 @@ use foco_tools::{ToolExecution, WEB_FETCH_TOOL, WEB_SEARCH_TOOL};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use super::broker_artifacts::{
+    BROKERED_WEB_RESULT_MIME, BrokeredTransferFile, MAX_BROKERED_WEB_RESULT_FILE_BYTES,
+    MAX_BROKERED_WEB_RESULT_FILE_COUNT, WEB_RESULTS_RELATIVE_DIR, atomic_write_bytes,
+    decode_and_verify_transfer_file, ensure_path_under_allowed_root, is_safe_transfer_file_name,
+    normalize_workspace_relative_path, package_workspace_file_for_transfer,
+};
+
 const DEFAULT_WEB_TOOL_TIMEOUT_MS: u64 = 15_000;
 const MAX_WEB_TOOL_TIMEOUT_MS: u64 = 120_000;
 const DEFAULT_WEB_SEARCH_RESULT_LIMIT: usize = 5;
@@ -64,6 +71,239 @@ struct WebFetchToolInput {
 
 pub(crate) fn is_web_tool_name(tool_name: &str) -> bool {
     matches!(tool_name, WEB_SEARCH_TOOL | WEB_FETCH_TOOL)
+}
+
+/// Package a host-side web cache file referenced by `fullResultPath` for broker transfer.
+///
+/// Returns `Ok(None)` when the tool result has no cache path (within soft budget).
+/// Returns `Err` when a path is claimed but cannot be packaged — callers must not publish
+/// a successful ToolResult that points at a missing remote file.
+pub(crate) fn package_brokered_web_result_files(
+    workspace_path: &Path,
+    result: &Value,
+) -> Result<Option<Vec<BrokeredTransferFile>>, String> {
+    let Some(relative_path) = result
+        .get(LINE_BOUNDED_FULL_RESULT_PATH_FIELD)
+        .and_then(Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let relative_path = validate_web_result_relative_path(relative_path)?;
+    let file = package_workspace_file_for_transfer(
+        workspace_path,
+        &relative_path,
+        BROKERED_WEB_RESULT_MIME,
+        MAX_BROKERED_WEB_RESULT_FILE_BYTES,
+        WEB_RESULTS_RELATIVE_DIR,
+    )?;
+    let expected_name = Path::new(&relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "web result cache path is missing a file name".to_string())?;
+    if file.file_name != expected_name {
+        return Err(format!(
+            "web result cache file name '{}' does not match path '{relative_path}'",
+            file.file_name
+        ));
+    }
+    Ok(Some(vec![file]))
+}
+
+/// Materialize a brokered web cache file into the sidecar tool workspace and confirm
+/// `fullResultPath` is a workspace-relative path under `.foco/web-results/`.
+///
+/// Does not publish a success result when validation or write fails. Credentials must not
+/// appear in the transfer payload (host is responsible for caching credential-free text only).
+///
+/// Uses the same process-local prune + no-clobber publish critical section as the local
+/// `write_web_result_cache` path (1h TTL, 20-file cap). Failures never delete an existing
+/// destination cache entry.
+pub(crate) fn materialize_brokered_web_result(
+    workspace_path: &Path,
+    mut result: Value,
+    files: Vec<BrokeredTransferFile>,
+) -> Result<Value, String> {
+    let relative_path = result
+        .get(LINE_BOUNDED_FULL_RESULT_PATH_FIELD)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "web broker response claims transferred files but is missing fullResultPath".to_string()
+        })?
+        .to_string();
+    let relative_path = validate_web_result_relative_path(&relative_path)?;
+
+    if files.len() != MAX_BROKERED_WEB_RESULT_FILE_COUNT {
+        return Err(format!(
+            "brokered web result transfer must contain exactly {MAX_BROKERED_WEB_RESULT_FILE_COUNT} file"
+        ));
+    }
+    let file = files
+        .into_iter()
+        .next()
+        .expect("exactly one web result file");
+
+    if !is_allowed_web_result_mime(&file.mime_type) {
+        return Err(format!(
+            "brokered web result file '{}' has unsupported MIME type '{}'",
+            file.file_name, file.mime_type
+        ));
+    }
+    if !is_safe_transfer_file_name(&file.file_name) || !is_valid_web_result_file_name(&file.file_name)
+    {
+        return Err("brokered web result file name is unsafe".to_string());
+    }
+    let expected_name = Path::new(&relative_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "web result cache path is missing a file name".to_string())?;
+    if file.file_name != expected_name {
+        return Err(format!(
+            "brokered web result file name '{}' does not match fullResultPath '{relative_path}'",
+            file.file_name
+        ));
+    }
+
+    let bytes = decode_and_verify_transfer_file(&file, MAX_BROKERED_WEB_RESULT_FILE_BYTES)?;
+    // Cache is credential-free readable text; reject non-UTF-8 to keep read_file safe.
+    std::str::from_utf8(&bytes).map_err(|_| {
+        format!(
+            "brokered web result file '{}' is not valid UTF-8 text",
+            file.file_name
+        )
+    })?;
+
+    // Same critical section as local cache writes: no-clobber check, then prune + publish.
+    let _write_guard = WEB_RESULTS_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let results_dir = workspace_foco_dir(workspace_path).join(WEB_RESULTS_DIR);
+    fs::create_dir_all(&results_dir).map_err(|source| {
+        format!(
+            "failed to create sidecar web results directory '{}': {source}",
+            results_dir.display()
+        )
+    })?;
+
+    let destination = workspace_path.join(&relative_path);
+    // Ensure destination stays under the workspace root (path already normalized).
+    let canonical_workspace = fs::canonicalize(workspace_path).map_err(|source| {
+        format!("failed to resolve sidecar workspace for web result: {source}")
+    })?;
+    // Check destination BEFORE prune: reserve-prune with room_for_new=1 can delete the
+    // oldest cache entry when the dir is at the count cap. If that entry is this destination,
+    // pruning first would erase a no-clobber collision target and allow overwrite.
+    if let Ok(existing) = fs::canonicalize(&destination) {
+        if !existing.starts_with(&canonical_workspace) {
+            return Err("web result destination escaped the workspace".to_string());
+        }
+        // Destination already present: do not overwrite. If content matches, treat as
+        // idempotent success so a broker replay does not fail a valid cache entry.
+        let existing_bytes = fs::read(&destination).map_err(|source| {
+            format!(
+                "failed to read existing sidecar web result '{}': {source}",
+                destination.display()
+            )
+        })?;
+        if existing_bytes == bytes {
+            result[LINE_BOUNDED_FULL_RESULT_PATH_FIELD] = json!(relative_path);
+            rewrite_web_result_note_if_needed(&mut result, &relative_path);
+            return Ok(result);
+        }
+        return Err(format!(
+            "sidecar web result cache path already exists '{}'",
+            relative_path
+        ));
+    } else if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).map_err(|source| {
+            format!(
+                "failed to create sidecar web results directory '{}': {source}",
+                parent.display()
+            )
+        })?;
+        let canonical_parent = fs::canonicalize(parent).map_err(|source| {
+            format!("failed to resolve sidecar web results directory: {source}")
+        })?;
+        if !canonical_parent.starts_with(&canonical_workspace) {
+            return Err("web result destination escaped the workspace".to_string());
+        }
+    }
+
+    // Destination does not exist: free TTL-expired entries and reserve room, then publish.
+    prune_web_results_dir(&results_dir);
+
+    // No-clobber atomic publish. On failure do NOT delete destination (it should not exist
+    // for a new name; if a race created one, leave it alone).
+    atomic_write_bytes(&destination, &bytes)?;
+    // Post-write exact cap under the same lock (preserve the just-published file).
+    prune_web_results_dir_to_cap(&results_dir);
+
+    // Confirm model-facing path is the workspace-relative cache path (never a host temp path).
+    result[LINE_BOUNDED_FULL_RESULT_PATH_FIELD] = json!(relative_path);
+    rewrite_web_result_note_if_needed(&mut result, &relative_path);
+    Ok(result)
+}
+
+fn rewrite_web_result_note_if_needed(result: &mut Value, relative_path: &str) {
+    if let Some(note) = result.get(LINE_BOUNDED_NOTE_FIELD).and_then(Value::as_str) {
+        // Refresh note so it cannot retain a host absolute path if one ever leaked into the note.
+        if let Some(next_start) = result
+            .get(LINE_BOUNDED_NEXT_START_LINE_FIELD)
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+        {
+            result[LINE_BOUNDED_NOTE_FIELD] =
+                json!(web_result_truncated_note(relative_path, next_start.max(1)));
+        } else if note.contains(relative_path) {
+            // Keep existing note when it already matches; no nextStartLine to rebuild with.
+        } else {
+            result[LINE_BOUNDED_NOTE_FIELD] = json!(web_result_truncated_note(relative_path, 1));
+        }
+    }
+}
+
+fn is_allowed_web_result_mime(mime_type: &str) -> bool {
+    let normalized = mime_type.trim().to_ascii_lowercase();
+    normalized == "text/plain"
+        || normalized == BROKERED_WEB_RESULT_MIME
+        || normalized.starts_with("text/plain;")
+}
+
+/// Validate and normalize a workspace-relative web cache path under `.foco/web-results/`.
+pub(crate) fn validate_web_result_relative_path(path: &str) -> Result<String, String> {
+    let normalized = normalize_workspace_relative_path(path)?;
+    ensure_path_under_allowed_root(&normalized, WEB_RESULTS_RELATIVE_DIR)?;
+    let file_name = Path::new(&normalized)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "web result cache path is missing a file name".to_string())?;
+    if Path::new(&normalized)
+        .parent()
+        .map(|parent| parent.to_string_lossy().replace('\\', "/"))
+        .as_deref()
+        != Some(WEB_RESULTS_RELATIVE_DIR)
+    {
+        return Err(format!(
+            "web result cache path '{normalized}' must be a direct child of {WEB_RESULTS_RELATIVE_DIR}"
+        ));
+    }
+    if !is_valid_web_result_file_name(file_name) {
+        return Err(format!(
+            "web result cache file name '{file_name}' is invalid"
+        ));
+    }
+    Ok(normalized)
+}
+
+fn is_valid_web_result_file_name(file_name: &str) -> bool {
+    if !is_safe_transfer_file_name(file_name) {
+        return false;
+    }
+    let Some(stem) = file_name.strip_suffix(".txt") else {
+        return false;
+    };
+    // stem is web-fetch-... or web-search-... (same rules as is_valid_web_result_id)
+    is_valid_web_result_id(stem)
 }
 
 pub(crate) fn web_tool_timeout_ms(arguments: &Value) -> Result<u64, String> {
@@ -2663,6 +2903,345 @@ mod tests {
         assert!(
             count <= MAX_WEB_RESULT_FILES,
             "concurrent writers exceeded count cap: count={count} cap={MAX_WEB_RESULT_FILES}"
+        );
+    }
+
+    #[test]
+    fn package_and_materialize_web_result_roundtrip_for_sidecar() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let host_workspace = tempfile::tempdir().expect("host");
+        let sidecar_workspace = tempfile::tempdir().expect("sidecar");
+        let body = "line-1\nline-2\nline-3\n";
+        let relative = write_web_result_cache(host_workspace.path(), "fetch", body, None, None)
+            .expect("cache");
+        let host_result = json!({
+            "truncated": true,
+            "nextStartLine": 2,
+            "fullResultPath": relative,
+            "note": web_result_truncated_note(&relative, 2),
+            "text": "line-1",
+        });
+
+        let files = package_brokered_web_result_files(host_workspace.path(), &host_result)
+            .expect("package")
+            .expect("files present");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].mime_type, BROKERED_WEB_RESULT_MIME);
+        assert!(!files[0].data_base64.is_empty());
+
+        let materialized = materialize_brokered_web_result(
+            sidecar_workspace.path(),
+            host_result.clone(),
+            files,
+        )
+        .expect("materialize");
+        assert_eq!(
+            materialized["fullResultPath"].as_str().expect("path"),
+            relative
+        );
+        assert!(
+            materialized["fullResultPath"]
+                .as_str()
+                .expect("path")
+                .starts_with(".foco/web-results/"),
+            "must stay workspace-relative"
+        );
+        assert!(
+            !materialized["fullResultPath"]
+                .as_str()
+                .expect("path")
+                .starts_with('/'),
+            "must not leak host absolute path"
+        );
+        let sidecar_bytes =
+            fs::read(sidecar_workspace.path().join(&relative)).expect("sidecar file");
+        assert_eq!(sidecar_bytes, body.as_bytes());
+
+        // Checksum mismatch must not leave a file.
+        let bad = vec![BrokeredTransferFile {
+            file_name: Path::new(&relative)
+                .file_name()
+                .and_then(|v| v.to_str())
+                .expect("name")
+                .to_string(),
+            mime_type: BROKERED_WEB_RESULT_MIME.to_string(),
+            bytes: body.len(),
+            sha256: "00".repeat(32),
+            data_base64: BASE64_STANDARD.encode(body.as_bytes()),
+        }];
+        let err = materialize_brokered_web_result(
+            sidecar_workspace.path(),
+            host_result.clone(),
+            bad,
+        )
+        .expect_err("checksum");
+        assert!(err.contains("checksum"), "{err}");
+
+        // Illegal filename / wrong directory.
+        let evil_result = json!({
+            "truncated": true,
+            "nextStartLine": 1,
+            "fullResultPath": "/tmp/host-secret.txt",
+        });
+        let err = package_brokered_web_result_files(host_workspace.path(), &evil_result)
+            .expect_err("absolute path");
+        assert!(
+            err.contains("workspace-relative") || err.contains("outside"),
+            "{err}"
+        );
+
+        let escape_result = json!({
+            "truncated": true,
+            "nextStartLine": 1,
+            "fullResultPath": ".foco/image-gen/not-web.png",
+        });
+        let err = package_brokered_web_result_files(host_workspace.path(), &escape_result)
+            .expect_err("wrong dir");
+        assert!(err.contains("outside") || err.contains("invalid"), "{err}");
+
+        // Oversized declared size.
+        let oversized = vec![BrokeredTransferFile {
+            file_name: Path::new(&relative)
+                .file_name()
+                .and_then(|v| v.to_str())
+                .expect("name")
+                .to_string(),
+            mime_type: BROKERED_WEB_RESULT_MIME.to_string(),
+            bytes: MAX_BROKERED_WEB_RESULT_FILE_BYTES + 1,
+            sha256: format!("{:x}", Sha256::digest(body.as_bytes())),
+            data_base64: BASE64_STANDARD.encode(body.as_bytes()),
+        }];
+        let err = materialize_brokered_web_result(sidecar_workspace.path(), host_result, oversized)
+            .expect_err("oversize");
+        assert!(err.contains("invalid size") || err.contains("size"), "{err}");
+    }
+
+    #[test]
+    fn package_web_result_returns_none_without_full_result_path() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = json!({ "truncated": false, "text": "small" });
+        let files = package_brokered_web_result_files(workspace.path(), &result).expect("ok");
+        assert!(files.is_none());
+    }
+
+    #[test]
+    fn materialize_rejects_image_mime_and_host_path_in_full_result_path() {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use sha2::{Digest, Sha256};
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let body = b"not an image";
+        let relative = ".foco/web-results/web-fetch-1-2-abcdef01.txt";
+        let result = json!({
+            "fullResultPath": relative,
+            "truncated": true,
+            "nextStartLine": 1,
+        });
+        let files = vec![BrokeredTransferFile {
+            file_name: "web-fetch-1-2-abcdef01.txt".to_string(),
+            mime_type: "image/png".to_string(),
+            bytes: body.len(),
+            sha256: format!("{:x}", Sha256::digest(body)),
+            data_base64: BASE64_STANDARD.encode(body),
+        }];
+        let err = materialize_brokered_web_result(workspace.path(), result, files)
+            .expect_err("mime");
+        assert!(err.contains("MIME"), "{err}");
+        assert!(!workspace.path().join(relative).exists());
+
+        let host_path_result = json!({
+            "fullResultPath": "/Users/host/.foco/broker-web-transfer/x/web-fetch-1.txt",
+            "truncated": true,
+            "nextStartLine": 1,
+        });
+        let err = materialize_brokered_web_result(workspace.path(), host_path_result, vec![])
+            .expect_err("host path");
+        assert!(
+            err.contains("workspace-relative")
+                || err.contains("exactly")
+                || err.contains("invalid"),
+            "{err}"
+        );
+    }
+
+    fn brokered_web_file(file_name: &str, body: &[u8]) -> BrokeredTransferFile {
+        use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+        use sha2::{Digest, Sha256};
+        BrokeredTransferFile {
+            file_name: file_name.to_string(),
+            mime_type: BROKERED_WEB_RESULT_MIME.to_string(),
+            bytes: body.len(),
+            sha256: format!("{:x}", Sha256::digest(body)),
+            data_base64: BASE64_STANDARD.encode(body),
+        }
+    }
+
+    #[test]
+    fn materialize_brokered_web_result_prunes_count_and_ttl() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let dir = workspace.path().join(".foco/web-results");
+        fs::create_dir_all(&dir).expect("dir");
+
+        // Seed expired file; materialize must prune it.
+        let expired_path = dir.join("web-fetch-expired-sidecar-old.txt");
+        fs::write(&expired_path, b"stale").expect("write expired");
+        let stale_time = SystemTime::now()
+            .checked_sub(WEB_RESULT_TTL + Duration::from_secs(60))
+            .expect("stale time");
+        let file = fs::File::options()
+            .write(true)
+            .open(&expired_path)
+            .expect("open expired");
+        file.set_modified(stale_time).expect("set mtime");
+        drop(file);
+
+        // Fill to the count cap with unique names, then materialize one more.
+        for i in 0..MAX_WEB_RESULT_FILES {
+            let name = format!("web-fetch-seed-{i:02}-abcdef0123456789.txt");
+            fs::write(dir.join(&name), format!("seed-{i}")).expect("seed");
+        }
+
+        let new_name = "web-fetch-sidecar-new-abcdef0123456789.txt";
+        let relative = format!(".foco/web-results/{new_name}");
+        let body = b"sidecar-materialized-body\n";
+        let result = json!({
+            "fullResultPath": relative,
+            "truncated": true,
+            "nextStartLine": 1,
+            "note": "host note",
+        });
+        materialize_brokered_web_result(
+            workspace.path(),
+            result,
+            vec![brokered_web_file(new_name, body)],
+        )
+        .expect("materialize");
+
+        assert!(!expired_path.exists(), "TTL-expired file must be pruned");
+        assert_eq!(
+            fs::read(workspace.path().join(&relative)).expect("read new"),
+            body
+        );
+
+        let count = fs::read_dir(&dir)
+            .expect("read")
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("web-") && n.ends_with(".txt"))
+            })
+            .count();
+        assert!(
+            count <= MAX_WEB_RESULT_FILES,
+            "sidecar materialize count={count} cap={MAX_WEB_RESULT_FILES}"
+        );
+        // Just-published file must survive post-publish cap prune.
+        assert!(workspace.path().join(&relative).exists());
+    }
+
+    #[test]
+    fn materialize_brokered_web_result_does_not_delete_existing_on_collision() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let file_name = "web-fetch-keep-abcdef0123456789.txt";
+        let relative = format!(".foco/web-results/{file_name}");
+        let dest = workspace.path().join(&relative);
+        fs::create_dir_all(dest.parent().expect("parent")).expect("mkdir");
+        fs::write(&dest, b"original-cache").expect("seed");
+
+        // Different content, same path: must fail and leave original intact.
+        let result = json!({
+            "fullResultPath": relative,
+            "truncated": true,
+            "nextStartLine": 1,
+        });
+        let err = materialize_brokered_web_result(
+            workspace.path(),
+            result,
+            vec![brokered_web_file(file_name, b"replacement-body")],
+        )
+        .expect_err("collision");
+        assert!(
+            err.contains("already exists"),
+            "expected already-exists error, got: {err}"
+        );
+        assert_eq!(fs::read(&dest).expect("read"), b"original-cache");
+
+        // Same content replay: idempotent success, still no overwrite churn.
+        let result = json!({
+            "fullResultPath": relative,
+            "truncated": true,
+            "nextStartLine": 1,
+        });
+        let ok = materialize_brokered_web_result(
+            workspace.path(),
+            result,
+            vec![brokered_web_file(file_name, b"original-cache")],
+        )
+        .expect("idempotent");
+        assert_eq!(ok["fullResultPath"].as_str().expect("path"), relative);
+        assert_eq!(fs::read(&dest).expect("read"), b"original-cache");
+    }
+
+    #[test]
+    fn materialize_brokered_web_result_protects_collision_target_at_count_cap() {
+        // When the cache dir is full and the collision target is the oldest entry,
+        // pre-write reserve-prune must not delete it to make room — no-clobber wins.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let dir = workspace.path().join(".foco/web-results");
+        fs::create_dir_all(&dir).expect("dir");
+
+        let keep_name = "web-fetch-oldest-keep-abcdef0123456789.txt";
+        let keep_path = dir.join(keep_name);
+        fs::write(&keep_path, b"protected-original").expect("seed keep");
+        let oldest = SystemTime::now()
+            .checked_sub(Duration::from_secs(3600))
+            .expect("oldest time");
+        let keep_file = fs::File::options()
+            .write(true)
+            .open(&keep_path)
+            .expect("open keep");
+        keep_file.set_modified(oldest).expect("set oldest mtime");
+        drop(keep_file);
+
+        // Fill remaining slots with newer seeds so the protected file is strictly oldest.
+        for i in 1..MAX_WEB_RESULT_FILES {
+            let name = format!("web-fetch-seed-{i:02}-abcdef0123456789.txt");
+            let path = dir.join(&name);
+            fs::write(&path, format!("seed-{i}")).expect("seed");
+            let newer = SystemTime::now()
+                .checked_sub(Duration::from_secs(60))
+                .expect("newer time");
+            let file = fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("open seed");
+            file.set_modified(newer).expect("set seed mtime");
+            drop(file);
+        }
+
+        let relative = format!(".foco/web-results/{keep_name}");
+        let result = json!({
+            "fullResultPath": relative,
+            "truncated": true,
+            "nextStartLine": 1,
+        });
+        let err = materialize_brokered_web_result(
+            workspace.path(),
+            result,
+            vec![brokered_web_file(keep_name, b"different-content-must-not-land")],
+        )
+        .expect_err("full-cap collision");
+        assert!(
+            err.contains("already exists"),
+            "expected already-exists error, got: {err}"
+        );
+        assert_eq!(
+            fs::read(&keep_path).expect("read keep"),
+            b"protected-original",
+            "oldest collision target must survive full-cap reserve prune"
         );
     }
 }
