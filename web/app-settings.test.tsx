@@ -119,6 +119,29 @@ describe("app-settings verification surfaces", () => {
     expect(githubLink).toHaveAttribute("rel", "noreferrer");
   });
 
+  it("shows the five-minute default for Spec and every Memory LLM request", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
+    expect(
+      (await screen.findByLabelText("Spec LLM timeout ms") as HTMLInputElement).value,
+    ).toBe("300000");
+
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Memory" }));
+    expect(
+      (await screen.findByLabelText("Retrieval LLM timeout ms") as HTMLInputElement).value,
+    ).toBe("300000");
+    expect(
+      (screen.getByLabelText("Extraction LLM timeout ms") as HTMLInputElement).value,
+    ).toBe("300000");
+    expect(
+      (screen.getByLabelText("Dream LLM timeout ms") as HTMLInputElement).value,
+    ).toBe("300000");
+  });
+
   it("tests configured models with per-row loading and toast feedback", async () => {
     const fetchMock = vi.mocked(fetch);
     const pendingResponse = deferred<Response>();
@@ -1561,7 +1584,7 @@ describe("app-settings verification surfaces", () => {
       expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
         autoEnabled: false,
         generationModelId: null,
-        llmTimeoutMs: 120000,
+        llmTimeoutMs: 300000,
       });
       expect(JSON.parse(String(saveCall?.[1]?.body))).not.toHaveProperty(
         "generationSystemPrompt",
@@ -1578,7 +1601,7 @@ describe("app-settings verification surfaces", () => {
       expect(lastBody).toEqual({
         autoEnabled: false,
         generationModelId: "gpt-test",
-        llmTimeoutMs: 120000,
+        llmTimeoutMs: 300000,
       });
     });
 
@@ -1963,12 +1986,12 @@ describe("app-settings verification surfaces", () => {
     expect(postBodies[0]).toEqual({
       autoEnabled: false,
       generationModelId: null,
-      llmTimeoutMs: 120000,
+      llmTimeoutMs: 300000,
     });
     expect(postBodies[1]).toEqual({
       autoEnabled: false,
       generationModelId: "gpt-test",
-      llmTimeoutMs: 120000,
+      llmTimeoutMs: 300000,
     });
     expect(postBodies.some((body) => body.generationModelId === "gpt-alt")).toBe(false);
     for (const body of postBodies) {

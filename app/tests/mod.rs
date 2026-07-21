@@ -31928,6 +31928,20 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
 }
 
 #[test]
+fn remaining_llm_request_timeout_is_a_total_deadline() {
+    let timeout_ms = 10;
+    let started_at = Instant::now()
+        .checked_sub(Duration::from_millis(timeout_ms))
+        .expect("monotonic clock supports elapsed test interval");
+
+    assert_eq!(
+        remaining_llm_request_timeout(started_at, timeout_ms),
+        Duration::ZERO,
+        "a later stream receive must not reset the single provider request deadline"
+    );
+}
+
+#[test]
 fn resolve_audited_single_tool_arguments_prefers_real_tool_call() {
     let tool_call_args = json!({"updateNeeded": false, "edits": null});
     let text_json = r#"{"updateNeeded":true,"edits":[{"oldText":"a","newText":"b"}]}"#;

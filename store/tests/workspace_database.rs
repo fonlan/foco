@@ -11929,6 +11929,35 @@ fn startup_reconciliation_closes_running_llm_audit_once_and_updates_rollup() {
             response_body_json: None,
         })
         .expect("request insert");
+    database
+        .insert_llm_request(NewLlmRequest {
+            id: "completed-request",
+            workspace_id: "workspace-1",
+            chat_id: None,
+            request_kind: "chat completion",
+            agent_team_id: None,
+            agent_instance_id: None,
+            agent_task_id: None,
+            agent_attempt_id: None,
+            provider_id: "openai",
+            model_id: "gpt-test",
+            thinking_level: None,
+            request_started_at: "2026-07-16T00:00:00Z",
+            first_token_at: Some("2026-07-16T00:00:01Z"),
+            completed_at: Some("2026-07-16T00:00:02Z"),
+            input_tokens: Some(4),
+            output_tokens: Some(3),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            reasoning_tokens: None,
+            first_token_latency_ms: Some(1000),
+            total_latency_ms: Some(2000),
+            status_code: Some(200),
+            final_state: "succeeded",
+            request_body_json: None,
+            response_body_json: None,
+        })
+        .expect("completed request insert");
 
     assert_eq!(
         database
@@ -11943,6 +11972,16 @@ fn startup_reconciliation_closes_running_llm_audit_once_and_updates_rollup() {
     assert_eq!(request.final_state, "failed");
     assert!(request.completed_at.is_some());
     assert_eq!(request.total_latency_ms, Some(0));
+    let completed = database
+        .llm_request("completed-request")
+        .expect("completed request lookup")
+        .expect("completed request row");
+    assert_eq!(completed.final_state, "succeeded");
+    assert_eq!(
+        completed.completed_at.as_deref(),
+        Some("2026-07-16T00:00:02Z")
+    );
+    assert_eq!(completed.output_tokens, Some(3));
     let events = database
         .llm_request_events("interrupted-request")
         .expect("reconciliation event lookup");
@@ -11955,7 +11994,7 @@ fn startup_reconciliation_closes_running_llm_audit_once_and_updates_rollup() {
     let rollup = database
         .llm_request_usage_rollup_summary(LlmRequestUsageRollupFilters::default())
         .expect("rollup summary");
-    assert_eq!(rollup.total_requests, 1);
+    assert_eq!(rollup.total_requests, 2);
     assert_eq!(rollup.failed_requests, 1);
     assert_eq!(
         database

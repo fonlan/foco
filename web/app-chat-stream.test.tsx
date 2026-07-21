@@ -1708,7 +1708,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("restores durable compression parts when chat messages are reloaded", async () => {
+  it("restores three durable compression parts when chat messages are reloaded", async () => {
     const durableMessages = {
       activeRun: null,
       messages: [
@@ -1745,6 +1745,40 @@ describe("app-chat-stream verification surfaces", () => {
                 modelId: "gpt-test",
               },
             },
+            {
+              type: "contextCompression",
+              id: "llm-snapshot-history-two",
+              status: "completed",
+              kind: "llm",
+              detail: {
+                status: "completed",
+                kind: "llm",
+                snapshotId: "llm-snapshot-history-two",
+                originalTokenCount: 3600,
+                summaryTokenCount: 700,
+                startedAt: "2026-07-06T07:00:02Z",
+                completedAt: "2026-07-06T07:00:03Z",
+                providerId: "openai",
+                modelId: "gpt-test",
+              },
+            },
+            {
+              type: "contextCompression",
+              id: "llm-snapshot-history-three",
+              status: "completed",
+              kind: "llm",
+              detail: {
+                status: "completed",
+                kind: "llm",
+                snapshotId: "llm-snapshot-history-three",
+                originalTokenCount: 2800,
+                summaryTokenCount: 600,
+                startedAt: "2026-07-06T07:00:04Z",
+                completedAt: "2026-07-06T07:00:05Z",
+                providerId: "openai",
+                modelId: "gpt-test",
+              },
+            },
             { type: "text", text: "Recovered answer." },
           ],
           toolCalls: [],
@@ -1772,8 +1806,8 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Tool run"));
 
     expect(await screen.findByText("Recovered answer.")).toBeInTheDocument();
-    expect(screen.getByText("Context compression")).toBeInTheDocument();
-    expect(screen.getByText("Compressed")).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(3);
+    expect(screen.getAllByText("Compressed")).toHaveLength(3);
     expect(
       screen.getByText(/Saved 3,400 tokens|Saved 3400 tokens/),
     ).toBeInTheDocument();

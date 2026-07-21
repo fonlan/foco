@@ -20,6 +20,13 @@ Store 格式不变量（本地 workspace、主进程 SSH audit mirror、远端 s
 - **结构化 `llm_requests.status_code` 与详情开关解耦**：只要观察到真实 HTTP Response head，就写入结构化 `status_code`（本地与 SSH 主进程 `remote-workspace-audit` 同契约）；完整 head dump 与 wire envelope 仍仅在详情开启时保留。无 Response（DNS/TLS/连接失败或响应前取消）→ `status_code` 为 NULL（UI `n/a`）。列表/详情 API **只读**该列，不从 `final_state` 或可选 wire dump 推导，不得硬编码 200。存量：`status_code IS NULL` 且仍保留合法 `provider_final_response_v1` 时一次性从 `http.status`（否则 failed envelope 的 `statusCode` 100–599）回填；metadata `llm_audit_status_code_v1_repaired`；非 v1/已清理/无 head 保持 NULL。
 - 归一化状态只保留在 `llm_request_events.normalized_event_json`、run events 与结构化列。
 
+## 单次 Provider 请求的总 deadline
+
+- 固定 LLM 请求的总 deadline 为 **300000 ms（5 分钟）**：从开始建立 provider stream 前计时，建流与每次后续流事件接收均使用同一请求起点的剩余时间；持续 delta 不会重置为新的 5 分钟空闲窗口。
+- 可配置的 Workspace Spec、Memory retrieval、Memory extraction 与 Memory Dream 缺省同为 `300000 ms`；已有显式配置保持原值，校验上限仍为 `600000 ms`。
+- 分层 context compression、重试或其他会发起多个 provider 调用的工作流可以包含多次请求；**每一条 provider 请求**各自拥有一个总 deadline，而不是把整个工作流限制为 5 分钟。
+- SSH broker 必须透传有效 `timeoutMs`；超时要发送取消、移除 `broker_pending`，并使主进程审计 mirror 与 sidecar 结构化镜像都以终态收口。非 LLM 的 HTTP、SSH、数据库、命令和普通工具 timeout 不属于此契约。
+
 源码守卫 `app/provider_audit_source_guard.rs` 固定以下边界：
 
 - `app/` 生产代码不再允许 direct `stream_chat(...)`；所有受审计 provider 调用必须经过 capture-aware API。
