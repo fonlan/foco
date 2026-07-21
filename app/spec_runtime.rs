@@ -23,7 +23,8 @@ use serde_json::{Value, json};
 
 use crate::{
     ApiError, AppState, PlanPhaseDerivedEffectsContext, PreparedChatContext,
-    api_audit_save_details, audited_provider_tool_request, config_snapshot, markdown_code_block,
+    api_audit_save_details, audited_provider_tool_request,
+    audited_provider_tool_request_with_args_validate, config_snapshot, markdown_code_block,
     neutral_text_message, provider_connection_config, unique_id, workspace_by_id,
 };
 use foco_tools::{SpecPatchError, SpecTextEdit, apply_spec_text_edits};
@@ -896,7 +897,9 @@ async fn run_workspace_spec_update_job_inner(
         model.max_output_tokens,
         &input_summary,
     )?;
-    let tool_result = audited_provider_tool_request(
+    // Schema-level validation only: serde shape. Semantic edit application stays outside
+    // so we never guess patches from prose, and invalid oldText fails the job without writing.
+    let tool_result = audited_provider_tool_request_with_args_validate(
         workspace_path,
         workspace_id,
         job.chat_id.as_deref(),
@@ -909,6 +912,11 @@ async fn run_workspace_spec_update_job_inner(
         config.spec.llm_timeout_ms,
         config.app.llm_request_retry_count,
         api_audit_save_details(config),
+        Some(Box::new(|value: &Value| {
+            serde_json::from_value::<WorkspaceSpecUpdateToolOutput>(value.clone())
+                .map(|_| ())
+                .map_err(|source| format!("malformed workspace spec update JSON: {source}"))
+        })),
     )
     .await?;
 
@@ -928,6 +936,7 @@ async fn run_workspace_spec_update_job_inner(
                     classification,
                 );
             }
+            // Protocol/schema already repaired once inside audited; semantic failures must not write.
             return Err(error);
         }
     };

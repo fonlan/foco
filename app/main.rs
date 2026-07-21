@@ -310,9 +310,6 @@ Use the submit_commit_message tool exactly once. Do not return prose. \
 Prefer Conventional Commits format when the staged changes clearly map to a type, otherwise use a short imperative subject. \
 The subject must be at most 72 characters. Include an optional body only when it materially improves clarity. \
 Do not mention unstaged changes, model limitations, or that a diff was provided.";
-// One retry is enough for malformed model tool output; repeated failures are ignored.
-const MEMORY_EXTRACTION_MAX_ATTEMPTS: usize = 2;
-
 // Maximum output tokens allowed for the memory extraction model request.
 const MEMORY_EXTRACTION_MAX_OUTPUT_TOKENS: u32 = 2048;
 // Maximum output tokens allowed for the memory retrieval model request.
@@ -5881,9 +5878,71 @@ pub(crate) async fn audited_provider_tool_request(
     retry_count: u32,
     save_details: bool,
 ) -> Result<AuditedProviderToolResult, ApiError> {
-    for attempt_index in 0..=retry_count {
+    audited_provider_tool_request_with_args_validate(
+        workspace_path,
+        workspace_id,
+        chat_id,
+        provider_id,
+        provider_config,
+        request,
+        request_kind,
+        expected_tool_name,
+        tool_label,
+        timeout_ms,
+        retry_count,
+        save_details,
+        None,
+    )
+    .await
+}
+
+/// Like [`audited_provider_tool_request`], but optionally validates tool arguments after recovery.
+///
+/// When validation fails with a schema-class error, one output-protocol repair retry is allowed
+/// (same budget as missing_tool / prose / wrong_tool). Semantic validation failures do not repair.
+pub(crate) async fn audited_provider_tool_request_with_args_validate(
+    workspace_path: &Path,
+    workspace_id: &str,
+    chat_id: Option<&str>,
+    provider_id: &str,
+    provider_config: &ProviderConnectionConfig,
+    request: NeutralChatRequest,
+    request_kind: &str,
+    expected_tool_name: &str,
+    tool_label: &str,
+    timeout_ms: u64,
+    retry_count: u32,
+    save_details: bool,
+    validate_arguments: Option<Box<dyn Fn(&Value) -> Result<(), String> + Send + Sync>>,
+) -> Result<AuditedProviderToolResult, ApiError> {
+    // Provider transport retries and output-protocol repair are independent budgets.
+    // - Provider: same prompt, up to `retry_count` additional attempts (timeout/429/5xx).
+    // - Output repair: at most one attempt with a short deterministic correction message.
+    let base_request = request;
+    let mut active_request = base_request.clone();
+    let mut provider_attempts_used: u32 = 0;
+    let mut output_repair_used = false;
+    let mut next_attempt_index: u32 = 1;
+    // Distinguishes each stream attempt: initial vs provider_retry vs output_repair.
+    // Once repair is scheduled, later transport retries of the repaired body stay provider_retry.
+    let mut next_retry_kind = structured_llm_outcome::StructuredLlmRetryKind::Initial;
+    // Cap total stream attempts so pathological combinations cannot spin.
+    let max_stream_attempts = retry_count
+        .saturating_add(1) // initial + provider retries
+        .saturating_add(1) // one output repair
+        .saturating_add(retry_count); // provider retries of the repaired request
+
+    for _ in 0..max_stream_attempts {
+        let attempt_index = next_attempt_index;
+        next_attempt_index = next_attempt_index.saturating_add(1);
+        let retry_kind = next_retry_kind;
+        // True only for the attempt that first uses the repaired request body.
+        let is_output_repair_attempt =
+            matches!(retry_kind, structured_llm_outcome::StructuredLlmRetryKind::OutputRepair);
+        // True once any attempt runs after repair was scheduled (repair itself or later provider retries).
+        let recovery_uses_correction = output_repair_used;
         let request_id = unique_id("llm");
-        let attempt_number = i64::from(attempt_index) + 1;
+        let attempt_number = i64::from(attempt_index);
         let request_started_at = utc_timestamp();
         let started_at = Instant::now();
         let mut database = WorkspaceDatabase::open_or_create(workspace_path)
@@ -5899,8 +5958,8 @@ pub(crate) async fn audited_provider_tool_request(
                 agent_task_id: None,
                 agent_attempt_id: None,
                 provider_id,
-                model_id: &request.model_id,
-                thinking_level: request.thinking_level.as_deref(),
+                model_id: &active_request.model_id,
+                thinking_level: active_request.thinking_level.as_deref(),
                 request_started_at: &request_started_at,
                 first_token_at: None,
                 completed_at: None,
@@ -5931,8 +5990,18 @@ pub(crate) async fn audited_provider_tool_request(
                     "llmRequestId": &request_id,
                     "workspaceId": workspace_id,
                     "chatId": chat_id,
-                    "attempt": attempt_index + 1,
-                    "maxAttempts": retry_count + 1,
+                    "attempt": attempt_index,
+                    // Configured provider transport retry budget (not the current index).
+                    "providerRetryBudget": retry_count,
+                    // Actual provider-retry ordinal for the current request body (0 = first try of that body).
+                    "providerRetryIndex": provider_attempts_used,
+                    // explicit attempt reason: initial | provider_retry | output_repair
+                    "retryKind": retry_kind.as_str(),
+                    // true only for the first stream attempt after the repair message was appended
+                    "outputRepairAttempt": is_output_repair_attempt,
+                    // true if repair was already scheduled for this audited call
+                    "outputRepairUsed": recovery_uses_correction,
+                    "maxAttempts": max_stream_attempts,
                 })
                 .to_string(),
             })
@@ -5940,7 +6009,7 @@ pub(crate) async fn audited_provider_tool_request(
         drop(database);
 
         let capture = ProviderAuditCapture::new(workspace_path, request_id.clone(), save_details);
-        let mut attempt_request = request.clone();
+        let mut attempt_request = active_request.clone();
         if let Some(chat_id) = chat_id {
             let (session_id, thread_id) =
                 resolve_provider_session_thread_for_chat(workspace_path, chat_id, None, None)?;
@@ -5978,6 +6047,117 @@ pub(crate) async fn audited_provider_tool_request(
                 first_token_latency_ms,
                 response_body_json,
             }) => {
+                // Optional caller schema validation before accepting success.
+                if let Some(ref validate) = validate_arguments {
+                    if let Err(validation_message) = validate(&tool_arguments) {
+                        let failure_kind =
+                            structured_llm_outcome::classify_caller_structured_failure_kind(
+                                &validation_message,
+                            )
+                            .unwrap_or(structured_llm_outcome::StructuredLlmFailureKind::SchemaInvalid);
+                        database
+                            .update_llm_request_outcome(
+                                &request_id,
+                                UpdateLlmRequestOutcome {
+                                    first_token_at: first_token_at.as_deref(),
+                                    completed_at: Some(&completed_at),
+                                    input_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.input_tokens),
+                                    output_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_read_tokens),
+                                    cache_write_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.cache_write_tokens),
+                                    reasoning_tokens: usage
+                                        .as_ref()
+                                        .and_then(|usage| usage.reasoning_tokens),
+                                    first_token_latency_ms,
+                                    total_latency_ms: Some(elapsed_millis(started_at)),
+                                    status_code: Some(200),
+                                    final_state: "failed",
+                                    response_body_json: response_body_json.as_deref(),
+                                },
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        let _ = structured_llm_outcome::persist_structured_classification_on_database(
+                            &mut database,
+                            &request_id,
+                            failure_kind.classification(attempt_number),
+                        );
+                        persist_audited_provider_events(
+                            &mut database,
+                            &request_id,
+                            &events,
+                            1,
+                            save_details,
+                        )?;
+                        drop(database);
+
+                        match structured_llm_outcome::next_audited_stream_action(
+                            failure_kind,
+                            None,
+                            output_repair_used,
+                            provider_attempts_used,
+                            retry_count,
+                        ) {
+                            structured_llm_outcome::StructuredLlmNextAction::Continue {
+                                retry_kind,
+                                provider_retry_index,
+                                output_repair_used: next_output_repair_used,
+                            } => {
+                                output_repair_used = next_output_repair_used;
+                                provider_attempts_used = provider_retry_index;
+                                next_retry_kind = retry_kind;
+                                if matches!(
+                                    retry_kind,
+                                    structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+                                ) {
+                                    active_request = append_output_repair_message(
+                                        &base_request,
+                                        expected_tool_name,
+                                        failure_kind,
+                                    );
+                                    tracing::debug!(
+                                        request_kind,
+                                        expected_tool_name,
+                                        failure_category = failure_kind.category_label(),
+                                        "scheduling single-tool output repair after schema validation failure"
+                                    );
+                                }
+                                continue;
+                            }
+                            structured_llm_outcome::StructuredLlmNextAction::Stop => {
+                                return Err(ApiError::bad_request(validation_message));
+                            }
+                        }
+                    }
+                }
+
+                // Success after repair was scheduled (including later provider retries of that body)
+                // records recovery_source=correction_retry; individual attempt still has retryKind.
+                let (final_outcome, final_recovery) = if recovery_uses_correction {
+                    let text_json = recovery_source
+                        == foco_store::workspace::STRUCTURED_LLM_RECOVERY_TEXT_JSON
+                        || structured_outcome
+                            == foco_store::workspace::STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED;
+                    let classification =
+                        structured_llm_outcome::classification_correction_retry_success(
+                            attempt_number,
+                            text_json,
+                        );
+                    (
+                        classification.structured_outcome,
+                        classification.recovery_source,
+                    )
+                } else {
+                    (structured_outcome, recovery_source)
+                };
+
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -6007,8 +6187,8 @@ pub(crate) async fn audited_provider_tool_request(
                     &mut database,
                     &request_id,
                     foco_store::workspace::StructuredLlmRequestClassification {
-                        structured_outcome,
-                        recovery_source,
+                        structured_outcome: final_outcome,
+                        recovery_source: final_recovery,
                         attempt_index: attempt_number,
                     },
                 );
@@ -6022,12 +6202,13 @@ pub(crate) async fn audited_provider_tool_request(
                 return Ok(AuditedProviderToolResult {
                     arguments: tool_arguments,
                     request_id,
-                    structured_outcome,
-                    recovery_source,
-                    attempt_index: attempt_index + 1,
+                    structured_outcome: final_outcome,
+                    recovery_source: final_recovery,
+                    attempt_index,
                 });
             }
             Err(error) => {
+                let failure_kind = error.failure_kind;
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -6047,17 +6228,58 @@ pub(crate) async fn audited_provider_tool_request(
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
-                let failure = structured_llm_outcome::with_attempt_index(
-                    structured_llm_outcome::classify_provider_tool_failure_message(&error.message),
-                    attempt_number,
-                );
                 let _ = structured_llm_outcome::persist_structured_classification_on_database(
                     &mut database,
                     &request_id,
-                    failure,
+                    failure_kind.classification(attempt_number),
                 );
-                if attempt_index >= retry_count {
-                    return Err(ApiError::internal(error.message));
+                drop(database);
+
+                match structured_llm_outcome::next_audited_stream_action(
+                    failure_kind,
+                    error.status_code,
+                    output_repair_used,
+                    provider_attempts_used,
+                    retry_count,
+                ) {
+                    structured_llm_outcome::StructuredLlmNextAction::Continue {
+                        retry_kind,
+                        provider_retry_index,
+                        output_repair_used: next_output_repair_used,
+                    } => {
+                        output_repair_used = next_output_repair_used;
+                        provider_attempts_used = provider_retry_index;
+                        next_retry_kind = retry_kind;
+                        if matches!(
+                            retry_kind,
+                            structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+                        ) {
+                            active_request = append_output_repair_message(
+                                &base_request,
+                                expected_tool_name,
+                                failure_kind,
+                            );
+                            tracing::debug!(
+                                request_kind,
+                                expected_tool_name,
+                                failure_category = failure_kind.category_label(),
+                                "scheduling single-tool output repair after protocol failure"
+                            );
+                        } else {
+                            tracing::debug!(
+                                request_kind,
+                                provider_attempts_used,
+                                retry_count,
+                                failure_category = failure_kind.category_label(),
+                                status_code = ?error.status_code,
+                                "retrying single-tool provider transport failure"
+                            );
+                        }
+                        continue;
+                    }
+                    structured_llm_outcome::StructuredLlmNextAction::Stop => {
+                        return Err(ApiError::internal(error.message));
+                    }
                 }
             }
         }
@@ -6067,6 +6289,20 @@ pub(crate) async fn audited_provider_tool_request(
         "{request_kind} failed without an attempt result"
     )))
 }
+
+fn append_output_repair_message(
+    base_request: &NeutralChatRequest,
+    expected_tool_name: &str,
+    failure_kind: structured_llm_outcome::StructuredLlmFailureKind,
+) -> NeutralChatRequest {
+    let mut repaired = base_request.clone();
+    repaired.messages.push(neutral_text_message(
+        NeutralChatRole::User,
+        structured_llm_outcome::build_output_repair_user_message(expected_tool_name, failure_kind),
+    ));
+    repaired
+}
+
 
 struct AuditedTextStreamOutcome {
     text: String,
@@ -6090,11 +6326,12 @@ struct AuditedToolStreamOutcome {
 
 /// Result of a single-tool audited provider request, including classification ids.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // structured_outcome/recovery_source reserved for later recovery phases
 pub(crate) struct AuditedProviderToolResult {
     pub arguments: Value,
     pub request_id: String,
+    #[allow(dead_code)] // exposed for callers/metrics beyond current write-back paths
     pub structured_outcome: &'static str,
+    #[allow(dead_code)] // exposed for callers/metrics beyond current write-back paths
     pub recovery_source: &'static str,
     pub attempt_index: u32,
 }
@@ -6103,15 +6340,28 @@ struct AuditedProviderError {
     message: String,
     status_code: Option<i64>,
     response_body_json: Option<String>,
+    failure_kind: structured_llm_outcome::StructuredLlmFailureKind,
 }
 
 impl AuditedProviderError {
     fn new(message: impl Into<String>, status_code: Option<i64>) -> Self {
+        let message = message.into();
+        let failure_kind =
+            structured_llm_outcome::classify_provider_tool_failure_kind(&message, status_code);
         Self {
-            message: message.into(),
+            message,
             status_code,
             response_body_json: None,
+            failure_kind,
         }
+    }
+
+    fn with_failure_kind(
+        mut self,
+        failure_kind: structured_llm_outcome::StructuredLlmFailureKind,
+    ) -> Self {
+        self.failure_kind = failure_kind;
+        self
     }
 
     fn with_response_body_json(mut self, response_body_json: Option<String>) -> Self {
@@ -6406,6 +6656,9 @@ async fn run_provider_stream_for_tool(
                             ),
                             None,
                         )
+                        .with_failure_kind(
+                            structured_llm_outcome::StructuredLlmFailureKind::WrongTool,
+                        )
                         .with_stream_final_response(capture, &stream));
                     }
                     tool_arguments = Some(tool_call.arguments);
@@ -6456,16 +6709,20 @@ async fn run_provider_stream_for_tool(
             }
             None => {
                 let text = output_text.trim();
+                // Prefer structured kinds over string classification; do not re-inject model body
+                // into failure_kind (message may still include a short text for diagnostics).
                 let error = if text.is_empty() {
                     AuditedProviderError::new(
                         format!("{request_kind} did not call {tool_label}"),
                         None,
                     )
+                    .with_failure_kind(structured_llm_outcome::StructuredLlmFailureKind::MissingTool)
                 } else {
                     AuditedProviderError::new(
                         format!("{request_kind} returned text instead of {tool_label}: {text}"),
                         None,
                     )
+                    .with_failure_kind(structured_llm_outcome::StructuredLlmFailureKind::Prose)
                 };
                 return Err(error.with_stream_final_response(capture, &stream));
             }

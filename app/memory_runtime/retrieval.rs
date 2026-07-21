@@ -206,7 +206,7 @@ pub(crate) async fn memory_prompt_context(
                 )?;
                 drop(workspace_memory);
                 drop(global_memory);
-                relevant_memory_facts_llm(
+                match relevant_memory_facts_llm(
                     config,
                     &workspace.id,
                     &workspace.path,
@@ -217,7 +217,55 @@ pub(crate) async fn memory_prompt_context(
                     chat_provider,
                     chat_id,
                 )
-                .await?
+                .await
+                {
+                    Ok(facts) => facts,
+                    Err(error) => {
+                        // Read path: never block main chat on structured LLM failure.
+                        // Prefer FTS; if FTS also fails, use empty selection.
+                        tracing::warn!(
+                            workspace_id = %workspace.id,
+                            chat_id = chat_id.unwrap_or(""),
+                            error = %error.message,
+                            "memory retrieval LLM failed; falling back to FTS"
+                        );
+                        match (
+                            MemoryDatabase::open_or_create_workspace(&workspace.path),
+                            MemoryDatabase::open_or_create_global_at(memory_database_file),
+                        ) {
+                            (Ok(mut workspace_memory), Ok(mut global_memory)) => {
+                                match relevant_memory_facts_fts(
+                                    &mut global_memory,
+                                    &mut workspace_memory,
+                                    chat_id,
+                                    query_text,
+                                ) {
+                                    Ok(facts) => facts,
+                                    Err(fts_error) => {
+                                        tracing::warn!(
+                                            workspace_id = %workspace.id,
+                                            chat_id = chat_id.unwrap_or(""),
+                                            llm_error = %error.message,
+                                            fts_error = %fts_error.message,
+                                            "memory retrieval FTS fallback failed; using empty selection"
+                                        );
+                                        RelevantMemoryFacts { facts: Vec::new() }
+                                    }
+                                }
+                            }
+                            (Err(open_error), _) | (_, Err(open_error)) => {
+                                tracing::warn!(
+                                    workspace_id = %workspace.id,
+                                    chat_id = chat_id.unwrap_or(""),
+                                    llm_error = %error.message,
+                                    open_error = %open_error,
+                                    "memory retrieval FTS reopen failed; using empty selection"
+                                );
+                                RelevantMemoryFacts { facts: Vec::new() }
+                            }
+                        }
+                    }
+                }
             }
             other => {
                 return Err(ApiError::bad_request(format!(

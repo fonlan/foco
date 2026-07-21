@@ -327,38 +327,9 @@ pub(crate) async fn run_memory_extraction_job(
     }
     drop(workspace_memory_database);
 
-    let mut attempt = 1;
-    let extraction_result = loop {
-        let result = run_memory_extraction_job_inner(&task).await;
-        let Err(error) = &result else {
-            break result;
-        };
-        if !memory_extraction_error_should_be_ignored(Some(&error.message)) {
-            break result;
-        }
-        if attempt >= MEMORY_EXTRACTION_MAX_ATTEMPTS {
-            tracing::warn!(
-                job_id = %task.job_id,
-                workspace_id = %task.workspace_id,
-                chat_id = %task.chat_id,
-                model_id = %task.model_id,
-                attempt,
-                error = %error.message,
-                "memory extraction model output stayed invalid after retry; ignoring extraction"
-            );
-            break result;
-        }
-        tracing::warn!(
-            job_id = %task.job_id,
-            workspace_id = %task.workspace_id,
-            chat_id = %task.chat_id,
-            model_id = %task.model_id,
-            attempt,
-            error = %error.message,
-            "memory extraction model output was invalid; retrying"
-        );
-        attempt += 1;
-    };
+    let extraction_result = run_memory_extraction_job_inner(&task).await;
+    // Protocol/schema failures already consume at most one output-protocol repair inside
+    // audited_provider_tool_request. Do not re-run the original prompt without feedback.
     let mut workspace_memory_database =
         MemoryDatabase::open_or_create_workspace(&task.workspace_path)
             .map_err(ApiError::from_memory_error)?;
@@ -381,8 +352,25 @@ pub(crate) async fn run_memory_extraction_job(
         }
         Err(error) => {
             if memory_extraction_error_should_be_ignored(Some(&error.message)) {
+                // Prefer no facts over incorrect writes. Protocol/schema failures are already
+                // classified on llm_requests; record ignore reason in completion payload.
+                let ignored_reason = memory_extraction_ignore_reason(&error.message);
+                tracing::warn!(
+                    job_id = %task.job_id,
+                    workspace_id = %task.workspace_id,
+                    chat_id = %task.chat_id,
+                    model_id = %task.model_id,
+                    ignored_reason,
+                    error = %error.message,
+                    "memory extraction protocol/schema failure ignored; completing with no facts"
+                );
+                let output_json = serde_json::json!({
+                    "facts": [],
+                    "ignoredReason": ignored_reason,
+                })
+                .to_string();
                 workspace_memory_database
-                    .complete_extraction_job(&task.job_id, r#"{"facts":[]}"#)
+                    .complete_extraction_job(&task.job_id, &output_json)
                     .map_err(ApiError::from_memory_error)?;
                 Vec::new()
             } else {
@@ -855,7 +843,8 @@ pub(crate) async fn call_memory_extraction_provider(
     retry_count: u32,
     save_details: bool,
 ) -> Result<crate::AuditedProviderToolResult, ApiError> {
-    audited_provider_tool_request(
+    // Schema-invalid tool args are eligible for one output-protocol repair inside audited.
+    crate::audited_provider_tool_request_with_args_validate(
         workspace_path,
         workspace_id,
         chat_id,
@@ -868,6 +857,11 @@ pub(crate) async fn call_memory_extraction_provider(
         timeout_ms,
         retry_count,
         save_details,
+        Some(Box::new(|value: &serde_json::Value| {
+            parse_memory_extraction_output(value.clone())
+                .map(|_| ())
+                .map_err(|e| e.message)
+        })),
     )
     .await
 }
@@ -883,7 +877,7 @@ pub(crate) async fn call_memory_retrieval_provider(
     retry_count: u32,
     save_details: bool,
 ) -> Result<crate::AuditedProviderToolResult, ApiError> {
-    audited_provider_tool_request(
+    crate::audited_provider_tool_request_with_args_validate(
         workspace_path,
         workspace_id,
         chat_id,
@@ -896,6 +890,11 @@ pub(crate) async fn call_memory_retrieval_provider(
         timeout_ms,
         retry_count,
         save_details,
+        Some(Box::new(|value: &serde_json::Value| {
+            parse_memory_retrieval_output(value.clone())
+                .map(|_| ())
+                .map_err(|e| e.message)
+        })),
     )
     .await
 }
@@ -918,6 +917,17 @@ pub(crate) fn memory_extraction_error_should_be_ignored(error_message: Option<&s
         || message.starts_with("memory extraction called unsupported tool ")
         || message.starts_with("memory extraction completed with unsupported tool ")
         || message.starts_with("extracted fact ")
+}
+
+/// Stable ignore reason for extraction completion when protocol/schema fails safely.
+pub(crate) fn memory_extraction_ignore_reason(error_message: &str) -> &'static str {
+    if let Some(kind) =
+        crate::structured_llm_outcome::classify_caller_structured_failure_kind(error_message)
+    {
+        return kind.category_label();
+    }
+    crate::structured_llm_outcome::classify_provider_tool_failure_kind(error_message, None)
+        .category_label()
 }
 
 pub(crate) fn parse_memory_retrieval_output(
@@ -1209,5 +1219,66 @@ fn memory_scopes_share_database(left: MemoryScope, right: MemoryScope) -> bool {
         (MemoryScope::Global, MemoryScope::Global) => true,
         (MemoryScope::Global, _) | (_, MemoryScope::Global) => false,
         _ => true,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extraction_protocol_and_schema_errors_are_ignored() {
+        assert!(memory_extraction_error_should_be_ignored(Some(
+            "malformed memory extraction JSON: missing field `facts`"
+        )));
+        assert!(memory_extraction_error_should_be_ignored(Some(
+            "memory extraction did not call submit tool"
+        )));
+        assert!(memory_extraction_error_should_be_ignored(Some(
+            "memory extraction returned text instead of submit tool: hello"
+        )));
+        assert!(memory_extraction_error_should_be_ignored(Some(
+            "memory extraction completed with unsupported tool 'foo'"
+        )));
+        assert!(memory_extraction_error_should_be_ignored(Some(
+            "extracted fact fact-1 has invalid confidence"
+        )));
+        assert!(!memory_extraction_error_should_be_ignored(Some(
+            "memory extraction stream failed: boom"
+        )));
+        assert!(!memory_extraction_error_should_be_ignored(Some(
+            "memory extraction timed out after 60000 ms"
+        )));
+        assert!(!memory_extraction_error_should_be_ignored(None));
+    }
+
+    #[test]
+    fn extraction_ignore_reason_is_stable_category_label() {
+        assert_eq!(
+            memory_extraction_ignore_reason(
+                "malformed memory extraction JSON: missing field `facts`"
+            ),
+            "schema_invalid"
+        );
+        assert_eq!(
+            memory_extraction_ignore_reason("memory extraction did not call submit tool"),
+            "missing_tool"
+        );
+        assert_eq!(
+            memory_extraction_ignore_reason(
+                "memory extraction returned text instead of submit tool: hello"
+            ),
+            "prose"
+        );
+        assert_eq!(
+            memory_extraction_ignore_reason(
+                "memory extraction completed with unsupported tool 'foo'"
+            ),
+            "wrong_tool"
+        );
+        assert_eq!(
+            memory_extraction_ignore_reason("extracted fact fact-1 has invalid confidence"),
+            "semantic_invalid"
+        );
     }
 }
