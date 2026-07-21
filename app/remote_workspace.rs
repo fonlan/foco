@@ -7123,6 +7123,9 @@ async fn broker_web_tool(
         tool_name,
         arguments,
         Duration::from_millis(timeout_ms),
+        // Phase 3: local cache path for main-process execution. SSH materialization of
+        // fullResultPath into the sidecar workspace is handled in a later phase.
+        Path::new(&state.user_profile_dir),
     )
     .await
     {

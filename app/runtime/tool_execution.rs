@@ -1204,7 +1204,13 @@ async fn execute_tool_unbudgeted(
             _ = cancellation_token_cancelled(cancellation_token.clone()) => {
                 Err("tool execution cancelled".to_string())
             }
-            execution = execute_web_tool(web_search_settings, tool_name, arguments, remaining_timeout) => execution,
+            execution = execute_web_tool(
+                web_search_settings,
+                tool_name,
+                arguments,
+                remaining_timeout,
+                tool_workspace_path,
+            ) => execution,
         };
         let execution = match execution {
             Ok(output) => ToolExecution {
