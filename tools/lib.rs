@@ -83,10 +83,11 @@ pub const AGENT_WAIT_TASKS_TOOL: &str = "agent_wait_tasks";
 pub const AGENT_TRANSFER_TASK_TOOL: &str = "agent_transfer_task";
 pub const AGENT_CREATE_INSTANCES_TOOL: &str = "agent_create_instances";
 
-/// Full unscoped `read_file` will not load sources larger than this; use startLine/endLine instead.
-const MAX_FULL_READ_BYTES: u64 = 128 * 1024;
+/// Ordinary text source protection for `read_file` (full and ranged). Soft output truncation is
+/// separate: large sources under this ceiling still return complete-line prefixes successfully.
 const MAX_RANGED_READ_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
-/// Hard safety cap on numbered `read_file` content before the shared 128 KiB envelope gate.
+/// Hard safety cap on numbered `read_file` content before the shared 128 KiB envelope gate
+/// (SKILL.md full-document path only; ordinary reads use complete-line soft truncation first).
 const MAX_RANGED_READ_OUTPUT_BYTES: usize = output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT;
 const MAX_FIND_ENTRIES: usize = 200;
 const MAX_SEARCH_TEXT_LINE_BYTES: usize = 4 * 1024;
@@ -714,7 +715,8 @@ pub(crate) fn normalize_read_line_range(
 }
 
 pub(crate) fn count_text_lines(content: &str) -> usize {
-    line_spans(content).len()
+    // Same line-ending rules as numbered_content / read ranges (`\r\n`, `\n`, `\r`).
+    output_budget::complete_line_count(content)
 }
 
 pub(crate) fn read_line_range(content: &str, range: &LineRange) -> String {
@@ -1668,10 +1670,12 @@ mod tests {
     }
 
     #[test]
-    fn rejects_full_file_read_larger_than_limit() {
+    fn rejects_full_file_read_larger_than_source_protection() {
         let workspace = tempfile::tempdir().expect("workspace");
-        let content = "x".repeat(MAX_FULL_READ_BYTES as usize + 1);
-        fs::write(workspace.path().join("large.txt"), content).expect("write large file");
+        let path = workspace.path().join("large.txt");
+        let file = fs::File::create(&path).expect("create large file");
+        file.set_len(MAX_RANGED_READ_SOURCE_BYTES + 1)
+            .expect("set_len beyond ordinary source protection");
 
         let result = execute_builtin_tool(
             workspace.path(),
@@ -1687,7 +1691,7 @@ mod tests {
             .expect("error");
         assert!(error.contains("too large to read"), "{error}");
         assert!(
-            error.contains(&format!("max {MAX_FULL_READ_BYTES}")),
+            error.contains(&format!("max {MAX_RANGED_READ_SOURCE_BYTES}")),
             "{error}"
         );
         assert!(error.contains("startLine/endLine"), "{error}");
@@ -1695,12 +1699,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_full_file_read_over_soft_budget_with_suggested_range() {
+    fn full_file_read_over_soft_budget_returns_truncated_success() {
         let workspace = tempfile::tempdir().expect("workspace");
-        // Under the 128 KiB full-read source cap, but over the 50 KiB soft numbered output budget.
-        let content = format!("{}\n", "y".repeat(60 * 1024));
-        assert!(content.len() < MAX_FULL_READ_BYTES as usize);
-        fs::write(workspace.path().join("soft.txt"), content).expect("write soft file");
+        // Many short lines so soft byte/line budgets truncate with more content remaining.
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let mut content = String::new();
+        while content.len() < 60 * 1024 {
+            content.push_str(line);
+        }
+        assert!(content.len() < MAX_RANGED_READ_SOURCE_BYTES as usize);
+        fs::write(workspace.path().join("soft.txt"), &content).expect("write soft file");
 
         let result = execute_builtin_tool(
             workspace.path(),
@@ -1708,23 +1716,159 @@ mod tests {
             json!({ "path": "soft.txt", "startLine": null, "endLine": null }),
         );
 
-        assert!(result.is_error);
-        let error = result
-            .output
-            .get("error")
-            .and_then(Value::as_str)
-            .expect("error");
-        assert!(error.contains("soft output budget"), "{error}");
-        assert!(error.contains("startLine="), "{error}");
-        assert!(error.contains("endLine="), "{error}");
-        assert!(error.contains("soft.txt"), "{error}");
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        let next = result.output["nextStartLine"]
+            .as_u64()
+            .expect("nextStartLine") as usize;
+        assert!(next >= 2, "nextStartLine={next}");
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.starts_with("1\t"));
+        assert!(body.len() <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        assert!(
+            result.output["returnedLines"].as_u64().unwrap_or(0) >= 1,
+            "{:?}",
+            result.output
+        );
+        assert!(
+            result.output["note"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("nextStartLine"),
+            "{:?}",
+            result.output["note"]
+        );
+
+        // Full ToolExecution JSON (path/bytes/lines/note) must stay under the soft envelope when
+        // multi-line soft truncation applied; normalize must preserve truncated success.
+        let measured = output_budget::serialized_json_size(&result).expect("measure");
+        assert!(
+            measured <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+            "measured={measured}"
+        );
+        let normalized = output_budget::normalize_tool_execution(
+            READ_FILE_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            result.clone(),
+        );
+        assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
+        assert_eq!(normalized.execution.output["truncated"], true);
+
+        // Page with nextStartLine until complete; reassemble unnumbered lines and match original.
+        let end_line = count_text_lines(&content);
+        let expected_numbered = numbered_content(&content, 1);
+        let mut reassembled = body.to_string();
+        let mut cursor = next;
+        let last_first = result.output["lastReturnedLine"].as_u64().expect("last") as usize;
+        assert_eq!(last_first + 1, next);
+        for _ in 0..32 {
+            let page = execute_builtin_tool(
+                workspace.path(),
+                READ_FILE_TOOL,
+                json!({
+                    "path": "soft.txt",
+                    "startLine": cursor,
+                    "endLine": end_line,
+                }),
+            );
+            assert!(!page.is_error, "{:?}", page.output);
+            let page_body = page.output["content"].as_str().expect("page content");
+            assert!(
+                page_body.starts_with(&format!("{cursor}\t")),
+                "page should start at absolute line {cursor}: {}",
+                &page_body[..page_body.len().min(40)]
+            );
+            reassembled.push_str(page_body);
+            if page.output["truncated"].as_bool() != Some(true) {
+                assert_eq!(page.output["truncated"], false);
+                break;
+            }
+            let page_last = page.output["lastReturnedLine"]
+                .as_u64()
+                .expect("lastReturnedLine") as usize;
+            let page_next = page.output["nextStartLine"]
+                .as_u64()
+                .expect("nextStartLine") as usize;
+            assert_eq!(page_last + 1, page_next);
+            cursor = page_next;
+        }
+        assert_eq!(reassembled, expected_numbered);
     }
 
     #[test]
-    fn reads_line_range_from_file_larger_than_full_read_limit() {
+    fn ordinary_file_without_trailing_newline_truncates_and_continues() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut content = String::new();
+        for i in 0..2500 {
+            if i > 0 {
+                content.push('\n');
+            }
+            content.push_str(&format!("row-{i}-payload-xxxxxxxx"));
+        }
+        // No final newline on last line.
+        assert!(!content.ends_with('\n'));
+        fs::write(workspace.path().join("no-nl.txt"), &content).expect("write");
+
+        let first = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "no-nl.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["truncated"], true);
+        let next = first.output["nextStartLine"].as_u64().expect("next") as usize;
+        let end_line = count_text_lines(&content);
+        let second = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": "no-nl.txt",
+                "startLine": next,
+                "endLine": end_line,
+            }),
+        );
+        assert!(!second.is_error, "{:?}", second.output);
+        let second_body = second.output["content"].as_str().expect("content");
+        assert!(second_body.contains(&format!("{end_line}\t")));
+        assert!(second_body.contains("row-2499-payload"));
+    }
+
+    #[test]
+    fn full_file_read_between_former_128kib_and_source_protection_truncates() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Formerly blocked at 128 KiB full-read source cap; now allowed under 32 MiB with prefix.
+        let line = "line-content-padding-xxxxxxxxxxxxxxxx\n";
+        let mut content = String::new();
+        while content.len() <= 128 * 1024 {
+            content.push_str(line);
+        }
+        assert!(content.len() > 128 * 1024);
+        assert!(content.len() < MAX_RANGED_READ_SOURCE_BYTES as usize);
+        fs::write(workspace.path().join("mid.txt"), &content).expect("write mid file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "mid.txt", "startLine": null, "endLine": null }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert!(
+            result.output["nextStartLine"].as_u64().unwrap_or(0) >= 2,
+            "{:?}",
+            result.output
+        );
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.starts_with("1\t"));
+        assert!(body.len() <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+    }
+
+    #[test]
+    fn reads_line_range_from_file_larger_than_128kib() {
         let workspace = tempfile::tempdir().expect("workspace");
         let mut content = String::from("needle\n");
-        while content.len() <= MAX_FULL_READ_BYTES as usize {
+        while content.len() <= 128 * 1024 {
             content.push_str("padding line\n");
         }
         fs::write(workspace.path().join("large.txt"), content).expect("write large file");
@@ -1739,10 +1883,11 @@ mod tests {
         assert_eq!(result.output["content"], "1\tneedle\n");
         assert_eq!(result.output["startLine"], 1);
         assert_eq!(result.output["endLine"], 1);
+        assert_eq!(result.output["truncated"], false);
     }
 
     #[test]
-    fn rejects_line_range_output_larger_than_limit() {
+    fn rejects_line_range_single_line_over_hard_output_ceiling() {
         let workspace = tempfile::tempdir().expect("workspace");
         let first_line = "x".repeat(MAX_RANGED_READ_OUTPUT_BYTES);
         fs::write(
@@ -1764,16 +1909,287 @@ mod tests {
             .and_then(Value::as_str)
             .expect("error");
         assert!(
-            error.contains("too large") || error.contains("hard max"),
+            error.contains("too large")
+                || error.contains("hard")
+                || error.contains("exceeds")
+                || error.contains("splitting"),
             "{error}"
         );
-        assert!(
-            error.contains(&format!("{MAX_RANGED_READ_OUTPUT_BYTES}"))
-                || error.contains("soft output budget"),
-            "{error}"
-        );
-        assert!(error.contains("startLine"), "{error}");
         assert!(error.contains("large-line.txt"), "{error}");
+    }
+
+    #[test]
+    fn ranged_read_truncates_with_absolute_next_start_line() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let line = "abcdefghij0123456789\n";
+        let mut content = String::new();
+        for _ in 0..4000 {
+            content.push_str(line);
+        }
+        fs::write(workspace.path().join("range.txt"), &content).expect("write range file");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "range.txt", "startLine": 10, "endLine": 3500 }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["startLine"], 10);
+        assert_eq!(result.output["endLine"], 3500);
+        let next = result.output["nextStartLine"]
+            .as_u64()
+            .expect("nextStartLine") as usize;
+        let last = result.output["lastReturnedLine"]
+            .as_u64()
+            .expect("lastReturnedLine") as usize;
+        assert_eq!(last + 1, next);
+        assert!(next > 10);
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.starts_with("10\t"));
+    }
+
+    #[test]
+    fn empty_file_read_returns_empty_content_not_truncated() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("empty.txt"), "").expect("write empty");
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "empty.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["content"], "");
+        assert_eq!(result.output["truncated"], false);
+        assert_eq!(result.output["returnedLines"], 0);
+    }
+
+    #[test]
+    fn crlf_and_utf8_lines_truncate_on_complete_line_boundaries() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut content = String::new();
+        for i in 0..3000 {
+            content.push_str(&format!("行-{i}-αβγ\r\n"));
+        }
+        fs::write(workspace.path().join("crlf.txt"), &content).expect("write crlf");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "crlf.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        let body = result.output["content"].as_str().expect("content");
+        // Numbered lines must keep CRLF endings intact (complete lines).
+        assert!(body.contains("\r\n"), "expected CRLF preserved in {body:?}");
+        assert!(body.is_char_boundary(body.len()));
+        assert!(!body.ends_with('\r'), "must not split CRLF mid-sequence");
+    }
+
+    #[test]
+    fn cr_only_file_truncates_and_continues_by_true_line_count() {
+        // Review P1: lone `\r` endings must share line_spans semantics with truncation/peel.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let total_lines = output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT + 800;
+        let content = "x\r".repeat(total_lines);
+        assert_eq!(count_text_lines(&content), total_lines);
+        fs::write(workspace.path().join("cr-only.txt"), &content).expect("write cr-only");
+
+        let first = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "cr-only.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!first.is_error, "{:?}", first.output);
+        assert_eq!(first.output["truncated"], true);
+        let returned = first.output["returnedLines"].as_u64().expect("returned") as usize;
+        assert!(
+            returned <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT,
+            "returned={returned} must not bypass soft line limit"
+        );
+        assert!(returned >= 1, "{:?}", first.output);
+        let next = first.output["nextStartLine"].as_u64().expect("next") as usize;
+        let last = first.output["lastReturnedLine"].as_u64().expect("last") as usize;
+        assert_eq!(last + 1, next);
+        let body = first.output["content"].as_str().expect("content");
+        assert!(body.starts_with("1\t"));
+        assert!(body.contains('\r'));
+        // Numbered CR-only content has no LF between source lines.
+        assert!(
+            !body.contains("\n"),
+            "CR-only source lines must not invent LF endings: {body:?}"
+        );
+
+        // Continue and reassemble absolute numbered content without overlap/gap.
+        let expected_numbered = numbered_content(&content, 1);
+        let mut reassembled = body.to_string();
+        let mut cursor = next;
+        for _ in 0..8 {
+            let page = execute_builtin_tool(
+                workspace.path(),
+                READ_FILE_TOOL,
+                json!({
+                    "path": "cr-only.txt",
+                    "startLine": cursor,
+                    "endLine": total_lines,
+                }),
+            );
+            assert!(!page.is_error, "{:?}", page.output);
+            let page_body = page.output["content"].as_str().expect("page content");
+            assert!(
+                page_body.starts_with(&format!("{cursor}\t")),
+                "expected absolute line {cursor}, got {}",
+                &page_body[..page_body.len().min(40)]
+            );
+            reassembled.push_str(page_body);
+            if page.output["truncated"].as_bool() != Some(true) {
+                break;
+            }
+            let page_last = page.output["lastReturnedLine"]
+                .as_u64()
+                .expect("lastReturnedLine") as usize;
+            let page_next = page.output["nextStartLine"]
+                .as_u64()
+                .expect("nextStartLine") as usize;
+            assert_eq!(page_last + 1, page_next);
+            cursor = page_next;
+        }
+        assert_eq!(reassembled, expected_numbered);
+
+        let normalized = output_budget::normalize_tool_execution(
+            READ_FILE_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            first.clone(),
+        );
+        assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
+        assert_eq!(normalized.execution.output["truncated"], true);
+    }
+
+    #[test]
+    fn single_soft_over_line_under_hard_returns_full_line() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let long = "z".repeat(output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 256);
+        let content = format!("{long}\ntrailer\n");
+        fs::write(workspace.path().join("longline.txt"), &content).expect("write longline");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "longline.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["nextStartLine"], 2);
+        assert_eq!(result.output["returnedLines"], 1);
+        let body = result.output["content"].as_str().expect("content");
+        assert!(body.starts_with("1\t"));
+        assert!(body.contains(&long[..32]));
+        assert!(!body.contains("trailer"));
+    }
+
+    #[test]
+    fn exact_soft_line_limit_with_trailing_newlines_stays_success() {
+        // Review P1: "line\n" × 2000 must not become a softLineLimit failure after normalize.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = "line\n".repeat(output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT);
+        assert_eq!(
+            count_text_lines(&content),
+            output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
+        );
+        fs::write(workspace.path().join("exact-lines.txt"), &content).expect("write");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": "exact-lines.txt", "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        let returned = result.output["returnedLines"].as_u64().expect("returnedLines") as usize;
+        assert!(returned >= 1, "{:?}", result.output);
+        // May be full or truncated depending on path/note line overhead, but never a soft error.
+        if result.output["truncated"].as_bool() == Some(true) {
+            let next = result.output["nextStartLine"].as_u64().expect("next") as usize;
+            let last = result.output["lastReturnedLine"].as_u64().expect("last") as usize;
+            assert_eq!(last + 1, next);
+            assert!(next <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT + 1);
+        } else {
+            assert_eq!(result.output["truncated"], false);
+            assert_eq!(returned, output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT);
+        }
+
+        let measured = output_budget::serialized_json_size(&result).expect("measure");
+        let normalized = output_budget::normalize_tool_execution(
+            READ_FILE_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            result.clone(),
+        );
+        assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
+        if result.output["truncated"].as_bool() == Some(true) {
+            // Truncated success may exceed soft only for single soft-over lines; multi-line
+            // prefixes must stay under soft after dynamic budgeting.
+            if returned > 1 {
+                assert!(
+                    measured <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+                    "measured={measured}"
+                );
+            }
+        } else {
+            assert!(
+                measured <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+                "measured={measured}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_path_metadata_still_keeps_truncated_success_under_soft_envelope() {
+        // Review P2: dynamic path cost must not let multi-line truncated success exceed soft.
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut dir = workspace.path().to_path_buf();
+        // Nested dirs to create a long relative path without hitting OS path limits hard.
+        for i in 0..8 {
+            dir = dir.join(format!("dir-with-a-quite-long-name-{i:02}"));
+        }
+        fs::create_dir_all(&dir).expect("mkdirs");
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789\n";
+        let mut content = String::new();
+        while content.len() < 60 * 1024 {
+            content.push_str(line);
+        }
+        let file_name = "payload-with-a-long-file-name-xxxxxxxx.txt";
+        fs::write(dir.join(file_name), &content).expect("write");
+        let rel = dir
+            .strip_prefix(workspace.path())
+            .expect("strip")
+            .join(file_name);
+        let rel = rel.to_string_lossy().replace('\\', "/");
+        assert!(rel.len() > 200, "rel path should be long: {rel}");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({ "path": rel, "startLine": null, "endLine": null }),
+        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        let returned = result.output["returnedLines"].as_u64().unwrap_or(0);
+        assert!(returned >= 1, "{:?}", result.output);
+        if returned > 1 {
+            let measured = output_budget::serialized_json_size(&result).expect("measure");
+            assert!(
+                measured <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+                "measured={measured} path_len={}",
+                rel.len()
+            );
+        }
+        let normalized = output_budget::normalize_tool_execution(
+            READ_FILE_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            result.clone(),
+        );
+        assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
+        assert_eq!(normalized.execution.output["truncated"], true);
     }
 
     #[test]
@@ -1974,10 +2390,11 @@ mod tests {
     }
 
     #[test]
-    fn read_file_output_limits_are_128kib() {
-        assert_eq!(MAX_FULL_READ_BYTES, 128 * 1024);
+    fn read_file_output_limits_are_documented_constants() {
         assert_eq!(MAX_RANGED_READ_OUTPUT_BYTES, 128 * 1024);
         assert_eq!(MAX_RANGED_READ_SOURCE_BYTES, 32 * 1024 * 1024);
+        assert_eq!(output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT, 50 * 1024);
+        assert_eq!(output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT, 2_000);
     }
 
     #[test]

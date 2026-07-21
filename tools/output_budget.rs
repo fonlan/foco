@@ -277,9 +277,7 @@ impl CompleteLineTruncateOutcome {
     pub fn model_note(&self) -> Option<String> {
         match self {
             Self::Full(prefix) if !prefix.truncated => None,
-            Self::Full(prefix) | Self::Truncated(prefix) => {
-                Some(complete_line_prefix_note(prefix))
-            }
+            Self::Full(prefix) | Self::Truncated(prefix) => Some(complete_line_prefix_note(prefix)),
             Self::SingleLineExceedsHardLimit {
                 line_number,
                 line_bytes,
@@ -305,10 +303,71 @@ impl CompleteLineTruncateOutcome {
     }
 }
 
+/// Walk complete lines of `content` using the same endings as file-tool `line_spans`:
+/// `\r\n`, `\n`, and lone `\r`. Each visit receives the 0-based line offset and the line slice
+/// including its trailing line ending when present. A trailing newline does **not** create an
+/// extra empty line. Return `false` from `visit` to stop early.
+pub fn for_each_complete_line<'a, F>(content: &'a str, mut visit: F)
+where
+    F: FnMut(usize, &'a str) -> bool,
+{
+    if content.is_empty() {
+        return;
+    }
+    let bytes = content.as_bytes();
+    let mut start = 0_usize;
+    let mut index = 0_usize;
+    let mut offset = 0_usize;
+    while index < bytes.len() {
+        let end = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index + 2,
+            b'\r' | b'\n' => index + 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        if !visit(offset, &content[start..end]) {
+            return;
+        }
+        offset = offset.saturating_add(1);
+        start = end;
+        index = end;
+    }
+    if start < bytes.len() {
+        let _ = visit(offset, &content[start..]);
+    }
+}
+
+/// Drop the last complete line from `prefix_text` (supports `\r\n` / `\n` / `\r`).
+///
+/// Returns `Some("")` when only one line remains, or `None` when `prefix_text` is empty.
+pub fn peel_last_complete_line(prefix_text: &str) -> Option<&str> {
+    if prefix_text.is_empty() {
+        return None;
+    }
+    let mut prev_end = 0_usize;
+    let mut end = 0_usize;
+    let mut count = 0_usize;
+    for_each_complete_line(prefix_text, |_, line| {
+        prev_end = end;
+        end = end.saturating_add(line.len());
+        count = count.saturating_add(1);
+        true
+    });
+    if count == 0 {
+        None
+    } else if count == 1 {
+        Some("")
+    } else {
+        Some(&prefix_text[..prev_end])
+    }
+}
+
 /// Take a UTF-8 complete-line prefix of `content` under shared soft/hard budgets.
 ///
-/// Line measurement uses raw UTF-8 byte length of each line (including its trailing newline when
-/// present). Callers that emit numbered lines (e.g. `read_file`) should use
+/// Line measurement uses raw UTF-8 byte length of each line (including its trailing line ending
+/// when present). Callers that emit numbered lines (e.g. `read_file`) should use
 /// [`truncate_to_complete_lines_with_measure`] instead.
 pub fn truncate_to_complete_lines(
     content: &str,
@@ -320,8 +379,8 @@ pub fn truncate_to_complete_lines(
 /// Like [`truncate_to_complete_lines`], but each line's byte cost is supplied by `measure_line`.
 ///
 /// `measure_line` receives the 1-based line number and the line slice (including its trailing
-/// `\n` when present via `split_inclusive`). UTF-8 character boundaries are never split because
-/// iteration is over whole lines of a valid `&str`.
+/// `\r\n` / `\n` / `\r` when present). UTF-8 character boundaries are never split because
+/// iteration is over whole lines of a valid `&str`. Line endings match file-tool `line_spans`.
 pub fn truncate_to_complete_lines_with_measure<F>(
     content: &str,
     options: CompleteLineTruncateOptions,
@@ -350,18 +409,23 @@ where
     let mut lines = 0_usize;
     let mut last_line = start;
     let mut remaining_after_prefix = false;
+    // Soft-over single complete line must be marked truncated so normalize preserves the
+    // success under the Phase 1 `truncated == true` contract, even when it is the entire
+    // remaining content (nextStartLine may point past EOF).
+    let mut force_truncated = false;
+    let mut hard_limit_failure: Option<(usize, usize)> = None;
 
-    for (offset, line) in content.split_inclusive('\n').enumerate() {
+    for_each_complete_line(content, |offset, line| {
+        if hard_limit_failure.is_some() {
+            return false;
+        }
         let line_no = start.saturating_add(offset);
         let line_bytes = measure_line(line_no, line);
 
         if lines == 0 {
             if line_bytes > hard_bytes {
-                return CompleteLineTruncateOutcome::SingleLineExceedsHardLimit {
-                    line_number: line_no,
-                    line_bytes,
-                    hard_limit_bytes: hard_bytes,
-                };
+                hard_limit_failure = Some((line_no, line_bytes));
+                return false;
             }
             // One complete line over soft but under hard: return it fully so callers make progress.
             if line_bytes > soft_bytes {
@@ -369,28 +433,39 @@ where
                 lines = 1;
                 last_line = line_no;
                 remaining_after_prefix = end_byte < content.len();
-                break;
+                force_truncated = true;
+                return false;
             }
         }
 
         let Some(next_bytes) = bytes.checked_add(line_bytes) else {
             remaining_after_prefix = true;
-            break;
+            return false;
         };
         let next_lines = lines.saturating_add(1);
         if next_bytes > soft_bytes || next_lines > soft_lines {
             remaining_after_prefix = true;
-            break;
+            return false;
         }
 
         end_byte = end_byte.saturating_add(line.len());
         bytes = next_bytes;
         lines = next_lines;
         last_line = line_no;
+        true
+    });
+
+    if let Some((line_number, line_bytes)) = hard_limit_failure {
+        return CompleteLineTruncateOutcome::SingleLineExceedsHardLimit {
+            line_number,
+            line_bytes,
+            hard_limit_bytes: hard_bytes,
+        };
     }
 
     debug_assert!(end_byte <= content.len());
-    let truncated = remaining_after_prefix && end_byte < content.len();
+    let truncated =
+        force_truncated || (remaining_after_prefix && end_byte < content.len());
     let prefix = CompleteLinePrefix {
         text: content[..end_byte].to_string(),
         returned_lines: lines,
@@ -418,7 +493,9 @@ pub fn complete_line_prefix_note(prefix: &CompleteLinePrefix) -> String {
             prefix.returned_lines, prefix.last_returned_line
         );
     }
-    let next = prefix.next_start_line.unwrap_or(prefix.last_returned_line.saturating_add(1));
+    let next = prefix
+        .next_start_line
+        .unwrap_or(prefix.last_returned_line.saturating_add(1));
     format!(
         "Result truncated at a complete line boundary under the shared soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines): returned {} line(s) through line {}. Continue with nextStartLine={next}. This is an explicit truncated success (is_error=false), not hidden data loss.",
         prefix.returned_lines, prefix.last_returned_line
@@ -427,11 +504,15 @@ pub fn complete_line_prefix_note(prefix: &CompleteLinePrefix) -> String {
 
 /// Whether a successful tool result already applied the complete-line budget contract.
 ///
-/// Contract: only non-error outputs with **`truncated: true`** and a positive integer
-/// `nextStartLine` (optional `fullResultPath` / `note`) are treated as actively generated
-/// safe truncated successes. Those must not be re-written into a read-only soft-limit error by
-/// [`normalize_tool_execution`]. `truncated: false` or a missing/invalid truncated flag never
-/// bypasses soft-limit normalization. Hard envelope limits still apply.
+/// Contract (Phase 1 / shared soft-budget preserve rule):
+/// - Non-error outputs with **`truncated: true`** and a positive integer `nextStartLine`
+///   (optional `fullResultPath` / `note`) are treated as actively generated safe truncated
+///   successes and must not be re-written into a read-only soft-limit error by
+///   [`normalize_tool_execution`].
+/// - **`truncated: false` never bypasses** soft-limit normalization, including single-line
+///   full results. Callers that return one soft-over/hard-under complete line must set
+///   `truncated: true` and a positive `nextStartLine` so the success is preserved.
+/// - Hard envelope limits still apply.
 pub fn is_line_bounded_budget_success(execution: &ToolExecution) -> bool {
     if execution.is_error {
         return false;
@@ -439,10 +520,10 @@ pub fn is_line_bounded_budget_success(execution: &ToolExecution) -> bool {
     let Some(fields) = execution.output.as_object() else {
         return false;
     };
-    if fields.get(LINE_BOUNDED_TRUNCATED_FIELD) != Some(&Value::Bool(true)) {
-        return false;
-    }
-    fields
+    matches!(
+        fields.get(LINE_BOUNDED_TRUNCATED_FIELD),
+        Some(Value::Bool(true))
+    ) && fields
         .get(LINE_BOUNDED_NEXT_START_LINE_FIELD)
         .and_then(Value::as_u64)
         .is_some_and(|line| line >= 1)
@@ -634,18 +715,23 @@ fn budget_reason(
     }
 }
 
+/// Count complete lines using the same semantics as [`for_each_complete_line`] /
+/// file-tool `line_spans`: `\r\n`, `\n`, and lone `\r` are line endings; a trailing
+/// newline does **not** create an extra empty line.
+///
+/// Examples: `""` → 0, `"a"` → 1, `"a\n"` → 1, `"a\nb\n"` → 2, `"a\rb\r"` → 2.
+pub fn complete_line_count(text: &str) -> usize {
+    let mut count = 0_usize;
+    for_each_complete_line(text, |_, _| {
+        count = count.saturating_add(1);
+        true
+    });
+    count
+}
+
 fn value_text_lines(value: &Value) -> usize {
     match value {
-        Value::String(text) => {
-            if text.is_empty() {
-                0
-            } else {
-                text.bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    .saturating_add(1)
-            }
-        }
+        Value::String(text) => complete_line_count(text),
         Value::Array(values) => values.iter().fold(0_usize, |lines, value| {
             lines.saturating_add(value_text_lines(value))
         }),
@@ -1014,8 +1100,9 @@ mod tests {
 
     #[test]
     fn normalize_tool_execution_applies_line_soft_limit() {
+        // complete_line_count("line\n" * N) == N; need N > soft line limit.
         let execution = ToolExecution {
-            output: json!({ "content": "line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT) }),
+            output: json!({ "content": "line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT + 1) }),
             is_error: false,
         };
 
@@ -1109,8 +1196,8 @@ mod tests {
 
     #[test]
     fn soft_line_boundary_accepts_exact_limit_and_rejects_plus_one() {
-        // value_text_lines counts trailing-newline-free text as N lines for N newlines + 1.
-        // "line\n" * 1999 ends with newline → 1999 lines; plus final "line" → 2000 lines.
+        // complete_line_count matches split_inclusive: trailing newline does not add an extra line.
+        // "line\n" * 1999 + "line" → 2000 complete lines; "line\n" * 2000 + "line" → 2001.
         let at_limit_text = format!("{}line", "line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT - 1));
         let at_limit = ToolExecution {
             output: json!({ "content": at_limit_text }),
@@ -1150,6 +1237,37 @@ mod tests {
         );
         assert_eq!(over.execution.output["reason"], "softLineLimit");
         assert!(over.execution.is_error);
+    }
+
+    #[test]
+    fn complete_line_count_matches_line_spans_endings() {
+        assert_eq!(complete_line_count(""), 0);
+        assert_eq!(complete_line_count("a"), 1);
+        assert_eq!(complete_line_count("a\n"), 1);
+        assert_eq!(complete_line_count("a\nb"), 2);
+        assert_eq!(complete_line_count("a\nb\n"), 2);
+        assert_eq!(
+            complete_line_count(&"line\n".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT)),
+            TOOL_OUTPUT_SOFT_LINE_LIMIT
+        );
+        // CR-only and CRLF must match file-tool line_spans (not split_inclusive('\\n') alone).
+        assert_eq!(complete_line_count("a\r"), 1);
+        assert_eq!(complete_line_count("a\rb"), 2);
+        assert_eq!(complete_line_count("a\rb\r"), 2);
+        assert_eq!(complete_line_count("a\r\n"), 1);
+        assert_eq!(complete_line_count("a\r\nb\r\n"), 2);
+        assert_eq!(complete_line_count(&"x\r".repeat(3000)), 3000);
+        assert_eq!(complete_line_count("a\rb\nc\r\nd"), 4);
+    }
+
+    #[test]
+    fn peel_last_complete_line_handles_cr_lf_and_crlf() {
+        assert_eq!(peel_last_complete_line(""), None);
+        assert_eq!(peel_last_complete_line("only"), Some(""));
+        assert_eq!(peel_last_complete_line("a\nb\n"), Some("a\n"));
+        assert_eq!(peel_last_complete_line("a\rb\r"), Some("a\r"));
+        assert_eq!(peel_last_complete_line("a\r\nb\r\n"), Some("a\r\n"));
+        assert_eq!(peel_last_complete_line("a\rb\nc"), Some("a\rb\n"));
     }
 
     #[test]
@@ -1426,7 +1544,10 @@ mod tests {
     fn truncate_to_complete_lines_single_soft_over_line_under_hard_makes_progress() {
         let long_line = "x".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT + 64);
         let content = format!("{long_line}\nmore\n");
-        let outcome = truncate_to_complete_lines(content.as_str(), CompleteLineTruncateOptions::shared_defaults());
+        let outcome = truncate_to_complete_lines(
+            content.as_str(),
+            CompleteLineTruncateOptions::shared_defaults(),
+        );
         match outcome {
             CompleteLineTruncateOutcome::Truncated(prefix) => {
                 assert!(prefix.text.starts_with(&long_line));
@@ -1442,12 +1563,31 @@ mod tests {
     }
 
     #[test]
-    fn truncate_to_complete_lines_single_line_over_hard_is_error_outcome() {
-        let long_line = "y".repeat(TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT + 1);
+    fn truncate_to_complete_lines_single_soft_over_entire_content_still_truncated_true() {
+        // Soft-over single line that is the entire content must still set truncated=true so
+        // normalize preserves the success (Phase 1: truncated:false never bypasses soft limits).
+        let long_line = "z".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT + 32);
         let outcome = truncate_to_complete_lines(
             &long_line,
             CompleteLineTruncateOptions::shared_defaults(),
         );
+        match outcome {
+            CompleteLineTruncateOutcome::Truncated(prefix) => {
+                assert_eq!(prefix.text, long_line);
+                assert_eq!(prefix.returned_lines, 1);
+                assert_eq!(prefix.last_returned_line, 1);
+                assert_eq!(prefix.next_start_line, Some(2));
+                assert!(prefix.truncated);
+            }
+            other => panic!("expected truncated soft-over full content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_to_complete_lines_single_line_over_hard_is_error_outcome() {
+        let long_line = "y".repeat(TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT + 1);
+        let outcome =
+            truncate_to_complete_lines(&long_line, CompleteLineTruncateOptions::shared_defaults());
         match outcome {
             CompleteLineTruncateOutcome::SingleLineExceedsHardLimit {
                 line_number,
@@ -1474,6 +1614,65 @@ mod tests {
         assert_eq!(prefix.next_start_line, None);
         assert!(matches!(outcome, CompleteLineTruncateOutcome::Full(_)));
         assert!(outcome.model_note().is_none());
+    }
+
+    #[test]
+    fn truncate_to_complete_lines_respects_cr_only_line_endings() {
+        // Review P1: lone `\r` is a line ending (same as line_spans); soft line limit must apply.
+        let content = "x\r".repeat(TOOL_OUTPUT_SOFT_LINE_LIMIT + 500);
+        assert_eq!(
+            complete_line_count(&content),
+            TOOL_OUTPUT_SOFT_LINE_LIMIT + 500
+        );
+        let outcome = truncate_to_complete_lines(
+            &content,
+            CompleteLineTruncateOptions {
+                soft_byte_limit: TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+                soft_line_limit: TOOL_OUTPUT_SOFT_LINE_LIMIT,
+                hard_byte_limit: TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT,
+                content_start_line: 1,
+            },
+        );
+        match outcome {
+            CompleteLineTruncateOutcome::Truncated(prefix) => {
+                assert_eq!(prefix.returned_lines, TOOL_OUTPUT_SOFT_LINE_LIMIT);
+                assert_eq!(prefix.last_returned_line, TOOL_OUTPUT_SOFT_LINE_LIMIT);
+                assert_eq!(
+                    prefix.next_start_line,
+                    Some(TOOL_OUTPUT_SOFT_LINE_LIMIT + 1)
+                );
+                assert_eq!(
+                    complete_line_count(&prefix.text),
+                    TOOL_OUTPUT_SOFT_LINE_LIMIT
+                );
+                assert!(prefix.text.ends_with('\r'));
+                assert!(!prefix.text.contains('\n'));
+            }
+            other => panic!("expected truncated CR-only prefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_to_complete_lines_crlf_counts_as_single_ending() {
+        let content = "a\r\nb\r\nc\r\n";
+        let outcome = truncate_to_complete_lines(
+            content,
+            CompleteLineTruncateOptions {
+                soft_byte_limit: content.len(),
+                soft_line_limit: 2,
+                hard_byte_limit: TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT,
+                content_start_line: 5,
+            },
+        );
+        match outcome {
+            CompleteLineTruncateOutcome::Truncated(prefix) => {
+                assert_eq!(prefix.text, "a\r\nb\r\n");
+                assert_eq!(prefix.returned_lines, 2);
+                assert_eq!(prefix.last_returned_line, 6);
+                assert_eq!(prefix.next_start_line, Some(7));
+            }
+            other => panic!("expected truncated CRLF prefix, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1527,9 +1726,18 @@ mod tests {
             output: json!({ "content": "ok" }),
             is_error: false,
         }));
-        // truncated:false must not preserve over-soft successes.
+        // truncated:false never preserves over-soft (including single-line markers).
         assert!(!is_line_bounded_budget_success(&ToolExecution {
             output: json!({ "content": "ok", "truncated": false, "nextStartLine": 2 }),
+            is_error: false,
+        }));
+        assert!(!is_line_bounded_budget_success(&ToolExecution {
+            output: json!({
+                "content": "ok",
+                "truncated": false,
+                "returnedLines": 1,
+                "lastReturnedLine": 1,
+            }),
             is_error: false,
         }));
         assert!(!is_line_bounded_budget_success(&ToolExecution {
@@ -1546,6 +1754,16 @@ mod tests {
         }));
         assert!(is_line_bounded_budget_success(&ToolExecution {
             output: json!({ "content": "ok", "truncated": true, "nextStartLine": 2 }),
+            is_error: false,
+        }));
+        // Multi-line full result without truncation marker must not bypass soft limits.
+        assert!(!is_line_bounded_budget_success(&ToolExecution {
+            output: json!({
+                "content": "ok",
+                "truncated": false,
+                "returnedLines": 2,
+                "lastReturnedLine": 2,
+            }),
             is_error: false,
         }));
     }

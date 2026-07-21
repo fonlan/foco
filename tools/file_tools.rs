@@ -11,17 +11,21 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::output_budget::{
-    SKILL_MD_MAX_BYTES, TOOL_OUTPUT_SOFT_BYTE_LIMIT, TOOL_OUTPUT_SOFT_LINE_LIMIT, path_is_skill_md,
-    soft_limit_array_prefix_len_with_overhead, suggest_read_file_line_range,
+    CompleteLinePrefix, CompleteLineTruncateOptions, CompleteLineTruncateOutcome,
+    LINE_BOUNDED_LAST_RETURNED_LINE_FIELD, LINE_BOUNDED_NEXT_START_LINE_FIELD,
+    LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_RETURNED_LINES_FIELD, LINE_BOUNDED_TRUNCATED_FIELD,
+    SKILL_MD_MAX_BYTES, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+    TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count, complete_line_prefix_note, measure_tool_execution,
+    path_is_skill_md, peel_last_complete_line, serialized_json_size,
+    soft_limit_array_prefix_len_with_overhead, truncate_to_complete_lines_with_measure,
 };
 use crate::{
     CommandOutputLimits, DEFAULT_FILE_TOOL_TIMEOUT_MS, DEFAULT_SEARCH_TEXT_TIMEOUT_MS,
     DEFAULT_WRITE_FILE_TIMEOUT_MS, FIND_FILES_RESPONSE_OVERHEAD_BYTES, LineRange, MAX_FIND_ENTRIES,
-    MAX_FULL_READ_BYTES, MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES,
-    MAX_SEARCH_RESULT_FILES, MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, MAX_SEARCH_TEXT_LINE_BYTES,
-    RIPGREP_PATH, SEARCH_RESULT_TTL, SEARCH_RESULTS_DIR, SEARCH_SNAPSHOT_VERSION,
-    SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES, TextEncoding, ToolCancellationToken, count_text_lines,
-    decode_text_file, encode_text_file,
+    MAX_RANGED_READ_OUTPUT_BYTES, MAX_RANGED_READ_SOURCE_BYTES, MAX_SEARCH_RESULT_FILES,
+    MAX_SEARCH_TEXT_FULL_OUTPUT_BYTES, MAX_SEARCH_TEXT_LINE_BYTES, RIPGREP_PATH, SEARCH_RESULT_TTL,
+    SEARCH_RESULTS_DIR, SEARCH_SNAPSHOT_VERSION, SEARCH_TEXT_RESPONSE_OVERHEAD_BYTES, TextEncoding,
+    ToolCancellationToken, ToolExecution, count_text_lines, decode_text_file, encode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     parse_optional_line_range, read_line_range, relative_workspace_path, replace_line_range,
@@ -85,12 +89,12 @@ fn read_file_inner(
         }
     }
 
+    // Ordinary full and ranged reads share the 32 MiB text source protection. Soft output
+    // truncation is applied after decode (complete-line prefixes), not by refusing the source.
     let max_source_bytes = if is_skill_md {
         SKILL_MD_MAX_BYTES as u64
-    } else if requested_line_range.is_some() {
-        MAX_RANGED_READ_SOURCE_BYTES
     } else {
-        MAX_FULL_READ_BYTES
+        MAX_RANGED_READ_SOURCE_BYTES
     };
 
     if metadata.len() > max_source_bytes {
@@ -138,71 +142,292 @@ fn read_file_inner(
         content
     };
     let content_start_line = line_range.as_ref().map(|range| range.start).unwrap_or(1);
-    let content_end_line = line_range
-        .as_ref()
-        .map(|range| range.end)
-        .unwrap_or_else(|| {
-            let lines = count_text_lines(&content);
-            if lines == 0 { 0 } else { lines }
-        });
-    let numbered = numbered_content(&content, content_start_line);
-    let numbered_lines = if numbered.is_empty() {
-        0
-    } else {
-        numbered
-            .bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            .saturating_add(1)
-    };
 
-    // SKILL.md keeps the full-document integrity exception (Phase 2).
-    // Ordinary files use soft 50 KiB / 2,000-line recoverable errors so the model can shrink ranges.
-    if !is_skill_md {
+    if is_skill_md {
+        // SKILL.md integrity: full document only, never complete-line soft truncation.
+        let numbered = numbered_content(&content, content_start_line);
         if numbered.len() > MAX_RANGED_READ_OUTPUT_BYTES {
             return Err(ToolRuntimeError::InvalidArguments(format!(
-                "read_file path '{}' output is too large ({} bytes; hard max {MAX_RANGED_READ_OUTPUT_BYTES}). Retry with a smaller startLine/endLine range.",
+                "read_file path '{}' SKILL.md output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}).",
                 request.path,
                 numbered.len()
             )));
         }
-        if numbered.len() > TOOL_OUTPUT_SOFT_BYTE_LIMIT
-            || numbered_lines > TOOL_OUTPUT_SOFT_LINE_LIMIT
-        {
-            let (suggest_start, suggest_end) =
-                suggest_read_file_line_range(&content, content_start_line);
-            let range_hint = if line_range.is_some() {
-                format!(
-                    "Requested range was {content_start_line}-{content_end_line} ({} numbered UTF-8 bytes, {numbered_lines} lines).",
-                    numbered.len()
-                )
-            } else {
-                format!(
-                    "Full-file read produced {} numbered UTF-8 bytes across {numbered_lines} lines.",
-                    numbered.len()
-                )
-            };
-            return Err(ToolRuntimeError::InvalidArguments(format!(
-                "read_file path '{}' exceeds the soft output budget (max {TOOL_OUTPUT_SOFT_BYTE_LIMIT} bytes or {TOOL_OUTPUT_SOFT_LINE_LIMIT} lines). {range_hint} Retry with startLine={suggest_start} and endLine={suggest_end} (or a smaller inclusive range), then continue with later ranges. Do not stitch silent truncations.",
-                request.path
-            )));
-        }
-    } else if numbered.len() > MAX_RANGED_READ_OUTPUT_BYTES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file path '{}' SKILL.md output is too large ({} bytes; max {MAX_RANGED_READ_OUTPUT_BYTES}).",
-            request.path,
-            numbered.len()
-        )));
+        return Ok(json!({
+            "path": request.path,
+            "content": numbered,
+            "bytes": metadata.len(),
+            "startLine": Value::Null,
+            "endLine": Value::Null,
+            "timeoutMs": timeout_ms
+        }));
     }
 
-    Ok(json!({
-        "path": request.path,
+    // Ordinary files: budget complete numbered lines without building a huge intermediate string.
+    build_ordinary_read_file_response(
+        &request.path,
+        &content,
+        content_start_line,
+        line_range.as_ref(),
+        metadata.len(),
+        timeout_ms,
+    )
+}
+
+/// Numbered line cost in the final JSON string body: `"<lineNo>\t"` prefix plus the line slice
+/// (including its trailing newline), counted with JSON escape expansion so soft budgeting tracks
+/// the serialized ToolExecution envelope rather than raw UTF-8 only.
+fn numbered_line_measure(line_no: usize, line: &str) -> usize {
+    let mut prefix = line_no.to_string();
+    prefix.push('\t');
+    json_string_body_len(&prefix).saturating_add(json_string_body_len(line))
+}
+
+/// UTF-8 length of a JSON string body (without surrounding quotes), matching serde_json escaping.
+fn json_string_body_len(s: &str) -> usize {
+    let mut len = 0_usize;
+    for byte in s.bytes() {
+        len = len.saturating_add(match byte {
+            b'"' | b'\\' | b'\n' | b'\r' | b'\t' => 2,
+            0x00..=0x1F => 6, // \u00XX
+            _ => 1,
+        });
+    }
+    len
+}
+
+/// Measure ToolExecution JSON size for a `read_file` response with empty content and a
+/// worst-case truncation note so content budgeting accounts for the real path/metadata.
+fn measure_read_file_response_overhead(
+    request_path: &str,
+    line_range: Option<&LineRange>,
+    source_bytes: u64,
+    timeout_ms: u64,
+    content_start_line: usize,
+) -> Result<usize, ToolRuntimeError> {
+    let last = content_start_line
+        .saturating_add(TOOL_OUTPUT_SOFT_LINE_LIMIT)
+        .saturating_sub(1)
+        .max(1);
+    let next = last.saturating_add(1);
+    let note = complete_line_prefix_note(&CompleteLinePrefix {
+        text: String::new(),
+        returned_lines: TOOL_OUTPUT_SOFT_LINE_LIMIT,
+        last_returned_line: last,
+        next_start_line: Some(next),
+        truncated: true,
+    });
+    let skeleton = json!({
+        "path": request_path,
+        "content": "",
+        "bytes": source_bytes,
+        "startLine": line_range.map(|range| range.start),
+        "endLine": line_range.map(|range| range.end),
+        "timeoutMs": timeout_ms,
+        LINE_BOUNDED_TRUNCATED_FIELD: true,
+        LINE_BOUNDED_RETURNED_LINES_FIELD: TOOL_OUTPUT_SOFT_LINE_LIMIT,
+        LINE_BOUNDED_LAST_RETURNED_LINE_FIELD: last,
+        LINE_BOUNDED_NEXT_START_LINE_FIELD: next,
+        LINE_BOUNDED_NOTE_FIELD: note,
+    });
+    let execution = ToolExecution {
+        output: skeleton,
+        is_error: false,
+    };
+    serialized_json_size(&execution).map_err(|error| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "read_file path '{request_path}': failed to measure response budget ({error})"
+        ))
+    })
+}
+
+fn assemble_read_file_response(
+    request_path: &str,
+    numbered: &str,
+    line_range: Option<&LineRange>,
+    source_bytes: u64,
+    timeout_ms: u64,
+    prefix: &CompleteLinePrefix,
+) -> Value {
+    let mut response = json!({
+        "path": request_path,
         "content": numbered,
-        "bytes": metadata.len(),
-        "startLine": line_range.as_ref().map(|range| range.start),
-        "endLine": line_range.as_ref().map(|range| range.end),
-        "timeoutMs": timeout_ms
-    }))
+        "bytes": source_bytes,
+        "startLine": line_range.map(|range| range.start),
+        "endLine": line_range.map(|range| range.end),
+        "timeoutMs": timeout_ms,
+        LINE_BOUNDED_TRUNCATED_FIELD: prefix.truncated,
+        LINE_BOUNDED_RETURNED_LINES_FIELD: prefix.returned_lines,
+        LINE_BOUNDED_LAST_RETURNED_LINE_FIELD: prefix.last_returned_line,
+        LINE_BOUNDED_NEXT_START_LINE_FIELD: prefix.next_start_line,
+    });
+    if prefix.truncated {
+        response[LINE_BOUNDED_NOTE_FIELD] = Value::String(complete_line_prefix_note(prefix));
+    }
+    response
+}
+
+fn build_ordinary_read_file_response(
+    request_path: &str,
+    content: &str,
+    content_start_line: usize,
+    line_range: Option<&LineRange>,
+    source_bytes: u64,
+    timeout_ms: u64,
+) -> Result<Value, ToolRuntimeError> {
+    let content_start_line = content_start_line.max(1);
+
+    if content.is_empty() {
+        let prefix = CompleteLinePrefix {
+            text: String::new(),
+            returned_lines: 0,
+            last_returned_line: content_start_line,
+            next_start_line: None,
+            truncated: false,
+        };
+        return Ok(assemble_read_file_response(
+            request_path,
+            "",
+            line_range,
+            source_bytes,
+            timeout_ms,
+            &prefix,
+        ));
+    }
+
+    // Dynamic overhead from the actual path and response metadata (not a fixed 3 KiB pad).
+    let overhead = measure_read_file_response_overhead(
+        request_path,
+        line_range,
+        source_bytes,
+        timeout_ms,
+        content_start_line,
+    )?;
+    let soft_byte_limit = TOOL_OUTPUT_SOFT_BYTE_LIMIT.saturating_sub(overhead);
+    let hard_byte_limit = TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT.saturating_sub(overhead);
+
+    // Reserve complete lines for non-content string fields (path, optional note) so the final
+    // ToolExecution measurement stays within the shared soft line limit when truncated=false.
+    let path_lines = complete_line_count(request_path).max(1);
+    let metadata_line_reserve = path_lines.saturating_add(2); // note + margin
+    let soft_line_limit = TOOL_OUTPUT_SOFT_LINE_LIMIT
+        .saturating_sub(metadata_line_reserve)
+        .max(1);
+
+    let options = CompleteLineTruncateOptions {
+        soft_byte_limit,
+        soft_line_limit,
+        hard_byte_limit: hard_byte_limit.max(1),
+        content_start_line,
+    };
+
+    let outcome = truncate_to_complete_lines_with_measure(content, options, numbered_line_measure);
+
+    match outcome {
+        CompleteLineTruncateOutcome::SingleLineExceedsHardLimit {
+            line_number,
+            line_bytes,
+            hard_limit_bytes,
+        } => Err(ToolRuntimeError::InvalidArguments(format!(
+            "read_file path '{request_path}': a single complete line (line {line_number}, {line_bytes} numbered UTF-8 bytes) exceeds the hard output ceiling ({hard_limit_bytes} bytes) and cannot be returned without splitting the line. Refine the source or request a different range."
+        ))),
+        CompleteLineTruncateOutcome::Full(prefix)
+        | CompleteLineTruncateOutcome::Truncated(prefix) => {
+            fit_read_file_response_to_envelope(
+                request_path,
+                content,
+                content_start_line,
+                line_range,
+                source_bytes,
+                timeout_ms,
+                prefix,
+            )
+        }
+    }
+}
+
+/// Build the final response and, if the serialized ToolExecution still exceeds the soft budget,
+/// peel complete lines until it fits. A single soft-over/hard-under line is kept with
+/// `truncated: true` so normalize preserves the success.
+fn fit_read_file_response_to_envelope(
+    request_path: &str,
+    full_content: &str,
+    content_start_line: usize,
+    line_range: Option<&LineRange>,
+    source_bytes: u64,
+    timeout_ms: u64,
+    mut prefix: CompleteLinePrefix,
+) -> Result<Value, ToolRuntimeError> {
+    // Peel at most soft_line_limit + 2 times (guard against pathological loops).
+    for _ in 0..=TOOL_OUTPUT_SOFT_LINE_LIMIT.saturating_add(2) {
+        let numbered = numbered_content(&prefix.text, content_start_line);
+        let response = assemble_read_file_response(
+            request_path,
+            &numbered,
+            line_range,
+            source_bytes,
+            timeout_ms,
+            &prefix,
+        );
+        let execution = ToolExecution {
+            output: response.clone(),
+            is_error: false,
+        };
+        let measurement = measure_tool_execution(&execution).map_err(|error| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{request_path}': failed to measure response ({error})"
+            ))
+        })?;
+
+        let within_soft = measurement.serialized_bytes <= TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            && measurement.text_lines <= TOOL_OUTPUT_SOFT_LINE_LIMIT;
+        if within_soft {
+            return Ok(response);
+        }
+
+        if measurement.serialized_bytes > TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT {
+            if prefix.returned_lines <= 1 {
+                return Err(ToolRuntimeError::InvalidArguments(format!(
+                    "read_file path '{request_path}': a single complete line exceeds the hard output ceiling ({} bytes measured; max {}) and cannot be returned without splitting the line. Refine the source or request a different range.",
+                    measurement.serialized_bytes, TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+                )));
+            }
+        } else if prefix.returned_lines <= 1 {
+            // Soft-over single complete line under hard: force truncated markers and keep.
+            if !prefix.truncated {
+                prefix.truncated = true;
+                prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
+                continue;
+            }
+            return Ok(response);
+        }
+
+        // Peel one complete line from the prefix and re-measure.
+        let Some(peeled) = peel_last_complete_line(&prefix.text) else {
+            return Ok(response);
+        };
+        if peeled.len() == prefix.text.len() {
+            return Ok(response);
+        }
+        let more_after_peel = peeled.len() < full_content.len();
+        prefix.text = peeled.to_string();
+        prefix.returned_lines = prefix.returned_lines.saturating_sub(1);
+        prefix.last_returned_line = prefix.last_returned_line.saturating_sub(1).max(content_start_line);
+        prefix.truncated = more_after_peel || prefix.returned_lines > 0;
+        // After peeling there is always remaining content relative to the original request
+        // when we started over budget with multiple lines; mark truncated for continuation.
+        prefix.truncated = true;
+        prefix.next_start_line = Some(prefix.last_returned_line.saturating_add(1));
+        if prefix.returned_lines == 0 {
+            return Err(ToolRuntimeError::InvalidArguments(format!(
+                "read_file path '{request_path}': unable to fit any complete line under the shared soft output budget after accounting for path and metadata. Use a shorter path or a narrower range."
+            )));
+        }
+    }
+
+    Err(ToolRuntimeError::InvalidArguments(format!(
+        "read_file path '{request_path}': unable to fit response under the shared soft output budget."
+    )))
 }
 
 fn resolve_read_file_path(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
