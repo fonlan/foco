@@ -485,7 +485,7 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("confirms Fast once, resets it for unsupported models, and snapshots Fast on send", async () => {
+  it("confirms Fast once, keeps preference across unsupported models, and snapshots Fast on send", async () => {
     const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
     appTestState.settingsResponse = {
       ...settings,
@@ -530,10 +530,8 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByRole("button", { name: "Model: GPT Standard" }),
     );
     expect(
-      await screen.findByText(
-        "Fast mode is not available for the selected model.",
-      ),
-    ).toBeInTheDocument();
+      screen.queryByText("Fast mode is not available for the selected model."),
+    ).not.toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Fast mode" }),
     ).not.toBeInTheDocument();
@@ -545,8 +543,8 @@ describe("app-chat-stream verification surfaces", () => {
     const restoredFastToggle = await screen.findByRole("button", {
       name: "Fast mode",
     });
-    expect(restoredFastToggle).toHaveAttribute("aria-pressed", "false");
-    await userEvent.click(restoredFastToggle);
+    // Preference is kept while the model temporarily cannot use Fast; UI and
+    // send path clamp via selectedRequestLatencyMode, so no error is shown.
     expect(restoredFastToggle).toHaveAttribute("aria-pressed", "true");
 
     await userEvent.type(
@@ -572,7 +570,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("sends Standard after Fast is reset by an unsupported active provider", async () => {
+  it("sends Standard while Fast preference is inactive for an unsupported model", async () => {
     const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
     appTestState.settingsResponse = {
       ...settings,
@@ -606,10 +604,11 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByRole("button", { name: "Model: Anthropic Standard" }),
     );
     expect(
-      await screen.findByText(
-        "Fast mode is not available for the selected model.",
-      ),
-    ).toBeInTheDocument();
+      screen.queryByText("Fast mode is not available for the selected model."),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Fast mode" }),
+    ).not.toBeInTheDocument();
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "Use the standard provider route.",

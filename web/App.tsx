@@ -2671,16 +2671,6 @@ export function App() {
       : "";
   }, [selectedModel, selectedThinkingLevel]);
 
-  useEffect(() => {
-    if (
-      selectedModel?.supportsFast !== true &&
-      selectedLatencyMode === "fast"
-    ) {
-      setSelectedLatencyMode("standard");
-      setError(t("Fast mode is not available for the selected model."));
-    }
-  }, [selectedLatencyMode, selectedModel, t]);
-
   useEffect(
     () => () => {
       for (const abortController of contextUsageAbortByChatKeyRef.current.values()) {
@@ -9690,8 +9680,8 @@ export function App() {
 
   function handleChatLatencyModeChange(latencyMode: "standard" | "fast") {
     if (latencyMode === "fast" && selectedModel?.supportsFast !== true) {
+      // Toggle is hidden for unsupported models; keep a silent defensive clamp.
       setSelectedLatencyMode("standard");
-      setError(t("Fast mode is not available for the selected model."));
       return;
     }
     setSelectedLatencyMode(latencyMode);
