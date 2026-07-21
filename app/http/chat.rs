@@ -1980,16 +1980,15 @@ fn load_ai_statistics_response(
             elapsed_ms = database_started_at.elapsed().as_millis() as u64,
             "AI statistics workspace database opened"
         );
+        // AI Statistics is an audit surface: keep every request kind for the selected
+        // chat (memory / Spec / compression / hooks). Main-chat-only exclusion
+        // belongs on chat_statistics, not here.
         let audit_filters = LlmRequestAuditFilters {
             request_ids: &filters.request_ids,
             workspace_id: None,
             chat_id: filters.chat_id.as_deref(),
             request_kind: filters.request_kind.as_deref(),
-            exclude_request_kinds: if filters.chat_id.is_some() && filters.request_kind.is_none() {
-                MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS
-            } else {
-                &[]
-            },
+            exclude_request_kinds: &[],
             provider_id: filters.provider_id.as_deref(),
             model_id: filters.model_id.as_deref(),
             final_state: filters.status.as_deref(),

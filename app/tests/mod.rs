@@ -26957,16 +26957,75 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
     )
     .await
     .expect("ai statistics");
-    assert_eq!(ai_stats.total_count, 1);
-    assert_eq!(ai_stats.summary.total_requests, 1);
-    assert_eq!(ai_stats.summary.total_tokens, 125);
-    assert_eq!(ai_stats.requests.len(), 1);
-    assert_eq!(ai_stats.requests[0].id, "main-chat-request");
-    assert_eq!(ai_stats.requests[0].request_kind, "chat completion");
-    assert_eq!(ai_stats.summary.request_kind_breakdown.len(), 1);
+    // AI Statistics is an audit list: chat filter keeps every request kind for that
+    // chat (memory / Spec / compression). Main-chat-only exclusion is chat_statistics.
+    assert_eq!(ai_stats.total_count, 3);
+    assert_eq!(ai_stats.summary.total_requests, 3);
+    assert_eq!(ai_stats.summary.total_tokens, 100 + 25 + 700 + 70 + 500 + 50);
+    assert_eq!(ai_stats.requests.len(), 3);
+    let ai_stats_request_ids = ai_stats
+        .requests
+        .iter()
+        .map(|request| request.id.as_str())
+        .collect::<HashSet<_>>();
     assert_eq!(
-        ai_stats.summary.request_kind_breakdown[0].request_kind,
-        "chat completion"
+        ai_stats_request_ids,
+        HashSet::from([
+            "main-chat-request",
+            "internal-memory-retrieval",
+            "internal-context-compression",
+        ])
+    );
+    let ai_stats_request_kinds = ai_stats
+        .summary
+        .request_kind_breakdown
+        .iter()
+        .map(|row| row.request_kind.as_str())
+        .collect::<HashSet<_>>();
+    assert_eq!(
+        ai_stats_request_kinds,
+        HashSet::from([
+            "chat completion",
+            "memory retrieval",
+            "contextCompression",
+        ])
+    );
+
+    let Json(chat_filtered_stats) = crate::http::chat::ai_statistics(
+        State(state.clone()),
+        Query(AiStatisticsQuery {
+            workspace_id: Some(workspace_id.clone()),
+            request_id: None,
+            request_ids: None,
+            chat_id: Some("chat-internal-filter".to_string()),
+            request_kind: None,
+            provider_id: None,
+            model_id: None,
+            status: None,
+            started_after: None,
+            started_before: None,
+            page: None,
+            page_size: Some(20),
+            limit: None,
+        }),
+    )
+    .await
+    .expect("ai statistics by chat only");
+    assert_eq!(chat_filtered_stats.total_count, 8);
+    assert_eq!(chat_filtered_stats.requests.len(), 8);
+    assert!(
+        chat_filtered_stats
+            .summary
+            .request_kind_breakdown
+            .iter()
+            .any(|row| row.request_kind == "memory extraction")
+    );
+    assert!(
+        chat_filtered_stats
+            .summary
+            .request_kind_breakdown
+            .iter()
+            .any(|row| row.request_kind == "workspace spec update")
     );
 
     let Json(compression_stats) = crate::http::chat::ai_statistics(
@@ -32799,9 +32858,20 @@ fn proxy_workspace_route_path_keeps_ai_statistics_on_main_process() {
         ),
         Some("chats/chat-1/statistics")
     );
+    // context-usage is POST-only in the workspace route contract; the GET helper
+    // used by this test must not claim it is proxied.
     assert_eq!(
         crate::http::router::proxy_workspace_route_path("/api/workspaces/remote/context-usage"),
-        Some("context-usage")
+        None,
+        "GET helper must not treat POST-only context-usage as a proxied route"
+    );
+    assert_eq!(
+        crate::http::router::proxy_workspace_route_path_for_method(
+            "/api/workspaces/remote/context-usage",
+            crate::http::workspace_route_contract::WorkspaceRouteMethod::Post,
+        ),
+        Some("context-usage"),
+        "POST context-usage must still proxy to the remote sidecar"
     );
 }
 

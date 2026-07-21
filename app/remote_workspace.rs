@@ -8151,6 +8151,21 @@ pub(crate) async fn ensure_remote_workspace_connected(
     let Some(server_id) = workspace.server_id().map(str::to_string) else {
         return Ok(());
     };
+
+    // Proxy hot path: reuse an already-connected session without SSH probing when
+    // its identity still matches (or expected identity cannot be resolved yet).
+    // Stale identity still falls through to full connect/replace.
+    if matches!(
+        sidecar_proxy_target(state, workspace_id)?,
+        SidecarProxyTarget::Connected { .. }
+    ) {
+        if connected_remote_session_is_still_usable(state, &config, &server_id, workspace_id)
+            .await?
+        {
+            return Ok(());
+        }
+    }
+
     state
         .remote_workspace_manager
         .connect_workspace(state.clone(), &server_id, workspace_id)
@@ -8163,6 +8178,60 @@ pub(crate) async fn ensure_remote_workspace_connected(
         SidecarProxyTarget::Local => Err(ApiError::internal(format!(
             "workspace became local while connecting remote sidecar: {workspace_id}"
         ))),
+    }
+}
+
+/// Returns true when the existing Ready/connected session can safely serve proxy
+/// traffic without a full reconnect.
+///
+/// - Matching packaged identity → reuse
+/// - Identity cannot be resolved locally (missing assets / custom command probe) →
+///   keep the session rather than hard-failing every proxied request
+/// - Identity mismatch → false so ensure falls through to upgrade/replace
+async fn connected_remote_session_is_still_usable(
+    state: &AppState,
+    config: &foco_store::config::GlobalConfig,
+    server_id: &str,
+    workspace_id: &str,
+) -> Result<bool, ApiError> {
+    let server = config
+        .remote_servers
+        .iter()
+        .find(|server| server.id == server_id)
+        .ok_or_else(|| remote_error(server_id, Some(workspace_id), "remote server was not found"))?;
+
+    // Keep the std::sync::Mutex guard out of any .await so the middleware future stays Send.
+    let session = {
+        let sessions = state
+            .remote_workspace_manager
+            .sessions
+            .lock()
+            .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+        sessions
+            .get(&session_key(server_id, workspace_id))
+            .cloned()
+    };
+    let Some(session) = session else {
+        return Ok(false);
+    };
+
+    let target = server
+        .last_known_target
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(session.target.as_str())
+        .to_string();
+    match expected_remote_sidecar_identity(server, &target, server_id, Some(workspace_id)).await {
+        Ok(expected_identity) => Ok(session.matches_expected_identity(
+            server_id,
+            workspace_id,
+            &expected_identity,
+        )),
+        // Keep serving an already-open tunnel when identity cannot be resolved
+        // (test fakes, incomplete local sidecar packaging). Explicit reconnect
+        // still goes through full connect_workspace.
+        Err(_) => Ok(true),
     }
 }
 
