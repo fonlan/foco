@@ -128,6 +128,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
         attach_agent_request_correlation(&mut request, "", "t", "r", None, None);
         assert!(request.agent_correlation.is_none());

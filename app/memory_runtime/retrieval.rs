@@ -753,6 +753,9 @@ fn memory_retrieval_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+            MEMORY_RETRIEVAL_TOOL_NAME,
+        ),
     })
 }
 
@@ -1651,4 +1654,28 @@ fn append_replayed_tool_call_pair(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod required_single_tool_tests {
+    use super::*;
+    use crate::MEMORY_RETRIEVAL_TOOL_NAME;
+    use crate::memory_runtime::tools::memory_retrieval_tool_definition;
+
+    #[test]
+    fn memory_retrieval_request_requires_select_relevant_memory() {
+        let request = memory_retrieval_provider_request(
+            "model-1",
+            256,
+            "how does memory matching work?",
+            &[],
+            "system prompt",
+        )
+        .expect("retrieval request");
+        assert_eq!(
+            request.tool_choice,
+            foco_providers::NeutralToolChoice::required_single_tool(MEMORY_RETRIEVAL_TOOL_NAME)
+        );
+        assert_eq!(request.tools, vec![memory_retrieval_tool_definition()]);
+    }
 }

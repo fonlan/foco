@@ -1295,6 +1295,7 @@ fn test_prepared_chat_context(
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         },
         hook_runtime: HookRuntime::new(mcp_registry.clone()),
         global_hooks: HookConfig::default(),
@@ -1398,6 +1399,7 @@ fn prompt_cache_key_includes_agent_layers_and_resolved_memory() {
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     };
     let source_sequences = vec![None, None, None, Some(7), Some(7)];
     let context_sources = vec![
@@ -7126,6 +7128,10 @@ fn memory_extraction_request_uses_custom_base_prompt_and_language_suffix() {
     assert!(system_prompt.starts_with("CUSTOM_EXTRACTION_BASE "));
     assert!(system_prompt.contains("Simplified Chinese"));
     assert!(!system_prompt.contains(DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT));
+    assert_eq!(
+        request.tool_choice,
+        foco_providers::NeutralToolChoice::required_single_tool(MEMORY_EXTRACTION_TOOL_NAME)
+    );
 }
 
 #[tokio::test]
@@ -15008,6 +15014,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         },
         hook_runtime: HookRuntime::new(mcp_registry.clone()),
         global_hooks: HookConfig::default(),
@@ -16941,6 +16948,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         },
         hook_runtime: HookRuntime::new(mcp_registry.clone()),
         global_hooks: HookConfig::default(),
@@ -17361,6 +17369,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         },
         hook_runtime: HookRuntime::new(mcp_registry.clone()),
         global_hooks: HookConfig::default(),

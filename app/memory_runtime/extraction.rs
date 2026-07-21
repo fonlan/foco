@@ -766,6 +766,9 @@ pub(crate) fn memory_extraction_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+            MEMORY_EXTRACTION_TOOL_NAME,
+        ),
     })
 }
 

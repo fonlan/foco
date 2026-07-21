@@ -2639,6 +2639,7 @@ pub(crate) fn model_test_provider_request(model_id: &str) -> NeutralChatRequest 
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     }
 }
 

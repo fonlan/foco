@@ -6044,6 +6044,10 @@ async fn broker_llm_stream(
                     .get("promptCacheRetention")
                     .and_then(|v| serde_json::from_value(v.clone()).ok()),
                 agent_correlation: None,
+                tool_choice: payload
+                    .get("toolChoice")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default(),
             }
         });
     // Ensure a nested request cannot disagree with the model selected by the broker payload.
@@ -12202,6 +12206,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
                     prompt_cache_key: None,
                     prompt_cache_retention: None,
                     agent_correlation: None,
+                    tool_choice: foco_providers::NeutralToolChoice::Auto,
                 },
                 requested_latency_mode,
                 tool_catalog,
@@ -12264,6 +12269,7 @@ fn remote_sidecar_prepare_chat_context_with_options(
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         },
         requested_latency_mode,
         tool_catalog,
@@ -16521,6 +16527,8 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     prompt_cache_key: current_request.prompt_cache_key.clone(),
                     prompt_cache_retention: current_request.prompt_cache_retention.clone(),
                     agent_correlation: None,
+                    // Preserve transport tool strategy for the next turn (agent chat stays Auto).
+                    tool_choice: current_request.tool_choice.clone(),
                 };
             }
             Ok(RemoteSidecarBrokerLlmTurnOutcome::ReasoningLoopInterrupted {
@@ -22671,6 +22679,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
 
         let runtime_tool_state =
@@ -23936,6 +23945,14 @@ mod tests {
             assert_eq!(
                 request.payload.get("requestKind").and_then(Value::as_str),
                 Some(LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE)
+            );
+            assert_eq!(
+                request.payload.pointer("/request/tool_choice"),
+                Some(&json!({
+                    "type": "requiredSingleTool",
+                    "toolName": "submit_workspace_spec_update"
+                })),
+                "broker must pass RequiredSingleTool for workspace spec update"
             );
             answer_broker_spec_tool_call(
                 &broker_pending,
@@ -26428,6 +26445,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -26769,6 +26787,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -26989,6 +27008,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,
@@ -31838,6 +31858,7 @@ mod tests {
                 prompt_cache_key: None,
                 prompt_cache_retention: None,
                 agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::Auto,
             },
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_path_buf(),
@@ -31910,6 +31931,7 @@ mod tests {
                 prompt_cache_key: None,
                 prompt_cache_retention: None,
                 agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::Auto,
             },
             workspace_id: "workspace".to_string(),
             workspace_path: workspace.path().to_path_buf(),
@@ -37778,6 +37800,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::Auto,
         };
         let broker_payload = json!({
             "workspaceId": workspace_id,

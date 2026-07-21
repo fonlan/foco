@@ -5591,6 +5591,7 @@ pub(crate) fn prepare_git_commit_message_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     })
 }
 

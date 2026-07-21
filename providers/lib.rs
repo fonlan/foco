@@ -19,8 +19,8 @@ use genai::{
     adapter::AdapterKind,
     chat::{
         CacheControl, ChatMessage, ChatOptions, ChatRequest, ChatStreamEvent, ContentPart,
-        MessageContent, ReasoningEffort, StreamEnd, Tool, ToolCall as GenaiToolCall, ToolResponse,
-        Usage,
+        MessageContent, ReasoningEffort, StreamEnd, Tool, ToolCall as GenaiToolCall,
+        ToolChoice as GenaiToolChoice, ToolResponse, Usage,
     },
     resolver::{AuthData, Endpoint, ProviderConfig},
 };
@@ -903,6 +903,114 @@ pub struct NeutralChatRequest {
     /// Optional; when absent, Foco still injects fixed identity (+ WS beta) for OpenAIResp.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_correlation: Option<AgentRequestCorrelation>,
+    /// Provider-neutral tool selection strategy.
+    ///
+    /// Default is `Auto` (normal chat). Internal single-tool structured requests may set
+    /// `RequiredSingleTool` so supporting adapters send a native forced tool-choice field.
+    #[serde(default)]
+    pub tool_choice: NeutralToolChoice,
+}
+
+/// Provider-neutral tool selection preference for a chat request.
+///
+/// Only `Auto` and `RequiredSingleTool` are exposed on the Foco transport model today.
+/// Normal agent chat keeps `Auto`; internal single-tool structured requests use
+/// `RequiredSingleTool`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum NeutralToolChoice {
+    /// Let the model decide whether (and which) tool to call.
+    #[default]
+    Auto,
+    /// Require the model to call exactly the named tool when the provider supports it.
+    RequiredSingleTool {
+        #[serde(rename = "toolName")]
+        tool_name: String,
+    },
+}
+
+impl NeutralToolChoice {
+    pub fn required_single_tool(tool_name: impl Into<String>) -> Self {
+        Self::RequiredSingleTool {
+            tool_name: tool_name.into(),
+        }
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub fn required_tool_name(&self) -> Option<&str> {
+        match self {
+            Self::RequiredSingleTool { tool_name } => Some(tool_name.as_str()),
+            Self::Auto => None,
+        }
+    }
+}
+
+/// Whether a requested `RequiredSingleTool` was applied on the provider wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolChoiceEnforcement {
+    /// No forced single-tool strategy was requested.
+    Auto,
+    /// Native forced tool-choice was applied for this adapter.
+    Applied,
+    /// Forced single-tool was requested but this adapter does not support it; the
+    /// request falls back to tools + prompt (+ later repair retry). Never claim forced.
+    UnsupportedDegraded,
+}
+
+/// Return whether this adapter can emit a native forced single-tool selection field.
+///
+/// Unsupported adapters (Ollama native protocol, Cohere, Bedrock) keep tools + prompt
+/// only; callers must treat that as an explicit degradation, not silent enforcement.
+pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool {
+    match adapter_kind {
+        AdapterKind::OpenAI
+        | AdapterKind::OpenAIResp
+        | AdapterKind::Gemini
+        | AdapterKind::Anthropic
+        | AdapterKind::Fireworks
+        | AdapterKind::Together
+        | AdapterKind::Groq
+        | AdapterKind::Aihubmix
+        | AdapterKind::Mimo
+        | AdapterKind::Moonshot
+        | AdapterKind::Nebius
+        | AdapterKind::Xai
+        | AdapterKind::DeepSeek
+        | AdapterKind::Zai
+        | AdapterKind::BigModel
+        | AdapterKind::Aliyun
+        | AdapterKind::Baidu
+        | AdapterKind::Vertex
+        | AdapterKind::GithubCopilot
+        | AdapterKind::OpenCodeGo
+        | AdapterKind::OpenRouter
+        | AdapterKind::MiniMax => true,
+        AdapterKind::Ollama
+        | AdapterKind::OllamaCloud
+        | AdapterKind::Cohere
+        | AdapterKind::BedrockApi => false,
+    }
+}
+
+/// Resolve enforcement for a request against a concrete adapter.
+pub fn resolve_tool_choice_enforcement(
+    adapter_kind: AdapterKind,
+    tool_choice: &NeutralToolChoice,
+) -> ToolChoiceEnforcement {
+    match tool_choice {
+        NeutralToolChoice::Auto => ToolChoiceEnforcement::Auto,
+        NeutralToolChoice::RequiredSingleTool { .. } => {
+            if adapter_supports_required_single_tool(adapter_kind) {
+                ToolChoiceEnforcement::Applied
+            } else {
+                ToolChoiceEnforcement::UnsupportedDegraded
+            }
+        }
+    }
 }
 
 /// Session / multi-turn correlation for OpenAI Responses (HTTP and WebSocket).
@@ -2127,7 +2235,51 @@ fn genai_chat_options_with_runtime_options(
         options = options.with_cache_control(cache_control);
     }
 
+    options = apply_neutral_tool_choice(options, config.kind.adapter_kind(), request)?;
+
     apply_request_overrides_and_agent_headers(options, config, request, runtime_options)
+}
+
+/// Map Foco `NeutralToolChoice` onto genai `ChatOptions` when the adapter supports it.
+///
+/// Unsupported adapters leave tool_choice unset (tools + prompt only) and log an explicit
+/// degradation so callers never assume native enforcement happened.
+fn apply_neutral_tool_choice(
+    mut options: ChatOptions,
+    adapter_kind: AdapterKind,
+    request: &NeutralChatRequest,
+) -> Result<ChatOptions, ProviderConfigError> {
+    let NeutralToolChoice::RequiredSingleTool { tool_name } = &request.tool_choice else {
+        return Ok(options);
+    };
+
+    let tool_name = tool_name.trim();
+    if tool_name.is_empty() {
+        return Err(ProviderConfigError::InvalidRequest(
+            "RequiredSingleTool tool name must not be empty".to_string(),
+        ));
+    }
+    if !request.tools.iter().any(|tool| tool.name == tool_name) {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "RequiredSingleTool '{tool_name}' is not present in request.tools"
+        )));
+    }
+
+    match resolve_tool_choice_enforcement(adapter_kind, &request.tool_choice) {
+        ToolChoiceEnforcement::Applied => {
+            options = options.with_tool_choice(GenaiToolChoice::tool(tool_name));
+            Ok(options)
+        }
+        ToolChoiceEnforcement::UnsupportedDegraded => {
+            tracing::warn!(
+                adapter = adapter_kind.as_str(),
+                tool_name,
+                "RequiredSingleTool requested but adapter does not support native forced tool choice; degrading to tools + prompt (+ repair retry)"
+            );
+            Ok(options)
+        }
+        ToolChoiceEnforcement::Auto => Ok(options),
+    }
 }
 
 fn apply_request_overrides_and_agent_headers(
@@ -3132,6 +3284,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         }
     }
 
@@ -3521,6 +3674,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let client = config.genai_client().expect("client");
@@ -3729,6 +3883,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let mut stream = stream_chat_with_capture(&config, request, true)
@@ -3889,6 +4044,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
         let mut stream1 =
             stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
@@ -3946,6 +4102,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
         let mut stream2 =
             stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
@@ -4085,6 +4242,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let mut stream =
@@ -4231,6 +4389,7 @@ mod tests {
                     .with_run_id("run-ws")
                     .with_workspace_id("ws-ws"),
             ),
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let mut stream =
@@ -4377,6 +4536,7 @@ mod tests {
                 "chat-one-shot",
                 "req-1",
             )),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let mut stream1 =
             stream_chat_with_capture_observer(&config, request1, true, None, Some(session.clone()))
@@ -4428,6 +4588,7 @@ mod tests {
                 "chat-one-shot",
                 "req-2",
             )),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let mut stream2 =
             stream_chat_with_capture_observer(&config, request2, true, None, Some(session))
@@ -4494,6 +4655,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let failure =
@@ -5094,6 +5256,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -5121,6 +5284,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         genai_chat_request(&request).expect("reasoning-only assistant message should convert");
@@ -5152,6 +5316,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -5191,6 +5356,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: NeutralToolChoice::Auto,
         };
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -5235,6 +5401,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let result = genai_chat_request(&request);
@@ -5283,6 +5450,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let result = genai_chat_request(&request);
@@ -5310,6 +5478,7 @@ mod tests {
             prompt_cache_key: Some("foco:workspace:chat".to_string()),
             prompt_cache_retention: Some("24h".to_string()),
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let config = ProviderConnectionConfig {
@@ -5342,6 +5511,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let config = ProviderConnectionConfig {
@@ -5367,6 +5537,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let config = ProviderConnectionConfig {
@@ -5397,6 +5568,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
 
         let config = ProviderConnectionConfig {
@@ -5424,6 +5596,7 @@ mod tests {
             prompt_cache_key: Some("foco:workspace:chat".to_string()),
             prompt_cache_retention: Some("1h".to_string()),
             agent_correlation: None,
+            tool_choice: NeutralToolChoice::Auto,
         };
         let config = ProviderConnectionConfig {
             kind: openai_responses_kind(),
@@ -5475,6 +5648,7 @@ mod tests {
                     .with_run_id("run-1")
                     .with_workspace_id("ws-1"),
             ),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let config = ProviderConnectionConfig {
             kind: openai_responses_kind(),
@@ -5530,6 +5704,7 @@ mod tests {
                 "chat-abc",
                 "llm-req-2",
             )),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind"),
@@ -5567,6 +5742,7 @@ mod tests {
                 "thread-default",
                 "req-default",
             )),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let config = ProviderConnectionConfig {
             kind: openai_responses_kind(),
@@ -5616,6 +5792,7 @@ mod tests {
             prompt_cache_key: None,
             prompt_cache_retention: None,
             agent_correlation: Some(AgentRequestCorrelation::new("s", "t", "r")),
+            tool_choice: NeutralToolChoice::Auto,
         };
         let config = ProviderConnectionConfig {
             kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind"),
@@ -5628,6 +5805,348 @@ mod tests {
         let options = genai_chat_options(&config, &request).expect("options");
         let headers = header_map_from_options(&options);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn neutral_tool_choice_serializes_auto_and_required_single_tool() {
+        let auto = NeutralToolChoice::Auto;
+        assert_eq!(
+            serde_json::to_value(&auto).expect("auto json"),
+            serde_json::json!({ "type": "auto" })
+        );
+        assert_eq!(
+            serde_json::from_value::<NeutralToolChoice>(serde_json::json!({ "type": "auto" }))
+                .expect("auto parse"),
+            NeutralToolChoice::Auto
+        );
+
+        let required = NeutralToolChoice::required_single_tool("select_relevant_memory");
+        assert_eq!(
+            serde_json::to_value(&required).expect("required json"),
+            serde_json::json!({
+                "type": "requiredSingleTool",
+                "toolName": "select_relevant_memory"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<NeutralToolChoice>(serde_json::json!({
+                "type": "requiredSingleTool",
+                "toolName": "submit_memory_extraction"
+            }))
+            .expect("required parse"),
+            NeutralToolChoice::required_single_tool("submit_memory_extraction")
+        );
+
+        // Missing toolChoice deserializes as Auto for broker / older payloads.
+        let request: NeutralChatRequest = serde_json::from_value(serde_json::json!({
+            "model_id": "gpt-4o-mini",
+            "messages": [{
+                "role": "user",
+                "content": "hi",
+                "attachments": [],
+                "tool_calls": []
+            }],
+            "tools": []
+        }))
+        .expect("legacy request without toolChoice");
+        assert_eq!(request.tool_choice, NeutralToolChoice::Auto);
+    }
+
+    #[test]
+    fn required_single_tool_enforcement_matrix() {
+        assert_eq!(
+            resolve_tool_choice_enforcement(AdapterKind::OpenAIResp, &NeutralToolChoice::Auto),
+            ToolChoiceEnforcement::Auto
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::OpenAIResp,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+            ),
+            ToolChoiceEnforcement::Applied
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::Anthropic,
+                &NeutralToolChoice::required_single_tool("submit_memory_extraction")
+            ),
+            ToolChoiceEnforcement::Applied
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::Gemini,
+                &NeutralToolChoice::required_single_tool("submit_workspace_spec_update")
+            ),
+            ToolChoiceEnforcement::Applied
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::Ollama,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::Cohere,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::BedrockApi,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        assert!(!adapter_supports_required_single_tool(AdapterKind::OllamaCloud));
+        assert!(adapter_supports_required_single_tool(AdapterKind::OpenAI));
+    }
+
+    #[test]
+    fn required_single_tool_maps_to_genai_options_for_supported_adapters() {
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "use the tool",
+        )]);
+        request.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        request.tool_choice =
+            NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind"),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let options = genai_chat_options(&config, &request).expect("options");
+        let tool_choice = options.tool_choice.expect("tool choice applied");
+        assert_eq!(
+            tool_choice,
+            genai::chat::ToolChoice::tool("select_relevant_memory")
+        );
+    }
+
+    #[test]
+    fn required_single_tool_degrades_without_claiming_enforcement_for_ollama() {
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "use the tool",
+        )]);
+        request.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        request.tool_choice =
+            NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OLLAMA_KIND).expect("ollama kind"),
+            base_url: Some("http://localhost:11434/".to_string()),
+            api_key: None,
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        assert_eq!(
+            resolve_tool_choice_enforcement(config.kind.adapter_kind(), &request.tool_choice),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
+        let options = genai_chat_options(&config, &request).expect("options");
+        assert!(
+            options.tool_choice.is_none(),
+            "unsupported adapters must not silently claim forced tool_choice"
+        );
+    }
+
+    #[test]
+    fn required_single_tool_rejects_missing_or_empty_tool_name() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut missing = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "use the tool",
+        )]);
+        missing.tool_choice =
+            NeutralToolChoice::required_single_tool("select_relevant_memory");
+        let err = genai_chat_options(&config, &missing).expect_err("missing tool");
+        assert!(
+            err.to_string()
+                .contains("is not present in request.tools")
+        );
+
+        let mut empty = missing;
+        empty.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        empty.tool_choice = NeutralToolChoice::required_single_tool("   ");
+        let err = genai_chat_options(&config, &empty).expect_err("empty tool name");
+        assert!(err.to_string().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn required_single_tool_is_serialized_on_openai_chat_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let base_url = format!("{fixture_root}v1/");
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("openai kind"),
+            base_url: Some(base_url),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![
+            neutral_text_message(NeutralChatRole::System, "wire system"),
+            neutral_text_message(NeutralChatRole::User, "wire user"),
+        ]);
+        request.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            strict: true,
+        });
+        request.tool_choice =
+            NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert_eq!(
+            body_json["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "function": { "name": "select_relevant_memory" }
+            })
+        );
+        assert_eq!(
+            body_json["tools"][0]["function"]["name"],
+            "select_relevant_memory"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn required_single_tool_is_serialized_on_openai_responses_prepare_payload() {
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_RESPONSES_KIND).expect("responses kind"),
+            base_url: Some("https://gateway.example/v1/".to_string()),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: vec![],
+            model_redirects: Default::default(),
+        };
+        let mut request = NeutralChatRequest {
+            model_id: "gpt-4.1-mini".to_string(),
+            messages: vec![
+                NeutralChatMessage {
+                    role: NeutralChatRole::System,
+                    content: "sys".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+                NeutralChatMessage {
+                    role: NeutralChatRole::User,
+                    content: "hi".to_string(),
+                    attachments: vec![],
+                    reasoning: None,
+                    tool_calls: vec![],
+                    tool_call_id: None,
+                    tool_name: None,
+                },
+            ],
+            tools: vec![NeutralToolDefinition {
+                name: "submit_workspace_spec_update".to_string(),
+                description: "update spec".to_string(),
+                input_schema: serde_json::json!({"type": "object"}),
+                strict: true,
+            }],
+            max_output_tokens: Some(128),
+            thinking_level: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: NeutralToolChoice::required_single_tool(
+                "submit_workspace_spec_update",
+            ),
+        };
+
+        let client = config.genai_client().expect("client");
+        let chat_request =
+            genai_chat_request_for_adapter(&request, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options(&config, &request).expect("options");
+        let model = genai::ModelIden::new(config.kind.adapter_kind(), "gpt-4.1-mini");
+        let prepared = client
+            .prepare_chat_stream_request(model.clone(), chat_request, Some(&options))
+            .await
+            .expect("prepare");
+
+        assert_eq!(
+            prepared.payload["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "name": "submit_workspace_spec_update"
+            })
+        );
+
+        let ws_payload =
+            genai::adapter::openai_resp_websocket_create_payload(prepared.payload.clone());
+        assert_eq!(
+            ws_payload["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "name": "submit_workspace_spec_update"
+            })
+        );
+
+        // Normal chat Auto must not emit tool_choice.
+        request.tool_choice = NeutralToolChoice::Auto;
+        let chat_request =
+            genai_chat_request_for_adapter(&request, config.kind.adapter_kind()).expect("chat");
+        let options = genai_chat_options(&config, &request).expect("options");
+        let prepared = client
+            .prepare_chat_stream_request(model, chat_request, Some(&options))
+            .await
+            .expect("prepare auto");
+        assert!(prepared.payload.get("tool_choice").is_none());
     }
 
     #[test]

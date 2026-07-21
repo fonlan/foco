@@ -1819,6 +1819,7 @@ Submit a substantially shorter complete Project Spec. contentMarkdown MUST be un
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     }
 }
 
@@ -1878,6 +1879,7 @@ Submit ordered exact-text edits that shrink the CURRENT candidate. After all edi
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     }
 }
 
@@ -2114,6 +2116,7 @@ fn workspace_spec_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     })
 }
 
@@ -2150,6 +2153,9 @@ fn workspace_spec_update_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+            WORKSPACE_SPEC_UPDATE_TOOL_NAME,
+        ),
     })
 }
 
@@ -3263,6 +3269,42 @@ mod tests {
         assert!(system_prompt.contains("Custom update prompt."));
         assert!(system_prompt.contains("current Foco app language setting (zh-CN)"));
         assert!(system_prompt.contains("write Project Spec prose in Simplified Chinese"));
+        assert_eq!(
+            request.tool_choice,
+            foco_providers::NeutralToolChoice::required_single_tool(
+                WORKSPACE_SPEC_UPDATE_TOOL_NAME
+            )
+        );
+        assert_eq!(
+            request.tools.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+            vec![WORKSPACE_SPEC_UPDATE_TOOL_NAME]
+        );
+    }
+
+    #[test]
+    fn workspace_spec_generation_request_keeps_auto_tool_choice() {
+        let input = WorkspaceSpecGenerationInput {
+            workspace_id: "workspace-1".to_string(),
+            base_revision: 0,
+            code_graph: WorkspaceSpecCodeGraphInput {
+                indexed_files: 0,
+                symbol_count: 0,
+                reference_count: 0,
+                edge_count: 0,
+                languages: Vec::new(),
+                files: Vec::new(),
+                symbols: Vec::new(),
+            },
+            memory_profiles: Vec::new(),
+            source_files: Vec::new(),
+        };
+        let request = workspace_spec_provider_request("model", "en", None, 1_024, &input)
+            .expect("generation request");
+        assert_eq!(
+            request.tool_choice,
+            foco_providers::NeutralToolChoice::Auto,
+            "only update path forces a single tool; generation stays Auto"
+        );
     }
 
     #[test]

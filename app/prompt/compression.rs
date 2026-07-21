@@ -737,6 +737,7 @@ pub(crate) fn build_context_compression_summary_request_with_prompt(
         prompt_cache_key: None,
         prompt_cache_retention: None,
         agent_correlation: None,
+        tool_choice: foco_providers::NeutralToolChoice::Auto,
     }
 }
 

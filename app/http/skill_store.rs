@@ -1016,6 +1016,7 @@ pub(crate) fn skill_translation_provider_request(
         prompt_cache_key: None,
         prompt_cache_retention: None,
     agent_correlation: None,
+    tool_choice: foco_providers::NeutralToolChoice::Auto,
     })
 }
 
