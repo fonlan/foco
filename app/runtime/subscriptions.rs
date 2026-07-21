@@ -25,7 +25,7 @@ pub(crate) struct ActiveChatRunRegistry {
     runs: Arc<Mutex<HashMap<String, ActiveChatRun>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActiveAgentRunIdentity {
     pub(crate) team_id: AgentTeamId,
     pub(crate) instance_id: AgentInstanceId,
@@ -37,6 +37,9 @@ pub(crate) struct ActiveAgentRunIdentity {
 struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
+    assistant_message_id: String,
+    assistant_sequence: i64,
+    queued_user_message_id: Option<String>,
     agent_identity: Option<ActiveAgentRunIdentity>,
     primary_chat_output: bool,
     guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
@@ -45,6 +48,15 @@ struct ActiveChatRun {
     events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
     event_tx: broadcast::Sender<ChatRunEventFrame>,
     pub(crate) completed_rx: watch::Receiver<bool>,
+}
+
+/// The outcome of registering a chat run.
+///
+/// Replaying the exact same owner attaches to the existing stream instead of starting a second
+/// producer. A distinct owner is rejected by the registry.
+pub(crate) enum ActiveChatRunRegistrationResult {
+    Registered(ActiveChatRunRegistration),
+    Existing,
 }
 
 #[derive(Clone, Debug)]
@@ -165,12 +177,49 @@ impl ActiveChatRunRegistry {
         next_sequence: i64,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
+        match self.register_with_queued_user_message(
+            run_id,
+            workspace_id,
+            chat_id,
+            assistant_message_id,
+            assistant_sequence,
+            None,
+            memories_used,
+            primary_chat_output,
+            next_sequence,
+            guidance_tx,
+        )? {
+            ActiveChatRunRegistrationResult::Registered(registration) => Ok(registration),
+            ActiveChatRunRegistrationResult::Existing => Err(ApiError::conflict(
+                "active chat run is already registered; use the durable identity registration API to replay it",
+            )),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the registration boundary keeps durable chat identity explicit"
+    )]
+    pub(crate) fn register_with_queued_user_message(
+        &self,
+        run_id: String,
+        workspace_id: String,
+        chat_id: String,
+        assistant_message_id: String,
+        assistant_sequence: i64,
+        queued_user_message_id: Option<String>,
+        memories_used: Vec<ChatMemoryUsedSummary>,
+        primary_chat_output: bool,
+        next_sequence: i64,
+        guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    ) -> Result<ActiveChatRunRegistrationResult, ApiError> {
         self.register_with_agent_identity(
             run_id,
             workspace_id,
             chat_id,
             assistant_message_id,
             assistant_sequence,
+            queued_user_message_id,
             memories_used,
             primary_chat_output,
             None,
@@ -193,12 +242,51 @@ impl ActiveChatRunRegistry {
         next_sequence: i64,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
     ) -> Result<ActiveChatRunRegistration, ApiError> {
+        match self.register_agent_with_queued_user_message(
+            run_id,
+            workspace_id,
+            chat_id,
+            assistant_message_id,
+            assistant_sequence,
+            None,
+            memories_used,
+            primary_chat_output,
+            agent_identity,
+            next_sequence,
+            guidance_tx,
+        )? {
+            ActiveChatRunRegistrationResult::Registered(registration) => Ok(registration),
+            ActiveChatRunRegistrationResult::Existing => Err(ApiError::conflict(
+                "active chat run is already registered; use the durable identity registration API to replay it",
+            )),
+        }
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the registration boundary keeps durable chat identity explicit"
+    )]
+    pub(crate) fn register_agent_with_queued_user_message(
+        &self,
+        run_id: String,
+        workspace_id: String,
+        chat_id: String,
+        assistant_message_id: String,
+        assistant_sequence: i64,
+        queued_user_message_id: Option<String>,
+        memories_used: Vec<ChatMemoryUsedSummary>,
+        primary_chat_output: bool,
+        agent_identity: ActiveAgentRunIdentity,
+        next_sequence: i64,
+        guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
+    ) -> Result<ActiveChatRunRegistrationResult, ApiError> {
         self.register_with_agent_identity(
             run_id,
             workspace_id,
             chat_id,
             assistant_message_id,
             assistant_sequence,
+            queued_user_message_id,
             memories_used,
             primary_chat_output,
             Some(agent_identity),
@@ -218,12 +306,13 @@ impl ActiveChatRunRegistry {
         chat_id: String,
         assistant_message_id: String,
         assistant_sequence: i64,
+        queued_user_message_id: Option<String>,
         memories_used: Vec<ChatMemoryUsedSummary>,
         primary_chat_output: bool,
         agent_identity: Option<ActiveAgentRunIdentity>,
         next_sequence: i64,
         guidance_tx: mpsc::UnboundedSender<GuidanceMessage>,
-    ) -> Result<ActiveChatRunRegistration, ApiError> {
+    ) -> Result<ActiveChatRunRegistrationResult, ApiError> {
         if next_sequence < 0 {
             return Err(ApiError::internal(
                 "active chat run sequence must be non-negative",
@@ -234,9 +323,31 @@ impl ActiveChatRunRegistry {
             .lock()
             .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
 
-        if runs.contains_key(&run_id) {
-            return Err(ApiError::internal(format!(
-                "duplicate active chat run id: {run_id}"
+        if let Some(existing) = runs.get(&run_id) {
+            let same_owner = existing.workspace_id == workspace_id
+                && existing.chat_id == chat_id
+                && existing.assistant_message_id == assistant_message_id
+                && existing.assistant_sequence == assistant_sequence
+                && existing.queued_user_message_id == queued_user_message_id
+                && existing.agent_identity == agent_identity
+                && existing.primary_chat_output == primary_chat_output;
+            if same_owner && !*existing.completed_rx.borrow() {
+                return Ok(ActiveChatRunRegistrationResult::Existing);
+            }
+            return Err(ApiError::conflict(format!(
+                "active chat run id '{run_id}' is already owned by a different or completed run"
+            )));
+        }
+        if primary_chat_output
+            && let Some((existing_run_id, _)) = runs.iter().find(|(_, run)| {
+                run.workspace_id == workspace_id
+                    && run.chat_id == chat_id
+                    && run.primary_chat_output
+                    && !*run.completed_rx.borrow()
+            })
+        {
+            return Err(ApiError::conflict(format!(
+                "chat '{chat_id}' already has primary active run '{existing_run_id}'"
             )));
         }
 
@@ -249,6 +360,9 @@ impl ActiveChatRunRegistry {
             ActiveChatRun {
                 workspace_id,
                 chat_id,
+                assistant_message_id: assistant_message_id.clone(),
+                assistant_sequence,
+                queued_user_message_id,
                 agent_identity,
                 primary_chat_output,
                 guidance_tx,
@@ -260,21 +374,23 @@ impl ActiveChatRunRegistry {
             },
         );
 
-        Ok(ActiveChatRunRegistration {
-            registry: self.clone(),
-            run_id,
-            assistant_message_id,
-            assistant_sequence,
-            memories_used,
-            primary_chat_output,
-            cancellation,
-            events,
-            event_tx,
-            completed_tx,
-            next_sequence,
-            assistant_draft: StreamingAssistantDraft::default(),
-            completed: false,
-        })
+        Ok(ActiveChatRunRegistrationResult::Registered(
+            ActiveChatRunRegistration {
+                registry: self.clone(),
+                run_id,
+                assistant_message_id,
+                assistant_sequence,
+                memories_used,
+                primary_chat_output,
+                cancellation,
+                events,
+                event_tx,
+                completed_tx,
+                next_sequence,
+                assistant_draft: StreamingAssistantDraft::default(),
+                completed: false,
+            },
+        ))
     }
 
     fn unregister(&self, run_id: &str) {
@@ -300,17 +416,12 @@ impl ActiveChatRunRegistry {
             .runs
             .lock()
             .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
-        let mut matches = runs
-            .iter()
-            .filter(|(_, run)| {
-                run.workspace_id == workspace_id
-                    && run.chat_id == chat_id
-                    && run.primary_chat_output
-                    && !*run.completed_rx.borrow()
-            })
-            .collect::<Vec<_>>();
-        matches.sort_by_key(|(_, run)| !run.accepting_guidance);
-        let Some((run_id, run)) = matches.into_iter().next() else {
+        let Some((run_id, run)) = runs.iter().find(|(_, run)| {
+            run.workspace_id == workspace_id
+                && run.chat_id == chat_id
+                && run.primary_chat_output
+                && !*run.completed_rx.borrow()
+        }) else {
             return Ok(None);
         };
 
@@ -325,6 +436,9 @@ impl ActiveChatRunRegistry {
             run_id: run_id.clone(),
             workspace_id: run.workspace_id.clone(),
             chat_id: run.chat_id.clone(),
+            assistant_message_id: run.assistant_message_id.clone(),
+            assistant_sequence: Some(run.assistant_sequence),
+            queued_user_message_id: run.queued_user_message_id.clone(),
             last_sequence,
             accepting_guidance: run.accepting_guidance,
         }))
@@ -837,6 +951,11 @@ pub(crate) struct ActiveChatRunSummary {
     pub(crate) run_id: String,
     workspace_id: String,
     chat_id: String,
+    pub(crate) assistant_message_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assistant_sequence: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) queued_user_message_id: Option<String>,
     pub(crate) last_sequence: Option<i64>,
     pub(crate) accepting_guidance: bool,
 }
@@ -904,6 +1023,7 @@ fn sse_event_frame(event: &ChatRunEventFrame) -> Event {
 mod tests {
     use axum::{
         body::to_bytes,
+        http::StatusCode,
         response::{IntoResponse, Sse},
     };
     use tokio::sync::{broadcast, mpsc, watch};
@@ -1225,6 +1345,140 @@ mod tests {
                 .content,
             "Continue manually."
         );
+    }
+
+    #[test]
+    fn primary_run_summary_exposes_durable_assistant_identity() {
+        let registry = ActiveChatRunRegistry::default();
+        let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+        let _registration = registry
+            .register_with_queued_user_message(
+                "run-primary-identity".to_string(),
+                "workspace-primary-identity".to_string(),
+                "chat-primary-identity".to_string(),
+                "assistant-primary-identity".to_string(),
+                7,
+                Some("user-primary-identity".to_string()),
+                Vec::new(),
+                true,
+                0,
+                guidance_tx,
+            )
+            .expect("register primary run");
+
+        let summary = registry
+            .active_run_for_chat("workspace-primary-identity", "chat-primary-identity")
+            .expect("read active run")
+            .expect("primary run is active");
+        let serialized = serde_json::to_value(&summary).expect("summary serializes");
+
+        assert_eq!(
+            (
+                summary.run_id,
+                summary.assistant_message_id,
+                summary.assistant_sequence,
+                summary.queued_user_message_id,
+            ),
+            (
+                "run-primary-identity".to_string(),
+                "assistant-primary-identity".to_string(),
+                Some(7),
+                Some("user-primary-identity".to_string()),
+            )
+        );
+        assert_eq!(
+            serialized
+                .get("assistantMessageId")
+                .and_then(|value| value.as_str()),
+            Some("assistant-primary-identity")
+        );
+        assert_eq!(
+            serialized
+                .get("assistantSequence")
+                .and_then(|value| value.as_i64()),
+            Some(7)
+        );
+        assert_eq!(
+            serialized
+                .get("queuedUserMessageId")
+                .and_then(|value| value.as_str()),
+            Some("user-primary-identity")
+        );
+    }
+
+    #[test]
+    fn primary_run_registration_rejects_a_second_owner_for_the_same_chat() {
+        let registry = ActiveChatRunRegistry::default();
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let _first = registry
+            .register(
+                "run-primary-first".to_string(),
+                "workspace-primary-conflict".to_string(),
+                "chat-primary-conflict".to_string(),
+                "assistant-primary-first".to_string(),
+                1,
+                Vec::new(),
+                true,
+                0,
+                first_tx,
+            )
+            .expect("register first primary run");
+        let (second_tx, _second_rx) = mpsc::unbounded_channel();
+
+        let error = match registry.register(
+            "run-primary-second".to_string(),
+            "workspace-primary-conflict".to_string(),
+            "chat-primary-conflict".to_string(),
+            "assistant-primary-second".to_string(),
+            3,
+            Vec::new(),
+            true,
+            0,
+            second_tx,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("second primary owner must be rejected"),
+        };
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn primary_run_registration_replays_the_same_owner_idempotently() {
+        let registry = ActiveChatRunRegistry::default();
+        let (first_tx, _first_rx) = mpsc::unbounded_channel();
+        let _first = registry
+            .register_with_queued_user_message(
+                "run-primary-replay".to_string(),
+                "workspace-primary-replay".to_string(),
+                "chat-primary-replay".to_string(),
+                "assistant-primary-replay".to_string(),
+                5,
+                Some("user-primary-replay".to_string()),
+                Vec::new(),
+                true,
+                0,
+                first_tx,
+            )
+            .expect("register primary run");
+        let (replay_tx, _replay_rx) = mpsc::unbounded_channel();
+
+        let replay = registry
+            .register_with_queued_user_message(
+                "run-primary-replay".to_string(),
+                "workspace-primary-replay".to_string(),
+                "chat-primary-replay".to_string(),
+                "assistant-primary-replay".to_string(),
+                5,
+                Some("user-primary-replay".to_string()),
+                Vec::new(),
+                true,
+                9,
+                replay_tx,
+            )
+            .expect("replay same primary owner");
+
+        assert!(matches!(replay, ActiveChatRunRegistrationResult::Existing));
     }
 
     fn agent_message_guidance(id: &str) -> GuidanceMessage {

@@ -73,9 +73,10 @@ pub(crate) use reasoning_loop_detector::{
 };
 pub(crate) use sidecar_config::{SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle};
 pub(crate) use subscriptions::{
-    ActiveAgentRunIdentity, ActiveChatRunRegistration, ActiveChatRunRegistry,
-    ActiveChatRunSubscription, ActiveChatRunSummary, AgentMessageGuidanceDelivery,
-    ChatRunCancellation, GuidanceMessage, chat_run_subscription_stream,
+    ActiveAgentRunIdentity, ActiveChatRunRegistration, ActiveChatRunRegistrationResult,
+    ActiveChatRunRegistry, ActiveChatRunSubscription, ActiveChatRunSummary,
+    AgentMessageGuidanceDelivery, ChatRunCancellation, GuidanceMessage,
+    chat_run_subscription_stream,
 };
 pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
 #[cfg(test)]

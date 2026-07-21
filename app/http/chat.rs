@@ -28,6 +28,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::git_backend::{
     AgentWorktreeInfo, agent_worktree_relative_path, create_agent_worktree, delete_agent_worktree,
 };
+use crate::runtime::ActiveChatRunRegistrationResult;
 use crate::*;
 
 type BoxedChatEventStream =
@@ -1512,12 +1513,13 @@ pub(crate) async fn stream_chat_response(
     let chat_context = prepare_chat_context(&state, &config, &workspace_id, request).await?;
     let run_id = chat_context.llm_request_id.clone();
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
-    let active_run_registration = state.active_chat_runs.register(
+    let registration = state.active_chat_runs.register_with_queued_user_message(
         run_id.clone(),
         chat_context.workspace_id.clone(),
         chat_context.chat_id.clone(),
         chat_context.assistant_message_id.clone(),
         chat_context.assistant_sequence,
+        chat_context.queued_user_message_id.clone(),
         chat_context.memories_used.clone(),
         chat_context.agent_primary_chat_output,
         0,
@@ -1527,11 +1529,13 @@ pub(crate) async fn stream_chat_response(
         .active_chat_runs
         .subscribe(&workspace_id, &run_id, Some(-1))?;
 
-    tokio::spawn(run_chat_context_in_background(
-        chat_context,
-        active_run_registration,
-        guidance_rx,
-    ));
+    if let ActiveChatRunRegistrationResult::Registered(active_run_registration) = registration {
+        tokio::spawn(run_chat_context_in_background(
+            chat_context,
+            active_run_registration,
+            guidance_rx,
+        ));
+    }
 
     Ok(boxed_chat_run_sse(subscription))
 }

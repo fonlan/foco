@@ -382,6 +382,10 @@ export type ActiveChatRunSummary = {
   runId: string;
   workspaceId: string;
   chatId: string;
+  // Optional for compatibility with sidecars that predate durable assistant identity.
+  assistantMessageId?: string | null;
+  assistantSequence?: number | null;
+  queuedUserMessageId?: string | null;
   lastSequence: number | null;
   acceptingGuidance: boolean;
 };

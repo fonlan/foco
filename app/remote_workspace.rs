@@ -1327,6 +1327,12 @@ pub(crate) struct RemoteWorkspaceSessionSummary {
 pub(crate) struct RemoteActiveRunSummary {
     pub(crate) run_id: String,
     pub(crate) chat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assistant_message_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) assistant_sequence: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) queued_user_message_id: Option<String>,
     pub(crate) last_sequence: Option<i64>,
     pub(crate) accepting_guidance: bool,
     pub(crate) broker_status: String,
@@ -3183,12 +3189,23 @@ fn remote_sidecar_send_heartbeat(state: &RemoteSidecarState) {
     let _ = state.broker_tx.send(envelope);
 }
 
-fn remote_sidecar_set_active_run(state: &RemoteSidecarState, run: RemoteActiveRunSummary) {
+fn remote_sidecar_set_active_run(state: &RemoteSidecarState, mut run: RemoteActiveRunSummary) {
     if let Ok(mut runs) = state.active_runs.lock() {
         if let Some(existing) = runs
             .iter_mut()
             .find(|existing| existing.run_id == run.run_id)
         {
+            if run.assistant_message_id.is_none() {
+                run.assistant_message_id
+                    .clone_from(&existing.assistant_message_id);
+            }
+            if run.assistant_sequence.is_none() {
+                run.assistant_sequence = existing.assistant_sequence;
+            }
+            if run.queued_user_message_id.is_none() {
+                run.queued_user_message_id
+                    .clone_from(&existing.queued_user_message_id);
+            }
             *existing = run;
         } else {
             runs.push(run);
@@ -8180,6 +8197,15 @@ fn remote_active_run_from_value(value: &Value) -> Option<RemoteActiveRunSummary>
     Some(RemoteActiveRunSummary {
         run_id: value.get("runId")?.as_str()?.to_string(),
         chat_id: value.get("chatId")?.as_str()?.to_string(),
+        assistant_message_id: value
+            .get("assistantMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        assistant_sequence: value.get("assistantSequence").and_then(Value::as_i64),
+        queued_user_message_id: value
+            .get("queuedUserMessageId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         last_sequence: value.get("lastSequence").and_then(Value::as_i64),
         accepting_guidance: value
             .get("acceptingGuidance")
@@ -8205,7 +8231,7 @@ fn update_remote_active_runs(
     let Some(runs) = payload.get("activeRuns").and_then(Value::as_array) else {
         return Vec::new();
     };
-    let summaries = runs
+    let mut summaries = runs
         .iter()
         .filter_map(remote_active_run_from_value)
         .collect::<Vec<_>>();
@@ -8217,6 +8243,27 @@ fn update_remote_active_runs(
     let next: std::collections::HashSet<String> =
         summaries.iter().map(|run| run.run_id.clone()).collect();
     let removed = previous.difference(&next).cloned().collect::<Vec<_>>();
+    for summary in &mut summaries {
+        let Some(previous) = active_runs
+            .iter()
+            .find(|previous| previous.run_id == summary.run_id)
+        else {
+            continue;
+        };
+        if summary.assistant_message_id.is_none() {
+            summary
+                .assistant_message_id
+                .clone_from(&previous.assistant_message_id);
+        }
+        if summary.assistant_sequence.is_none() {
+            summary.assistant_sequence = previous.assistant_sequence;
+        }
+        if summary.queued_user_message_id.is_none() {
+            summary
+                .queued_user_message_id
+                .clone_from(&previous.queued_user_message_id);
+        }
+    }
     *active_runs = summaries;
     removed
 }
@@ -9450,6 +9497,9 @@ fn remote_chat_active_run(state: &RemoteSidecarState, chat_id: &str) -> Option<V
                 "runId": run.run_id,
                 "workspaceId": state.workspace_id,
                 "chatId": run.chat_id,
+                "assistantMessageId": run.assistant_message_id,
+                "assistantSequence": run.assistant_sequence,
+                "queuedUserMessageId": run.queued_user_message_id,
                 "lastSequence": run.last_sequence,
                 "acceptingGuidance": run.accepting_guidance,
             })
@@ -13972,6 +14022,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         accepting_guidance: true,
                         broker_status: "connected".to_string(),
                         updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                        ..RemoteActiveRunSummary::default()
                     },
                 );
             }
@@ -17806,7 +17857,7 @@ async fn remote_sidecar_start_chat_run(
         .map(AgentTaskId::new)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let (chat_title, assistant_message_id, session_mode, plan_task) = {
+    let (chat_title, assistant_message_id, assistant_sequence, session_mode, plan_task) = {
         let (_startup_cancel_tx, startup_cancel_rx) = watch::channel(false);
         let database = open_workspace_database_ordinary_with_pre_stream_retry(
             sidecar_workspace_path(&state),
@@ -17836,6 +17887,14 @@ async fn remote_sidecar_start_chat_run(
             .ok_or_else(|| {
                 ApiError::bad_request("queued user message has no assistant identity")
             })?;
+        let assistant_sequence = serde_json::from_str::<Value>(&user_message.metadata_json)
+            .ok()
+            .and_then(|metadata| {
+                metadata
+                    .get("queuedRun")
+                    .and_then(|run| run.get("assistantSequence"))
+                    .and_then(Value::as_i64)
+            });
         let session_mode =
             remote_sidecar_session_mode(&database, &chat_id, &queued_user_message_id).map_err(
                 |_| ApiError::bad_request("queued user message does not belong to this chat"),
@@ -17849,7 +17908,13 @@ async fn remote_sidecar_start_chat_run(
             &tool_workspace_path,
             &shared_workspace_path,
         )?;
-        (chat.title, assistant_message_id, session_mode, plan_task)
+        (
+            chat.title,
+            assistant_message_id,
+            assistant_sequence,
+            session_mode,
+            plan_task,
+        )
     };
 
     let (run_id, run_stream) = match remote_sidecar_reserve_active_run(
@@ -17905,6 +17970,9 @@ async fn remote_sidecar_start_chat_run(
     let run = RemoteActiveRunSummary {
         run_id: run_id.clone(),
         chat_id: chat_id.clone(),
+        assistant_message_id: Some(assistant_message_id.clone()),
+        assistant_sequence,
+        queued_user_message_id: Some(queued_user_message_id.clone()),
         last_sequence: Some(0),
         accepting_guidance: true,
         broker_status: "connecting".to_string(),
@@ -25006,6 +25074,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..RemoteActiveRunSummary::default()
             },
         );
 
@@ -25103,6 +25172,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..RemoteActiveRunSummary::default()
             },
         );
 
@@ -25754,6 +25824,9 @@ mod tests {
                 "activeRuns": [{
                     "runId": "run-1",
                     "chatId": "chat-1",
+                    "assistantMessageId": "assistant-1",
+                    "assistantSequence": 6,
+                    "queuedUserMessageId": "user-1",
                     "lastSequence": 7,
                     "acceptingGuidance": true,
                     "brokerStatus": "brokerUnavailable",
@@ -25766,6 +25839,63 @@ mod tests {
         assert_eq!(runs[0].run_id, "run-1");
         assert_eq!(runs[0].last_sequence, Some(7));
         assert_eq!(runs[0].broker_status, "brokerUnavailable");
+        assert_eq!(runs[0].assistant_message_id.as_deref(), Some("assistant-1"));
+        assert_eq!(runs[0].assistant_sequence, Some(6));
+        assert_eq!(runs[0].queued_user_message_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn remote_active_run_heartbeat_without_identity_remains_compatible() {
+        let run = remote_active_run_from_value(&json!({
+            "runId": "run-legacy",
+            "chatId": "chat-legacy",
+            "lastSequence": 3,
+        }))
+        .expect("legacy heartbeat parses");
+
+        assert_eq!(
+            (
+                run.assistant_message_id,
+                run.assistant_sequence,
+                run.queued_user_message_id,
+            ),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn remote_active_run_heartbeat_keeps_known_identity_when_a_legacy_update_omits_it() {
+        let active_runs = Arc::new(Mutex::new(Vec::new()));
+        update_remote_active_runs(
+            &active_runs,
+            &json!({
+                "activeRuns": [{
+                    "runId": "run-1",
+                    "chatId": "chat-1",
+                    "assistantMessageId": "assistant-1",
+                    "assistantSequence": 6,
+                    "queuedUserMessageId": "user-1",
+                    "lastSequence": 7,
+                }],
+            }),
+        );
+
+        update_remote_active_runs(
+            &active_runs,
+            &json!({
+                "activeRuns": [{
+                    "runId": "run-1",
+                    "chatId": "chat-1",
+                    "lastSequence": 8,
+                }],
+            }),
+        );
+
+        let runs = active_runs.lock().expect("active runs");
+        assert_eq!(runs[0].last_sequence, Some(8));
+        assert_eq!(runs[0].assistant_message_id.as_deref(), Some("assistant-1"));
+        assert_eq!(runs[0].assistant_sequence, Some(6));
+        assert_eq!(runs[0].queued_user_message_id.as_deref(), Some("user-1"));
     }
 
     #[test]
@@ -26105,6 +26235,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..RemoteActiveRunSummary::default()
             },
         );
         while broker_rx.try_recv().is_ok() {}
@@ -30145,6 +30276,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: "2026-07-19T00:00:00Z".to_string(),
+                ..RemoteActiveRunSummary::default()
             },
         );
 
@@ -30206,6 +30338,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: "2026-07-19T00:00:00Z".to_string(),
+                ..RemoteActiveRunSummary::default()
             },
         );
 
@@ -30290,6 +30423,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: "2026-07-19T00:00:01Z".to_string(),
+                ..RemoteActiveRunSummary::default()
             },
         );
 
@@ -30355,6 +30489,7 @@ mod tests {
                 accepting_guidance: true,
                 broker_status: "connected".to_string(),
                 updated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+                ..RemoteActiveRunSummary::default()
             },
         );
         while broker_rx.try_recv().is_ok() {}

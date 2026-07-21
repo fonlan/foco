@@ -33,7 +33,7 @@ use tokio::{
     time,
 };
 
-use super::ActiveAgentRunIdentity;
+use super::{ActiveAgentRunIdentity, ActiveChatRunRegistrationResult};
 use crate::git_backend::{
     agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response,
     resolve_agent_worktree_path,
@@ -879,23 +879,37 @@ async fn run_coordinator_task_inner(
         .map_err(ApiError::from_workspace_error)?;
     // Register before snapshotting unread Agent messages. Messages sent after the snapshot are
     // buffered as live guidance instead of being stranded until a later attempt.
-    let registration = state.active_chat_runs.register_agent(
-        task.id.to_string(),
-        workspace.id.clone(),
-        team.chat_id.clone(),
-        chat_context.assistant_message_id.clone(),
-        chat_context.assistant_sequence,
-        chat_context.memories_used.clone(),
-        chat_context.agent_primary_chat_output,
-        ActiveAgentRunIdentity {
-            team_id: task.team_id.clone(),
-            instance_id: task.owner_instance_id.clone(),
-            task_id: task.id.clone(),
-            _attempt_id: attempt_id.clone(),
-        },
-        next_run_event_sequence,
-        guidance_tx,
-    )?;
+    let registration = state
+        .active_chat_runs
+        .register_agent_with_queued_user_message(
+            task.id.to_string(),
+            workspace.id.clone(),
+            team.chat_id.clone(),
+            chat_context.assistant_message_id.clone(),
+            chat_context.assistant_sequence,
+            chat_context.queued_user_message_id.clone(),
+            chat_context.memories_used.clone(),
+            chat_context.agent_primary_chat_output,
+            ActiveAgentRunIdentity {
+                team_id: task.team_id.clone(),
+                instance_id: task.owner_instance_id.clone(),
+                task_id: task.id.clone(),
+                _attempt_id: attempt_id.clone(),
+            },
+            next_run_event_sequence,
+            guidance_tx,
+        )?;
+    let registration = match registration {
+        ActiveChatRunRegistrationResult::Registered(registration) => registration,
+        ActiveChatRunRegistrationResult::Existing => {
+            tracing::debug!(
+                workspace_id = %workspace.id,
+                task_id = %task.id,
+                "Coordinator task replay is already owned by an active chat run"
+            );
+            return Ok(());
+        }
+    };
     let (agent_unread_messages, consumed_agent_message_ids) = apply_agent_prompt_layers(
         &workspace.path,
         &mut chat_context,
