@@ -48,7 +48,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
 fn read_file_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_FILE_TOOL,
-        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. Ordinary files use a soft output budget of about 50KiB or 2,000 numbered lines: exceeding it returns a recoverable tool error with a suggested smaller startLine/endLine rather than silent truncation. Full unscoped reads also refuse sources larger than about 128KiB and require a line range; numbered output has a hard envelope safety cap at about 128KiB. Prefer smaller startLine/endLine ranges and retry if the tool reports the output is too large. Files named SKILL.md are an integrity exception: startLine/endLine must both be null, the full document is returned when it is at most 64KiB, and oversized SKILL.md files fail outright (partial range reads cannot reconstruct a disabled skill). Non-SKILL.md files under skill directories (references/, scripts, assets) keep normal ranged-read rules. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
+        description: "Read a text file inside the active workspace, or outside the workspace after explicit user authorization, optionally restricted to a 1-based inclusive line range. Ordinary files use the shared soft output budget (~50KiB or 2,000 numbered lines) and the ~128KiB complete ToolExecution/envelope hard limit. When ordinary content exceeds the soft budget, the tool succeeds (is_error=false) with an explicit complete-line prefix: truncated=true, nextStartLine for continuation from the original file, returnedLines/lastReturnedLine, and a model-facing note. This is explicit truncated success, not hidden data loss; continue with startLine=nextStartLine and a non-null inclusive endLine rather than stitching silent mid-line cuts. UTF-8 characters and line contents are never split. If a single complete line cannot fit under the hard envelope without splitting, the tool returns a recoverable error. A single line that only exceeds the soft limit but fits the hard limit is returned in full and marked truncated when more content remains, so the model always makes progress. Full unscoped reads also refuse ordinary sources larger than about 128KiB and require a line range when needed. Files named SKILL.md are an integrity exception: startLine/endLine must both be null, the full document is returned when it is at most 64KiB (SKILL.md does not use silent/complete-line truncation), and oversized SKILL.md files fail outright (partial range reads cannot reconstruct a disabled skill). Non-SKILL.md files under skill directories (references/, scripts, assets) keep normal ranged-read rules. The returned content is prefixed with real 1-based file line numbers for edit targeting; line-number prefixes are not file content and must not be copied into write_file content or edit_file oldStr/newStr values.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -59,11 +59,11 @@ fn read_file_definition() -> ToolDefinition {
                 },
                 "startLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based first line to read. Must be null when endLine is null. Must be null for SKILL.md (full document only). Use a smaller range when a full read or previous range exceeds the soft ~50KiB / 2,000-line budget or the ~128KiB hard cap."
+                    "description": "Optional 1-based first line to read. Must be null when endLine is null (full-file mode). Must be null for SKILL.md (full document only). After a truncated ordinary read, continue with startLine=nextStartLine from the previous result together with an inclusive endLine (both must be non-null integers; omitting endLine is invalid when startLine is set). Prefer a finite endLine so the request stays under the soft ~50KiB / 2,000-line budget and the ~128KiB hard cap; if the range is still large the tool may return truncated=true with another nextStartLine."
                 },
                 "endLine": {
                     "type": ["integer", "null"],
-                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null. Must be null for SKILL.md (full document only). Keep ranges small enough that the numbered output stays under the soft ~50KiB / 2,000-line budget."
+                    "description": "Optional 1-based last line to read, inclusive. Values beyond the file length read through the final line. Must be null when startLine is null. Must be null for SKILL.md (full document only). Continuation after truncated=true requires startLine=nextStartLine and a non-null inclusive endLine together; do not pass startLine with endLine=null."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
@@ -353,7 +353,7 @@ fn search_text_definition() -> ToolDefinition {
 fn web_search_definition() -> ToolDefinition {
     ToolDefinition {
         name: WEB_SEARCH_TOOL,
-        description: "Search the web for current or external information using the search API configured in Foco settings. Use web_fetch on result URLs when page details or direct source text are needed.",
+        description: "Search the web for current or external information using the search API configured in Foco settings. Use web_fetch on result URLs when page details or direct source text are needed. Large result payloads use the shared soft output budget (~50KiB / 2,000 lines) and ~128KiB complete envelope hard limit: when over the soft budget the tool succeeds (is_error=false) with an explicit complete-line prefix (truncated=true, nextStartLine, note) and writes the full credential-free readable result under the tool execution workspace `.foco/web-results/` as fullResultPath (local workspace or SSH sidecar workspace via broker file transfer so a later read_file can open it). Field names truncated, nextStartLine, fullResultPath, and note are identical for local and SSH. This is explicit truncated success, not hidden data loss; continue via nextStartLine on the cached file or read_file ranges on fullResultPath. UTF-8 characters and lines are never split. A single line over the hard envelope without a safe complete-line return is a recoverable error; a single line over soft but under hard is returned fully with truncated when more content remains.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -380,7 +380,7 @@ fn web_search_definition() -> ToolDefinition {
 fn web_fetch_definition() -> ToolDefinition {
     ToolDefinition {
         name: WEB_FETCH_TOOL,
-        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. Large pages fail under the shared soft budget (~50KiB / 2,000 lines) with an instruction to retry using a 1-based inclusive line range; prefer startLine/endLine continuation rather than a full unscoped fetch.",
+        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. Large pages use the shared soft output budget (~50KiB / 2,000 lines) and ~128KiB complete envelope hard limit: when over the soft budget the tool succeeds (is_error=false) with an explicit complete-line prefix of the readable text (truncated=true, nextStartLine, note) and saves the full credential-free readable result under the tool execution workspace `.foco/web-results/` as fullResultPath (local sessions write the local workspace; SSH sessions transfer via broker into the sidecar workspace so fullResultPath is readable by a later read_file). Prefer continuing with nextStartLine or read_file on fullResultPath rather than assuming mid-line cuts. Optional startLine/endLine still select a 1-based inclusive slice of the readable text before the shared complete-line soft cap applies. Field names truncated, nextStartLine, fullResultPath, and note are shared with web_search and local/SSH paths. A single complete line that cannot fit the hard envelope is a recoverable error; a single line over soft but under hard is returned fully with truncated when more remains. SKILL.md integrity rules do not apply to web tools.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -392,7 +392,7 @@ fn web_fetch_definition() -> ToolDefinition {
                 "startLine": {
                     "type": ["integer", "null"],
                     "minimum": 1,
-                    "description": "Optional 1-based first readable-text line to return. Must be set together with endLine; null requests the full page."
+                    "description": "Optional 1-based first readable-text line to return. Must be set together with endLine; null requests the full page (still subject to complete-line soft truncation with truncated/nextStartLine/fullResultPath). After a truncated fetch, continue from nextStartLine or read_file fullResultPath."
                 },
                 "endLine": {
                     "type": ["integer", "null"],
