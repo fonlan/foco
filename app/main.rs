@@ -192,6 +192,7 @@ mod single_instance;
 mod skills;
 mod spec_runtime;
 mod ssh_client;
+mod structured_llm_outcome;
 mod terminal;
 mod update_runtime;
 #[cfg(test)]
@@ -5690,7 +5691,8 @@ pub(crate) async fn generate_git_commit_message(
         0,
         api_audit_save_details(config),
     )
-    .await?;
+    .await?
+    .arguments;
     parse_git_commit_message_tool_arguments(arguments)
 }
 
@@ -5877,9 +5879,10 @@ pub(crate) async fn audited_provider_tool_request(
     timeout_ms: u64,
     retry_count: u32,
     save_details: bool,
-) -> Result<Value, ApiError> {
+) -> Result<AuditedProviderToolResult, ApiError> {
     for attempt_index in 0..=retry_count {
         let request_id = unique_id("llm");
+        let attempt_number = i64::from(attempt_index) + 1;
         let request_started_at = utc_timestamp();
         let started_at = Instant::now();
         let mut database = WorkspaceDatabase::open_or_create(workspace_path)
@@ -5966,6 +5969,8 @@ pub(crate) async fn audited_provider_tool_request(
         match result {
             Ok(AuditedToolStreamOutcome {
                 tool_arguments,
+                recovery_source,
+                structured_outcome,
                 events,
                 usage,
                 first_token_at,
@@ -5997,6 +6002,15 @@ pub(crate) async fn audited_provider_tool_request(
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
+                let _ = structured_llm_outcome::persist_structured_classification_on_database(
+                    &mut database,
+                    &request_id,
+                    foco_store::workspace::StructuredLlmRequestClassification {
+                        structured_outcome,
+                        recovery_source,
+                        attempt_index: attempt_number,
+                    },
+                );
                 persist_audited_provider_events(
                     &mut database,
                     &request_id,
@@ -6004,7 +6018,13 @@ pub(crate) async fn audited_provider_tool_request(
                     1,
                     save_details,
                 )?;
-                return Ok(tool_arguments);
+                return Ok(AuditedProviderToolResult {
+                    arguments: tool_arguments,
+                    request_id,
+                    structured_outcome,
+                    recovery_source,
+                    attempt_index: attempt_index + 1,
+                });
             }
             Err(error) => {
                 database
@@ -6026,6 +6046,15 @@ pub(crate) async fn audited_provider_tool_request(
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
+                let failure = structured_llm_outcome::with_attempt_index(
+                    structured_llm_outcome::classify_provider_tool_failure_message(&error.message),
+                    attempt_number,
+                );
+                let _ = structured_llm_outcome::persist_structured_classification_on_database(
+                    &mut database,
+                    &request_id,
+                    failure,
+                );
                 if attempt_index >= retry_count {
                     return Err(ApiError::internal(error.message));
                 }
@@ -6049,11 +6078,24 @@ struct AuditedTextStreamOutcome {
 
 struct AuditedToolStreamOutcome {
     tool_arguments: Value,
+    recovery_source: &'static str,
+    structured_outcome: &'static str,
     events: Vec<NeutralChatStreamEvent>,
     usage: Option<NeutralUsage>,
     first_token_at: Option<String>,
     first_token_latency_ms: Option<i64>,
     response_body_json: Option<String>,
+}
+
+/// Result of a single-tool audited provider request, including classification ids.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // structured_outcome/recovery_source reserved for later recovery phases
+pub(crate) struct AuditedProviderToolResult {
+    pub arguments: Value,
+    pub request_id: String,
+    pub structured_outcome: &'static str,
+    pub recovery_source: &'static str,
+    pub attempt_index: u32,
 }
 
 struct AuditedProviderError {
@@ -6387,37 +6429,51 @@ async fn run_provider_stream_for_tool(
         }
     }
 
-    let tool_arguments = match resolve_audited_single_tool_arguments(
-        tool_arguments,
-        &output_text,
-        request_tool_count,
-    ) {
-        Some(ResolvedAuditedToolArguments::FromToolCall(arguments)) => arguments,
-        Some(ResolvedAuditedToolArguments::FromTextJsonFallback(arguments)) => {
-            tracing::debug!(
-                request_kind,
-                expected_tool_name,
-                text_json_fallback = true,
-                "recovered single-tool arguments from model text JSON"
-            );
-            arguments
-        }
-        None => {
-            let text = output_text.trim();
-            let error = if text.is_empty() {
-                AuditedProviderError::new(format!("{request_kind} did not call {tool_label}"), None)
-            } else {
-                AuditedProviderError::new(
-                    format!("{request_kind} returned text instead of {tool_label}: {text}"),
-                    None,
+    let (tool_arguments, recovery_source, structured_outcome) =
+        match resolve_audited_single_tool_arguments(
+            tool_arguments,
+            &output_text,
+            request_tool_count,
+        ) {
+            Some(ResolvedAuditedToolArguments::FromToolCall(arguments)) => (
+                arguments,
+                foco_store::workspace::STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                foco_store::workspace::STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+            ),
+            Some(ResolvedAuditedToolArguments::FromTextJsonFallback(arguments)) => {
+                tracing::debug!(
+                    request_kind,
+                    expected_tool_name,
+                    text_json_fallback = true,
+                    "recovered single-tool arguments from model text JSON"
+                );
+                (
+                    arguments,
+                    foco_store::workspace::STRUCTURED_LLM_RECOVERY_TEXT_JSON,
+                    foco_store::workspace::STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
                 )
-            };
-            return Err(error.with_stream_final_response(capture, &stream));
-        }
-    };
+            }
+            None => {
+                let text = output_text.trim();
+                let error = if text.is_empty() {
+                    AuditedProviderError::new(
+                        format!("{request_kind} did not call {tool_label}"),
+                        None,
+                    )
+                } else {
+                    AuditedProviderError::new(
+                        format!("{request_kind} returned text instead of {tool_label}: {text}"),
+                        None,
+                    )
+                };
+                return Err(error.with_stream_final_response(capture, &stream));
+            }
+        };
 
     Ok(AuditedToolStreamOutcome {
         tool_arguments,
+        recovery_source,
+        structured_outcome,
         events,
         usage: final_usage,
         first_token_at,

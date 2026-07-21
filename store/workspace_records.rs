@@ -1046,6 +1046,14 @@ pub struct LlmRequestRecord {
     pub total_latency_ms: Option<i64>,
     pub status_code: Option<i64>,
     pub final_state: String,
+    /// Stable structured single-tool outcome code (nullable for historical rows).
+    /// See `STRUCTURED_LLM_OUTCOME_*` constants.
+    pub structured_outcome: Option<String>,
+    /// How structured arguments were obtained when applicable.
+    /// See `STRUCTURED_LLM_RECOVERY_*` constants.
+    pub recovery_source: Option<String>,
+    /// 1-based attempt within the audited provider request loop.
+    pub attempt_index: Option<i64>,
     pub request_body_json: Option<String>,
     pub response_body_json: Option<String>,
     pub invalidated_at: Option<String>,
@@ -1238,6 +1246,79 @@ pub struct LlmRequestAuditRequestKindBreakdown {
     pub total_tokens: i64,
     pub latency_count: i64,
     pub latency_sum: i64,
+}
+
+/// Stable structured single-tool LLM outcome codes (no sensitive body text).
+///
+/// Used for memory retrieval/extraction and workspace-spec update baseline metrics.
+pub const STRUCTURED_LLM_OUTCOME_SUCCEEDED: &str = "succeeded";
+pub const STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED: &str = "text_json_recovered";
+pub const STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT: &str = "provider_timeout";
+pub const STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR: &str = "provider_error";
+pub const STRUCTURED_LLM_OUTCOME_MISSING_TOOL: &str = "missing_tool";
+pub const STRUCTURED_LLM_OUTCOME_WRONG_TOOL: &str = "wrong_tool";
+pub const STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID: &str = "schema_invalid";
+pub const STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID: &str = "semantic_invalid";
+pub const STRUCTURED_LLM_OUTCOME_OTHER: &str = "other";
+
+/// Recovery path when structured arguments were obtained.
+pub const STRUCTURED_LLM_RECOVERY_TOOL_CALL: &str = "tool_call";
+pub const STRUCTURED_LLM_RECOVERY_TEXT_JSON: &str = "text_json";
+pub const STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY: &str = "correction_retry";
+pub const STRUCTURED_LLM_RECOVERY_NONE: &str = "none";
+
+/// Primary request kinds tracked for structured single-tool reliability baseline.
+pub const STRUCTURED_LLM_BASELINE_REQUEST_KINDS: &[&str] = &[
+    "memory retrieval",
+    "memory extraction",
+    "workspace spec update",
+];
+
+/// Classification payload written to `llm_requests` (never includes model/prompt body).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructuredLlmRequestClassification<'a> {
+    pub structured_outcome: &'a str,
+    pub recovery_source: &'a str,
+    pub attempt_index: i64,
+}
+
+/// Filters for structured outcome breakdown queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructuredLlmOutcomeFilters<'a> {
+    pub request_kinds: &'a [&'a str],
+    pub provider_id: Option<&'a str>,
+    pub model_id: Option<&'a str>,
+    pub started_after: Option<&'a str>,
+    pub started_before: Option<&'a str>,
+    pub valid_only: bool,
+}
+
+/// One bucket for structured outcome analytics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuredLlmOutcomeBreakdownRow {
+    pub request_kind: String,
+    pub provider_id: String,
+    pub model_id: String,
+    pub transport: LlmRequestTransport,
+    pub attempt_index: i64,
+    pub structured_outcome: String,
+    pub recovery_source: String,
+    pub request_count: i64,
+    pub success_count: i64,
+    pub failed_count: i64,
+}
+
+/// Per-kind first-attempt vs terminal success summary for structured requests.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructuredLlmOutcomeKindSummary {
+    pub request_kind: String,
+    pub total_requests: i64,
+    pub first_attempt_requests: i64,
+    pub first_attempt_successes: i64,
+    pub terminal_successes: i64,
+    pub extra_request_count: i64,
+    pub first_attempt_success_rate: f64,
+    pub terminal_success_rate: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

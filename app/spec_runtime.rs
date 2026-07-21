@@ -821,7 +821,7 @@ async fn run_workspace_spec_job_inner(
         return Ok(());
     };
 
-    let tool_arguments = audited_provider_tool_request(
+    let tool_result = audited_provider_tool_request(
         &prepared.workspace_path,
         &prepared.workspace_id,
         prepared.chat_id.as_deref(),
@@ -836,7 +836,22 @@ async fn run_workspace_spec_job_inner(
         api_audit_save_details(config),
     )
     .await?;
-    let content_markdown = parse_workspace_spec_output(tool_arguments)?;
+    let content_markdown = match parse_workspace_spec_output(tool_result.arguments.clone()) {
+        Ok(content) => content,
+        Err(error) => {
+            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
+                &error.message,
+                i64::from(tool_result.attempt_index),
+            ) {
+                let _ = crate::structured_llm_outcome::persist_structured_classification(
+                    &prepared.workspace_path,
+                    &tool_result.request_id,
+                    classification,
+                );
+            }
+            return Err(error);
+        }
+    };
     let content_markdown = ensure_workspace_spec_markdown_fits_limit(
         config,
         &prepared.workspace_path,
@@ -881,7 +896,7 @@ async fn run_workspace_spec_update_job_inner(
         model.max_output_tokens,
         &input_summary,
     )?;
-    let tool_arguments = audited_provider_tool_request(
+    let tool_result = audited_provider_tool_request(
         workspace_path,
         workspace_id,
         job.chat_id.as_deref(),
@@ -897,8 +912,25 @@ async fn run_workspace_spec_update_job_inner(
     )
     .await?;
 
-    let update_output =
-        parse_workspace_spec_update_output(tool_arguments, &input_summary.current_spec_markdown)?;
+    let update_output = match parse_workspace_spec_update_output(
+        tool_result.arguments.clone(),
+        &input_summary.current_spec_markdown,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
+                &error.message,
+                i64::from(tool_result.attempt_index),
+            ) {
+                let _ = crate::structured_llm_outcome::persist_structured_classification(
+                    workspace_path,
+                    &tool_result.request_id,
+                    classification,
+                );
+            }
+            return Err(error);
+        }
+    };
     let update_output = ensure_workspace_spec_update_fits_limit(
         config,
         workspace_path,
@@ -1487,7 +1519,7 @@ async fn ensure_workspace_spec_update_markdown_fits_limit(
             let retry_count = config.app.llm_request_retry_count;
             let save_details = api_audit_save_details(config);
             async move {
-                audited_provider_tool_request(
+                Ok(audited_provider_tool_request(
                     &workspace_path,
                     &workspace_id,
                     chat_id.as_deref(),
@@ -1501,7 +1533,8 @@ async fn ensure_workspace_spec_update_markdown_fits_limit(
                     retry_count,
                     save_details,
                 )
-                .await
+                .await?
+                .arguments)
             }
         },
     )
@@ -1533,7 +1566,7 @@ async fn ensure_workspace_spec_markdown_fits_limit(
             let retry_count = config.app.llm_request_retry_count;
             let save_details = api_audit_save_details(config);
             async move {
-                audited_provider_tool_request(
+                Ok(audited_provider_tool_request(
                     &workspace_path,
                     &workspace_id,
                     chat_id.as_deref(),
@@ -1547,7 +1580,8 @@ async fn ensure_workspace_spec_markdown_fits_limit(
                     retry_count,
                     save_details,
                 )
-                .await
+                .await?
+                .arguments)
             }
         },
     )

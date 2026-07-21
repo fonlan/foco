@@ -70,8 +70,16 @@ pub use workspace_records::{
     PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, ScheduledTaskDueRunClaim,
     ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
-    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, TerminalSessionRecord, TodoGraphFilter,
-    TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
+    ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+    STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
+    STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
+    STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID,
+    STRUCTURED_LLM_OUTCOME_SUCCEEDED, STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
+    STRUCTURED_LLM_OUTCOME_WRONG_TOOL, STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
+    STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TEXT_JSON,
+    STRUCTURED_LLM_RECOVERY_TOOL_CALL, StructuredLlmOutcomeBreakdownRow, StructuredLlmOutcomeFilters,
+    StructuredLlmOutcomeKindSummary, StructuredLlmRequestClassification, TerminalSessionRecord,
+    TodoGraphFilter, TodoGraphRecord, TodoGraphTask, TodoGraphTaskPatch, ToolCallCountRecord,
     ToolCallWithResultRecord, ToolResultRecord, UpdateLlmRequestOutcome, WorkspaceSpecJobRecord,
     WorkspaceSpecRecord,
 };
@@ -82,13 +90,13 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    MIGRATION_039, MIGRATION_040, Migration,
+    MIGRATION_039, MIGRATION_040, MIGRATION_041, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 40;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 41;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -424,6 +432,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 40,
         sql: MIGRATION_040,
+    },
+    Migration {
+        version: 41,
+        sql: MIGRATION_041,
     },
 ];
 
@@ -7831,6 +7843,9 @@ impl WorkspaceDatabase {
                     total_latency_ms: row.get(10)?,
                     status_code: None,
                     final_state: row.get(5)?,
+                    structured_outcome: None,
+                    recovery_source: None,
+                    attempt_index: None,
                     request_body_json: None,
                     response_body_json: None,
                     invalidated_at: None,
@@ -9375,45 +9390,210 @@ impl WorkspaceDatabase {
                     request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
+                    structured_outcome, recovery_source, attempt_index,
                     request_body_json, response_body_json, invalidated_at, invalidated_reason
                  FROM llm_requests
                  WHERE id = ?1",
                 params![id],
-                |row| {
-                    Ok(LlmRequestRecord {
-                        id: row.get(0)?,
-                        workspace_id: row.get(1)?,
-                        chat_id: row.get(2)?,
-                        request_kind: row.get(3)?,
-                        agent_team_id: optional_agent_id_from_row(row, 4)?,
-                        agent_instance_id: optional_agent_id_from_row(row, 5)?,
-                        agent_task_id: optional_agent_id_from_row(row, 6)?,
-                        agent_attempt_id: optional_agent_id_from_row(row, 7)?,
-                        provider_id: row.get(8)?,
-                        model_id: row.get(9)?,
-                        thinking_level: row.get(10)?,
-                        request_started_at: row.get(11)?,
-                        first_token_at: row.get(12)?,
-                        completed_at: row.get(13)?,
-                        input_tokens: row.get(14)?,
-                        output_tokens: row.get(15)?,
-                        cache_read_tokens: row.get(16)?,
-                        cache_write_tokens: row.get(17)?,
-                        reasoning_tokens: row.get(18)?,
-                        cache_ratio: row.get(19)?,
-                        first_token_latency_ms: row.get(20)?,
-                        total_latency_ms: row.get(21)?,
-                        status_code: row.get(22)?,
-                        final_state: row.get(23)?,
-                        request_body_json: row.get(24)?,
-                        response_body_json: row.get(25)?,
-                        invalidated_at: row.get(26)?,
-                        invalidated_reason: row.get(27)?,
-                    })
-                },
+                llm_request_record_from_row,
             )
             .optional()
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Persist structured single-tool outcome classification without sensitive body text.
+    ///
+    /// Safe to call after terminal `update_llm_request_outcome`. Overwrites previous values.
+    pub fn set_llm_request_structured_classification(
+        &mut self,
+        id: &str,
+        classification: StructuredLlmRequestClassification<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        if classification.attempt_index < 1 {
+            return Err(WorkspaceDatabaseError::InvalidAuditData {
+                message: "structured LLM attempt_index must be >= 1".to_string(),
+            });
+        }
+        if classification.structured_outcome.trim().is_empty()
+            || classification.recovery_source.trim().is_empty()
+        {
+            return Err(WorkspaceDatabaseError::InvalidAuditData {
+                message: "structured LLM outcome fields must be non-empty".to_string(),
+            });
+        }
+
+        let updated = self
+            .connection
+            .execute(
+                "UPDATE llm_requests
+                 SET structured_outcome = ?2,
+                     recovery_source = ?3,
+                     attempt_index = ?4
+                 WHERE id = ?1",
+                params![
+                    id,
+                    classification.structured_outcome,
+                    classification.recovery_source,
+                    classification.attempt_index
+                ],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        if updated == 0 {
+            return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });
+        }
+        Ok(())
+    }
+
+    /// Breakdown of structured single-tool outcomes by kind/provider/model/transport/attempt.
+    pub fn structured_llm_outcome_breakdown(
+        &self,
+        filters: StructuredLlmOutcomeFilters<'_>,
+    ) -> Result<Vec<StructuredLlmOutcomeBreakdownRow>, WorkspaceDatabaseError> {
+        let request_kinds = if filters.request_kinds.is_empty() {
+            STRUCTURED_LLM_BASELINE_REQUEST_KINDS
+        } else {
+            filters.request_kinds
+        };
+
+        let mut query = format!(
+            "SELECT
+                request_kind,
+                provider_id,
+                model_id,
+                {LLM_REQUEST_TRANSPORT_SQL} AS transport,
+                COALESCE(attempt_index, 1) AS attempt_index,
+                COALESCE(structured_outcome, CASE
+                    WHEN final_state IN ('succeeded', 'completed') THEN 'unclassified_success'
+                    ELSE 'unclassified_failure'
+                END) AS structured_outcome,
+                COALESCE(recovery_source, 'none') AS recovery_source,
+                COUNT(*) AS request_count,
+                SUM(CASE WHEN final_state IN ('succeeded', 'completed') THEN 1 ELSE 0 END)
+                    AS success_count,
+                SUM(CASE
+                    WHEN final_state NOT IN ('succeeded', 'completed', 'running') THEN 1
+                    ELSE 0
+                END) AS failed_count
+             FROM llm_requests
+             WHERE final_state != 'running'"
+        );
+        let mut params: Vec<SqlValue> = Vec::new();
+        if !request_kinds.is_empty() {
+            query.push_str(" AND request_kind IN (");
+            for (index, kind) in request_kinds.iter().enumerate() {
+                if index > 0 {
+                    query.push_str(", ");
+                }
+                query.push('?');
+                params.push(SqlValue::Text(kind.to_string()));
+            }
+            query.push(')');
+        }
+        if let Some(provider_id) = filters.provider_id {
+            query.push_str(" AND provider_id = ?");
+            params.push(SqlValue::Text(provider_id.to_string()));
+        }
+        if let Some(model_id) = filters.model_id {
+            query.push_str(" AND model_id = ?");
+            params.push(SqlValue::Text(model_id.to_string()));
+        }
+        if let Some(started_after) = filters.started_after {
+            query.push_str(" AND request_started_at >= ?");
+            params.push(SqlValue::Text(started_after.to_string()));
+        }
+        if let Some(started_before) = filters.started_before {
+            query.push_str(" AND request_started_at < ?");
+            params.push(SqlValue::Text(started_before.to_string()));
+        }
+        if filters.valid_only {
+            query.push_str(" AND invalidated_at IS NULL");
+        }
+        query.push_str(
+            " GROUP BY request_kind, provider_id, model_id, transport, attempt_index,
+                      structured_outcome, recovery_source
+              ORDER BY request_kind ASC, provider_id ASC, model_id ASC, transport ASC,
+                       attempt_index ASC, structured_outcome ASC, recovery_source ASC",
+        );
+
+        let mut statement = self
+            .connection
+            .prepare(&query)
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params_from_iter(params), |row| {
+                let transport_raw: String = row.get(3)?;
+                Ok(StructuredLlmOutcomeBreakdownRow {
+                    request_kind: row.get(0)?,
+                    provider_id: row.get(1)?,
+                    model_id: row.get(2)?,
+                    transport: LlmRequestTransport::parse(&transport_raw),
+                    attempt_index: row.get(4)?,
+                    structured_outcome: row.get(5)?,
+                    recovery_source: row.get(6)?,
+                    request_count: row.get(7)?,
+                    success_count: row.get(8)?,
+                    failed_count: row.get(9)?,
+                })
+            })
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// First-attempt vs terminal success rates for structured baseline request kinds.
+    pub fn structured_llm_outcome_kind_summaries(
+        &self,
+        filters: StructuredLlmOutcomeFilters<'_>,
+    ) -> Result<Vec<StructuredLlmOutcomeKindSummary>, WorkspaceDatabaseError> {
+        let rows = self.structured_llm_outcome_breakdown(filters)?;
+        let mut by_kind: HashMap<String, StructuredLlmOutcomeKindSummary> = HashMap::new();
+
+        for row in rows {
+            let entry = by_kind
+                .entry(row.request_kind.clone())
+                .or_insert_with(|| StructuredLlmOutcomeKindSummary {
+                    request_kind: row.request_kind.clone(),
+                    total_requests: 0,
+                    first_attempt_requests: 0,
+                    first_attempt_successes: 0,
+                    terminal_successes: 0,
+                    extra_request_count: 0,
+                    first_attempt_success_rate: 0.0,
+                    terminal_success_rate: 0.0,
+                });
+            entry.total_requests += row.request_count;
+            entry.terminal_successes += row.success_count;
+            if row.attempt_index <= 1 {
+                entry.first_attempt_requests += row.request_count;
+                let success_for_attempt = if row.structured_outcome == "unclassified_success"
+                    || row.structured_outcome == "unclassified_failure"
+                {
+                    row.success_count
+                } else if structured_outcome_counts_as_success(&row.structured_outcome) {
+                    row.request_count
+                } else {
+                    0
+                };
+                entry.first_attempt_successes += success_for_attempt;
+            } else {
+                entry.extra_request_count += row.request_count;
+            }
+        }
+
+        let mut summaries = by_kind.into_values().collect::<Vec<_>>();
+        for summary in &mut summaries {
+            summary.first_attempt_success_rate = if summary.first_attempt_requests > 0 {
+                summary.first_attempt_successes as f64 / summary.first_attempt_requests as f64
+            } else {
+                0.0
+            };
+            summary.terminal_success_rate = if summary.total_requests > 0 {
+                summary.terminal_successes as f64 / summary.total_requests as f64
+            } else {
+                0.0
+            };
+        }
+        summaries.sort_by(|left, right| left.request_kind.cmp(&right.request_kind));
+        Ok(summaries)
     }
 
     pub fn invalidate_llm_request(
@@ -16594,6 +16774,7 @@ fn select_llm_request_record(
                 request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
+                structured_outcome, recovery_source, attempt_index,
                 request_body_json, response_body_json, invalidated_at, invalidated_reason
              FROM llm_requests
              WHERE id = ?1",
@@ -16629,10 +16810,13 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         total_latency_ms: row.get(21)?,
         status_code: row.get(22)?,
         final_state: row.get(23)?,
-        request_body_json: row.get(24)?,
-        response_body_json: row.get(25)?,
-        invalidated_at: row.get(26)?,
-        invalidated_reason: row.get(27)?,
+        structured_outcome: row.get(24)?,
+        recovery_source: row.get(25)?,
+        attempt_index: row.get(26)?,
+        request_body_json: row.get(27)?,
+        response_body_json: row.get(28)?,
+        invalidated_at: row.get(29)?,
+        invalidated_reason: row.get(30)?,
     })
 }
 
@@ -16649,6 +16833,13 @@ fn llm_request_record_rollup_source(request: &LlmRequestRecord) -> LlmRequestUsa
         cache_write_tokens: request.cache_write_tokens,
         total_latency_ms: request.total_latency_ms,
     }
+}
+
+fn structured_outcome_counts_as_success(outcome: &str) -> bool {
+    matches!(
+        outcome,
+        STRUCTURED_LLM_OUTCOME_SUCCEEDED | STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED
+    )
 }
 
 fn llm_request_usage_rollup_delta(

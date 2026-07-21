@@ -1427,6 +1427,25 @@ ALTER TABLE workspace_spec_jobs
     ADD COLUMN lease_renewed_at TEXT;
 "#;
 
+// Structured single-tool LLM outcome classification for baseline observability.
+// Nullable for historical rows; never stores model/prompt body text.
+pub(crate) const MIGRATION_041: &str = r#"
+ALTER TABLE llm_requests
+    ADD COLUMN structured_outcome TEXT
+    CHECK (structured_outcome IS NULL OR length(structured_outcome) > 0);
+
+ALTER TABLE llm_requests
+    ADD COLUMN recovery_source TEXT
+    CHECK (recovery_source IS NULL OR length(recovery_source) > 0);
+
+ALTER TABLE llm_requests
+    ADD COLUMN attempt_index INTEGER
+    CHECK (attempt_index IS NULL OR attempt_index >= 1);
+
+CREATE INDEX llm_requests_structured_outcome_idx
+ON llm_requests (request_kind, structured_outcome, attempt_index);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

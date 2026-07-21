@@ -909,7 +909,8 @@ pub(crate) async fn skill_store_translate(
         config.app.llm_request_retry_count,
         api_audit_save_details(&config),
     )
-    .await?;
+    .await?
+    .arguments;
     let translated_content = parse_skill_translation_output(tool_arguments)?;
 
     Ok(Json(SkillStoreTranslateResponse { translated_content }))

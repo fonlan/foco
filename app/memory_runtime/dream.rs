@@ -2044,7 +2044,7 @@ async fn call_memory_dream_planner_provider(
     selection: &MemoryDreamModelSelection,
     request: NeutralChatRequest,
 ) -> Result<Value, ApiError> {
-    audited_provider_tool_request(
+    Ok(audited_provider_tool_request(
         planner.workspace_path,
         planner.audit_workspace_id,
         planner.audit_chat_id,
@@ -2058,7 +2058,8 @@ async fn call_memory_dream_planner_provider(
         planner.config.app.llm_request_retry_count,
         api_audit_save_details(planner.config),
     )
-    .await
+    .await?
+    .arguments)
 }
 
 fn memory_dream_planner_tool_definition() -> NeutralToolDefinition {

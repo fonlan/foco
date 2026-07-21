@@ -397,7 +397,7 @@ async fn relevant_memory_facts_llm(
         &candidates,
         system_prompt,
     )?;
-    let output = call_memory_retrieval_provider(
+    let tool_result = call_memory_retrieval_provider(
         workspace_path,
         workspace_id,
         chat_id,
@@ -409,7 +409,22 @@ async fn relevant_memory_facts_llm(
         api_audit_save_details(config),
     )
     .await?;
-    let selected = parse_memory_retrieval_output(output)?;
+    let selected = match parse_memory_retrieval_output(tool_result.arguments.clone()) {
+        Ok(selected) => selected,
+        Err(error) => {
+            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
+                &error.message,
+                i64::from(tool_result.attempt_index),
+            ) {
+                let _ = crate::structured_llm_outcome::persist_structured_classification(
+                    workspace_path,
+                    &tool_result.request_id,
+                    classification,
+                );
+            }
+            return Err(error);
+        }
+    };
     let mut by_key = candidates
         .into_iter()
         .map(|fact| (memory_fact_key(&fact), fact))
@@ -422,11 +437,27 @@ async fn relevant_memory_facts_llm(
         if fact_key.is_empty() || !seen.insert(fact_key.to_string()) {
             continue;
         }
-        let fact = by_key.remove(fact_key).ok_or_else(|| {
-            ApiError::bad_request(format!(
-                "memory retrieval model returned unknown fact key '{fact_key}'"
-            ))
-        })?;
+        let fact = match by_key.remove(fact_key) {
+            Some(fact) => fact,
+            None => {
+                let error = ApiError::bad_request(format!(
+                    "memory retrieval model returned unknown fact key '{fact_key}'"
+                ));
+                if let Some(classification) =
+                    crate::structured_llm_outcome::classification_for_caller_failure(
+                        &error.message,
+                        i64::from(tool_result.attempt_index),
+                    )
+                {
+                    let _ = crate::structured_llm_outcome::persist_structured_classification(
+                        workspace_path,
+                        &tool_result.request_id,
+                        classification,
+                    );
+                }
+                return Err(error);
+            }
+        };
         facts.push(RetrievedMemoryFact {
             fact,
             source: RetrievedMemorySource::Direct,

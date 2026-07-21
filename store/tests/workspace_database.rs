@@ -21318,3 +21318,233 @@ fn global_memory_pragma_optimize_is_throttled_process_local() {
         "process-local throttle should suppress immediate re-run"
     );
 }
+
+#[test]
+fn structured_llm_outcome_classification_and_breakdown_baseline() {
+    use foco_store::workspace::{
+        STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+        STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+        STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED, STRUCTURED_LLM_RECOVERY_NONE,
+        STRUCTURED_LLM_RECOVERY_TEXT_JSON, STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+        StructuredLlmOutcomeFilters, StructuredLlmRequestClassification,
+    };
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let insert = |database: &mut WorkspaceDatabase,
+                  id: &str,
+                  request_kind: &str,
+                  provider_id: &str,
+                  model_id: &str,
+                  final_state: &str,
+                  started_at: &str| {
+        database
+            .insert_llm_request(NewLlmRequest {
+                id,
+                workspace_id: "workspace-1",
+                chat_id: None,
+                request_kind,
+                agent_team_id: None,
+                agent_instance_id: None,
+                agent_task_id: None,
+                agent_attempt_id: None,
+                provider_id,
+                model_id,
+                thinking_level: None,
+                request_started_at: started_at,
+                first_token_at: None,
+                completed_at: Some(started_at),
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                reasoning_tokens: None,
+                first_token_latency_ms: None,
+                total_latency_ms: Some(100),
+                status_code: Some(200),
+                final_state,
+                request_body_json: Some(
+                    r#"{"format":"provider_request_v1","version":1,"method":"POST"}"#,
+                ),
+                response_body_json: None,
+            })
+            .expect("insert llm request");
+    };
+
+    insert(
+        &mut database,
+        "req-mem-1",
+        "memory retrieval",
+        "provider-a",
+        "model-a",
+        "succeeded",
+        "2026-07-21T10:00:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-mem-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 1,
+            },
+        )
+        .expect("classify succeeded tool call");
+
+    insert(
+        &mut database,
+        "req-mem-2",
+        "memory retrieval",
+        "provider-a",
+        "model-a",
+        "succeeded",
+        "2026-07-21T10:01:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-mem-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TEXT_JSON,
+                attempt_index: 1,
+            },
+        )
+        .expect("classify text json recovery");
+
+    insert(
+        &mut database,
+        "req-mem-3",
+        "memory retrieval",
+        "provider-a",
+        "model-a",
+        "failed",
+        "2026-07-21T10:02:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-mem-3",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+            },
+        )
+        .expect("classify missing tool");
+
+    insert(
+        &mut database,
+        "req-extract-1",
+        "memory extraction",
+        "provider-a",
+        "model-a",
+        "succeeded",
+        "2026-07-21T10:03:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-extract-1",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID,
+                recovery_source: STRUCTURED_LLM_RECOVERY_NONE,
+                attempt_index: 1,
+            },
+        )
+        .expect("classify schema invalid after tool args");
+
+    insert(
+        &mut database,
+        "req-spec-2",
+        "workspace spec update",
+        "provider-b",
+        "model-b",
+        "succeeded",
+        "2026-07-21T10:04:00Z",
+    );
+    database
+        .set_llm_request_structured_classification(
+            "req-spec-2",
+            StructuredLlmRequestClassification {
+                structured_outcome: STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+                recovery_source: STRUCTURED_LLM_RECOVERY_TOOL_CALL,
+                attempt_index: 2,
+            },
+        )
+        .expect("classify attempt 2 success");
+
+    let request = database
+        .llm_request("req-mem-2")
+        .expect("read")
+        .expect("row");
+    assert_eq!(
+        request.structured_outcome.as_deref(),
+        Some(STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED)
+    );
+    assert_eq!(
+        request.recovery_source.as_deref(),
+        Some(STRUCTURED_LLM_RECOVERY_TEXT_JSON)
+    );
+    assert_eq!(request.attempt_index, Some(1));
+
+    let breakdown = database
+        .structured_llm_outcome_breakdown(StructuredLlmOutcomeFilters {
+            request_kinds: STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+            valid_only: true,
+            ..StructuredLlmOutcomeFilters::default()
+        })
+        .expect("breakdown");
+    assert!(
+        breakdown
+            .iter()
+            .any(|row| row.structured_outcome == STRUCTURED_LLM_OUTCOME_MISSING_TOOL
+                && row.request_count == 1)
+    );
+    assert!(
+        breakdown
+            .iter()
+            .any(|row| row.structured_outcome == STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED
+                && row.recovery_source == STRUCTURED_LLM_RECOVERY_TEXT_JSON
+                && row.transport == LlmRequestTransport::Http)
+    );
+    assert!(
+        breakdown
+            .iter()
+            .any(|row| row.request_kind == "workspace spec update" && row.attempt_index == 2)
+    );
+
+    let summaries = database
+        .structured_llm_outcome_kind_summaries(StructuredLlmOutcomeFilters {
+            request_kinds: STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
+            valid_only: true,
+            ..StructuredLlmOutcomeFilters::default()
+        })
+        .expect("summaries");
+    let retrieval = summaries
+        .iter()
+        .find(|row| row.request_kind == "memory retrieval")
+        .expect("memory retrieval summary");
+    assert_eq!(retrieval.first_attempt_requests, 3);
+    assert_eq!(retrieval.first_attempt_successes, 2);
+    assert!((retrieval.first_attempt_success_rate - (2.0 / 3.0)).abs() < f64::EPSILON);
+    assert_eq!(retrieval.total_requests, 3);
+    // terminal_successes counts protocol final_state success (includes schema_invalid overwrite cases elsewhere)
+    assert_eq!(retrieval.terminal_successes, 2);
+
+    let extract = summaries
+        .iter()
+        .find(|row| row.request_kind == "memory extraction")
+        .expect("memory extraction summary");
+    // schema_invalid is not counted as structured success even if final_state is succeeded
+    assert_eq!(extract.first_attempt_requests, 1);
+    assert_eq!(extract.first_attempt_successes, 0);
+    assert_eq!(extract.terminal_successes, 1);
+
+    let spec = summaries
+        .iter()
+        .find(|row| row.request_kind == "workspace spec update")
+        .expect("workspace spec update summary");
+    assert_eq!(spec.first_attempt_requests, 0);
+    assert_eq!(spec.extra_request_count, 1);
+    assert_eq!(spec.total_requests, 1);
+}

@@ -439,7 +439,7 @@ pub(crate) async fn run_memory_extraction_job_inner(
         &existing_memory_candidates,
         base_system_prompt,
     )?;
-    let tool_arguments = call_memory_extraction_provider(
+    let tool_result = call_memory_extraction_provider(
         &task.workspace_path,
         &task.workspace_id,
         Some(&task.chat_id),
@@ -451,8 +451,41 @@ pub(crate) async fn run_memory_extraction_job_inner(
         api_audit_save_details(&task.config),
     )
     .await?;
-    let output = parse_memory_extraction_output(tool_arguments)?;
-    let extracted_memories = store_extracted_memory_facts(task, &evidence_candidates, &output)?;
+    let output = match parse_memory_extraction_output(tool_result.arguments.clone()) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(classification) = crate::structured_llm_outcome::classification_for_caller_failure(
+                &error.message,
+                i64::from(tool_result.attempt_index),
+            ) {
+                let _ = crate::structured_llm_outcome::persist_structured_classification(
+                    &task.workspace_path,
+                    &tool_result.request_id,
+                    classification,
+                );
+            }
+            return Err(error);
+        }
+    };
+    let extracted_memories =
+        match store_extracted_memory_facts(task, &evidence_candidates, &output) {
+            Ok(memories) => memories,
+            Err(error) => {
+                if let Some(classification) =
+                    crate::structured_llm_outcome::classification_for_caller_failure(
+                        &error.message,
+                        i64::from(tool_result.attempt_index),
+                    )
+                {
+                    let _ = crate::structured_llm_outcome::persist_structured_classification(
+                        &task.workspace_path,
+                        &tool_result.request_id,
+                        classification,
+                    );
+                }
+                return Err(error);
+            }
+        };
     let output_json = serde_json::to_string(&output).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize memory extraction output: {source}"
@@ -818,7 +851,7 @@ pub(crate) async fn call_memory_extraction_provider(
     timeout_ms: u64,
     retry_count: u32,
     save_details: bool,
-) -> Result<Value, ApiError> {
+) -> Result<crate::AuditedProviderToolResult, ApiError> {
     audited_provider_tool_request(
         workspace_path,
         workspace_id,
@@ -846,7 +879,7 @@ pub(crate) async fn call_memory_retrieval_provider(
     timeout_ms: u64,
     retry_count: u32,
     save_details: bool,
-) -> Result<Value, ApiError> {
+) -> Result<crate::AuditedProviderToolResult, ApiError> {
     audited_provider_tool_request(
         workspace_path,
         workspace_id,
