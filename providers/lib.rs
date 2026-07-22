@@ -1148,6 +1148,176 @@ fn openai_priority_processing_supports_model(model_id: &str) -> bool {
     model_id == "gpt-5" || model_id.starts_with("gpt-5-") || model_id.starts_with("gpt-5.")
 }
 
+/// Per-model preference for how Foco should expose web search when the global switch is on.
+///
+/// Stored on `ModelSettings` and resolved together with provider protocol/model capability into a
+/// single runtime [`WebSearchRoute`]. Unknown JSON values are rejected by serde.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebSearchMode {
+    /// Prefer provider-native search only when the central capability table confirms support;
+    /// otherwise use the Tavily/Brave function fallback when configured.
+    #[default]
+    Auto,
+    /// Force provider-native search when the active provider protocol supports it.
+    Native,
+    /// Force Foco's Tavily/Brave function tool when a fallback key is available.
+    Function,
+    /// Never expose web search for this model, even if the global switch is on.
+    Disabled,
+}
+
+/// Runtime decision for which web-search path (if any) a chat turn may use.
+///
+/// At most one path is active per turn. Callers must not invent parallel native + function tools.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WebSearchRoute {
+    Disabled,
+    ProviderNative,
+    FocoFunction,
+}
+
+/// Inputs for the central web-search route state machine.
+///
+/// Callers resolve `active_provider_id` and `model_redirects` first, then pass the active provider
+/// kind and redirected upstream model id. Capability must not be inferred from tool names.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WebSearchRouteInput<'a> {
+    /// Global `web_search.enabled` master switch.
+    pub enabled: bool,
+    /// Whether the configured Tavily/Brave active provider has a usable API key.
+    pub fallback_available: bool,
+    /// Active provider kind after model route resolution; `None` when the route is incomplete.
+    pub provider_kind: Option<ProviderKind>,
+    /// Upstream model id after applying provider `model_redirects`.
+    pub upstream_model_id: &'a str,
+    /// Explicit per-model mode (defaults to [`WebSearchMode::Auto`]).
+    pub mode: WebSearchMode,
+}
+
+/// Whether the provider protocol can carry a native web-search tool at all.
+///
+/// This is independent of per-model capability. Phase 1 covers OpenAI Responses (HTTP + WebSocket).
+/// xAI Responses and other protocols can be added here without scattering checks.
+pub fn provider_protocol_supports_native_web_search(kind: ProviderKind) -> bool {
+    kind.adapter_kind() == AdapterKind::OpenAIResp
+}
+
+/// Central native web-search capability for a provider kind + upstream model id.
+///
+/// - [`NativeWebSearchSupport::Supported`]: confirmed by the maintained capability table
+/// - [`NativeWebSearchSupport::Unsupported`]: protocol or model is known not to support native search
+/// - [`NativeWebSearchSupport::Unknown`]: protocol may support it, but model capability is unconfirmed
+///
+/// `auto` must not treat Unknown as Supported. Future model-metadata signals should plug in here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeWebSearchSupport {
+    Supported,
+    Unsupported,
+    Unknown,
+}
+
+pub fn native_web_search_support(
+    kind: ProviderKind,
+    upstream_model_id: &str,
+) -> NativeWebSearchSupport {
+    if !provider_protocol_supports_native_web_search(kind) {
+        return NativeWebSearchSupport::Unsupported;
+    }
+
+    let model_id = upstream_model_id.trim();
+    if model_id.is_empty() {
+        return NativeWebSearchSupport::Unknown;
+    }
+
+    match openai_responses_native_web_search_model_support(model_id) {
+        Some(true) => NativeWebSearchSupport::Supported,
+        Some(false) => NativeWebSearchSupport::Unsupported,
+        None => NativeWebSearchSupport::Unknown,
+    }
+}
+
+/// True only when native web search is positively confirmed for this route.
+pub fn supports_native_web_search(kind: ProviderKind, upstream_model_id: &str) -> bool {
+    matches!(
+        native_web_search_support(kind, upstream_model_id),
+        NativeWebSearchSupport::Supported
+    )
+}
+
+/// Resolve the single web-search route for a turn.
+///
+/// Rules:
+/// - Global switch off or mode `disabled` → [`WebSearchRoute::Disabled`]
+/// - Mode `function` → Foco function only when a fallback key is available
+/// - Mode `native` → provider native only when the protocol supports native search
+/// - Mode `auto` → native only when capability is Supported; otherwise Foco function if available
+pub fn resolve_web_search_route(input: WebSearchRouteInput<'_>) -> WebSearchRoute {
+    if !input.enabled {
+        return WebSearchRoute::Disabled;
+    }
+
+    match input.mode {
+        WebSearchMode::Disabled => WebSearchRoute::Disabled,
+        WebSearchMode::Function => {
+            if input.fallback_available {
+                WebSearchRoute::FocoFunction
+            } else {
+                WebSearchRoute::Disabled
+            }
+        }
+        WebSearchMode::Native => match input.provider_kind {
+            Some(kind) if provider_protocol_supports_native_web_search(kind) => {
+                WebSearchRoute::ProviderNative
+            }
+            _ => WebSearchRoute::Disabled,
+        },
+        WebSearchMode::Auto => {
+            let native = input
+                .provider_kind
+                .is_some_and(|kind| supports_native_web_search(kind, input.upstream_model_id));
+            if native {
+                WebSearchRoute::ProviderNative
+            } else if input.fallback_available {
+                WebSearchRoute::FocoFunction
+            } else {
+                WebSearchRoute::Disabled
+            }
+        }
+    }
+}
+
+/// Maintained OpenAI Responses native web-search model table.
+///
+/// Returns `Some(true)` / `Some(false)` when known, `None` when unconfirmed (auto must not
+/// optimistically send a native tool).
+fn openai_responses_native_web_search_model_support(model_id: &str) -> Option<bool> {
+    let model_id = model_id.trim().to_ascii_lowercase();
+    // Known-supported families on OpenAI Responses web_search.
+    if model_id == "gpt-4o"
+        || model_id.starts_with("gpt-4o-")
+        || model_id == "gpt-4.1"
+        || model_id.starts_with("gpt-4.1-")
+        || model_id == "gpt-5"
+        || model_id.starts_with("gpt-5-")
+        || model_id.starts_with("gpt-5.")
+        || model_id == "o3"
+        || model_id.starts_with("o3-")
+        || model_id == "o4-mini"
+        || model_id.starts_with("o4-mini-")
+    {
+        return Some(true);
+    }
+
+    // Explicitly non-search / embedding-style ids when they appear on Responses-compatible routes.
+    if model_id.contains("embed") || model_id.contains("tts") || model_id.contains("whisper") {
+        return Some(false);
+    }
+
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NeutralChatRequest {
     pub model_id: String,
@@ -3667,6 +3837,163 @@ mod tests {
         assert!(
             !supports_fast_latency_mode(chat_kind, "friendly-fast-model", &redirects)
                 .expect("non-Responses adapter is not Fast-capable")
+        );
+    }
+
+    #[test]
+    fn web_search_mode_defaults_and_serializes_as_camel_case() {
+        assert_eq!(
+            serde_json::from_value::<WebSearchMode>(serde_json::json!("auto")).expect("auto mode"),
+            WebSearchMode::Auto
+        );
+        assert_eq!(
+            serde_json::to_value(WebSearchMode::Native).expect("serialize native"),
+            serde_json::json!("native")
+        );
+        assert_eq!(
+            serde_json::from_value::<WebSearchMode>(serde_json::Value::Null).unwrap_or_default(),
+            WebSearchMode::Auto
+        );
+        assert!(
+            serde_json::from_value::<WebSearchMode>(serde_json::json!("bogus")).is_err(),
+            "invalid webSearchMode must fail"
+        );
+    }
+
+    #[test]
+    fn resolve_web_search_route_prefers_confirmed_native_and_falls_back_conservatively() {
+        let responses = openai_responses_kind();
+        let chat = parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind");
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: false,
+                fallback_available: true,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+            }),
+            WebSearchRoute::Disabled
+        );
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+            }),
+            WebSearchRoute::ProviderNative
+        );
+
+        // Unknown model capability must not optimistically send a native tool.
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(responses),
+                upstream_model_id: "custom-gateway-model",
+                mode: WebSearchMode::Auto,
+            }),
+            WebSearchRoute::FocoFunction
+        );
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: false,
+                provider_kind: Some(responses),
+                upstream_model_id: "custom-gateway-model",
+                mode: WebSearchMode::Auto,
+            }),
+            WebSearchRoute::Disabled
+        );
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(chat),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+            }),
+            WebSearchRoute::FocoFunction
+        );
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: false,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Native,
+            }),
+            WebSearchRoute::ProviderNative
+        );
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(chat),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Native,
+            }),
+            WebSearchRoute::Disabled
+        );
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Function,
+            }),
+            WebSearchRoute::FocoFunction
+        );
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: false,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Function,
+            }),
+            WebSearchRoute::Disabled
+        );
+
+        assert_eq!(
+            resolve_web_search_route(WebSearchRouteInput {
+                enabled: true,
+                fallback_available: true,
+                provider_kind: Some(responses),
+                upstream_model_id: "gpt-4o",
+                mode: WebSearchMode::Disabled,
+            }),
+            WebSearchRoute::Disabled
+        );
+    }
+
+    #[test]
+    fn supports_native_web_search_requires_protocol_and_known_model() {
+        let responses = openai_responses_kind();
+        let chat = parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind");
+        let ws = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind");
+
+        assert!(supports_native_web_search(responses, "gpt-4o"));
+        assert!(supports_native_web_search(ws, "gpt-5.4"));
+        assert!(!supports_native_web_search(chat, "gpt-4o"));
+        assert!(!supports_native_web_search(
+            responses,
+            "custom-gateway-model"
+        ));
+        assert_eq!(
+            native_web_search_support(responses, "custom-gateway-model"),
+            NativeWebSearchSupport::Unknown
+        );
+        assert_eq!(
+            native_web_search_support(chat, "gpt-4o"),
+            NativeWebSearchSupport::Unsupported
         );
     }
 

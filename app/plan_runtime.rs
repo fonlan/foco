@@ -7,6 +7,7 @@ use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId,
     AgentTaskStatus, AgentTeamId,
 };
+use foco_providers::WebSearchMode;
 use foco_store::{
     config::{
         GlobalConfig, ModelSettings, PLAN_MERGE_AUTOMATION_DIRECT_AUTO,
@@ -1950,6 +1951,7 @@ mod tests {
             provider_ids: vec!["provider-a".to_string()],
             active_provider_id: Some("provider-a".to_string()),
             thinking_level: Some("low".to_string()),
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -1968,6 +1970,7 @@ mod tests {
             provider_ids: vec!["provider-b".to_string()],
             active_provider_id: Some("provider-b".to_string()),
             thinking_level: Some("medium".to_string()),
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,

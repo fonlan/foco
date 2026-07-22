@@ -26,7 +26,7 @@ use foco_agent::{
 use foco_providers::{
     GROQ_KIND, OPENAI_CHAT_KIND, OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND,
     OpenAiRespWsSessionRegistry, ProviderModelRedirect, ProviderRequestOverride, TOGETHER_KIND,
-    redirected_provider_model_ids,
+    WebSearchMode, redirected_provider_model_ids,
 };
 use foco_store::{
     config::{
@@ -3997,6 +3997,7 @@ fn apply_patch_eligibility_allows_only_native_openai_gpt_routes_after_redirects(
             provider_ids: vec!["provider".to_string()],
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -4649,6 +4650,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -4664,6 +4666,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: Some("low".to_string()),
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -5097,6 +5100,7 @@ async fn concurrent_model_edit_and_route_update_preserve_both_changes() {
                 output_modalities: None,
                 thinking_level: None,
                 clear_thinking_level: None,
+                web_search_mode: None,
                 system_prompt_name: None,
             }),
         )
@@ -5221,6 +5225,7 @@ async fn image_output_model_can_be_saved_without_text_limits() {
             output_modalities: Some(vec!["image".to_string()]),
             thinking_level: None,
             clear_thinking_level: Some(true),
+            web_search_mode: None,
             system_prompt_name: Some(DEFAULT_SYSTEM_PROMPT_NAME.to_string()),
         }),
     )
@@ -5238,6 +5243,153 @@ async fn image_output_model_can_be_saved_without_text_limits() {
     assert!(image_model.can_enable);
     assert_eq!(image_model.output_modalities, vec!["image"]);
     assert_eq!(image_model.system_prompt_name, DEFAULT_SYSTEM_PROMPT_NAME);
+}
+
+#[tokio::test]
+async fn save_manual_model_preserves_web_search_mode_and_rejects_native_on_chat() {
+    let fixture = prompt_state_fixture(|config| {
+        config.providers[0].kind = OPENAI_CHAT_KIND.to_string();
+        config.models[0].web_search_mode = WebSearchMode::Function;
+        config.web_search.enabled = true;
+    });
+    let state = fixture.state;
+
+    let preserved = crate::http::settings::save_manual_model(
+        State(state.clone()),
+        Json(ManualModelRequest {
+            model_id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            metadata_key: None,
+            context_window: Some(128_000),
+            max_output_tokens: Some(4_096),
+            provider_ids: None,
+            active_provider_id: None,
+            input_modalities: None,
+            output_modalities: None,
+            thinking_level: None,
+            clear_thinking_level: None,
+            web_search_mode: None,
+            system_prompt_name: None,
+        }),
+    )
+    .await
+    .expect("preserve web search mode")
+    .0;
+    let preserved_model = preserved
+        .configured_models
+        .iter()
+        .find(|model| model.id == "model")
+        .expect("model summary");
+    assert_eq!(preserved_model.web_search_mode, WebSearchMode::Function);
+    assert_eq!(
+        state.config.lock().expect("config lock").models[0].web_search_mode,
+        WebSearchMode::Function
+    );
+
+    let native_rejected = crate::http::settings::save_manual_model(
+        State(state.clone()),
+        Json(ManualModelRequest {
+            model_id: "model".to_string(),
+            display_name: "Model".to_string(),
+            enabled: true,
+            metadata_key: None,
+            context_window: Some(128_000),
+            max_output_tokens: Some(4_096),
+            provider_ids: Some(vec!["provider".to_string()]),
+            active_provider_id: Some("provider".to_string()),
+            input_modalities: None,
+            output_modalities: None,
+            thinking_level: None,
+            clear_thinking_level: None,
+            web_search_mode: Some(WebSearchMode::Native),
+            system_prompt_name: None,
+        }),
+    )
+    .await
+    .err()
+    .expect("native on chat protocol should fail");
+    assert_eq!(native_rejected.status, StatusCode::BAD_REQUEST);
+    assert!(
+        native_rejected
+            .message
+            .contains("webSearchMode 'native' is not supported"),
+        "unexpected message: {}",
+        native_rejected.message
+    );
+}
+
+#[tokio::test]
+async fn save_manual_model_native_on_responses_allows_unknown_model_with_warning() {
+    let fixture = prompt_state_fixture(|config| {
+        config.providers[0].kind = OPENAI_RESPONSES_KIND.to_string();
+        config.models[0].id = "custom-gateway-model".to_string();
+        config.models[0].web_search_mode = WebSearchMode::Auto;
+        config.web_search.enabled = true;
+    });
+    let state = fixture.state;
+
+    let native_saved = crate::http::settings::save_manual_model(
+        State(state.clone()),
+        Json(ManualModelRequest {
+            model_id: "custom-gateway-model".to_string(),
+            display_name: "Custom".to_string(),
+            enabled: true,
+            metadata_key: None,
+            context_window: Some(128_000),
+            max_output_tokens: Some(4_096),
+            provider_ids: Some(vec!["provider".to_string()]),
+            active_provider_id: Some("provider".to_string()),
+            input_modalities: None,
+            output_modalities: None,
+            thinking_level: None,
+            clear_thinking_level: None,
+            web_search_mode: Some(WebSearchMode::Native),
+            system_prompt_name: None,
+        }),
+    )
+    .await
+    .expect("native override on Responses protocol")
+    .0;
+    let native_model = native_saved
+        .configured_models
+        .iter()
+        .find(|model| model.id == "custom-gateway-model")
+        .expect("native model summary");
+    assert_eq!(native_model.web_search_mode, WebSearchMode::Native);
+    assert!(
+        native_model
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("cannot confirm native web search")),
+        "expected unknown-capability warning, got {:?}",
+        native_model.warnings
+    );
+}
+
+#[tokio::test]
+async fn web_search_settings_summary_distinguishes_master_switch_and_fallback() {
+    let fixture = prompt_state_fixture(|config| {
+        config.web_search.enabled = true;
+        config.web_search.tavily_api_key = None;
+        config.web_search.brave_api_key = None;
+    });
+    let state = fixture.state;
+    let summary = crate::settings_runtime::web_search_settings_summary(
+        &state.config.lock().expect("config lock").web_search,
+    );
+    assert!(summary.enabled);
+    assert!(!summary.fallback_available);
+
+    {
+        let mut config = state.config.lock().expect("config lock");
+        config.web_search.tavily_api_key = Some("tvly-test".to_string());
+    }
+    let summary = crate::settings_runtime::web_search_settings_summary(
+        &state.config.lock().expect("config lock").web_search,
+    );
+    assert!(summary.enabled);
+    assert!(summary.fallback_available);
 }
 
 fn agent_definition_input_from_settings(
@@ -12329,6 +12481,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -23361,6 +23514,7 @@ Search memory before repo work.
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -23686,6 +23840,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -23808,6 +23963,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -23904,6 +24060,7 @@ Use the existing product UI conventions.
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -24214,6 +24371,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -24615,6 +24773,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -24847,6 +25006,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -24955,6 +25115,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -24973,6 +25134,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25524,6 +25686,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25747,6 +25910,7 @@ async fn prepare_prompt_context_memory_budget_follows_context_budget_percent() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25924,6 +26088,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26204,6 +26369,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26421,6 +26587,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26903,6 +27070,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26921,6 +27089,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27169,6 +27338,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27495,6 +27665,7 @@ async fn ai_statistics_list_and_detail_expose_wire_derived_transport() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27957,6 +28128,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28118,6 +28290,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30151,6 +30324,7 @@ fn test_model_settings(id: &str) -> ModelSettings {
         provider_ids: Vec::new(),
         active_provider_id: None,
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -33276,6 +33450,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         provider_ids: vec!["provider".to_string()],
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
+        web_search_mode: WebSearchMode::Auto,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,

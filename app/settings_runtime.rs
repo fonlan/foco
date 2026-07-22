@@ -543,6 +543,7 @@ pub(crate) fn web_search_settings_summary(
 ) -> WebSearchSettingsSummary {
     WebSearchSettingsSummary {
         enabled: settings.enabled,
+        fallback_available: settings.fallback_available(),
         active_provider: settings.active_provider.clone(),
         api_proxy: ApiProxySettingsSummary {
             enabled: settings.api_proxy.enabled,
@@ -1024,6 +1025,7 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         input_modalities: model.input_modalities.clone(),
         output_modalities: model.output_modalities.clone(),
         thinking_level: model.thinking_level.clone(),
+        web_search_mode: model.web_search_mode,
         system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
         supports_fast: false,

@@ -11,8 +11,11 @@ use foco_agent::{AgentDefinitionId, AgentExecutionWorkspaceMode, AgentPermission
 use foco_mcp::{McpServerDefinition, McpTransportKind, validate_server_definitions};
 use foco_providers::{
     HTTP_PROXY_KIND, ProviderModelRedirect, ProviderRequestOverride, SOCKS_PROXY_KIND,
-    normalized_base_url, normalized_proxy_url, parse_provider_kind, validate_model_redirects,
+    WebSearchMode, normalized_base_url, normalized_proxy_url, parse_provider_kind,
+    validate_model_redirects,
 };
+
+pub use foco_providers::WebSearchMode as ModelWebSearchMode;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -918,6 +921,21 @@ impl WebSearchSettings {
         .filter(|value| !value.is_empty())
     }
 
+    /// Whether the active Tavily/Brave provider has a usable API key for Foco function search.
+    ///
+    /// Independent of the global `enabled` master switch. Native provider search does not require
+    /// these keys; function-path executors still enforce a key at execution time.
+    pub fn fallback_available(&self) -> bool {
+        self.api_key_for_provider(self.active_provider.trim())
+            .is_some()
+    }
+
+    /// Active fallback provider id when a key is present; otherwise `None`.
+    pub fn active_fallback_provider(&self) -> Option<&str> {
+        let provider = self.active_provider.trim();
+        self.api_key_for_provider(provider).map(|_| provider)
+    }
+
     fn redact_secrets(&mut self) {
         if self.tavily_api_key.is_some() {
             self.tavily_api_key = Some(REDACTED_SECRET.to_string());
@@ -1324,6 +1342,11 @@ pub struct ModelSettings {
     pub provider_ids: Vec<String>,
     pub active_provider_id: Option<String>,
     pub thinking_level: Option<String>,
+    /// How this model should use web search when the global switch is on.
+    ///
+    /// Defaults to [`WebSearchMode::Auto`] for configs that predate this field.
+    #[serde(default, rename = "webSearchMode")]
+    pub web_search_mode: WebSearchMode,
     #[serde(default = "default_system_prompt_name")]
     pub system_prompt_name: String,
     pub metadata_key: Option<String>,
@@ -2219,12 +2242,8 @@ fn validate_web_search_settings(
         "web_search.brave_api_key",
         &settings.brave_api_key,
     )?;
-    if settings.enabled && settings.api_key_for_provider(active_provider).is_none() {
-        return invalid_config(
-            config_path,
-            format!("web_search.{active_provider} api key must be set when web search is enabled"),
-        );
-    }
+    // Global `enabled` is the master switch for any web search path (native or function).
+    // Tavily/Brave keys are only required when the Foco function fallback is used at runtime.
     validate_api_proxy_settings(config_path, "web_search.api_proxy", &settings.api_proxy)?;
 
     Ok(())
@@ -4281,7 +4300,7 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_enabled_web_search_without_active_provider_key() {
+    fn web_search_enabled_without_fallback_key_is_allowed() {
         let profile = tempfile::tempdir().expect("temp profile");
         let paths = FocoPaths::from_user_profile(profile.path());
 
@@ -4291,17 +4310,78 @@ mod tests {
         config.web_search.enabled = true;
         config.web_search.active_provider = WEB_SEARCH_PROVIDER_TAVILY.to_string();
 
-        let error = save_global_config(&paths.config_file, &config)
-            .expect_err("enabled web search without token should fail");
-        assert!(
-            error
-                .to_string()
-                .contains("web_search.tavily api key must be set")
-        );
-
-        config.web_search.tavily_api_key = Some("token".to_string());
+        // Native-only path: master switch on, no Tavily/Brave key.
+        assert!(!config.web_search.fallback_available());
         save_global_config(&paths.config_file, &config)
-            .expect("enabled web search with active token should save");
+            .expect("enabled web search without fallback key should save for native-only use");
+
+        // Fallback-only path: key present, switch can still be toggled independently.
+        config.web_search.tavily_api_key = Some("token".to_string());
+        assert!(config.web_search.fallback_available());
+        save_global_config(&paths.config_file, &config)
+            .expect("enabled web search with fallback key should save");
+
+        // Both available.
+        config.web_search.enabled = true;
+        assert!(config.web_search.enabled && config.web_search.fallback_available());
+        save_global_config(&paths.config_file, &config)
+            .expect("enabled web search with both native intent and fallback should save");
+
+        // Neither: switch off, no key.
+        config.web_search.enabled = false;
+        config.web_search.tavily_api_key = None;
+        assert!(!config.web_search.enabled && !config.web_search.fallback_available());
+        save_global_config(&paths.config_file, &config)
+            .expect("disabled web search without key should save");
+    }
+
+    #[test]
+    fn model_web_search_mode_defaults_to_auto_when_missing() {
+        let model: ModelSettings = serde_json::from_value(serde_json::json!({
+            "id": "m1",
+            "display_name": "M1",
+            "enabled": false,
+            "provider_ids": [],
+            "active_provider_id": null,
+            "thinking_level": null,
+            "metadata_key": null,
+            "metadata_source_url": null,
+            "metadata_refreshed_at": null,
+            "limits": null
+        }))
+        .expect("legacy model without webSearchMode should deserialize");
+        assert_eq!(model.web_search_mode, WebSearchMode::Auto);
+
+        let with_mode: ModelSettings = serde_json::from_value(serde_json::json!({
+            "id": "m2",
+            "display_name": "M2",
+            "enabled": false,
+            "provider_ids": [],
+            "active_provider_id": null,
+            "thinking_level": null,
+            "webSearchMode": "function",
+            "metadata_key": null,
+            "metadata_source_url": null,
+            "metadata_refreshed_at": null,
+            "limits": null
+        }))
+        .expect("explicit webSearchMode should deserialize");
+        assert_eq!(with_mode.web_search_mode, WebSearchMode::Function);
+
+        let invalid = serde_json::from_value::<ModelSettings>(serde_json::json!({
+            "id": "m3",
+            "display_name": "M3",
+            "enabled": false,
+            "provider_ids": [],
+            "active_provider_id": null,
+            "thinking_level": null,
+            "webSearchMode": "bogus",
+            "metadata_key": null,
+            "metadata_source_url": null,
+            "metadata_refreshed_at": null,
+            "limits": null
+        }));
+        assert!(invalid.is_err(), "invalid webSearchMode must fail");
     }
 
     #[test]
@@ -4426,6 +4506,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: "Missing".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -4458,6 +4539,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: IMAGE_GENERATION_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5119,6 +5201,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5166,6 +5249,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5192,6 +5276,7 @@ mod tests {
             provider_ids: Vec::new(),
             active_provider_id: None,
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5229,6 +5314,7 @@ mod tests {
             provider_ids: vec!["provider-1".to_string()],
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,

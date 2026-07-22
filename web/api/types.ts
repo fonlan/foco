@@ -1188,6 +1188,8 @@ export type ModelMetadataRecord = {
   sourceUrl: string;
   refreshedAt: string;
 };
+export type WebSearchMode = "auto" | "native" | "function" | "disabled";
+
 export type ConfiguredModelSummary = {
   id: string;
   displayName: string;
@@ -1204,6 +1206,8 @@ export type ConfiguredModelSummary = {
   inputModalities: string[];
   outputModalities: string[];
   thinkingLevel: string | null;
+  /** Per-model web search preference; defaults to auto when omitted by older servers. */
+  webSearchMode?: WebSearchMode;
   systemPromptName: string;
   supportsThinking: boolean;
   /** Server-resolved Fast eligibility for the active provider and upstream model. */
@@ -1657,6 +1661,8 @@ type WebSearchProviderSummary = {
 
 type WebSearchSettingsSummary = {
   enabled: boolean;
+  /** Whether the active Tavily/Brave provider has a usable API key for function fallback. */
+  fallbackAvailable?: boolean;
   activeProvider: string;
   providers: WebSearchProviderSummary[];
   apiProxy: ApiProxySettingsSummary;

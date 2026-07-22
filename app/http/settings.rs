@@ -13,8 +13,9 @@ use fancy_regex::Regex;
 use foco_agent::build_default_system_prompt;
 use foco_providers::{
     NeutralChatRequest, NeutralChatRole, ProviderConfigError, ProviderConnectionConfig,
-    ProviderModelRedirect, ensure_proxy_compatible_with_kind, fetch_provider_model_ids,
-    normalized_base_url, parse_provider_kind, test_provider_connection, validate_model_redirects,
+    ProviderModelRedirect, WebSearchMode, ensure_proxy_compatible_with_kind,
+    fetch_provider_model_ids, normalized_base_url, parse_provider_kind, test_provider_connection,
+    validate_model_redirects,
 };
 use foco_store::{
     config::{
@@ -263,6 +264,9 @@ pub(crate) struct ManualModelRequest {
     pub(crate) output_modalities: Option<Vec<String>>,
     pub(crate) thinking_level: Option<String>,
     pub(crate) clear_thinking_level: Option<bool>,
+    /// Optional per-model web search mode. When omitted, preserve the existing value (or `auto`).
+    #[serde(default)]
+    pub(crate) web_search_mode: Option<WebSearchMode>,
     pub(crate) system_prompt_name: Option<String>,
 }
 
@@ -429,7 +433,10 @@ pub(crate) struct ApiAuditSettingsSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct WebSearchSettingsSummary {
+    /// Master switch for any web-search path (native or Foco function).
     pub(crate) enabled: bool,
+    /// Whether the active Tavily/Brave provider has a usable API key for function fallback.
+    pub(crate) fallback_available: bool,
     pub(crate) active_provider: String,
     pub(crate) providers: Vec<WebSearchProviderSummary>,
     pub(crate) api_proxy: ApiProxySettingsSummary,
@@ -787,6 +794,7 @@ pub(crate) struct ConfiguredModelSummary {
     pub(crate) input_modalities: Vec<String>,
     pub(crate) output_modalities: Vec<String>,
     pub(crate) thinking_level: Option<String>,
+    pub(crate) web_search_mode: WebSearchMode,
     pub(crate) system_prompt_name: String,
     pub(crate) supports_thinking: bool,
     pub(crate) supports_fast: bool,
@@ -2910,6 +2918,12 @@ pub(crate) async fn save_manual_model(
         None if clear_thinking_level => None,
         None => existing_model.and_then(|model| model.thinking_level.clone()),
     };
+    let web_search_mode = match request.web_search_mode {
+        Some(mode) => mode,
+        None => existing_model
+            .map(|model| model.web_search_mode)
+            .unwrap_or(WebSearchMode::Auto),
+    };
     let system_prompt_name = match requested_system_prompt_name {
         Some(value) => {
             let value = value.trim().to_string();
@@ -2926,6 +2940,13 @@ pub(crate) async fn save_manual_model(
     };
 
     validate_model_provider_references(&config, &provider_ids, active_provider_id.as_deref())?;
+    validate_model_web_search_mode_for_save(
+        &config,
+        model_id,
+        &provider_ids,
+        active_provider_id.as_deref(),
+        web_search_mode,
+    )?;
 
     let model = ModelSettings {
         id: model_id.to_string(),
@@ -2934,6 +2955,7 @@ pub(crate) async fn save_manual_model(
         provider_ids,
         active_provider_id,
         thinking_level,
+        web_search_mode,
         system_prompt_name,
         metadata_key: metadata_key
             .clone()

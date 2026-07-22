@@ -35,7 +35,7 @@ use foco_providers::{
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage, OPENAI_CHAT_KIND,
     OPENAI_RESPONSES_KIND, OPENAI_RESPONSES_WEBSOCKET_KIND, OpenAiRespWsSessionKey,
     OpenAiRespWsSessionRegistry, ProviderConfigError, ProviderConnectionConfig,
-    ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext,
+    ProviderRequestFailure, ProviderRequestOverride, ProviderWsSessionContext, WebSearchMode,
     normalized_proxy_url, parse_provider_kind, recover_model_json_from_text,
     stream_chat_with_capture_observer, stream_chat_with_capture_observer_runtime_options,
     upstream_provider_model_id,
@@ -9083,6 +9083,65 @@ fn validate_model_provider_references(
     Ok(())
 }
 
+/// Validate explicit `webSearchMode=native` against the active provider protocol.
+///
+/// Protocol mismatch is a hard error so saves cannot silently pretend native search works.
+/// Unknown model capability is allowed (user override) and surfaces as a settings warning.
+fn validate_model_web_search_mode_for_save(
+    config: &GlobalConfig,
+    model_id: &str,
+    provider_ids: &[String],
+    active_provider_id: Option<&str>,
+    mode: WebSearchMode,
+) -> Result<(), ApiError> {
+    if mode != WebSearchMode::Native {
+        return Ok(());
+    }
+
+    let Some(active_provider_id) = active_provider_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(ApiError::bad_request(format!(
+            "webSearchMode 'native' requires an active provider for model '{model_id}'"
+        )));
+    };
+
+    if !provider_ids
+        .iter()
+        .any(|provider_id| provider_id == active_provider_id)
+    {
+        return Err(ApiError::bad_request(format!(
+            "webSearchMode 'native' active provider '{active_provider_id}' is not associated with model '{model_id}'"
+        )));
+    }
+
+    let provider = config
+        .providers
+        .iter()
+        .find(|provider| provider.id == active_provider_id)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "webSearchMode 'native' references missing provider '{active_provider_id}'"
+            ))
+        })?;
+
+    let kind = parse_provider_kind(&provider.kind).map_err(|error| {
+        ApiError::bad_request(format!(
+            "webSearchMode 'native' cannot use provider '{active_provider_id}': {error}"
+        ))
+    })?;
+
+    if !foco_providers::provider_protocol_supports_native_web_search(kind) {
+        return Err(ApiError::bad_request(format!(
+            "webSearchMode 'native' is not supported by provider protocol '{}' for model '{model_id}'",
+            provider.kind
+        )));
+    }
+
+    Ok(())
+}
+
 fn model_supports_thinking(model: &ModelSettings, config: &GlobalConfig) -> bool {
     let has_responses_provider = model.provider_ids.iter().any(|provider_id| {
         config.providers.iter().any(|provider| {
@@ -9154,7 +9213,77 @@ fn model_warnings(
         );
     }
 
+    append_web_search_mode_warnings(model, config, &mut warnings);
+
     warnings
+}
+
+fn append_web_search_mode_warnings(
+    model: &ModelSettings,
+    config: &GlobalConfig,
+    warnings: &mut Vec<String>,
+) {
+    match model.web_search_mode {
+        WebSearchMode::Auto | WebSearchMode::Disabled => {}
+        WebSearchMode::Function => {
+            if !config.web_search.fallback_available() {
+                warnings.push(
+                    "Web search mode is 'function', but no Tavily/Brave API key is configured for the active search provider."
+                        .to_string(),
+                );
+            }
+        }
+        WebSearchMode::Native => {
+            let Some(active_provider_id) = model.active_provider_id.as_deref() else {
+                warnings.push(
+                    "Web search mode is 'native', but this model has no active provider."
+                        .to_string(),
+                );
+                return;
+            };
+            let Some(provider) = config
+                .providers
+                .iter()
+                .find(|provider| provider.id == active_provider_id)
+            else {
+                warnings.push(format!(
+                    "Web search mode is 'native', but active provider '{active_provider_id}' does not exist."
+                ));
+                return;
+            };
+            let Ok(kind) = parse_provider_kind(&provider.kind) else {
+                warnings.push(format!(
+                    "Web search mode is 'native', but provider '{}' has an unsupported protocol '{}'.",
+                    provider.name, provider.kind
+                ));
+                return;
+            };
+            if !foco_providers::provider_protocol_supports_native_web_search(kind) {
+                warnings.push(format!(
+                    "Web search mode is 'native', but provider protocol '{}' does not support native web search.",
+                    provider.kind
+                ));
+                return;
+            }
+
+            let upstream_model_id =
+                foco_providers::upstream_provider_model_id(&model.id, &provider.model_redirects)
+                    .unwrap_or(model.id.as_str());
+            match foco_providers::native_web_search_support(kind, upstream_model_id) {
+                foco_providers::NativeWebSearchSupport::Supported => {}
+                foco_providers::NativeWebSearchSupport::Unsupported => {
+                    warnings.push(format!(
+                        "Web search mode is 'native', but model '{upstream_model_id}' is not known to support native web search on this protocol."
+                    ));
+                }
+                foco_providers::NativeWebSearchSupport::Unknown => {
+                    warnings.push(format!(
+                        "Web search mode is 'native', but Foco cannot confirm native web search for model '{upstream_model_id}'. Explicit override is allowed; auto mode would not send a native tool."
+                    ));
+                }
+            }
+        }
+    }
 }
 fn validate_provider_request_thinking_level(
     config: &GlobalConfig,
