@@ -2902,26 +2902,51 @@ mod tests {
     }
 
     #[test]
-    fn get_plans_offset_takes_precedence_over_page_and_rejects_negative_offsets() {
+    fn get_plans_uses_page_pagination_when_offset_is_null() {
         let workspace = tempfile::tempdir().expect("workspace");
         for index in 0..5 {
             insert_test_plan(workspace.path(), &format!("offset-plan-{index:02}"), None);
         }
 
-        let first_page = execute_builtin_tool(
+        let page = execute_builtin_tool(
             workspace.path(),
             GET_PLANS_TOOL,
             json!({
                 "view": "active",
                 "status": null,
-                "page": 1,
+                "page": 2,
                 "pageSize": 2,
                 "limit": null,
                 "offset": null,
                 "timeoutMs": null
             }),
         );
-        assert!(!first_page.is_error, "{:?}", first_page.output);
+        assert!(!page.is_error, "{:?}", page.output);
+        assert_eq!(page.output["page"], 2);
+        assert_eq!(page.output["offset"], 2);
+        assert_eq!(page.output["returnedCount"], 2);
+        assert_eq!(page.output["truncated"], false);
+        assert_eq!(page.output["hasMore"], true);
+        assert_eq!(page.output["nextOffset"], 4);
+        assert_eq!(page.output["totalCount"], 5);
+        assert_eq!(page.output["totalPages"], 3);
+        assert_eq!(
+            page.output["plans"]
+                .as_array()
+                .expect("plans")
+                .iter()
+                .map(|plan| plan["id"].as_str().expect("plan id"))
+                .collect::<Vec<_>>(),
+            vec!["offset-plan-02", "offset-plan-01"]
+        );
+    }
+
+    #[test]
+    fn get_plans_offset_takes_precedence_over_page() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..5 {
+            insert_test_plan(workspace.path(), &format!("offset-plan-{index:02}"), None);
+        }
 
         let offset_page = execute_builtin_tool(
             workspace.path(),
@@ -2939,11 +2964,23 @@ mod tests {
         assert!(!offset_page.is_error, "{:?}", offset_page.output);
         assert_eq!(offset_page.output["page"], 1);
         assert_eq!(offset_page.output["offset"], 3);
-        assert_ne!(
-            offset_page.output["plans"][0]["id"],
-            first_page.output["plans"][0]["id"]
+        assert_eq!(offset_page.output["returnedCount"], 2);
+        assert_eq!(offset_page.output["hasMore"], false);
+        assert_eq!(offset_page.output["nextOffset"], Value::Null);
+        assert_eq!(
+            offset_page.output["plans"]
+                .as_array()
+                .expect("plans")
+                .iter()
+                .map(|plan| plan["id"].as_str().expect("plan id"))
+                .collect::<Vec<_>>(),
+            vec!["offset-plan-01", "offset-plan-00"]
         );
+    }
 
+    #[test]
+    fn get_plans_rejects_negative_offset() {
+        let workspace = tempfile::tempdir().expect("workspace");
         let negative_offset = execute_builtin_tool(
             workspace.path(),
             GET_PLANS_TOOL,
@@ -2962,6 +2999,60 @@ mod tests {
     }
 
     #[test]
+    fn get_plans_reports_empty_and_final_page_continuation_metadata() {
+        let workspace = tempfile::tempdir().expect("workspace");
+
+        let empty = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": 1,
+                "pageSize": 2,
+                "limit": null,
+                "offset": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!empty.is_error, "{:?}", empty.output);
+        assert_eq!(empty.output["plans"], json!([]));
+        assert_eq!(empty.output["offset"], 0);
+        assert_eq!(empty.output["returnedCount"], 0);
+        assert_eq!(empty.output["truncated"], false);
+        assert_eq!(empty.output["hasMore"], false);
+        assert_eq!(empty.output["nextOffset"], Value::Null);
+
+        for index in 0..3 {
+            insert_test_plan(
+                workspace.path(),
+                &format!("final-page-plan-{index:02}"),
+                None,
+            );
+        }
+        let final_page = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": 2,
+                "pageSize": 2,
+                "limit": null,
+                "offset": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!final_page.is_error, "{:?}", final_page.output);
+        assert_eq!(final_page.output["offset"], 2);
+        assert_eq!(final_page.output["returnedCount"], 1);
+        assert_eq!(final_page.output["truncated"], false);
+        assert_eq!(final_page.output["hasMore"], false);
+        assert_eq!(final_page.output["nextOffset"], Value::Null);
+        assert_eq!(final_page.output["plans"][0]["id"], "final-page-plan-00");
+    }
+
+    #[test]
     fn get_plans_budget_prefix_uses_returned_count_for_next_offset() {
         let workspace = tempfile::tempdir().expect("workspace");
         for index in 0..4 {
@@ -2973,7 +3064,7 @@ mod tests {
         }
 
         let mut offset = 0_i64;
-        let mut seen_plan_ids = BTreeSet::new();
+        let mut seen_plan_ids = Vec::new();
         let mut saw_budget_truncation = false;
         for _ in 0..4 {
             let result = execute_builtin_tool(
@@ -3003,6 +3094,28 @@ mod tests {
                         .saturating_sub(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
             );
             assert!(measurement.text_lines <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT);
+            assert!(
+                measurement.serialized_bytes
+                    <= output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT
+            );
+            let normalized = output_budget::normalize_tool_execution_for_envelope(
+                GET_PLANS_TOOL,
+                output_budget::ToolOutputSemantics::ReadOnly,
+                result.clone(),
+                |execution| {
+                    output_budget::serialized_json_size(execution).map(|serialized_bytes| {
+                        serialized_bytes
+                            .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+                    })
+                },
+            );
+            assert_eq!(
+                normalized.state,
+                output_budget::ToolOutputBudgetState::WithinBudget,
+                "{:?}",
+                normalized.execution
+            );
+            assert!(!normalized.execution.is_error, "{:?}", normalized.execution);
             saw_budget_truncation |= result.output["truncated"] == true;
             seen_plan_ids.extend(
                 plans
@@ -3020,7 +3133,15 @@ mod tests {
         }
 
         assert!(saw_budget_truncation);
-        assert_eq!(seen_plan_ids.len(), 4);
+        assert_eq!(
+            seen_plan_ids,
+            vec![
+                "budget-plan-03".to_string(),
+                "budget-plan-02".to_string(),
+                "budget-plan-01".to_string(),
+                "budget-plan-00".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -3047,6 +3168,32 @@ mod tests {
         assert!(byte_result.is_error);
         assert_error_contains(&byte_result, "get_plans_plan_record_exceeds_output_budget");
         assert_error_contains(&byte_result, "oversized-byte-plan");
+        assert!(byte_result.output.get("nextOffset").is_none());
+        let normalized_byte = output_budget::normalize_tool_execution_for_envelope(
+            GET_PLANS_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            byte_result.clone(),
+            |execution| {
+                output_budget::serialized_json_size(execution).map(|serialized_bytes| {
+                    serialized_bytes
+                        .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+                })
+            },
+        );
+        assert_eq!(
+            normalized_byte.state,
+            output_budget::ToolOutputBudgetState::WithinBudget
+        );
+        assert_error_contains(
+            &normalized_byte.execution,
+            "get_plans_plan_record_exceeds_output_budget",
+        );
+        assert!(
+            output_budget::serialized_json_size(&normalized_byte.execution)
+                .expect("measure normalized byte error")
+                .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+                <= output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
 
         let line_workspace = tempfile::tempdir().expect("line workspace");
         insert_test_plan_with_overview(
@@ -3070,6 +3217,32 @@ mod tests {
         assert!(line_result.is_error);
         assert_error_contains(&line_result, "get_plans_plan_record_exceeds_output_budget");
         assert_error_contains(&line_result, "oversized-line-plan");
+        assert!(line_result.output.get("nextOffset").is_none());
+        let normalized_line = output_budget::normalize_tool_execution_for_envelope(
+            GET_PLANS_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            line_result.clone(),
+            |execution| {
+                output_budget::serialized_json_size(execution).map(|serialized_bytes| {
+                    serialized_bytes
+                        .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+                })
+            },
+        );
+        assert_eq!(
+            normalized_line.state,
+            output_budget::ToolOutputBudgetState::WithinBudget
+        );
+        assert_error_contains(
+            &normalized_line.execution,
+            "get_plans_plan_record_exceeds_output_budget",
+        );
+        assert!(
+            output_budget::serialized_json_size(&normalized_line.execution)
+                .expect("measure normalized line error")
+                .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+                <= output_budget::TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
     }
 
     #[test]

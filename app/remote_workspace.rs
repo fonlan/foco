@@ -36021,6 +36021,7 @@ mod tests {
                 "page": 1,
                 "pageSize": null,
                 "limit": 99,
+                "offset": null,
                 "timeoutMs": null
             }),
             None,
@@ -36028,6 +36029,9 @@ mod tests {
         .await;
         assert!(!plans_error, "{plans}");
         assert_eq!(plans["pageSize"], 10);
+        assert_eq!(plans["offset"], 0);
+        assert_eq!(plans["returnedCount"], 1);
+        assert_eq!(plans["nextOffset"], Value::Null);
         assert_eq!(plans["plans"][0]["id"], "plan-remote-tools");
 
         let (updated_plan, updated_plan_error, _, _) = test_execute_remote_sidecar_local_tool(
@@ -36277,6 +36281,20 @@ mod tests {
         let normal = remote_sidecar_tool_catalog(&state, Some(&bundle), None)
             .await
             .expect("normal catalog");
+        let local_get_plans = foco_tools::builtin_tool_definitions()
+            .into_iter()
+            .find(|tool| tool.name == "get_plans")
+            .expect("local get_plans definition");
+        let remote_get_plans = normal
+            .builtin_prompt_tools
+            .iter()
+            .find(|tool| tool.name == "get_plans")
+            .expect("remote get_plans definition");
+        assert_eq!(remote_get_plans.input_schema, local_get_plans.input_schema);
+        assert_eq!(
+            normal.route("get_plans"),
+            Some(&RemoteToolRoute::SidecarLocal)
+        );
         for expected in [
             "read_file",
             "write_file",

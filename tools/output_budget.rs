@@ -588,6 +588,33 @@ fn is_command_output_cursor_pagination(tool_name: &str, execution: &ToolExecutio
         && fields.get("note").and_then(Value::as_str).is_some()
 }
 
+/// Whether `get_plans` already returned an explicitly offset-paginated success.
+///
+/// `get_plans` emits complete plan records only and derives `nextOffset` from the actual returned
+/// count. Preserve that progress when only the outer transport envelope crosses a soft limit;
+/// hard envelope limits still apply.
+fn is_get_plans_offset_pagination(tool_name: &str, execution: &ToolExecution) -> bool {
+    if tool_name != "get_plans" || execution.is_error {
+        return false;
+    }
+    let Some(fields) = execution.output.as_object() else {
+        return false;
+    };
+
+    matches!(
+        fields.get(LINE_BOUNDED_TRUNCATED_FIELD),
+        Some(Value::Bool(true))
+    ) && matches!(fields.get("hasMore"), Some(Value::Bool(true)))
+        && fields
+            .get("returnedCount")
+            .and_then(Value::as_u64)
+            .is_some_and(|count| count > 0)
+        && fields
+            .get("nextOffset")
+            .and_then(Value::as_u64)
+            .is_some_and(|offset| offset > 0)
+}
+
 pub fn normalize_tool_execution(
     tool_name: &str,
     semantics: ToolOutputSemantics,
@@ -673,11 +700,13 @@ where
     // - `truncated: true` + positive nextStartLine (remaining content exists), or
     // - `softBudgetExceeded: true` + `truncated: false` (single soft-over line, full content).
     // - `get_command_output`'s `truncated: true` + `hasMore: true` + `nextCursor` cursor page.
+    // - `get_plans`' `truncated: true` + `hasMore: true` + `nextOffset` record page.
     // Hard envelope limits still apply.
     if !execution.is_error
         && reason != ToolOutputBudgetReason::HardByteLimit
         && (is_line_bounded_budget_success(&execution)
-            || is_command_output_cursor_pagination(tool_name, &execution))
+            || is_command_output_cursor_pagination(tool_name, &execution)
+            || is_get_plans_offset_pagination(tool_name, &execution))
     {
         return BudgetedToolExecution {
             execution,
@@ -1827,6 +1856,72 @@ mod tests {
 
         let budgeted = normalize_tool_execution_for_envelope(
             "get_command_output",
+            ToolOutputSemantics::ReadOnly,
+            execution.clone(),
+            measure,
+        );
+
+        assert_eq!(budgeted.state, ToolOutputBudgetState::WithinBudget);
+        assert_eq!(budgeted.execution, execution);
+    }
+
+    #[test]
+    fn normalize_preserves_get_plans_offset_page_when_transport_crosses_soft_limit() {
+        #[derive(serde::Serialize)]
+        struct SyntheticEnvelope<'a> {
+            #[serde(rename = "type")]
+            event_type: &'static str,
+            tool_call_id: &'static str,
+            output: &'a Value,
+            is_error: bool,
+        }
+
+        let measure = |execution: &ToolExecution| {
+            serialized_json_size(&SyntheticEnvelope {
+                event_type: "toolResult",
+                tool_call_id: "call-get-plans",
+                output: &execution.output,
+                is_error: execution.is_error,
+            })
+        };
+        let mut overview = "x".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        let mut execution = ToolExecution {
+            output: json!({
+                "plans": [{ "id": "budget-plan", "overview": overview.clone() }],
+                "offset": 0,
+                "returnedCount": 1,
+                "truncated": true,
+                "hasMore": true,
+                "nextOffset": 1,
+            }),
+            is_error: false,
+        };
+        while serialized_json_size(&execution).expect("measure tool execution")
+            > TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        {
+            overview.pop();
+            execution = ToolExecution {
+                output: json!({
+                    "plans": [{ "id": "budget-plan", "overview": overview.clone() }],
+                    "offset": 0,
+                    "returnedCount": 1,
+                    "truncated": true,
+                    "hasMore": true,
+                    "nextOffset": 1,
+                }),
+                is_error: false,
+            };
+        }
+        assert!(
+            measure(&execution).expect("measure transport envelope") > TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+        assert!(
+            measure(&execution).expect("remeasure transport envelope")
+                <= TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let budgeted = normalize_tool_execution_for_envelope(
+            "get_plans",
             ToolOutputSemantics::ReadOnly,
             execution.clone(),
             measure,
