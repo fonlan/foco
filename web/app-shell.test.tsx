@@ -1183,6 +1183,91 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("keeps failed apply_patch errors visible without a compact diff", async () => {
+    const failedPatchChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = failedPatchChatMessages.messages[1];
+    const failedToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: {
+        patch: "*** Begin Patch\n*** Update File: README.md\n@@\n-old\n+new\n*** End Patch",
+      },
+      isError: true,
+      name: "apply_patch",
+      output: { error: "patch did not apply" },
+    };
+    assistantMessage.toolCalls = [failedToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: failedToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...failedPatchChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Patch (apply_patch)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(within(assistantBubble).getByText("patch did not apply")).toBeInTheDocument();
+    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+  });
+
+  it("falls back to the compact summary for malformed successful apply_patch input", async () => {
+    const malformedPatchChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = malformedPatchChatMessages.messages[1];
+    const malformedToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { patch: "not a patch\n+unexpected" },
+      name: "apply_patch",
+      output: "Patch summary",
+    };
+    assistantMessage.toolCalls = [malformedToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: malformedToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...malformedPatchChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Patch (apply_patch)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(within(assistantBubble).getByText("Patch summary")).toBeInTheDocument();
+    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
+  });
+
   it("keeps managed command errors out of the success summary", async () => {
     const failedCommandMessages = JSON.parse(JSON.stringify(chatMessages));
     const assistantMessage = failedCommandMessages.messages[1];
@@ -1446,6 +1531,115 @@ describe("app-shell verification surfaces", () => {
       "-Legacy flag",
       "+Modern flag",
     ]);
+  });
+
+  it("renders successful apply_patch calls as compact multi-file diffs", async () => {
+    const applyPatchChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = applyPatchChatMessages.messages[1];
+    const applyPatchToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: {
+        patch: [
+          "*** Begin Patch",
+          "*** Update File: README.md",
+          "@@",
+          "-old readme",
+          "+new readme",
+          "*** Add File: docs/new.md",
+          "+# New document",
+          "+",
+          "*** Delete File: legacy.md",
+          "*** Update File: moved.md",
+          "*** Move to: docs/moved.md",
+          "@@",
+          "-old location",
+          "+new location",
+          "*** End of File",
+          "*** End Patch",
+        ].join("\n"),
+      },
+      name: "apply_patch",
+      output: { patchedFiles: 4 },
+    };
+    assistantMessage.toolCalls = [applyPatchToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: applyPatchToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...applyPatchChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Patch (apply_patch)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    const expectedDiffLines = [
+      "-old readme",
+      "+new readme",
+      "+# New document",
+      "+",
+      "-old location",
+      "+new location",
+    ];
+    const diffLines = Array.from(
+      assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"),
+    );
+    expect(diffLines.map((line) => line.textContent)).toEqual(expectedDiffLines);
+    expect(
+      diffLines.some((line) => /\*\*\*|@@|Move to/.test(line.textContent ?? "")),
+    ).toBe(false);
+    expect(diffLines[0]).toHaveClass("bg-rose-50", "text-rose-800");
+    expect(diffLines[1]).toHaveClass("bg-emerald-50", "text-emerald-800");
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(
+      within(assistantBubble).queryByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"patch": "*** Begin Patch')),
+      ),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Raw" }));
+
+    expect(within(assistantBubble).getByText("Input")).toBeInTheDocument();
+    expect(within(assistantBubble).getByText("Output")).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"patch": "*** Begin Patch')),
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(assistantBubble).getByText((_content, element) =>
+        element?.tagName === "PRE" &&
+        Boolean(element.textContent?.includes('"patchedFiles": 4')),
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(assistantBubble).getByRole("button", { name: "Compact" }));
+
+    expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
+    expect(
+      Array.from(assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line")).map(
+        (line) => line.textContent,
+      ),
+    ).toEqual(expectedDiffLines);
   });
 
   it("renders successful update_spec contentMarkdown as markdown in compact mode", async () => {

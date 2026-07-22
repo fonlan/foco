@@ -2810,6 +2810,83 @@ function replacementDiffLines(
   ];
 }
 
+function applyPatchDiffLines(patch: string): CompactReplacementDiffLine[] | null {
+  const patchLines = patch
+    .trim()
+    .split("\n")
+    .map((line) => line.replace(/\r$/, ""));
+  if (
+    patchLines.length < 2 ||
+    patchLines[0]?.trim() !== "*** Begin Patch" ||
+    patchLines.at(-1)?.trim() !== "*** End Patch"
+  ) {
+    return null;
+  }
+
+  const lines: CompactReplacementDiffLine[] = [];
+  let section: "added" | "deleted" | "updated" | null = null;
+  let hasFileOperation = false;
+
+  for (const line of patchLines.slice(1, -1)) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("*** Add File:")) {
+      if (!trimmed.slice("*** Add File:".length).trim()) {
+        return null;
+      }
+      section = "added";
+      hasFileOperation = true;
+      continue;
+    }
+    if (trimmed.startsWith("*** Delete File:")) {
+      if (!trimmed.slice("*** Delete File:".length).trim()) {
+        return null;
+      }
+      section = "deleted";
+      hasFileOperation = true;
+      continue;
+    }
+    if (trimmed.startsWith("*** Update File:")) {
+      if (!trimmed.slice("*** Update File:".length).trim()) {
+        return null;
+      }
+      section = "updated";
+      hasFileOperation = true;
+      continue;
+    }
+    if (trimmed.startsWith("*** Move to:")) {
+      if (section !== "updated" || !trimmed.slice("*** Move to:".length).trim()) {
+        return null;
+      }
+      continue;
+    }
+    if (trimmed === "*** End of File" || trimmed === "@@" || trimmed.startsWith("@@ ")) {
+      if (section !== "updated") {
+        return null;
+      }
+      continue;
+    }
+    if (trimmed.startsWith("***")) {
+      return null;
+    }
+
+    if (line.startsWith("+")) {
+      if (section !== "added" && section !== "updated") {
+        return null;
+      }
+      lines.push({ kind: "added", text: line.slice(1) });
+    } else if (line.startsWith("-")) {
+      if (section !== "updated") {
+        return null;
+      }
+      lines.push({ kind: "removed", text: line.slice(1) });
+    } else if (section !== "updated") {
+      return null;
+    }
+  }
+
+  return hasFileOperation && lines.length > 0 ? lines : null;
+}
+
 function successfulCompactReplacementDiff(
   toolCall: ChatToolCallSummary,
   input: JsonValue,
@@ -2831,6 +2908,16 @@ function successfulCompactReplacementDiff(
 
     // ponytail: this is replacement-snippet diff, not a full-file diff; upgrade when the backend returns real hunks/startLine.
     return { lines: replacementDiffLines(oldStr, newStr) };
+  }
+
+  if (toolCall.name === "apply_patch") {
+    const patch = input.patch;
+    if (typeof patch !== "string") {
+      return null;
+    }
+
+    const lines = applyPatchDiffLines(patch);
+    return lines ? { lines } : null;
   }
 
   if (
