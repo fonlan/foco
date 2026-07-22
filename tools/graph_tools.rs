@@ -1,8 +1,8 @@
 use std::{fs, path::Path};
 
 use foco_store::workspace::{
-    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, WorkspaceDatabase,
+    CodeGraphImportRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
+    CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord, WorkspaceDatabase,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -199,6 +199,59 @@ pub(crate) fn graph_related_files(
     Ok(json!({
         "path": path,
         "files": files,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+pub(crate) fn graph_find_imports(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GraphFindImportsInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
+    let path = normalize_workspace_path_text(&request.path)?;
+    let limit = graph_limit(request.limit)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let mut imports =
+        database.code_graph_imports(&path, request.resolved, graph_query_limit(limit)?)?;
+    let limit_truncated = truncate_records(&mut imports, limit);
+    let records = imports.into_iter().map(import_json).collect::<Vec<_>>();
+    let (imports, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = imports.len();
+
+    Ok(json!({
+        "path": path,
+        "resolved": request.resolved,
+        "imports": imports,
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+pub(crate) fn graph_find_importers(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GraphFindImportersInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
+    let path = normalize_workspace_path_text(&request.path)?;
+    let limit = graph_limit(request.limit)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let mut importers = database.code_graph_importers(&path, graph_query_limit(limit)?)?;
+    let limit_truncated = truncate_records(&mut importers, limit);
+    let records = importers.into_iter().map(import_json).collect::<Vec<_>>();
+    let (importers, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = importers.len();
+
+    Ok(json!({
+        "path": path,
+        "importers": importers,
+        "relationshipSemantics": "exact_workspace_module_resolution_only",
         "truncated": limit_truncated || soft_truncated,
         "returnedCount": returned_count,
         "timeoutMs": timeout_ms
@@ -584,6 +637,28 @@ fn related_file_json(file: CodeGraphRelatedFileRecord) -> Value {
     })
 }
 
+fn import_json(import: CodeGraphImportRecord) -> Value {
+    let candidates = serde_json::from_str::<Value>(&import.candidates_json)
+        .unwrap_or_else(|_| Value::Array(Vec::new()));
+    let metadata = serde_json::from_str::<Value>(&import.metadata_json)
+        .unwrap_or_else(|_| Value::String(import.metadata_json.clone()));
+    json!({
+        "importId": import.id,
+        "sourcePath": import.path,
+        "language": import.language,
+        "module": import.module,
+        "importedSymbol": import.imported_symbol,
+        "alias": import.alias,
+        "startLine": import.start_line,
+        "startColumn": import.start_column,
+        "resolution": import.resolution,
+        "targetPath": import.target_path,
+        "targetSymbol": import.target_symbol.map(symbol_json),
+        "candidates": candidates,
+        "provenance": metadata
+    })
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct GraphFindSymbolsInput {
@@ -630,6 +705,23 @@ struct GraphExploreInput {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphRelatedFilesInput {
+    path: String,
+    limit: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphFindImportsInput {
+    path: String,
+    resolved: Option<bool>,
+    limit: Option<usize>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphFindImportersInput {
     path: String,
     limit: Option<usize>,
     timeout_ms: Option<u64>,

@@ -62,6 +62,8 @@ pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
 pub const GRAPH_FIND_CHILDREN_TOOL: &str = "graph_find_children";
 pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
+pub const GRAPH_FIND_IMPORTS_TOOL: &str = "graph_find_imports";
+pub const GRAPH_FIND_IMPORTERS_TOOL: &str = "graph_find_importers";
 pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
 pub const GRAPH_EXPLORE_TOOL: &str = "graph_explore";
 pub const CREATE_TODO_GRAPH_TOOL: &str = "create_todo_graph";
@@ -492,6 +494,8 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_CALLEES_TOOL => graph_tools::graph_find_callees(workspace_path, arguments),
         GRAPH_FIND_CHILDREN_TOOL => graph_tools::graph_find_children(workspace_path, arguments),
         GRAPH_FIND_REFERENCES_TOOL => graph_tools::graph_find_references(workspace_path, arguments),
+        GRAPH_FIND_IMPORTS_TOOL => graph_tools::graph_find_imports(workspace_path, arguments),
+        GRAPH_FIND_IMPORTERS_TOOL => graph_tools::graph_find_importers(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_tools::graph_related_files(workspace_path, arguments),
         GRAPH_EXPLORE_TOOL => graph_tools::graph_explore(workspace_path, arguments),
         SEARCH_TEXT_TOOL if allow_external_read_access => {
@@ -1341,9 +1345,9 @@ mod tests {
         file_tools::{EditFileInput, ReadFileInput, WriteFileInput, ripgrep_command},
     };
     use foco_store::workspace::{
-        NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference,
-        NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WorkspaceDatabase,
+        NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
+        NewCodeGraphReference, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabase,
     };
     use serde_json::json;
     use std::{
@@ -4981,6 +4985,64 @@ mod tests {
                 && !graph_path.contains("external-read grant"),
             "graph must not advertise external grants: {graph_path}"
         );
+    }
+
+    #[test]
+    fn graph_import_tools_return_exact_resolution_and_exact_reverse_dependencies() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        insert_graph_fixture(workspace.path());
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let snapshot = database
+            .code_graph_resolver_snapshot()
+            .expect("resolver snapshot");
+        let import = snapshot
+            .imports
+            .iter()
+            .find(|import| import.path == "caller.rs")
+            .expect("caller import");
+        let target_file = snapshot
+            .files
+            .iter()
+            .find(|file| file.path == "lib.rs")
+            .expect("target file");
+        let target_symbol = snapshot
+            .symbols
+            .iter()
+            .find(|symbol| symbol.file_id == target_file.id && symbol.name == "public_api")
+            .expect("target symbol");
+        let resolutions = [NewCodeGraphImportResolution {
+            import_id: import.id,
+            resolution: "exact",
+            target_file_id: Some(target_file.id),
+            target_symbol_id: Some(target_symbol.id),
+            candidates: &[],
+            candidates_json: "[]",
+            metadata_json: r#"{"provenance":"module_resolver","confidence":"exact"}"#,
+        }];
+        database
+            .replace_code_graph_import_resolutions(&resolutions, &[])
+            .expect("store resolution");
+
+        let imports = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_IMPORTS_TOOL,
+            json!({ "path": "caller.rs", "resolved": null, "limit": null, "timeoutMs": null }),
+        );
+        let importers = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_IMPORTERS_TOOL,
+            json!({ "path": "lib.rs", "limit": null, "timeoutMs": null }),
+        );
+
+        assert!(!imports.is_error, "{:?}", imports.output);
+        assert_eq!(imports.output["imports"][0]["resolution"], "exact");
+        assert_eq!(imports.output["imports"][0]["targetPath"], "lib.rs");
+        assert_eq!(
+            imports.output["imports"][0]["targetSymbol"]["name"],
+            "public_api"
+        );
+        assert!(!importers.is_error, "{:?}", importers.output);
+        assert_eq!(importers.output["importers"][0]["sourcePath"], "caller.rs");
     }
 
     #[test]

@@ -99,6 +99,7 @@ fn extract_typescript_family(
         &file_key,
         &root_scope,
         false,
+        false,
         &mut declarations,
         &mut imports,
     );
@@ -156,6 +157,7 @@ fn collect_declarations(
     file_key: &str,
     scope: &Scope,
     exported: bool,
+    default_exported: bool,
     declarations: &mut Vec<Declaration>,
     imports: &mut Vec<ExtractedImport>,
 ) {
@@ -167,7 +169,15 @@ fn collect_declarations(
         _ => {}
     }
 
-    let declaration = typescript_declaration(node, text, lines, file_key, scope, exported);
+    let declaration = typescript_declaration(
+        node,
+        text,
+        lines,
+        file_key,
+        scope,
+        exported,
+        default_exported,
+    );
     let has_declaration = declaration.is_some();
     let child_scope = declaration.as_ref().map_or_else(
         || child_scope_for_non_symbol(node, scope),
@@ -184,6 +194,8 @@ fn collect_declarations(
         declarations.push(declaration);
     }
     let child_exported = !has_declaration && (exported || node.kind() == "export_statement");
+    let child_default_exported =
+        !has_declaration && (default_exported || is_default_export_statement(node, text));
     for index in 0..node.child_count() {
         if let Some(child) = child_at(node, index) {
             collect_declarations(
@@ -193,6 +205,7 @@ fn collect_declarations(
                 file_key,
                 &child_scope,
                 child_exported,
+                child_default_exported,
                 declarations,
                 imports,
             );
@@ -224,6 +237,7 @@ fn typescript_declaration(
     file_key: &str,
     scope: &Scope,
     exported: bool,
+    default_exported: bool,
 ) -> Option<Declaration> {
     let (kind, name_node, callable) = match node.kind() {
         "function_declaration" | "generator_function_declaration" => {
@@ -254,7 +268,7 @@ fn typescript_declaration(
     let range = range_from_node(node);
     let source = node_text(node, text).unwrap_or_default();
     let visibility = accessibility(node, text).or_else(|| exported.then_some("public"));
-    let metadata_json = declaration_metadata(exported, &source);
+    let metadata_json = declaration_metadata(exported, default_exported, &source);
 
     Some(Declaration {
         node: ExtractedNode {
@@ -295,12 +309,18 @@ fn accessibility(node: Node<'_>, text: &str) -> Option<&'static str> {
     None
 }
 
-fn declaration_metadata(exported: bool, source: &str) -> String {
+fn declaration_metadata(exported: bool, default_exported: bool, source: &str) -> String {
     let async_marker = source.split_whitespace().any(|token| token == "async");
     let static_marker = source.split_whitespace().any(|token| token == "static");
     format!(
-        r#"{{"semanticVersion":1,"provenance":"tree_sitter","confidence":"exact","exported":{exported},"async":{async_marker},"static":{static_marker}}}"#
+        r#"{{"semanticVersion":1,"provenance":"tree_sitter","confidence":"exact","exported":{exported},"defaultExport":{default_exported},"async":{async_marker},"static":{static_marker}}}"#
     )
+}
+
+fn is_default_export_statement(node: Node<'_>, text: &str) -> bool {
+    node.kind() == "export_statement"
+        && node_text(node, text)
+            .is_some_and(|source| source.trim_start().starts_with("export default"))
 }
 
 fn collect_module_bindings(

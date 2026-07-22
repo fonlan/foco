@@ -1587,12 +1587,42 @@ pub struct NewCodeGraphEdge<'a> {
     pub metadata_json: Option<&'a str>,
 }
 
+/// A resolver-owned import relation. File and symbol ids refer to the durable
+/// code graph rows captured by a resolver snapshot, not extractor-local keys.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphImportResolution<'a> {
+    pub import_id: i64,
+    pub resolution: &'a str,
+    pub target_file_id: Option<i64>,
+    pub target_symbol_id: Option<i64>,
+    pub candidates: &'a [NewCodeGraphImportResolutionCandidate],
+    pub candidates_json: &'a str,
+    pub metadata_json: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphImportResolutionCandidate {
+    pub target_file_id: i64,
+    pub target_symbol_id: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewCodeGraphResolvedCall<'a> {
+    pub source_symbol_id: i64,
+    pub target_symbol_id: i64,
+    pub metadata_json: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodeGraphContextRecord {
     pub indexed_files: i64,
     pub symbols: i64,
     pub references: i64,
     pub edges: i64,
+    pub exact_import_resolutions: i64,
+    pub candidate_import_resolutions: i64,
+    pub unresolved_import_resolutions: i64,
+    pub external_import_resolutions: i64,
     pub languages: Vec<String>,
 }
 
@@ -1651,4 +1681,78 @@ pub struct CodeGraphRelatedFileRecord {
     pub language: Option<String>,
     pub relation: String,
     pub score: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphResolverSnapshot {
+    pub files: Vec<CodeGraphResolverFileRecord>,
+    pub imports: Vec<CodeGraphResolverImportRecord>,
+    pub symbols: Vec<CodeGraphResolverSymbolRecord>,
+    pub references: Vec<CodeGraphResolverReferenceRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphResolverFileRecord {
+    pub id: i64,
+    pub path: String,
+    pub language: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphResolverImportRecord {
+    pub id: i64,
+    pub file_id: i64,
+    pub path: String,
+    pub language: Option<String>,
+    pub module: String,
+    pub imported_symbol: Option<String>,
+    pub alias: Option<String>,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphResolverSymbolRecord {
+    pub id: i64,
+    pub file_id: i64,
+    pub path: String,
+    pub name: String,
+    pub qualified_name: Option<String>,
+    pub kind: String,
+    pub visibility: Option<String>,
+    pub metadata_json: String,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphResolverReferenceRecord {
+    pub id: i64,
+    pub file_id: i64,
+    pub name: String,
+    /// A locally resolved declaration means an import binding must not claim this reference.
+    pub symbol_id: Option<i64>,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub end_line: Option<i64>,
+    pub end_column: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeGraphImportRecord {
+    pub id: i64,
+    pub path: String,
+    pub language: Option<String>,
+    pub module: String,
+    pub imported_symbol: Option<String>,
+    pub alias: Option<String>,
+    pub start_line: Option<i64>,
+    pub start_column: Option<i64>,
+    pub resolution: String,
+    pub target_path: Option<String>,
+    pub target_symbol: Option<CodeGraphSymbolRecord>,
+    pub candidates_json: String,
+    pub metadata_json: String,
 }

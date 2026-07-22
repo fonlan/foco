@@ -69,6 +69,9 @@ pub(crate) fn index_workspace(workspace_path: &Path) -> Result<IndexReport, Code
         let mut database = WorkspaceDatabase::open_or_create(&workspace_path)?;
         report.deleted_files = database.remove_stale_code_graph_files(&live_paths)?.len();
     }
+    // A resolver-only pass refreshes dependency-derived relationships even when
+    // importer content hashes are unchanged. It does not reparse those files.
+    crate::resolver::resolve_workspace_imports(&workspace_path)?;
 
     Ok(report)
 }

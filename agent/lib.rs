@@ -871,6 +871,8 @@ const GRAPH_FIND_CALLERS_TOOL_NAME: &str = "graph_find_callers";
 const GRAPH_FIND_CALLEES_TOOL_NAME: &str = "graph_find_callees";
 const GRAPH_FIND_CHILDREN_TOOL_NAME: &str = "graph_find_children";
 const GRAPH_FIND_REFERENCES_TOOL_NAME: &str = "graph_find_references";
+const GRAPH_FIND_IMPORTS_TOOL_NAME: &str = "graph_find_imports";
+const GRAPH_FIND_IMPORTERS_TOOL_NAME: &str = "graph_find_importers";
 const GRAPH_RELATED_FILES_TOOL_NAME: &str = "graph_related_files";
 const GRAPH_EXPLORE_TOOL_NAME: &str = "graph_explore";
 const CREATE_TODO_GRAPH_TOOL_NAME: &str = "create_todo_graph";
@@ -1255,6 +1257,7 @@ fn available_graph_tool_guidance(tools: &[ToolPromptInfo]) -> Option<&'static st
          - Need source context for a symbol or likely code target: use graph_explore first; do not follow it with read_file for the same returned snippet.\n\
          - Need a candidate list or a symbolId for an ambiguous name: use graph_find_symbols.\n\
          - Need relationships: use graph_find_callers, graph_find_callees, or graph_find_references; callers/callees are static call-site approximations, not runtime tracing.\n\
+         - Need module declarations or resolution diagnostics: use graph_find_imports. Need reliable reverse module dependencies: use graph_find_importers; it excludes candidate and unresolved module strings.\n\
          - Need direct members of a module, class, impl, or trait: use graph_find_children.\n\
          - Need adjacent files: use graph_related_files.",
     )
@@ -1579,6 +1582,8 @@ pub fn tool_resource_locks(
         | GRAPH_FIND_CALLEES_TOOL_NAME
         | GRAPH_FIND_CHILDREN_TOOL_NAME
         | GRAPH_FIND_REFERENCES_TOOL_NAME
+        | GRAPH_FIND_IMPORTS_TOOL_NAME
+        | GRAPH_FIND_IMPORTERS_TOOL_NAME
         | GRAPH_RELATED_FILES_TOOL_NAME
         | GRAPH_EXPLORE_TOOL_NAME => vec![ToolResourceLock {
             resource: ToolResource::WorkspaceFiles,
@@ -1686,6 +1691,8 @@ pub fn tool_effect(tool_name: &str) -> ToolEffect {
         | GRAPH_FIND_CALLEES_TOOL_NAME
         | GRAPH_FIND_CHILDREN_TOOL_NAME
         | GRAPH_FIND_REFERENCES_TOOL_NAME
+        | GRAPH_FIND_IMPORTS_TOOL_NAME
+        | GRAPH_FIND_IMPORTERS_TOOL_NAME
         | GRAPH_RELATED_FILES_TOOL_NAME
         | GRAPH_EXPLORE_TOOL_NAME
         | GET_TODO_GRAPH_TOOL_NAME
@@ -3021,6 +3028,12 @@ mod tests {
             },
             ToolPromptInfo {
                 name: GRAPH_FIND_REFERENCES_TOOL_NAME.to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_IMPORTS_TOOL_NAME.to_string(),
+            },
+            ToolPromptInfo {
+                name: GRAPH_FIND_IMPORTERS_TOOL_NAME.to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_RELATED_FILES_TOOL_NAME.to_string(),

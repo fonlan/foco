@@ -1478,6 +1478,32 @@ DELETE FROM code_graph_fts_data
 DELETE FROM code_graph_files;
 "#;
 
+pub(crate) const MIGRATION_044: &str = r#"
+CREATE TABLE code_graph_import_resolutions (
+    import_id INTEGER PRIMARY KEY REFERENCES code_graph_imports(id) ON DELETE CASCADE,
+    resolution TEXT NOT NULL CHECK (resolution IN ('exact', 'candidate', 'unresolved', 'external')),
+    target_file_id INTEGER REFERENCES code_graph_files(id) ON DELETE SET NULL,
+    target_symbol_id INTEGER REFERENCES code_graph_symbols(id) ON DELETE SET NULL,
+    candidates_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    resolved_at TEXT NOT NULL
+);
+
+CREATE INDEX code_graph_import_resolutions_target_file_idx
+ON code_graph_import_resolutions (target_file_id)
+WHERE target_file_id IS NOT NULL;
+
+CREATE TABLE code_graph_import_resolution_candidates (
+    import_id INTEGER NOT NULL REFERENCES code_graph_import_resolutions(import_id) ON DELETE CASCADE,
+    target_file_id INTEGER NOT NULL REFERENCES code_graph_files(id) ON DELETE CASCADE,
+    target_symbol_id INTEGER REFERENCES code_graph_symbols(id) ON DELETE SET NULL,
+    PRIMARY KEY (import_id, target_file_id, target_symbol_id)
+);
+
+CREATE INDEX code_graph_import_resolution_candidates_target_file_idx
+ON code_graph_import_resolution_candidates (target_file_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

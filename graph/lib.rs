@@ -10,6 +10,7 @@ use notify::{RecursiveMode, Watcher};
 
 mod extractors;
 mod indexing;
+mod resolver;
 
 #[cfg(test)]
 #[path = "tests.rs"]

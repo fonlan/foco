@@ -48,8 +48,10 @@ pub use workspace_records::{
     AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
     AgentTaskRecord, AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, AgentTeamRecord,
     ChatPage, ChatPageCursor, ChatRecord, ChatSpecSnapshotRecord, CodeChangeStats,
-    CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphReferenceRecord,
-    CodeGraphRelatedFileRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
+    CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphImportRecord,
+    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphResolverFileRecord,
+    CodeGraphResolverImportRecord, CodeGraphResolverReferenceRecord, CodeGraphResolverSnapshot,
+    CodeGraphResolverSymbolRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
     ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
     LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
@@ -58,16 +60,18 @@ pub use workspace_records::{
     LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
     NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
     NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-    NewContextCompressionSnapshot, NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage,
-    NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
-    NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-    NewToolResult, NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection,
-    PlanAutoRunStateRecord, PlanListFilter, PlanListOrder, PlanListPage, PlanPatch,
-    PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord,
-    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
-    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
-    PromptContextInjectionRecord, RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
+    NewCodeGraphImportResolutionCandidate, NewCodeGraphReference, NewCodeGraphResolvedCall,
+    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
+    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
+    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
+    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
+    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
+    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
+    PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+    PreStreamFailureMaterialization, PromptContextInjectionRecord,
+    RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
     STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
     STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
@@ -90,13 +94,14 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, Migration,
+    MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 43;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 44;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -444,6 +449,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 43,
         sql: MIGRATION_043,
+    },
+    Migration {
+        version: 44,
+        sql: MIGRATION_044,
     },
 ];
 
@@ -14641,6 +14650,24 @@ impl WorkspaceDatabase {
                 row.get(0)
             })
             .map_err(|source| self.sqlite_error(source))?;
+        let (
+            exact_import_resolutions,
+            candidate_import_resolutions,
+            unresolved_import_resolutions,
+            external_import_resolutions,
+        ) = self
+            .connection
+            .query_row(
+                "SELECT
+                    COUNT(*) FILTER (WHERE resolution = 'exact'),
+                    COUNT(*) FILTER (WHERE resolution = 'candidate'),
+                    COUNT(*) FILTER (WHERE resolution = 'unresolved'),
+                    COUNT(*) FILTER (WHERE resolution = 'external')
+                 FROM code_graph_import_resolutions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
         let mut statement = self
             .connection
             .prepare(
@@ -14660,6 +14687,10 @@ impl WorkspaceDatabase {
             symbols,
             references,
             edges,
+            exact_import_resolutions,
+            candidate_import_resolutions,
+            unresolved_import_resolutions,
+            external_import_resolutions,
             languages: collect_rows(rows, &self.database_path)?,
         })
     }
@@ -14860,7 +14891,7 @@ impl WorkspaceDatabase {
             .prepare(
                 "WITH related AS (
                     SELECT target_file.path AS path, target_file.language AS language,
-                           'callee' AS relation, COUNT(*) AS score
+                           'direct_call' AS relation, 400000 + COUNT(*) AS score
                     FROM code_graph_edges edge
                     JOIN code_graph_symbols source_symbol
                         ON source_symbol.id = edge.source_symbol_id
@@ -14877,7 +14908,7 @@ impl WorkspaceDatabase {
                     UNION ALL
 
                     SELECT source_file.path AS path, source_file.language AS language,
-                           'caller' AS relation, COUNT(*) AS score
+                           'direct_call' AS relation, 400000 + COUNT(*) AS score
                     FROM code_graph_edges edge
                     JOIN code_graph_symbols source_symbol
                         ON source_symbol.id = edge.source_symbol_id
@@ -14893,8 +14924,46 @@ impl WorkspaceDatabase {
 
                     UNION ALL
 
+                    SELECT target_file.path AS path, target_file.language AS language,
+                           'exact_import' AS relation, 300000 + COUNT(*) AS score
+                    FROM code_graph_import_resolutions resolution
+                    JOIN code_graph_imports import ON import.id = resolution.import_id
+                    JOIN code_graph_files source_file ON source_file.id = import.file_id
+                    JOIN code_graph_files target_file ON target_file.id = resolution.target_file_id
+                    WHERE source_file.path = ?1 AND target_file.path <> ?1
+                      AND resolution.resolution = 'exact'
+                    GROUP BY target_file.path, target_file.language
+
+                    UNION ALL
+
+                    SELECT source_file.path AS path, source_file.language AS language,
+                           'exact_importer' AS relation, 300000 + COUNT(*) AS score
+                    FROM code_graph_import_resolutions resolution
+                    JOIN code_graph_imports import ON import.id = resolution.import_id
+                    JOIN code_graph_files source_file ON source_file.id = import.file_id
+                    JOIN code_graph_files target_file ON target_file.id = resolution.target_file_id
+                    WHERE target_file.path = ?1 AND source_file.path <> ?1
+                      AND resolution.resolution = 'exact'
+                    GROUP BY source_file.path, source_file.language
+
+                    UNION ALL
+
+                    SELECT candidate_file.path AS path, candidate_file.language AS language,
+                           'candidate_import' AS relation, 100000 + COUNT(*) AS score
+                    FROM code_graph_import_resolutions resolution
+                    JOIN code_graph_imports import ON import.id = resolution.import_id
+                    JOIN code_graph_files source_file ON source_file.id = import.file_id
+                    JOIN code_graph_import_resolution_candidates candidate
+                        ON candidate.import_id = resolution.import_id
+                    JOIN code_graph_files candidate_file ON candidate_file.id = candidate.target_file_id
+                    WHERE source_file.path = ?1 AND candidate_file.path <> ?1
+                      AND resolution.resolution = 'candidate'
+                    GROUP BY candidate_file.path, candidate_file.language
+
+                    UNION ALL
+
                     SELECT other_file.path AS path, other_file.language AS language,
-                           'shared_import' AS relation, COUNT(*) AS score
+                           'shared_import' AS relation, 200000 + COUNT(*) AS score
                     FROM code_graph_imports import
                     JOIN code_graph_files file ON file.id = import.file_id
                     JOIN code_graph_imports other_import
@@ -14919,6 +14988,292 @@ impl WorkspaceDatabase {
                     score: row.get(3)?,
                 })
             })
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// Capture the durable facts needed by the cross-file resolver while the
+    /// database permit is held. Resolution itself runs outside SQLite.
+    pub fn code_graph_resolver_snapshot(
+        &self,
+    ) -> Result<CodeGraphResolverSnapshot, WorkspaceDatabaseError> {
+        let files = {
+            let mut statement = self
+                .connection
+                .prepare("SELECT id, path, language FROM code_graph_files ORDER BY path ASC")
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(CodeGraphResolverFileRecord {
+                        id: row.get(0)?,
+                        path: row.get(1)?,
+                        language: row.get(2)?,
+                    })
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+        let imports = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT import.id, file.id, file.path, file.language, import.module,
+                            import.imported_symbol, import.alias, import.start_line, import.start_column
+                     FROM code_graph_imports import
+                     JOIN code_graph_files file ON file.id = import.file_id
+                     ORDER BY file.path ASC, import.start_line ASC, import.id ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(CodeGraphResolverImportRecord {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        path: row.get(2)?,
+                        language: row.get(3)?,
+                        module: row.get(4)?,
+                        imported_symbol: row.get(5)?,
+                        alias: row.get(6)?,
+                        start_line: row.get(7)?,
+                        start_column: row.get(8)?,
+                    })
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+        let symbols = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT symbol.id, file.id, file.path, symbol.name, symbol.qualified_name,
+                            symbol.kind, symbol.visibility, symbol.metadata_json,
+                            symbol.start_line, symbol.start_column, symbol.end_line, symbol.end_column
+                     FROM code_graph_symbols symbol
+                     JOIN code_graph_files file ON file.id = symbol.file_id
+                     ORDER BY file.path ASC, symbol.start_line ASC, symbol.id ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(CodeGraphResolverSymbolRecord {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        path: row.get(2)?,
+                        name: row.get(3)?,
+                        qualified_name: row.get(4)?,
+                        kind: row.get(5)?,
+                        visibility: row.get(6)?,
+                        metadata_json: row.get(7)?,
+                        start_line: row.get(8)?,
+                        start_column: row.get(9)?,
+                        end_line: row.get(10)?,
+                        end_column: row.get(11)?,
+                    })
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+        let references = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT id, file_id, name, symbol_id, start_line, start_column, end_line, end_column
+                     FROM code_graph_references
+                     ORDER BY file_id ASC, start_line ASC, id ASC",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok(CodeGraphResolverReferenceRecord {
+                        id: row.get(0)?,
+                        file_id: row.get(1)?,
+                        name: row.get(2)?,
+                        symbol_id: row.get(3)?,
+                        start_line: row.get(4)?,
+                        start_column: row.get(5)?,
+                        end_line: row.get(6)?,
+                        end_column: row.get(7)?,
+                    })
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(rows, &self.database_path)?
+        };
+
+        Ok(CodeGraphResolverSnapshot {
+            files,
+            imports,
+            symbols,
+            references,
+        })
+    }
+
+    /// Replace resolver-owned rows in one short transaction. Extractor-owned
+    /// rows remain untouched, so content hashes still skip unchanged files.
+    pub fn replace_code_graph_import_resolutions(
+        &mut self,
+        resolutions: &[NewCodeGraphImportResolution<'_>],
+        calls: &[NewCodeGraphResolvedCall<'_>],
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| WorkspaceDatabaseError::Sqlite {
+                path: database_path.clone(),
+                source,
+            })?;
+        transaction
+            .execute(
+                "DELETE FROM code_graph_edges
+                 WHERE edge_kind = 'calls'
+                   AND json_extract(metadata_json, '$.provenance') = 'module_resolver'",
+                [],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute("DELETE FROM code_graph_import_resolutions", [])
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let now = now_timestamp();
+        let mut insert_resolution = transaction
+            .prepare(
+                "INSERT INTO code_graph_import_resolutions
+                    (import_id, resolution, target_file_id, target_symbol_id, candidates_json, metadata_json, resolved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let mut insert_candidate = transaction
+            .prepare(
+                "INSERT INTO code_graph_import_resolution_candidates
+                    (import_id, target_file_id, target_symbol_id)
+                 VALUES (?1, ?2, ?3)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for resolution in resolutions {
+            insert_resolution
+                .execute(params![
+                    resolution.import_id,
+                    resolution.resolution,
+                    resolution.target_file_id,
+                    resolution.target_symbol_id,
+                    resolution.candidates_json,
+                    resolution.metadata_json,
+                    now
+                ])
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            for candidate in resolution.candidates {
+                insert_candidate
+                    .execute(params![
+                        resolution.import_id,
+                        candidate.target_file_id,
+                        candidate.target_symbol_id
+                    ])
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+        }
+        let mut insert_call = transaction
+            .prepare(
+                "INSERT INTO code_graph_edges
+                    (source_symbol_id, target_symbol_id, edge_kind, metadata_json)
+                 VALUES (?1, ?2, 'calls', ?3)",
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        for call in calls {
+            insert_call
+                .execute(params![
+                    call.source_symbol_id,
+                    call.target_symbol_id,
+                    call.metadata_json
+                ])
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        drop(insert_call);
+        drop(insert_candidate);
+        drop(insert_resolution);
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(())
+    }
+
+    pub fn code_graph_imports(
+        &self,
+        path: &str,
+        resolved: Option<bool>,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphImportRecord>, WorkspaceDatabaseError> {
+        let resolution_filter = resolved.map(|value| if value { "exact" } else { "" });
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    import.id, file.path, file.language, import.module, import.imported_symbol,
+                    import.alias, import.start_line, import.start_column,
+                    COALESCE(resolution.resolution, 'unresolved'), target_file.path,
+                    target_symbol.id, target_symbol_file.path, target_symbol_file.language,
+                    target_symbol.name, target_symbol.qualified_name, target_symbol.kind,
+                    target_symbol.visibility, target_symbol.metadata_json,
+                    target_symbol.start_line, target_symbol.start_column, target_symbol.end_line,
+                    target_symbol.end_column, target_symbol.signature, target_symbol.documentation,
+                    COALESCE(resolution.candidates_json, '[]'),
+                    COALESCE(resolution.metadata_json, '{}')
+                 FROM code_graph_imports import
+                 JOIN code_graph_files file ON file.id = import.file_id
+                 LEFT JOIN code_graph_import_resolutions resolution ON resolution.import_id = import.id
+                 LEFT JOIN code_graph_files target_file ON target_file.id = resolution.target_file_id
+                 LEFT JOIN code_graph_symbols target_symbol ON target_symbol.id = resolution.target_symbol_id
+                 LEFT JOIN code_graph_files target_symbol_file ON target_symbol_file.id = target_symbol.file_id
+                 WHERE file.path = ?1
+                   AND (?2 IS NULL OR (?2 = 'exact' AND resolution.resolution = 'exact')
+                        OR (?2 = '' AND COALESCE(resolution.resolution, 'unresolved') <> 'exact'))
+                 ORDER BY import.start_line ASC, import.start_column ASC, import.id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![path, resolution_filter, limit],
+                code_graph_import_from_row,
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// Return only exact reverse module dependencies. Candidate and textual
+    /// module matches are deliberately excluded from this navigation surface.
+    pub fn code_graph_importers(
+        &self,
+        path: &str,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphImportRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    import.id, file.path, file.language, import.module, import.imported_symbol,
+                    import.alias, import.start_line, import.start_column,
+                    resolution.resolution, target_file.path,
+                    target_symbol.id, target_symbol_file.path, target_symbol_file.language,
+                    target_symbol.name, target_symbol.qualified_name, target_symbol.kind,
+                    target_symbol.visibility, target_symbol.metadata_json,
+                    target_symbol.start_line, target_symbol.start_column, target_symbol.end_line,
+                    target_symbol.end_column, target_symbol.signature, target_symbol.documentation,
+                    resolution.candidates_json, resolution.metadata_json
+                 FROM code_graph_import_resolutions resolution
+                 JOIN code_graph_imports import ON import.id = resolution.import_id
+                 JOIN code_graph_files file ON file.id = import.file_id
+                 JOIN code_graph_files target_file ON target_file.id = resolution.target_file_id
+                 LEFT JOIN code_graph_symbols target_symbol ON target_symbol.id = resolution.target_symbol_id
+                 LEFT JOIN code_graph_files target_symbol_file ON target_symbol_file.id = target_symbol.file_id
+                 WHERE target_file.path = ?1 AND resolution.resolution = 'exact'
+                 ORDER BY file.path ASC, import.start_line ASC, import.id ASC
+                 LIMIT ?2",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![path, limit], code_graph_import_from_row)
             .map_err(|source| self.sqlite_error(source))?;
 
         collect_rows(rows, &self.database_path)
@@ -16878,6 +17233,24 @@ fn code_graph_reference_from_row(
         end_line: row.get(6)?,
         end_column: row.get(7)?,
         symbol: optional_code_graph_symbol_from_row_offset(row, 8)?,
+    })
+}
+
+fn code_graph_import_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphImportRecord> {
+    Ok(CodeGraphImportRecord {
+        id: row.get(0)?,
+        path: row.get(1)?,
+        language: row.get(2)?,
+        module: row.get(3)?,
+        imported_symbol: row.get(4)?,
+        alias: row.get(5)?,
+        start_line: row.get(6)?,
+        start_column: row.get(7)?,
+        resolution: row.get(8)?,
+        target_path: row.get(9)?,
+        target_symbol: optional_code_graph_symbol_from_row_offset(row, 10)?,
+        candidates_json: row.get(24)?,
+        metadata_json: row.get(25)?,
     })
 }
 

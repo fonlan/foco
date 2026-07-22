@@ -115,6 +115,8 @@ const TOOL_CALL_ICONS: Record<string, LucideIcon> = {
   graph_find_callees: Search,
   graph_find_callers: Search,
   graph_find_children: Search,
+  graph_find_importers: Search,
+  graph_find_imports: Search,
   graph_find_references: Search,
   graph_find_symbols: Search,
   graph_related_files: Search,

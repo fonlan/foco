@@ -178,22 +178,232 @@ fn semantic_fixture_resolves_same_name_calls_in_the_nearest_lexical_scope() {
 }
 
 #[test]
-fn semantic_fixture_keeps_cross_file_imports_without_cross_file_edges() {
+fn semantic_fixture_resolves_cross_file_rust_imports_and_calls() {
     let workspace = semantic_fixture_workspace("rust_workspace");
 
     index_workspace(workspace.path()).expect("index fixture");
 
     let connection = graph_connection(workspace.path());
-    let cross_file_edge_count = query_count(
+    let relation = connection
+        .query_row(
+            "SELECT edge.metadata_json
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.name = 'local_helper' AND target.name = 'decorate'
+               AND source.file_id <> target.file_id",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("cross-file decorate call");
+    let resolution = connection
+        .query_row(
+            "SELECT resolution.resolution
+             FROM code_graph_import_resolutions resolution
+             JOIN code_graph_imports import ON import.id = resolution.import_id
+             JOIN code_graph_files file ON file.id = import.file_id
+             WHERE file.path = 'src/lib.rs' AND import.module = 'crate::formatting'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("formatting resolution");
+
+    assert_eq!(resolution, "exact");
+    assert!(relation.contains("\"provenance\":\"module_resolver\""));
+}
+
+#[test]
+fn resolver_keeps_ambiguous_and_external_typescript_imports_non_exact() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::write(
+        workspace.path().join("src/consumer.ts"),
+        "import { value } from './shared';\nimport { join } from 'node:path';\nexport function caller() { return value(); }\n",
+    )
+    .expect("consumer source");
+    fs::write(
+        workspace.path().join("src/shared.ts"),
+        "export function value() { return 'ts'; }\n",
+    )
+    .expect("typescript source");
+    fs::write(
+        workspace.path().join("src/shared.tsx"),
+        "export function value() { return 'tsx'; }\n",
+    )
+    .expect("tsx source");
+
+    index_workspace(workspace.path()).expect("index workspace");
+
+    let connection = graph_connection(workspace.path());
+    let (candidate_count, external_count, cross_file_calls, candidates_json) = (
+        query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_import_resolutions WHERE resolution = 'candidate'",
+        ),
+        query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_import_resolutions WHERE resolution = 'external'",
+        ),
+        query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.file_id <> target.file_id",
+        ),
+        connection
+            .query_row(
+                "SELECT candidates_json
+                 FROM code_graph_import_resolutions
+                 WHERE resolution = 'candidate'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("candidate metadata"),
+    );
+
+    assert_eq!(candidate_count, 1);
+    assert_eq!(external_count, 1);
+    assert_eq!(cross_file_calls, 0);
+    assert!(candidates_json.contains("\"path\":\"src/shared.ts\""));
+    assert!(candidates_json.contains("\"language\":\"typescript\""));
+}
+
+#[test]
+fn resolver_does_not_turn_a_locally_resolved_shadow_into_an_import_call() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::write(
+        workspace.path().join("src/consumer.ts"),
+        "import { value } from './producer';\nexport function caller() { const value = () => 1; return value(); }\n",
+    )
+    .expect("consumer source");
+    fs::write(
+        workspace.path().join("src/producer.ts"),
+        "export function value() { return 2; }\n",
+    )
+    .expect("producer source");
+
+    index_workspace(workspace.path()).expect("index workspace");
+
+    let connection = graph_connection(workspace.path());
+    let imported_call_count = query_count(
         &connection,
         "SELECT COUNT(*)
          FROM code_graph_edges edge
          JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
          JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
-         WHERE source.file_id <> target.file_id",
+         WHERE source.name = 'caller' AND target.name = 'value'
+           AND source.file_id <> target.file_id",
     );
 
-    assert_eq!(cross_file_edge_count, 0);
+    assert_eq!(imported_call_count, 0);
+}
+
+#[test]
+fn resolver_resolves_dotted_typescript_specifiers_with_implicit_extensions() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::write(
+        workspace.path().join("src/consumer.ts"),
+        "import { value } from './feature.test';\nexport function caller() { return value(); }\n",
+    )
+    .expect("consumer source");
+    fs::write(
+        workspace.path().join("src/feature.test.ts"),
+        "export function value() { return 'ok'; }\n",
+    )
+    .expect("producer source");
+
+    index_workspace(workspace.path()).expect("index workspace");
+
+    let connection = graph_connection(workspace.path());
+    let resolution = connection
+        .query_row(
+            "SELECT resolution.resolution
+             FROM code_graph_import_resolutions resolution
+             JOIN code_graph_imports import ON import.id = resolution.import_id
+             WHERE import.module = './feature.test'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("dotted specifier resolution");
+
+    assert_eq!(resolution, "exact");
+}
+
+#[test]
+fn resolver_connects_default_imports_to_unique_default_callable_exports() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::write(
+        workspace.path().join("src/consumer.ts"),
+        "import render from './render';\nexport function caller() { return render(); }\n",
+    )
+    .expect("consumer source");
+    fs::write(
+        workspace.path().join("src/render.ts"),
+        "export default function render() { return 'ok'; }\n",
+    )
+    .expect("producer source");
+
+    index_workspace(workspace.path()).expect("index workspace");
+
+    let connection = graph_connection(workspace.path());
+    let default_call_count = query_count(
+        &connection,
+        "SELECT COUNT(*)
+         FROM code_graph_edges edge
+         JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+         JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+         WHERE source.name = 'caller' AND target.name = 'render'
+           AND source.file_id <> target.file_id",
+    );
+
+    assert_eq!(default_call_count, 1);
+}
+
+#[test]
+fn resolver_refreshes_unchanged_importers_after_their_target_is_deleted() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::create_dir_all(workspace.path().join("src")).expect("source directory");
+    fs::write(
+        workspace.path().join("src/consumer.ts"),
+        "import { value } from './producer';\nexport function caller() { return value(); }\n",
+    )
+    .expect("consumer source");
+    let producer_path = workspace.path().join("src/producer.ts");
+    fs::write(&producer_path, "export function value() { return 'ok'; }\n")
+        .expect("producer source");
+
+    index_workspace(workspace.path()).expect("initial index");
+    fs::remove_file(&producer_path).expect("delete producer");
+    let report = index_workspace(workspace.path()).expect("refresh after delete");
+
+    let connection = graph_connection(workspace.path());
+    let (unresolved_count, cross_file_calls) = (
+        query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_import_resolutions resolution
+             JOIN code_graph_imports import ON import.id = resolution.import_id
+             JOIN code_graph_files file ON file.id = import.file_id
+             WHERE file.path = 'src/consumer.ts' AND resolution.resolution = 'unresolved'",
+        ),
+        query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.file_id <> target.file_id",
+        ),
+    );
+
+    assert_eq!(report.deleted_files, 1);
+    assert_eq!(unresolved_count, 1);
+    assert_eq!(cross_file_calls, 0);
 }
 
 #[test]
@@ -468,7 +678,7 @@ fn typescript_extractor_does_not_mark_nested_symbols_as_exported() {
 }
 
 #[test]
-fn typescript_and_tsx_fixture_keeps_cross_file_edges_unresolved() {
+fn typescript_and_tsx_fixture_resolves_exact_imports_and_cross_file_calls() {
     let workspace = semantic_fixture_workspace("typescript_workspace");
 
     index_workspace(workspace.path()).expect("index fixture");
@@ -483,7 +693,46 @@ fn typescript_and_tsx_fixture_keeps_cross_file_edges_unresolved() {
          WHERE source.file_id <> target.file_id",
     );
 
-    assert_eq!(cross_file_edge_count, 0);
+    let resolution_rows = connection
+        .prepare(
+            "SELECT file.path, import.module, resolution.resolution
+             FROM code_graph_import_resolutions resolution
+             JOIN code_graph_imports import ON import.id = resolution.import_id
+             JOIN code_graph_files file ON file.id = import.file_id
+             ORDER BY file.path, import.module",
+        )
+        .expect("resolution query")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("resolution rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect resolutions");
+    assert_eq!(
+        resolution_rows,
+        vec![
+            (
+                "src/Panel.tsx".to_string(),
+                "./index".to_string(),
+                "exact".to_string()
+            ),
+            (
+                "src/index.ts".to_string(),
+                "./public".to_string(),
+                "exact".to_string()
+            ),
+            (
+                "src/public.ts".to_string(),
+                "./format".to_string(),
+                "exact".to_string()
+            ),
+        ]
+    );
+    assert_eq!(cross_file_edge_count, 1);
 }
 
 #[test]

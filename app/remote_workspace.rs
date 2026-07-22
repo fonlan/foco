@@ -8269,7 +8269,8 @@ pub(crate) fn classify_tool_route(tool_name: &str) -> ToolRoute {
         | "run_command" | "get_command_output" | "stop_command"
         // code graph
         | "graph_find_symbols" | "graph_find_callers" | "graph_find_callees" | "graph_find_children"
-        | "graph_find_references" | "graph_related_files" | "graph_explore"
+        | "graph_find_references" | "graph_find_imports" | "graph_find_importers"
+        | "graph_related_files" | "graph_explore"
         // sleep is harmless anywhere
         | "sleep"
         // todo/plan/spec tools use workspace DB
@@ -8345,6 +8346,8 @@ mod routing_tests {
             "graph_find_callees",
             "graph_find_children",
             "graph_find_references",
+            "graph_find_imports",
+            "graph_find_importers",
             "graph_related_files",
             "graph_explore",
             "sleep",

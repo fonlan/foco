@@ -4,11 +4,11 @@ use crate::{
     APPLY_PATCH_TOOL, ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
     DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_COMMAND_OUTPUT_TOOL, GET_PLANS_TOOL,
     GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_CHILDREN_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL,
-    SEARCH_TEXT_TOOL, SLEEP_TOOL, STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL,
-    UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
-    WRITE_FILE_TOOL,
+    GRAPH_FIND_CHILDREN_TOOL, GRAPH_FIND_IMPORTERS_TOOL, GRAPH_FIND_IMPORTS_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
+    READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
+    STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
+    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -20,6 +20,8 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_find_callees_definition(),
         graph_find_children_definition(),
         graph_find_references_definition(),
+        graph_find_imports_definition(),
+        graph_find_importers_definition(),
         graph_related_files_definition(),
         graph_explore_definition(),
         search_text_definition(),
@@ -285,6 +287,64 @@ fn graph_find_references_definition() -> ToolDefinition {
                 }
             },
             "required": ["symbolId", "symbol", "path", "limit", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_imports_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_IMPORTS_TOOL,
+        description: "List import declarations from one indexed workspace file with module-resolution status, target path/symbol when exact, candidates, and resolver provenance. Set resolved=true to keep only exact results; false returns candidate, unresolved, and external imports.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative indexed file path."
+                },
+                "resolved": {
+                    "type": ["boolean", "null"],
+                    "description": "Optional exact-resolution filter. true returns exact imports only; false excludes exact imports."
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["path", "resolved", "limit", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_importers_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_IMPORTERS_TOOL,
+        description: "Find workspace files that exactly resolve an import to the requested path. Candidate and unresolved module strings are intentionally excluded, so this is reliable reverse dependency navigation.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative indexed file or module path."
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["path", "limit", "timeoutMs"]
         }),
         strict: true,
     }

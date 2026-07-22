@@ -41,6 +41,8 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   graph_find_callees: { en: "Callees", "zh-CN": "查找被调" },
   graph_find_callers: { en: "Callers", "zh-CN": "查找调用" },
   graph_find_children: { en: "Children", "zh-CN": "查找成员" },
+  graph_find_importers: { en: "Importers", "zh-CN": "查找依赖" },
+  graph_find_imports: { en: "Imports", "zh-CN": "查找导入" },
   graph_find_references: { en: "References", "zh-CN": "查找引用" },
   graph_find_symbols: { en: "Symbols", "zh-CN": "查找符号" },
   graph_related_files: { en: "Related", "zh-CN": "相关文件" },

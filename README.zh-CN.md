@@ -221,7 +221,7 @@ Foco 会向会话运行暴露一组严格定义的内置工具：
 - 文件与搜索：`read_file`、`write_file`、`edit_file`、`find_files`、`search_text`
 - 命令与时间：`run_command`、`sleep`
 - 网页：`web_search`、`web_fetch`
-- 代码图谱：`graph_explore`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_children`、`graph_find_references`、`graph_related_files`
+- 代码图谱：`graph_explore`、`graph_find_symbols`、`graph_find_callers`、`graph_find_callees`、`graph_find_children`、`graph_find_references`、`graph_find_imports`、`graph_find_importers`、`graph_related_files`
 - 任务状态：`create_todo_graph`、`update_todo_graph`、`get_todo_graph`、`ask_question`
 - 智能体团队：`agent_list`、`agent_get_task`、`agent_send_message`、`agent_delegate_task`、`agent_cancel_task`、`agent_wait_tasks`、`agent_transfer_task`、`agent_create_instances`
 - 记忆工具会在启用记忆时由应用运行时加入。
