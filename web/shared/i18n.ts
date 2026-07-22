@@ -625,6 +625,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Context compression in progress": "上下文压缩进行中",
     "Context compression completed": "上下文压缩已完成",
     "Background running": "后台运行中",
+    Backgrounded: "已后台",
     Exited: "已退出",
     "Exited · code {code}": "已退出 · code {code}",
     Stopped: "已停止",

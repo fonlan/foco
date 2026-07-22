@@ -1623,9 +1623,12 @@ describe("app-shell verification surfaces", () => {
   it("renders managed command lifecycle, incremental chunks, and raw protocol fields", async () => {
     const managedCommandMessages = JSON.parse(JSON.stringify(chatMessages));
     const assistantMessage = managedCommandMessages.messages[1];
+    const processStartedAt = Date.parse("2026-07-22T04:00:00.000Z");
+    const toolCompletedAt = "2026-07-22T04:00:02.000Z";
     const backgroundStart = {
       ...assistantMessage.toolCalls[0],
       id: "tool-background-start",
+      completedAt: toolCompletedAt,
       input: {
         args: ["--watch"],
         background: true,
@@ -1640,13 +1643,15 @@ describe("app-shell verification surfaces", () => {
         nextCursor: 0,
         pid: 4242,
         processId: "process-demo",
-        startedAt: Date.now() - 2_000,
+        startedAt: processStartedAt,
         status: "running",
       },
+      status: "completed",
     };
     const outputPoll = {
       ...assistantMessage.toolCalls[0],
       id: "tool-command-output",
+      completedAt: toolCompletedAt,
       input: { cursor: 4, processId: "process-demo", timeoutMs: 10_000, waitMs: 100 },
       name: "get_command_output",
       output: {
@@ -1661,13 +1666,15 @@ describe("app-shell verification surfaces", () => {
         nextCursor: 21,
         pid: 4242,
         processId: "process-demo",
-        startedAt: Date.now() - 2_000,
+        startedAt: processStartedAt,
         status: "running",
       },
+      status: "completed",
     };
     const stoppedCommand = {
       ...assistantMessage.toolCalls[0],
       id: "tool-stop-command",
+      completedAt: toolCompletedAt,
       input: { processId: "process-demo", timeoutMs: 10_000 },
       name: "stop_command",
       output: {
@@ -1677,6 +1684,7 @@ describe("app-shell verification surfaces", () => {
         status: "stopped",
         terminationReason: "explicit_stop",
       },
+      status: "completed",
     };
     const stopRequestedCommand = {
       ...stoppedCommand,
@@ -1726,13 +1734,18 @@ describe("app-shell verification surfaces", () => {
       throw new Error("Expected both terminal and pending stop command cards");
     }
 
-    const startStatus = within(startSummary).getByText("Background running");
-    expect(startStatus).toHaveClass("bg-amber-50", "text-amber-800");
+    const startStatus = within(startSummary).getByText("Backgrounded");
+    expect(startStatus).toHaveClass("bg-emerald-50", "text-emerald-700");
     expect(outputSummary).toHaveTextContent("Background running");
     expect(stopSummary).toHaveTextContent("Stopped");
 
     await userEvent.click(startSummary);
     expect(await screen.findByText("Background process started, no output yet")).toBeInTheDocument();
+    const startBubble = startSummary.closest(".tool-call-block") as HTMLElement | null;
+    if (!startBubble) {
+      throw new Error("Expected background start tool block");
+    }
+    expect(within(startBubble).getAllByText("2.0s")).not.toHaveLength(0);
 
     await userEvent.click(outputSummary);
     expect(await screen.findByText("Earlier output was removed from the retained buffer.")).toBeInTheDocument();
@@ -1740,6 +1753,11 @@ describe("app-shell verification surfaces", () => {
     expect(await screen.findByText("ready")).toBeInTheDocument();
     expect(await screen.findByText("warning")).toBeInTheDocument();
     expect(await screen.findByText(/More output is available; continue with nextCursor 21/)).toBeInTheDocument();
+    const outputBubble = outputSummary.closest(".tool-call-block") as HTMLElement | null;
+    if (!outputBubble) {
+      throw new Error("Expected managed command tool block");
+    }
+    expect(within(outputBubble).getAllByText("2.0s")).not.toHaveLength(0);
 
     await userEvent.click(stopSummary);
     expect(await screen.findByText("Entire process tree terminated")).toBeInTheDocument();
@@ -1747,10 +1765,6 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(stopRequestedSummary);
     expect(await screen.findByText("Process tree termination requested")).toBeInTheDocument();
 
-    const outputBubble = outputSummary.closest(".tool-call-block") as HTMLElement | null;
-    if (!outputBubble) {
-      throw new Error("Expected managed command tool block");
-    }
     await userEvent.click(within(outputBubble).getByRole("button", { name: "Raw" }));
     expect(within(outputBubble).getByText("Input")).toBeInTheDocument();
     expect(
@@ -1762,6 +1776,7 @@ describe("app-shell verification surfaces", () => {
     await userEvent.click(within(outputBubble).getByRole("button", { name: "Compact" }));
     expect(within(outputBubble).getAllByText("Background running")).not.toHaveLength(0);
     expect(within(outputBubble).getByText("cursor 20–21")).toBeInTheDocument();
+    expect(within(outputBubble).getAllByText("2.0s")).not.toHaveLength(0);
     expect(outputBubble.querySelector(".tool-call-scroll")).not.toBeNull();
   });
 

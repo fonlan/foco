@@ -2987,6 +2987,8 @@ type ManagedCommandPresentation = {
   startedAt: number | null;
   status: string | null;
   terminationReason: string | null;
+  toolCompletedAt: number | null;
+  toolIsActive: boolean;
 };
 
 function managedCommandPresentation(
@@ -3048,6 +3050,8 @@ function managedCommandPresentation(
     startedAt: timestampMilliseconds(output?.startedAt),
     status: nonEmptyText(output?.status),
     terminationReason: nonEmptyText(output?.terminationReason),
+    toolCompletedAt: timestampMilliseconds(toolCall.completedAt),
+    toolIsActive: !toolCall.isError && toolCall.status !== "completed",
   };
 }
 
@@ -3066,14 +3070,30 @@ function timestampMilliseconds(value: unknown) {
   return null;
 }
 
-function managedCommandDuration(
-  startedAt: number | null,
-  endedAt: number | null,
+function managedCommandDurationEndAt(
+  presentation: ManagedCommandPresentation,
 ) {
-  if (startedAt === null) {
+  if (presentation.endedAt !== null) {
+    return presentation.endedAt;
+  }
+  if (presentation.toolCompletedAt !== null) {
+    return presentation.toolCompletedAt;
+  }
+  if (presentation.toolIsActive) {
+    return Date.now();
+  }
+  return null;
+}
+
+function managedCommandDuration(presentation: ManagedCommandPresentation) {
+  if (presentation.startedAt === null) {
     return null;
   }
-  const elapsed = Math.max(0, (endedAt ?? Date.now()) - startedAt);
+  const endedAt = managedCommandDurationEndAt(presentation);
+  if (endedAt === null) {
+    return null;
+  }
+  const elapsed = Math.max(0, endedAt - presentation.startedAt);
   if (elapsed < 1_000) {
     return `${elapsed}ms`;
   }
@@ -3089,7 +3109,9 @@ function managedCommandStatusLabel(
 ) {
   switch (presentation.status) {
     case "running":
-      return t("Background running");
+      return presentation.isBackgroundStart
+        ? t("Backgrounded")
+        : t("Background running");
     case "exited":
       return presentation.exitCode === null
         ? t("Exited")
@@ -3105,8 +3127,11 @@ function managedCommandStatusLabel(
   }
 }
 
-function managedCommandStatusClass(status: string | null) {
-  switch (status) {
+function managedCommandStatusClass(presentation: ManagedCommandPresentation) {
+  if (presentation.status === "running" && presentation.isBackgroundStart) {
+    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+  }
+  switch (presentation.status) {
     case "running":
       return "border-amber-200 bg-amber-50 text-amber-800";
     case "exited":
@@ -3160,10 +3185,7 @@ function ManagedCommandSummary({
   t: Translate;
 }) {
   const statusLabel = managedCommandStatusLabel(presentation, t);
-  const duration = managedCommandDuration(
-    presentation.startedAt,
-    presentation.endedAt,
-  );
+  const duration = managedCommandDuration(presentation);
   const cursorRangeStart = presentation.cursorExpired
     ? (presentation.availableFromCursor ?? presentation.fromCursor)
     : presentation.fromCursor;
@@ -3179,7 +3201,7 @@ function ManagedCommandSummary({
   return (
     <div className="grid min-w-0 gap-2">
       <div
-        className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation.status)}`}
+        className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation)}`}
       >
         {statusLabel ? (
           <span className="font-semibold">{statusLabel}</span>
@@ -3639,7 +3661,7 @@ function ToolCallBlock({
   const summaryStatusClass = toolCall.isError
     ? "bg-rose-50 text-rose-700"
     : managedCommand && managedStatusLabel
-      ? managedCommandStatusClass(managedCommand.status)
+      ? managedCommandStatusClass(managedCommand)
       : toolCall.status === "completed"
         ? "bg-emerald-50 text-emerald-700"
         : "bg-stone-100 text-stone-600";
