@@ -759,7 +759,7 @@ fn create_plan_definition() -> ToolDefinition {
 fn get_plans_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_PLANS_TOOL,
-        description: "Read workspace plans from the Plan panel store. Use view active for the right panel and view all for history.",
+        description: "Read workspace plans from the Plan panel store. Use view active for the right panel and view all for history. When offset is non-null, it takes precedence over page for this read; continue only with the returned nextOffset while keeping view and status unchanged. Offset is not a database index or stable snapshot cursor.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

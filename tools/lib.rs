@@ -2394,6 +2394,18 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|value| value == "offset"))
         );
+        assert!(
+            definition
+                .description
+                .contains("takes precedence over page")
+        );
+        assert!(definition.description.contains("returned nextOffset"));
+        assert!(definition.description.contains("view and status unchanged"));
+        assert!(
+            definition
+                .description
+                .contains("not a database index or stable snapshot cursor")
+        );
     }
 
     #[test]
