@@ -39,8 +39,9 @@ use foco_providers::{
     NeutralChatStreamEvent, NeutralToolCall, NeutralToolDefinition, NeutralUsage,
     OpenAiRespWsSessionKey, ProviderAuditRequestDump, ProviderConfigError,
     ProviderRequestDumpObserver, ProviderRequestFailure, ProviderWireRequestDump,
-    ProviderWsSessionContext, WebSearchMode, recover_model_json_from_text,
-    stream_chat_with_capture_observer_runtime_options,
+    ProviderWsSessionContext, WebSearchMode, WebSearchRoute, WebSearchRouteInput,
+    recover_model_json_from_text, resolve_web_search_route,
+    stream_chat_with_capture_observer_runtime_options, upstream_provider_model_id,
 };
 use foco_store::{
     config::{
@@ -126,7 +127,8 @@ use crate::{
         environment_context_message, insert_context_compression_snapshot_record,
         llm_context_compression_trigger_source, llm_context_compression_trigger_tokens,
         pack_neutral_messages, plan_llm_context_compression, plan_mode_builtin_tool_allowed,
-        prepare_context_compression_snapshot, record_chat_completion_input_tokens,
+        prepare_context_compression_snapshot, provider_native_web_search_tool_definition,
+        record_chat_completion_input_tokens, resolve_web_search_route_for_turn,
         should_trigger_normal_llm_context_compression, tool_prompt_infos,
         truncate_workspace_spec_markdown_for_prompt,
     },
@@ -8042,7 +8044,11 @@ async fn broker_remote_tool_discovery(
         method: None,
         payload: json!({
             "status": "ok",
+            // Host function-path availability only (enabled + fallback key).
+            // Provider-native search is decided on the sidecar from the runtime bundle.
             "webSearchAvailable": crate::runtime::web_search_enabled(&config.web_search),
+            "webSearchEnabled": config.web_search.enabled,
+            "webSearchFallbackAvailable": config.web_search.fallback_available(),
             "applyPatchAvailable": apply_patch_available,
             "mcpTools": mcp_tools,
         }),
@@ -11836,10 +11842,22 @@ async fn remote_sidecar_broker_tool_discovery(
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
     Ok(RemoteBrokerToolDiscovery {
+        // Prefer explicit fields; fall back to legacy webSearchAvailable bool.
         web_search_function_available: response
             .payload
             .get("webSearchAvailable")
             .and_then(Value::as_bool)
+            .or_else(|| {
+                let enabled = response
+                    .payload
+                    .get("webSearchEnabled")
+                    .and_then(Value::as_bool)?;
+                let fallback = response
+                    .payload
+                    .get("webSearchFallbackAvailable")
+                    .and_then(Value::as_bool)?;
+                Some(enabled && fallback)
+            })
             .unwrap_or(false),
         apply_patch_available: response
             .payload
@@ -11902,6 +11920,7 @@ async fn remote_sidecar_tool_catalog_for_model(
         workspace_mcp_registry,
         &state.workspace_id,
         remote_sidecar_ripgrep_available().await,
+        model_id,
     )
     .await)
 }
@@ -11921,6 +11940,7 @@ async fn build_remote_tool_catalog(
     workspace_mcp_registry: Arc<McpRegistry>,
     workspace_id: &str,
     ripgrep_available: bool,
+    model_id: Option<&str>,
 ) -> Arc<RemoteToolCatalog> {
     let mut workspace_mcp_tools = workspace_mcp_registry.tool_definitions(workspace_id).await;
     workspace_mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -11928,16 +11948,34 @@ async fn build_remote_tool_catalog(
     local_mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
 
     let plan_mode = session_mode == Some("plan");
-    // Host discovery reports whether the Foco function web_search path can execute
-    // (master switch + active Tavily/Brave key). Provider-native search is not a
-    // sidecar-executable tool and is not added to the remote runtime catalog/routes.
-    let mut builtin_tools = builtin_tool_definitions_for_runtime(
-        ripgrep_available,
-        discovery.web_search_function_available,
-    )
-    .into_iter()
-    .filter(|tool| !tool.name.starts_with("agent_"))
-    .collect::<Vec<_>>();
+    // Resolve dual-route web search when model + bundle are available.
+    // Only FocoFunction registers an executable broker route for web_search.
+    // ProviderNative is injected into provider_request.tools later and never enters routes.
+    let web_search_route = match (bundle, model_id) {
+        (Some(bundle), Some(model_id)) => remote_sidecar_resolve_web_search_route(bundle, model_id),
+        _ => {
+            // Without model context, only host function-path availability can expose web_search.
+            if discovery.web_search_function_available
+                || bundle
+                    .map(|bundle| bundle.payload.web_search.function_path_available())
+                    .unwrap_or(false)
+            {
+                WebSearchRoute::FocoFunction
+            } else {
+                WebSearchRoute::Disabled
+            }
+        }
+    };
+    let web_search_function_available = matches!(web_search_route, WebSearchRoute::FocoFunction)
+        && (discovery.web_search_function_available
+            || bundle
+                .map(|bundle| bundle.payload.web_search.function_path_available())
+                .unwrap_or(false));
+    let mut builtin_tools =
+        builtin_tool_definitions_for_runtime(ripgrep_available, web_search_function_available)
+            .into_iter()
+            .filter(|tool| !tool.name.starts_with("agent_"))
+            .collect::<Vec<_>>();
     if !discovery.apply_patch_available {
         builtin_tools.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
     }
@@ -11987,6 +12025,106 @@ async fn build_remote_tool_catalog(
         memory_prompt_tools: memory_tools,
         mcp_prompt_tools,
     })
+}
+
+/// Resolve the web-search route for a remote turn from the secret-free runtime bundle.
+///
+/// Matches local `resolve_web_search_route_for_turn` semantics for the same model/provider
+/// configuration. Provider API keys and Tavily/Brave keys are never required on the sidecar.
+fn remote_sidecar_resolve_web_search_route(
+    bundle: &SidecarRuntimeConfigBundle,
+    model_id: &str,
+) -> WebSearchRoute {
+    let model = bundle
+        .payload
+        .models
+        .iter()
+        .find(|model| model.id == model_id);
+    let Some(model) = model else {
+        return WebSearchRoute::Disabled;
+    };
+    let provider = model.active_provider_id.as_deref().and_then(|provider_id| {
+        bundle
+            .payload
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+    });
+    let Some(provider) = provider else {
+        // No active provider route: only function path can still apply when mode allows it.
+        return resolve_web_search_route(WebSearchRouteInput {
+            enabled: bundle.payload.web_search.enabled,
+            fallback_available: bundle.payload.web_search.fallback_available,
+            provider_kind: None,
+            upstream_model_id: model_id,
+            mode: model.web_search_mode,
+        });
+    };
+    let provider_kind = foco_providers::parse_provider_kind(&provider.kind).ok();
+    let upstream_model_id = provider_kind
+        .and_then(|_| upstream_provider_model_id(model_id, &provider.model_redirects).ok())
+        .unwrap_or(model_id);
+    resolve_web_search_route(WebSearchRouteInput {
+        enabled: bundle.payload.web_search.enabled,
+        fallback_available: bundle.payload.web_search.fallback_available,
+        provider_kind,
+        upstream_model_id,
+        mode: model.web_search_mode,
+    })
+}
+
+/// Apply dual-route web search to a remote provider request.
+///
+/// - **ProviderNative**: inject native capability into `provider_request.tools` only;
+///   remove any executable function `web_search` from tools (catalog still may list it
+///   for broker discovery, but the model must not see both).
+/// - **FocoFunction**: keep function tool if present in catalog tools.
+/// - **Disabled**: strip any `web_search` tool from the provider request.
+fn remote_sidecar_apply_web_search_route(
+    mut request: NeutralChatRequest,
+    route: WebSearchRoute,
+) -> NeutralChatRequest {
+    match route {
+        WebSearchRoute::ProviderNative => {
+            request
+                .tools
+                .retain(|tool| tool.name != foco_tools::WEB_SEARCH_TOOL);
+            request
+                .tools
+                .push(provider_native_web_search_tool_definition());
+        }
+        WebSearchRoute::FocoFunction => {
+            // Catalog already includes function web_search when host/bundle allows it.
+            // Ensure no accidental native kind remains.
+            request.tools.retain(|tool| {
+                tool.name != foco_tools::WEB_SEARCH_TOOL
+                    || tool.kind == foco_providers::NeutralToolKind::Function
+            });
+            if !request
+                .tools
+                .iter()
+                .any(|tool| tool.name == foco_tools::WEB_SEARCH_TOOL)
+            {
+                // Function path selected but catalog omitted the tool (e.g. discovery lag).
+                // Do not invent a function tool without host execution capability.
+            }
+        }
+        WebSearchRoute::Disabled => {
+            request
+                .tools
+                .retain(|tool| tool.name != foco_tools::WEB_SEARCH_TOOL);
+        }
+    }
+    debug_assert!(
+        request
+            .tools
+            .iter()
+            .filter(|tool| tool.name == foco_tools::WEB_SEARCH_TOOL)
+            .count()
+            <= 1,
+        "remote provider_request.tools must expose at most one web_search"
+    );
+    request
 }
 
 #[derive(Clone)]
@@ -12993,6 +13131,20 @@ fn remote_sidecar_finish_prepared_context(
     skill_read_root_dirs: Vec<PathBuf>,
     attachment_read_allowlist: Vec<PathBuf>,
 ) -> Result<RemotePreparedChatContext, axum::response::Response> {
+    // Apply dual-route web search after catalog tools are assembled so ProviderNative
+    // is injected into provider_request.tools only (never into executable catalog routes).
+    let provider_request = {
+        let route = state
+            .runtime_config
+            .lock()
+            .ok()
+            .and_then(|config| config.clone())
+            .map(|bundle| {
+                remote_sidecar_resolve_web_search_route(&bundle, &provider_request.model_id)
+            })
+            .unwrap_or(WebSearchRoute::Disabled);
+        remote_sidecar_apply_web_search_route(provider_request, route)
+    };
     let context_budget = remote_sidecar_context_budget_for_request(state, &provider_request)
         .map_err(|e| e.into_response())?;
     Ok(RemotePreparedChatContext {
@@ -37110,6 +37262,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         (state, catalog)
@@ -37989,6 +38142,7 @@ mod tests {
             workspace_registry,
             "workspace",
             false,
+            None,
         )
         .await;
 
@@ -38063,6 +38217,7 @@ mod tests {
             workspace_registry.clone(),
             "workspace",
             false,
+            None,
         )
         .await;
         assert!(normal.allows("apply_patch"));
@@ -38101,6 +38256,7 @@ mod tests {
             workspace_registry,
             "workspace",
             false,
+            None,
         )
         .await;
         assert!(plan.tools.iter().all(|tool| {
@@ -38139,12 +38295,184 @@ mod tests {
             Arc::new(McpRegistry::default()),
             "workspace",
             false,
+            None,
         )
         .await;
         assert!(!disabled.allows("memory_search"));
         assert!(!disabled.allows("memory_write"));
         assert!(!disabled.allows("web_search"));
         assert!(disabled.allows("web_fetch"));
+    }
+
+    #[test]
+    fn remote_sidecar_web_search_route_matches_local_matrix() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.web_search.enabled = true;
+        config.web_search.tavily_api_key = Some("tvly-test".to_string());
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "openai-resp".to_string(),
+            name: "OpenAI Responses".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: Some("provider-secret".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: Default::default(),
+        });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "gpt-4o".to_string(),
+            display_name: "GPT-4o".to_string(),
+            enabled: true,
+            provider_ids: vec!["openai-resp".to_string()],
+            active_provider_id: Some("openai-resp".to_string()),
+            thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
+            system_prompt_name: "Default".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        let json = serde_json::to_string(&bundle).expect("bundle json");
+        assert!(!json.contains("tvly-test"));
+        assert!(!json.contains("provider-secret"));
+
+        let provider = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai-resp")
+            .expect("provider");
+        let model = config
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-4o")
+            .expect("model");
+        let local = resolve_web_search_route_for_turn(
+            &config.web_search,
+            model.web_search_mode,
+            provider,
+            &model.id,
+        );
+        let remote = remote_sidecar_resolve_web_search_route(&bundle, "gpt-4o");
+        assert_eq!(local, remote);
+        assert_eq!(remote, WebSearchRoute::ProviderNative);
+
+        // Function mode with fallback key.
+        let mut function_config = config.clone();
+        function_config.models[0].web_search_mode = WebSearchMode::Function;
+        let function_bundle =
+            build_sidecar_runtime_config_bundle(workspace.path(), &function_config, 2)
+                .expect("function bundle");
+        assert_eq!(
+            remote_sidecar_resolve_web_search_route(&function_bundle, "gpt-4o"),
+            WebSearchRoute::FocoFunction
+        );
+
+        // Native without function key still works.
+        let mut native_only = config.clone();
+        native_only.web_search.tavily_api_key = None;
+        native_only.web_search.brave_api_key = None;
+        native_only.models[0].web_search_mode = WebSearchMode::Native;
+        let native_bundle = build_sidecar_runtime_config_bundle(workspace.path(), &native_only, 3)
+            .expect("native bundle");
+        assert!(!native_bundle.payload.web_search.fallback_available);
+        assert_eq!(
+            remote_sidecar_resolve_web_search_route(&native_bundle, "gpt-4o"),
+            WebSearchRoute::ProviderNative
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_tool_catalog_omits_broker_web_search_for_provider_native() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.web_search.enabled = true;
+        // No Tavily/Brave key: function path unavailable; native still works.
+        config.web_search.tavily_api_key = None;
+        config.providers.push(foco_store::config::ProviderSettings {
+            id: "openai-resp".to_string(),
+            name: "OpenAI Responses".to_string(),
+            kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: Some("provider-secret".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+            api_proxy: Default::default(),
+        });
+        config.models.push(foco_store::config::ModelSettings {
+            id: "gpt-4o".to_string(),
+            display_name: "GPT-4o".to_string(),
+            enabled: true,
+            provider_ids: vec!["openai-resp".to_string()],
+            active_provider_id: Some("openai-resp".to_string()),
+            thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
+            system_prompt_name: "Default".to_string(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: None,
+            input_modalities: vec!["text".to_string()],
+            output_modalities: vec!["text".to_string()],
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        let catalog = build_remote_tool_catalog(
+            Some(&bundle),
+            None,
+            RemoteBrokerToolDiscovery {
+                web_search_function_available: false,
+                apply_patch_available: false,
+                local_mcp_tools: Vec::new(),
+            },
+            Arc::new(McpRegistry::default()),
+            "workspace",
+            false,
+            Some("gpt-4o"),
+        )
+        .await;
+        assert!(
+            !catalog.allows("web_search"),
+            "ProviderNative must not register broker web_search"
+        );
+
+        let request = remote_sidecar_apply_web_search_route(
+            NeutralChatRequest {
+                model_id: "gpt-4o".to_string(),
+                messages: Vec::new(),
+                tools: catalog.tools.clone(),
+                thinking_level: None,
+                max_output_tokens: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::Auto,
+            },
+            WebSearchRoute::ProviderNative,
+        );
+        let web_search_tools: Vec<_> = request
+            .tools
+            .iter()
+            .filter(|tool| tool.name == "web_search")
+            .collect();
+        assert_eq!(web_search_tools.len(), 1);
+        assert_eq!(
+            web_search_tools[0].kind,
+            foco_providers::NeutralToolKind::ProviderWebSearch
+        );
     }
 
     #[tokio::test]
@@ -38180,6 +38508,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let cases = [
@@ -38282,6 +38611,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let bytes = b"\x89PNG\r\n\x1a\nremote-image";
@@ -38363,6 +38693,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let body = "cached line 1\ncached line 2\n";
@@ -38609,6 +38940,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let body = "isolated cache line 1\nisolated cache line 2\n";
@@ -38697,6 +39029,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let execution_state = state.clone();
@@ -38873,6 +39206,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         for (call_id, scope) in [
@@ -39004,6 +39338,7 @@ mod tests {
             Arc::new(McpRegistry::default()),
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let (hidden_output, hidden_is_error, _, _) = test_execute_remote_sidecar_local_tool(
@@ -39059,6 +39394,7 @@ mod tests {
             workspace_registry,
             &state.workspace_id,
             false,
+            None,
         )
         .await;
         let (mcp_output, mcp_is_error, _, _) = test_execute_remote_sidecar_local_tool(

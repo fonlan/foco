@@ -1253,6 +1253,7 @@ export type ModelFormState = {
   inputModalities: string[];
   outputModalities: string[];
   thinkingLevel: string;
+  webSearchMode: WebSearchMode;
   systemPromptName: string;
 };
 

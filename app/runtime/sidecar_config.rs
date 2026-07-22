@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use foco_providers::ProviderModelRedirect;
 use foco_store::config::{
     AgentDefinitionSettings, GlobalConfig, HookConfig, McpConfig, MemorySettings, ModelSettings,
-    PlanSettings, PromptSettings, SKILL_SCOPE_GLOBAL, SpecSettings,
+    PlanSettings, PromptSettings, SKILL_SCOPE_GLOBAL, SpecSettings, WebSearchSettings,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -59,6 +60,14 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) agent_definitions: Vec<AgentDefinitionSettings>,
     pub(crate) prompts: PromptSettings,
     pub(crate) models: Vec<ModelSettings>,
+    /// Provider routing metadata for remote web-search / model resolution.
+    ///
+    /// Secrets (`api_key`) are never included. Sidecar uses kind + redirects only.
+    #[serde(default)]
+    pub(crate) providers: Vec<SidecarRuntimeProviderRoute>,
+    /// Web search master switch + fallback availability (no Tavily/Brave API keys).
+    #[serde(default)]
+    pub(crate) web_search: SidecarRuntimeWebSearchSettings,
     #[serde(default)]
     pub(crate) hooks: HookConfig,
     pub(crate) mcp: McpConfig,
@@ -75,6 +84,61 @@ pub(crate) struct SidecarRuntimeConfigPayload {
     pub(crate) required_disabled_skill_keys: Vec<String>,
     #[serde(default)]
     pub(crate) selected_skills: Vec<SidecarRuntimeSkillContent>,
+}
+
+/// Secret-free provider route snapshot for remote prompt assembly.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarRuntimeProviderRoute {
+    pub(crate) id: String,
+    pub(crate) kind: String,
+    pub(crate) enabled: bool,
+    #[serde(default)]
+    pub(crate) model_redirects: Vec<ProviderModelRedirect>,
+}
+
+/// Secret-free web search settings for remote route resolution.
+///
+/// `fallback_available` is computed on the host from the active Tavily/Brave key presence.
+/// Keys themselves never leave the main process.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SidecarRuntimeWebSearchSettings {
+    #[serde(default)]
+    pub(crate) enabled: bool,
+    /// Whether the host can execute the Foco function web_search path (active fallback key present).
+    #[serde(default)]
+    pub(crate) fallback_available: bool,
+    #[serde(default)]
+    pub(crate) active_provider: String,
+}
+
+impl SidecarRuntimeWebSearchSettings {
+    pub(crate) fn from_settings(settings: &WebSearchSettings) -> Self {
+        Self {
+            enabled: settings.enabled,
+            fallback_available: settings.fallback_available(),
+            active_provider: settings.active_provider.clone(),
+        }
+    }
+
+    /// Host can broker the Foco function `web_search` tool (master switch + fallback key).
+    pub(crate) fn function_path_available(&self) -> bool {
+        self.enabled && self.fallback_available
+    }
+}
+
+fn sidecar_provider_routes(config: &GlobalConfig) -> Vec<SidecarRuntimeProviderRoute> {
+    config
+        .providers
+        .iter()
+        .map(|provider| SidecarRuntimeProviderRoute {
+            id: provider.id.clone(),
+            kind: provider.kind.clone(),
+            enabled: provider.enabled,
+            model_redirects: provider.model_redirects.clone(),
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -125,6 +189,8 @@ pub(crate) fn build_sidecar_runtime_config_bundle(
         agent_definitions: config.agent_definitions.clone(),
         prompts: config.prompts.clone(),
         models: config.models.clone(),
+        providers: sidecar_provider_routes(config),
+        web_search: SidecarRuntimeWebSearchSettings::from_settings(&config.web_search),
         hooks: config.hooks.clone(),
         mcp: sidecar_mcp_config(&config.mcp),
         memory: config.memory.clone(),
@@ -260,7 +326,81 @@ mod tests {
         assert_eq!(bundle.config_generation, 7);
         assert!(bundle.hash.starts_with("sha256:"));
         assert!(!json.contains("secret-key"));
-        assert!(!json.contains("providers"));
+        // Provider routes are synced for remote web-search / model resolution, but never with secrets.
+        assert_eq!(bundle.payload.providers.len(), 1);
+        assert_eq!(bundle.payload.providers[0].id, "openai");
+        assert_eq!(bundle.payload.providers[0].kind, "openai");
+        assert!(!json.contains("apiKey") && !json.contains("api_key"));
+        assert!(!json.contains("tavily") || !json.contains("tvly-"));
+    }
+
+    #[test]
+    fn sidecar_runtime_bundle_syncs_web_search_route_metadata_without_keys() {
+        let profile = tempfile::tempdir().expect("profile");
+        let workspace = tempfile::tempdir().expect("workspace");
+        let mut config = GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.web_search.enabled = true;
+        config.web_search.tavily_api_key = Some("tvly-secret-key".to_string());
+        config.web_search.active_provider = "tavily".to_string();
+        config.providers.push(ProviderSettings {
+            id: "openai-resp".to_string(),
+            name: "OpenAI Responses".to_string(),
+            kind: "openai-responses".to_string(),
+            enabled: true,
+            base_url: None,
+            api_key: Some("provider-secret".to_string()),
+            auto_sync_models: false,
+            model_sync_filter_regex: None,
+            request_overrides: Vec::new(),
+            model_redirects: vec![ProviderModelRedirect {
+                from: "gpt-local".to_string(),
+                to: "gpt-4o".to_string(),
+            }],
+            api_proxy: Default::default(),
+        });
+        if let Some(model) = config.models.first_mut() {
+            model.web_search_mode = foco_providers::WebSearchMode::Native;
+            model.active_provider_id = Some("openai-resp".to_string());
+        } else {
+            config.models.push(ModelSettings {
+                id: "gpt-4o".to_string(),
+                display_name: "GPT-4o".to_string(),
+                enabled: true,
+                provider_ids: vec!["openai-resp".to_string()],
+                active_provider_id: Some("openai-resp".to_string()),
+                thinking_level: None,
+                web_search_mode: foco_providers::WebSearchMode::Native,
+                system_prompt_name: "Default".to_string(),
+                metadata_key: None,
+                metadata_source_url: None,
+                metadata_refreshed_at: None,
+                limits: None,
+                input_modalities: vec!["text".to_string()],
+                output_modalities: vec!["text".to_string()],
+            });
+        }
+
+        let bundle =
+            build_sidecar_runtime_config_bundle(profile.path(), &config, 3).expect("bundle");
+        let json = serde_json::to_string(&bundle).expect("bundle json");
+
+        assert!(bundle.payload.web_search.enabled);
+        assert!(bundle.payload.web_search.fallback_available);
+        assert_eq!(bundle.payload.web_search.active_provider, "tavily");
+        assert!(!json.contains("tvly-secret-key"));
+        assert!(!json.contains("provider-secret"));
+        let provider = bundle
+            .payload
+            .providers
+            .iter()
+            .find(|provider| provider.id == "openai-resp")
+            .expect("provider route");
+        assert_eq!(provider.kind, "openai-responses");
+        assert_eq!(provider.model_redirects.len(), 1);
+        assert_eq!(
+            bundle.payload.models[0].web_search_mode,
+            foco_providers::WebSearchMode::Native
+        );
     }
 
     #[test]

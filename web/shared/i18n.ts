@@ -1370,9 +1370,29 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Reload general settings": "重新加载常规设置",
     "Web search": "Web 搜索",
     "Runtime tool": "运行时工具",
+    "Allow web search for chat runs": "允许聊天运行使用联网搜索",
     "Expose web_search to chat runs": "向聊天运行暴露 web_search",
+    "Master switch for online search. Models with confirmed native search use the provider; others can fall back to Tavily/Brave when a key is configured.":
+      "联网搜索总开关。已确认原生搜索能力的模型走供应商原生；未知能力可在配置 Key 后回退到 Tavily/Brave。",
     "web_fetch is available for known URLs; web_search requires an enabled search API.":
       "web_fetch 可用于已知 URL；web_search 需要启用搜索 API。",
+    "Tavily and Brave are function-path fallbacks for models without confirmed native search. Enabling the master switch does not require a search API key.":
+      "Tavily / Brave 是无确认原生搜索能力模型的 function 兜底。开启总开关不要求填写搜索 API Key。",
+    "Function fallback: available": "Function 兜底：可用",
+    "Function fallback: no API key for active provider":
+      "Function 兜底：当前搜索 API 未配置 Key",
+    "Web search mode": "Web 搜索模式",
+    "Auto (native when confirmed)": "自动（确认原生时优先）",
+    "Native only": "仅原生",
+    "Function fallback only": "仅 Function 兜底",
+    "Disabled for this model": "此模型禁用",
+    "Auto prefers confirmed provider-native search; unknown capability falls back to Tavily/Brave when available.":
+      "自动模式仅在确认原生能力时使用供应商搜索；未知能力在可用时回退到 Tavily/Brave。",
+    "Global web search is on. Function fallback key is configured.":
+      "全局联网搜索已开启，Function 兜底 Key 已配置。",
+    "Global web search is on. Function fallback key is not configured.":
+      "全局联网搜索已开启，Function 兜底 Key 未配置。",
+    "Global web search master switch is off.": "全局联网搜索总开关已关闭。",
     "Search API": "搜索 API",
     "API token": "API token",
     saved: "已保存",

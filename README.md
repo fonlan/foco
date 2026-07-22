@@ -221,6 +221,10 @@ Foco exposes a strict set of built-in tools to chat runs:
 - Files and search: `read_file`, `write_file`, `edit_file`, `find_files`, `search_text`
 - Commands and timing: `run_command`, `sleep`
 - Web: `web_search`, `web_fetch`
+  - `web_search` dual-route: global `web_search.enabled` master switch; per-model `webSearchMode` (`auto`/`native`/`function`/`disabled`, default `auto`)
+  - Confirmed provider-native search (e.g. OpenAI Responses / xAI Responses) is preferred; otherwise Tavily/Brave function fallback when a key is configured
+  - Same turn exposes at most one search tool; Tavily/Brave keys stay on the host (or broker) and are never sent to model providers
+  - Enabling the master switch does **not** require a search API key (native-only setups are valid)
 - Code graph: `graph_explore`, `graph_find_symbols`, `graph_find_callers`, `graph_find_callees`, `graph_find_children`, `graph_find_references`, `graph_find_imports`, `graph_find_importers`, `graph_related_files`
 - Task state: `create_todo_graph`, `update_todo_graph`, `get_todo_graph`, `ask_question`
 - Agent teams: `agent_list`, `agent_get_task`, `agent_send_message`, `agent_delegate_task`, `agent_cancel_task`, `agent_wait_tasks`, `agent_transfer_task`, `agent_create_instances`

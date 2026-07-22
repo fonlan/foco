@@ -176,6 +176,7 @@ export const settings = {
       supportedThinkingLevels: ["low", "high"],
       systemPromptName: "Default",
       thinkingLevel: null,
+      webSearchMode: "auto",
       warnings: [],
     },
   ] as ConfiguredModelSummary[],
@@ -260,6 +261,7 @@ export const settings = {
   },
   webSearch: {
     enabled: false,
+    fallbackAvailable: false,
     activeProvider: "tavily",
     providers: [
       { provider: "tavily", label: "Tavily", hasApiKey: false },
