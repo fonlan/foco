@@ -1702,11 +1702,12 @@ impl RemoteWorkspaceManager {
                 .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
             match sessions.get(key) {
                 Some(existing)
-                    if existing.matches_expected_identity(
-                        server_id,
-                        workspace_id,
-                        expected_identity,
-                    ) =>
+                    if existing.is_reusable_for_proxy()
+                        && existing.matches_expected_identity(
+                            server_id,
+                            workspace_id,
+                            expected_identity,
+                        ) =>
                 {
                     self.set_status(
                         server_id,
@@ -2141,6 +2142,20 @@ impl RemoteWorkspaceManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_fake_session_state_for_test(
+        &self,
+        server_id: &str,
+        workspace_id: &str,
+        state: RemoteConnectionState,
+    ) {
+        let sessions = self.sessions.lock().expect("remote sessions");
+        let session = sessions
+            .get(&session_key(server_id, workspace_id))
+            .expect("fake remote session");
+        set_session_status(&session.status, state, None);
+    }
+
+    #[cfg(test)]
     pub(crate) fn remove_fake_session_for_test(&self, workspace_id: &str) {
         let mut sessions = self.sessions.lock().expect("remote sessions");
         sessions.retain(|_, session| session.workspace_id != workspace_id);
@@ -2317,6 +2332,23 @@ struct RemoteWorkspaceSession {
 }
 
 impl RemoteWorkspaceSession {
+    /// A session may only serve or bypass a reconnect when every live component has
+    /// reported the ready state. Identity alone cannot prove that its SSH tunnel and
+    /// local forward are still usable.
+    fn is_reusable_for_proxy(&self) -> bool {
+        if self.status_snapshot().state != RemoteConnectionState::Ready {
+            return false;
+        }
+
+        // Avoid waiting behind teardown while deciding whether to route a request. A
+        // missing SSH handle is used by lightweight test sessions; production sessions
+        // set Disconnected before taking it during stop().
+        let Ok(ssh) = self.ssh.try_lock() else {
+            return false;
+        };
+        ssh.as_deref().is_none_or(|session| !session.is_closed())
+    }
+
     fn matches_expected_identity(
         &self,
         server_id: &str,
@@ -8278,9 +8310,9 @@ pub(crate) async fn ensure_remote_workspace_connected(
         return Ok(());
     };
 
-    // Proxy hot path: reuse an already-connected session without SSH probing when
-    // its identity still matches (or expected identity cannot be resolved yet).
-    // Stale identity still falls through to full connect/replace.
+    // Proxy hot path: reuse only a Ready session whose identity still matches (or
+    // whose expected identity cannot be resolved yet). A non-Ready session must go
+    // through full connect/replace; its map entry alone is not a usable tunnel.
     if matches!(
         sidecar_proxy_target(state, workspace_id)?,
         SidecarProxyTarget::Connected { .. }
@@ -8340,6 +8372,9 @@ async fn connected_remote_session_is_still_usable(
     let Some(session) = session else {
         return Ok(false);
     };
+    if !session.is_reusable_for_proxy() {
+        return Ok(false);
+    }
 
     let target = server
         .last_known_target
@@ -8383,7 +8418,10 @@ pub(crate) fn sidecar_proxy_target(
         .lock()
         .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
     let key = session_key(server_id, workspace_id);
-    if let Some(session) = sessions.get(&key) {
+    if let Some(session) = sessions
+        .get(&key)
+        .filter(|session| session.is_reusable_for_proxy())
+    {
         Ok(SidecarProxyTarget::Connected {
             base: format!("http://127.0.0.1:{}/", session.local_port),
             token: session.token.clone(),
@@ -21248,6 +21286,28 @@ mod tests {
         }
     }
 
+    fn test_remote_workspace_session(state: RemoteConnectionState) -> RemoteWorkspaceSession {
+        RemoteWorkspaceSession {
+            server_id: "server-a".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            remote_path: "/srv/workspace-a".to_string(),
+            sidecar_identity: test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:test"),
+            target: "linux-x64".to_string(),
+            local_port: 3211,
+            remote_port: 3211,
+            token: "test-token".to_string(),
+            started_at: "2026-07-22T00:00:00Z".to_string(),
+            ssh: AsyncMutex::new(None),
+            sidecar: AsyncMutex::new(None),
+            forward_stop: AsyncMutex::new(None),
+            forward_task: AsyncMutex::new(None),
+            control_task: AsyncMutex::new(None),
+            health_task: AsyncMutex::new(None),
+            status: Arc::new(Mutex::new(RemoteSessionStatus::new(state, None))),
+            active_runs: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     #[test]
     fn remote_merge_task_input_preserves_identity_and_execution_mode() {
         let direct = json!({
@@ -21296,6 +21356,42 @@ mod tests {
             "workspace-a",
             &identity,
         ));
+    }
+
+    #[test]
+    fn remote_workspace_session_reuse_requires_ready_status() {
+        let ready = test_remote_workspace_session(RemoteConnectionState::Ready);
+
+        assert!(ready.is_reusable_for_proxy());
+    }
+
+    #[test]
+    fn remote_workspace_session_reuse_rejects_non_ready_statuses() {
+        for state in [
+            RemoteConnectionState::Disconnected,
+            RemoteConnectionState::BrokerConnecting,
+            RemoteConnectionState::Reconnecting,
+            RemoteConnectionState::Offline,
+            RemoteConnectionState::FailedAuth,
+        ] {
+            let session = test_remote_workspace_session(state);
+
+            assert!(
+                !session.is_reusable_for_proxy(),
+                "{state:?} session must not bypass a full reconnect"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_workspace_session_reuse_rejects_ssh_state_during_teardown() {
+        let session = test_remote_workspace_session(RemoteConnectionState::Ready);
+        let _ssh = session.ssh.lock().await;
+
+        assert!(
+            !session.is_reusable_for_proxy(),
+            "a session being torn down must not bypass a full reconnect"
+        );
     }
 
     #[test]
@@ -23854,6 +23950,17 @@ mod tests {
             sidecar_proxy_target(&state, "remote").expect("connected proxy target"),
             SidecarProxyTarget::Connected { .. }
         ));
+        state
+            .remote_workspace_manager
+            .set_fake_session_state_for_test("srv", "remote", RemoteConnectionState::Reconnecting);
+        assert!(matches!(
+            sidecar_proxy_target(&state, "remote")
+                .expect("reconnecting proxy target classification"),
+            SidecarProxyTarget::Disconnected
+        ));
+        state
+            .remote_workspace_manager
+            .set_fake_session_state_for_test("srv", "remote", RemoteConnectionState::Ready);
 
         let app_listener = TcpListener::bind("127.0.0.1:0")
             .await
