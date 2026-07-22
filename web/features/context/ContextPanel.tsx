@@ -1093,7 +1093,7 @@ function ContextPlanTab({
                           className="context-memory-pin inline-flex items-center gap-1 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                           disabled={operationKey !== null}
                           onClick={() => onAction(plan.id, "retry_merge")}
-                          title={t("Clean the shared workspace, then retry merge")}
+                          title={t(planMergeRetryHint(plan))}
                           type="button"
                         >
                           {isRetryingMerge ? (
@@ -1166,7 +1166,7 @@ function ContextPlanTab({
                   {plan.errorMessage ? (
                     <div
                       className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700"
-                      title={canRetryMerge ? t("Clean the shared workspace, then retry merge") : undefined}
+                      title={canRetryMerge ? t(planMergeRetryHint(plan)) : undefined}
                     >
                       {plan.errorMessage}
                     </div>
@@ -3351,13 +3351,26 @@ function planRetryMergeOperationKey(planId: string) {
 }
 
 function planNeedsMergeRetry(plan: Plan) {
+  // Merge integration is separate from phase implementation: after all phases
+  // complete, a failed merge leaves the plan implemented with an error and no
+  // sharedMergeCommitId. Offer Retry Merge for any such state (dirty workspace,
+  // LLM merge failure, cancel/interrupt), not only the dirty-workspace message.
   const errorMessage = plan.errorMessage?.trim();
   return (
     !plan.sharedMergeCommitId?.trim() &&
     !!errorMessage &&
-    (plan.status === "implemented" || plan.status === "blocked") &&
-    errorMessage.includes("shared workspace has uncommitted changes")
+    (plan.status === "implemented" || plan.status === "blocked")
   );
+}
+
+function isDirtySharedWorkspaceMergeError(errorMessage: string | null | undefined) {
+  return (errorMessage ?? "").includes("shared workspace has uncommitted changes");
+}
+
+function planMergeRetryHint(plan: Plan) {
+  return isDirtySharedWorkspaceMergeError(plan.errorMessage)
+    ? "Clean the shared workspace, then retry merge"
+    : "Retry merging into the shared workspace";
 }
 
 function planActionLabel(action: PlanAction) {

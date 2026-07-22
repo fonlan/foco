@@ -394,6 +394,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Retry Merge": "重试合并",
     "Clean the shared workspace, then retry merge":
       "先清理共享工作区，然后重试合并",
+    "Retry merging into the shared workspace": "重试合并到共享工作区",
     Blocked: "阻塞",
     "Close retry dialog": "关闭重试弹窗",
     "Scope: this retry only": "作用域：仅本次重试",

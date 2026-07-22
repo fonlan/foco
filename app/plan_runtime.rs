@@ -588,12 +588,7 @@ async fn sync_plan_merge_task(
             };
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .await_plan_merge_retry(
-                    &target.plan_id,
-                    &target.phase_id,
-                    &message,
-                    attempt_status,
-                )
+                .await_plan_merge_retry(&target.plan_id, &target.phase_id, &message, attempt_status)
                 .map_err(ApiError::from_workspace_error)?;
             // Preserve awaiting-integration effects for a later successful merge retry.
         }
@@ -634,11 +629,7 @@ async fn dispatch_plan_merge(
         let mut database = open_workspace_database(&workspace.path)?;
         let began = if manual_retry {
             database
-                .try_begin_plan_phase_merge_retry_attempt(
-                    &plan.id,
-                    &phase.id,
-                    &merge_error.message,
-                )
+                .try_begin_plan_phase_merge_retry_attempt(&plan.id, &phase.id, &merge_error.message)
                 .map_err(ApiError::from_workspace_error)?
         } else {
             database
@@ -1009,7 +1000,10 @@ fn is_shared_head_mismatch_merge_error(error: &ApiError) -> bool {
 /// carries a durable merge error. Accepts any merge error text, not only dirty.
 fn is_plan_awaiting_merge_retry(plan: &PlanRecord) -> bool {
     plan.shared_merge_commit_id.is_none()
-        && plan.error_message.as_deref().is_some_and(|message| !message.trim().is_empty())
+        && plan
+            .error_message
+            .as_deref()
+            .is_some_and(|message| !message.trim().is_empty())
         && matches!(plan.status.as_str(), "implemented" | "merge_blocked")
 }
 

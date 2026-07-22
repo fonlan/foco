@@ -16385,10 +16385,7 @@ fn remote_sidecar_validate_plan_task_binding(
                     task.id
                 ))
             })?;
-        if !matches!(
-            attempt.trigger.as_str(),
-            "merge_auto" | "merge_retry"
-        ) {
+        if !matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry") {
             return Err(ApiError::bad_request(format!(
                 "remote Plan merge Agent task '{}' is not a merge attempt",
                 task.id
@@ -17764,11 +17761,7 @@ fn remote_sidecar_finalize_plan_merge_task(
         // Complete merge attempt + shared merge SHA without rewriting the phase
         // implementation commit_id.
         database
-            .complete_plan_merge_attempt(
-                &phase.plan_id,
-                &phase.id,
-                Some(&shared_merge_commit_id),
-            )
+            .complete_plan_merge_attempt(&phase.plan_id, &phase.id, Some(&shared_merge_commit_id))
             .map_err(ApiError::from_workspace_error)?;
         database
             .confirm_latest_completed_plan_phase_derived_effects(&phase.plan_id, &phase.id)
@@ -18139,11 +18132,7 @@ async fn remote_sidecar_dispatch_plan_merge(
             .map_err(ApiError::from_workspace_error)?;
         let began = if manual_retry {
             database
-                .try_begin_plan_phase_merge_retry_attempt(
-                    &plan.id,
-                    &phase.id,
-                    &merge_error.message,
-                )
+                .try_begin_plan_phase_merge_retry_attempt(&plan.id, &phase.id, &merge_error.message)
                 .map_err(ApiError::from_workspace_error)?
         } else {
             database
@@ -18390,13 +18379,8 @@ async fn remote_sidecar_finalize_plan_worktree(
                             .find(|phase| phase.id == worktree.phase_id)
                             .map(|phase| {
                                 phase.attempts.iter().any(|attempt| {
-                                    matches!(
-                                        attempt.trigger.as_str(),
-                                        "merge_auto" | "merge_retry"
-                                    ) && matches!(
-                                        attempt.status.as_str(),
-                                        "queued" | "running"
-                                    )
+                                    matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                                        && matches!(attempt.status.as_str(), "queued" | "running")
                                 })
                             })
                             .unwrap_or(false);
@@ -43706,13 +43690,8 @@ mod tests {
             .iter()
             .find(|attempt| attempt.trigger == "merge_auto")
             .expect("durable merge attempt");
-        let task_id = AgentTaskId::new(
-            merge_attempt
-                .agent_task_id
-                .clone()
-                .expect("merge task id"),
-        )
-        .expect("merge task id format");
+        let task_id = AgentTaskId::new(merge_attempt.agent_task_id.clone().expect("merge task id"))
+            .expect("merge task id format");
         let task = database
             .agent_task(&task_id)
             .expect("task lookup")
@@ -43783,13 +43762,8 @@ mod tests {
             .iter()
             .find(|attempt| attempt.trigger == "merge_auto")
             .expect("durable merge attempt");
-        let task_id = AgentTaskId::new(
-            merge_attempt
-                .agent_task_id
-                .clone()
-                .expect("merge task id"),
-        )
-        .expect("merge task id format");
+        let task_id = AgentTaskId::new(merge_attempt.agent_task_id.clone().expect("merge task id"))
+            .expect("merge task id format");
         let task = database
             .agent_task(&task_id)
             .expect("task lookup")
@@ -43933,13 +43907,9 @@ mod tests {
             .iter()
             .find(|attempt| attempt.trigger == "merge_auto")
             .expect("merge_auto attempt");
-        let auto_task_id = AgentTaskId::new(
-            auto_attempt
-                .agent_task_id
-                .clone()
-                .expect("auto merge task"),
-        )
-        .expect("task id");
+        let auto_task_id =
+            AgentTaskId::new(auto_attempt.agent_task_id.clone().expect("auto merge task"))
+                .expect("task id");
         let implementation_task_id = after_auto.phases[0]
             .agent_task_id
             .clone()

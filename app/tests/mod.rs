@@ -14179,16 +14179,14 @@ async fn retry_merge_after_llm_merge_failure_keeps_phase_completed_and_dispatche
     {
         let mut database =
             WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
-        let task_id =
-            foco_agent::AgentTaskId::new(first_merge_task_id.clone()).expect("task id");
+        let task_id = foco_agent::AgentTaskId::new(first_merge_task_id.clone()).expect("task id");
         let task = database
             .agent_task(&task_id)
             .expect("task lookup")
             .expect("task");
-        let attempt_id = foco_agent::AgentAttemptId::new(format!(
-            "agent-attempt-retry-after-llm-fail-merge"
-        ))
-        .expect("attempt id");
+        let attempt_id =
+            foco_agent::AgentAttemptId::new(format!("agent-attempt-retry-after-llm-fail-merge"))
+                .expect("attempt id");
         database
             .claim_runnable_agent_task(&task.team_id, &task_id, &attempt_id)
             .expect("claim merge task")
@@ -14205,8 +14203,7 @@ async fn retry_merge_after_llm_merge_failure_keeps_phase_completed_and_dispatche
             })
             .expect("fail merge task");
     }
-    let merge_task_id =
-        foco_agent::AgentTaskId::new(first_merge_task_id).expect("merge task id");
+    let merge_task_id = foco_agent::AgentTaskId::new(first_merge_task_id).expect("merge task id");
     crate::plan_runtime::sync_plan_phase_for_agent_task(
         &fixture.state,
         &fixture.workspace,

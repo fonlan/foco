@@ -2240,6 +2240,184 @@ describe("app-panels-stats verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows retry merge for LLM merge failures without phase retry", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-22T18:00:00Z";
+    const mergeError = "LLM merge failed: conflict";
+    const completedPhase = {
+      agentTaskId: "agent-task-impl-1",
+      agentTeamId: "agent-team-impl-1",
+      attempts: [
+        {
+          agentTaskId: "agent-task-impl-1",
+          agentTeamId: "agent-team-impl-1",
+          commitId: "implcommit123456",
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "attempt-impl-1",
+          implementationChatId: "plan-chat-impl-1",
+          modelId: null,
+          phaseId: "plan-phase-llm-merge-fail",
+          planId: "plan-llm-merge-fail",
+          providerId: null,
+          sequence: 0,
+          startedAt: timestamp,
+          status: "completed",
+          thinkingLevel: null,
+          trigger: "start",
+          updatedAt: timestamp,
+        },
+        {
+          agentTaskId: "agent-task-merge-1",
+          agentTeamId: "agent-team-merge-1",
+          commitId: null,
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: mergeError,
+          id: "attempt-merge-1",
+          implementationChatId: "plan-chat-merge-1",
+          modelId: null,
+          phaseId: "plan-phase-llm-merge-fail",
+          planId: "plan-llm-merge-fail",
+          providerId: null,
+          sequence: 1,
+          startedAt: timestamp,
+          status: "failed",
+          thinkingLevel: null,
+          trigger: "merge_auto",
+          updatedAt: timestamp,
+        },
+      ],
+      commitId: "implcommit123456",
+      completedAt: timestamp,
+      createdAt: timestamp,
+      errorMessage: mergeError,
+      id: "plan-phase-llm-merge-fail",
+      implementationChatId: "plan-chat-impl-1",
+      mergeAttemptCount: 1,
+      planId: "plan-llm-merge-fail",
+      sequence: 0,
+      startedAt: timestamp,
+      status: "completed",
+      steps: [
+        {
+          acceptance: ["Phase implementation is done."],
+          checkedAt: timestamp,
+          createdAt: timestamp,
+          detail: "Implementation finished before merge.",
+          id: "plan-step-llm-merge-fail",
+          phaseId: "plan-phase-llm-merge-fail",
+          planId: "plan-llm-merge-fail",
+          sequence: 0,
+          status: "completed",
+          title: "Implement phase",
+          updatedAt: timestamp,
+        },
+      ],
+      summary: "Implementation completed; merge failed.",
+      title: "Final phase",
+      updatedAt: timestamp,
+    };
+    const failedMergePlan = {
+      activePhaseId: null,
+      completedAt: timestamp,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: mergeError,
+      sharedMergeCommitId: null,
+      id: "plan-llm-merge-fail",
+      overview: "All phases implemented; shared merge failed.",
+      pauseRequestedAt: null,
+      phases: [completedPhase],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "implemented",
+      title: "LLM merge failed plan",
+      updatedAt: timestamp,
+    };
+    const runningMergePlan = {
+      ...failedMergePlan,
+      completedAt: null,
+      errorMessage: null,
+      status: "running",
+      updatedAt: "2026-07-22T18:01:00Z",
+    };
+    let didRetryMerge = false;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [didRetryMerge ? runningMergePlan : failedMergePlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
+
+        if (
+          path ===
+          "/api/workspaces/workspace-1/plans/plan-llm-merge-fail/action"
+        ) {
+          didRetryMerge = true;
+          return jsonResponse({ plan: runningMergePlan });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await screen.findAllByText("Default");
+    await user.click(screen.getByRole("tab", { name: "Plan" }));
+
+    const planCard = (await screen.findByText("LLM merge failed plan")).closest(
+      "article",
+    );
+    expect(planCard).not.toBeNull();
+    const card = planCard as HTMLElement;
+
+    const retryButton = within(card).getByRole("button", {
+      name: "Retry Merge",
+    });
+    expect(retryButton).toHaveAttribute(
+      "title",
+      "Retry merging into the shared workspace",
+    );
+    expect(within(card).getByText(mergeError)).toBeInTheDocument();
+    expect(within(card).getByText("Completed")).toBeInTheDocument();
+    expect(
+      within(card).queryByRole("button", { name: "Retry plan phase" }),
+    ).not.toBeInTheDocument();
+
+    await user.click(retryButton);
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/workspaces/workspace-1/plans/plan-llm-merge-fail/action",
+        expect.objectContaining({
+          body: JSON.stringify({ action: "retry_merge" }),
+          method: "POST",
+        }),
+      );
+    });
+    await waitFor(() => {
+      expect(didRetryMerge).toBe(true);
+      expect(within(card).getByText("Running")).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("button", { name: "Retry Merge" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("keeps retry merge action response visible when the refresh returns stale plan data", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-07-04T12:20:00Z";
