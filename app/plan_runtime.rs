@@ -14,8 +14,8 @@ use foco_store::{
         PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE, SUPPORTED_AGENT_THINKING_LEVELS, WorkspaceConfig,
     },
     workspace::{
-        AgentInstanceRecord, AgentTaskRecord, PlanPhaseAttemptTrigger, PlanPhaseRecord, PlanRecord,
-        WorkspaceDatabase, WorkspaceDatabaseError,
+        AgentInstanceRecord, AgentTaskRecord, PlanPhaseAttemptStatus, PlanPhaseAttemptTrigger,
+        PlanPhaseRecord, PlanRecord, WorkspaceDatabase, WorkspaceDatabaseError,
     },
 };
 use serde_json::Value;
@@ -169,13 +169,15 @@ pub(crate) async fn retry_plan_merge(
     if plan.shared_merge_commit_id.is_some() {
         return Ok(plan);
     }
-    if !is_plan_merge_blocked(&plan) && plan.status != "implemented" {
+    if !is_plan_awaiting_merge_retry(&plan) {
         return Err(ApiError::bad_request(format!(
             "plan '{}' is not waiting for merge retry",
             plan.id
         )));
     }
-    finalize_plan_worktree(state, &workspace, &plan).await?;
+    // Manual retry: try direct fast-forward first; only HEAD mismatch dispatches
+    // a merge_retry LLM attempt (never re-runs the last implementation phase).
+    finalize_plan_worktree(state, &workspace, &plan, true).await?;
     state.plan_auto_run_scheduler.wake()?;
     let database = open_workspace_database(&workspace.path)?;
     database
@@ -537,31 +539,19 @@ async fn sync_plan_merge_task(
                     {
                         delete_instance_worktree(workspace, instance, true)?;
                     }
+                    // Merge commit/apply failure: keep implementation phase completed
+                    // and return the plan to implemented + merge error for Retry Merge.
                     let mut database = open_workspace_database(&workspace.path)?;
-                    if is_shared_workspace_dirty_merge_error(&error) {
-                        database
-                            .block_plan_phase_merge(
-                                &target.plan_id,
-                                &target.phase_id,
-                                &error.message,
-                            )
-                            .map_err(ApiError::from_workspace_error)?;
-                    } else {
-                        database
-                            .fail_plan_phase_by_id(
-                                &target.plan_id,
-                                &target.phase_id,
-                                &error.message,
-                            )
-                            .map_err(ApiError::from_workspace_error)?;
-                        drop(database);
-                        discard_plan_derived_effects_for_phase(
-                            workspace,
+                    database
+                        .await_plan_merge_retry(
                             &target.plan_id,
                             &target.phase_id,
                             &error.message,
-                        )?;
-                    }
+                            PlanPhaseAttemptStatus::Failed,
+                        )
+                        .map_err(ApiError::from_workspace_error)?;
+                    // Keep awaiting-integration derived effects so a later successful
+                    // merge retry can still confirm/release them. Do not discard here.
                     return Ok(());
                 }
             };
@@ -571,15 +561,14 @@ async fn sync_plan_merge_task(
             };
             let plan = {
                 let mut database = open_workspace_database(&workspace.path)?;
+                // Complete merge attempt + record shared merge SHA without rewriting
+                // the phase implementation commit_id.
                 database
-                    .complete_plan_phase_by_id(
+                    .complete_plan_merge_attempt(
                         &target.plan_id,
                         &target.phase_id,
-                        commit_id.as_deref(),
+                        Some(&shared_merge_commit_id),
                     )
-                    .map_err(ApiError::from_workspace_error)?;
-                database
-                    .record_plan_shared_merge_commit(&target.plan_id, &shared_merge_commit_id)
                     .map_err(ApiError::from_workspace_error)?
             };
             confirm_plan_derived_effects_for_phase(workspace, &target.plan_id, &target.phase_id)?;
@@ -592,17 +581,21 @@ async fn sync_plan_merge_task(
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
             let message = agent_task_error_message(task);
+            let attempt_status = match task.status {
+                AgentTaskStatus::Cancelled => PlanPhaseAttemptStatus::Cancelled,
+                AgentTaskStatus::Interrupted => PlanPhaseAttemptStatus::Interrupted,
+                _ => PlanPhaseAttemptStatus::Failed,
+            };
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .fail_plan_phase_by_id(&target.plan_id, &target.phase_id, &message)
+                .await_plan_merge_retry(
+                    &target.plan_id,
+                    &target.phase_id,
+                    &message,
+                    attempt_status,
+                )
                 .map_err(ApiError::from_workspace_error)?;
-            drop(database);
-            discard_plan_derived_effects_for_phase(
-                workspace,
-                &target.plan_id,
-                &target.phase_id,
-                &message,
-            )?;
+            // Preserve awaiting-integration effects for a later successful merge retry.
         }
         AgentTaskStatus::Queued | AgentTaskStatus::Running | AgentTaskStatus::Waiting => {}
     }
@@ -616,6 +609,7 @@ async fn dispatch_plan_merge(
     phase: &PlanPhaseRecord,
     source_instance: &AgentInstanceRecord,
     merge_error: &ApiError,
+    manual_retry: bool,
 ) -> Result<bool, ApiError> {
     let root_path = plan_instance_worktree_path(workspace, source_instance);
     let Some(base_revision) = source_instance.worktree_base_revision.as_deref() else {
@@ -638,10 +632,20 @@ async fn dispatch_plan_merge(
     };
     {
         let mut database = open_workspace_database(&workspace.path)?;
-        if !database
-            .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
-            .map_err(ApiError::from_workspace_error)?
-        {
+        let began = if manual_retry {
+            database
+                .try_begin_plan_phase_merge_retry_attempt(
+                    &plan.id,
+                    &phase.id,
+                    &merge_error.message,
+                )
+                .map_err(ApiError::from_workspace_error)?
+        } else {
+            database
+                .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
+                .map_err(ApiError::from_workspace_error)?
+        };
+        if !began {
             return Ok(false);
         }
     }
@@ -676,12 +680,17 @@ async fn dispatch_plan_merge(
     let queued = match queued {
         Ok(queued) => queued,
         Err(error) => {
+            // Queue failure after creating a merge attempt: terminal the merge
+            // attempt and return to implemented + error (not phase failed).
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+                .await_plan_merge_retry(
+                    &plan.id,
+                    &phase.id,
+                    &error.message,
+                    PlanPhaseAttemptStatus::Failed,
+                )
                 .map_err(ApiError::from_workspace_error)?;
-            drop(database);
-            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
     };
@@ -691,20 +700,26 @@ async fn dispatch_plan_merge(
             let error = ApiError::internal("plan merge queue did not create an Agent team");
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+                .await_plan_merge_retry(
+                    &plan.id,
+                    &phase.id,
+                    &error.message,
+                    PlanPhaseAttemptStatus::Failed,
+                )
                 .map_err(ApiError::from_workspace_error)?;
-            drop(database);
-            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
         (_, None) => {
             let error = ApiError::internal("plan merge queue did not create an Agent task");
             let mut database = open_workspace_database(&workspace.path)?;
             database
-                .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
+                .await_plan_merge_retry(
+                    &plan.id,
+                    &phase.id,
+                    &error.message,
+                    PlanPhaseAttemptStatus::Failed,
+                )
                 .map_err(ApiError::from_workspace_error)?;
-            drop(database);
-            discard_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id, &error.message)?;
             return Err(error);
         }
     };
@@ -736,7 +751,7 @@ async fn continue_plan_if_ready(
             let _ = transition_plan_action(state, &workspace.id, &plan.id, "resume").await?;
         }
         "implemented" => {
-            finalize_plan_worktree(state, workspace, &plan).await?;
+            finalize_plan_worktree(state, workspace, &plan, false).await?;
         }
         _ => {}
     }
@@ -883,6 +898,7 @@ async fn finalize_plan_worktree(
     state: &AppState,
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
+    manual_retry: bool,
 ) -> Result<(), ApiError> {
     let (phase, instance) = {
         let database = open_workspace_database(&workspace.path)?;
@@ -923,21 +939,58 @@ async fn finalize_plan_worktree(
                 return Ok(());
             }
             if is_shared_head_mismatch_merge_error(&error)
-                && dispatch_plan_merge(state, workspace, plan, &phase, &instance, &error).await?
+                && dispatch_plan_merge(
+                    state,
+                    workspace,
+                    plan,
+                    &phase,
+                    &instance,
+                    &error,
+                    manual_retry,
+                )
+                .await?
             {
                 Ok(())
-            } else {
+            } else if is_shared_head_mismatch_merge_error(&error) {
+                // Could not begin a new attempt. If one is already active, leave
+                // the plan running (idempotent). Otherwise surface await-retry.
+                let database = open_workspace_database(&workspace.path)?;
+                let refreshed = database
+                    .plan(&plan.id)
+                    .map_err(ApiError::from_workspace_error)?
+                    .ok_or_else(|| {
+                        ApiError::internal(format!(
+                            "plan was not found after merge dispatch: {}",
+                            plan.id
+                        ))
+                    })?;
+                let has_active_merge = refreshed
+                    .phases
+                    .iter()
+                    .find(|candidate| candidate.id == phase.id)
+                    .map(|candidate| {
+                        candidate.attempts.iter().any(|attempt| {
+                            matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                                && matches!(attempt.status.as_str(), "queued" | "running")
+                        })
+                    })
+                    .unwrap_or(false);
+                if has_active_merge || refreshed.status == "running" {
+                    return Ok(());
+                }
+                drop(database);
                 let mut database = open_workspace_database(&workspace.path)?;
                 database
-                    .fail_plan_phase_by_id(&phase.plan_id, &phase.id, &error.message)
+                    .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
-                drop(database);
-                discard_plan_derived_effects_for_phase(
-                    workspace,
-                    &phase.plan_id,
-                    &phase.id,
-                    &error.message,
-                )?;
+                Ok(())
+            } else {
+                // Other git/config errors: still keep implementation completed
+                // and allow Retry Merge rather than failing the last phase.
+                let mut database = open_workspace_database(&workspace.path)?;
+                database
+                    .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
+                    .map_err(ApiError::from_workspace_error)?;
                 Ok(())
             }
         }
@@ -952,8 +1005,17 @@ fn is_shared_head_mismatch_merge_error(error: &ApiError) -> bool {
     classify_plan_merge_failure(error) == PlanMergeFailureKind::SharedHeadMismatch
 }
 
-fn is_plan_merge_blocked(plan: &PlanRecord) -> bool {
+/// Plan is implemented (or legacy blocked) without a shared merge commit and
+/// carries a durable merge error. Accepts any merge error text, not only dirty.
+fn is_plan_awaiting_merge_retry(plan: &PlanRecord) -> bool {
     plan.shared_merge_commit_id.is_none()
+        && plan.error_message.as_deref().is_some_and(|message| !message.trim().is_empty())
+        && matches!(plan.status.as_str(), "implemented" | "merge_blocked")
+}
+
+/// Legacy helper kept for unit tests that assert dirty-message classification.
+fn is_plan_merge_blocked(plan: &PlanRecord) -> bool {
+    is_plan_awaiting_merge_retry(plan)
         && plan
             .error_message
             .as_deref()
@@ -1089,10 +1151,31 @@ fn plan_worktree_source(
     plan: &PlanRecord,
 ) -> Result<Option<(PlanPhaseRecord, AgentInstanceRecord)>, ApiError> {
     for phase in plan.phases.iter().rev() {
-        for instance in plan_phase_worktree_instances(database, phase)?
+        // Prefer the phase-bound implementation Coordinator. Merge attempts bind a
+        // separate team/instance and must not replace the source worktree for
+        // fast-forward or subsequent merge retries.
+        if let Some(instance) = plan_phase_coordinator_instance(database, phase)? {
+            if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
+                && instance.worktree_status.as_deref() != Some("deleted")
+            {
+                return Ok(Some((phase.clone(), instance)));
+            }
+        }
+        for attempt in database
+            .plan_phase_attempts_for_phase(&phase.id)
+            .map_err(ApiError::from_workspace_error)?
             .into_iter()
             .rev()
         {
+            if matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry") {
+                continue;
+            }
+            let Some(team_id) = attempt.agent_team_id.as_deref() else {
+                continue;
+            };
+            let Some(instance) = coordinator_instance_for_team(database, team_id)? else {
+                continue;
+            };
             if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree
                 && instance.worktree_status.as_deref() != Some("deleted")
             {
@@ -1598,8 +1681,13 @@ mod tests {
         plan.status = "implemented".to_string();
         plan.error_message = Some(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE.to_string());
         assert!(is_plan_merge_blocked(&plan));
+        assert!(is_plan_awaiting_merge_retry(&plan));
+        plan.error_message = Some("LLM merge failed: conflict".to_string());
+        assert!(!is_plan_merge_blocked(&plan));
+        assert!(is_plan_awaiting_merge_retry(&plan));
         plan.shared_merge_commit_id = Some("shared".to_string());
         assert!(!is_plan_merge_blocked(&plan));
+        assert!(!is_plan_awaiting_merge_retry(&plan));
     }
 
     #[test]

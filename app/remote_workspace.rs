@@ -16385,14 +16385,24 @@ fn remote_sidecar_validate_plan_task_binding(
                     task.id
                 ))
             })?;
-        if attempt.trigger != PlanPhaseAttemptTrigger::MergeAuto.as_str() {
+        if !matches!(
+            attempt.trigger.as_str(),
+            "merge_auto" | "merge_retry"
+        ) {
             return Err(ApiError::bad_request(format!(
                 "remote Plan merge Agent task '{}' is not a merge attempt",
                 task.id
             )));
         }
-    }
-    if phase.implementation_chat_id.as_deref() != Some(chat_id) {
+        // Merge binds a dedicated chat on the attempt; do not require the
+        // phase implementation chat (which stays on the original phase work).
+        if attempt.implementation_chat_id.as_deref() != Some(chat_id) {
+            return Err(ApiError::bad_request(format!(
+                "remote Plan Agent task '{}' is not bound to chat '{}'",
+                task.id, chat_id
+            )));
+        }
+    } else if phase.implementation_chat_id.as_deref() != Some(chat_id) {
         return Err(ApiError::bad_request(format!(
             "remote Plan Agent task '{}' is not bound to chat '{}'",
             task.id, chat_id
@@ -17605,6 +17615,9 @@ fn remote_sidecar_fail_plan_task(
     let phase = database
         .plan_phase_for_agent_task(&task.id)
         .map_err(ApiError::from_workspace_error)?;
+    let is_merge_task = remote_plan_task_kind_from_input(&task.input_json)
+        .map(|kind| kind.requires_merge_attempt())
+        .unwrap_or(false);
     if matches!(
         task.status,
         AgentTaskStatus::Running | AgentTaskStatus::Waiting
@@ -17621,13 +17634,17 @@ fn remote_sidecar_fail_plan_task(
             })
             .map_err(ApiError::from_workspace_error)?;
     }
+    // Merge failures route to await_plan_merge_retry via fail_plan_phase_run and
+    // must keep awaiting-integration derived effects for a later successful retry.
     database
         .fail_plan_phase_run(&task.id, message)
         .map_err(ApiError::from_workspace_error)?;
     if let Some(phase) = phase {
-        database
-            .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
-            .map_err(ApiError::from_workspace_error)?;
+        if !is_merge_task {
+            database
+                .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
+                .map_err(ApiError::from_workspace_error)?;
+        }
     }
     Ok(())
 }
@@ -17648,6 +17665,9 @@ fn remote_sidecar_cancel_plan_task(
     let phase = database
         .plan_phase_for_agent_task(&task.id)
         .map_err(ApiError::from_workspace_error)?;
+    let is_merge_task = remote_plan_task_kind_from_input(&task.input_json)
+        .map(|kind| kind.requires_merge_attempt())
+        .unwrap_or(false);
     if matches!(
         task.status,
         AgentTaskStatus::Running | AgentTaskStatus::Waiting
@@ -17668,9 +17688,11 @@ fn remote_sidecar_cancel_plan_task(
         .cancel_plan_phase_run(&task.id, message)
         .map_err(ApiError::from_workspace_error)?;
     if let Some(phase) = phase {
-        database
-            .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
-            .map_err(ApiError::from_workspace_error)?;
+        if !is_merge_task {
+            database
+                .discard_plan_phase_derived_effects_for_phase(&phase.plan_id, &phase.id, message)
+                .map_err(ApiError::from_workspace_error)?;
+        }
     }
     Ok(())
 }
@@ -17739,11 +17761,14 @@ fn remote_sidecar_finalize_plan_merge_task(
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
         remote_sidecar_complete_plan_task_if_running(&mut database, task)?;
+        // Complete merge attempt + shared merge SHA without rewriting the phase
+        // implementation commit_id.
         database
-            .complete_plan_phase_by_id(&phase.plan_id, &phase.id, Some(&shared_merge_commit_id))
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .record_plan_shared_merge_commit(&phase.plan_id, &shared_merge_commit_id)
+            .complete_plan_merge_attempt(
+                &phase.plan_id,
+                &phase.id,
+                Some(&shared_merge_commit_id),
+            )
             .map_err(ApiError::from_workspace_error)?;
         database
             .confirm_latest_completed_plan_phase_derived_effects(&phase.plan_id, &phase.id)
@@ -17808,8 +17833,21 @@ fn remote_sidecar_sync_plan_task_after_chat(
                     "remote Plan phase for Agent task '{task_id}' was not found"
                 ))
             })?;
-        if phase.status != "running" {
+        // Implementation tasks still require a running phase. Merge coordinators
+        // bind only on plan_phase_attempts and leave the phase completed.
+        if !task_kind.requires_merge_attempt() && phase.status != "running" {
             return Ok(None);
+        }
+        if task_kind.requires_merge_attempt() {
+            let has_active_merge = phase.attempts.iter().any(|attempt| {
+                matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                    && matches!(attempt.status.as_str(), "queued" | "running")
+                    && attempt.agent_task_id.as_deref() == Some(task_id.as_str())
+            });
+            if !has_active_merge {
+                // Merge attempt already terminalized (success or await-retry).
+                return Ok(None);
+            }
         }
         let worktree = if cancelled || assistant_terminal_state.is_some() {
             None
@@ -17970,12 +18008,14 @@ fn remote_sidecar_plan_worktree(
     plan: &foco_store::workspace::PlanRecord,
 ) -> Result<Option<RemotePlanWorktree>, ApiError> {
     for phase in plan.phases.iter().rev() {
+        // Prefer the phase-bound implementation Coordinator over merge attempts.
         let mut team_ids = phase.agent_team_id.iter().cloned().collect::<Vec<_>>();
         team_ids.extend(
             phase
                 .attempts
                 .iter()
                 .rev()
+                .filter(|attempt| !matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry"))
                 .filter_map(|attempt| attempt.agent_team_id.clone()),
         );
         for team_id in team_ids {
@@ -18056,7 +18096,7 @@ async fn remote_sidecar_continue_plan_if_ready(
             }
             Ok(())
         }
-        "implemented" => remote_sidecar_finalize_plan_worktree(state, &plan).await,
+        "implemented" => remote_sidecar_finalize_plan_worktree(state, &plan, false).await,
         _ => Ok(()),
     }
 }
@@ -18066,6 +18106,7 @@ async fn remote_sidecar_dispatch_plan_merge(
     plan: &foco_store::workspace::PlanRecord,
     source_worktree: &RemotePlanWorktree,
     merge_error: &ApiError,
+    manual_retry: bool,
 ) -> Result<bool, ApiError> {
     let phase = plan
         .phases
@@ -18096,10 +18137,20 @@ async fn remote_sidecar_dispatch_plan_merge(
     {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
-        if !database
-            .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
-            .map_err(ApiError::from_workspace_error)?
-        {
+        let began = if manual_retry {
+            database
+                .try_begin_plan_phase_merge_retry_attempt(
+                    &plan.id,
+                    &phase.id,
+                    &merge_error.message,
+                )
+                .map_err(ApiError::from_workspace_error)?
+        } else {
+            database
+                .try_begin_plan_phase_merge_attempt(&plan.id, &phase.id, &merge_error.message)
+                .map_err(ApiError::from_workspace_error)?
+        };
+        if !began {
             return Ok(false);
         }
     }
@@ -18235,11 +18286,14 @@ async fn remote_sidecar_dispatch_plan_merge(
         }
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
+        // Keep implementation phase completed; terminal the merge attempt only.
         database
-            .fail_plan_phase_by_id(&plan.id, &phase.id, &error.message)
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .discard_plan_phase_derived_effects_for_phase(&plan.id, &phase.id, &error.message)
+            .await_plan_merge_retry(
+                &plan.id,
+                &phase.id,
+                &error.message,
+                foco_store::workspace::PlanPhaseAttemptStatus::Failed,
+            )
             .map_err(ApiError::from_workspace_error)?;
         return Err(error);
     }
@@ -18270,6 +18324,7 @@ async fn remote_sidecar_dispatch_plan_merge(
 async fn remote_sidecar_finalize_plan_worktree(
     state: &RemoteSidecarState,
     plan: &foco_store::workspace::PlanRecord,
+    manual_retry: bool,
 ) -> Result<(), ApiError> {
     let workspace_path = PathBuf::from(&state.workspace_path);
     let Some(worktree) = ({
@@ -18304,37 +18359,68 @@ async fn remote_sidecar_finalize_plan_worktree(
                 Ok(())
             }
             PlanMergeFailureKind::SharedHeadMismatch => {
-                match remote_sidecar_dispatch_plan_merge(state, plan, &worktree, &error).await {
+                match remote_sidecar_dispatch_plan_merge(
+                    state,
+                    plan,
+                    &worktree,
+                    &error,
+                    manual_retry,
+                )
+                .await
+                {
                     Ok(true) => Ok(()),
                     Ok(false) => {
+                        // Could not begin a new attempt: either one is already
+                        // active (idempotent no-op) or auto budget is exhausted.
+                        let database =
+                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                                .map_err(ApiError::from_workspace_error)?;
+                        let refreshed = database
+                            .plan(&plan.id)
+                            .map_err(ApiError::from_workspace_error)?
+                            .ok_or_else(|| {
+                                ApiError::internal(format!(
+                                    "plan was not found after merge dispatch: {}",
+                                    plan.id
+                                ))
+                            })?;
+                        let has_active_merge = refreshed
+                            .phases
+                            .iter()
+                            .find(|phase| phase.id == worktree.phase_id)
+                            .map(|phase| {
+                                phase.attempts.iter().any(|attempt| {
+                                    matches!(
+                                        attempt.trigger.as_str(),
+                                        "merge_auto" | "merge_retry"
+                                    ) && matches!(
+                                        attempt.status.as_str(),
+                                        "queued" | "running"
+                                    )
+                                })
+                            })
+                            .unwrap_or(false);
+                        if has_active_merge || refreshed.status == "running" {
+                            return Ok(());
+                        }
+                        drop(database);
                         let mut database =
                             WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
                                 .map_err(ApiError::from_workspace_error)?;
                         database
-                            .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
-                            .map_err(ApiError::from_workspace_error)?;
-                        database
-                            .discard_plan_phase_derived_effects_for_phase(
-                                &plan.id,
-                                &worktree.phase_id,
-                                &error.message,
-                            )
+                            .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
                             .map_err(ApiError::from_workspace_error)?;
                         Ok(())
                     }
                     Err(dispatch_error) => {
+                        // Dispatch already terminalized the merge attempt via
+                        // await_plan_merge_retry when a queued attempt existed.
+                        // Ensure plan is still awaiting merge retry.
                         let mut database =
                             WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
                                 .map_err(ApiError::from_workspace_error)?;
                         database
-                            .fail_plan_phase_by_id(
-                                &plan.id,
-                                &worktree.phase_id,
-                                &dispatch_error.message,
-                            )
-                            .map_err(ApiError::from_workspace_error)?;
-                        database
-                            .discard_plan_phase_derived_effects_for_phase(
+                            .block_plan_phase_merge(
                                 &plan.id,
                                 &worktree.phase_id,
                                 &dispatch_error.message,
@@ -18348,14 +18434,7 @@ async fn remote_sidecar_finalize_plan_worktree(
                 let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
                     .map_err(ApiError::from_workspace_error)?;
                 database
-                    .fail_plan_phase_by_id(&plan.id, &worktree.phase_id, &error.message)
-                    .map_err(ApiError::from_workspace_error)?;
-                database
-                    .discard_plan_phase_derived_effects_for_phase(
-                        &plan.id,
-                        &worktree.phase_id,
-                        &error.message,
-                    )
+                    .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
                 Ok(())
             }
@@ -21734,18 +21813,25 @@ async fn remote_sidecar_plans_action(
                     ApiError::bad_request(format!("plan was not found: {plan_id}")).into_response()
                 })?
         };
-        if plan.shared_merge_commit_id.is_none() {
-            if plan.status != "implemented" {
-                return Err(ApiError::bad_request(format!(
-                    "plan '{}' is not waiting for merge retry",
-                    plan.id
-                ))
-                .into_response());
-            }
-            remote_sidecar_finalize_plan_worktree(&state, &plan)
-                .await
-                .map_err(ApiError::into_response)?;
+        if plan.shared_merge_commit_id.is_some() {
+            return Ok(Json(json!({ "plan": plan })));
         }
+        // Accept any implemented plan with a durable merge error (not only dirty).
+        let awaiting_merge = plan.status == "implemented"
+            && plan
+                .error_message
+                .as_deref()
+                .is_some_and(|message| !message.trim().is_empty());
+        if !awaiting_merge {
+            return Err(ApiError::bad_request(format!(
+                "plan '{}' is not waiting for merge retry",
+                plan.id
+            ))
+            .into_response());
+        }
+        remote_sidecar_finalize_plan_worktree(&state, &plan, true)
+            .await
+            .map_err(ApiError::into_response)?;
         let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
             .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
         let plan = database
@@ -43607,7 +43693,7 @@ mod tests {
         let (state, _broker) =
             remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
 
-        remote_sidecar_finalize_plan_worktree(&state, &plan)
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
             .await
             .expect("finalize source worktree");
 
@@ -43615,8 +43701,18 @@ mod tests {
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
         let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
         let phase = &refreshed.phases[0];
-        let task_id = AgentTaskId::new(phase.agent_task_id.clone().expect("merge task id"))
-            .expect("merge task id format");
+        let merge_attempt = phase
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_auto")
+            .expect("durable merge attempt");
+        let task_id = AgentTaskId::new(
+            merge_attempt
+                .agent_task_id
+                .clone()
+                .expect("merge task id"),
+        )
+        .expect("merge task id format");
         let task = database
             .agent_task(&task_id)
             .expect("task lookup")
@@ -43629,21 +43725,18 @@ mod tests {
             .agent_instance(&team.coordinator_instance_id)
             .expect("Coordinator lookup")
             .expect("Coordinator");
-        let merge_attempt = phase
-            .attempts
-            .iter()
-            .find(|attempt| attempt.trigger == "merge_auto")
-            .expect("durable merge attempt");
 
         assert_eq!(refreshed.status, "running");
-        assert_eq!(phase.status, "running");
+        assert_eq!(phase.status, "completed");
         assert!(refreshed.shared_merge_commit_id.is_none());
         assert_eq!(task.status, AgentTaskStatus::Running);
         assert_eq!(merge_attempt.status, "running");
-        assert_eq!(
-            merge_attempt.implementation_chat_id,
-            phase.implementation_chat_id
+        assert_ne!(
+            phase.agent_task_id.as_deref(),
+            Some(task_id.as_str()),
+            "merge must not overwrite phase implementation task id"
         );
+        assert!(merge_attempt.implementation_chat_id.is_some());
         assert_eq!(
             merge_attempt.agent_team_id.as_deref(),
             Some(task.team_id.as_str())
@@ -43677,7 +43770,7 @@ mod tests {
             PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
         );
 
-        remote_sidecar_finalize_plan_worktree(&state, &plan)
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
             .await
             .expect("finalize source worktree");
 
@@ -43685,8 +43778,18 @@ mod tests {
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
         let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
         let phase = &refreshed.phases[0];
-        let task_id = AgentTaskId::new(phase.agent_task_id.clone().expect("merge task id"))
-            .expect("merge task id format");
+        let merge_attempt = phase
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_auto")
+            .expect("durable merge attempt");
+        let task_id = AgentTaskId::new(
+            merge_attempt
+                .agent_task_id
+                .clone()
+                .expect("merge task id"),
+        )
+        .expect("merge task id format");
         let task = database
             .agent_task(&task_id)
             .expect("task lookup")
@@ -43699,24 +43802,21 @@ mod tests {
             .agent_instance(&team.coordinator_instance_id)
             .expect("Coordinator lookup")
             .expect("Coordinator");
-        let merge_attempt = phase
-            .attempts
-            .iter()
-            .find(|attempt| attempt.trigger == "merge_auto")
-            .expect("durable merge attempt");
         let source_worktree_root =
             agent_worktree_relative_path(workspace.path(), &source_worktree.root_path)
                 .expect("relative source worktree");
 
         assert_eq!(refreshed.status, "running");
-        assert_eq!(phase.status, "running");
+        assert_eq!(phase.status, "completed");
         assert!(refreshed.shared_merge_commit_id.is_none());
         assert_eq!(task.status, AgentTaskStatus::Running);
         assert_eq!(merge_attempt.status, "running");
-        assert_eq!(
-            merge_attempt.implementation_chat_id,
-            phase.implementation_chat_id
+        assert_ne!(
+            phase.agent_task_id.as_deref(),
+            Some(task_id.as_str()),
+            "merge must not overwrite phase implementation task id"
         );
+        assert!(merge_attempt.implementation_chat_id.is_some());
         assert_eq!(
             merge_attempt.agent_team_id.as_deref(),
             Some(task.team_id.as_str())
@@ -43755,7 +43855,7 @@ mod tests {
             .expect("write uncommitted shared change");
         let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
 
-        remote_sidecar_finalize_plan_worktree(&state, &plan)
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
             .await
             .expect("finalize source worktree");
 
@@ -43785,7 +43885,7 @@ mod tests {
         let (state, _broker) =
             remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
 
-        remote_sidecar_finalize_plan_worktree(&state, &plan)
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
             .await
             .expect("first finalize");
         let first = {
@@ -43793,7 +43893,7 @@ mod tests {
                 WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
             database.plan(&plan.id).expect("plan lookup").expect("plan")
         };
-        remote_sidecar_finalize_plan_worktree(&state, &first)
+        remote_sidecar_finalize_plan_worktree(&state, &first, false)
             .await
             .expect("second finalize");
 
@@ -43807,7 +43907,97 @@ mod tests {
             .count();
         assert_eq!(merge_tasks, 1);
         assert_eq!(refreshed.status, "running");
-        assert_eq!(refreshed.phases[0].status, "running");
+        assert_eq!(refreshed.phases[0].status, "completed");
         assert!(refreshed.shared_merge_commit_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn remote_retry_merge_after_auto_merge_failure_dispatches_merge_retry_not_phase() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, _source_worktree, _shared_head) =
+            setup_remote_plan_merge_fixture(workspace.path(), "retry-after-fail", true);
+        let (state, _broker) =
+            remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
+
+        // Auto finalize dispatches merge_auto.
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
+            .await
+            .expect("auto finalize");
+        let after_auto = {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database.plan(&plan.id).expect("plan lookup").expect("plan")
+        };
+        let auto_attempt = after_auto.phases[0]
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_auto")
+            .expect("merge_auto attempt");
+        let auto_task_id = AgentTaskId::new(
+            auto_attempt
+                .agent_task_id
+                .clone()
+                .expect("auto merge task"),
+        )
+        .expect("task id");
+        let implementation_task_id = after_auto.phases[0]
+            .agent_task_id
+            .clone()
+            .expect("implementation task");
+
+        // Fail the merge Coordinator.
+        remote_sidecar_fail_plan_task(&state, &auto_task_id, "LLM merge failed: conflict")
+            .expect("fail merge task");
+        let after_fail = {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database.plan(&plan.id).expect("plan lookup").expect("plan")
+        };
+        assert_eq!(after_fail.status, "implemented");
+        assert_eq!(after_fail.phases[0].status, "completed");
+        assert_eq!(
+            after_fail.phases[0].agent_task_id.as_deref(),
+            Some(implementation_task_id.as_str())
+        );
+        assert!(after_fail.shared_merge_commit_id.is_none());
+        assert!(
+            after_fail
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("LLM merge failed"))
+        );
+
+        // Manual retry_merge creates merge_retry without re-running the phase.
+        remote_sidecar_finalize_plan_worktree(&state, &after_fail, true)
+            .await
+            .expect("manual retry finalize");
+        let after_retry = {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database.plan(&plan.id).expect("plan lookup").expect("plan")
+        };
+        assert_eq!(after_retry.status, "running");
+        assert_eq!(after_retry.phases[0].status, "completed");
+        assert_eq!(
+            after_retry.phases[0].agent_task_id.as_deref(),
+            Some(implementation_task_id.as_str())
+        );
+        let merge_retries = after_retry.phases[0]
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.trigger == "merge_retry")
+            .count();
+        assert_eq!(merge_retries, 1);
+        let retry_attempt = after_retry.phases[0]
+            .attempts
+            .iter()
+            .find(|attempt| attempt.trigger == "merge_retry")
+            .expect("merge_retry attempt");
+        assert_eq!(retry_attempt.status, "running");
+        assert!(retry_attempt.agent_task_id.is_some());
+        assert_ne!(
+            retry_attempt.agent_task_id.as_deref(),
+            Some(auto_task_id.as_str())
+        );
     }
 }

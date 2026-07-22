@@ -14078,10 +14078,18 @@ async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once()
     assert_eq!(retried.status, "running");
     assert!(retried.shared_merge_commit_id.is_none());
     assert_eq!(retried.phases[0].merge_attempt_count, 1);
-    assert_ne!(
+    // Phase keeps implementation task identity; merge binds on the attempt only.
+    assert_eq!(
         retried.phases[0].agent_task_id.as_deref(),
         Some(fixture.phase_task_id.as_str())
     );
+    assert_eq!(retried.phases[0].status, "completed");
+    let merge_attempt = retried.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_retry")
+        .expect("manual merge_retry attempt");
+    assert_eq!(merge_attempt.status, "running");
     assert_eq!(fixture.agent_scheduler_rx.recv().await, Some(()));
 
     let database = WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
@@ -14093,7 +14101,7 @@ async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once()
     assert!(fixture.source_root.exists());
 
     let merge_team_id = foco_agent::AgentTeamId::new(
-        retried.phases[0]
+        merge_attempt
             .agent_team_id
             .as_deref()
             .expect("merge team id"),
@@ -14125,6 +14133,134 @@ async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once()
             .expect("shared HEAD"),
         advanced_head
     );
+}
+
+#[tokio::test]
+async fn retry_merge_after_llm_merge_failure_keeps_phase_completed_and_dispatches_merge_retry() {
+    let mut fixture = blocked_plan_worktree_fixture("retry-after-llm-fail").await;
+    fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
+    fs::write(
+        fixture.workspace.path.join("shared-advance.txt"),
+        "advance\n",
+    )
+    .expect("advance file");
+    crate::git_backend::stage_git_file(&fixture.workspace.path, "shared-advance.txt")
+        .expect("stage advance");
+    crate::git_backend::commit_staged_changes(
+        &fixture.workspace.path,
+        "advance shared head".to_string(),
+    )
+    .expect("advance shared head");
+
+    // First manual retry dispatches LLM merge (HEAD mismatch).
+    let first = crate::plan_runtime::transition_plan_action(
+        &fixture.state,
+        &fixture.workspace.id,
+        &fixture.plan_id,
+        "retry_merge",
+    )
+    .await
+    .expect("first retry merge");
+    assert_eq!(first.status, "running");
+    assert_eq!(first.phases[0].status, "completed");
+    let first_merge = first.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_retry")
+        .expect("first merge_retry");
+    let first_merge_task_id = first_merge
+        .agent_task_id
+        .as_deref()
+        .expect("first merge task")
+        .to_string();
+    assert_eq!(fixture.agent_scheduler_rx.recv().await, Some(()));
+
+    // Simulate LLM merge Coordinator failure: claim Queued → Running, then Fail.
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
+        let task_id =
+            foco_agent::AgentTaskId::new(first_merge_task_id.clone()).expect("task id");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .expect("task");
+        let attempt_id = foco_agent::AgentAttemptId::new(format!(
+            "agent-attempt-retry-after-llm-fail-merge"
+        ))
+        .expect("attempt id");
+        database
+            .claim_runnable_agent_task(&task.team_id, &task_id, &attempt_id)
+            .expect("claim merge task")
+            .expect("claimed");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(r#"{"message":"LLM merge failed: conflict"}"#),
+                interruption_reason: None,
+            })
+            .expect("fail merge task");
+    }
+    let merge_task_id =
+        foco_agent::AgentTaskId::new(first_merge_task_id).expect("merge task id");
+    crate::plan_runtime::sync_plan_phase_for_agent_task(
+        &fixture.state,
+        &fixture.workspace,
+        &merge_task_id,
+    )
+    .await
+    .expect("sync failed merge");
+
+    let after_fail = {
+        let database =
+            WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
+        database
+            .plan(&fixture.plan_id)
+            .expect("plan lookup")
+            .expect("plan")
+    };
+    assert_eq!(after_fail.status, "implemented");
+    assert!(after_fail.shared_merge_commit_id.is_none());
+    assert_eq!(after_fail.phases[0].status, "completed");
+    assert_eq!(
+        after_fail.phases[0].agent_task_id.as_deref(),
+        Some(fixture.phase_task_id.as_str()),
+        "implementation task identity must survive merge failure"
+    );
+    assert!(
+        after_fail
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("LLM merge failed"))
+    );
+    assert!(fixture.source_root.exists(), "source worktree retained");
+
+    // Second Retry Merge must create another merge_retry, not re-run implementation.
+    let second = crate::plan_runtime::transition_plan_action(
+        &fixture.state,
+        &fixture.workspace.id,
+        &fixture.plan_id,
+        "retry_merge",
+    )
+    .await
+    .expect("second retry merge");
+    assert_eq!(second.status, "running");
+    assert_eq!(second.phases[0].status, "completed");
+    assert_eq!(
+        second.phases[0].agent_task_id.as_deref(),
+        Some(fixture.phase_task_id.as_str())
+    );
+    let merge_retries = second.phases[0]
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.trigger == "merge_retry")
+        .count();
+    assert_eq!(merge_retries, 2);
+    assert_eq!(fixture.agent_scheduler_rx.recv().await, Some(()));
 }
 
 #[tokio::test]
