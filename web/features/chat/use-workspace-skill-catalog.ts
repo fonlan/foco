@@ -1,14 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { ConfiguredSkillSummary } from "../../api/types";
-import { errorMessage, requestJson } from "../../shared/api-client";
+import { errorMessage } from "../../shared/api-client";
+import { fetchWorkspaceSkillCatalog } from "../skills/workspace-skill-catalog";
 
 export type WorkspaceSkillCatalogStatus = "idle" | "loading" | "ready" | "error";
-
-export type WorkspaceSkillsDiscoveryResponse = {
-  skills: ConfiguredSkillSummary[];
-  errors: Array<{ path: string; message: string }>;
-};
 
 export type WorkspaceSkillCatalogState = {
   /** Enabled skills for the active workspace menu (authoritative when status is ready). */
@@ -84,9 +80,7 @@ export function useWorkspaceSkillCatalog(workspaceId: string | null) {
 
     void (async () => {
       try {
-        const data = await requestJson<WorkspaceSkillsDiscoveryResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/skills`,
-        );
+        const data = await fetchWorkspaceSkillCatalog(workspaceId);
         if (cancelled || requestGenerationRef.current !== generation) {
           return;
         }

@@ -171,6 +171,7 @@ import {
 import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
 import { FilePickerDialog, type FilePickerSelection } from "../file-picker/FilePickerDialog";
+import { useRemoteWorkspaceSkillCatalog } from "./use-remote-workspace-skill-catalog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
 import {
   moveItemId,
@@ -867,6 +868,11 @@ export function SettingsPanel({
   const mcpTransports = settings?.mcpTransports ?? [];
   const mcpServers = settings?.mcpServers ?? [];
   const skills = settings?.skills;
+  const {
+    catalogs: remoteWorkspaceSkillCatalogs,
+    reload: reloadRemoteWorkspaceSkillCatalogs,
+    retryWorkspace: retryRemoteWorkspaceSkillCatalog,
+  } = useRemoteWorkspaceSkillCatalog(activeSection === "skills", workspaces);
   const skillLocations: SkillLocationSummary[] =
     skills?.locations ??
     (skills?.directories ?? []).map((path) => ({
@@ -879,6 +885,25 @@ export function SettingsPanel({
     new Set((skills?.detected ?? []).filter((skill) => skill.enabled).map((skill) => skill.key));
   const updateableStoreSkills = (skills?.detected ?? []).filter((skill) =>
     Boolean(skill.store?.updateable),
+  );
+  const detectedSkillRows = useMemo(
+    () => [
+      ...(skills?.detected ?? []).map((skill) => ({
+        key: `local:${skill.key}`,
+        skill,
+        source: "local" as const,
+        workspace: null,
+      })),
+      ...remoteWorkspaceSkillCatalogs.flatMap((catalog) =>
+        catalog.skills.map((skill) => ({
+          key: `remote:${catalog.workspace.id}:${skill.key}`,
+          skill,
+          source: "remote" as const,
+          workspace: catalog.workspace,
+        })),
+      ),
+    ],
+    [remoteWorkspaceSkillCatalogs, skills?.detected],
   );
   const thinkingLevels = settings?.thinkingLevels ?? [];
   const configuredModels =
@@ -4634,6 +4659,7 @@ export function SettingsPanel({
       setSettings(data);
       onSettingsChange(data);
       syncSkillsForm(data);
+      reloadRemoteWorkspaceSkillCatalogs();
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -11797,9 +11823,9 @@ export function SettingsPanel({
                     ) : null}
                     <CapabilityPill
                       label={t("skills {count}", {
-                        count: skills?.detected.length ?? 0,
+                        count: detectedSkillRows.length,
                       })}
-                      ok={(skills?.detected.length ?? 0) > 0}
+                      ok={detectedSkillRows.length > 0}
                     />
                     <button
                       aria-label={t("Refresh skill discovery")}
@@ -11820,14 +11846,24 @@ export function SettingsPanel({
                   </div>
                 </div>
                 <div className="divide-y divide-stone-100">
-                  {skills?.detected.length ? (
-                    skills.detected.map((skill) => {
-                      const enabled = currentEnabledSkillIds.has(skill.key);
-                      const isStoreUpdateable = Boolean(skill.store?.updateable);
+                  {detectedSkillRows.length ? (
+                    detectedSkillRows.map((row) => {
+                      const { skill } = row;
+                      const isRemoteSkill = row.source === "remote";
+                      const enabled = isRemoteSkill
+                        ? skill.enabled
+                        : currentEnabledSkillIds.has(skill.key);
+                      const isStoreUpdateable =
+                        !isRemoteSkill && Boolean(skill.store?.updateable);
                       const isUpdatingSkill = updatingSkillKey === skill.key;
+                      const remoteWorkspaceLabel = row.workspace
+                        ? [row.workspace.name, row.workspace.serverName ?? row.workspace.serverId]
+                          .filter(Boolean)
+                          .join(" · ")
+                        : null;
 
                       return (
-                        <div className="px-4 py-3" key={skill.key}>
+                        <div className="px-4 py-3" key={row.key}>
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                             <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-2">
@@ -11842,6 +11878,14 @@ export function SettingsPanel({
                                   label={skillScopeLabel(skill, t)}
                                   ok={skill.scope === "global"}
                                 />
+                                {isRemoteSkill ? (
+                                  <>
+                                    <CapabilityPill label={t("Remote workspace")} ok={true} />
+                                    {remoteWorkspaceLabel ? (
+                                      <CapabilityPill label={remoteWorkspaceLabel} ok={true} />
+                                    ) : null}
+                                  </>
+                                ) : null}
                                 {isStoreUpdateable ? (
                                   <CapabilityPill
                                     label={t("Store-installed skill")}
@@ -11860,67 +11904,69 @@ export function SettingsPanel({
                                 {skill.path}
                               </div>
                             </div>
-                            <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
-                              {isStoreUpdateable ? (
+                            {!isRemoteSkill ? (
+                              <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
+                                {isStoreUpdateable ? (
+                                  <button
+                                    aria-label={t("Update skill {name}", { name: skill.name })}
+                                    className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    disabled={
+                                      isSavingSkills ||
+                                      isRefreshingSkills ||
+                                      isUpdatingAllSkills ||
+                                      (updatingSkillKey !== null && !isUpdatingSkill)
+                                    }
+                                    onClick={() => void updateSkill(skill)}
+                                    title={t("Updates overwrite local changes")}
+                                    type="button"
+                                  >
+                                    {isUpdatingSkill ? (
+                                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
+                                    ) : (
+                                      <RefreshCw aria-hidden="true" className="size-4" />
+                                    )}
+                                    <span>{isUpdatingSkill ? t("Updating...") : t("Update skill")}</span>
+                                  </button>
+                                ) : null}
                                 <button
-                                  aria-label={t("Update skill {name}", { name: skill.name })}
-                                  className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  aria-label={t("Delete skill {name}", { name: skill.name })}
+                                  className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
                                   disabled={
                                     isSavingSkills ||
                                     isRefreshingSkills ||
                                     isUpdatingAllSkills ||
-                                    (updatingSkillKey !== null && !isUpdatingSkill)
+                                    updatingSkillKey !== null
                                   }
-                                  onClick={() => void updateSkill(skill)}
-                                  title={t("Updates overwrite local changes")}
+                                  onClick={() => void deleteSkill(skill)}
+                                  title={t("Delete skill")}
                                   type="button"
                                 >
-                                  {isUpdatingSkill ? (
-                                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                                  ) : (
-                                    <RefreshCw aria-hidden="true" className="size-4" />
-                                  )}
-                                  <span>{isUpdatingSkill ? t("Updating...") : t("Update skill")}</span>
+                                  <Trash2 aria-hidden="true" className="size-4" />
                                 </button>
-                              ) : null}
-                              <button
-                                aria-label={t("Delete skill {name}", { name: skill.name })}
-                                className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
-                                disabled={
-                                  isSavingSkills ||
-                                  isRefreshingSkills ||
-                                  isUpdatingAllSkills ||
-                                  updatingSkillKey !== null
-                                }
-                                onClick={() => void deleteSkill(skill)}
-                                title={t("Delete skill")}
-                                type="button"
-                              >
-                                <Trash2 aria-hidden="true" className="size-4" />
-                              </button>
-                              <label className="relative inline-flex cursor-pointer items-center">
-                                <input
-                                  aria-label={t("Enable skill {name}", {
-                                    name: skill.name,
-                                  })}
-                                  checked={enabled}
-                                  className="peer sr-only"
-                                  disabled={
-                                    isSavingSkills ||
-                                    isRefreshingSkills ||
-                                    isUpdatingAllSkills ||
-                                    updatingSkillKey !== null ||
-                                    !skill.canEnable
-                                  }
-                                  onChange={(event) =>
-                                    toggleSkill(skill.key, event.target.checked)
-                                  }
-                                  type="checkbox"
-                                />
-                                <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                                <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
-                              </label>
-                            </div>
+                                <label className="relative inline-flex cursor-pointer items-center">
+                                  <input
+                                    aria-label={t("Enable skill {name}", {
+                                      name: skill.name,
+                                    })}
+                                    checked={enabled}
+                                    className="peer sr-only"
+                                    disabled={
+                                      isSavingSkills ||
+                                      isRefreshingSkills ||
+                                      isUpdatingAllSkills ||
+                                      updatingSkillKey !== null ||
+                                      !skill.canEnable
+                                    }
+                                    onChange={(event) =>
+                                      toggleSkill(skill.key, event.target.checked)
+                                    }
+                                    type="checkbox"
+                                  />
+                                  <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
+                                  <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                                </label>
+                              </div>
+                            ) : null}
                           </div>
                           <Warnings warnings={skill.warnings} />
                         </div>
@@ -11932,6 +11978,44 @@ export function SettingsPanel({
                     </div>
                   )}
                 </div>
+                {remoteWorkspaceSkillCatalogs.some((catalog) => catalog.status === "loading") ? (
+                  <div className="border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
+                    {t("Loading remote workspace skills...")}
+                  </div>
+                ) : null}
+                {remoteWorkspaceSkillCatalogs.some(
+                  (catalog) => catalog.error || catalog.refreshError,
+                ) ? (
+                  <div className="space-y-2 border-t border-stone-100 px-4 py-3">
+                    {remoteWorkspaceSkillCatalogs
+                      .filter((catalog) => catalog.error || catalog.refreshError)
+                      .map((catalog) => {
+                        const message = catalog.error ?? catalog.refreshError;
+                        const serverLabel =
+                          catalog.workspace.serverName ?? catalog.workspace.serverId;
+
+                        return (
+                          <div
+                            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                            key={`remote-error:${catalog.workspace.id}`}
+                            role="alert"
+                          >
+                            <div className="min-w-0 break-words">
+                              <span className="font-medium">{catalog.workspace.name}</span>
+                              {serverLabel ? ` · ${serverLabel}` : null}: {message}
+                            </div>
+                            <button
+                              className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white px-2.5 text-xs font-semibold text-rose-700 shadow-sm hover:bg-rose-100"
+                              onClick={() => retryRemoteWorkspaceSkillCatalog(catalog.workspace.id)}
+                              type="button"
+                            >
+                              {t("Retry")}
+                            </button>
+                          </div>
+                        );
+                      })}
+                  </div>
+                ) : null}
               </section>
 
               <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">

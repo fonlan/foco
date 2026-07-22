@@ -119,6 +119,252 @@ describe("app-settings verification surfaces", () => {
     expect(githubLink).toHaveAttribute("rel", "noreferrer");
   });
 
+  it("lazily aggregates only matching remote workspace skills without local write controls", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const remoteWorkspace = {
+      ...appTestState.settingsResponse.workspaces[0]!,
+      connectionStatus: "connected",
+      id: "workspace-remote-1",
+      isDefault: false,
+      name: "Remote project",
+      remotePath: "/srv/project",
+      serverId: "server-1",
+      serverName: "build-box",
+    };
+    const remoteSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      description: "Deploy the remote project.",
+      id: "deploy",
+      key: "workspace:workspace-remote-1:deploy",
+      name: "Remote deploy",
+      path: "/srv/project/.agents/skills/deploy/SKILL.md",
+      scope: "workspace",
+      workspaceId: remoteWorkspace.id,
+      workspaceName: "Incorrect response name",
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [...appTestState.settingsResponse.workspaces, remoteWorkspace],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: {
+        skills: [
+          { ...remoteSkill, scope: "global", workspaceId: null },
+          { ...remoteSkill, key: "workspace:other:deploy", workspaceId: "other" },
+          remoteSkill,
+        ],
+      },
+    };
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces/workspace-remote-1/skills"),
+      ),
+    ).toHaveLength(0);
+
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    expect(await screen.findByText("Remote deploy")).toBeInTheDocument();
+    expect(screen.getByText("Remote workspace")).toBeInTheDocument();
+    expect(screen.getByText("Remote project · build-box")).toBeInTheDocument();
+    expect(screen.queryByText("Incorrect response name")).toBeNull();
+    expect(screen.queryByRole("checkbox", { name: "Enable skill Remote deploy" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Delete skill Remote deploy" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Update skill Remote deploy" })).toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces/workspace-remote-1/skills"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("keeps a disconnected remote workspace isolated until the user retries discovery", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const remoteWorkspace = {
+      ...appTestState.settingsResponse.workspaces[0]!,
+      connectionStatus: "offline",
+      id: "workspace-remote-offline",
+      isDefault: false,
+      lastRemoteError: "Remote connection is offline",
+      name: "Offline remote",
+      remotePath: "/srv/offline",
+      serverId: "server-offline",
+      serverName: "offline-host",
+    };
+    const remoteSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      id: "retried-skill",
+      key: "workspace:workspace-remote-offline:retried-skill",
+      name: "Retried remote skill",
+      path: "/srv/offline/.agents/skills/retried-skill/SKILL.md",
+      scope: "workspace",
+      workspaceId: remoteWorkspace.id,
+      workspaceName: remoteWorkspace.name,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [...appTestState.settingsResponse.workspaces, remoteWorkspace],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: { skills: [remoteSkill] },
+    };
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Offline remote · offline-host: Remote connection is offline",
+    );
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces/workspace-remote-offline/skills"),
+      ),
+    ).toHaveLength(0);
+
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Retried remote skill")).toBeInTheDocument();
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces/workspace-remote-offline/skills"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("keeps other remote catalogs visible when one discovery fails and retries that workspace", async () => {
+    const readyWorkspace = {
+      ...appTestState.settingsResponse.workspaces[0]!,
+      connectionStatus: "connected",
+      id: "workspace-remote-ready",
+      isDefault: false,
+      name: "Ready remote",
+      remotePath: "/srv/ready",
+      serverId: "server-ready",
+      serverName: "ready-host",
+    };
+    const failingWorkspace = {
+      ...readyWorkspace,
+      id: "workspace-remote-failing",
+      name: "Failing remote",
+      remotePath: "/srv/failing",
+      serverId: "server-failing",
+      serverName: "failing-host",
+    };
+    const readySkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      id: "ready-skill",
+      key: "workspace:workspace-remote-ready:ready-skill",
+      name: "Ready remote skill",
+      path: "/srv/ready/.agents/skills/ready-skill/SKILL.md",
+      scope: "workspace",
+      workspaceId: readyWorkspace.id,
+      workspaceName: readyWorkspace.name,
+    };
+    const recoveredSkill: ConfiguredSkillSummary = {
+      ...readySkill,
+      id: "recovered-skill",
+      key: "workspace:workspace-remote-failing:recovered-skill",
+      name: "Recovered remote skill",
+      path: "/srv/failing/.agents/skills/recovered-skill/SKILL.md",
+      workspaceId: failingWorkspace.id,
+      workspaceName: failingWorkspace.name,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [
+        ...appTestState.settingsResponse.workspaces,
+        readyWorkspace,
+        failingWorkspace,
+      ],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [readyWorkspace.id]: { skills: [readySkill] },
+      [failingWorkspace.id]: [
+        jsonResponse({ error: "Sidecar unavailable" }, { status: 502 }),
+        jsonResponse({ error: "Sidecar unavailable" }, { status: 502 }),
+      ],
+    };
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    expect(await screen.findByText("Ready remote skill")).toBeInTheDocument();
+    const discoveryError = await screen.findByRole("alert");
+    expect(discoveryError).toHaveTextContent("Failing remote · failing-host: Sidecar unavailable");
+    appTestState.workspaceSkillsResponsesByWorkspaceId[failingWorkspace.id] = {
+      skills: [recoveredSkill],
+    };
+    await userEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("Recovered remote skill")).toBeInTheDocument();
+    expect(screen.getByText("Ready remote skill")).toBeInTheDocument();
+  });
+
+  it("refreshes remote workspace catalogs and ignores responses from the prior generation", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const staleResponse = deferred<Response>();
+    const remoteWorkspace = {
+      ...appTestState.settingsResponse.workspaces[0]!,
+      connectionStatus: "connected",
+      id: "workspace-remote-race",
+      isDefault: false,
+      name: "Race remote",
+      remotePath: "/srv/race",
+      serverId: "server-race",
+      serverName: "race-host",
+    };
+    const staleSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      id: "stale-skill",
+      key: "workspace:workspace-remote-race:stale-skill",
+      name: "Stale remote skill",
+      path: "/srv/race/.agents/skills/stale-skill/SKILL.md",
+      scope: "workspace",
+      workspaceId: remoteWorkspace.id,
+      workspaceName: remoteWorkspace.name,
+    };
+    const freshSkill: ConfiguredSkillSummary = {
+      ...staleSkill,
+      id: "fresh-skill",
+      key: "workspace:workspace-remote-race:fresh-skill",
+      name: "Fresh remote skill",
+      path: "/srv/race/.agents/skills/fresh-skill/SKILL.md",
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [...appTestState.settingsResponse.workspaces, remoteWorkspace],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [remoteWorkspace.id]: [
+        staleResponse.promise,
+        jsonResponse({ skills: [freshSkill], errors: [] }),
+      ],
+    };
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh skill discovery" }));
+    expect(await screen.findByText("Fresh remote skill")).toBeInTheDocument();
+    staleResponse.resolve(jsonResponse({ skills: [staleSkill], errors: [] }));
+    await act(async () => undefined);
+
+    expect(screen.queryByText("Stale remote skill")).toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(([url]) =>
+        String(url).includes("/api/workspaces/workspace-remote-race/skills"),
+      ).length,
+    ).toBeGreaterThanOrEqual(2);
+  });
+
   it("shows the five-minute default for Spec and every Memory LLM request", async () => {
     renderApp();
 
