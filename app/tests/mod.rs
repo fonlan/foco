@@ -141,6 +141,62 @@ fn test_neutral_tool_call(call_id: &str, name: &str, arguments: Value) -> Neutra
 }
 
 #[test]
+fn builtin_tool_prompt_metadata_omits_descriptions_without_changing_provider_schemas() {
+    let builtin_tools = builtin_tool_definitions_for_runtime(true, true);
+    let neutral_tools = builtin_tools
+        .iter()
+        .cloned()
+        .map(neutral_tool_definition)
+        .collect::<Vec<_>>();
+    let prompt_infos = tool_prompt_infos(&builtin_tools, &[], &[]);
+
+    assert_eq!(
+        prompt_infos
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>(),
+        neutral_tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect::<Vec<_>>()
+    );
+    for (builtin, neutral) in builtin_tools.iter().zip(&neutral_tools) {
+        assert_eq!(neutral.name, builtin.name);
+        assert_eq!(neutral.description, builtin.description);
+        assert_eq!(neutral.input_schema, builtin.input_schema);
+        assert_eq!(neutral.strict, builtin.strict);
+    }
+
+    let routing_prompt = build_available_tools_prompt(&prompt_infos).expect("graph routing prompt");
+    let graph_guidance = routing_prompt
+        .strip_prefix("## Tool Routing\n\n")
+        .expect("tool routing heading");
+    let legacy_tool_listing = builtin_tools
+        .iter()
+        .map(|tool| format!("\n- `{}`: {}", tool.name, tool.description))
+        .collect::<String>();
+    let legacy_prompt = format!(
+        "## Available Tools\n\n### Tool Routing\n{graph_guidance}\n\n### Tools{legacy_tool_listing}"
+    );
+
+    assert!(!routing_prompt.contains("### Tools"));
+    assert!(
+        builtin_tools
+            .iter()
+            .all(|tool| !routing_prompt.contains(tool.description))
+    );
+    assert!(legacy_prompt.len() > routing_prompt.len());
+    assert!(estimate_text_tokens(&legacy_prompt) > estimate_text_tokens(&routing_prompt));
+    println!(
+        "available tool prompt: {} chars / {} tokens -> {} chars / {} tokens",
+        legacy_prompt.len(),
+        estimate_text_tokens(&legacy_prompt),
+        routing_prompt.len(),
+        estimate_text_tokens(&routing_prompt)
+    );
+}
+
+#[test]
 fn tool_results_affect_plans_requires_successful_plan_tool_result() {
     let read_file_result = ExecutedToolCall {
         id: "call-1".to_string(),
@@ -23892,14 +23948,10 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("## Available Tools"))
-        .expect("available tools message");
+        .find(|message| message.content.contains("## Tool Routing"))
+        .expect("tool routing message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(
-        available_tools_message
-            .content
-            .contains("## Available Tools")
-    );
+    assert!(available_tools_message.content.contains("## Tool Routing"));
     assert!(
         !available_tools_message
             .content
@@ -24127,33 +24179,20 @@ Use this only after reading the skill file.
         .provider_request
         .messages
         .iter()
-        .find(|message| message.content.contains("## Available Tools"))
-        .expect("available tools message");
+        .find(|message| message.content.contains("## Tool Routing"))
+        .expect("tool routing message");
     assert!(
         available_tools_message
             .content
-            .contains(&format!("- `{CREATE_PLAN_TOOL}`:"))
-    );
-    assert!(
-        available_tools_message
-            .content
-            .contains(&format!("- `{DELETE_PLAN_TOOL}`:"))
+            .contains("Code graph tool routing:")
     );
     assert!(
         available_tools_message
             .content
-            .contains(&format!("- `{mcp_tool_name}`:"))
+            .contains("MCP tool routing:")
     );
-    assert!(
-        !available_tools_message
-            .content
-            .contains(&format!("- `{WRITE_FILE_TOOL}`:"))
-    );
-    assert!(
-        !available_tools_message
-            .content
-            .contains(&format!("- `{MEMORY_WRITE_TOOL_NAME}`:"))
-    );
+    assert!(!available_tools_message.content.contains("### Tools"));
+    assert!(!available_tools_message.content.contains(mcp_tool_name));
 
     drop(context);
     drop(state);
@@ -24317,11 +24356,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         .get(1)
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(
-        available_tools_message
-            .content
-            .contains("## Available Tools")
-    );
+    assert!(available_tools_message.content.contains("## Tool Routing"));
     assert!(!available_tools_message.content.contains(SEARCH_TEXT_TOOL));
 
     drop(context);
@@ -24389,7 +24424,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
         .get(1)
         .expect("available tools message");
     assert!(!available_tools_message.content.contains(WEB_SEARCH_TOOL));
-    assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
+    assert!(!available_tools_message.content.contains(WEB_FETCH_TOOL));
 
     drop(context);
     drop(state);
@@ -24445,8 +24480,8 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
         .messages
         .get(1)
         .expect("available tools message");
-    assert!(available_tools_message.content.contains(WEB_SEARCH_TOOL));
-    assert!(available_tools_message.content.contains(WEB_FETCH_TOOL));
+    assert!(!available_tools_message.content.contains(WEB_SEARCH_TOOL));
+    assert!(!available_tools_message.content.contains(WEB_FETCH_TOOL));
 
     drop(context);
     drop(state);
@@ -24545,7 +24580,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
     assert!(
         !context.provider_request.messages[0]
             .content
-            .contains("## Available Tools")
+            .contains("## Tool Routing")
     );
     let available_tools_message = context
         .provider_request
@@ -24553,12 +24588,8 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         .get(1)
         .expect("available tools message");
     assert_eq!(available_tools_message.role, NeutralChatRole::System);
-    assert!(
-        available_tools_message
-            .content
-            .contains("## Available Tools")
-    );
-    assert!(available_tools_message.content.contains("read_file"));
+    assert!(available_tools_message.content.contains("## Tool Routing"));
+    assert!(!available_tools_message.content.contains("### Tools"));
 
     drop(context);
     drop(state);

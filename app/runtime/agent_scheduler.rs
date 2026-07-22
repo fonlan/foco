@@ -12,9 +12,10 @@ use chrono::{DateTime, Utc};
 use foco_agent::{
     AgentAttemptId, AgentCollaborationTool, AgentExecutionWorkspaceMode, AgentInstanceStatus,
     AgentPermissions, AgentRole, AgentRunAssociations, AgentRunOutcome, AgentTaskId,
-    AgentTaskStatus, AgentTaskTransition, build_subagents_prompt_section, estimate_text_tokens,
+    AgentTaskStatus, AgentTaskTransition, ToolPromptInfo, build_available_tools_prompt,
+    build_subagents_prompt_section, estimate_text_tokens,
 };
-use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall};
+use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall, NeutralToolDefinition};
 use foco_store::{
     config::{AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS, AgentDefinitionSettings},
     workspace::{
@@ -856,6 +857,16 @@ async fn run_coordinator_task_inner(
         .cloned()
         .collect::<HashSet<_>>();
     retain_agent_snapshot_tools(&mut chat_context.provider_request.tools, &allowed_tools);
+    let removed_tool_routing = sync_agent_tool_routing_prompt(
+        &mut chat_context.provider_request.messages,
+        &mut chat_context.message_source_sequences,
+        &mut chat_context.message_context_sources,
+        &chat_context.provider_request.tools,
+    );
+    if removed_tool_routing {
+        chat_context.active_tool_start_index =
+            chat_context.active_tool_start_index.saturating_sub(1);
+    }
     let collaboration_permissions = if task_input.collaboration_tools_enabled {
         instance.definition_snapshot.permissions.clone()
     } else {
@@ -1831,6 +1842,38 @@ pub(crate) fn retain_agent_snapshot_tools(
     allowed_tools: &HashSet<String>,
 ) {
     tools.retain(|tool| allowed_tools.contains(&tool.name));
+}
+
+fn sync_agent_tool_routing_prompt(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    tools: &[NeutralToolDefinition],
+) -> bool {
+    let tool_infos = tools
+        .iter()
+        .map(|tool| ToolPromptInfo {
+            name: tool.name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let routing_prompt = build_available_tools_prompt(&tool_infos);
+    let routing_index = messages.iter().position(|message| {
+        message.role == NeutralChatRole::System && message.content.starts_with("## Tool Routing")
+    });
+
+    match (routing_index, routing_prompt) {
+        (Some(index), Some(prompt)) => {
+            messages[index].content = prompt;
+            false
+        }
+        (Some(index), None) => {
+            messages.remove(index);
+            message_source_sequences.remove(index);
+            message_context_sources.remove(index);
+            true
+        }
+        (None, _) => false,
+    }
 }
 
 fn append_agent_collaboration_tools(

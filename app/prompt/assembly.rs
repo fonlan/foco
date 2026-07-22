@@ -304,7 +304,7 @@ pub(crate) async fn prepare_prompt_context(
         .as_ref()
         .map(|_| build_project_spec_prompt_section());
     let memory_prompt_section = config.memory.enabled.then(build_memory_prompt_section);
-    let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos);
+    let available_tools_prompt = build_available_tools_prompt(&tool_prompt_infos);
     let skills_snapshot =
         available_skills_snapshot_for_workspace(&state.user_profile_dir, config, &workspace.id);
     let skill_messages = available_skills_routing_message(&skills_snapshot.prompt_entries)

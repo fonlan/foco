@@ -901,7 +901,6 @@ const IMAGE_GEN_TOOL_NAME: &str = "image_gen";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolPromptInfo {
     pub name: String,
-    pub description: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1123,8 +1122,8 @@ You are a deeply pragmatic, effective software engineer. You take engineering qu
 
 - Prefer code graph tools before text search when locating symbols, callers, callees, references, or related files.
 - Use search_text for literal text, config keys, and error messages when available; it is powered by ripgrep/rg. Use find_files for glob-based file discovery when available.
-- Use only tools that are actually available in the current run. The next system message lists the current tool names and descriptions.
-- Treat MCP tools in the available-tool list as first-class tools. Use them when they directly match an external system, service, or data source needed for the task.
+- Use only tools that are actually exposed for the current request. Their provided schemas define the available names and arguments.
+- Treat exposed MCP tools as first-class tools. Use them when they directly match an external system, service, or data source needed for the task.
 - Built-in file tools use workspace-relative paths. Use "." for the workspace root.
 - Command execution tools run a command plus args directly. Put the executable in command and each argument in args. Do not concatenate shell commands into one string unless you explicitly invoke the detected shell.
 - Parallelize independent tool calls whenever the current model/tool interface supports multiple calls in one turn. Foco executes compatible tool calls concurrently, but conflicting writes to the same resource must not be batched.
@@ -1222,31 +1221,21 @@ The final answer should lead with the result, then explain what changed and what
     )
 }
 
-pub fn build_available_tools_prompt(tools: Vec<ToolPromptInfo>) -> Option<String> {
-    if tools.is_empty() {
+pub fn build_available_tools_prompt(tools: &[ToolPromptInfo]) -> Option<String> {
+    let graph_guidance = available_graph_tool_guidance(tools);
+    let mcp_guidance = available_mcp_tool_guidance(tools);
+    if graph_guidance.is_none() && mcp_guidance.is_none() {
         return None;
     }
 
-    let graph_guidance = available_graph_tool_guidance(&tools);
-    let mcp_guidance = available_mcp_tool_guidance(&tools);
-    let mut prompt = String::from("## Available Tools");
-    if graph_guidance.is_some() || mcp_guidance.is_some() {
-        prompt.push_str("\n\n### Tool Routing");
-        if let Some(graph_guidance) = graph_guidance {
-            prompt.push('\n');
-            prompt.push_str(graph_guidance);
-        }
-        if let Some(mcp_guidance) = mcp_guidance {
-            prompt.push('\n');
-            prompt.push_str(mcp_guidance);
-        }
+    let mut prompt = String::from("## Tool Routing");
+    if let Some(graph_guidance) = graph_guidance {
+        prompt.push_str("\n\n");
+        prompt.push_str(graph_guidance);
     }
-    prompt.push_str("\n\n### Tools");
-    for tool in tools {
-        prompt.push_str("\n- `");
-        prompt.push_str(&tool.name.replace('`', "\\`"));
-        prompt.push_str("`: ");
-        prompt.push_str(&tool.description);
+    if let Some(mcp_guidance) = mcp_guidance {
+        prompt.push_str("\n\n");
+        prompt.push_str(mcp_guidance);
     }
 
     Some(prompt)
@@ -2945,7 +2934,11 @@ mod tests {
 
         assert!(prompt.contains("You are Foco, a local coding agent"));
         assert!(prompt.contains("Prefer code graph tools before text search"));
-        assert!(prompt.contains("Treat MCP tools in the available-tool list as first-class tools"));
+        assert!(prompt.contains("Treat exposed MCP tools as first-class tools"));
+        assert!(
+            prompt.contains("Use only tools that are actually exposed for the current request")
+        );
+        assert!(!prompt.contains("The next system message lists the current tool names"));
         assert!(prompt.contains("When skill front matter is injected"));
         assert!(prompt.contains("A hard tool-batch conflict rejects the entire batch"));
         assert!(prompt.contains("never batch write_file with edit_file"));
@@ -2977,65 +2970,53 @@ mod tests {
     }
 
     #[test]
-    fn available_tools_prompt_formats_current_tools_only() {
-        let prompt = build_available_tools_prompt(vec![
+    fn available_tools_prompt_is_omitted_without_routing_rules() {
+        let prompt = build_available_tools_prompt(&[
             ToolPromptInfo {
                 name: "read_file".to_string(),
-                description: "Read a file.".to_string(),
             },
             ToolPromptInfo {
                 name: "run_command".to_string(),
-                description: "Run a command.".to_string(),
             },
-        ])
-        .expect("available tools prompt");
+        ]);
 
-        assert_eq!(
-            prompt,
-            "## Available Tools\n\n### Tools\n- `read_file`: Read a file.\n- `run_command`: Run a command."
-        );
+        assert!(prompt.is_none());
     }
 
     #[test]
     fn available_tools_prompt_routes_mcp_tools_when_available() {
-        let prompt = build_available_tools_prompt(vec![ToolPromptInfo {
+        let prompt = build_available_tools_prompt(&[ToolPromptInfo {
             name: "mcp__notes__search".to_string(),
-            description: "Search notes.".to_string(),
         }])
         .expect("available tools prompt");
 
-        assert!(prompt.contains("### Tool Routing"));
+        assert!(prompt.starts_with("## Tool Routing"));
         assert!(prompt.contains("MCP tool routing:"));
         assert!(prompt.contains("Use MCP tools when they directly match"));
-        assert!(prompt.contains("- `mcp__notes__search`: Search notes."));
+        assert!(!prompt.contains("### Tools"));
+        assert!(!prompt.contains("mcp__notes__search"));
     }
 
     #[test]
     fn available_tools_prompt_routes_graph_tools_when_graph_explore_is_available() {
-        let prompt = build_available_tools_prompt(vec![
+        let prompt = build_available_tools_prompt(&[
             ToolPromptInfo {
                 name: GRAPH_EXPLORE_TOOL_NAME.to_string(),
-                description: "Read symbol source.".to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_FIND_SYMBOLS_TOOL_NAME.to_string(),
-                description: "Find symbols.".to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_FIND_CALLERS_TOOL_NAME.to_string(),
-                description: "Find callers.".to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_FIND_CALLEES_TOOL_NAME.to_string(),
-                description: "Find callees.".to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_FIND_REFERENCES_TOOL_NAME.to_string(),
-                description: "Find references.".to_string(),
             },
             ToolPromptInfo {
                 name: GRAPH_RELATED_FILES_TOOL_NAME.to_string(),
-                description: "Find related files.".to_string(),
             },
         ])
         .expect("available tools prompt");
@@ -3044,7 +3025,34 @@ mod tests {
         assert!(prompt.contains("use graph_explore first"));
         assert!(prompt.contains("do not follow it with read_file"));
         assert!(prompt.contains("Need relationships"));
-        assert!(prompt.contains("- `graph_explore`: Read symbol source."));
+        assert!(!prompt.contains("### Tools"));
+        assert!(!prompt.contains("Read symbol source."));
+    }
+
+    #[test]
+    fn available_tools_prompt_orders_graph_routing_before_mcp_routing() {
+        let prompt = build_available_tools_prompt(&[
+            ToolPromptInfo {
+                name: GRAPH_EXPLORE_TOOL_NAME.to_string(),
+            },
+            ToolPromptInfo {
+                name: "mcp__notes__search".to_string(),
+            },
+        ])
+        .expect("available tools prompt");
+
+        let graph_index = prompt
+            .find("Code graph tool routing:")
+            .expect("graph routing guidance");
+        let mcp_index = prompt
+            .find("MCP tool routing:")
+            .expect("MCP routing guidance");
+        assert!(
+            graph_index < mcp_index,
+            "graph routing must precede MCP routing: {prompt}"
+        );
+        assert!(!prompt.contains("### Tools"));
+        assert!(!prompt.contains("mcp__notes__search"));
     }
 
     #[test]

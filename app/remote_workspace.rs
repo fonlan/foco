@@ -12190,11 +12190,12 @@ fn remote_sidecar_prepare_chat_context_with_options(
         .lock()
         .ok()
         .and_then(|config| config.clone());
-    let available_tools_prompt = build_available_tools_prompt(tool_prompt_infos(
+    let tool_prompt_infos = tool_prompt_infos(
         &tool_catalog.builtin_prompt_tools,
         &tool_catalog.memory_prompt_tools,
         &tool_catalog.mcp_prompt_tools,
-    ));
+    );
+    let available_tools_prompt = build_available_tools_prompt(&tool_prompt_infos);
     let skill_context = remote_sidecar_skill_context(state, bundle.as_ref(), requested_skill_ids)?;
     apply_sidecar_selected_skills(&skill_context.selected_entries, &mut filtered_messages)?;
     let skill_routing_message = skill_context.routing_message;

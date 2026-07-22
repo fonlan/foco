@@ -105,18 +105,12 @@ pub(crate) fn tool_prompt_infos(
         .iter()
         .map(|tool| ToolPromptInfo {
             name: tool.name.to_string(),
-            description: tool.description.to_string(),
         })
         .chain(memory_tools.iter().map(|tool| ToolPromptInfo {
             name: tool.name.clone(),
-            description: tool.description.clone(),
         }))
         .chain(mcp_tools.iter().map(|tool| ToolPromptInfo {
             name: tool.name.clone(),
-            description: format!(
-                "{} MCP server '{}': {}",
-                tool.original_name, tool.server_name, tool.description
-            ),
         }))
         .collect()
 }
