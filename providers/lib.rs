@@ -1302,7 +1302,6 @@ pub const AGENT_HEADER_FOCO_RUN_ID: &str = "x-foco-run-id";
 pub const AGENT_HEADER_FOCO_WORKSPACE_ID: &str = "x-foco-workspace-id";
 pub const AGENT_HEADER_ORIGINATOR: &str = "originator";
 pub const AGENT_HEADER_USER_AGENT: &str = "User-Agent";
-pub const AGENT_HEADER_VERSION: &str = "version";
 
 /// Headers that must not affect OpenAI Responses WebSocket continuation fingerprints.
 pub const AGENT_VOLATILE_HEADER_NAMES: &[&str] =
@@ -1344,29 +1343,26 @@ pub fn foco_agent_user_agent() -> String {
     )
 }
 
-pub fn foco_agent_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
-
 fn header_name_key(name: &str) -> String {
     name.trim().to_ascii_lowercase()
 }
 
 /// Build default OpenAIResp Agent headers (L2–L4). Callers merge `request_overrides` after.
+///
+/// Does not send a bare `version` header: some third-party/CPA gateways misread it as a
+/// Codex client version. App version remains in the Foco `User-Agent`. Operators may still
+/// add `version` via `request_overrides`.
 pub fn default_openai_resp_agent_headers(
     uses_websocket: bool,
     correlation: Option<&AgentRequestCorrelation>,
 ) -> Vec<(String, String)> {
-    let mut headers = Vec::with_capacity(10);
+    // originator + User-Agent + optional WS beta + up to 5 correlation headers
+    let mut headers = Vec::with_capacity(8);
     headers.push((
         AGENT_HEADER_ORIGINATOR.to_string(),
         FOCO_AGENT_ORIGINATOR.to_string(),
     ));
     headers.push((AGENT_HEADER_USER_AGENT.to_string(), foco_agent_user_agent()));
-    headers.push((
-        AGENT_HEADER_VERSION.to_string(),
-        foco_agent_version().to_string(),
-    ));
     if uses_websocket {
         headers.push((
             OPENAI_RESP_WS_BETA_HEADER.to_string(),
@@ -4731,6 +4727,10 @@ mod tests {
                     header(OPENAI_RESP_WS_BETA_HEADER),
                     OPENAI_RESP_WS_BETA_VALUE
                 );
+                assert!(
+                    req.headers().get("version").is_none(),
+                    "upgrade must not send bare version header by default"
+                );
                 saw_agent_headers_server.fetch_add(1, Ordering::SeqCst);
                 Ok(response)
             })
@@ -4824,6 +4824,10 @@ mod tests {
         assert_eq!(
             dump_header_first(&wire.headers, AGENT_HEADER_ORIGINATOR).as_deref(),
             Some(FOCO_AGENT_ORIGINATOR)
+        );
+        assert!(
+            dump_header_first(&wire.headers, "version").is_none(),
+            "WS wire dump must not include default version header"
         );
         while let Some(event) = stream.next_event().await {
             let _ = event.expect("event");
@@ -6093,6 +6097,10 @@ mod tests {
             Some("ws-1")
         );
         assert!(!headers.contains_key("openai-beta"));
+        assert!(
+            !headers.contains_key("version"),
+            "default OpenAIResp HTTP headers must not send bare version (app version stays in User-Agent)"
+        );
     }
 
     #[test]
@@ -6131,6 +6139,10 @@ mod tests {
             headers.get("session-id").map(String::as_str),
             Some("chat-abc")
         );
+        assert!(
+            !headers.contains_key("version"),
+            "default OpenAIResp WebSocket headers must not send bare version"
+        );
     }
 
     #[test]
@@ -6168,6 +6180,12 @@ mod tests {
                     value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
                     value: Value::String("custom-gateway".to_string()),
                 },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "version".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("explicit-version-override".to_string()),
+                },
             ],
             model_redirects: Vec::new(),
         };
@@ -6184,6 +6202,11 @@ mod tests {
         assert_eq!(
             headers.get("thread-id").map(String::as_str),
             Some("thread-default")
+        );
+        assert_eq!(
+            headers.get("version").map(String::as_str),
+            Some("explicit-version-override"),
+            "request_overrides may still add version; defaults only omit it"
         );
     }
 
@@ -6652,6 +6675,10 @@ mod tests {
             dump_header_first(&dump.headers, OPENAI_RESP_WS_BETA_HEADER).is_none(),
             "HTTP Responses must not send OpenAI-Beta websocket capability header"
         );
+        assert!(
+            dump_header_first(&dump.headers, "version").is_none(),
+            "HTTP wire dump must not include default version header"
+        );
 
         assert_eq!(
             raw_header_value(&raw, AGENT_HEADER_ORIGINATOR).as_deref(),
@@ -6672,6 +6699,10 @@ mod tests {
         assert!(
             raw_header_value(&raw, OPENAI_RESP_WS_BETA_HEADER).is_none(),
             "raw HTTP must not include OpenAI-Beta websocket header"
+        );
+        assert!(
+            raw_header_value(&raw, "version").is_none(),
+            "raw HTTP must not include default version header"
         );
     }
 
@@ -6839,6 +6870,12 @@ mod tests {
                     value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
                     value: Value::String("gateway-custom".to_string()),
                 },
+                ProviderRequestOverride {
+                    target: REQUEST_OVERRIDE_TARGET_HEADER.to_string(),
+                    name: "version".to_string(),
+                    value_type: REQUEST_OVERRIDE_VALUE_TYPE_STRING.to_string(),
+                    value: Value::String("explicit-version-wire".to_string()),
+                },
             ],
             model_redirects: Vec::new(),
         };
@@ -6879,12 +6916,22 @@ mod tests {
             Some("thread-default")
         );
         assert_eq!(
+            dump_header_first(&dump.headers, "version").as_deref(),
+            Some("explicit-version-wire"),
+            "wire dump must allow explicit version via request_overrides"
+        );
+        assert_eq!(
             raw_header_value(&raw, AGENT_HEADER_SESSION_ID).as_deref(),
             Some("session-from-override")
         );
         assert_eq!(
             raw_header_value(&raw, AGENT_HEADER_ORIGINATOR).as_deref(),
             Some("gateway-custom")
+        );
+        assert_eq!(
+            raw_header_value(&raw, "version").as_deref(),
+            Some("explicit-version-wire"),
+            "raw HTTP must allow explicit version via request_overrides"
         );
     }
 

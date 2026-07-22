@@ -28,7 +28,7 @@ Implementation status: **runtime injection + wire verification** (Phases 2–3).
 | **L1 Official / common Responses** | Auth + body multi-turn / cache fields | On where already implemented | Yes for auth; body fields per product path |
 | **L2 Responses WebSocket capability** | `OpenAI-Beta: responses_websockets=2026-02-06` | On **only** when `uses_websocket` | Required by Responses WS product path; not used on plain HTTP Responses |
 | **L3 Agent correlation** | `session-id`, `thread-id`, `x-client-request-id` (+ optional diagnostic headers) | **On** for OpenAIResp adapters only (HTTP Responses and Responses WebSocket) | No (product/gateway convention) |
-| **L4 Foco client identity** | `originator`, `User-Agent`, optional `version` | **On** for OpenAIResp adapters only; fixed Foco values | No |
+| **L4 Foco client identity** | `originator`, `User-Agent` (app version in UA only) | **On** for OpenAIResp adapters only; fixed Foco values | No |
 | **L5 Codex / ChatGPT product headers** | e.g. `ChatGPT-Account-ID`, `x-oai-attestation`, server `x-codex-turn-state`, Codex-style `originator` | **Never** defaulted by Foco | Out of scope |
 
 `request_overrides` (Provider settings header/body overrides) may **override or append** same-named headers after Foco defaults are assembled. Overrides never become a Codex “compatibility mode” product surface.
@@ -94,13 +94,13 @@ Rules:
 | --- | --- | --- |
 | `originator` | `foco` | On (OpenAIResp) |
 | `User-Agent` | `foco/<app-version> (...)` with OS/arch detail as implemented | On (OpenAIResp) |
-| `version` | `<app-version>` | Optional companion to User-Agent |
 
 Rules:
 
 - Foco’s default identity is **`foco`**, **not** `codex_cli_rs`.
 - There is **no** settings switch to “act as Codex CLI” or to swap originator to Codex product strings.
-- Operators may still set custom `originator` / `User-Agent` via `request_overrides` if a gateway requires it; that is manual configuration, not a first-class Codex compatibility mode.
+- App version is carried only in the Foco `User-Agent` string. Foco does **not** default-send a bare `version` request header: some third-party / CPA gateways misinterpret a standalone `version` as a Codex client version and may reject newer models as “upgrade Codex”.
+- Operators may still set custom `originator` / `User-Agent` / `version` via `request_overrides` if a gateway requires it; that is manual configuration, not a first-class Codex compatibility mode. Explicit `version` in overrides is still allowed and is not blocked.
 
 ---
 
