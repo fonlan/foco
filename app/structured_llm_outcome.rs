@@ -671,6 +671,62 @@ mod tests {
     }
 
     #[test]
+    fn thinking_tool_choice_compatibility_matches_case_and_separator_variants() {
+        let required = NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        for message in [
+            "Thinking mode does not support this tool_choice",
+            "THINKING MODE DOES NOT SUPPORT THIS TOOL CHOICE",
+            "Thinking is incompatible with forced tool-choice; only supports auto.",
+        ] {
+            let failure =
+                classify_required_single_tool_provider_failure_kind(message, Some(400), &required);
+            assert_eq!(
+                failure,
+                StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
+                "expected Thinking/tool-choice compatibility classification for {message:?}"
+            );
+            assert_eq!(
+                failure.structured_outcome(),
+                STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR
+            );
+            assert_eq!(
+                next_audited_stream_action(failure, Some(400), false, 0, 2),
+                StructuredLlmNextAction::Continue {
+                    retry_kind: StructuredLlmRetryKind::OutputRepair,
+                    provider_retry_index: 0,
+                    output_repair_used: true,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_tool_choice_compatibility_rejects_partial_and_non_400_signals() {
+        let required = NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        for (message, status_code) in [
+            ("Thinking mode is enabled.", Some(400)),
+            ("tool_choice is unsupported.", Some(400)),
+            ("Thinking mode does not support this tool_choice", None),
+            ("Thinking mode does not support this tool_choice", Some(408)),
+            ("Thinking mode does not support this tool_choice", Some(429)),
+            ("Thinking mode does not support this tool_choice", Some(500)),
+            ("invalid request body", Some(400)),
+        ] {
+            assert_ne!(
+                classify_required_single_tool_provider_failure_kind(
+                    message,
+                    status_code,
+                    &required
+                ),
+                StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
+                "must not classify {message:?} with status {status_code:?} as a compatibility failure"
+            );
+        }
+    }
+
+    #[test]
     fn compatibility_repair_downgrades_only_tool_choice_and_keeps_the_single_tool_prompt() {
         let base = NeutralChatRequest {
             model_id: "model".to_string(),
@@ -830,6 +886,54 @@ mod tests {
             ),
             StructuredLlmNextAction::Stop
         );
+    }
+
+    #[test]
+    fn compatibility_repair_uses_the_only_output_repair_slot() {
+        let repair = next_audited_stream_action(
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
+            Some(400),
+            false,
+            0,
+            2,
+        );
+        assert_eq!(
+            repair,
+            StructuredLlmNextAction::Continue {
+                retry_kind: StructuredLlmRetryKind::OutputRepair,
+                provider_retry_index: 0,
+                output_repair_used: true,
+            }
+        );
+
+        for failure_kind in [
+            StructuredLlmFailureKind::MissingTool,
+            StructuredLlmFailureKind::Prose,
+            StructuredLlmFailureKind::SchemaInvalid,
+        ] {
+            assert_eq!(
+                next_audited_stream_action(failure_kind, None, true, 0, 2),
+                StructuredLlmNextAction::Stop,
+                "{failure_kind:?} after a compatibility repair must not schedule another repair"
+            );
+        }
+
+        for (failure_kind, status_code) in [
+            (StructuredLlmFailureKind::ProviderTimeout, None),
+            (StructuredLlmFailureKind::ProviderError, Some(408)),
+            (StructuredLlmFailureKind::ProviderError, Some(429)),
+            (StructuredLlmFailureKind::ProviderError, Some(503)),
+        ] {
+            assert_eq!(
+                next_audited_stream_action(failure_kind, status_code, true, 0, 2),
+                StructuredLlmNextAction::Continue {
+                    retry_kind: StructuredLlmRetryKind::ProviderRetry,
+                    provider_retry_index: 1,
+                    output_repair_used: true,
+                },
+                "{failure_kind:?} status {status_code:?} must retain the provider retry budget"
+            );
+        }
     }
 
     /// Fault matrix: each protocol-class failure repairs once; semantic/other stop; transport uses budget.

@@ -11,10 +11,11 @@ use crate::runtime::{
     REASONING_LOOP_RECOVERY_USER_TEXT, agent_run_event_kind,
 };
 use axum::{
-    Json,
+    Json, Router,
     body::to_bytes,
     extract::{Path as AxumPath, Query, State},
     response::IntoResponse,
+    routing::post,
 };
 use foco_agent::{
     AgentInstanceId, AgentRunContext, AgentRunEvent, AgentRunEventEmitter, AgentRunExecutor,
@@ -32304,6 +32305,408 @@ async fn run_provider_stream_for_text_returns_readable_timeout() {
     assert_eq!(
         error.message,
         "model availability test timed out after 1 ms"
+    );
+}
+
+#[tokio::test]
+async fn audited_single_tool_request_recovers_thinking_tool_choice_400_with_auto_wire_and_linked_audits()
+ {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let provider_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let provider_app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let provider_requests = provider_requests.clone();
+            move |body: axum::body::Bytes| {
+                let provider_requests = provider_requests.clone();
+                async move {
+                    let request: Value =
+                        serde_json::from_slice(&body).expect("provider request JSON");
+                    let attempt = {
+                        let mut requests = provider_requests.lock().expect("provider capture");
+                        requests.push(request);
+                        requests.len()
+                    };
+
+                    if attempt == 1 {
+                        return axum::response::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
+                            ))
+                            .expect("build Thinking compatibility failure");
+                    }
+
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(concat!(
+                            "data: {\"id\":\"thinking-tool-repair\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-memory\",\"type\":\"function\",\"function\":{\"name\":\"select_relevant_memory\",\"arguments\":\"{\\\"factKeys\\\":[\\\"fact-1\\\"]}\"}}]},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"thinking-tool-repair\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )))
+                        .expect("build repaired tool-call stream")
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind provider fixture");
+    let provider_address = listener.local_addr().expect("provider fixture address");
+    let provider_task = tokio::spawn(async move {
+        axum::serve(listener, provider_app)
+            .await
+            .expect("serve provider fixture");
+    });
+
+    let provider_config = ProviderConnectionConfig {
+        kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("provider kind"),
+        base_url: Some(format!("http://{provider_address}/v1")),
+        api_key: Some("test-key".to_string()),
+        proxy_url: None,
+        request_overrides: Vec::new(),
+        model_redirects: Vec::new(),
+    };
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Memory retrieval")
+        .expect("insert chat");
+    drop(database);
+
+    let tool = memory_retrieval_tool_definition();
+    let result = audited_provider_tool_request(
+        workspace.path(),
+        "workspace",
+        Some("chat-1"),
+        "provider",
+        &provider_config,
+        NeutralChatRequest {
+            model_id: "model".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Select relevant memory.".to_string(),
+            )],
+            tools: vec![tool.clone()],
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                "select_relevant_memory",
+            ),
+        },
+        "memory retrieval",
+        "select_relevant_memory",
+        "memory retrieval",
+        5_000,
+        2,
+        true,
+    )
+    .await
+    .expect("Thinking compatibility repair should recover");
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    assert_eq!(result.arguments, json!({ "factKeys": ["fact-1"] }));
+    assert_eq!(result.attempt_index, 2);
+    assert_eq!(
+        result.recovery_source,
+        foco_store::workspace::STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY
+    );
+
+    let provider_requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(provider_requests.len(), 2);
+    assert_eq!(provider_requests[0]["tool_choice"]["type"], "function");
+    assert_eq!(
+        provider_requests[0]["tool_choice"]["function"]["name"],
+        "select_relevant_memory"
+    );
+    assert!(
+        provider_requests[1]["tool_choice"].is_null(),
+        "OpenAI chat omits Auto rather than serializing another forced choice"
+    );
+    assert_eq!(provider_requests[0]["tools"], provider_requests[1]["tools"]);
+    assert_eq!(
+        provider_requests[1]["tools"][0]["function"]["name"],
+        tool.name
+    );
+    drop(provider_requests);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let audit_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_kind: Some("memory retrieval"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("memory retrieval audit rows");
+    assert_eq!(audit_rows.len(), 2);
+    let mut attempts = audit_rows
+        .iter()
+        .map(|row| {
+            database
+                .llm_request(&row.id)
+                .expect("read audit row")
+                .expect("audit row exists")
+        })
+        .collect::<Vec<_>>();
+    attempts.sort_by_key(|attempt| attempt.attempt_index);
+    assert_eq!(attempts[0].final_state, "failed");
+    assert_eq!(attempts[0].status_code, Some(400));
+    assert_eq!(
+        attempts[0].structured_outcome.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR)
+    );
+    assert_eq!(
+        attempts[0].recovery_source.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_RECOVERY_NONE)
+    );
+    assert_eq!(attempts[0].attempt_index, Some(1));
+    assert_eq!(attempts[1].final_state, "succeeded");
+    assert_eq!(
+        attempts[1].recovery_source.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY)
+    );
+    assert_eq!(attempts[1].attempt_index, Some(2));
+    assert_eq!(
+        attempts[1].structured_outcome.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_OUTCOME_SUCCEEDED)
+    );
+    assert_eq!(
+        attempts[0].structured_call_id,
+        attempts[1].structured_call_id
+    );
+    assert!(attempts[0].structured_call_id.is_some());
+
+    let first_request_wire: Value = serde_json::from_str(
+        attempts[0]
+            .request_body_json
+            .as_deref()
+            .expect("first request wire audit"),
+    )
+    .expect("first request wire JSON");
+    let first_response_wire: Value = serde_json::from_str(
+        attempts[0]
+            .response_body_json
+            .as_deref()
+            .expect("first response wire audit"),
+    )
+    .expect("first response wire JSON");
+    let second_request_wire: Value = serde_json::from_str(
+        attempts[1]
+            .request_body_json
+            .as_deref()
+            .expect("second request wire audit"),
+    )
+    .expect("second request wire JSON");
+    let second_response_wire: Value = serde_json::from_str(
+        attempts[1]
+            .response_body_json
+            .as_deref()
+            .expect("second response wire audit"),
+    )
+    .expect("second response wire JSON");
+    assert_eq!(first_request_wire["format"], "provider_request_v1");
+    assert_eq!(first_response_wire["state"], "failed");
+    assert_eq!(first_response_wire["http"]["status"], 400);
+    assert_eq!(second_request_wire["format"], "provider_request_v1");
+    assert_eq!(second_response_wire["state"], "succeeded");
+}
+
+#[tokio::test]
+async fn audited_single_tool_request_does_not_repair_an_unrelated_http_400() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let provider_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let provider_app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let provider_requests = provider_requests.clone();
+            move |body: axum::body::Bytes| {
+                let provider_requests = provider_requests.clone();
+                async move {
+                    provider_requests
+                        .lock()
+                        .expect("provider capture")
+                        .push(serde_json::from_slice(&body).expect("provider request JSON"));
+                    axum::response::Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(axum::body::Body::from(
+                            r#"{"error":{"message":"invalid request body"}}"#,
+                        ))
+                        .expect("build non-compatible provider failure")
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind provider fixture");
+    let provider_address = listener.local_addr().expect("provider fixture address");
+    let provider_task = tokio::spawn(async move {
+        axum::serve(listener, provider_app)
+            .await
+            .expect("serve provider fixture");
+    });
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Memory retrieval")
+        .expect("insert chat");
+    drop(database);
+    let tool = memory_retrieval_tool_definition();
+    let result = audited_provider_tool_request(
+        workspace.path(),
+        "workspace",
+        Some("chat-1"),
+        "provider",
+        &ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("provider kind"),
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        },
+        NeutralChatRequest {
+            model_id: "model".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Select relevant memory.".to_string(),
+            )],
+            tools: vec![tool],
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                "select_relevant_memory",
+            ),
+        },
+        "memory retrieval",
+        "select_relevant_memory",
+        "memory retrieval",
+        5_000,
+        2,
+        false,
+    )
+    .await;
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    assert!(result.is_err(), "unrelated HTTP 400 must fail directly");
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        1,
+        "unrelated HTTP 400 must not schedule a compatibility repair"
+    );
+}
+
+#[tokio::test]
+async fn audited_single_tool_request_stops_after_compatibility_repair_returns_prose() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let provider_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let provider_app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let provider_requests = provider_requests.clone();
+            move |body: axum::body::Bytes| {
+                let provider_requests = provider_requests.clone();
+                async move {
+                    let attempt = {
+                        let mut requests = provider_requests.lock().expect("provider capture");
+                        requests.push(serde_json::from_slice(&body).expect("provider request JSON"));
+                        requests.len()
+                    };
+                    if attempt == 1 {
+                        return axum::response::Response::builder()
+                            .status(StatusCode::BAD_REQUEST)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
+                            ))
+                            .expect("build Thinking compatibility failure");
+                    }
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(concat!(
+                            "data: {\"id\":\"thinking-tool-prose\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"I will not call the tool.\"},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"thinking-tool-prose\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )))
+                        .expect("build prose stream")
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind provider fixture");
+    let provider_address = listener.local_addr().expect("provider fixture address");
+    let provider_task = tokio::spawn(async move {
+        axum::serve(listener, provider_app)
+            .await
+            .expect("serve provider fixture");
+    });
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Memory retrieval")
+        .expect("insert chat");
+    drop(database);
+    let tool = memory_retrieval_tool_definition();
+    let result = audited_provider_tool_request(
+        workspace.path(),
+        "workspace",
+        Some("chat-1"),
+        "provider",
+        &ProviderConnectionConfig {
+            kind: parse_provider_kind(OPENAI_CHAT_KIND).expect("provider kind"),
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        },
+        NeutralChatRequest {
+            model_id: "model".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Select relevant memory.".to_string(),
+            )],
+            tools: vec![tool],
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                "select_relevant_memory",
+            ),
+        },
+        "memory retrieval",
+        "select_relevant_memory",
+        "memory retrieval",
+        5_000,
+        2,
+        false,
+    )
+    .await;
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    assert!(result.is_err(), "prose after the repair must not recover");
+    assert_eq!(
+        provider_requests.lock().expect("provider requests").len(),
+        2,
+        "the compatibility repair must consume the only output-repair slot"
     );
 }
 

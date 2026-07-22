@@ -39927,6 +39927,172 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn remote_single_tool_request_retries_thinking_tool_choice_400_with_auto() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let first_request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                first_request.payload.pointer("/request/tool_choice"),
+                Some(&json!({
+                    "type": "requiredSingleTool",
+                    "toolName": "submit_workspace_spec_update"
+                }))
+            );
+            let first_id = first_request.id.clone().expect("first request id");
+            let first_tx = broker_pending
+                .lock()
+                .await
+                .remove(&first_id)
+                .expect("first pending response channel");
+            first_tx
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(first_id),
+                    method: None,
+                    payload: json!({
+                        "code": "stream_error",
+                        "statusCode": 400,
+                        "retryable": false,
+                        "message": "Thinking mode does not support this tool_choice",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send compatibility error");
+
+            let second_request = next_broker_llm_stream_request(&mut broker_rx).await;
+            assert_eq!(
+                second_request.payload.pointer("/request/tool_choice"),
+                Some(&json!({ "type": "auto" }))
+            );
+            assert_eq!(
+                second_request.payload["request"]["tools"][0]["name"],
+                "submit_workspace_spec_update"
+            );
+            assert!(
+                second_request.payload["request"]["messages"]
+                    .as_array()
+                    .is_some_and(|messages| messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("submit_workspace_spec_update"))
+                    })),
+                "Auto fallback must retain the expected tool instruction"
+            );
+            answer_broker_spec_tool_call(
+                &broker_pending,
+                &second_request,
+                "submit_workspace_spec_update",
+                json!({ "updateNeeded": false, "edits": null }),
+            )
+            .await;
+        });
+
+        let arguments = remote_sidecar_broker_tool_request(
+            &state,
+            "provider-1",
+            "model-1",
+            NeutralChatRequest {
+                model_id: "model-1".to_string(),
+                messages: vec![neutral_text_message(
+                    NeutralChatRole::User,
+                    "Update spec.".into(),
+                )],
+                tools: vec![single_submit_spec_tool()],
+                thinking_level: None,
+                max_output_tokens: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                    "submit_workspace_spec_update",
+                ),
+            },
+            None,
+            5_000,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            "submit_workspace_spec_update",
+        )
+        .await
+        .expect("Thinking compatibility repair should recover remotely");
+
+        assert_eq!(arguments, json!({ "updateNeeded": false, "edits": null }));
+        broker_task.await.expect("broker task");
+    }
+
+    #[tokio::test]
+    async fn remote_single_tool_request_does_not_retry_noncompatible_broker_400() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) = test_sidecar_state(workspace.path().display().to_string(), 1);
+        let broker_pending = state.broker_pending.clone();
+        let broker_task = tokio::spawn(async move {
+            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+            let request_id = request.id.clone().expect("broker request id");
+            let tx = broker_pending
+                .lock()
+                .await
+                .remove(&request_id)
+                .expect("pending broker response channel");
+            tx.send(ControlEnvelope {
+                version: 1,
+                message_type: "error".to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: json!({
+                    "code": "stream_error",
+                    "statusCode": 400,
+                    "retryable": false,
+                    "message": "invalid request body",
+                }),
+                timestamp: None,
+            })
+            .expect("send non-compatible error");
+            assert!(
+                timeout(
+                    Duration::from_millis(150),
+                    next_broker_llm_stream_request(&mut broker_rx)
+                )
+                .await
+                .is_err(),
+                "non-compatible broker error must not schedule a repair request"
+            );
+        });
+
+        let error = remote_sidecar_broker_tool_request(
+            &state,
+            "provider-1",
+            "model-1",
+            NeutralChatRequest {
+                model_id: "model-1".to_string(),
+                messages: vec![neutral_text_message(
+                    NeutralChatRole::User,
+                    "Update spec.".into(),
+                )],
+                tools: vec![single_submit_spec_tool()],
+                thinking_level: None,
+                max_output_tokens: None,
+                prompt_cache_key: None,
+                prompt_cache_retention: None,
+                agent_correlation: None,
+                tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                    "submit_workspace_spec_update",
+                ),
+            },
+            None,
+            5_000,
+            LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+            "submit_workspace_spec_update",
+        )
+        .await
+        .expect_err("non-compatible broker 400 must fail directly");
+
+        assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        broker_task.await.expect("broker task");
+    }
+
     #[test]
     fn remote_single_tool_protocol_failure_schedules_one_output_repair() {
         use crate::structured_llm_outcome::{
@@ -39959,7 +40125,7 @@ mod tests {
         let base_request = NeutralChatRequest {
             model_id: "m".to_string(),
             messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],
-            tools: vec![],
+            tools: vec![single_submit_spec_tool()],
             thinking_level: None,
             max_output_tokens: None,
             prompt_cache_key: None,
@@ -39992,6 +40158,12 @@ mod tests {
         assert_eq!(
             compatibility_repair.tool_choice,
             foco_providers::NeutralToolChoice::Auto
+        );
+        assert_eq!(compatibility_repair.tools, base_request.tools);
+        assert!(
+            compatibility_repair.messages[1]
+                .content
+                .contains("thinking_tool_choice_incompatible")
         );
     }
 
