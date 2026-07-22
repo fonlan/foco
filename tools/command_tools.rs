@@ -229,14 +229,38 @@ fn command_output_response(
     });
     let (chunks, next_cursor, has_more) =
         limited_chunks(&response_base, &output, cursor_before_output)?;
-    let mut result = response_base;
-    let object = result.as_object_mut().ok_or_else(|| {
+    command_output_page(response_base, chunks, next_cursor, has_more)
+}
+
+fn command_output_page(
+    mut response: Value,
+    chunks: Vec<Value>,
+    next_cursor: u64,
+    has_more: bool,
+) -> Result<Value, ToolRuntimeError> {
+    let process_id = response
+        .get("processId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+        })?;
+    let truncated = has_more;
+    let note = truncated.then(|| {
+        format!(
+            "This response was explicitly paginated under the shared output budget; no retained output was silently discarded. Continue with get_command_output using the same processId={process_id} and cursor={next_cursor} (the returned nextCursor) to receive the next complete chunk without repeats. This response-level truncated flag is separate from outputTruncated and cursorExpired, which only describe the retained process buffer."
+        )
+    });
+    let object = response.as_object_mut().ok_or_else(|| {
         ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
     })?;
     object.insert("chunks".to_string(), Value::Array(chunks));
     object.insert("nextCursor".to_string(), json!(next_cursor));
     object.insert("hasMore".to_string(), json!(has_more));
-    Ok(result)
+    object.insert("truncated".to_string(), Value::Bool(truncated));
+    if let Some(note) = note {
+        object.insert("note".to_string(), Value::String(note));
+    }
+    Ok(response)
 }
 
 fn limited_chunks(
@@ -246,71 +270,46 @@ fn limited_chunks(
 ) -> Result<(Vec<Value>, u64, bool), ToolRuntimeError> {
     let mut chunks = Vec::new();
     let mut next_cursor = cursor_before_output;
-    let mut text_lines = 0usize;
 
     for (index, chunk) in output.chunks.iter().enumerate() {
-        let text = String::from_utf8_lossy(&chunk.bytes).into_owned();
-        let chunk_lines = text_line_count(&text);
-        let next_lines = text_lines.saturating_add(chunk_lines);
         let candidate = json!({
             "cursor": chunk.cursor,
             "stream": match chunk.stream {
                 BackgroundCommandOutputStream::Stdout => "stdout",
                 BackgroundCommandOutputStream::Stderr => "stderr",
             },
-            "text": text,
+            "text": String::from_utf8_lossy(&chunk.bytes),
         });
-        let mut candidate_chunks = chunks.clone();
-        candidate_chunks.push(candidate);
         let candidate_next_cursor = chunk.cursor;
         let candidate_has_more = index + 1 < output.chunks.len();
-        let mut candidate_response = response_base.clone();
-        let candidate_object = candidate_response.as_object_mut().ok_or_else(|| {
-            ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
+        chunks.push(candidate);
+        let candidate_response = command_output_page(
+            response_base.clone(),
+            chunks.clone(),
+            candidate_next_cursor,
+            candidate_has_more,
+        )?;
+        let measurement = crate::output_budget::measure_tool_execution(&crate::ToolExecution {
+            output: candidate_response,
+            is_error: false,
+        })
+        .map_err(|source| {
+            ToolRuntimeError::InvalidArguments(format!(
+                "failed to measure managed command output: {source}"
+            ))
         })?;
-        candidate_object.insert("chunks".to_string(), Value::Array(candidate_chunks));
-        candidate_object.insert("nextCursor".to_string(), json!(candidate_next_cursor));
-        candidate_object.insert("hasMore".to_string(), json!(candidate_has_more));
-        let serialized_bytes =
-            crate::output_budget::measure_tool_execution(&crate::ToolExecution {
-                output: candidate_response.clone(),
-                is_error: false,
-            })
-            .map_err(|source| {
-                ToolRuntimeError::InvalidArguments(format!(
-                    "failed to measure managed command output: {source}"
-                ))
-            })?
-            .serialized_bytes;
-        if serialized_bytes > crate::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
-            || next_lines > crate::output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
+        if measurement.serialized_bytes > crate::output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            || measurement.text_lines > crate::output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
         {
+            let _ = chunks.pop();
             break;
         }
 
-        chunks = candidate_response["chunks"]
-            .as_array()
-            .cloned()
-            .ok_or_else(|| {
-                ToolRuntimeError::InvalidArguments("invalid managed command response".to_string())
-            })?;
         next_cursor = candidate_next_cursor;
-        text_lines = next_lines;
     }
 
     let has_more = chunks.len() < output.chunks.len();
     Ok((chunks, next_cursor, has_more))
-}
-
-fn text_line_count(text: &str) -> usize {
-    if text.is_empty() {
-        0
-    } else {
-        text.bytes()
-            .filter(|byte| *byte == b'\n')
-            .count()
-            .saturating_add(1)
-    }
 }
 
 fn owned_command_snapshot(
@@ -740,37 +739,38 @@ mod tests {
 
     #[test]
     fn paginated_command_output_keeps_the_first_unreturned_chunk_reachable() {
-        let output = BackgroundCommandOutput {
-            command_id: "command-test".to_string(),
-            chunks: vec![
-                crate::BackgroundCommandOutputChunk {
-                    cursor: 1,
-                    stream: BackgroundCommandOutputStream::Stdout,
-                    bytes: vec![1; 4 * 1024],
-                },
-                crate::BackgroundCommandOutputChunk {
-                    cursor: 2,
-                    stream: BackgroundCommandOutputStream::Stderr,
-                    bytes: vec![2; 4 * 1024],
-                },
-                crate::BackgroundCommandOutputChunk {
-                    cursor: 3,
-                    stream: BackgroundCommandOutputStream::Stdout,
-                    bytes: vec![3; 4 * 1024],
-                },
-            ],
-            next_cursor: 3,
-            earliest_cursor: Some(1),
-            cursor_expired: false,
-            output_truncated: false,
-        };
+        let output = test_output(vec![
+            test_chunk(
+                1,
+                BackgroundCommandOutputStream::Stdout,
+                vec![b'a'; 30 * 1024],
+            ),
+            test_chunk(
+                2,
+                BackgroundCommandOutputStream::Stderr,
+                vec![b'b'; 30 * 1024],
+            ),
+            test_chunk(
+                3,
+                BackgroundCommandOutputStream::Stdout,
+                vec![b'c'; 30 * 1024],
+            ),
+        ]);
 
         let first = command_output_response(test_snapshot(), output.clone(), None)
             .expect("first command output response");
-        assert_eq!(first["chunks"].as_array().expect("chunks").len(), 2);
-        assert_eq!(first["chunks"][1]["cursor"], 2);
-        assert_eq!(first["nextCursor"], 2);
+        assert_eq!(first["chunks"].as_array().expect("chunks").len(), 1);
+        assert_eq!(first["chunks"][0]["cursor"], 1);
+        assert_eq!(first["chunks"][0]["stream"], "stdout");
+        assert_eq!(first["nextCursor"], 1);
         assert_eq!(first["hasMore"], true);
+        assert_eq!(first["truncated"], true);
+        assert!(
+            first["note"]
+                .as_str()
+                .expect("pagination note")
+                .contains("same processId=command-test and cursor=1")
+        );
         assert!(
             crate::output_budget::measure_tool_execution(&crate::ToolExecution {
                 output: first.clone(),
@@ -792,9 +792,102 @@ mod tests {
         };
         let second = command_output_response(test_snapshot(), remaining, Some(after_cursor))
             .expect("second command output response");
-        assert_eq!(second["chunks"][0]["cursor"], 3);
-        assert_eq!(second["nextCursor"], 3);
-        assert_eq!(second["hasMore"], false);
+        assert_eq!(second["chunks"][0]["cursor"], 2);
+        assert_eq!(second["chunks"][0]["stream"], "stderr");
+    }
+
+    #[test]
+    fn command_output_paginates_when_text_lines_exceed_the_shared_limit() {
+        let chunk = b"line\n".repeat(1_100);
+        let output = test_output(vec![
+            test_chunk(1, BackgroundCommandOutputStream::Stdout, chunk.clone()),
+            test_chunk(2, BackgroundCommandOutputStream::Stderr, chunk),
+        ]);
+
+        let response = command_output_response(test_snapshot(), output, None)
+            .expect("line-bounded command output response");
+
+        assert_eq!(response["chunks"].as_array().expect("chunks").len(), 1);
+        assert_eq!(response["nextCursor"], 1);
+        assert_eq!(response["hasMore"], true);
+        assert_eq!(response["truncated"], true);
+        assert!(
+            crate::output_budget::measure_tool_execution(&crate::ToolExecution {
+                output: response,
+                is_error: false,
+            })
+            .expect("measure line-bounded response")
+            .text_lines
+                <= crate::output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
+        );
+    }
+
+    #[test]
+    fn complete_command_output_does_not_claim_response_pagination() {
+        let response = command_output_response(
+            test_snapshot(),
+            test_output(vec![test_chunk(
+                1,
+                BackgroundCommandOutputStream::Stdout,
+                b"ready\n".to_vec(),
+            )]),
+            None,
+        )
+        .expect("complete command output response");
+
+        assert_eq!(response["hasMore"], false);
+        assert_eq!(response["truncated"], false);
+        assert!(response.get("note").is_none());
+    }
+
+    #[test]
+    fn response_pagination_does_not_change_process_buffer_truncation_metadata() {
+        let mut output = test_output(vec![
+            test_chunk(
+                1,
+                BackgroundCommandOutputStream::Stdout,
+                vec![b'a'; 30 * 1024],
+            ),
+            test_chunk(
+                2,
+                BackgroundCommandOutputStream::Stderr,
+                vec![b'b'; 30 * 1024],
+            ),
+        ]);
+        output.cursor_expired = true;
+        output.output_truncated = true;
+
+        let response = command_output_response(test_snapshot(), output, Some(0))
+            .expect("paginated command output response");
+
+        assert_eq!(response["cursorExpired"], true);
+        assert_eq!(response["outputTruncated"], true);
+        assert_eq!(response["truncated"], true);
+        assert_eq!(response["hasMore"], true);
+    }
+
+    fn test_output(chunks: Vec<crate::BackgroundCommandOutputChunk>) -> BackgroundCommandOutput {
+        let next_cursor = chunks.last().map_or(0, |chunk| chunk.cursor);
+        BackgroundCommandOutput {
+            command_id: "command-test".to_string(),
+            chunks,
+            next_cursor,
+            earliest_cursor: Some(1),
+            cursor_expired: false,
+            output_truncated: false,
+        }
+    }
+
+    fn test_chunk(
+        cursor: u64,
+        stream: BackgroundCommandOutputStream,
+        bytes: Vec<u8>,
+    ) -> crate::BackgroundCommandOutputChunk {
+        crate::BackgroundCommandOutputChunk {
+            cursor,
+            stream,
+            bytes,
+        }
     }
 
     fn test_snapshot() -> BackgroundCommandSnapshot {

@@ -1035,7 +1035,7 @@ fn ask_question_definition() -> ToolDefinition {
 fn run_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: RUN_COMMAND_TOOL,
-        description: "Run a local command in the active workspace without invoking a shell. Recursive scans must stay inside the workspace. Set background=true to start a managed background process and receive a stable processId immediately. Keep that processId as structured state: call get_command_output with its nextCursor to read only new retained stdout/stderr (use waitMs for a bounded long-poll), and call stop_command to terminate the complete process tree when the process is no longer needed. Background output is bounded and retained only in memory; do not expect it to survive an application or sidecar restart.",
+        description: "Run a local command in the active workspace without invoking a shell. Recursive scans must stay inside the workspace. Set background=true to start a managed background process and receive a stable processId immediately. Keep that processId and every returned nextCursor as structured state: call get_command_output with cursor=nextCursor to read only new retained stdout/stderr (use waitMs for a bounded long-poll), and call stop_command to terminate the complete process tree when the process is no longer needed. Background output is bounded and retained only in memory; outputTruncated only means its ring buffer evicted older output, not ordinary response pagination. Do not expect it to survive an application or sidecar restart.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -1075,7 +1075,7 @@ fn run_command_definition() -> ToolDefinition {
 fn get_command_output_definition() -> ToolDefinition {
     ToolDefinition {
         name: GET_COMMAND_OUTPUT_TOOL,
-        description: "Read retained incremental stdout and stderr for a managed background command. Reuse nextCursor as cursor for the next non-consuming read so prior logs are not repeated in context; null starts at the earliest retained output. waitMs is a bounded long-poll that returns early when output arrives or the process exits. A cursorExpired response means earlier output was evicted from the bounded in-memory buffer. Stop long-running processes explicitly with stop_command when they are no longer needed.",
+        description: "Read retained incremental stdout and stderr for a managed background command. Reuse nextCursor as cursor for the next non-consuming read so prior logs are not repeated in context; null starts at the earliest retained output. Large retained output is returned as complete-chunk pages: when hasMore=true and truncated=true, immediately call this tool again with the same processId and cursor=nextCursor. The note confirms this is an explicit successful response pagination, not silent loss. outputTruncated means the process ring buffer evicted older output; cursorExpired means the requested cursor predates retained output. waitMs is a bounded long-poll that returns early when output arrives or the process exits. Stop long-running processes explicitly with stop_command when they are no longer needed.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

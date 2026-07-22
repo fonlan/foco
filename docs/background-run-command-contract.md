@@ -35,7 +35,7 @@ The existing strict input gains these fields:
 }
 ```
 
-This is a read-only, retry-safe, non-consuming incremental read. The response contains `processId`, process state, `fromCursor`, `availableFromCursor`, `nextCursor`, `cursorExpired`, `hasMore`, output-retention metadata, and ordered `chunks`:
+This is a read-only, retry-safe, non-consuming incremental read. The response contains `processId`, process state, `fromCursor`, `availableFromCursor`, `nextCursor`, `cursorExpired`, `hasMore`, response-level `truncated`, output-retention metadata, and ordered `chunks`:
 
 ```json
 {
@@ -47,7 +47,9 @@ This is a read-only, retry-safe, non-consuming incremental read. The response co
 
 Pass `nextCursor` as the next `cursor` so previously observed log chunks are not repeated in model context. `cursor: null` reads from the earliest currently retained chunk. `waitMs` is a bounded long-poll: it returns early when output arrives or the process reaches a terminal state.
 
-`cursorExpired: true` means requested earlier output has been evicted from the bounded in-memory buffer. The response still starts at `availableFromCursor`; callers should proceed from `nextCursor`, not retry the expired range. `hasMore: true` means the response was paged to fit the shared tool-output budget and must be continued explicitly with `nextCursor`.
+`cursorExpired: true` means requested earlier output has been evicted from the bounded in-memory buffer. The response still starts at `availableFromCursor`; callers should proceed from `nextCursor`, not retry the expired range. `outputTruncated: true` likewise only means the process ring buffer has already evicted older output.
+
+When a complete-chunk prefix is returned because the response reached the shared 50 KiB / 2,000-line budget, the response has `hasMore: true`, `truncated: true`, and a `note`. This is an explicit successful pagination, not data silently discarded: reuse the same `processId` with `cursor: nextCursor` to retrieve the next complete chunk without repeats. Response-level `truncated` is independent of `outputTruncated` and `cursorExpired`.
 
 ### `stop_command`
 

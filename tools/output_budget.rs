@@ -560,6 +560,34 @@ pub fn is_line_bounded_budget_success(execution: &ToolExecution) -> bool {
     soft_budget_exceeded && truncated_false
 }
 
+/// Whether `get_command_output` already returned an explicitly cursor-paginated success.
+///
+/// The command tool measures this response before the outer transport wrapper is added. If that
+/// wrapper crosses a soft limit, preserve the cursor page so the model can continue with the
+/// returned `nextCursor`; hard envelope limits still apply.
+fn is_command_output_cursor_pagination(tool_name: &str, execution: &ToolExecution) -> bool {
+    if tool_name != "get_command_output" || execution.is_error {
+        return false;
+    }
+    let Some(fields) = execution.output.as_object() else {
+        return false;
+    };
+
+    matches!(
+        fields.get(LINE_BOUNDED_TRUNCATED_FIELD),
+        Some(Value::Bool(true))
+    ) && matches!(fields.get("hasMore"), Some(Value::Bool(true)))
+        && fields
+            .get("nextCursor")
+            .and_then(Value::as_u64)
+            .is_some_and(|cursor| cursor >= 1)
+        && fields
+            .get("processId")
+            .and_then(Value::as_str)
+            .is_some_and(|process_id| !process_id.is_empty())
+        && fields.get("note").and_then(Value::as_str).is_some()
+}
+
 pub fn normalize_tool_execution(
     tool_name: &str,
     semantics: ToolOutputSemantics,
@@ -640,14 +668,16 @@ where
         };
     }
 
-    // Tools that already applied complete-line budgeting must not be re-converted into a
+    // Tools that already applied continuation-aware budgeting must not be re-converted into a
     // soft-limit read-only error:
     // - `truncated: true` + positive nextStartLine (remaining content exists), or
     // - `softBudgetExceeded: true` + `truncated: false` (single soft-over line, full content).
+    // - `get_command_output`'s `truncated: true` + `hasMore: true` + `nextCursor` cursor page.
     // Hard envelope limits still apply.
     if !execution.is_error
         && reason != ToolOutputBudgetReason::HardByteLimit
-        && is_line_bounded_budget_success(&execution)
+        && (is_line_bounded_budget_success(&execution)
+            || is_command_output_cursor_pagination(tool_name, &execution))
     {
         return BudgetedToolExecution {
             execution,
@@ -1737,6 +1767,72 @@ mod tests {
         assert!(!budgeted.execution.is_error);
         assert_eq!(budgeted.execution.output["truncated"], true);
         assert_eq!(budgeted.execution.output["nextStartLine"], 2);
+        assert_eq!(budgeted.execution, execution);
+    }
+
+    #[test]
+    fn normalize_preserves_command_output_cursor_page_when_transport_crosses_soft_limit() {
+        #[derive(serde::Serialize)]
+        struct SyntheticEnvelope<'a> {
+            #[serde(rename = "type")]
+            event_type: &'static str,
+            tool_call_id: &'static str,
+            output: &'a Value,
+            is_error: bool,
+        }
+
+        let measure = |execution: &ToolExecution| {
+            serialized_json_size(&SyntheticEnvelope {
+                event_type: "toolResult",
+                tool_call_id: "call-command-output",
+                output: &execution.output,
+                is_error: execution.is_error,
+            })
+        };
+        let mut text = "x".repeat(TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        let mut execution = ToolExecution {
+            output: json!({
+                "processId": "command-test",
+                "chunks": [{ "cursor": 1, "stream": "stdout", "text": text.clone() }],
+                "nextCursor": 1,
+                "hasMore": true,
+                "truncated": true,
+                "note": "explicit command output pagination",
+            }),
+            is_error: false,
+        };
+        while serialized_json_size(&execution).expect("measure tool execution")
+            > TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        {
+            text.pop();
+            execution = ToolExecution {
+                output: json!({
+                    "processId": "command-test",
+                    "chunks": [{ "cursor": 1, "stream": "stdout", "text": text.clone() }],
+                    "nextCursor": 1,
+                    "hasMore": true,
+                    "truncated": true,
+                    "note": "explicit command output pagination",
+                }),
+                is_error: false,
+            };
+        }
+        assert!(
+            measure(&execution).expect("measure transport envelope") > TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        );
+        assert!(
+            measure(&execution).expect("remeasure transport envelope")
+                <= TOOL_EXECUTION_HARD_BYTE_LIMIT
+        );
+
+        let budgeted = normalize_tool_execution_for_envelope(
+            "get_command_output",
+            ToolOutputSemantics::ReadOnly,
+            execution.clone(),
+            measure,
+        );
+
+        assert_eq!(budgeted.state, ToolOutputBudgetState::WithinBudget);
         assert_eq!(budgeted.execution, execution);
     }
 

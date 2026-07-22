@@ -4612,6 +4612,22 @@ mod tests {
         assert!(run_command.strict);
         assert!(required.contains(&json!("background")));
         assert!(required.contains(&json!("backgroundTimeoutMs")));
+        assert!(
+            run_command
+                .description
+                .contains("outputTruncated only means")
+        );
+
+        let command_output = definitions
+            .iter()
+            .find(|definition| definition.name == GET_COMMAND_OUTPUT_TOOL)
+            .expect("get_command_output definition");
+        assert!(
+            command_output
+                .description
+                .contains("hasMore=true and truncated=true")
+        );
+        assert!(command_output.description.contains("cursor=nextCursor"));
 
         for tool_name in [GET_COMMAND_OUTPUT_TOOL, STOP_COMMAND_TOOL] {
             let definition = definitions
