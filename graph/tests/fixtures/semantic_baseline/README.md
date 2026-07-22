@@ -6,7 +6,9 @@
 | --- | --- | --- | --- |
 | `rust_workspace` | 局部函数调用、变量读取、同名函数、嵌套遮蔽、`use ... as` alias、跨文件 module、ERROR 文件 | 同文件 identifier 同名匹配产生 `references`；同名可误连；`use` 只保存 import 行；ERROR 文件无抽取结果 | 可验证局部调用为 `calls/tree_sitter/exact`；遮蔽精确绑定；alias 经 module resolver 连接或显式 unresolved/candidate。 |
 | `typescript_workspace` | `.ts` import alias、re-export、`.tsx` 消费者与跨文件 module 路径 | import/re-export 只保存 import 行，不产生跨文件 edge | imports 和 re-export 可表示 `imports/module_resolver`，调用按 resolution 写 `calls` 或 candidate/unresolved。 |
-| `performance_rust_workspace` | 固定中等规模 Rust 源码、连续局部调用和多个模块 | 可用于观察当前索引吞吐和 SQLite 写入成本 | 用作后续 release 比较样本，不设机器相关时间阈值。 |
+| `python_workspace` | Python class/function/import/direct call | 专用 Python extractor 的 stable IR golden 与 SQLite 持久化 | 覆盖 `from ... import ... as ...`、qualified name、calls、位置。 |
+| `go_workspace` | Go package/import/function/method/type/direct call | 专用 Go extractor 的 stable IR golden 与 SQLite 持久化 | selector call 仅保留未解析 reference，不猜测 receiver 类型。 |
+| `performance_rust_workspace` | 固定中等规模 Rust 源码、连续局部调用和多个模块 | 可用于观察全量与增量索引、file prepare（读/哈希/识别/抽取）、SQLite persistence、resolver 与 caller/callee 查询成本 | 用作后续 release 比较样本，不设机器相关时间阈值。 |
 
 手工运行性能样本：
 

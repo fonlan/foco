@@ -26,6 +26,12 @@ pub struct IndexReport {
     pub skipped_files: usize,
     pub deleted_files: usize,
     pub parse_errors: usize,
+    /// Total time spent reading, hashing, detecting, and extracting workspace files.
+    pub file_prepare_duration_us: u64,
+    /// Total time spent acquiring a workspace database and persisting graph updates.
+    pub sqlite_persistence_duration_us: u64,
+    /// Total time spent resolving module imports after file persistence completes.
+    pub resolver_duration_us: u64,
 }
 
 /// Indexes a workspace using owned extraction facts, then opens SQLite only for

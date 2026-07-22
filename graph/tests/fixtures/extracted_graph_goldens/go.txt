@@ -1,0 +1,14 @@
+call|greeting::Format|greeting::helper|exact
+call|greeting::caller|greeting::helper|exact
+import|example.com/project/text||
+import|fmt||fmt
+node|function|greeting::caller
+node|function|greeting::helper
+node|method|greeting::Format
+node|module|greeting
+node|type_alias|greeting::Greeter
+parse_status|parsed
+reference|Println|unresolved
+reference|helper|greeting::helper
+reference|helper|greeting::helper
+

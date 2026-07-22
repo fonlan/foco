@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs, io,
     path::{Component, Path, PathBuf},
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -38,7 +38,12 @@ pub(crate) fn index_workspace(workspace_path: &Path) -> Result<IndexReport, Code
 
     for file_path in files {
         report.scanned_files += 1;
-        match prepare_workspace_file(&workspace_path, &file_path, &existing_hashes)? {
+        let prepare_started_at = Instant::now();
+        let prepared = prepare_workspace_file(&workspace_path, &file_path, &existing_hashes)?;
+        report.file_prepare_duration_us = report
+            .file_prepare_duration_us
+            .saturating_add(duration_micros(prepare_started_at.elapsed()));
+        match prepared {
             FilePrepareOutcome::Indexed(prepared) => {
                 if prepared.had_parse_error {
                     report.parse_errors += 1;
@@ -56,24 +61,42 @@ pub(crate) fn index_workspace(workspace_path: &Path) -> Result<IndexReport, Code
 
         // Flush writes in small batches so a permit is not held for the whole workspace.
         if pending_writes.len() >= CODE_GRAPH_WRITE_BATCH_SIZE {
+            let write_started_at = Instant::now();
             flush_prepared_indexes(&workspace_path, &mut pending_writes)?;
+            report.sqlite_persistence_duration_us = report
+                .sqlite_persistence_duration_us
+                .saturating_add(duration_micros(write_started_at.elapsed()));
         }
     }
 
     if !pending_writes.is_empty() {
+        let write_started_at = Instant::now();
         flush_prepared_indexes(&workspace_path, &mut pending_writes)?;
+        report.sqlite_persistence_duration_us = report
+            .sqlite_persistence_duration_us
+            .saturating_add(duration_micros(write_started_at.elapsed()));
     }
 
     // Short permit: stale cleanup only.
     {
+        let write_started_at = Instant::now();
         let mut database = WorkspaceDatabase::open_or_create(&workspace_path)?;
         report.deleted_files = database.remove_stale_code_graph_files(&live_paths)?.len();
+        report.sqlite_persistence_duration_us = report
+            .sqlite_persistence_duration_us
+            .saturating_add(duration_micros(write_started_at.elapsed()));
     }
     // A resolver-only pass refreshes dependency-derived relationships even when
     // importer content hashes are unchanged. It does not reparse those files.
+    let resolver_started_at = Instant::now();
     crate::resolver::resolve_workspace_imports(&workspace_path)?;
+    report.resolver_duration_us = duration_micros(resolver_started_at.elapsed());
 
     Ok(report)
+}
+
+fn duration_micros(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
 
 struct PreparedFileIndex {

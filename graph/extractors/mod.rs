@@ -1,7 +1,9 @@
 mod ast;
 pub(crate) mod facts;
+mod go;
 mod language;
 mod legacy;
+mod python;
 mod rust;
 mod typescript;
 
@@ -10,7 +12,9 @@ use std::path::Path;
 use crate::CodeGraphError;
 
 pub(crate) use facts::ExtractedGraphFile;
+use go::GoExtractor;
 pub(crate) use language::{LanguageKind, detect_language};
+use python::PythonExtractor;
 use rust::RustExtractor;
 use typescript::TypeScriptFamilyExtractor;
 
@@ -42,6 +46,8 @@ impl GraphExtractor for LegacyFallbackExtractor {
 struct LanguageRegistry {
     rust: RustExtractor,
     typescript: TypeScriptFamilyExtractor,
+    python: PythonExtractor,
+    go: GoExtractor,
     fallback: LegacyFallbackExtractor,
 }
 
@@ -55,6 +61,8 @@ impl LanguageRegistry {
             LanguageKind::TypeScript | LanguageKind::Tsx | LanguageKind::JavaScript => {
                 self.typescript.extract(context)
             }
+            LanguageKind::Python => self.python.extract(context),
+            LanguageKind::Go => self.go.extract(context),
             _ => self.fallback.extract(context),
         }
     }
@@ -69,6 +77,8 @@ pub(crate) fn extract_file(
     LanguageRegistry {
         rust: RustExtractor,
         typescript: TypeScriptFamilyExtractor,
+        python: PythonExtractor,
+        go: GoExtractor,
         fallback: LegacyFallbackExtractor,
     }
     .extract(ExtractionContext {

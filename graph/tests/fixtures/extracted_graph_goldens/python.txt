@@ -1,0 +1,12 @@
+call|Greeter::format|helper|exact
+call|caller|helper|exact
+import|toolkit.helpers|helper|helper_alias
+import|utility||
+node|class|Greeter
+node|function|Greeter::format
+node|function|caller
+node|function|helper
+parse_status|parsed
+reference|helper|helper
+reference|helper|helper
+

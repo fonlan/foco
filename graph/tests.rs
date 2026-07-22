@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    thread,
+    time::{Duration, Instant},
+};
 
 use rusqlite::Connection;
 
@@ -102,6 +107,44 @@ fn removes_stale_graph_rows_for_deleted_files() {
     assert_eq!(
         query_count(&connection, "SELECT COUNT(*) FROM code_graph_files"),
         0
+    );
+}
+
+#[test]
+fn watcher_reindexes_a_modified_python_file() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let source_path = workspace.path().join("app.py");
+    fs::write(&source_path, "def first():\n    return 1\n").expect("initial source");
+    index_workspace(workspace.path()).expect("initial index");
+    let watcher =
+        crate::start_code_graph_watcher_with_debounce(workspace.path(), Duration::from_millis(20))
+            .expect("start watcher");
+
+    fs::write(
+        &source_path,
+        "def first():\n    return 1\n\ndef added():\n    return first()\n",
+    )
+    .expect("modified source");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut indexed = false;
+    while Instant::now() < deadline {
+        let connection = graph_connection(workspace.path());
+        if query_count(
+            &connection,
+            "SELECT COUNT(*) FROM code_graph_symbols WHERE qualified_name = 'added'",
+        ) == 1
+        {
+            indexed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    drop(watcher);
+
+    assert!(
+        indexed,
+        "watcher did not persist the modified Python symbol"
     );
 }
 
@@ -824,6 +867,199 @@ fn fallback_extractor_preserves_additional_tree_sitter_language_coverage() {
 }
 
 #[test]
+fn python_extractor_matches_the_checked_in_semantic_golden() {
+    let source = include_str!("tests/fixtures/semantic_baseline/python_workspace/app.py");
+    let extracted = extract_file(LanguageKind::Python, "app.py", Path::new("app.py"), source)
+        .expect("extract Python fixture");
+
+    assert_eq!(
+        stable_extracted_graph_summary(&extracted),
+        include_str!("tests/fixtures/extracted_graph_goldens/python.txt")
+    );
+}
+
+#[test]
+fn python_extractor_collects_multiline_relative_imports_from_ast_bindings() {
+    let extracted = extract_file(
+        LanguageKind::Python,
+        "app.py",
+        Path::new("app.py"),
+        "from .helpers import (\n    first,\n    second as renamed,\n)\n",
+    )
+    .expect("extract multiline Python import");
+    let imports = extracted
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.module.as_str(),
+                import.imported_symbol.as_deref(),
+                import.alias.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        imports,
+        vec![
+            (".helpers", Some("first"), None),
+            (".helpers", Some("second"), Some("renamed")),
+        ]
+    );
+}
+
+#[test]
+fn python_extractor_prefers_a_visible_local_lambda_over_an_outer_function() {
+    let extracted = extract_file(
+        LanguageKind::Python,
+        "app.py",
+        Path::new("app.py"),
+        "def helper():\n    return 1\n\ndef caller():\n    helper = lambda: 2\n    return helper()\n",
+    )
+    .expect("extract Python shadowing source");
+    let caller = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "caller")
+        .expect("caller");
+    let local_helper = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "caller::helper")
+        .expect("local helper binding");
+    let outer_helper = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "helper")
+        .expect("outer helper");
+    let target = extracted
+        .edges
+        .iter()
+        .find_map(|edge| {
+            (edge.edge_kind == "calls" && edge.source_local_key == caller.local_key).then(|| {
+                let ExtractedEdgeTarget::Local(target) = &edge.target else {
+                    return None;
+                };
+                Some(target.as_str())
+            })?
+        })
+        .expect("local lambda call");
+
+    assert_eq!(target, local_helper.local_key);
+    assert_ne!(target, outer_helper.local_key);
+}
+
+#[test]
+fn go_extractor_matches_the_checked_in_semantic_golden() {
+    let source = include_str!("tests/fixtures/semantic_baseline/go_workspace/main.go");
+    let extracted = extract_file(LanguageKind::Go, "main.go", Path::new("main.go"), source)
+        .expect("extract Go fixture");
+
+    assert_eq!(
+        stable_extracted_graph_summary(&extracted),
+        include_str!("tests/fixtures/extracted_graph_goldens/go.txt")
+    );
+}
+
+#[test]
+fn go_extractor_prefers_a_visible_short_var_function_literal_over_an_outer_function() {
+    let extracted = extract_file(
+        LanguageKind::Go,
+        "main.go",
+        Path::new("main.go"),
+        "package demo\n\nfunc helper() {}\n\nfunc caller() {\n\thelper := func() {}\n\thelper()\n}\n",
+    )
+    .expect("extract Go shadowing source");
+    let caller = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "demo::caller")
+        .expect("caller");
+    let local_helper = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "demo::caller::helper")
+        .expect("local helper binding");
+    let outer_helper = extracted
+        .nodes
+        .iter()
+        .find(|node| node.qualified_name == "demo::helper")
+        .expect("outer helper");
+    let target = extracted
+        .edges
+        .iter()
+        .find_map(|edge| {
+            (edge.edge_kind == "calls" && edge.source_local_key == caller.local_key).then(|| {
+                let ExtractedEdgeTarget::Local(target) = &edge.target else {
+                    return None;
+                };
+                Some(target.as_str())
+            })?
+        })
+        .expect("local function literal call");
+
+    assert_eq!(target, local_helper.local_key);
+    assert_ne!(target, outer_helper.local_key);
+}
+
+#[test]
+fn python_and_go_fixtures_persist_language_specific_symbols_and_calls() {
+    let python_workspace = semantic_fixture_workspace("python_workspace");
+    let go_workspace = semantic_fixture_workspace("go_workspace");
+
+    index_workspace(python_workspace.path()).expect("index Python fixture");
+    index_workspace(go_workspace.path()).expect("index Go fixture");
+
+    let python = graph_connection(python_workspace.path());
+    let go = graph_connection(go_workspace.path());
+    let python_format_start = python
+        .query_row(
+            "SELECT start_line FROM code_graph_symbols WHERE qualified_name = 'Greeter::format'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("Python method position");
+    let go_package_start = go
+        .query_row(
+            "SELECT start_line FROM code_graph_symbols WHERE qualified_name = 'greeting'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .expect("Go package position");
+
+    assert_eq!(python_format_start, 4);
+    assert_eq!(go_package_start, 0);
+    assert_eq!(
+        query_count(
+            &python,
+            "SELECT COUNT(*) FROM code_graph_edges WHERE edge_kind = 'calls'",
+        ),
+        2
+    );
+    assert_eq!(
+        query_count(
+            &go,
+            "SELECT COUNT(*) FROM code_graph_edges WHERE edge_kind = 'calls'",
+        ),
+        2
+    );
+    assert_eq!(
+        query_count(
+            &python,
+            "SELECT COUNT(*) FROM code_graph_imports WHERE module = 'toolkit.helpers' AND imported_symbol = 'helper' AND alias = 'helper_alias'",
+        ),
+        1
+    );
+    assert_eq!(
+        query_count(
+            &go,
+            "SELECT COUNT(*) FROM code_graph_imports WHERE module = 'fmt' AND alias = 'fmt'",
+        ),
+        1
+    );
+}
+
+#[test]
 fn legacy_extraction_does_not_allocate_unpersistable_unresolved_edges() {
     let extracted = extract_file(
         LanguageKind::Ruby,
@@ -845,18 +1081,64 @@ fn legacy_extraction_does_not_allocate_unpersistable_unresolved_edges() {
 #[ignore = "run with --release to compare the fixed semantic graph performance fixture"]
 fn semantic_fixture_performance_baseline_indexes_fixed_workspace() {
     let workspace = semantic_fixture_workspace("performance_rust_workspace");
-    let started_at = std::time::Instant::now();
+    let workspace_bytes = fixture_file_bytes(workspace.path());
+    let full_started_at = std::time::Instant::now();
 
-    let report = index_workspace(workspace.path()).expect("index performance fixture");
+    let full_report = index_workspace(workspace.path()).expect("index performance fixture");
 
     assert!(
-        report.indexed_files > 0,
+        full_report.indexed_files > 0,
         "performance fixture must be indexed"
     );
+    let incremental_path = workspace.path().join("src/consumer.rs");
+    fs::write(
+        &incremental_path,
+        "use crate::generated::{step_00, step_20, step_40};\n\npub fn render_batch(value: usize) -> usize {\n    step_40(step_20(step_00(value)))\n}\n\n// benchmark mutation\n",
+    )
+    .expect("mutate performance fixture");
+    let incremental_started_at = std::time::Instant::now();
+    let incremental_report = index_workspace(workspace.path()).expect("incremental index");
+    let resolver_started_at = std::time::Instant::now();
+    crate::resolver::resolve_workspace_imports(workspace.path()).expect("resolver-only pass");
+
+    let connection = graph_connection(workspace.path());
+    let caller_query_started_at = std::time::Instant::now();
+    let caller_count = query_count(
+        &connection,
+        "SELECT COUNT(*)
+         FROM code_graph_edges edge
+         JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+         WHERE target.name = 'step_20'",
+    );
+    let caller_query_duration = caller_query_started_at.elapsed();
+    let callee_query_started_at = std::time::Instant::now();
+    let callee_count = query_count(
+        &connection,
+        "SELECT COUNT(*)
+         FROM code_graph_edges edge
+         JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+         WHERE source.name = 'render_batch'",
+    );
+    let callee_query_duration = callee_query_started_at.elapsed();
+
     eprintln!(
-        "semantic graph performance fixture indexed {} files in {} ms",
-        report.indexed_files,
-        started_at.elapsed().as_millis()
+        "semantic graph benchmark files={} bytes={} full_ms={} full_file_prepare_us={} full_sqlite_persistence_us={} full_resolver_us={} incremental_ms={} incremental_indexed={} incremental_file_prepare_us={} incremental_sqlite_persistence_us={} incremental_resolver_us={} resolver_only_ms={} callers={} caller_query_ms={} callees={} callee_query_ms={}",
+        full_report.scanned_files,
+        workspace_bytes,
+        full_started_at.elapsed().as_millis(),
+        full_report.file_prepare_duration_us,
+        full_report.sqlite_persistence_duration_us,
+        full_report.resolver_duration_us,
+        incremental_started_at.elapsed().as_millis(),
+        incremental_report.indexed_files,
+        incremental_report.file_prepare_duration_us,
+        incremental_report.sqlite_persistence_duration_us,
+        incremental_report.resolver_duration_us,
+        resolver_started_at.elapsed().as_millis(),
+        caller_count,
+        caller_query_duration.as_millis(),
+        callee_count,
+        callee_query_duration.as_millis(),
     );
 }
 
@@ -932,4 +1214,71 @@ fn query_count(connection: &Connection, sql: &str) -> i64 {
     connection
         .query_row(sql, [], |row| row.get(0))
         .expect("query count")
+}
+
+fn fixture_file_bytes(path: &Path) -> u64 {
+    let mut bytes = 0_u64;
+    for entry in fs::read_dir(path).expect("read fixture directory") {
+        let entry = entry.expect("fixture directory entry");
+        let entry_path = entry.path();
+        if entry.file_type().expect("fixture file type").is_dir() {
+            bytes = bytes.saturating_add(fixture_file_bytes(&entry_path));
+        } else {
+            bytes = bytes.saturating_add(entry.metadata().expect("fixture metadata").len());
+        }
+    }
+    bytes
+}
+
+fn stable_extracted_graph_summary(
+    extracted: &crate::extractors::facts::ExtractedGraphFile,
+) -> String {
+    let nodes_by_key = extracted
+        .nodes
+        .iter()
+        .map(|node| (node.local_key.as_str(), node.qualified_name.as_str()))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut lines = vec![format!("parse_status|{}", extracted.parse_status)];
+    lines.extend(
+        extracted
+            .nodes
+            .iter()
+            .map(|node| format!("node|{}|{}", node.kind, node.qualified_name)),
+    );
+    lines.extend(extracted.imports.iter().map(|import| {
+        format!(
+            "import|{}|{}|{}",
+            import.module,
+            import.imported_symbol.as_deref().unwrap_or_default(),
+            import.alias.as_deref().unwrap_or_default()
+        )
+    }));
+    lines.extend(extracted.references.iter().map(|reference| {
+        format!(
+            "reference|{}|{}",
+            reference.name,
+            reference
+                .target_local_key
+                .as_deref()
+                .and_then(|key| nodes_by_key.get(key).copied())
+                .unwrap_or("unresolved")
+        )
+    }));
+    lines.extend(extracted.edges.iter().filter_map(|edge| {
+        let ExtractedEdgeTarget::Local(target) = &edge.target else {
+            return None;
+        };
+        let source = nodes_by_key.get(edge.source_local_key.as_str())?;
+        let target = nodes_by_key.get(target.as_str())?;
+        (edge.edge_kind == "calls").then(|| {
+            let confidence = if edge.metadata_json.contains("\"confidence\":\"exact\"") {
+                "exact"
+            } else {
+                "heuristic"
+            };
+            format!("call|{source}|{target}|{confidence}")
+        })
+    }));
+    lines.sort();
+    format!("{}\n\n", lines.join("\n"))
 }
