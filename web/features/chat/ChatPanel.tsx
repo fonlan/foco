@@ -392,7 +392,6 @@ function ChatPanelComponent({
           left.displayName.localeCompare(right.displayName),
         )
         .map((model) => ({
-          badge: model.supportsFast ? t("Fast") : undefined,
           label: model.displayName,
           value: model.id,
         })),

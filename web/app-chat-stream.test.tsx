@@ -1173,6 +1173,28 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not mark Fast-capable models in the composer model picker", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        { ...settings.configuredModels[0]!, supportsFast: true },
+      ],
+    } as typeof settings;
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    expect(
+      await screen.findByRole("button", { name: "Fast mode" }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    const modelOption = screen.getByRole("button", {
+      name: "Model: GPT Test",
+    });
+    expect(within(modelOption).queryByText("Fast")).not.toBeInTheDocument();
+  });
+
   it("confirms Fast once, keeps preference across unsupported models, and snapshots Fast on send", async () => {
     const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
     appTestState.settingsResponse = {
