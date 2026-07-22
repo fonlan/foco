@@ -171,30 +171,9 @@ function installTrackingResizeObserver() {
     }
 
     observe(target: Element) {
+      // Do not fire synchronously on observe (matches browser + global mock).
+      // Tests that need a notification call flush().
       this.tracked.targets.add(target);
-      const contentRect = {
-        bottom: 300,
-        height: 300,
-        left: 0,
-        right: 800,
-        toJSON: () => ({}),
-        top: 0,
-        width: 800,
-        x: 0,
-        y: 0,
-      } satisfies DOMRectReadOnly;
-      this.tracked.callback(
-        [
-          {
-            borderBoxSize: [],
-            contentBoxSize: [],
-            contentRect,
-            devicePixelContentBoxSize: [],
-            target,
-          } satisfies ResizeObserverEntry,
-        ],
-        this,
-      );
     }
 
     unobserve(target: Element) {

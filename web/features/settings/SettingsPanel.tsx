@@ -353,6 +353,8 @@ const SPEC_JOBS_POLL_INTERVAL_MS = 3000;
 
 const MEMORY_DREAM_MAX_PAGE_SIZE = 200;
 
+const EMPTY_WORKSPACES: ConfiguredWorkspaceSummary[] = [];
+
 type SkillStoreUpdateResponse = {
   results: Array<{
     key: string;
@@ -739,7 +741,9 @@ export function SettingsPanel({
   const providerKinds = settings?.providerKinds ?? [];
   const providers = settings?.providers ?? [];
   const remoteServers = settings?.remoteServers ?? [];
-  const workspaces = settings?.workspaces ?? [];
+  // Stable empty fallback: a fresh `[]` each render re-triggers remote skill
+  // catalog effects while settings are still loading.
+  const workspaces = settings?.workspaces ?? EMPTY_WORKSPACES;
   const memoryWorkspace =
     workspaces.find((workspace) => workspace.id === memoryFilter.workspaceId) ??
     workspaces[0] ??

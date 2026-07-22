@@ -1,4 +1,4 @@
-import { fireEvent, render, type RenderOptions } from "@testing-library/react";
+import { fireEvent, render, cleanup, type RenderOptions } from "@testing-library/react";
 import { vi } from "vitest";
 
 import type {
@@ -2869,6 +2869,9 @@ export function savedGeneralSettings(init?: RequestInit) {
 import { App } from "../App";
 
 export function resetAppTestEnvironment() {
+  // Unmount previous App trees so intervals/effects from prior tests cannot
+  // keep driving fetch/setState after the next test starts.
+  cleanup();
   appTestState.activeChatStreamController = null;
   appTestState.chatStreamControllers = new Map();
   appTestState.chatMessagesResponsesByChatKey = {};
@@ -4313,6 +4316,12 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
   }
 
   if (path === "/api/models/manual") {
+    // Keep settings.configuredModels in sync so App can detect model changes
+    // and refresh agent definitions (e.g. image-output built-in agent).
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      configuredModels: savedModelMetadata.configuredModels,
+    };
     return jsonResponse(savedModelMetadata);
   }
 

@@ -60,9 +60,15 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    // Isolate hung tests so one infinite loop cannot freeze the whole suite.
+    pool: "forks",
+    // Keep local machines responsive; CI can override with VITEST_MAX_WORKERS.
+    maxWorkers: Number(process.env.VITEST_MAX_WORKERS ?? 4),
     globals: true,
     setupFiles: "./test-setup.ts",
     testTimeout: 15_000,
+    hookTimeout: 15_000,
+    teardownTimeout: 10_000,
   },
 });
 

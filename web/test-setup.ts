@@ -2,36 +2,14 @@ import "@testing-library/jest-dom/vitest";
 import { afterEach, vi } from "vitest";
 
 class MockResizeObserver implements ResizeObserver {
-  constructor(private readonly callback: ResizeObserverCallback) {}
-
-  observe(target: Element) {
-    const contentRect = {
-      bottom: 300,
-      height: 300,
-      left: 0,
-      right: 800,
-      toJSON: () => ({}),
-      top: 0,
-      width: 800,
-      x: 0,
-      y: 0,
-    } satisfies DOMRectReadOnly;
-
-    this.callback(
-      [
-        {
-          borderBoxSize: [],
-          contentBoxSize: [],
-          contentRect,
-          devicePixelContentBoxSize: [],
-          target,
-        } satisfies ResizeObserverEntry,
-      ],
-      this,
-    );
+  observe(_target: Element) {
+    // Do not auto-fire. Real browsers deliver ResizeObserver asynchronously and
+    // only when size changes; jsdom has no layout engine, so a sync or eager
+    // callback can re-enter React updates and hang tests. Suites that need a
+    // notification install a tracking observer and call flush() explicitly.
   }
 
-  unobserve() {}
+  unobserve(_target: Element) {}
   disconnect() {}
 }
 

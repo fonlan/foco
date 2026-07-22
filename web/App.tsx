@@ -1600,6 +1600,8 @@ export function App() {
     chatMessagePaginationByKeyRef.current = next;
   }
   const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const settingsSkillsSnapshotRef = useRef<string | null>(null);
+  const settingsModelsSnapshotRef = useRef<string | null>(null);
   const [updateStatus, setUpdateStatus] = useState<UpdateStatusSummary | null>(
     null,
   );
@@ -3028,6 +3030,8 @@ export function App() {
 
     try {
       const data = await requestJson<SettingsResponse>("/api/settings");
+      settingsSkillsSnapshotRef.current = JSON.stringify(data.skills);
+      settingsModelsSnapshotRef.current = JSON.stringify(data.configuredModels);
       setSettings(data);
       setUpdateStatus(data.update);
       setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
@@ -5261,6 +5265,7 @@ export function App() {
         },
       ]);
       const nextSettings = await requestJson<SettingsResponse>("/api/settings");
+      settingsSkillsSnapshotRef.current = JSON.stringify(nextSettings.skills);
       setSettings(nextSettings);
       if (
         response.result.hostKeyVerificationRequired ||
@@ -5328,6 +5333,7 @@ export function App() {
           );
         const nextSettings =
           await requestJson<SettingsResponse>("/api/settings");
+        settingsSkillsSnapshotRef.current = JSON.stringify(nextSettings.skills);
         setSettings(nextSettings);
         setWorkspaceServerId(response.server.id);
         if (!workspacePath.trim() && response.server.defaultRemoteRoot) {
@@ -5363,6 +5369,7 @@ export function App() {
       } catch (connectError) {
         const nextSettings =
           await requestJson<SettingsResponse>("/api/settings");
+        settingsSkillsSnapshotRef.current = JSON.stringify(nextSettings.skills);
         setSettings(nextSettings);
         setWorkspaceServerId(response.server.id);
         throw connectError;
@@ -12913,6 +12920,7 @@ export function App() {
           method: "POST",
         },
       );
+      settingsSkillsSnapshotRef.current = JSON.stringify(data.skills);
       setSettings(data);
       setWorkspaces((current) =>
         reorderWorkspacesByIds(
@@ -13064,6 +13072,7 @@ export function App() {
           method: "POST",
         },
       );
+      settingsSkillsSnapshotRef.current = JSON.stringify(data.skills);
       setSettings(data);
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -13082,14 +13091,29 @@ export function App() {
 
   const handleSettingsPanelSettingsChange = useCallback(
     (data: SettingsResponse) => {
+      const skillsSnapshot = JSON.stringify(data.skills);
+      const skillsChanged = settingsSkillsSnapshotRef.current !== skillsSnapshot;
+      settingsSkillsSnapshotRef.current = skillsSnapshot;
+      const modelsSnapshot = JSON.stringify(data.configuredModels);
+      const modelsChanged = settingsModelsSnapshotRef.current !== modelsSnapshot;
+      settingsModelsSnapshotRef.current = modelsSnapshot;
       setSettings(data);
       setUpdateStatus(data.update);
       setIsTeamModeEnabled(data.general.defaultTeamModeEnabled);
       // Skill install/update/refresh mutates settings.skills; re-fetch the
       // workspace menu catalog so slash menu matches the effective set.
       // Soft reload keeps the last good catalog until the new response arrives.
-      reloadWorkspaceSkillCatalog();
-      void loadAgentDefinitions();
+      // Skip when skills are unchanged (e.g. Settings panel mount GET) so we
+      // do not form a tight setState → request → setState loop under mocks.
+      if (skillsChanged) {
+        reloadWorkspaceSkillCatalog();
+      }
+      // Image-output model install can materialize built-in agent definitions
+      // server-side. Reload only when configured models actually change — not
+      // on every Settings open / non-model save.
+      if (modelsChanged) {
+        void loadAgentDefinitions();
+      }
     },
     [loadAgentDefinitions, reloadWorkspaceSkillCatalog],
   );

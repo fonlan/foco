@@ -4789,7 +4789,8 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.click(screen.getByRole("button", { name: "Models" }));
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
     await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
     await userEvent.selectOptions(screen.getByLabelText("Model id"), "gpt-image-2");
@@ -4798,7 +4799,7 @@ describe("app-settings verification surfaces", () => {
     await waitFor(() => {
       const saveCall = fetchMock.mock.calls.find(
         ([url, init]) =>
-          url === "/api/models/manual" &&
+          String(url).includes("/api/models/manual") &&
           typeof init?.body === "string" &&
           init.body.includes('"modelId":"gpt-image-2"'),
       );
@@ -4811,7 +4812,7 @@ describe("app-settings verification surfaces", () => {
       });
     });
 
-    await userEvent.click(screen.getByRole("button", { name: "Agents" }));
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Agents" }));
     expect(await screen.findByText("Image generation agent")).toBeInTheDocument();
   });
 

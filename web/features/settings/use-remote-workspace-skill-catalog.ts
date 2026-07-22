@@ -14,8 +14,11 @@ export type RemoteWorkspaceSkillCatalog = {
   refreshError: string | null;
 };
 
+const EMPTY_REMOTE_WORKSPACES: ConfiguredWorkspaceSummary[] = [];
+
 function remoteWorkspaceTargets(workspaces: ConfiguredWorkspaceSummary[]) {
-  return workspaces.filter((workspace) => Boolean(workspace.serverId));
+  const remote = workspaces.filter((workspace) => Boolean(workspace.serverId));
+  return remote.length === 0 ? EMPTY_REMOTE_WORKSPACES : remote;
 }
 
 function workspaceConnectionLooksReady(status: string | undefined) {
@@ -63,13 +66,26 @@ export function useRemoteWorkspaceSkillCatalog(
     Record<string, RemoteWorkspaceSkillCatalog>
   >({});
 
-  const remoteWorkspaces = useMemo(() => remoteWorkspaceTargets(workspaces), [workspaces]);
-  const workspaceSignature = remoteWorkspaces
-    .map(
-      (workspace) =>
-        `${workspace.id}:${workspace.serverId ?? ""}:${workspace.connectionStatus ?? ""}:${workspace.lastRemoteError ?? ""}`,
-    )
-    .join("\u0000");
+  // Prefer a content signature over the workspaces array identity. SettingsPanel
+  // may pass a new array reference for the same remote set; depending on identity
+  // would re-fire this effect forever (setState → render → new array → effect).
+  const workspaceSignature = useMemo(
+    () =>
+      remoteWorkspaceTargets(workspaces)
+        .map(
+          (workspace) =>
+            `${workspace.id}:${workspace.serverId ?? ""}:${workspace.connectionStatus ?? ""}:${workspace.lastRemoteError ?? ""}`,
+        )
+        .join("\u0000"),
+    [workspaces],
+  );
+  // Recompute only when the signature changes so we keep a stable array identity.
+  const remoteWorkspaces = useMemo(
+    () => remoteWorkspaceTargets(workspaces),
+    // Intentionally omit `workspaces`: identity churn must not rebuild the list.
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- signature is the content key
+    [workspaceSignature],
+  );
 
   const loadWorkspaceCatalog = useCallback(
     (workspace: ConfiguredWorkspaceSummary, generation: number, force = false) => {
@@ -82,29 +98,55 @@ export function useRemoteWorkspaceSkillCatalog(
       const cached = cacheRef.current.get(workspace.id);
       if (!force && !workspaceConnectionLooksReady(workspace.connectionStatus)) {
         const message = unavailableWorkspaceMessage(workspace);
-        setCatalogsByWorkspaceId((current) => ({
+        setCatalogsByWorkspaceId((current) => {
+          const previous = current[workspace.id];
+          if (
+            previous &&
+            previous.workspace === workspace &&
+            previous.skills === (cached ?? previous.skills) &&
+            previous.status === (cached === undefined ? "error" : "ready") &&
+            previous.error === (cached === undefined ? message : null) &&
+            previous.refreshError === (cached === undefined ? null : message)
+          ) {
+            return current;
+          }
+          return {
+            ...current,
+            [workspace.id]: {
+              workspace,
+              skills: cached ?? [],
+              status: cached === undefined ? "error" : "ready",
+              error: cached === undefined ? message : null,
+              refreshError: cached === undefined ? null : message,
+            },
+          };
+        });
+        return;
+      }
+
+      setCatalogsByWorkspaceId((current) => {
+        const previous = current[workspace.id];
+        if (
+          previous &&
+          previous.workspace === workspace &&
+          previous.skills === (cached ?? previous.skills) &&
+          previous.status === "loading" &&
+          previous.error === null &&
+          previous.refreshError === null
+        ) {
+          return current;
+        }
+        return {
           ...current,
           [workspace.id]: {
             workspace,
             skills: cached ?? [],
-            status: cached === undefined ? "error" : "ready",
-            error: cached === undefined ? message : null,
-            refreshError: cached === undefined ? null : message,
+            status: "loading",
+            error: null,
+            refreshError: null,
           },
-        }));
-        return;
-      }
-
-      setCatalogsByWorkspaceId((current) => ({
-        ...current,
-        [workspace.id]: {
-          workspace,
-          skills: cached ?? [],
-          status: "loading",
-          error: null,
-          refreshError: null,
-        },
-      }));
+        };
+      });
 
       void (async () => {
         try {
@@ -151,13 +193,17 @@ export function useRemoteWorkspaceSkillCatalog(
   useEffect(() => {
     if (!enabled) {
       requestGenerationRef.current += 1;
-      setCatalogsByWorkspaceId({});
+      setCatalogsByWorkspaceId((current) =>
+        Object.keys(current).length === 0 ? current : {},
+      );
       return;
     }
 
     const generation = ++requestGenerationRef.current;
     if (!remoteWorkspaces.length) {
-      setCatalogsByWorkspaceId({});
+      setCatalogsByWorkspaceId((current) =>
+        Object.keys(current).length === 0 ? current : {},
+      );
       return;
     }
 
