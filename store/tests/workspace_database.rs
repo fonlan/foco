@@ -10873,7 +10873,10 @@ fn code_graph_query_helpers_return_compact_relationships() {
     let lib_symbols = [
         NewCodeGraphSymbol {
             name: "public_api",
+            qualified_name: "public_api",
             kind: "function",
+            visibility: Some("public"),
+            metadata_json: None,
             start_line: Some(1),
             start_column: Some(1),
             end_line: Some(5),
@@ -10883,7 +10886,10 @@ fn code_graph_query_helpers_return_compact_relationships() {
         },
         NewCodeGraphSymbol {
             name: "helper",
+            qualified_name: "helper",
             kind: "function",
+            visibility: None,
+            metadata_json: None,
             start_line: Some(7),
             start_column: Some(1),
             end_line: Some(9),
@@ -10907,12 +10913,20 @@ fn code_graph_query_helpers_return_compact_relationships() {
         end_line: Some(3),
         end_column: Some(11),
     }];
-    let lib_edges = [NewCodeGraphEdge {
-        source_symbol_index: 0,
-        target_symbol_index: 1,
-        edge_kind: "references",
-        metadata_json: None,
-    }];
+    let lib_edges = [
+        NewCodeGraphEdge {
+            source_symbol_index: 0,
+            target_symbol_index: 1,
+            edge_kind: "calls",
+            metadata_json: Some(r#"{"provenance":"tree_sitter","confidence":"exact"}"#),
+        },
+        NewCodeGraphEdge {
+            source_symbol_index: 0,
+            target_symbol_index: 1,
+            edge_kind: "contains",
+            metadata_json: Some(r#"{"provenance":"tree_sitter","confidence":"exact"}"#),
+        },
+    ];
     database
         .replace_code_graph_file_index(NewCodeGraphFileIndex {
             path: "lib.rs",
@@ -10931,7 +10945,10 @@ fn code_graph_query_helpers_return_compact_relationships() {
         .expect("lib graph index");
     let caller_symbols = [NewCodeGraphSymbol {
         name: "caller_entry",
+        qualified_name: "caller_entry",
         kind: "function",
+        visibility: None,
+        metadata_json: None,
         start_line: Some(1),
         start_column: Some(1),
         end_line: Some(3),
@@ -10990,6 +11007,12 @@ fn code_graph_query_helpers_return_compact_relationships() {
     assert_eq!(callers.len(), 1);
     assert_eq!(callers[0].source.name, "public_api");
 
+    let children = database
+        .code_graph_children(public_api.id, Some("function"), 10)
+        .expect("direct children");
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].name, "helper");
+
     let references = database
         .code_graph_references(helper_id, 10)
         .expect("references");
@@ -11016,7 +11039,10 @@ fn replacing_code_graph_file_index_clears_old_fts_entries() {
     let old_symbols = [
         NewCodeGraphSymbol {
             name: "kept_helper",
+            qualified_name: "kept_helper",
             kind: "function",
+            visibility: None,
+            metadata_json: None,
             start_line: Some(1),
             start_column: Some(1),
             end_line: Some(3),
@@ -11026,7 +11052,10 @@ fn replacing_code_graph_file_index_clears_old_fts_entries() {
         },
         NewCodeGraphSymbol {
             name: "removed_helper",
+            qualified_name: "removed_helper",
             kind: "function",
+            visibility: None,
+            metadata_json: None,
             start_line: Some(5),
             start_column: Some(1),
             end_line: Some(7),
@@ -11054,7 +11083,10 @@ fn replacing_code_graph_file_index_clears_old_fts_entries() {
 
     let new_symbols = [NewCodeGraphSymbol {
         name: "kept_helper",
+        qualified_name: "kept_helper",
         kind: "function",
+        visibility: None,
+        metadata_json: None,
         start_line: Some(1),
         start_column: Some(1),
         end_line: Some(3),

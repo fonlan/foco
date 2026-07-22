@@ -112,7 +112,10 @@ fn flush_prepared_indexes(
             .iter()
             .map(|node| NewCodeGraphSymbol {
                 name: &node.name,
+                qualified_name: &node.qualified_name,
                 kind: node.kind,
+                visibility: node.visibility,
+                metadata_json: Some(&node.metadata_json),
                 start_line: Some(position_line(node.range.start)),
                 start_column: Some(position_column(node.range.start)),
                 end_line: Some(position_line(node.range.end)),
@@ -161,7 +164,7 @@ fn flush_prepared_indexes(
                     source_symbol_index,
                     target_symbol_index,
                     edge_kind: edge.edge_kind,
-                    metadata_json: None,
+                    metadata_json: Some(&edge.metadata_json),
                 })
             })
             .collect::<Vec<_>>();

@@ -1548,7 +1548,10 @@ pub struct NewCodeGraphFileIndex<'a> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewCodeGraphSymbol<'a> {
     pub name: &'a str,
+    pub qualified_name: &'a str,
     pub kind: &'a str,
+    pub visibility: Option<&'a str>,
+    pub metadata_json: Option<&'a str>,
     pub start_line: Option<i64>,
     pub start_column: Option<i64>,
     pub end_line: Option<i64>,
@@ -1608,7 +1611,10 @@ pub struct CodeGraphSymbolRecord {
     pub path: String,
     pub language: Option<String>,
     pub name: String,
+    pub qualified_name: Option<String>,
     pub kind: String,
+    pub visibility: Option<String>,
+    pub metadata_json: String,
     pub start_line: Option<i64>,
     pub start_column: Option<i64>,
     pub end_line: Option<i64>,

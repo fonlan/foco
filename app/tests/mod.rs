@@ -18875,7 +18875,10 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
                 parse_error_message: None,
                 symbols: &[NewCodeGraphSymbol {
                     name: "public_api",
+                    qualified_name: "public_api",
                     kind: "function",
+                    visibility: Some("public"),
+                    metadata_json: None,
                     start_line: Some(1),
                     start_column: Some(1),
                     end_line: Some(3),

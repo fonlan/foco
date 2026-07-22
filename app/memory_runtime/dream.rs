@@ -5017,7 +5017,10 @@ mod tests {
         let main_symbols = [
             NewCodeGraphSymbol {
                 name: "public_api",
+                qualified_name: "public_api",
                 kind: "function",
+                visibility: Some("public"),
+                metadata_json: None,
                 start_line: Some(1),
                 start_column: Some(1),
                 end_line: Some(1),
@@ -5027,7 +5030,10 @@ mod tests {
             },
             NewCodeGraphSymbol {
                 name: "duplicate_symbol",
+                qualified_name: "duplicate_symbol",
                 kind: "function",
+                visibility: None,
+                metadata_json: None,
                 start_line: Some(3),
                 start_column: Some(1),
                 end_line: Some(3),
@@ -5054,7 +5060,10 @@ mod tests {
             .expect("main index");
         let other_symbols = [NewCodeGraphSymbol {
             name: "duplicate_symbol",
+            qualified_name: "duplicate_symbol",
             kind: "function",
+            visibility: None,
+            metadata_json: None,
             start_line: Some(1),
             start_column: Some(1),
             end_line: Some(1),

@@ -32,7 +32,10 @@ pub(crate) struct ExtractedGraphFile {
 pub(crate) struct ExtractedNode {
     pub(crate) local_key: String,
     pub(crate) name: String,
+    pub(crate) qualified_name: String,
     pub(crate) kind: &'static str,
+    pub(crate) visibility: Option<&'static str>,
+    pub(crate) metadata_json: String,
     pub(crate) range: ExtractedRange,
     pub(crate) name_range: ExtractedRange,
     pub(crate) signature: Option<String>,
@@ -63,6 +66,7 @@ pub(crate) struct ExtractedEdge {
     pub(crate) source_local_key: String,
     pub(crate) target: ExtractedEdgeTarget,
     pub(crate) edge_kind: &'static str,
+    pub(crate) metadata_json: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

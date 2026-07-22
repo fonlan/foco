@@ -80,6 +80,7 @@ pub(crate) fn graph_find_callers(
     Ok(json!({
         "symbol": symbol_json(symbol),
         "callers": callers,
+        "relationshipSemantics": "static_call_site_approximation",
         "truncated": limit_truncated || soft_truncated,
         "returnedCount": returned_count,
         "timeoutMs": timeout_ms
@@ -105,6 +106,46 @@ pub(crate) fn graph_find_callees(
     Ok(json!({
         "symbol": symbol_json(symbol),
         "callees": callees,
+        "relationshipSemantics": "static_call_site_approximation",
+        "truncated": limit_truncated || soft_truncated,
+        "returnedCount": returned_count,
+        "timeoutMs": timeout_ms
+    }))
+}
+
+pub(crate) fn graph_find_children(
+    workspace_path: &Path,
+    arguments: Value,
+) -> Result<Value, ToolRuntimeError> {
+    let request: GraphFindChildrenInput = parse_arguments(arguments)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
+    let database = open_code_graph_database(workspace_path)?;
+    let symbol = resolve_graph_symbol(
+        &database,
+        &GraphSymbolLookupInput {
+            symbol_id: request.symbol_id,
+            symbol: request.symbol.clone(),
+            path: request.path.clone(),
+            limit: request.limit,
+            timeout_ms: request.timeout_ms,
+        },
+    )?;
+    let limit = graph_limit(request.limit)?;
+    let mut children = database.code_graph_children(
+        symbol.id,
+        request.kind.as_deref(),
+        graph_query_limit(limit)?,
+    )?;
+    let limit_truncated = truncate_records(&mut children, limit);
+    let records = children.into_iter().map(symbol_json).collect::<Vec<_>>();
+    let (children, soft_truncated) =
+        soft_limit_preview_records(records, GRAPH_LIST_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = children.len();
+
+    Ok(json!({
+        "symbol": symbol_json(symbol),
+        "kind": request.kind,
+        "children": children,
         "truncated": limit_truncated || soft_truncated,
         "returnedCount": returned_count,
         "timeoutMs": timeout_ms
@@ -417,7 +458,10 @@ fn symbol_json(symbol: CodeGraphSymbolRecord) -> Value {
         "path": symbol.path,
         "language": symbol.language,
         "name": symbol.name,
+        "qualifiedName": symbol.qualified_name,
         "kind": symbol.kind,
+        "visibility": symbol.visibility,
+        "metadata": symbol.metadata_json,
         "startLine": symbol.start_line,
         "startColumn": symbol.start_column,
         "endLine": symbol.end_line,
@@ -556,6 +600,17 @@ pub(crate) struct GraphSymbolLookupInput {
     pub(crate) symbol_id: Option<i64>,
     pub(crate) symbol: Option<String>,
     pub(crate) path: Option<String>,
+    pub(crate) limit: Option<usize>,
+    pub(crate) timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GraphFindChildrenInput {
+    pub(crate) symbol_id: Option<i64>,
+    pub(crate) symbol: Option<String>,
+    pub(crate) path: Option<String>,
+    pub(crate) kind: Option<String>,
     pub(crate) limit: Option<usize>,
     pub(crate) timeout_ms: Option<u64>,
 }

@@ -28,7 +28,7 @@ WHERE edge.target_symbol_id = ?1 AND edge.edge_kind = 'calls'
 
 ## 数据库与迁移边界
 
-- 当前 workspace schema 版本为 **42**：`store/workspace.rs::MIGRATIONS` 的最后一项是 `MIGRATION_042`。图谱基础表在 `MIGRATION_001`：`code_graph_files`、`code_graph_symbols`、`code_graph_edges`、`code_graph_references`、`code_graph_imports`；FTS 在后续 migration 建立。
+- 当前 workspace schema 版本为 **43**：`store/workspace.rs::MIGRATIONS` 的最后一项是 `MIGRATION_043`。图谱基础表在 `MIGRATION_001`：`code_graph_files`、`code_graph_symbols`、`code_graph_edges`、`code_graph_references`、`code_graph_imports`；v43 为 symbols 增加 qualified/visibility/metadata 并清空旧图谱，FTS 在后续 migration 建立。
 - 迁移入口在 `WorkspaceDatabase::open_or_create` 的 workspace migration 流程，受 workspace database gate 管理。图谱工具、索引器和远程 sidecar 都经此入口打开 workspace DB；不得 raw-open 绕过 gate 或迁移锁。
 - `graph/lib.rs::index_workspace` 仅短暂打开数据库以读取 hash、批量替换（默认 16 文件）和删除 stale 文件。这一“解析 permit 外、短事务写入”的约束应保持。
 - `replace_code_graph_file_index` 目前用 transaction 维护文件级 replace。若跨文件 edge 不再只属于源文件，需要在设计中定义 source-file 删除、target-file 重建、module resolver 重跑时的失效策略，避免残留边。

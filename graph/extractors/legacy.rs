@@ -104,8 +104,13 @@ fn collect_symbols_and_imports(
         let range = range_from_node(node);
         symbols.push(ExtractedNode {
             local_key: node_local_key(file_key, symbol_kind, &name, range.start),
+            qualified_name: name.clone(),
             name,
             kind: symbol_kind,
+            visibility: None,
+            metadata_json:
+                r#"{"semanticVersion":1,"provenance":"tree_sitter","confidence":"heuristic"}"#
+                    .to_string(),
             range,
             name_range,
             signature: signature_text(node, text),
@@ -183,6 +188,7 @@ fn collect_references_recursive(
                     source_local_key: source_symbol.local_key.clone(),
                     target: ExtractedEdgeTarget::Local(target_symbol.local_key.clone()),
                     edge_kind: "references",
+                    metadata_json: r#"{"semanticVersion":1,"provenance":"heuristic","confidence":"heuristic","resolution":{"status":"resolved","candidates":[]}}"#.to_string(),
                 });
             }
         }

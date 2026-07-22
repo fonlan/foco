@@ -4,10 +4,11 @@ use crate::{
     APPLY_PATCH_TOOL, ASK_QUESTION_TOOL, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
     DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_COMMAND_OUTPUT_TOOL, GET_PLANS_TOOL,
     GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
-    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL,
-    READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
-    STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL,
-    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL,
+    GRAPH_FIND_CHILDREN_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    GRAPH_RELATED_FILES_TOOL, IMAGE_GEN_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, RUN_COMMAND_TOOL,
+    SEARCH_TEXT_TOOL, SLEEP_TOOL, STOP_COMMAND_TOOL, ToolDefinition, UPDATE_PLAN_STEP_TOOL,
+    UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
+    WRITE_FILE_TOOL,
 };
 
 pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
@@ -17,6 +18,7 @@ pub(crate) fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         graph_find_symbols_definition(),
         graph_find_callers_definition(),
         graph_find_callees_definition(),
+        graph_find_children_definition(),
         graph_find_references_definition(),
         graph_related_files_definition(),
         graph_explore_definition(),
@@ -147,7 +149,7 @@ fn graph_find_symbols_definition() -> ToolDefinition {
 fn graph_find_callers_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_CALLERS_TOOL,
-        description: "Find code graph caller relationships for the requested symbol. This returns relationship metadata, not source snippets; use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
+        description: "Find static call-site approximations that call the requested symbol. This is not runtime tracing; relationship metadata includes edge kind and provenance. Use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -182,7 +184,7 @@ fn graph_find_callers_definition() -> ToolDefinition {
 fn graph_find_callees_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_FIND_CALLEES_TOOL,
-        description: "Find code graph callee relationships from the requested symbol. This returns relationship metadata, not source snippets; use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
+        description: "Find static call-site approximations invoked by the requested symbol. This is not runtime tracing; relationship metadata includes edge kind and provenance. Use graph_explore for source context. Use symbolId from graph_find_symbols when names are ambiguous.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -209,6 +211,45 @@ fn graph_find_callees_definition() -> ToolDefinition {
                 }
             },
             "required": ["symbolId", "symbol", "path", "limit", "timeoutMs"]
+        }),
+        strict: true,
+    }
+}
+
+fn graph_find_children_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: GRAPH_FIND_CHILDREN_TOOL,
+        description: "List direct indexed members of a class, module, impl, trait, or other container symbol. This is one level only and does not recursively expand descendants.",
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "symbolId": {
+                    "type": ["integer", "null"],
+                    "description": "Exact code graph symbol id returned by graph_find_symbols."
+                },
+                "symbol": {
+                    "type": ["string", "null"],
+                    "description": "Symbol name to resolve when it is unique."
+                },
+                "path": {
+                    "type": ["string", "null"],
+                    "description": "Optional workspace-relative file or directory path used only with symbol."
+                },
+                "kind": {
+                    "type": ["string", "null"],
+                    "description": "Optional direct-member kind filter, such as method, function, variable, or type_alias."
+                },
+                "limit": {
+                    "type": ["integer", "null"],
+                    "description": "Optional result limit from 1 to 50. Defaults to 20."
+                },
+                "timeoutMs": {
+                    "type": ["integer", "null"],
+                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                }
+            },
+            "required": ["symbolId", "symbol", "path", "kind", "limit", "timeoutMs"]
         }),
         strict: true,
     }

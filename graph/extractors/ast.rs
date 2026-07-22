@@ -42,6 +42,20 @@ pub(crate) fn first_identifier(node: Node<'_>) -> Option<Node<'_>> {
     )
 }
 
+pub(crate) fn last_identifier(node: Node<'_>) -> Option<Node<'_>> {
+    let mut last = is_identifier_node(node).then_some(node);
+
+    for index in 0..node.child_count() {
+        if let Some(child) = child_at(node, index)
+            && let Some(found) = last_identifier(child)
+        {
+            last = Some(found);
+        }
+    }
+
+    last
+}
+
 pub(crate) fn is_identifier_node(node: Node<'_>) -> bool {
     matches!(
         node.kind(),

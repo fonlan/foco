@@ -47,6 +47,7 @@ fn extracted_edge_can_describe_a_deferred_cross_file_target() {
             description: "crate::other::helper".to_string(),
         },
         edge_kind: "calls",
+        metadata_json: r#"{"semanticVersion":1,"provenance":"module_resolver","confidence":"candidate","resolution":{"status":"unresolved","candidates":[]}}"#.to_string(),
     };
 
     assert!(matches!(
@@ -56,7 +57,7 @@ fn extracted_edge_can_describe_a_deferred_cross_file_target() {
 }
 
 #[test]
-fn indexes_workspace_incrementally_and_preserves_legacy_reference_edges() {
+fn indexes_workspace_incrementally_and_records_syntax_confirmed_calls() {
     let workspace = tempfile::tempdir().expect("workspace");
     fs::write(
         workspace.path().join("lib.rs"),
@@ -73,7 +74,7 @@ fn indexes_workspace_incrementally_and_preserves_legacy_reference_edges() {
     assert_eq!(
         query_count(
             &connection,
-            "SELECT COUNT(*) FROM code_graph_edges WHERE edge_kind = 'references'",
+            "SELECT COUNT(*) FROM code_graph_edges WHERE edge_kind = 'calls'",
         ),
         1
     );
@@ -127,7 +128,7 @@ fn indexes_ets_files_as_typescript() {
 }
 
 #[test]
-fn semantic_fixture_preserves_legacy_function_invocations_as_reference_edges() {
+fn semantic_fixture_records_function_invocations_as_calls_edges() {
     let workspace = semantic_fixture_workspace("rust_workspace");
 
     index_workspace(workspace.path()).expect("index fixture");
@@ -139,17 +140,23 @@ fn semantic_fixture_preserves_legacy_function_invocations_as_reference_edges() {
              FROM code_graph_edges edge
              JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
              JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
-             WHERE source.name = 'result' AND target.name = 'local_helper'",
+             WHERE source.name = 'render' AND target.name = 'local_helper'",
             [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
-        .expect("legacy render relation");
+        .expect("render calls local helper");
 
-    assert_eq!(relation, ("references".to_string(), "{}".to_string()));
+    assert_eq!(
+        relation,
+        (
+            "calls".to_string(),
+            r#"{"semanticVersion":1,"provenance":"tree_sitter","confidence":"exact","resolution":{"status":"resolved","candidates":[]}}"#.to_string()
+        )
+    );
 }
 
 #[test]
-fn semantic_fixture_preserves_same_name_legacy_mislink() {
+fn semantic_fixture_resolves_same_name_calls_in_the_nearest_lexical_scope() {
     let workspace = semantic_fixture_workspace("rust_workspace");
 
     index_workspace(workspace.path()).expect("index fixture");
@@ -165,9 +172,9 @@ fn semantic_fixture_preserves_same_name_legacy_mislink() {
             [],
             |row| row.get::<_, i64>(0),
         )
-        .expect("legacy same-name relation");
+        .expect("outer same-name relation");
 
-    assert_eq!(relation, 20);
+    assert_eq!(relation, 13);
 }
 
 #[test]
@@ -221,7 +228,7 @@ fn semantic_fixture_reports_error_files_without_partial_symbols() {
 }
 
 #[test]
-fn typescript_family_extractor_preserves_import_and_reexport_baseline() {
+fn typescript_family_extractor_records_import_aliases_and_reexports() {
     let workspace = semantic_fixture_workspace("typescript_workspace");
 
     index_workspace(workspace.path()).expect("index fixture");
@@ -251,8 +258,11 @@ fn typescript_family_extractor_preserves_import_and_reexport_baseline() {
          WHERE file.path = 'src/public.ts'",
     );
 
-    assert_eq!(import, ("./index".to_string(), None, None));
-    assert_eq!(reexport_import_count, 0);
+    assert_eq!(
+        import,
+        ("./index".to_string(), Some("render".to_string()), None)
+    );
+    assert_eq!(reexport_import_count, 1);
     assert_eq!(
         query_count(
             &connection,
@@ -263,6 +273,198 @@ fn typescript_family_extractor_preserves_import_and_reexport_baseline() {
         ),
         1
     );
+}
+
+#[test]
+fn rust_extractor_does_not_turn_a_shadowed_local_variable_call_into_a_function_call() {
+    let extracted = extract_file(
+        LanguageKind::Rust,
+        "src/lib.rs",
+        Path::new("src/lib.rs"),
+        "fn helper() {}\nfn caller() { let helper = || {}; helper(); }\n",
+    )
+    .expect("extract Rust source");
+
+    assert!(
+        !extracted.edges.iter().any(|edge| edge.edge_kind == "calls"),
+        "a shadowing local must block a strong function call edge"
+    );
+}
+
+#[test]
+fn rust_extractor_resolves_qualified_calls_by_the_final_segment() {
+    let extracted = extract_file(
+        LanguageKind::Rust,
+        "src/lib.rs",
+        Path::new("src/lib.rs"),
+        "struct Service;\nimpl Service { fn helper() {} fn caller() { Self::helper(); } }\n",
+    )
+    .expect("extract Rust source");
+
+    assert!(extracted.edges.iter().any(|edge| {
+        edge.edge_kind == "calls" && edge.metadata_json.contains("\"confidence\":\"heuristic\"")
+    }));
+}
+
+#[test]
+fn rust_extractor_does_not_apply_a_later_local_shadow_before_its_declaration() {
+    let extracted = extract_file(
+        LanguageKind::Rust,
+        "src/lib.rs",
+        Path::new("src/lib.rs"),
+        "fn helper() {}\nfn caller() { helper(); let helper = || {}; }\n",
+    )
+    .expect("extract Rust source");
+
+    assert!(extracted.edges.iter().any(|edge| edge.edge_kind == "calls"));
+}
+
+#[test]
+fn rust_extractor_collects_public_braced_alias_and_glob_use_imports() {
+    let extracted = extract_file(
+        LanguageKind::Rust,
+        "src/lib.rs",
+        Path::new("src/lib.rs"),
+        "pub use crate::{alpha as renamed, beta};\nuse std::fmt::*;\n",
+    )
+    .expect("extract Rust source");
+
+    let imports = extracted
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.module.as_str(),
+                import.imported_symbol.as_deref(),
+                import.alias.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(imports.contains(&("crate", Some("alpha"), Some("renamed"))));
+    assert!(imports.contains(&("crate", Some("beta"), None)));
+    assert!(
+        imports.contains(&("std::fmt", Some("*"), None)),
+        "glob import missing from {imports:?}"
+    );
+}
+
+#[test]
+fn typescript_extractor_only_emits_calls_for_call_or_new_syntax() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "class Service {}\nfunction create() { const value = Service; return new Service(); }\n",
+    )
+    .expect("extract TypeScript source");
+
+    assert_eq!(
+        extracted
+            .edges
+            .iter()
+            .filter(|edge| edge.edge_kind == "calls")
+            .count(),
+        1,
+        "only the new-expression should create a constructor call; the variable read must not"
+    );
+}
+
+#[test]
+fn typescript_extractor_resolves_calls_to_arrow_function_bindings() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "const helper = () => {};\nfunction caller() { helper(); }\n",
+    )
+    .expect("extract TypeScript source");
+
+    assert!(extracted.edges.iter().any(|edge| edge.edge_kind == "calls"));
+}
+
+#[test]
+fn typescript_extractor_resolves_member_calls_by_the_member_name() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "class Service { run() {} create() { this.run(); } }\n",
+    )
+    .expect("extract TypeScript source");
+
+    assert!(extracted.edges.iter().any(|edge| {
+        edge.edge_kind == "calls" && edge.metadata_json.contains("\"confidence\":\"heuristic\"")
+    }));
+}
+
+#[test]
+fn typescript_extractor_keeps_unconstrained_member_calls_unresolved() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "class Service { render() {} }\nfunction caller() { const service = () => {}; service.render(); }\n",
+    )
+    .expect("extract TypeScript source");
+
+    assert!(
+        !extracted.edges.iter().any(|edge| edge.edge_kind == "calls"),
+        "an arbitrary receiver must not resolve to an unrelated class method"
+    );
+    assert!(
+        extracted.references.iter().any(|reference| {
+            reference.name == "render" && reference.target_local_key.is_none()
+        })
+    );
+}
+
+#[test]
+fn typescript_extractor_collects_mixed_imports_and_star_reexports() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "import Default, { named as local } from 'module';\nimport * as namespace from 'other';\nexport { source as publicName } from 'third';\nexport * from 'fourth';\n",
+    )
+    .expect("extract TypeScript source");
+
+    let imports = extracted
+        .imports
+        .iter()
+        .map(|import| {
+            (
+                import.module.as_str(),
+                import.imported_symbol.as_deref(),
+                import.alias.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert!(imports.contains(&("module", Some("default"), Some("Default"))));
+    assert!(imports.contains(&("module", Some("named"), Some("local"))));
+    assert!(imports.contains(&("other", Some("*"), Some("namespace"))));
+    assert!(imports.contains(&("third", Some("source"), Some("publicName"))));
+    assert!(imports.contains(&("fourth", Some("*"), None)));
+}
+
+#[test]
+fn typescript_extractor_does_not_mark_nested_symbols_as_exported() {
+    let extracted = extract_file(
+        LanguageKind::TypeScript,
+        "src/example.ts",
+        Path::new("src/example.ts"),
+        "export function outer() { function inner() {} inner(); }\n",
+    )
+    .expect("extract TypeScript source");
+    let inner = extracted
+        .nodes
+        .iter()
+        .find(|node| node.name == "inner")
+        .expect("nested function symbol");
+
+    assert_eq!(inner.visibility, None);
+    assert!(inner.metadata_json.contains("\"exported\":false"));
 }
 
 #[test]

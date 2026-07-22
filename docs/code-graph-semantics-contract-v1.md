@@ -38,7 +38,7 @@
 | edge kind | source → target | 含义 | 何时可声明 |
 | --- | --- | --- | --- |
 | `contains` | file/module/symbol → contained symbol | 结构性归属，不代表运行时或名称解析 | 父子语法结构可精确确定时 |
-| `calls` | 可调用 symbol → 被调用 symbol | 一个 call expression 经解析后指向目标 callable | 只在目标解析为 exact 时；候选调用不得伪装为此边 |
+| `calls` | 可调用 symbol → 被调用 symbol | 一个 call/new expression 经解析后指向目标 callable | 语法调用成立；目标为局部唯一绑定时是 `exact`，关联/成员近似必须标为 `heuristic` |
 | `references` | symbol/reference owner → 被引用 symbol | 非调用名称使用，例如变量、类型、常量或保守的名称绑定 | 已能表示引用，且目标精度符合 metadata 声明时 |
 | `imports` | file/module → module 或 imported symbol | 源文件声明了 import/use/export-from/re-export 依赖 | 语法 import 可识别；目标 module 可暂时 unresolved |
 
@@ -93,7 +93,7 @@
 
 不确定性是图谱数据的一部分：解析器不得将同名、遮蔽、方法同名或外部依赖猜测为 `exact`。
 
-## 当前实现：兼容基线而非语义真相
+## 历史兼容基线（schema v42 及以前）
 
 截至 workspace schema v42，`graph/lib.rs` 会收集当前文件的 symbol，再把 identifier 文本按名称映射到一个同文件 symbol。若 identifier 不等于该目标的声明名称位置，它会创建 `code_graph_references` 行，并在有包含 symbol 时写入 `edge_kind = "references"`。
 
@@ -106,18 +106,27 @@
 - parser 有 `ERROR` 节点时当前文件在 `code_graph_parse_status.status` 中标记为 `error`，且不写 symbol、import、reference 或 edge。
 - 当前边 metadata 是空对象 `{}`，没有 provenance 或 confidence，因而不能被解读为 exact。
 
-这些限制是历史行为，不是 v1 语义承诺。`graph/tests/fixtures/semantic_baseline` 保留了可复现样本，使后续阶段能有意地替换预期。
+这些限制是历史行为，不是 v1 语义承诺。schema v43 会清空旧 code graph 文件、hash、FTS 数据和边，令下一次惰性索引以新提取器重建，绝不混用旧 `references` 调用近似与新 `calls`。`graph/tests/fixtures/semantic_baseline` 保留可复现样本。
+
+## 当前实现（schema v43）
+
+- Rust、TypeScript、TSX 与 JavaScript 使用专用 Tree-sitter walker；有 `ERROR` 的文件维持安全策略：仅记录 parse status，不写部分事实。
+- symbols 持久化 `qualified_name`、`visibility` 与 `metadata_json`；局部声明以词法 scope 解析，遮蔽局部变量会阻止生成错误的强调用边。
+- `calls` 仅从 Rust `call_expression`/`method_call_expression` 与 TS-family `call_expression`/`new_expression` 生成。非调用属性访问与普通变量读取不生成 calls。
+- Rust `use`、TS-family named/default/namespace import 及 `export ... from` 会写入 imports 的 module、imported_symbol、alias；尚未解析的跨文件目标不会凭名称产生 calls。
+- 当前文件内可验证的调用写 `tree_sitter`/`exact`；关联函数和成员调用的有限近似写 `heuristic`/`heuristic`。两者都必须在 metadata 中公开 provenance、confidence 与 resolution。
 
 ## 查询兼容策略
 
-当前 `graph_find_callers` 与 `graph_find_callees` 通过 `WorkspaceDatabase::code_graph_symbol_relations` 查询**所有** `code_graph_edges`，没有 `edge_kind` 条件。因此今天它们实际返回的是“有方向的关系”，而非可信 callers/callees；`references` 边会出现在两个工具中。
+在 schema v43，`graph_find_callers` 与 `graph_find_callees` 只查询 `edge_kind = 'calls'`，并把关系表述为静态 call-site approximation，而非运行时追踪。
 
 迁移策略：
 
-1. Phase 1 不修改 SQL、工具 schema 或结果。
-2. 引入 `calls` 后，`graph_find_callers` 和 `graph_find_callees` 的 SQL 必须限定 `edge.edge_kind = 'calls'`，并在工具文档/结果中说明它们只返回可信调用关系。
-3. `graph_find_references` 保持 reference 位置查询；当调用位置也需要展示时，应通过明确字段或专用工具表达，不能重新把 callers/callees 退化为全部边。
-4. `graph_related_files` 必须分别标示 `calls`、`imports`、候选/heuristic 影响；在过渡期间不可因旧 `references` 边把跨文件影响标为高置信。
+1. schema v43 migration 先清除历史图谱，再由既有 lazy/background 初始化按需重建。
+2. callers/callees 的 SQL 必须限定 `edge.edge_kind = 'calls'`，工具文档和结果都说明其为静态近似。
+3. `graph_find_references` 保持 occurrence 查询；不能重新把 callers/callees 退化为全部边。
+4. `graph_find_children` 仅返回一层 `contains` 子节点，支持 kind 过滤，不递归展开。
+5. `graph_related_files` 的 caller/callee 分支只基于 calls；共享 import 保持独立 relation。
 
 工具的字段形状保持向后兼容。后续若需要输出 edge metadata，应新增可选字段；旧客户端不依赖它时仍可读取原有 `edgeKind`、source 和 target。
 

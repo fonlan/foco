@@ -90,13 +90,13 @@ use workspace_schema::{
     MIGRATION_022, MIGRATION_022_BACKFILL, MIGRATION_023, MIGRATION_024, MIGRATION_025,
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
-    MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, Migration,
+    MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 42;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 43;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -440,6 +440,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 42,
         sql: MIGRATION_042,
+    },
+    Migration {
+        version: 43,
+        sql: MIGRATION_043,
     },
 ];
 
@@ -14364,10 +14368,10 @@ impl WorkspaceDatabase {
                 .prepare(
                     "INSERT INTO code_graph_symbols
                         (
-                            file_id, name, kind, start_line, start_column,
-                            end_line, end_column, signature, documentation
+                            file_id, name, qualified_name, kind, visibility, metadata_json,
+                            start_line, start_column, end_line, end_column, signature, documentation
                         )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
             let mut insert_fts_data = transaction
@@ -14389,7 +14393,10 @@ impl WorkspaceDatabase {
                     .execute(params![
                         file_id,
                         symbol.name,
+                        symbol.qualified_name,
                         symbol.kind,
+                        symbol.visibility,
+                        symbol.metadata_json.unwrap_or("{}"),
                         symbol.start_line,
                         symbol.start_column,
                         symbol.end_line,
@@ -14705,14 +14712,15 @@ impl WorkspaceDatabase {
             .connection
             .prepare(
                 "SELECT
-                    s.id, f.path, f.language, s.name, s.kind,
-                    s.start_line, s.start_column, s.end_line, s.end_column,
-                    s.signature, s.documentation
+                    s.id, f.path, f.language, s.name, s.qualified_name, s.kind,
+                    s.visibility, s.metadata_json, s.start_line, s.start_column,
+                    s.end_line, s.end_column, s.signature, s.documentation
                  FROM code_graph_symbols s
                  JOIN code_graph_files f ON f.id = s.file_id
                  WHERE
                     (
                         lower(s.name) LIKE ?1
+                        OR lower(COALESCE(s.qualified_name, '')) LIKE ?1
                         OR lower(COALESCE(s.signature, '')) LIKE ?1
                         OR lower(COALESCE(s.documentation, '')) LIKE ?1
                     )
@@ -14743,9 +14751,9 @@ impl WorkspaceDatabase {
         self.connection
             .query_row(
                 "SELECT
-                    s.id, f.path, f.language, s.name, s.kind,
-                    s.start_line, s.start_column, s.end_line, s.end_column,
-                    s.signature, s.documentation
+                    s.id, f.path, f.language, s.name, s.qualified_name, s.kind,
+                    s.visibility, s.metadata_json, s.start_line, s.start_column,
+                    s.end_line, s.end_column, s.signature, s.documentation
                  FROM code_graph_symbols s
                  JOIN code_graph_files f ON f.id = s.file_id
                  WHERE s.id = ?1",
@@ -14762,7 +14770,7 @@ impl WorkspaceDatabase {
         limit: i64,
     ) -> Result<Vec<CodeGraphSymbolRelationRecord>, WorkspaceDatabaseError> {
         self.code_graph_symbol_relations(
-            "WHERE edge.target_symbol_id = ?1",
+            "WHERE edge.target_symbol_id = ?1 AND edge.edge_kind = 'calls'",
             params![symbol_id, limit],
         )
     }
@@ -14773,9 +14781,41 @@ impl WorkspaceDatabase {
         limit: i64,
     ) -> Result<Vec<CodeGraphSymbolRelationRecord>, WorkspaceDatabaseError> {
         self.code_graph_symbol_relations(
-            "WHERE edge.source_symbol_id = ?1",
+            "WHERE edge.source_symbol_id = ?1 AND edge.edge_kind = 'calls'",
             params![symbol_id, limit],
         )
+    }
+
+    /// Return only direct declaration members recorded as `contains` edges.
+    pub fn code_graph_children(
+        &self,
+        symbol_id: i64,
+        kind: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<CodeGraphSymbolRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    child.id, file.path, file.language, child.name, child.qualified_name,
+                    child.kind, child.visibility, child.metadata_json, child.start_line,
+                    child.start_column, child.end_line, child.end_column, child.signature,
+                    child.documentation
+                 FROM code_graph_edges edge
+                 JOIN code_graph_symbols child ON child.id = edge.target_symbol_id
+                 JOIN code_graph_files file ON file.id = child.file_id
+                 WHERE edge.source_symbol_id = ?1
+                   AND edge.edge_kind = 'contains'
+                   AND (?2 IS NULL OR child.kind = ?2)
+                 ORDER BY child.start_line ASC, child.start_column ASC, child.name ASC
+                 LIMIT ?3",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(params![symbol_id, kind, limit], code_graph_symbol_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+
+        collect_rows(rows, &self.database_path)
     }
 
     pub fn code_graph_references(
@@ -14791,9 +14831,9 @@ impl WorkspaceDatabase {
                     reference.start_line, reference.start_column,
                     reference.end_line, reference.end_column,
                     symbol.id, symbol_file.path, symbol_file.language,
-                    symbol.name, symbol.kind, symbol.start_line, symbol.start_column,
-                    symbol.end_line, symbol.end_column, symbol.signature,
-                    symbol.documentation
+                    symbol.name, symbol.qualified_name, symbol.kind, symbol.visibility,
+                    symbol.metadata_json, symbol.start_line, symbol.start_column,
+                    symbol.end_line, symbol.end_column, symbol.signature, symbol.documentation
                  FROM code_graph_references reference
                  JOIN code_graph_files file ON file.id = reference.file_id
                  LEFT JOIN code_graph_symbols symbol ON symbol.id = reference.symbol_id
@@ -14831,6 +14871,7 @@ impl WorkspaceDatabase {
                     JOIN code_graph_files target_file
                         ON target_file.id = target_symbol.file_id
                     WHERE source_file.path = ?1 AND target_file.path <> ?1
+                      AND edge.edge_kind = 'calls'
                     GROUP BY target_file.path, target_file.language
 
                     UNION ALL
@@ -14847,6 +14888,7 @@ impl WorkspaceDatabase {
                     JOIN code_graph_files target_file
                         ON target_file.id = target_symbol.file_id
                     WHERE target_file.path = ?1 AND source_file.path <> ?1
+                      AND edge.edge_kind = 'calls'
                     GROUP BY source_file.path, source_file.language
 
                     UNION ALL
@@ -15015,10 +15057,12 @@ impl WorkspaceDatabase {
             "SELECT
                 edge.id, edge.edge_kind, edge.metadata_json,
                 source.id, source_file.path, source_file.language,
-                source.name, source.kind, source.start_line, source.start_column,
+                source.name, source.qualified_name, source.kind, source.visibility,
+                source.metadata_json, source.start_line, source.start_column,
                 source.end_line, source.end_column, source.signature, source.documentation,
                 target.id, target_file.path, target_file.language,
-                target.name, target.kind, target.start_line, target.start_column,
+                target.name, target.qualified_name, target.kind, target.visibility,
+                target.metadata_json, target.start_line, target.start_column,
                 target.end_line, target.end_column, target.signature, target.documentation
              FROM code_graph_edges edge
              JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
@@ -16783,13 +16827,16 @@ fn code_graph_symbol_from_row_offset(
         path: row.get(offset + 1)?,
         language: row.get(offset + 2)?,
         name: row.get(offset + 3)?,
-        kind: row.get(offset + 4)?,
-        start_line: row.get(offset + 5)?,
-        start_column: row.get(offset + 6)?,
-        end_line: row.get(offset + 7)?,
-        end_column: row.get(offset + 8)?,
-        signature: row.get(offset + 9)?,
-        documentation: row.get(offset + 10)?,
+        qualified_name: row.get(offset + 4)?,
+        kind: row.get(offset + 5)?,
+        visibility: row.get(offset + 6)?,
+        metadata_json: row.get(offset + 7)?,
+        start_line: row.get(offset + 8)?,
+        start_column: row.get(offset + 9)?,
+        end_line: row.get(offset + 10)?,
+        end_column: row.get(offset + 11)?,
+        signature: row.get(offset + 12)?,
+        documentation: row.get(offset + 13)?,
     })
 }
 
@@ -16814,7 +16861,7 @@ fn code_graph_relation_from_row(
         edge_kind: row.get(1)?,
         metadata_json: row.get(2)?,
         source: code_graph_symbol_from_row_offset(row, 3)?,
-        target: code_graph_symbol_from_row_offset(row, 14)?,
+        target: code_graph_symbol_from_row_offset(row, 17)?,
     })
 }
 

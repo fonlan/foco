@@ -40,6 +40,7 @@ const TOOL_DISPLAY_NAMES: Record<string, ToolDisplayLabels> = {
   graph_explore: { en: "Explore", "zh-CN": "代码探索" },
   graph_find_callees: { en: "Callees", "zh-CN": "查找被调" },
   graph_find_callers: { en: "Callers", "zh-CN": "查找调用" },
+  graph_find_children: { en: "Children", "zh-CN": "查找成员" },
   graph_find_references: { en: "References", "zh-CN": "查找引用" },
   graph_find_symbols: { en: "Symbols", "zh-CN": "查找符号" },
   graph_related_files: { en: "Related", "zh-CN": "相关文件" },

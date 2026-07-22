@@ -1458,6 +1458,26 @@ ON llm_requests (structured_call_id, attempt_index)
 WHERE structured_call_id IS NOT NULL;
 "#;
 
+pub(crate) const MIGRATION_043: &str = r#"
+ALTER TABLE code_graph_symbols
+    ADD COLUMN qualified_name TEXT;
+
+ALTER TABLE code_graph_symbols
+    ADD COLUMN visibility TEXT;
+
+ALTER TABLE code_graph_symbols
+    ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
+
+-- v42 graph rows used name-matched reference edges as caller/callee data. Drop
+-- them atomically with their hashes so the next lazy index rebuilds every file
+-- using the syntax-aware extractors instead of mixing incompatible semantics.
+DELETE FROM code_graph_fts_index
+ WHERE entity_kind IN ('file', 'symbol');
+DELETE FROM code_graph_fts_data
+ WHERE entity_kind IN ('file', 'symbol');
+DELETE FROM code_graph_files;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

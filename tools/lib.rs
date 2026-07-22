@@ -60,6 +60,7 @@ pub const SLEEP_TOOL: &str = "sleep";
 pub const GRAPH_FIND_SYMBOLS_TOOL: &str = "graph_find_symbols";
 pub const GRAPH_FIND_CALLERS_TOOL: &str = "graph_find_callers";
 pub const GRAPH_FIND_CALLEES_TOOL: &str = "graph_find_callees";
+pub const GRAPH_FIND_CHILDREN_TOOL: &str = "graph_find_children";
 pub const GRAPH_FIND_REFERENCES_TOOL: &str = "graph_find_references";
 pub const GRAPH_RELATED_FILES_TOOL: &str = "graph_related_files";
 pub const GRAPH_EXPLORE_TOOL: &str = "graph_explore";
@@ -489,6 +490,7 @@ fn execute_builtin_tool_inner(
         GRAPH_FIND_SYMBOLS_TOOL => graph_tools::graph_find_symbols(workspace_path, arguments),
         GRAPH_FIND_CALLERS_TOOL => graph_tools::graph_find_callers(workspace_path, arguments),
         GRAPH_FIND_CALLEES_TOOL => graph_tools::graph_find_callees(workspace_path, arguments),
+        GRAPH_FIND_CHILDREN_TOOL => graph_tools::graph_find_children(workspace_path, arguments),
         GRAPH_FIND_REFERENCES_TOOL => graph_tools::graph_find_references(workspace_path, arguments),
         GRAPH_RELATED_FILES_TOOL => graph_tools::graph_related_files(workspace_path, arguments),
         GRAPH_EXPLORE_TOOL => graph_tools::graph_explore(workspace_path, arguments),
@@ -3884,6 +3886,19 @@ mod tests {
 
         assert!(!callees.is_error);
         assert_eq!(callees.output["callees"][0]["target"]["name"], "helper");
+        assert_eq!(
+            callees.output["relationshipSemantics"],
+            "static_call_site_approximation"
+        );
+
+        let children = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_FIND_CHILDREN_TOOL,
+            json!({ "symbolId": public_api_id, "kind": "function", "limit": 5 }),
+        );
+
+        assert!(!children.is_error);
+        assert_eq!(children.output["children"][0]["name"], "helper");
 
         let related_files = execute_builtin_tool(
             workspace.path(),
@@ -6164,7 +6179,10 @@ mod tests {
         let lib_symbols = [
             NewCodeGraphSymbol {
                 name: "public_api",
+                qualified_name: "public_api",
                 kind: "function",
+                visibility: Some("public"),
+                metadata_json: None,
                 start_line: Some(1),
                 start_column: Some(1),
                 end_line: Some(5),
@@ -6174,7 +6192,10 @@ mod tests {
             },
             NewCodeGraphSymbol {
                 name: "helper",
+                qualified_name: "helper",
                 kind: "function",
+                visibility: None,
+                metadata_json: None,
                 start_line: Some(7),
                 start_column: Some(1),
                 end_line: Some(9),
@@ -6198,12 +6219,20 @@ mod tests {
             end_line: Some(3),
             end_column: Some(11),
         }];
-        let lib_edges = [NewCodeGraphEdge {
-            source_symbol_index: 0,
-            target_symbol_index: 1,
-            edge_kind: "references",
-            metadata_json: None,
-        }];
+        let lib_edges = [
+            NewCodeGraphEdge {
+                source_symbol_index: 0,
+                target_symbol_index: 1,
+                edge_kind: "calls",
+                metadata_json: Some(r#"{"provenance":"tree_sitter","confidence":"exact"}"#),
+            },
+            NewCodeGraphEdge {
+                source_symbol_index: 0,
+                target_symbol_index: 1,
+                edge_kind: "contains",
+                metadata_json: Some(r#"{"provenance":"tree_sitter","confidence":"exact"}"#),
+            },
+        ];
         database
             .replace_code_graph_file_index(NewCodeGraphFileIndex {
                 path: "lib.rs",
@@ -6222,7 +6251,10 @@ mod tests {
             .expect("lib graph index");
         let caller_symbols = [NewCodeGraphSymbol {
             name: "caller_entry",
+            qualified_name: "caller_entry",
             kind: "function",
+            visibility: None,
+            metadata_json: None,
             start_line: Some(1),
             start_column: Some(1),
             end_line: Some(3),
