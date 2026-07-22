@@ -3784,6 +3784,15 @@ body,
   font-size: var(--foco-font-micro);
 }
 
+/* Control-row button labels: normal weight for visual consistency.
+   Scoped to the control row so popover option emphasis (e.g. font-semibold) is unchanged. */
+.message-composer-control-row .composer-team-toggle,
+.message-composer-control-row .composer-select-summary,
+.message-composer-control-row .composer-fast-toggle,
+.message-composer-control-row > .composer-branch-select {
+  font-weight: 400;
+}
+
 .message-composer-control-row .composer-select-popover button {
   font-size: var(--foco-font-compact);
 }
