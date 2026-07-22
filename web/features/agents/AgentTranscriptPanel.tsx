@@ -19,6 +19,13 @@ import { useI18n } from "../../shared/i18n";
 type AgentTranscriptItem = AgentTranscriptItemView;
 type AgentTranscriptWirePart = ChatMessagePart | {
   type?: string;
+  text?: string;
+  durationMs?: number;
+  duration_ms?: number;
+  liveDurationMs?: number;
+  live_duration_ms?: number;
+  startedAtMs?: number;
+  started_at_ms?: number;
   tool_call?: Extract<ChatMessagePart, { type: "toolCall" }>["toolCall"];
   toolCall?: Extract<ChatMessagePart, { type: "toolCall" }>["toolCall"];
 };
@@ -36,11 +43,49 @@ export type AgentTranscriptViewCacheEntry = {
   stickToBottom: boolean;
 };
 
+function readOptionalFiniteNumber(...candidates: unknown[]): number | undefined {
+  for (const value of candidates) {
+    // Reject NaN/Infinity and negative durations so render falls back safely.
+    if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
 function normalizeAgentTranscriptPart(
   part: AgentTranscriptWirePart,
   itemId: string,
   partIndex: number,
 ): ChatMessagePart {
+  if (part.type === "reasoning") {
+    const wire = part as {
+      type: "reasoning";
+      text?: string;
+      durationMs?: number;
+      duration_ms?: number;
+      liveDurationMs?: number;
+      live_duration_ms?: number;
+      startedAtMs?: number;
+      started_at_ms?: number;
+    };
+    const text = typeof wire.text === "string" ? wire.text : "";
+    // Rust ChatMessagePart::Reasoning serializes duration as duration_ms; accept camelCase too.
+    const durationMs = readOptionalFiniteNumber(wire.durationMs, wire.duration_ms);
+    const liveDurationMs = readOptionalFiniteNumber(
+      wire.liveDurationMs,
+      wire.live_duration_ms,
+    );
+    const startedAtMs = readOptionalFiniteNumber(wire.startedAtMs, wire.started_at_ms);
+    return {
+      type: "reasoning",
+      text,
+      ...(durationMs !== undefined ? { durationMs } : {}),
+      ...(liveDurationMs !== undefined ? { liveDurationMs } : {}),
+      ...(startedAtMs !== undefined ? { startedAtMs } : {}),
+    };
+  }
+
   if (part.type !== "toolCall") {
     return part as ChatMessagePart;
   }

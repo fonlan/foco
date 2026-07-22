@@ -1032,8 +1032,9 @@ describe("app agents verification surfaces", () => {
             {
               type: "reasoning" as const,
               text: "Checking workspace state.",
-              durationMs: 1200,
-            },
+              // Real Rust wire shape for ChatMessagePart::Reasoning (snake_case).
+              duration_ms: 1200,
+            } as unknown as AgentTranscriptResponse["items"][number]["parts"][number],
             {
               type: "toolCall" as const,
               toolCall: {
@@ -1064,8 +1065,8 @@ describe("app agents verification surfaces", () => {
             {
               type: "reasoning" as const,
               text: "Checking workspace state.",
-              durationMs: 3500,
-            },
+              duration_ms: 3500,
+            } as unknown as AgentTranscriptResponse["items"][number]["parts"][number],
             firstTranscriptResponse.items[0]!.parts[1]!,
             { type: "text" as const, text: "Still inspecting." },
           ],
