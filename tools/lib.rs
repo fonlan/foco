@@ -6147,6 +6147,555 @@ mod tests {
         );
     }
 
+    /// Page through `read_spec` until `truncated=false`, asserting each page fits the soft
+    /// envelope (JSON-serialized ToolExecution) and reassembling `contentMarkdown` bytes.
+    fn read_spec_reassemble_all_pages(
+        workspace_path: &Path,
+        expected_revision: u64,
+        expected_content: &str,
+    ) {
+        let soft_with_reserve = output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            .saturating_sub(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES);
+        let mut reassembled = String::new();
+        let mut start_line: Option<u64> = None;
+        let mut pages = 0_usize;
+        loop {
+            pages = pages.saturating_add(1);
+            assert!(pages <= 64, "read_spec pagination did not terminate");
+            let page = execute_builtin_tool(
+                workspace_path,
+                READ_SPEC_TOOL,
+                json!({
+                    "startLine": start_line,
+                    "expectedRevision": if start_line.is_some() {
+                        json!(expected_revision)
+                    } else {
+                        Value::Null
+                    },
+                    "timeoutMs": null
+                }),
+            );
+            assert!(!page.is_error, "page {pages}: {}", page.output);
+            assert_eq!(page.output["revision"], expected_revision);
+            assert_eq!(page.output["totalBytes"], expected_content.len());
+
+            let measured = output_budget::measure_tool_execution(&page).expect("measure page");
+            // Multi-line soft pages must leave room for the outer SSE envelope; a single soft-over
+            // line may set softBudgetExceeded and exceed soft-with-reserve intentionally.
+            let soft_budget_exceeded = page.output["softBudgetExceeded"].as_bool() == Some(true);
+            if !soft_budget_exceeded {
+                assert!(
+                    measured.serialized_bytes <= soft_with_reserve
+                        || measured.serialized_bytes <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+                    "page {pages} envelope bytes {} exceed soft budgets",
+                    measured.serialized_bytes
+                );
+                assert!(
+                    measured.text_lines <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT,
+                    "page {pages} text_lines={}",
+                    measured.text_lines
+                );
+            }
+
+            let normalized = output_budget::normalize_tool_execution(
+                READ_SPEC_TOOL,
+                output_budget::ToolOutputSemantics::ReadOnly,
+                page.clone(),
+            );
+            assert!(
+                !normalized.execution.is_error,
+                "normalize must preserve read_spec success: {}",
+                normalized.execution.output
+            );
+            assert_eq!(
+                normalized.execution.output["contentMarkdown"],
+                page.output["contentMarkdown"]
+            );
+            assert_eq!(
+                normalized.execution.output["revision"],
+                page.output["revision"]
+            );
+
+            // Simulate a slightly larger transport envelope measurement (SSE ToolResult wrapper).
+            let envelope_budgeted = output_budget::normalize_tool_execution_for_envelope(
+                READ_SPEC_TOOL,
+                output_budget::ToolOutputSemantics::ReadOnly,
+                page.clone(),
+                |execution| {
+                    let bare = output_budget::serialized_json_size(execution)?;
+                    Ok(bare
+                        .saturating_add(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES / 2))
+                },
+            );
+            assert!(
+                !envelope_budgeted.execution.is_error,
+                "envelope normalize must preserve truncated/full success: {}",
+                envelope_budgeted.execution.output
+            );
+            assert!(
+                envelope_budgeted
+                    .execution
+                    .output
+                    .get("outputOmitted")
+                    .is_none()
+            );
+
+            let chunk = page.output["contentMarkdown"]
+                .as_str()
+                .expect("contentMarkdown")
+                .to_string();
+            reassembled.push_str(&chunk);
+
+            if page.output["truncated"].as_bool() != Some(true) {
+                assert_eq!(page.output["truncated"], false);
+                assert!(
+                    page.output.get("nextStartLine").is_none()
+                        || page.output["nextStartLine"].is_null()
+                );
+                break;
+            }
+            let next = page.output["nextStartLine"]
+                .as_u64()
+                .expect("nextStartLine on truncated page");
+            assert!(next >= 2 || start_line.is_some(), "nextStartLine={next}");
+            start_line = Some(next);
+        }
+
+        assert_eq!(
+            reassembled.as_bytes(),
+            expected_content.as_bytes(),
+            "reassembled contentMarkdown must match stored bytes exactly"
+        );
+        let db = WorkspaceDatabase::open_or_create(workspace_path).expect("db");
+        let stored = db
+            .workspace_spec()
+            .expect("spec")
+            .expect("spec present")
+            .content_markdown;
+        assert_eq!(reassembled.as_bytes(), stored.as_bytes());
+    }
+
+    #[test]
+    fn read_spec_small_body_returns_full_page_under_soft_budget() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = "# Small Spec\n\nUnder 50 KiB body with a few lines.\n";
+        assert!(content.len() < 50 * 1024);
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": content,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+        assert_eq!(written.output["contentOmitted"], false);
+
+        let page = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!page.is_error, "{}", page.output);
+        assert_eq!(page.output["truncated"], false);
+        assert_eq!(page.output["contentMarkdown"], content);
+        assert_eq!(page.output["revision"], 1);
+        assert_eq!(page.output["totalBytes"], content.len());
+        assert!(
+            page.output.get("nextStartLine").is_none() || page.output["nextStartLine"].is_null()
+        );
+
+        let measured = output_budget::measure_tool_execution(&page).expect("measure");
+        assert!(measured.serialized_bytes <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        let normalized = output_budget::normalize_tool_execution(
+            READ_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            page.clone(),
+        );
+        assert!(!normalized.execution.is_error);
+        assert_eq!(normalized.execution.output["contentMarkdown"], content);
+    }
+
+    #[test]
+    fn read_spec_empty_spec_returns_empty_success() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let page = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!page.is_error, "{}", page.output);
+        assert_eq!(page.output["revision"], 0);
+        assert_eq!(page.output["contentMarkdown"], "");
+        assert_eq!(page.output["truncated"], false);
+        assert_eq!(page.output["totalLines"], 0);
+        assert_eq!(page.output["totalBytes"], 0);
+        assert_eq!(page.output["returnedLines"], 0);
+
+        let past_eof = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": 1,
+                "expectedRevision": 0,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!past_eof.is_error, "{}", past_eof.output);
+        assert_eq!(past_eof.output["contentMarkdown"], "");
+        assert_eq!(past_eof.output["truncated"], false);
+    }
+
+    #[test]
+    fn read_spec_near_64kib_pages_reassemble_to_stored_bytes() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Approach the 64 KiB Spec hard cap with multi-line ASCII so pagination is required.
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789-near-64kib-padding-line\n";
+        let mut large = String::from("# Near 64 KiB Spec\n\n");
+        while large.len() + line.len() < WORKSPACE_SPEC_MAX_MARKDOWN_BYTES - 64 {
+            large.push_str(line);
+        }
+        assert!(large.len() > 50 * 1024);
+        assert!(large.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": large,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+        assert_eq!(written.output["revision"], 1);
+        assert_eq!(written.output["contentOmitted"], true);
+        assert!(written.output.get("contentMarkdown").is_none());
+
+        read_spec_reassemble_all_pages(workspace.path(), 1, &large);
+    }
+
+    #[test]
+    fn read_spec_more_than_soft_line_limit_pages_and_reassembles() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // > 2,000 complete lines forces soft line-limit pagination even when total bytes are modest.
+        let line_count = output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT + 400;
+        let mut content = String::with_capacity(line_count * 12);
+        for i in 0..line_count {
+            content.push_str(&format!("L{i:04}\n"));
+        }
+        assert!(content.len() < 50 * 1024);
+        assert!(
+            output_budget::complete_line_count(&content)
+                > output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT
+        );
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": content,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+
+        let first = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!first.is_error, "{}", first.output);
+        assert_eq!(first.output["truncated"], true);
+        assert!(
+            first.output["returnedLines"].as_u64().unwrap_or(0)
+                <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT as u64
+        );
+
+        read_spec_reassemble_all_pages(workspace.path(), 1, &content);
+    }
+
+    #[test]
+    fn read_spec_utf8_multibyte_lines_reassemble_without_splitting_chars() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Multi-byte UTF-8 (3-byte CJK) so JSON string body expansion differs from raw len.
+        let line = "中文规格行-测试分页与预算-αβγ\n";
+        assert!(line.len() > line.chars().count());
+        let mut content = String::from("# UTF-8 Spec\n\n");
+        while content.len() < 52 * 1024 {
+            content.push_str(line);
+        }
+        assert!(content.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": content,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+        read_spec_reassemble_all_pages(workspace.path(), 1, &content);
+    }
+
+    #[test]
+    fn read_spec_single_long_line_soft_over_returns_full_line_without_fake_continuation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // One complete line over soft but under hard: softBudgetExceeded, no past-EOF nextStartLine.
+        let long = format!(
+            "# {}\n",
+            "x".repeat(output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT + 256)
+        );
+        assert!(long.len() > output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
+        assert!(long.len() < output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+        assert!(long.len() <= WORKSPACE_SPEC_MAX_MARKDOWN_BYTES);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": long,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+
+        let page = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!page.is_error, "{}", page.output);
+        assert_eq!(page.output["contentMarkdown"], long);
+        assert_eq!(page.output["truncated"], false);
+        assert_eq!(page.output["softBudgetExceeded"], true);
+        assert!(
+            page.output.get("nextStartLine").is_none() || page.output["nextStartLine"].is_null(),
+            "must not invent nextStartLine past EOF: {:?}",
+            page.output.get("nextStartLine")
+        );
+
+        let normalized = output_budget::normalize_tool_execution(
+            READ_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            page.clone(),
+        );
+        assert!(
+            !normalized.execution.is_error,
+            "{}",
+            normalized.execution.output
+        );
+        assert_eq!(normalized.execution.output["softBudgetExceeded"], true);
+        assert_eq!(normalized.execution.output["contentMarkdown"], long);
+    }
+
+    #[test]
+    fn read_spec_last_page_and_stale_revision_restart() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789-last-page-pad\n";
+        let large = format!("# Last page Spec\n\n{}", line.repeat(1100));
+        assert!(large.len() > 50 * 1024);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": large,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+
+        // Walk to the final non-truncated page, then request past-EOF empty final page.
+        let mut start_line: Option<u64> = None;
+        let mut last_next: Option<u64> = None;
+        for _ in 0..64 {
+            let page = execute_builtin_tool(
+                workspace.path(),
+                READ_SPEC_TOOL,
+                json!({
+                    "startLine": start_line,
+                    "expectedRevision": if start_line.is_some() {
+                        json!(1)
+                    } else {
+                        Value::Null
+                    },
+                    "timeoutMs": null
+                }),
+            );
+            assert!(!page.is_error, "{}", page.output);
+            if page.output["truncated"].as_bool() == Some(true) {
+                last_next = Some(
+                    page.output["nextStartLine"]
+                        .as_u64()
+                        .expect("nextStartLine"),
+                );
+                start_line = last_next;
+                continue;
+            }
+            // Final content page.
+            assert_eq!(page.output["truncated"], false);
+            let total_lines = page.output["totalLines"].as_u64().expect("totalLines");
+            let past = execute_builtin_tool(
+                workspace.path(),
+                READ_SPEC_TOOL,
+                json!({
+                    "startLine": total_lines.saturating_add(1),
+                    "expectedRevision": 1,
+                    "timeoutMs": null
+                }),
+            );
+            assert!(!past.is_error, "{}", past.output);
+            assert_eq!(past.output["contentMarkdown"], "");
+            assert_eq!(past.output["truncated"], false);
+            assert_eq!(past.output["returnedLines"], 0);
+            break;
+        }
+
+        // Concurrent update: stale continuation rejected; first-page re-read sees new revision.
+        let mut concurrent =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("concurrent database");
+        concurrent
+            .update_workspace_spec_content(1, "# Spec\n\nConcurrent after pages")
+            .expect("concurrent update")
+            .expect("cas won");
+
+        if let Some(stale_start) = last_next {
+            let conflict = execute_builtin_tool(
+                workspace.path(),
+                READ_SPEC_TOOL,
+                json!({
+                    "startLine": stale_start,
+                    "expectedRevision": 1,
+                    "timeoutMs": null
+                }),
+            );
+            assert!(conflict.is_error);
+            assert!(
+                conflict.output["error"]
+                    .as_str()
+                    .expect("error")
+                    .contains("revision changed during read_spec continuation")
+            );
+        }
+
+        let fresh = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!fresh.is_error, "{}", fresh.output);
+        assert_eq!(fresh.output["revision"], 2);
+        assert_eq!(
+            fresh.output["contentMarkdown"],
+            "# Spec\n\nConcurrent after pages"
+        );
+        assert_eq!(fresh.output["truncated"], false);
+    }
+
+    #[test]
+    fn read_spec_truncated_success_survives_normalize_and_envelope() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789-envelope-preserve-line\n";
+        let large = format!("# Envelope preserve\n\n{}", line.repeat(950));
+        assert!(large.len() > 50 * 1024);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": large,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+
+        let first = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!first.is_error, "{}", first.output);
+        assert_eq!(first.output["truncated"], true);
+        assert!(
+            first.output["nextStartLine"]
+                .as_u64()
+                .expect("nextStartLine")
+                >= 2
+        );
+
+        let measured = output_budget::measure_tool_execution(&first).expect("measure");
+        let soft_with_reserve = output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            .saturating_sub(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES);
+        assert!(
+            measured.serialized_bytes <= soft_with_reserve,
+            "truncated page must fit soft minus envelope reserve: {} > {}",
+            measured.serialized_bytes,
+            soft_with_reserve
+        );
+
+        let budgeted = output_budget::normalize_tool_execution(
+            READ_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            first.clone(),
+        );
+        assert!(!budgeted.execution.is_error);
+        assert_eq!(budgeted.execution.output["truncated"], true);
+        assert_eq!(
+            budgeted.execution.output["nextStartLine"],
+            first.output["nextStartLine"]
+        );
+        assert_eq!(budgeted.execution.output["revision"], 1);
+        assert!(budgeted.execution.output.get("outputOmitted").is_none());
+
+        // Outer envelope soft overage must still preserve line-bounded truncated success.
+        let envelope_over = ToolExecution {
+            output: {
+                let mut output = first.output.clone();
+                if let Some(object) = output.as_object_mut() {
+                    object.insert(
+                        "padding".to_string(),
+                        json!(
+                            "x".repeat(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES + 128)
+                        ),
+                    );
+                }
+                output
+            },
+            is_error: false,
+        };
+        let envelope_budgeted = output_budget::normalize_tool_execution_for_envelope(
+            READ_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::ReadOnly,
+            envelope_over,
+            |execution| output_budget::serialized_json_size(execution),
+        );
+        assert!(!envelope_budgeted.execution.is_error);
+        assert_eq!(envelope_budgeted.execution.output["truncated"], true);
+        assert_eq!(envelope_budgeted.execution.output["revision"], 1);
+        assert!(
+            envelope_budgeted
+                .execution
+                .output
+                .get("outputOmitted")
+                .is_none()
+        );
+    }
+
     #[test]
     fn builtin_tools_include_apply_patch_with_strict_schema() {
         let tool = builtin_tool_definitions()

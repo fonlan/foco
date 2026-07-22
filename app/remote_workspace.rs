@@ -37812,6 +37812,31 @@ mod tests {
             normal.route("get_plans"),
             Some(&RemoteToolRoute::SidecarLocal)
         );
+        // Spec tools share the same builtin definitions and SidecarLocal route (no remote fork).
+        for name in ["read_spec", "update_spec"] {
+            let local = foco_tools::builtin_tool_definitions()
+                .into_iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("local {name} definition"));
+            let remote = normal
+                .builtin_prompt_tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap_or_else(|| panic!("remote {name} definition"));
+            assert_eq!(
+                remote.input_schema, local.input_schema,
+                "{name} schema must match local builtin"
+            );
+            assert_eq!(
+                remote.description, local.description,
+                "{name} description must match local builtin"
+            );
+            assert_eq!(
+                normal.route(name),
+                Some(&RemoteToolRoute::SidecarLocal),
+                "{name} must be SidecarLocal"
+            );
+        }
         for expected in [
             "read_file",
             "write_file",
