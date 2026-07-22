@@ -356,15 +356,22 @@ async fn execute_web_search(
     tool_workspace_path: &Path,
 ) -> Result<Value, String> {
     web_tool_timeout_ms_from_input(input.timeout_ms)?;
-    if !web_search_enabled(settings) {
-        return Err("web_search is disabled or missing an API key in settings".to_string());
+    // Only the FocoFunction path reaches here. Provider-native search is server-side and must
+    // never be routed into this executor (no NeutralToolCall for native search).
+    if !web_search_function_execution_allowed(settings) {
+        return Err(
+            "web_search function tool is disabled or missing an active Tavily/Brave API key"
+                .to_string(),
+        );
     }
     let query = input.query.trim();
     if query.is_empty() {
         return Err("query must not be empty".to_string());
     }
     let max_results = normalize_web_search_limit(input.max_results)?;
-    let provider = settings.active_provider.trim();
+    let provider = settings
+        .active_fallback_provider()
+        .ok_or_else(|| "web_search has no active fallback provider with an API key".to_string())?;
     let api_key = settings
         .api_key_for_provider(provider)
         .ok_or_else(|| format!("web_search provider '{provider}' is missing an API key"))?;
@@ -1529,10 +1536,14 @@ fn prune_web_results_dir_inner(results_dir: &Path, room_for_new: usize) {
 }
 
 pub(crate) fn web_search_enabled(settings: &WebSearchSettings) -> bool {
-    settings.enabled
-        && settings
-            .api_key_for_provider(settings.active_provider.trim())
-            .is_some()
+    // Master switch alone is not enough for the Foco function path: Tavily/Brave still need a key.
+    // Provider-native search is gated separately via resolve_web_search_route / ProviderNative tools.
+    settings.enabled && settings.fallback_available()
+}
+
+/// True when the Foco function `web_search` executor may run (master switch + active fallback key).
+pub(crate) fn web_search_function_execution_allowed(settings: &WebSearchSettings) -> bool {
+    web_search_enabled(settings)
 }
 
 fn normalize_web_search_limit(limit: Option<usize>) -> Result<usize, String> {

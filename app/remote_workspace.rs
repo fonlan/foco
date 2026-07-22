@@ -11757,7 +11757,8 @@ fn neutral_role_for_message(role: &str) -> NeutralChatRole {
 
 #[derive(Default)]
 struct RemoteBrokerToolDiscovery {
-    web_search_available: bool,
+    /// Whether the host can execute the Foco function web_search path (enabled + fallback key).
+    web_search_function_available: bool,
     apply_patch_available: bool,
     local_mcp_tools: Vec<McpToolDefinition>,
 }
@@ -11835,7 +11836,7 @@ async fn remote_sidecar_broker_tool_discovery(
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
     Ok(RemoteBrokerToolDiscovery {
-        web_search_available: response
+        web_search_function_available: response
             .payload
             .get("webSearchAvailable")
             .and_then(Value::as_bool)
@@ -11927,11 +11928,16 @@ async fn build_remote_tool_catalog(
     local_mcp_tools.sort_by(|left, right| left.name.cmp(&right.name));
 
     let plan_mode = session_mode == Some("plan");
-    let mut builtin_tools =
-        builtin_tool_definitions_for_runtime(ripgrep_available, discovery.web_search_available)
-            .into_iter()
-            .filter(|tool| !tool.name.starts_with("agent_"))
-            .collect::<Vec<_>>();
+    // Host discovery reports whether the Foco function web_search path can execute
+    // (master switch + active Tavily/Brave key). Provider-native search is not a
+    // sidecar-executable tool and is not added to the remote runtime catalog/routes.
+    let mut builtin_tools = builtin_tool_definitions_for_runtime(
+        ripgrep_available,
+        discovery.web_search_function_available,
+    )
+    .into_iter()
+    .filter(|tool| !tool.name.starts_with("agent_"))
+    .collect::<Vec<_>>();
     if !discovery.apply_patch_available {
         builtin_tools.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
     }
@@ -37968,7 +37974,7 @@ mod tests {
             )
             .await;
         let discovery = RemoteBrokerToolDiscovery {
-            web_search_available: true,
+            web_search_function_available: true,
             apply_patch_available: false,
             local_mcp_tools: vec![
                 mcp_tool("mcp__docs__search", "local-duplicate"),
@@ -38050,7 +38056,7 @@ mod tests {
             Some(&enabled_bundle),
             None,
             RemoteBrokerToolDiscovery {
-                web_search_available: true,
+                web_search_function_available: true,
                 apply_patch_available: true,
                 local_mcp_tools: vec![local_mcp.clone()],
             },
@@ -38088,7 +38094,7 @@ mod tests {
             Some(&enabled_bundle),
             Some("plan"),
             RemoteBrokerToolDiscovery {
-                web_search_available: true,
+                web_search_function_available: true,
                 apply_patch_available: true,
                 local_mcp_tools: vec![local_mcp],
             },
@@ -38167,7 +38173,7 @@ mod tests {
             Some(&bundle),
             None,
             RemoteBrokerToolDiscovery {
-                web_search_available: true,
+                web_search_function_available: true,
                 apply_patch_available: true,
                 local_mcp_tools: vec![mcp_tool("mcp__local__lookup", "local-tools")],
             },

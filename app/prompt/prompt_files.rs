@@ -2,12 +2,17 @@ use std::{fs, path::Path};
 
 use foco_agent::{ToolPromptInfo, build_default_system_prompt};
 use foco_mcp::McpToolDefinition;
-use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolDefinition};
+use foco_providers::{
+    NeutralChatMessage, NeutralChatRole, NeutralToolDefinition, NeutralToolKind, ProviderKind,
+    WebSearchMode, WebSearchRoute, WebSearchRouteInput, resolve_web_search_route,
+    upstream_provider_model_id,
+};
 use foco_store::config::{
     DEFAULT_SYSTEM_PROMPT_NAME, IMAGE_GENERATION_SYSTEM_PROMPT_NAME, PLAN_MODE_SYSTEM_PROMPT_NAME,
-    PromptSettings, REVIEW_SYSTEM_PROMPT_NAME,
+    PromptSettings, ProviderSettings, REVIEW_SYSTEM_PROMPT_NAME, WebSearchSettings,
 };
 use foco_tools::{SEARCH_TEXT_TOOL, WEB_SEARCH_TOOL, builtin_tool_definitions};
+use serde_json::json;
 
 use crate::{
     AGENTS_MESSAGE_PREFIX, ApiError, EXTRA_PROMPT_MESSAGE_PREFIX, PROMPT_FILE_MESSAGE_PREFIX,
@@ -87,13 +92,67 @@ pub(crate) fn system_prompt_summaries(
 
 pub(crate) fn builtin_tool_definitions_for_runtime(
     ripgrep_available: bool,
-    web_search_available: bool,
+    web_search_function_available: bool,
 ) -> Vec<foco_tools::ToolDefinition> {
     builtin_tool_definitions()
         .into_iter()
         .filter(|tool| ripgrep_available || tool.name != SEARCH_TEXT_TOOL)
-        .filter(|tool| web_search_available || tool.name != WEB_SEARCH_TOOL)
+        .filter(|tool| web_search_function_available || tool.name != WEB_SEARCH_TOOL)
         .collect()
+}
+
+/// Resolve the single web-search route for a chat turn after active model/provider routing.
+///
+/// Callers must pass the already-resolved active provider and model settings for this turn.
+/// Capability is never inferred from tool names.
+pub(crate) fn resolve_web_search_route_for_turn(
+    web_search: &WebSearchSettings,
+    model_mode: WebSearchMode,
+    provider: &ProviderSettings,
+    model_id: &str,
+) -> WebSearchRoute {
+    let provider_kind = parse_provider_kind_for_web_search(&provider.kind);
+    let upstream_model_id = provider_kind
+        .and_then(|_| upstream_provider_model_id(model_id, &provider.model_redirects).ok())
+        .unwrap_or(model_id);
+    resolve_web_search_route(WebSearchRouteInput {
+        enabled: web_search.enabled,
+        fallback_available: web_search.fallback_available(),
+        provider_kind,
+        upstream_model_id,
+        mode: model_mode,
+    })
+}
+
+fn parse_provider_kind_for_web_search(kind: &str) -> Option<ProviderKind> {
+    foco_providers::parse_provider_kind(kind).ok()
+}
+
+/// Provider-native web search capability injected into `provider_request.tools` only.
+///
+/// This is not a Foco-executable builtin: `execute_tool_with_runtime` must never run it.
+pub(crate) fn provider_native_web_search_tool_definition() -> NeutralToolDefinition {
+    NeutralToolDefinition {
+        name: WEB_SEARCH_TOOL.to_string(),
+        description: "Provider-native web search executed by the model provider (not Foco's Tavily/Brave function tool).".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {},
+        }),
+        strict: false,
+        kind: NeutralToolKind::ProviderWebSearch,
+    }
+}
+
+/// Whether the Foco function `web_search` tool should appear in the executable runtime catalog.
+pub(crate) fn web_search_function_tool_available(route: WebSearchRoute) -> bool {
+    matches!(route, WebSearchRoute::FocoFunction)
+}
+
+/// Whether a provider-native web search capability should be injected into the provider request.
+pub(crate) fn web_search_provider_native_available(route: WebSearchRoute) -> bool {
+    matches!(route, WebSearchRoute::ProviderNative)
 }
 
 pub(crate) fn tool_prompt_infos(

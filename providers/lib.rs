@@ -1904,69 +1904,75 @@ impl NeutralChatStream {
     pub async fn next_event(
         &mut self,
     ) -> Option<Result<NeutralChatStreamEvent, ProviderConfigError>> {
-        let event = self.stream.next().await?;
-        let normalized = match event {
-            Ok(event) => normalize_stream_event(event),
-            Err(source) => Err(ProviderConfigError::from_genai_error_with_context(
-                source,
-                &self.error_context,
-            )),
-        };
+        loop {
+            let event = self.stream.next().await?;
+            let normalized = match event {
+                Ok(event) => match normalize_stream_event(event) {
+                    Ok(Some(event)) => Ok(event),
+                    Ok(None) => continue,
+                    Err(error) => Err(error),
+                },
+                Err(source) => Err(ProviderConfigError::from_genai_error_with_context(
+                    source,
+                    &self.error_context,
+                )),
+            };
 
-        match &normalized {
-            Ok(
-                NeutralChatStreamEvent::Start
-                | NeutralChatStreamEvent::TextDelta { .. }
-                | NeutralChatStreamEvent::ReasoningDelta { .. }
-                | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
-                | NeutralChatStreamEvent::ToolCall { .. }
-                | NeutralChatStreamEvent::Usage { .. },
-            ) => {
-                self.saw_response_event = true;
-            }
-            Ok(NeutralChatStreamEvent::Complete {
-                text,
-                reasoning,
-                tool_calls,
-                usage,
-                stop_reason,
-                response_id,
-            }) => {
-                self.saw_response_event = true;
-                if self.wire_request_dump.is_some() {
-                    self.final_response_dump = Some(ProviderFinalResponseDump::succeeded(
-                        self.response_head_dump(),
-                        text.clone(),
-                        reasoning.clone(),
-                        tool_calls.clone(),
-                        usage.clone(),
-                        stop_reason.clone(),
-                        response_id.clone(),
-                    ));
+            match &normalized {
+                Ok(
+                    NeutralChatStreamEvent::Start
+                    | NeutralChatStreamEvent::TextDelta { .. }
+                    | NeutralChatStreamEvent::ReasoningDelta { .. }
+                    | NeutralChatStreamEvent::ThoughtSignatureDelta { .. }
+                    | NeutralChatStreamEvent::ToolCall { .. }
+                    | NeutralChatStreamEvent::Usage { .. },
+                ) => {
+                    self.saw_response_event = true;
+                }
+                Ok(NeutralChatStreamEvent::Complete {
+                    text,
+                    reasoning,
+                    tool_calls,
+                    usage,
+                    stop_reason,
+                    response_id,
+                }) => {
+                    self.saw_response_event = true;
+                    if self.wire_request_dump.is_some() {
+                        self.final_response_dump = Some(ProviderFinalResponseDump::succeeded(
+                            self.response_head_dump(),
+                            text.clone(),
+                            reasoning.clone(),
+                            tool_calls.clone(),
+                            usage.clone(),
+                            stop_reason.clone(),
+                            response_id.clone(),
+                        ));
+                    }
+                }
+                Ok(NeutralChatStreamEvent::Error { message }) => {
+                    self.final_response_dump = self.synthetic_failed_final_response_dump(
+                        message.clone(),
+                        None,
+                        self.saw_response_event,
+                    );
+                }
+                Err(error) => {
+                    // A decoder error after a successful HTTP response (for example a 200
+                    // SSE `response.failed`) has no error status of its own. Preserve the
+                    // observed response status in the terminal audit envelope without
+                    // changing ProviderConfigError, which callers use for retry policy.
+                    let status_code = error.status_code().or_else(|| self.http_status());
+                    self.final_response_dump = self.synthetic_failed_final_response_dump(
+                        error.to_string(),
+                        status_code,
+                        self.saw_response_event,
+                    );
                 }
             }
-            Ok(NeutralChatStreamEvent::Error { message }) => {
-                self.final_response_dump = self.synthetic_failed_final_response_dump(
-                    message.clone(),
-                    None,
-                    self.saw_response_event,
-                );
-            }
-            Err(error) => {
-                // A decoder error after a successful HTTP response (for example a 200
-                // SSE `response.failed`) has no error status of its own. Preserve the
-                // observed response status in the terminal audit envelope without
-                // changing ProviderConfigError, which callers use for retry policy.
-                let status_code = error.status_code().or_else(|| self.http_status());
-                self.final_response_dump = self.synthetic_failed_final_response_dump(
-                    error.to_string(),
-                    status_code,
-                    self.saw_response_event,
-                );
-            }
-        }
 
-        Some(normalized)
+            return Some(normalized);
+        }
     }
 }
 
@@ -3090,24 +3096,38 @@ fn is_sensitive_credential_name(name: &str) -> bool {
 
 fn normalize_stream_event(
     event: ChatStreamEvent,
-) -> Result<NeutralChatStreamEvent, ProviderConfigError> {
+) -> Result<Option<NeutralChatStreamEvent>, ProviderConfigError> {
     match event {
-        ChatStreamEvent::Start => Ok(NeutralChatStreamEvent::Start),
-        ChatStreamEvent::Chunk(chunk) => Ok(NeutralChatStreamEvent::TextDelta {
+        ChatStreamEvent::Start => Ok(Some(NeutralChatStreamEvent::Start)),
+        ChatStreamEvent::Chunk(chunk) => Ok(Some(NeutralChatStreamEvent::TextDelta {
             delta: chunk.content,
-        }),
-        ChatStreamEvent::ReasoningChunk(chunk) => Ok(NeutralChatStreamEvent::ReasoningDelta {
-            delta: chunk.content,
-        }),
-        ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
-            Ok(NeutralChatStreamEvent::ThoughtSignatureDelta {
+        })),
+        ChatStreamEvent::ReasoningChunk(chunk) => {
+            Ok(Some(NeutralChatStreamEvent::ReasoningDelta {
                 delta: chunk.content,
-            })
+            }))
         }
-        ChatStreamEvent::ToolCallChunk(chunk) => Ok(NeutralChatStreamEvent::ToolCall {
-            tool_call: neutral_tool_call(&chunk.tool_call),
-        }),
-        ChatStreamEvent::End(end) => normalize_stream_end(end),
+        ChatStreamEvent::ThoughtSignatureChunk(chunk) => {
+            Ok(Some(NeutralChatStreamEvent::ThoughtSignatureDelta {
+                delta: chunk.content,
+            }))
+        }
+        ChatStreamEvent::ToolCallChunk(chunk) => {
+            // Provider-native web search is server-side. Adapters should not surface it as a
+            // function ToolCall; if a stream still emits one, drop it so Foco never executes
+            // Tavily/Brave for a native search lifecycle event.
+            if is_provider_native_web_search_tool_call_name(&chunk.tool_call.fn_name) {
+                tracing::debug!(
+                    tool_name = %chunk.tool_call.fn_name,
+                    "ignoring provider-native web search stream tool call chunk"
+                );
+                return Ok(None);
+            }
+            Ok(Some(NeutralChatStreamEvent::ToolCall {
+                tool_call: neutral_tool_call(&chunk.tool_call),
+            }))
+        }
+        ChatStreamEvent::End(end) => normalize_stream_end(end).map(Some),
     }
 }
 
@@ -3117,6 +3137,7 @@ fn normalize_stream_end(end: StreamEnd) -> Result<NeutralChatStreamEvent, Provid
         .captured_tool_calls()
         .unwrap_or_default()
         .into_iter()
+        .filter(|tool_call| !is_provider_native_web_search_tool_call_name(&tool_call.fn_name))
         .map(neutral_tool_call)
         .collect();
     let usage = end.captured_usage.as_ref().map(neutral_usage);
@@ -3133,6 +3154,14 @@ fn normalize_stream_end(end: StreamEnd) -> Result<NeutralChatStreamEvent, Provid
         stop_reason,
         response_id: end.captured_response_id,
     })
+}
+
+/// Names that must never become Foco-executable `web_search` function calls.
+///
+/// OpenAI/xAI Responses native search uses `type=web_search` and is not a function_call.
+/// Genai's builtin display name is exactly `WebSearch` (not the Foco function name `web_search`).
+fn is_provider_native_web_search_tool_call_name(name: &str) -> bool {
+    name.trim() == "WebSearch"
 }
 
 fn genai_tool(tool: &NeutralToolDefinition) -> Tool {
@@ -4155,6 +4184,69 @@ mod tests {
                 .and_then(|p| p.get("timeoutMs"))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn normalize_stream_drops_provider_native_web_search_tool_calls() {
+        use genai::chat::{MessageContent, StreamEnd, ToolCall as GenaiToolCall, ToolChunk};
+
+        let native_chunk = ChatStreamEvent::ToolCallChunk(ToolChunk {
+            tool_call: GenaiToolCall {
+                call_id: "call-native".to_string(),
+                fn_name: "WebSearch".to_string(),
+                fn_arguments: serde_json::json!({}),
+                thought_signatures: None,
+            },
+        });
+        assert!(
+            matches!(
+                normalize_stream_event(native_chunk).expect("normalize"),
+                None
+            ),
+            "native WebSearch chunks must be dropped"
+        );
+
+        let function_chunk = ChatStreamEvent::ToolCallChunk(ToolChunk {
+            tool_call: GenaiToolCall {
+                call_id: "call-fn".to_string(),
+                fn_name: "web_search".to_string(),
+                fn_arguments: serde_json::json!({"query": "rust"}),
+                thought_signatures: None,
+            },
+        });
+        match normalize_stream_event(function_chunk).expect("normalize") {
+            Some(NeutralChatStreamEvent::ToolCall { tool_call }) => {
+                assert_eq!(tool_call.name, "web_search");
+                assert_eq!(tool_call.call_id, "call-fn");
+            }
+            other => panic!("function web_search must remain a ToolCall, got {other:?}"),
+        }
+
+        let end = StreamEnd {
+            captured_content: Some(MessageContent::from_tool_calls(vec![
+                GenaiToolCall {
+                    call_id: "native".to_string(),
+                    fn_name: "WebSearch".to_string(),
+                    fn_arguments: serde_json::json!({}),
+                    thought_signatures: None,
+                },
+                GenaiToolCall {
+                    call_id: "fn".to_string(),
+                    fn_name: "web_search".to_string(),
+                    fn_arguments: serde_json::json!({"query": "ok"}),
+                    thought_signatures: None,
+                },
+            ])),
+            ..StreamEnd::default()
+        };
+        match normalize_stream_end(end).expect("end") {
+            NeutralChatStreamEvent::Complete { tool_calls, .. } => {
+                assert_eq!(tool_calls.len(), 1);
+                assert_eq!(tool_calls[0].name, "web_search");
+                assert_eq!(tool_calls[0].call_id, "fn");
+            }
+            other => panic!("expected Complete, got {other:?}"),
+        }
     }
 
     #[test]

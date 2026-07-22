@@ -43,6 +43,8 @@ pub(crate) use environment::environment_context_message;
 pub(crate) use environment::is_wsl_environment;
 pub(crate) use prompt_files::{
     active_system_prompt, agents_prompt_messages, builtin_tool_definitions_for_runtime,
-    configured_extra_prompt_message, configured_prompt_messages, system_prompt_summaries,
-    tool_prompt_infos,
+    configured_extra_prompt_message, configured_prompt_messages,
+    provider_native_web_search_tool_definition, resolve_web_search_route_for_turn,
+    system_prompt_summaries, tool_prompt_infos, web_search_function_tool_available,
+    web_search_provider_native_available,
 };

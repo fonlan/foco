@@ -1,6 +1,8 @@
 use super::{
     active_compression_snapshots, active_llm_checkpoint_snapshot_ids, compression_snapshot_message,
-    snapshot_covered_sequences,
+    provider_native_web_search_tool_definition, resolve_web_search_route_for_turn,
+    snapshot_covered_sequences, web_search_function_tool_available,
+    web_search_provider_native_available,
 };
 use crate::memory_runtime::{
     memory_retrieval_query_text, neutral_messages_from_record,
@@ -8,7 +10,7 @@ use crate::memory_runtime::{
 };
 use crate::runtime::{
     open_workspace_database_ordinary_with_pre_stream_retry,
-    spawn_code_graph_workspace_initialization_if_needed, web_search_enabled,
+    spawn_code_graph_workspace_initialization_if_needed,
 };
 use crate::*;
 use foco_store::config::PLAN_MODE_SYSTEM_PROMPT_NAME;
@@ -258,9 +260,17 @@ pub(crate) async fn prepare_prompt_context(
             .map_err(|_| ApiError::internal("ripgrep status lock was poisoned"))?;
         status.available
     };
-    let web_search_available = web_search_enabled(&config.web_search);
+    // Resolve web-search route after active model/provider routing for this turn.
+    // ProviderNative is a provider request capability only; FocoFunction is the executable builtin.
+    let web_search_route = resolve_web_search_route_for_turn(
+        &config.web_search,
+        model.web_search_mode,
+        provider,
+        &model.id,
+    );
+    let web_search_function_available = web_search_function_tool_available(web_search_route);
     let mut builtin_tool_definitions =
-        builtin_tool_definitions_for_runtime(ripgrep_available, web_search_available);
+        builtin_tool_definitions_for_runtime(ripgrep_available, web_search_function_available);
     if !apply_patch_available_for_model(config, &model.id)? {
         builtin_tool_definitions.retain(|tool| tool.name != foco_tools::APPLY_PATCH_TOOL);
     }
@@ -288,6 +298,16 @@ pub(crate) async fn prepare_prompt_context(
         .collect::<Vec<_>>();
     neutral_tools.extend(memory_tool_definitions.iter().cloned());
     neutral_tools.extend(mcp_tools.iter().map(neutral_mcp_tool_definition));
+    // Native search is never part of the executable runtime catalog / agent allowlist.
+    if web_search_provider_native_available(web_search_route) {
+        debug_assert!(
+            !neutral_tools
+                .iter()
+                .any(|tool| tool.name == WEB_SEARCH_TOOL),
+            "provider_request.tools must not expose both native and function web_search"
+        );
+        neutral_tools.push(provider_native_web_search_tool_definition());
+    }
     let tool_prompt_infos = tool_prompt_infos(
         &builtin_tool_definitions,
         &memory_tool_definitions,

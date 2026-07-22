@@ -24912,7 +24912,7 @@ async fn prepare_prompt_context_hides_web_search_without_enabled_search_api() {
 }
 
 #[tokio::test]
-async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
+async fn prepare_prompt_context_exposes_function_web_search_when_fallback_available() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-web-search-enabled-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-web-search-enabled-profile-test"));
 
@@ -24921,6 +24921,7 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
     let mut config = prompt_test_config(workspace_dir.clone());
     config.web_search.enabled = true;
     config.web_search.tavily_api_key = Some("tavily-token".to_string());
+    // openai-chat does not support native search; auto falls back to FocoFunction.
     let state = test_app_state(config.clone(), profile_dir.clone());
     let context = prepare_prompt_context(
         &state,
@@ -24945,15 +24946,28 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
     )
     .await
     .expect("prompt context");
-    let tool_names = context
+    let web_search_tools = context
         .provider_request
         .tools
         .iter()
-        .map(|tool| tool.name.as_str())
-        .collect::<BTreeSet<_>>();
-
-    assert!(tool_names.contains(WEB_SEARCH_TOOL));
-    assert!(tool_names.contains(WEB_FETCH_TOOL));
+        .filter(|tool| tool.name == WEB_SEARCH_TOOL)
+        .collect::<Vec<_>>();
+    assert_eq!(web_search_tools.len(), 1, "exactly one web_search tool");
+    assert_eq!(
+        web_search_tools[0].kind,
+        foco_providers::NeutralToolKind::Function
+    );
+    assert!(
+        context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == WEB_SEARCH_TOOL),
+        "function web_search must be executable / allowlisted"
+    );
+    assert!(tool_names_contains(
+        &context.provider_request.tools,
+        WEB_FETCH_TOOL
+    ));
     let available_tools_message = context
         .provider_request
         .messages
@@ -24966,6 +24980,78 @@ async fn prepare_prompt_context_exposes_web_search_when_search_api_enabled() {
     drop(state);
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
     remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn prepare_prompt_context_exposes_provider_native_web_search_without_function_catalog() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-web-search-native-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-web-search-native-profile-test"));
+
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    config.web_search.enabled = true;
+    // No Tavily/Brave key: native path must still work when protocol+model support it.
+    config.web_search.tavily_api_key = None;
+    config.web_search.brave_api_key = None;
+    config.providers[0].kind = OPENAI_RESPONSES_KIND.to_string();
+    config.models[0].id = "gpt-4o".to_string();
+    config.models[0].web_search_mode = WebSearchMode::Auto;
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let context = prepare_prompt_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        PromptContextRequest {
+            queued_user_message_id: None,
+            chat_id: None,
+            model_id: "gpt-4o".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: Some("hello".to_string()),
+            assistant_draft: None,
+            assistant_draft_reasoning: None,
+            attachments: Vec::new(),
+        },
+        None,
+        PromptAssemblyPurpose::ContextPreview,
+    )
+    .await
+    .expect("prompt context");
+    let web_search_tools = context
+        .provider_request
+        .tools
+        .iter()
+        .filter(|tool| tool.name == WEB_SEARCH_TOOL)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        web_search_tools.len(),
+        1,
+        "exactly one native web_search capability"
+    );
+    assert_eq!(
+        web_search_tools[0].kind,
+        foco_providers::NeutralToolKind::ProviderWebSearch
+    );
+    assert!(
+        !context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == WEB_SEARCH_TOOL),
+        "native web_search must not enter the executable runtime catalog / agent allowlist"
+    );
+
+    drop(context);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+fn tool_names_contains(tools: &[NeutralToolDefinition], name: &str) -> bool {
+    tools.iter().any(|tool| tool.name == name)
 }
 
 #[tokio::test]
