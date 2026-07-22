@@ -36738,8 +36738,12 @@ mod tests {
             &compression_events,
             &[],
         );
+        // partsVersion 6 marks live/complete parts as authoritative so reload does not
+        // rematerialize superseded snapshot rows into the bubble.
         let metadata = json!({
             "parts": parts,
+            "partsVersion": 6,
+            "partsSource": "live_sse",
             "reasoning": null,
         });
         database
