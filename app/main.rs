@@ -2317,8 +2317,9 @@ struct PreparedChatContext {
     /// Canonical external file paths attached on this chat (history + current turn +
     /// in-run guidance). Exact `read_file` matches skip ask_question; not directory grants.
     attachment_read_allowlist: Vec<PathBuf>,
-    /// Last chat-completion provider `input_tokens` in this run (memory only).
-    /// Used as a second Normal (95%) LLM checkpoint gate when local estimate lags.
+    /// Last completed chat-completion provider `input_tokens` in this run (memory only).
+    /// Most-recent-sample semantics (not a high-water mark); cleared after a successful LLM
+    /// checkpoint and when a turn reports missing/non-positive usage.
     last_chat_completion_input_tokens: Option<u64>,
     /// Shared OpenAI Responses WebSocket session registry for run-scoped reuse.
     openai_resp_ws_sessions: Arc<OpenAiRespWsSessionRegistry>,
@@ -3674,6 +3675,9 @@ impl PreparedChatContext {
                 let mut turn_first_token_at = None;
                 let mut turn_first_token_latency_ms = None;
                 let mut completed_turn = false;
+                // Last usage seen on this turn (standalone Usage events or Complete.usage).
+                // Used when Complete.usage is None so provider-input gate still gets a sample.
+                let mut turn_stream_usage: Option<NeutralUsage> = None;
 
                 loop {
                     let Some(event_result) = (tokio::select! {
@@ -4006,6 +4010,7 @@ impl PreparedChatContext {
                             // (e.g. `"{\""`); only emit/persist from Complete with full args.
                         }
                         NeutralChatStreamEvent::Usage { usage } => {
+                            turn_stream_usage = Some(usage.clone());
                             let event = ChatSseEvent::Usage { usage };
                             yield event;
                         }
@@ -4171,9 +4176,15 @@ impl PreparedChatContext {
                             }
 
                             if let Some(usage) = &usage {
+                                turn_stream_usage = Some(usage.clone());
                                 merge_usage(&mut total_usage, usage);
                                 final_usage = Some(total_usage.clone());
+                            } else if let Some(stream_usage) = turn_stream_usage.as_ref() {
+                                // Complete omitted usage; still fold standalone Usage into run totals.
+                                merge_usage(&mut total_usage, stream_usage);
+                                final_usage = Some(total_usage.clone());
                             }
+                            let turn_completion_usage = turn_stream_usage.as_ref();
                             let turn_total_latency_ms = elapsed_millis(turn_started_at);
                             let response_body_json = best_effort_chat_audit_detail(
                                 &self,
@@ -4197,16 +4208,15 @@ impl PreparedChatContext {
                                     completed_at: utc_timestamp(),
                                     first_token_latency_ms: turn_first_token_latency_ms,
                                     total_latency_ms: turn_total_latency_ms,
-                                    input_tokens: usage.as_ref().and_then(|usage| usage.input_tokens),
-                                    output_tokens: usage.as_ref().and_then(|usage| usage.output_tokens),
-                                    cache_read_tokens: usage
-                                        .as_ref()
+                                    input_tokens: turn_completion_usage
+                                        .and_then(|usage| usage.input_tokens),
+                                    output_tokens: turn_completion_usage
+                                        .and_then(|usage| usage.output_tokens),
+                                    cache_read_tokens: turn_completion_usage
                                         .and_then(|usage| usage.cache_read_tokens),
-                                    cache_write_tokens: usage
-                                        .as_ref()
+                                    cache_write_tokens: turn_completion_usage
                                         .and_then(|usage| usage.cache_write_tokens),
-                                    reasoning_tokens: usage
-                                        .as_ref()
+                                    reasoning_tokens: turn_completion_usage
                                         .and_then(|usage| usage.reasoning_tokens),
                                     status_code: Some(200),
                                     final_state: "succeeded",
@@ -4217,16 +4227,18 @@ impl PreparedChatContext {
                             self.record_finished_llm_request(completed_turn_request);
                             record_chat_completion_input_tokens(
                                 &mut self.last_chat_completion_input_tokens,
-                                usage.as_ref().and_then(|usage| usage.input_tokens),
+                                turn_completion_usage.and_then(|usage| usage.input_tokens),
                             );
                             let turn_metrics = turn_reply_metrics(
                                 &self.model_id,
                                 &self.provider_id,
                                 turn_total_latency_ms,
                                 turn_first_token_latency_ms,
-                                usage.as_ref(),
+                                turn_completion_usage,
                                 vec![turn_llm_request_id.clone()],
                             );
+                            // Prefer Complete.usage for the SSE Usage event when present; otherwise
+                            // the standalone Usage was already forwarded during the stream.
                             if let Some(usage) = usage {
                                 let event = ChatSseEvent::Usage { usage };
                                 events.push(captured_event(&event));

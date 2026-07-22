@@ -236,7 +236,8 @@ struct RemoteSidecarRuntimeToolState {
     compression_enabled: bool,
     /// Active (non-superseded) compression snapshots loaded from / written to the remote workspace DB.
     compression_snapshots: Vec<foco_store::workspace::ContextCompressionSnapshotRecord>,
-    /// Last chat-completion provider `input_tokens` in this run (memory only).
+    /// Last completed chat-completion provider `input_tokens` in this run (memory only).
+    /// Most-recent-sample semantics; cleared after a successful LLM checkpoint.
     last_chat_completion_input_tokens: Option<u64>,
 }
 
@@ -815,6 +816,8 @@ impl RemoteSidecarRuntimeToolState {
         self.compression_snapshots.push(prepared.snapshot.clone());
         // Full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
         self.runtime_tool_state_compression_count = 0;
+        // Pre-compression provider input is stale after a durable checkpoint.
+        self.last_chat_completion_input_tokens = None;
 
         remote_push_context_compression_event(
             events,
@@ -34667,7 +34670,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
-            last_chat_completion_input_tokens: None,
+            last_chat_completion_input_tokens: Some(264_600),
         };
 
         let compress_task = tokio::spawn({
@@ -34887,6 +34890,33 @@ mod tests {
             2
         );
         assert!(hook_runs.iter().any(|run| run.event == "PostCompact"));
+        // Successful durable checkpoint must invalidate the pre-compression provider sample.
+        assert_eq!(runtime_after.last_chat_completion_input_tokens, None);
+    }
+
+    #[test]
+    fn remote_sidecar_provider_input_sample_clears_on_record_and_after_checkpoint_semantics() {
+        // Mirror local most-recent-sample + post-checkpoint clear for remote runtime state.
+        let mut last = Some(264_600_u64);
+        let window = 100_000_u64;
+        assert!(should_trigger_normal_llm_context_compression(
+            39_500, last, window
+        ));
+        last = None;
+        assert!(!should_trigger_normal_llm_context_compression(
+            39_500, last, window
+        ));
+        record_chat_completion_input_tokens(&mut last, Some(3_600));
+        assert_eq!(last, Some(3_600));
+        assert!(!should_trigger_normal_llm_context_compression(
+            3_600, last, window
+        ));
+        record_chat_completion_input_tokens(&mut last, None);
+        assert_eq!(last, None);
+        record_chat_completion_input_tokens(&mut last, Some(95_000));
+        assert_eq!(last, Some(95_000));
+        record_chat_completion_input_tokens(&mut last, Some(0));
+        assert_eq!(last, None);
     }
 
     #[tokio::test]
@@ -34967,7 +34997,7 @@ mod tests {
             },
             compression_enabled: false,
             compression_snapshots: Vec::new(),
-            last_chat_completion_input_tokens: None,
+            last_chat_completion_input_tokens: Some(264_600),
         };
         let compress_task = tokio::spawn({
             let state = state.clone();
@@ -35032,6 +35062,11 @@ mod tests {
             event.kind != CONTEXT_COMPRESSION_KIND_LLM || event.status != "completed"
         }));
         assert!(runtime_after.compression_snapshots.is_empty());
+        // PreCompact block must not clear a still-valid pre-compression provider sample.
+        assert_eq!(
+            runtime_after.last_chat_completion_input_tokens,
+            Some(264_600)
+        );
         assert_eq!(
             messages_after.len(),
             runtime_after.message_source_sequences.len()

@@ -582,6 +582,9 @@ async fn ensure_llm_context_compression(
     };
     // A full LLM checkpoint covers prior RuntimeToolState snapshots; allow a new 80% local cycle.
     context.runtime_tool_state_compression_count = 0;
+    // Pre-compression provider input is stale after a durable checkpoint; drop it so the next
+    // Normal gate uses only the post-checkpoint local estimate until a new chat completion lands.
+    context.last_chat_completion_input_tokens = None;
     // completed only after snapshot is durable so history reload never sees a half-success block.
     push_context_compression_event(
         events,
@@ -3683,15 +3686,21 @@ pub(crate) fn llm_context_compression_trigger_source(
 }
 
 /// Record provider-reported chat-completion input tokens for the next Normal compression gate.
-/// Ignores non-positive values; does not clear on compression success (next chat completion overwrites).
+///
+/// Semantics: replace the sample for the most recently completed chat-completion turn.
+/// Positive `input_tokens` become the new sample; missing, zero, or non-positive values clear the
+/// cache so an earlier high-water mark cannot stick across turns. Call only for chat completion
+/// (not contextCompression / hooks / memory / Spec).
 pub(crate) fn record_chat_completion_input_tokens(
     last_chat_completion_input_tokens: &mut Option<u64>,
     input_tokens: Option<i64>,
 ) {
     let Some(tokens) = input_tokens.filter(|tokens| *tokens > 0) else {
+        *last_chat_completion_input_tokens = None;
         return;
     };
     let Ok(tokens) = u64::try_from(tokens) else {
+        *last_chat_completion_input_tokens = None;
         return;
     };
     *last_chat_completion_input_tokens = Some(tokens);

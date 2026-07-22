@@ -6511,7 +6511,7 @@ fn llm_context_compression_trigger_source_labels_local_provider_or_both() {
 }
 
 #[test]
-fn record_chat_completion_input_tokens_keeps_positive_chat_completion_only() {
+fn record_chat_completion_input_tokens_replaces_latest_sample_or_clears() {
     let mut last = None;
     crate::prompt::record_chat_completion_input_tokens(&mut last, None);
     assert_eq!(last, None);
@@ -6521,8 +6521,16 @@ fn record_chat_completion_input_tokens_keeps_positive_chat_completion_only() {
     assert_eq!(last, None);
     crate::prompt::record_chat_completion_input_tokens(&mut last, Some(950));
     assert_eq!(last, Some(950));
+    // Lower positive value replaces (not high-water mark).
     crate::prompt::record_chat_completion_input_tokens(&mut last, Some(120));
     assert_eq!(last, Some(120));
+    // Missing / non-positive usage clears the previous sample.
+    crate::prompt::record_chat_completion_input_tokens(&mut last, None);
+    assert_eq!(last, None);
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(264_600));
+    assert_eq!(last, Some(264_600));
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(0));
+    assert_eq!(last, None);
 }
 
 #[tokio::test]
@@ -6560,6 +6568,34 @@ async fn ensure_context_compression_reaches_llm_branch_from_provider_input_below
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
+fn provider_input_sample_after_clear_does_not_retrigger_when_local_below_threshold() {
+    // Regression: sticky 264.6K provider sample must not force another Normal checkpoint after
+    // a successful compression when the post-checkpoint local estimate is well below 95%.
+    let window = 100_000_u64;
+    let trigger = crate::prompt::llm_context_compression_trigger_tokens(window);
+    assert_eq!(trigger, 95_000);
+
+    let mut last = Some(264_600_u64);
+    assert!(crate::prompt::should_trigger_normal_llm_context_compression(39_500, last, window,));
+
+    // Successful checkpoint invalidates the pre-compression sample.
+    last = None;
+    assert!(
+        !crate::prompt::should_trigger_normal_llm_context_compression(39_500, last, window,),
+        "after clear, local 39.5K must not re-enter LLM compression"
+    );
+    assert!(
+        !crate::prompt::should_trigger_normal_llm_context_compression(3_600, last, window,),
+        "after clear, local 3.6K must not re-enter LLM compression"
+    );
+
+    // Next completed turn replaces with the latest sample only.
+    crate::prompt::record_chat_completion_input_tokens(&mut last, Some(3_600));
+    assert_eq!(last, Some(3_600));
+    assert!(!crate::prompt::should_trigger_normal_llm_context_compression(3_600, last, window,));
 }
 
 #[tokio::test]
