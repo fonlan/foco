@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs, io,
     net::SocketAddr,
@@ -187,6 +187,22 @@ const SIDECAR_HEALTH_INTERVAL: Duration = Duration::from_secs(20);
 const SIDECAR_HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
 const REMOTE_RECONNECT_BASE_DELAY: Duration = Duration::from_millis(500);
 const REMOTE_RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
+/// Bound control WebSocket reconnects against a dead local tunnel / SSH transport.
+/// Failures are counted in a rolling time window so a flaky endpoint that completes
+/// config.sync (and even a post-stability heartbeat) then closes cannot reset the
+/// budget forever. After this many failures within the window the control task exits,
+/// marks the session offline, and tears it down so connect/ensure rebuilds.
+const CONTROL_WS_MAX_FAILURES_IN_WINDOW: u32 = 8;
+/// Rolling window for control WS reconnect budget. Failures older than this age out,
+/// so a long-stable link effectively restores budget without a heartbeat-based reset
+/// that flaky endpoints can game (config.sync -> wait -> heartbeat -> Close -> forever).
+const CONTROL_WS_FAILURE_WINDOW: Duration = Duration::from_secs(120);
+/// Per-attempt bound for control WS open + config.sync (initial and post-ready reconnect).
+/// Without this, a half-open local tunnel can hang forever waiting for a config response
+/// and never increment the failure counter.
+const CONTROL_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often the local forward supervisor re-checks SSH transport liveness when idle.
+const FORWARD_SSH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MAX_BROKER_REQUEST_ID_BYTES: usize =
@@ -1718,7 +1734,18 @@ impl RemoteWorkspaceManager {
                     self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
                     return Ok(existing.summary());
                 }
-                Some(_) => sessions.remove(key),
+                Some(existing) => {
+                    let status = existing.status_snapshot();
+                    tracing::info!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        local_port = existing.local_port,
+                        status = %status.state.as_str(),
+                        last_error = status.last_error.as_deref().unwrap_or(""),
+                        "rejecting remote session reuse; forcing full reconnect"
+                    );
+                    sessions.remove(key)
+                }
                 None => None,
             }
         };
@@ -1829,6 +1856,8 @@ impl RemoteWorkspaceManager {
                 server_id,
                 workspace_id,
                 status.clone(),
+                self.clone(),
+                state.clone(),
             )
             .await?;
             partial.forward_stop = Some(forward_stop);
@@ -1860,6 +1889,8 @@ impl RemoteWorkspaceManager {
                 workspace_id,
                 active_runs.clone(),
                 status.clone(),
+                Some(Arc::clone(partial.ssh_ref())),
+                self.clone(),
             )
             .await?;
             partial.control_task = Some(control_task);
@@ -1989,6 +2020,137 @@ impl RemoteWorkspaceManager {
             )?;
             Ok(false)
         }
+    }
+
+    /// Remove a dead remote session from the manager map and stop residual resources.
+    ///
+    /// Matches on `local_port` so a concurrent full reconnect that already replaced the
+    /// session is not torn down. Holds the session replacement lock to serialize with
+    /// connect. Idempotent: a second call for the same dead port is a no-op.
+    ///
+    /// `abort_control` should be false when the control task itself is performing the
+    /// drop (so it is not cancelled mid-teardown); true when forward/health triggers it.
+    /// `join_forward` should be false when the forward task itself is performing the drop
+    /// (awaiting/aborting its own JoinHandle would cancel the rest of teardown).
+    async fn drop_dead_session(
+        &self,
+        state: &AppState,
+        server_id: &str,
+        workspace_id: &str,
+        local_port: u16,
+        reason: &str,
+        abort_control: bool,
+        join_forward: bool,
+    ) {
+        let replacement_lock_key = session_replacement_lock_key(server_id, workspace_id);
+        let Ok(replacement_lock) = self.sidecar_install_lock(&replacement_lock_key) else {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                local_port,
+                reason,
+                "failed to acquire replacement lock while dropping dead remote session"
+            );
+            return;
+        };
+        let _replacement_guard = replacement_lock.lock().await;
+
+        let session = {
+            let Ok(mut sessions) = self.sessions.lock() else {
+                tracing::warn!(
+                    server_id = %server_id,
+                    workspace_id = %workspace_id,
+                    local_port,
+                    reason,
+                    "remote workspace session lock is poisoned while dropping dead session"
+                );
+                return;
+            };
+            let key = session_key(server_id, workspace_id);
+            match sessions.get(&key) {
+                Some(existing) if existing.local_port == local_port => sessions.remove(&key),
+                Some(existing) => {
+                    tracing::info!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        dead_local_port = local_port,
+                        live_local_port = existing.local_port,
+                        reason,
+                        "skipping dead remote session drop; map already holds a different tunnel"
+                    );
+                    None
+                }
+                None => None,
+            }
+        };
+
+        if let Some(session) = session {
+            tracing::warn!(
+                server_id = %server_id,
+                workspace_id = %workspace_id,
+                local_port,
+                reason,
+                "removing dead remote workspace session"
+            );
+            set_session_status(
+                &session.status,
+                RemoteConnectionState::Offline,
+                Some(reason.to_string()),
+            );
+            session
+                .shutdown_resources(abort_control, join_forward)
+                .await;
+            state
+                .openai_resp_ws_sessions
+                .invalidate_workspace(workspace_id)
+                .await;
+            let _ = self.set_status(
+                server_id,
+                Some(workspace_id),
+                RemoteConnectionState::Offline,
+                Some(reason.to_string()),
+            );
+            // Keep server-level status in sync so summaries do not keep showing Ready after
+            // the last (or only) workspace session was torn down. Sibling Ready sessions still
+            // win in `server_state` via the live session map.
+            let _ = self.set_status(
+                server_id,
+                None,
+                RemoteConnectionState::Offline,
+                Some(reason.to_string()),
+            );
+        }
+
+        let _ = self.remove_sidecar_install_lock(&replacement_lock_key, &replacement_lock);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn drop_dead_session_for_test(
+        &self,
+        state: &AppState,
+        server_id: &str,
+        workspace_id: &str,
+        local_port: u16,
+        reason: &str,
+    ) {
+        self.drop_dead_session(
+            state,
+            server_id,
+            workspace_id,
+            local_port,
+            reason,
+            true,
+            true,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_session_for_test(&self, server_id: &str, workspace_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .map(|sessions| sessions.contains_key(&session_key(server_id, workspace_id)))
+            .unwrap_or(false)
     }
 
     pub(crate) async fn disconnect_server(&self, server_id: &str) -> Result<Vec<String>, ApiError> {
@@ -2401,8 +2563,19 @@ impl RemoteWorkspaceSession {
 
     async fn stop(&self) {
         set_session_status(&self.status, RemoteConnectionState::Disconnected, None);
+        self.shutdown_resources(true, true).await;
+    }
+
+    /// Stop residual tunnel resources without changing the public disconnect path.
+    /// When `abort_control` is false the control JoinHandle is detached (caller is the
+    /// control task exiting cleanly) so teardown is not cancelled mid-flight.
+    /// When `join_forward` is false the forward JoinHandle is detached (caller is the
+    /// forward task) so teardown does not await/abort itself.
+    async fn shutdown_resources(&self, abort_control: bool, join_forward: bool) {
         if let Some(task) = self.control_task.lock().await.take() {
-            task.abort();
+            if abort_control {
+                task.abort();
+            }
         }
         if let Some(task) = self.health_task.lock().await.take() {
             task.abort();
@@ -2412,14 +2585,17 @@ impl RemoteWorkspaceSession {
             let _ = stop.send(());
         }
         if let Some(task) = self.forward_task.lock().await.take() {
-            // Allow the forward loop to abort bridge tasks on stop_rx before hard abort.
-            let abort = task.abort_handle();
-            match timeout(Duration::from_secs(2), task).await {
-                Ok(_) => {}
-                Err(_) => {
-                    abort.abort();
+            if join_forward {
+                // Allow the forward loop to abort bridge tasks on stop_rx before hard abort.
+                let abort = task.abort_handle();
+                match timeout(Duration::from_secs(2), task).await {
+                    Ok(_) => {}
+                    Err(_) => {
+                        abort.abort();
+                    }
                 }
             }
+            // else: detach — caller is the forward task itself.
         }
         if let Some(mut sidecar) = self.sidecar.lock().await.take() {
             sidecar.close().await;
@@ -5166,6 +5342,8 @@ async fn start_direct_tcpip_forward(
     server_id: &str,
     workspace_id: &str,
     status: Arc<Mutex<RemoteSessionStatus>>,
+    manager: RemoteWorkspaceManager,
+    state: AppState,
 ) -> Result<(u16, oneshot::Sender<()>, JoinHandle<()>), ApiError> {
     let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
@@ -5188,26 +5366,61 @@ async fn start_direct_tcpip_forward(
         .port();
 
     let (stop_tx, mut stop_rx) = oneshot::channel();
+    // Bridge tasks report transport-level terminal failures here so the supervisor can
+    // tear the session down immediately instead of waiting for the next accept/control ping.
+    let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel::<String>();
+    let log_server_id = server_id.to_string();
+    let log_workspace_id = workspace_id.to_string();
     let handle = tokio::spawn(async move {
         let mut bridges: Vec<JoinHandle<()>> = Vec::new();
+        let mut drop_reason: Option<String> = None;
+        let mut ssh_check = tokio::time::interval(FORWARD_SSH_CHECK_INTERVAL);
+        ssh_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             // Drop finished bridge tasks so the registry does not grow without bound.
             bridges.retain(|task| !task.is_finished());
             tokio::select! {
                 _ = &mut stop_rx => break,
+                terminal = terminal_rx.recv() => {
+                    if let Some(reason) = terminal {
+                        set_session_status(
+                            &status,
+                            RemoteConnectionState::Offline,
+                            Some(reason.clone()),
+                        );
+                        drop_reason = Some(reason);
+                        break;
+                    }
+                }
+                _ = ssh_check.tick() => {
+                    if session.is_closed() {
+                        let reason = "SSH transport closed".to_string();
+                        set_session_status(
+                            &status,
+                            RemoteConnectionState::Offline,
+                            Some(reason.clone()),
+                        );
+                        drop_reason = Some(reason);
+                        break;
+                    }
+                }
                 accepted = listener.accept() => {
                     match accepted {
                         Ok((tcp, peer)) => {
                             if session.is_closed() {
+                                let reason =
+                                    "SSH transport closed during local forward".to_string();
                                 set_session_status(
                                     &status,
                                     RemoteConnectionState::Offline,
-                                    Some("SSH transport closed during local forward".to_string()),
+                                    Some(reason.clone()),
                                 );
+                                drop_reason = Some(reason);
                                 break;
                             }
                             let session = Arc::clone(&session);
                             let status = Arc::clone(&status);
+                            let terminal_tx = terminal_tx.clone();
                             let origin = peer.ip().to_string();
                             let origin_port = peer.port();
                             bridges.push(tokio::spawn(async move {
@@ -5220,14 +5433,17 @@ async fn start_direct_tcpip_forward(
                                 )
                                 .await
                                 {
-                                    // Transport-level failure: mark offline so managers stop
-                                    // treating the half-dead tunnel as reconnectable-only.
+                                    // Transport-level failure: mark offline and notify the
+                                    // forward supervisor so the session is removed promptly.
                                     if err.contains("closed") || err.contains("disconnect") {
+                                        let reason =
+                                            format!("direct-tcpip bridge failed: {err}");
                                         set_session_status(
                                             &status,
                                             RemoteConnectionState::Offline,
-                                            Some(format!("direct-tcpip bridge failed: {err}")),
+                                            Some(reason.clone()),
                                         );
+                                        let _ = terminal_tx.send(reason);
                                     } else {
                                         set_session_status(
                                             &status,
@@ -5239,11 +5455,13 @@ async fn start_direct_tcpip_forward(
                             }));
                         }
                         Err(err) => {
+                            let reason = format!("local forward listener failed: {err}");
                             set_session_status(
                                 &status,
                                 RemoteConnectionState::Offline,
-                                Some(format!("local forward listener failed: {err}")),
+                                Some(reason.clone()),
                             );
+                            drop_reason = Some(reason);
                             break;
                         }
                     }
@@ -5252,6 +5470,21 @@ async fn start_direct_tcpip_forward(
         }
         for task in bridges {
             task.abort();
+        }
+        if let Some(reason) = drop_reason {
+            // join_forward=false: we are the forward task; awaiting our own JoinHandle
+            // would stall teardown and then abort the rest of shutdown_resources.
+            manager
+                .drop_dead_session(
+                    &state,
+                    &log_server_id,
+                    &log_workspace_id,
+                    local_port,
+                    &reason,
+                    true,
+                    false,
+                )
+                .await;
         }
     });
     Ok((local_port, stop_tx, handle))
@@ -5313,6 +5546,8 @@ async fn connect_control_ws(
     workspace_id: &str,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
     status: Arc<Mutex<RemoteSessionStatus>>,
+    ssh: Option<Arc<SshSession>>,
+    manager: RemoteWorkspaceManager,
 ) -> Result<JoinHandle<()>, ApiError> {
     let url = format!("ws://127.0.0.1:{local_port}{CONTROL_WS_PATH}");
     let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
@@ -5321,26 +5556,64 @@ async fn connect_control_ws(
     let log_workspace_id = workspace_id.to_string();
     let handle = tokio::spawn(async move {
         let mut ready_tx = Some(ready_tx);
-        let mut attempt = 0_u32;
+        // Rolling-window budget: heartbeats / config.sync must never clear failures.
+        // A flaky tunnel that handshakes (and even waits for a "stable" heartbeat) then
+        // closes would otherwise loop forever under a consecutive-counter reset model.
+        let mut budget = ControlWsReconnectBudget::new(
+            CONTROL_WS_MAX_FAILURES_IN_WINDOW,
+            control_ws_failure_window(),
+        );
+        let max_failures = budget.max_failures;
+        let mut exit_reason: Option<String> = None;
         loop {
-            let connection_state = if attempt == 0 {
+            let failure_count = budget.failure_count(Instant::now());
+            if let Some(reason) = control_ws_should_exit(
+                failure_count,
+                max_failures,
+                &status,
+                ssh.as_deref().is_some_and(SshSession::is_closed),
+            ) {
+                exit_reason = Some(reason);
+                break;
+            }
+
+            let connection_state = if failure_count == 0 {
                 RemoteConnectionState::BrokerConnecting
             } else {
                 RemoteConnectionState::Reconnecting
             };
             set_session_status(&status, connection_state, None);
-            match connect_control_ws_once(&url, &token, &bundle).await {
-                Ok((write, mut read)) => {
+            match timeout(
+                CONTROL_WS_CONNECT_TIMEOUT,
+                connect_control_ws_once(&url, &token, &bundle),
+            )
+            .await
+            {
+                Ok(Ok((write, mut read))) => {
+                    // config.sync success makes the session Ready for the initial ready
+                    // channel, but must NOT reset the reconnect budget. Budget is restored
+                    // only by aging failures out of the rolling window after a long-stable
+                    // period — never by handshake or heartbeat alone.
                     set_session_status(&status, RemoteConnectionState::Ready, None);
                     if let Some(tx) = ready_tx.take() {
                         let _ = tx.send(Ok(()));
                     }
-                    attempt = 0;
                     let write = Arc::new(AsyncMutex::new(write));
                     let cancellations: BrokerCancelRegistry =
                         Arc::new(AsyncMutex::new(HashMap::new()));
                     let mut ping_interval = tokio::time::interval(CONTROL_WS_PING_INTERVAL);
                     loop {
+                        if ssh.as_deref().is_some_and(SshSession::is_closed) {
+                            exit_reason = Some("SSH transport closed".to_string());
+                            break;
+                        }
+                        if session_status_is_offline(&status) {
+                            exit_reason = Some(
+                                session_status_last_error(&status)
+                                    .unwrap_or_else(|| "SSH transport closed".to_string()),
+                            );
+                            break;
+                        }
                         tokio::select! {
                             _ = ping_interval.tick() => {
                                 let mut write = write.lock().await;
@@ -5386,6 +5659,8 @@ async fn connect_control_ws(
                                                         .await;
                                                 }
                                                 set_session_status(&status, RemoteConnectionState::Ready, None);
+                                                // Heartbeats update Ready / active runs only.
+                                                // They must not clear the rolling reconnect budget.
                                             }
                                             "request" => {
                                                 let request_id = envelope.id.clone();
@@ -5446,21 +5721,75 @@ async fn connect_control_ws(
                     if let Ok(mut runs) = active_runs.lock() {
                         runs.clear();
                     }
+                    if exit_reason.is_some() {
+                        break;
+                    }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     set_session_status(&status, RemoteConnectionState::Reconnecting, Some(error));
                 }
+                Err(_) => {
+                    set_session_status(
+                        &status,
+                        RemoteConnectionState::Reconnecting,
+                        Some("timed out waiting for control WebSocket config sync".to_string()),
+                    );
+                }
             }
-            attempt = attempt.saturating_add(1);
-            let delay = reconnect_delay(attempt);
+            budget.record_failure(Instant::now());
+            let failure_count = budget.failure_count(Instant::now());
+            if let Some(reason) = control_ws_should_exit(
+                failure_count,
+                max_failures,
+                &status,
+                ssh.as_deref().is_some_and(SshSession::is_closed),
+            ) {
+                exit_reason = Some(reason);
+                break;
+            }
+            let delay = reconnect_delay(failure_count);
             tracing::warn!(
-                %log_server_id,
-                %log_workspace_id,
-                attempt,
+                server_id = %log_server_id,
+                workspace_id = %log_workspace_id,
+                attempt = failure_count,
                 delay_ms = delay.as_millis() as u64,
                 "remote control WebSocket reconnect scheduled"
             );
             sleep(delay).await;
+        }
+
+        let reason = exit_reason
+            .unwrap_or_else(|| "remote control WebSocket reconnect exhausted".to_string());
+        let final_attempt = budget.failure_count(Instant::now());
+        set_session_status(
+            &status,
+            RemoteConnectionState::Offline,
+            Some(reason.clone()),
+        );
+        tracing::warn!(
+            server_id = %log_server_id,
+            workspace_id = %log_workspace_id,
+            local_port,
+            attempt = final_attempt,
+            reason = %reason,
+            "remote control WebSocket reconnect loop exiting"
+        );
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Err(reason.clone()));
+        } else {
+            // Post-ready death: tear the session out of the manager so connect/ensure
+            // rebuilds the full tunnel. Do not open a new SSH session here.
+            manager
+                .drop_dead_session(
+                    &state,
+                    &log_server_id,
+                    &log_workspace_id,
+                    local_port,
+                    &reason,
+                    false,
+                    true,
+                )
+                .await;
         }
     });
 
@@ -5487,6 +5816,100 @@ async fn connect_control_ws(
             ))
         }
     }
+}
+
+/// Decide whether the control reconnect loop should stop instead of scheduling another
+/// attempt against a dead local port / SSH transport.
+fn control_ws_should_exit(
+    failures_in_window: u32,
+    max_failures: u32,
+    status: &Arc<Mutex<RemoteSessionStatus>>,
+    ssh_closed: bool,
+) -> Option<String> {
+    if session_status_is_offline(status) {
+        return Some(
+            session_status_last_error(status).unwrap_or_else(|| "SSH transport closed".to_string()),
+        );
+    }
+    if ssh_closed {
+        return Some("SSH transport closed".to_string());
+    }
+    if failures_in_window >= max_failures {
+        return Some("remote control WebSocket reconnect exhausted".to_string());
+    }
+    None
+}
+
+/// Rolling window used for the control reconnect budget.
+/// Tests use a window long enough to accumulate rapid fixture failures without aging out.
+fn control_ws_failure_window() -> Duration {
+    if cfg!(test) {
+        Duration::from_secs(30)
+    } else {
+        CONTROL_WS_FAILURE_WINDOW
+    }
+}
+
+/// Rolling reconnect budget for control WebSocket failures.
+///
+/// Each connect failure or post-handshake disconnect records a timestamp. When the number
+/// of failures still inside `window` reaches `max_failures`, the control task must exit.
+/// Failures age out after `window`, so a long-stable link effectively restores budget
+/// without a heartbeat-based reset that flaky endpoints can game.
+#[derive(Debug, Clone)]
+struct ControlWsReconnectBudget {
+    failure_times: VecDeque<Instant>,
+    max_failures: u32,
+    window: Duration,
+}
+
+impl ControlWsReconnectBudget {
+    fn new(max_failures: u32, window: Duration) -> Self {
+        Self {
+            failure_times: VecDeque::new(),
+            max_failures,
+            window,
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        while self
+            .failure_times
+            .front()
+            .is_some_and(|front| now.duration_since(*front) >= self.window)
+        {
+            self.failure_times.pop_front();
+        }
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.prune(now);
+        self.failure_times.push_back(now);
+    }
+
+    fn failure_count(&mut self, now: Instant) -> u32 {
+        self.prune(now);
+        u32::try_from(self.failure_times.len()).unwrap_or(u32::MAX)
+    }
+
+    #[cfg(test)]
+    fn is_exhausted(&mut self, now: Instant) -> bool {
+        self.failure_count(now) >= self.max_failures
+    }
+}
+
+fn session_status_is_offline(status: &Arc<Mutex<RemoteSessionStatus>>) -> bool {
+    status
+        .lock()
+        .map(|status| status.state == RemoteConnectionState::Offline)
+        .unwrap_or(false)
+}
+
+fn session_status_last_error(status: &Arc<Mutex<RemoteSessionStatus>>) -> Option<String> {
+    status
+        .lock()
+        .ok()
+        .and_then(|status| status.last_error.clone())
 }
 
 async fn handle_broker_request(
@@ -8085,6 +8508,11 @@ fn set_session_status(
 }
 
 fn reconnect_delay(attempt: u32) -> Duration {
+    if cfg!(test) {
+        // Keep control-WS reconnect regression tests fast; production uses
+        // exponential backoff below.
+        return Duration::from_millis(5);
+    }
     let shift = attempt.saturating_sub(1).min(6);
     let base_ms = REMOTE_RECONNECT_BASE_DELAY.as_millis() as u64;
     let max_ms = REMOTE_RECONNECT_MAX_DELAY.as_millis() as u64;
@@ -21395,6 +21823,639 @@ mod tests {
     }
 
     #[test]
+    fn control_ws_exits_after_consecutive_reconnect_failures() {
+        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Reconnecting,
+            Some("connection refused".to_string()),
+        )));
+
+        assert!(
+            control_ws_should_exit(0, CONTROL_WS_MAX_FAILURES_IN_WINDOW, &status, false).is_none(),
+            "fresh attempts must still be allowed when the rolling window is empty"
+        );
+        assert!(
+            control_ws_should_exit(
+                CONTROL_WS_MAX_FAILURES_IN_WINDOW - 1,
+                CONTROL_WS_MAX_FAILURES_IN_WINDOW,
+                &status,
+                false
+            )
+            .is_none()
+        );
+        assert_eq!(
+            control_ws_should_exit(
+                CONTROL_WS_MAX_FAILURES_IN_WINDOW,
+                CONTROL_WS_MAX_FAILURES_IN_WINDOW,
+                &status,
+                false
+            )
+            .as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+    }
+
+    #[test]
+    fn control_ws_exits_when_ssh_closed_or_status_offline() {
+        let ready = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Ready,
+            None,
+        )));
+        assert_eq!(
+            control_ws_should_exit(1, CONTROL_WS_MAX_FAILURES_IN_WINDOW, &ready, true).as_deref(),
+            Some("SSH transport closed")
+        );
+
+        let offline = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Offline,
+            Some("SSH transport closed during local forward".to_string()),
+        )));
+        assert_eq!(
+            control_ws_should_exit(1, CONTROL_WS_MAX_FAILURES_IN_WINDOW, &offline, false)
+                .as_deref(),
+            Some("SSH transport closed during local forward")
+        );
+    }
+
+    #[test]
+    fn control_ws_reconnect_budget_counts_failures_in_rolling_window() {
+        let mut budget = ControlWsReconnectBudget::new(3, Duration::from_millis(100));
+        let t0 = Instant::now();
+
+        budget.record_failure(t0);
+        budget.record_failure(t0 + Duration::from_millis(10));
+        assert!(
+            !budget.is_exhausted(t0 + Duration::from_millis(20)),
+            "under the max, the budget must still allow reconnects"
+        );
+        budget.record_failure(t0 + Duration::from_millis(20));
+        assert!(
+            budget.is_exhausted(t0 + Duration::from_millis(20)),
+            "reaching max failures inside the window must exhaust the budget"
+        );
+        assert_eq!(budget.failure_count(t0 + Duration::from_millis(20)), 3);
+
+        // After the window elapses, aged failures drop out so a long-stable link recovers.
+        assert!(
+            !budget.is_exhausted(t0 + Duration::from_millis(150)),
+            "failures older than the window must age out"
+        );
+        assert_eq!(budget.failure_count(t0 + Duration::from_millis(150)), 0);
+    }
+
+    #[test]
+    fn control_ws_reconnect_budget_does_not_reset_without_aging() {
+        // Models the flaky endpoint: each cycle records a failure; no heartbeat/handshake
+        // path may clear the deque. Only wall-clock aging restores budget.
+        let mut budget = ControlWsReconnectBudget::new(8, Duration::from_secs(30));
+        let t0 = Instant::now();
+        for i in 0..8 {
+            budget.record_failure(t0 + Duration::from_millis(i * 50));
+        }
+        assert!(
+            budget.is_exhausted(t0 + Duration::from_millis(400)),
+            "eight rapid post-handshake disconnects must exhaust without any reset path"
+        );
+        // Still inside the window: partial aging of only the oldest entry is not enough.
+        assert_eq!(
+            budget.failure_count(t0 + Duration::from_secs(1)),
+            8,
+            "failures must remain until the full window elapses"
+        );
+    }
+
+    /// Regression: a tunnel that completes config.sync then immediately Close/EOF must still
+    /// exhaust the rolling-window failure budget and tear the session out of the manager.
+    /// Resetting the counter on mere handshake success would loop forever (0 -> success -> 0 -> 1).
+    #[tokio::test]
+    async fn control_ws_exits_after_config_sync_then_immediate_close_exhausts_reconnects() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let config = remote_test_config(workspace.path());
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("flaky control fixture address");
+        let local_port = control_address.port();
+
+        let fixture_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = control_listener.accept().await else {
+                    break;
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                let Ok(Some(Ok(message))) = timeout(Duration::from_secs(2), socket.next()).await
+                else {
+                    continue;
+                };
+                let tungstenite::Message::Text(config_text) = message else {
+                    continue;
+                };
+                let Ok(config_envelope) =
+                    serde_json::from_str::<ControlEnvelope>(config_text.as_str())
+                else {
+                    continue;
+                };
+                if config_envelope.message_type != "config"
+                    || config_envelope.method.as_deref() != Some("config.sync")
+                {
+                    continue;
+                }
+                let Some(config_id) = config_envelope.id else {
+                    continue;
+                };
+                let config_response = ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(config_id),
+                    method: None,
+                    payload: json!({ "status": "ok" }),
+                    timestamp: None,
+                };
+                let Ok(_) = socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&config_response)
+                            .expect("serialize config response")
+                            .into(),
+                    ))
+                    .await
+                else {
+                    continue;
+                };
+                // Handshake succeeds, then the link dies immediately — the failure mode that
+                // previously reset attempt to 0 and never hit the reconnect ceiling.
+                let _ = socket.close(None).await;
+            }
+        });
+
+        let manager = RemoteWorkspaceManager::default();
+        manager.insert_fake_session_for_test(
+            "server-1",
+            &workspace_id,
+            "/remote/project",
+            local_port,
+            "control-token",
+        );
+        assert!(manager.has_session_for_test("server-1", &workspace_id));
+
+        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Disconnected,
+            None,
+        )));
+        let connection_task = connect_control_ws(
+            state.clone(),
+            local_port,
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            status.clone(),
+            None,
+            manager.clone(),
+        )
+        .await
+        .expect("first config.sync must succeed so the control task is post-ready");
+
+        timeout(Duration::from_secs(10), connection_task)
+            .await
+            .expect("control reconnect loop must exit after consecutive flaky handshakes")
+            .expect("control task join");
+
+        let task_status = status.lock().expect("status lock").clone();
+        assert_eq!(task_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            task_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        assert!(
+            !manager.has_session_for_test("server-1", &workspace_id),
+            "exhausted control reconnects must remove the session so ensure/connect rebuilds"
+        );
+
+        let workspace_status = manager
+            .get_status("server-1", Some(&workspace_id))
+            .expect("status lock")
+            .expect("workspace offline status");
+        assert_eq!(workspace_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            workspace_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        let server_status = manager
+            .get_status("server-1", None)
+            .expect("status lock")
+            .expect("server offline status");
+        assert_eq!(server_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            server_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        fixture_task.abort();
+        let _ = fixture_task.await;
+    }
+
+    /// Regression: config.sync -> validated heartbeat -> immediate Close must still exhaust the
+    /// rolling reconnect budget. Heartbeats must never clear failures (including the sidecar's
+    /// immediate first tick).
+    #[tokio::test]
+    async fn control_ws_exits_after_config_sync_heartbeat_then_immediate_close_exhausts_reconnects()
+    {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let config = remote_test_config(workspace.path());
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("flaky control fixture address");
+        let local_port = control_address.port();
+
+        let fixture_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = control_listener.accept().await else {
+                    break;
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                let Ok(Some(Ok(message))) = timeout(Duration::from_secs(2), socket.next()).await
+                else {
+                    continue;
+                };
+                let tungstenite::Message::Text(config_text) = message else {
+                    continue;
+                };
+                let Ok(config_envelope) =
+                    serde_json::from_str::<ControlEnvelope>(config_text.as_str())
+                else {
+                    continue;
+                };
+                if config_envelope.message_type != "config"
+                    || config_envelope.method.as_deref() != Some("config.sync")
+                {
+                    continue;
+                }
+                let Some(config_id) = config_envelope.id else {
+                    continue;
+                };
+                let config_response = ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(config_id),
+                    method: None,
+                    payload: json!({ "status": "ok" }),
+                    timestamp: None,
+                };
+                let Ok(_) = socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&config_response)
+                            .expect("serialize config response")
+                            .into(),
+                    ))
+                    .await
+                else {
+                    continue;
+                };
+                // Mirror sidecar: first heartbeat is sent immediately after the control link
+                // is up. Rolling budget must still accumulate this disconnect.
+                let heartbeat = ControlEnvelope {
+                    version: 1,
+                    message_type: "heartbeat".to_string(),
+                    id: None,
+                    method: Some("sidecar.heartbeat".to_string()),
+                    payload: json!({
+                        "workspaceId": "workspace-1",
+                        "activeRuns": [],
+                        "brokerStatus": "connected",
+                    }),
+                    timestamp: None,
+                };
+                let Ok(_) = socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&heartbeat)
+                            .expect("serialize heartbeat")
+                            .into(),
+                    ))
+                    .await
+                else {
+                    continue;
+                };
+                let _ = socket.close(None).await;
+            }
+        });
+
+        let manager = RemoteWorkspaceManager::default();
+        manager.insert_fake_session_for_test(
+            "server-1",
+            &workspace_id,
+            "/remote/project",
+            local_port,
+            "control-token",
+        );
+        assert!(manager.has_session_for_test("server-1", &workspace_id));
+
+        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Disconnected,
+            None,
+        )));
+        let connection_task = connect_control_ws(
+            state.clone(),
+            local_port,
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            status.clone(),
+            None,
+            manager.clone(),
+        )
+        .await
+        .expect("first config.sync must succeed so the control task is post-ready");
+
+        timeout(Duration::from_secs(10), connection_task)
+            .await
+            .expect("control reconnect loop must exit after config->heartbeat->close flakiness")
+            .expect("control task join");
+
+        let task_status = status.lock().expect("status lock").clone();
+        assert_eq!(task_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            task_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        assert!(
+            !manager.has_session_for_test("server-1", &workspace_id),
+            "exhausted control reconnects must remove the session so ensure/connect rebuilds"
+        );
+
+        let workspace_status = manager
+            .get_status("server-1", Some(&workspace_id))
+            .expect("status lock")
+            .expect("workspace offline status");
+        assert_eq!(workspace_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            workspace_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        fixture_task.abort();
+        let _ = fixture_task.await;
+    }
+
+    /// Regression for the residual P1: config.sync -> wait past a "stability" window ->
+    /// validated heartbeat -> Close must still exhaust. A consecutive-counter model that
+    /// reset on post-stability heartbeat would loop forever (N -> 0 -> Close -> 1).
+    #[tokio::test]
+    async fn control_ws_exits_after_stable_window_heartbeat_then_close_exhausts_reconnects() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let config = remote_test_config(workspace.path());
+        let workspace_id = config.workspaces[0].id.clone();
+        let state = crate::tests::test_app_state(config.clone(), profile.path().to_path_buf());
+        let bundle = build_sidecar_runtime_config_bundle(profile.path(), &config, 1)
+            .expect("runtime config bundle");
+
+        let control_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind flaky control fixture");
+        let control_address = control_listener
+            .local_addr()
+            .expect("flaky control fixture address");
+        let local_port = control_address.port();
+
+        // Longer than the old 100ms stability window used by the previous reset model.
+        let post_stability_delay = Duration::from_millis(150);
+
+        let fixture_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = control_listener.accept().await else {
+                    break;
+                };
+                let Ok(mut socket) = tokio_tungstenite::accept_async(stream).await else {
+                    continue;
+                };
+                let Ok(Some(Ok(message))) = timeout(Duration::from_secs(2), socket.next()).await
+                else {
+                    continue;
+                };
+                let tungstenite::Message::Text(config_text) = message else {
+                    continue;
+                };
+                let Ok(config_envelope) =
+                    serde_json::from_str::<ControlEnvelope>(config_text.as_str())
+                else {
+                    continue;
+                };
+                if config_envelope.message_type != "config"
+                    || config_envelope.method.as_deref() != Some("config.sync")
+                {
+                    continue;
+                }
+                let Some(config_id) = config_envelope.id else {
+                    continue;
+                };
+                let config_response = ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(config_id),
+                    method: None,
+                    payload: json!({ "status": "ok" }),
+                    timestamp: None,
+                };
+                let Ok(_) = socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&config_response)
+                            .expect("serialize config response")
+                            .into(),
+                    ))
+                    .await
+                else {
+                    continue;
+                };
+                // Stay open past a stability-like window, then send a protocol heartbeat
+                // before closing — the path that previously cleared attempt to 0 forever.
+                sleep(post_stability_delay).await;
+                let heartbeat = ControlEnvelope {
+                    version: 1,
+                    message_type: "heartbeat".to_string(),
+                    id: None,
+                    method: Some("sidecar.heartbeat".to_string()),
+                    payload: json!({
+                        "workspaceId": "workspace-1",
+                        "activeRuns": [],
+                        "brokerStatus": "connected",
+                    }),
+                    timestamp: None,
+                };
+                let Ok(_) = socket
+                    .send(tungstenite::Message::Text(
+                        serde_json::to_string(&heartbeat)
+                            .expect("serialize heartbeat")
+                            .into(),
+                    ))
+                    .await
+                else {
+                    continue;
+                };
+                let _ = socket.close(None).await;
+            }
+        });
+
+        let manager = RemoteWorkspaceManager::default();
+        manager.insert_fake_session_for_test(
+            "server-1",
+            &workspace_id,
+            "/remote/project",
+            local_port,
+            "control-token",
+        );
+        assert!(manager.has_session_for_test("server-1", &workspace_id));
+
+        let status = Arc::new(Mutex::new(RemoteSessionStatus::new(
+            RemoteConnectionState::Disconnected,
+            None,
+        )));
+        let connection_task = connect_control_ws(
+            state.clone(),
+            local_port,
+            "control-token",
+            bundle,
+            "server-1",
+            &workspace_id,
+            Arc::new(Mutex::new(Vec::new())),
+            status.clone(),
+            None,
+            manager.clone(),
+        )
+        .await
+        .expect("first config.sync must succeed so the control task is post-ready");
+
+        // 8 cycles * ~150ms hold + reconnect delays; keep a generous bound.
+        timeout(Duration::from_secs(15), connection_task)
+            .await
+            .expect(
+                "control reconnect loop must exit after stable-window heartbeat then close flakiness",
+            )
+            .expect("control task join");
+
+        let task_status = status.lock().expect("status lock").clone();
+        assert_eq!(task_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            task_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        assert!(
+            !manager.has_session_for_test("server-1", &workspace_id),
+            "exhausted control reconnects must remove the session so ensure/connect rebuilds"
+        );
+
+        let workspace_status = manager
+            .get_status("server-1", Some(&workspace_id))
+            .expect("status lock")
+            .expect("workspace offline status");
+        assert_eq!(workspace_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            workspace_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        fixture_task.abort();
+        let _ = fixture_task.await;
+    }
+
+    #[tokio::test]
+    async fn drop_dead_session_removes_matching_port_and_skips_replacements() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let config = remote_test_config(workspace.path());
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        let manager = RemoteWorkspaceManager::default();
+
+        manager.insert_fake_session_for_test(
+            "server-1",
+            "workspace-1",
+            "/remote/project",
+            4321,
+            "token-a",
+        );
+        assert!(manager.has_session_for_test("server-1", "workspace-1"));
+
+        manager
+            .drop_dead_session_for_test(
+                &state,
+                "server-1",
+                "workspace-1",
+                9999,
+                "stale port must not remove replacement",
+            )
+            .await;
+        assert!(
+            manager.has_session_for_test("server-1", "workspace-1"),
+            "mismatched local_port must leave the live session in the map"
+        );
+
+        manager
+            .drop_dead_session_for_test(
+                &state,
+                "server-1",
+                "workspace-1",
+                4321,
+                "remote control WebSocket reconnect exhausted",
+            )
+            .await;
+        assert!(
+            !manager.has_session_for_test("server-1", "workspace-1"),
+            "matching dead session must be removed so ensure/connect rebuilds"
+        );
+
+        let status = manager
+            .get_status("server-1", Some("workspace-1"))
+            .expect("status lock")
+            .expect("offline status");
+        assert_eq!(status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        let server_status = manager
+            .get_status("server-1", None)
+            .expect("status lock")
+            .expect("server offline status");
+        assert_eq!(server_status.state, RemoteConnectionState::Offline);
+        assert_eq!(
+            server_status.last_error.as_deref(),
+            Some("remote control WebSocket reconnect exhausted")
+        );
+
+        // Idempotent: second drop is a no-op.
+        manager
+            .drop_dead_session_for_test(&state, "server-1", "workspace-1", 4321, "already removed")
+            .await;
+    }
+
+    #[test]
     fn older_remote_session_identity_is_stale_after_app_upgrade() {
         let older = test_sidecar_identity("0.1.50", "foco-sidecar-v2:sha256:older");
         let current = test_sidecar_identity("0.1.51", "foco-sidecar-v2:sha256:current");
@@ -27144,6 +28205,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .expect("connect main-process control websocket");
@@ -27480,6 +28543,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .expect("connect main-process control websocket");
@@ -27701,6 +28766,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .expect("connect main-process control websocket");
@@ -27928,6 +28995,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .expect("connect main-process control websocket");
@@ -28341,6 +29410,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .expect("connect main-process control websocket");
@@ -39324,6 +40395,8 @@ mod tests {
                 RemoteConnectionState::Disconnected,
                 None,
             ))),
+            None,
+            RemoteWorkspaceManager::default(),
         )
         .await
         .map_err(|error| format!("connect control ws: {}", error.message()))?;
