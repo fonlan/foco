@@ -4,6 +4,7 @@
 //! for baseline first-attempt / terminal success metrics and drive output-repair
 //! vs provider-retry decisions.
 
+use foco_providers::{NeutralChatRequest, NeutralToolChoice};
 use foco_store::workspace::{
     STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
     STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
@@ -172,6 +173,8 @@ pub enum StructuredLlmFailureKind {
     ProviderTimeout,
     /// Provider/stream transport or HTTP error (may be retryable by status).
     ProviderError,
+    /// A Thinking-mode provider rejected native forced tool selection on a required-single-tool request.
+    ThinkingToolChoiceIncompatible,
     /// Unclassified failure.
     Other,
 }
@@ -187,7 +190,9 @@ impl StructuredLlmFailureKind {
             Self::SchemaInvalid => STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID,
             Self::SemanticInvalid => STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID,
             Self::ProviderTimeout => STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
-            Self::ProviderError => STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR,
+            Self::ProviderError | Self::ThinkingToolChoiceIncompatible => {
+                STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR
+            }
             Self::Other => STRUCTURED_LLM_OUTCOME_OTHER,
         }
     }
@@ -202,6 +207,7 @@ impl StructuredLlmFailureKind {
             Self::SemanticInvalid => "semantic_invalid",
             Self::ProviderTimeout => "provider_timeout",
             Self::ProviderError => "provider_error",
+            Self::ThinkingToolChoiceIncompatible => "thinking_tool_choice_incompatible",
             Self::Other => "other",
         }
     }
@@ -210,7 +216,11 @@ impl StructuredLlmFailureKind {
     pub fn is_output_repair_eligible(self) -> bool {
         matches!(
             self,
-            Self::MissingTool | Self::Prose | Self::WrongTool | Self::SchemaInvalid
+            Self::MissingTool
+                | Self::Prose
+                | Self::WrongTool
+                | Self::SchemaInvalid
+                | Self::ThinkingToolChoiceIncompatible
         )
     }
 
@@ -280,6 +290,30 @@ Do not reply with prose only. Do not call any other tool.",
         category = failure_kind.category_label(),
         tool = expected_tool_name,
     )
+}
+
+/// Rebuild a single-tool request for its one allowed output-repair attempt.
+///
+/// Most protocol failures retain native forced tool selection. The one exception is a provider's
+/// explicit Thinking-mode rejection of that selection: retry with the same single tool definition
+/// but automatic tool choice, and rely on the deterministic correction message to require the tool.
+pub fn build_output_repair_request(
+    base_request: &NeutralChatRequest,
+    expected_tool_name: &str,
+    failure_kind: StructuredLlmFailureKind,
+) -> NeutralChatRequest {
+    let mut repaired = base_request.clone();
+    if matches!(
+        failure_kind,
+        StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+    ) {
+        repaired.tool_choice = NeutralToolChoice::Auto;
+    }
+    repaired.messages.push(crate::neutral_text_message(
+        foco_providers::NeutralChatRole::User,
+        build_output_repair_user_message(expected_tool_name, failure_kind),
+    ));
+    repaired
 }
 
 /// Whether an HTTP status is eligible for existing provider transport retry (408/409/429/5xx).
@@ -353,6 +387,50 @@ pub fn classify_provider_tool_failure_kind(
     } else {
         StructuredLlmFailureKind::Other
     }
+}
+
+/// Classify a provider failure for a request that may have native required-single-tool selection.
+///
+/// The Thinking/tool-choice compatibility path is intentionally narrow: providers must return an
+/// HTTP 400 and explicitly mention Thinking, tool choice, and rejection/unsupported semantics.
+/// All other errors retain the generic classifier and existing transport retry behavior.
+pub fn classify_required_single_tool_provider_failure_kind(
+    message: &str,
+    status_code: Option<i64>,
+    tool_choice: &NeutralToolChoice,
+) -> StructuredLlmFailureKind {
+    if matches!(status_code, Some(400))
+        && tool_choice.required_tool_name().is_some()
+        && is_thinking_tool_choice_incompatibility(message)
+    {
+        StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+    } else {
+        classify_provider_tool_failure_kind(message, status_code)
+    }
+}
+
+fn is_thinking_tool_choice_incompatibility(message: &str) -> bool {
+    let normalized = message.to_ascii_lowercase().replace(['_', '-'], " ");
+    let mentions_tool_choice = normalized.contains("tool choice");
+    let rejects_tool_choice = [
+        "unsupported",
+        "not supported",
+        "does not support",
+        "doesn't support",
+        "cannot use",
+        "can't use",
+        "not allowed",
+        "rejected",
+        "reject",
+        "incompatible",
+        "only supports auto",
+        "only support auto",
+        "must be auto",
+    ]
+    .iter()
+    .any(|signal| normalized.contains(signal));
+
+    normalized.contains("thinking") && mentions_tool_choice && rejects_tool_choice
 }
 
 /// Classify caller-side parse / business validation errors after tool arguments arrive.
@@ -546,6 +624,89 @@ mod tests {
             ),
             message
         );
+    }
+
+    #[test]
+    fn thinking_tool_choice_compatibility_requires_required_tool_and_http_400() {
+        let required = NeutralToolChoice::required_single_tool("select_relevant_memory");
+        let message = "Thinking mode only supports auto tool_choice.";
+
+        let failure =
+            classify_required_single_tool_provider_failure_kind(message, Some(400), &required);
+        assert_eq!(
+            failure,
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+        );
+        assert_eq!(
+            failure.structured_outcome(),
+            STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR
+        );
+        assert_eq!(
+            failure.category_label(),
+            "thinking_tool_choice_incompatible"
+        );
+        assert!(failure.is_output_repair_eligible());
+        assert!(!is_provider_transport_retryable(failure, Some(400)));
+
+        assert_ne!(
+            classify_required_single_tool_provider_failure_kind(
+                message,
+                Some(400),
+                &NeutralToolChoice::Auto,
+            ),
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+        );
+        assert_ne!(
+            classify_required_single_tool_provider_failure_kind(message, Some(401), &required),
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+        );
+        assert_ne!(
+            classify_required_single_tool_provider_failure_kind(
+                "tool choice is unsupported",
+                Some(400),
+                &required,
+            ),
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+        );
+    }
+
+    #[test]
+    fn compatibility_repair_downgrades_only_tool_choice_and_keeps_the_single_tool_prompt() {
+        let base = NeutralChatRequest {
+            model_id: "model".to_string(),
+            messages: vec![crate::neutral_text_message(
+                foco_providers::NeutralChatRole::User,
+                "base request".to_string(),
+            )],
+            tools: Vec::new(),
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: NeutralToolChoice::required_single_tool("select_relevant_memory"),
+        };
+
+        let compatibility_repair = build_output_repair_request(
+            &base,
+            "select_relevant_memory",
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
+        );
+        assert_eq!(compatibility_repair.tool_choice, NeutralToolChoice::Auto);
+        assert_eq!(compatibility_repair.tools, base.tools);
+        assert_eq!(compatibility_repair.messages.len(), 2);
+        assert!(
+            compatibility_repair.messages[1]
+                .content
+                .contains("select_relevant_memory")
+        );
+
+        let protocol_repair = build_output_repair_request(
+            &base,
+            "select_relevant_memory",
+            StructuredLlmFailureKind::Prose,
+        );
+        assert_eq!(protocol_repair.tool_choice, base.tool_choice);
     }
 
     #[test]

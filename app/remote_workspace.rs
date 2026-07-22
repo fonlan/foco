@@ -20577,11 +20577,12 @@ async fn remote_sidecar_broker_tool_request_with_args_validate(
                             ) =>
                             {
                                 output_repair_used = next_output_repair_used;
-                                active_request = append_remote_output_repair_message(
-                                    &base_request,
-                                    expected_tool_name,
-                                    failure_kind,
-                                );
+                                active_request =
+                                    crate::structured_llm_outcome::build_output_repair_request(
+                                        &base_request,
+                                        expected_tool_name,
+                                        failure_kind,
+                                    );
                                 tracing::debug!(
                                     request_kind,
                                     expected_tool_name,
@@ -20619,7 +20620,7 @@ async fn remote_sidecar_broker_tool_request_with_args_validate(
                     ) =>
                     {
                         output_repair_used = next_output_repair_used;
-                        active_request = append_remote_output_repair_message(
+                        active_request = crate::structured_llm_outcome::build_output_repair_request(
                             &base_request,
                             expected_tool_name,
                             failure_kind,
@@ -20637,6 +20638,60 @@ async fn remote_sidecar_broker_tool_request_with_args_validate(
                     }
                 }
             }
+            Err(RemoteSidecarBrokerToolFailure::Broker {
+                message,
+                code,
+                retryable,
+                status_code,
+            }) => {
+                let failure_kind = crate::structured_llm_outcome::classify_required_single_tool_provider_failure_kind(
+                    &message,
+                    status_code,
+                    &active_request.tool_choice,
+                );
+                if !matches!(
+                    failure_kind,
+                    crate::structured_llm_outcome::StructuredLlmFailureKind::ThinkingToolChoiceIncompatible
+                ) {
+                    return Err(ApiError::bad_gateway(message));
+                }
+
+                match crate::structured_llm_outcome::next_audited_stream_action(
+                    failure_kind,
+                    status_code,
+                    output_repair_used,
+                    0,
+                    0, // provider transport retries stay on the broker stream path
+                ) {
+                    crate::structured_llm_outcome::StructuredLlmNextAction::Continue {
+                        retry_kind,
+                        output_repair_used: next_output_repair_used,
+                        ..
+                    } if matches!(
+                        retry_kind,
+                        crate::structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
+                    ) =>
+                    {
+                        output_repair_used = next_output_repair_used;
+                        active_request = crate::structured_llm_outcome::build_output_repair_request(
+                            &base_request,
+                            expected_tool_name,
+                            failure_kind,
+                        );
+                        tracing::debug!(
+                            request_kind,
+                            expected_tool_name,
+                            failure_category = failure_kind.category_label(),
+                            broker_code = ?code,
+                            broker_retryable = retryable,
+                            broker_status_code = ?status_code,
+                            "scheduling remote single-tool compatibility repair after broker provider error"
+                        );
+                        continue;
+                    }
+                    _ => return Err(ApiError::bad_gateway(message)),
+                }
+            }
             Err(RemoteSidecarBrokerToolFailure::Transport { message }) => {
                 return Err(ApiError::bad_gateway(message));
             }
@@ -20650,25 +20705,15 @@ enum RemoteSidecarBrokerToolFailure {
         failure_kind: crate::structured_llm_outcome::StructuredLlmFailureKind,
         message: String,
     },
+    Broker {
+        message: String,
+        code: Option<String>,
+        retryable: bool,
+        status_code: Option<i64>,
+    },
     Transport {
         message: String,
     },
-}
-
-fn append_remote_output_repair_message(
-    base_request: &NeutralChatRequest,
-    expected_tool_name: &str,
-    failure_kind: crate::structured_llm_outcome::StructuredLlmFailureKind,
-) -> NeutralChatRequest {
-    let mut repaired = base_request.clone();
-    repaired.messages.push(neutral_text_message(
-        NeutralChatRole::User,
-        crate::structured_llm_outcome::build_output_repair_user_message(
-            expected_tool_name,
-            failure_kind,
-        ),
-    ));
-    repaired
 }
 
 /// Classify missing/wrong-tool outcomes for remote single-tool broker responses.
@@ -20817,17 +20862,33 @@ async fn remote_sidecar_broker_tool_request_once(
                 return Ok(submit.arguments);
             }
             "error" => {
-                let message = envelope
-                    .payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("remote broker unavailable");
-                return Err(RemoteSidecarBrokerToolFailure::Transport {
-                    message: message.to_string(),
-                });
+                return Err(remote_sidecar_broker_tool_failure_from_error_payload(
+                    &envelope.payload,
+                ));
             }
             _ => {}
         }
+    }
+}
+
+fn remote_sidecar_broker_tool_failure_from_error_payload(
+    payload: &Value,
+) -> RemoteSidecarBrokerToolFailure {
+    RemoteSidecarBrokerToolFailure::Broker {
+        message: payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("remote broker unavailable")
+            .to_string(),
+        code: payload
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        retryable: payload
+            .get("retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        status_code: payload.get("statusCode").and_then(Value::as_i64),
     }
 }
 
@@ -39842,6 +39903,31 @@ mod tests {
     }
 
     #[test]
+    fn remote_broker_tool_error_preserves_provider_status_and_retry_metadata() {
+        let failure = remote_sidecar_broker_tool_failure_from_error_payload(&json!({
+            "code": "provider_error",
+            "message": "Thinking mode only supports auto tool_choice.",
+            "retryable": false,
+            "statusCode": 400,
+        }));
+
+        match failure {
+            RemoteSidecarBrokerToolFailure::Broker {
+                message,
+                code,
+                retryable,
+                status_code,
+            } => {
+                assert_eq!(message, "Thinking mode only supports auto tool_choice.");
+                assert_eq!(code.as_deref(), Some("provider_error"));
+                assert!(!retryable);
+                assert_eq!(status_code, Some(400));
+            }
+            other => panic!("expected broker failure metadata, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn remote_single_tool_protocol_failure_schedules_one_output_repair() {
         use crate::structured_llm_outcome::{
             StructuredLlmFailureKind, StructuredLlmNextAction, StructuredLlmRetryKind,
@@ -39853,6 +39939,7 @@ mod tests {
             StructuredLlmFailureKind::Prose,
             StructuredLlmFailureKind::WrongTool,
             StructuredLlmFailureKind::SchemaInvalid,
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
         ] {
             assert_eq!(
                 next_audited_stream_action(kind, None, false, 0, 0),
@@ -39869,21 +39956,25 @@ mod tests {
             );
         }
 
-        let repaired = append_remote_output_repair_message(
-            &NeutralChatRequest {
-                model_id: "m".to_string(),
-                messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],
-                tools: vec![],
-                thinking_level: None,
-                max_output_tokens: None,
-                prompt_cache_key: None,
-                prompt_cache_retention: None,
-                agent_correlation: None,
-                tool_choice: foco_providers::NeutralToolChoice::Auto,
-            },
+        let base_request = NeutralChatRequest {
+            model_id: "m".to_string(),
+            messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],
+            tools: vec![],
+            thinking_level: None,
+            max_output_tokens: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                "submit_workspace_spec_update",
+            ),
+        };
+        let repaired = crate::structured_llm_outcome::build_output_repair_request(
+            &base_request,
             "submit_workspace_spec_update",
             StructuredLlmFailureKind::Prose,
         );
+        assert_eq!(repaired.tool_choice, base_request.tool_choice);
         assert_eq!(repaired.messages.len(), 2);
         assert_eq!(repaired.messages[1].role, NeutralChatRole::User);
         assert!(
@@ -39892,6 +39983,16 @@ mod tests {
                 .contains("submit_workspace_spec_update")
         );
         assert!(repaired.messages[1].content.contains("prose"));
+
+        let compatibility_repair = crate::structured_llm_outcome::build_output_repair_request(
+            &base_request,
+            "submit_workspace_spec_update",
+            StructuredLlmFailureKind::ThinkingToolChoiceIncompatible,
+        );
+        assert_eq!(
+            compatibility_repair.tool_choice,
+            foco_providers::NeutralToolChoice::Auto
+        );
     }
 
     #[test]
@@ -39938,7 +40039,7 @@ mod tests {
             .is_ok()
         );
 
-        let repaired = append_remote_output_repair_message(
+        let repaired = crate::structured_llm_outcome::build_output_repair_request(
             &NeutralChatRequest {
                 model_id: "m".to_string(),
                 messages: vec![neutral_text_message(NeutralChatRole::User, "base".into())],

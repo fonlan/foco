@@ -6202,11 +6202,12 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                                     retry_kind,
                                     structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
                                 ) {
-                                    active_request = append_output_repair_message(
-                                        &base_request,
-                                        expected_tool_name,
-                                        failure_kind,
-                                    );
+                                    active_request =
+                                        structured_llm_outcome::build_output_repair_request(
+                                            &base_request,
+                                            expected_tool_name,
+                                            failure_kind,
+                                        );
                                     tracing::debug!(
                                         request_kind,
                                         expected_tool_name,
@@ -6294,7 +6295,12 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                 });
             }
             Err(error) => {
-                let failure_kind = error.failure_kind;
+                let failure_kind =
+                    structured_llm_outcome::classify_required_single_tool_provider_failure_kind(
+                        &error.message,
+                        error.status_code,
+                        &active_request.tool_choice,
+                    );
                 database
                     .update_llm_request_outcome(
                         &request_id,
@@ -6343,7 +6349,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                             retry_kind,
                             structured_llm_outcome::StructuredLlmRetryKind::OutputRepair
                         ) {
-                            active_request = append_output_repair_message(
+                            active_request = structured_llm_outcome::build_output_repair_request(
                                 &base_request,
                                 expected_tool_name,
                                 failure_kind,
@@ -6377,19 +6383,6 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     Err(ApiError::internal(format!(
         "{request_kind} failed without an attempt result"
     )))
-}
-
-fn append_output_repair_message(
-    base_request: &NeutralChatRequest,
-    expected_tool_name: &str,
-    failure_kind: structured_llm_outcome::StructuredLlmFailureKind,
-) -> NeutralChatRequest {
-    let mut repaired = base_request.clone();
-    repaired.messages.push(neutral_text_message(
-        NeutralChatRole::User,
-        structured_llm_outcome::build_output_repair_user_message(expected_tool_name, failure_kind),
-    ));
-    repaired
 }
 
 struct AuditedTextStreamOutcome {
