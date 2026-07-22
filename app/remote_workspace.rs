@@ -1711,54 +1711,18 @@ impl RemoteWorkspaceManager {
         )?;
         self.set_status(server_id, None, RemoteConnectionState::Checking, None)?;
 
-        let stale_session = {
-            let mut sessions = self
-                .sessions
-                .lock()
-                .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
-            match sessions.get(key) {
-                Some(existing)
-                    if existing.is_reusable_for_proxy()
-                        && existing.matches_expected_identity(
-                            server_id,
-                            workspace_id,
-                            expected_identity,
-                        ) =>
-                {
-                    self.set_status(
-                        server_id,
-                        Some(workspace_id),
-                        RemoteConnectionState::Ready,
-                        None,
-                    )?;
-                    self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
-                    return Ok(existing.summary());
-                }
-                Some(existing) => {
-                    let status = existing.status_snapshot();
-                    tracing::info!(
-                        server_id = %server_id,
-                        workspace_id = %workspace_id,
-                        local_port = existing.local_port,
-                        status = %status.state.as_str(),
-                        last_error = status.last_error.as_deref().unwrap_or(""),
-                        "rejecting remote session reuse; forcing full reconnect"
-                    );
-                    sessions.remove(key)
-                }
-                None => None,
-            }
-        };
-        if let Some(session) = stale_session {
-            // The stale tunnel must be gone before an upgrade can install and launch a
-            // replacement. Keep the session-map lock out of this async teardown.
-            session.stop().await;
-            // stop() aborts the control task (skips control-loop cleanup); clear any
-            // main-process Provider WebSocket sessions for this workspace before reconnect.
-            state
-                .openai_resp_ws_sessions
-                .invalidate_workspace(workspace_id)
-                .await;
+        // Shared short-path: Ready + matching identity reuses; otherwise remove/stop any
+        // map entry so the full SSH+sidecar rebuild below cannot attach to a half-dead tunnel.
+        if let Some(summary) = self
+            .take_reusable_session_or_remove_stale(
+                &state,
+                server_id,
+                workspace_id,
+                expected_identity,
+            )
+            .await?
+        {
+            return Ok(summary);
         }
 
         self.set_status(
@@ -2122,6 +2086,72 @@ impl RemoteWorkspaceManager {
         }
 
         let _ = self.remove_sidecar_install_lock(&replacement_lock_key, &replacement_lock);
+    }
+
+    /// Try to reuse a Ready session with matching identity, or remove a stale map entry
+    /// so the caller can perform a full SSH+sidecar rebuild.
+    ///
+    /// Returns `Some(summary)` when the existing session is reused (caller should return it).
+    /// Returns `None` when there was no session or a stale session was removed and stopped.
+    /// Performs no SSH, sidecar install, or control handshake work beyond `session.stop()`.
+    async fn take_reusable_session_or_remove_stale(
+        &self,
+        state: &AppState,
+        server_id: &str,
+        workspace_id: &str,
+        expected_identity: &RemoteSidecarIdentity,
+    ) -> Result<Option<RemoteWorkspaceSessionSummary>, ApiError> {
+        let key = session_key(server_id, workspace_id);
+        let stale_session = {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .map_err(|_| ApiError::internal("remote workspace session lock is poisoned"))?;
+            match sessions.get(&key) {
+                Some(existing)
+                    if existing.is_reusable_for_proxy()
+                        && existing.matches_expected_identity(
+                            server_id,
+                            workspace_id,
+                            expected_identity,
+                        ) =>
+                {
+                    self.set_status(
+                        server_id,
+                        Some(workspace_id),
+                        RemoteConnectionState::Ready,
+                        None,
+                    )?;
+                    self.set_status(server_id, None, RemoteConnectionState::Ready, None)?;
+                    return Ok(Some(existing.summary()));
+                }
+                Some(existing) => {
+                    let status = existing.status_snapshot();
+                    tracing::info!(
+                        server_id = %server_id,
+                        workspace_id = %workspace_id,
+                        local_port = existing.local_port,
+                        status = %status.state.as_str(),
+                        last_error = status.last_error.as_deref().unwrap_or(""),
+                        "rejecting remote session reuse; forcing full reconnect"
+                    );
+                    sessions.remove(&key)
+                }
+                None => None,
+            }
+        };
+        if let Some(session) = stale_session {
+            // The stale tunnel must be gone before an upgrade can install and launch a
+            // replacement. Keep the session-map lock out of this async teardown.
+            session.stop().await;
+            // stop() aborts the control task (skips control-loop cleanup); clear any
+            // main-process Provider WebSocket sessions for this workspace before reconnect.
+            state
+                .openai_resp_ws_sessions
+                .invalidate_workspace(workspace_id)
+                .await;
+        }
+        Ok(None)
     }
 
     #[cfg(test)]
@@ -21819,6 +21849,175 @@ mod tests {
         assert!(
             !session.is_reusable_for_proxy(),
             "a session being torn down must not bypass a full reconnect"
+        );
+    }
+
+    /// Connect short-path (production `take_reusable_session_or_remove_stale`, also used by
+    /// `connect_workspace_with_expected_identity`): Ready + matching identity reuses;
+    /// Reconnecting/Offline (even with matching identity) removes the map entry so a full
+    /// rebuild would follow. No real SSH.
+    #[tokio::test]
+    async fn connect_short_path_reuses_ready_and_removes_unhealthy_sessions() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let config = remote_test_config(workspace.path());
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        let manager = RemoteWorkspaceManager::default();
+        let matching_identity = RemoteSidecarIdentity {
+            version: "test".to_string(),
+            target: "linux-x64".to_string(),
+            build_id: "foco-sidecar-v2:sha256:test".to_string(),
+        };
+
+        manager.insert_fake_session_for_test(
+            "server-1",
+            "workspace-1",
+            "/remote/project",
+            4321,
+            "token-ready",
+        );
+        let reused = manager
+            .take_reusable_session_or_remove_stale(
+                &state,
+                "server-1",
+                "workspace-1",
+                &matching_identity,
+            )
+            .await
+            .expect("ready reuse decision");
+        assert!(
+            reused.is_some(),
+            "Ready + matching identity must short-circuit without rebuild"
+        );
+        assert!(
+            manager.has_session_for_test("server-1", "workspace-1"),
+            "reused Ready session must remain in the map"
+        );
+        assert_eq!(
+            reused.expect("summary").status,
+            RemoteConnectionState::Ready.as_str()
+        );
+
+        for bad_state in [
+            RemoteConnectionState::Reconnecting,
+            RemoteConnectionState::Offline,
+        ] {
+            manager.insert_fake_session_for_test(
+                "server-1",
+                "workspace-1",
+                "/remote/project",
+                4321,
+                "token-bad",
+            );
+            manager.set_fake_session_state_for_test("server-1", "workspace-1", bad_state);
+            let decision = manager
+                .take_reusable_session_or_remove_stale(
+                    &state,
+                    "server-1",
+                    "workspace-1",
+                    &matching_identity,
+                )
+                .await
+                .expect("unhealthy decision");
+            assert!(
+                decision.is_none(),
+                "{bad_state:?} + matching identity must not short-path return Ready"
+            );
+            assert!(
+                !manager.has_session_for_test("server-1", "workspace-1"),
+                "{bad_state:?} session must be removed so connect rebuilds SSH+sidecar"
+            );
+        }
+    }
+
+    /// ensure path: Ready fake session short-circuits without SSH; Reconnecting does not
+    /// expose the dead port and the production short-path removes the stale map entry so
+    /// a subsequent connect rebuild cannot attach to it.
+    #[tokio::test]
+    async fn ensure_remote_workspace_reuses_ready_but_not_reconnecting() {
+        let local_workspace = tempfile::tempdir().expect("local workspace");
+        let remote_workspace = tempfile::tempdir().expect("remote workspace");
+        let profile = tempfile::tempdir().expect("profile tempdir");
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(local_workspace.path().to_path_buf());
+        config
+            .remote_servers
+            .push(foco_store::config::RemoteServerProfile {
+                id: "srv".to_string(),
+                name: "Server".to_string(),
+                host_alias: "server".to_string(),
+                last_known_target: Some("linux-x64".to_string()),
+                ..foco_store::config::RemoteServerProfile::default()
+            });
+        config.workspaces.push(WorkspaceConfig {
+            id: "remote".to_string(),
+            name: "Remote".to_string(),
+            path: local_workspace.path().to_path_buf(),
+            location: WorkspaceLocation::Ssh {
+                server_id: "srv".to_string(),
+                remote_path: remote_workspace.path().display().to_string(),
+            },
+            pinned: false,
+            terminal_shell: "bash".to_string(),
+            common_commands: Vec::new(),
+        });
+        let state = crate::tests::test_app_state(config, profile.path().to_path_buf());
+        let matching_identity = RemoteSidecarIdentity {
+            version: "test".to_string(),
+            target: "linux-x64".to_string(),
+            build_id: "foco-sidecar-v2:sha256:test".to_string(),
+        };
+
+        state.remote_workspace_manager.insert_fake_session_for_test(
+            "srv",
+            "remote",
+            &remote_workspace.path().display().to_string(),
+            9876,
+            "token",
+        );
+
+        ensure_remote_workspace_connected(&state, "remote")
+            .await
+            .expect("Ready session must short-circuit ensure without SSH");
+        assert!(
+            state
+                .remote_workspace_manager
+                .has_session_for_test("srv", "remote"),
+            "healthy Ready session must remain after ensure short-circuit"
+        );
+
+        state
+            .remote_workspace_manager
+            .set_fake_session_state_for_test("srv", "remote", RemoteConnectionState::Reconnecting);
+        assert!(matches!(
+            sidecar_proxy_target(&state, "remote").expect("proxy target"),
+            SidecarProxyTarget::Disconnected
+        ));
+        // ensure falls through to full connect (no Ready short-circuit). Without packaged
+        // sidecar assets that path may fail before identity resolution; the production
+        // short-path helper (same as connect_workspace_with_expected_identity) still must
+        // remove the stale map entry once rebuild entrance is reached.
+        let err = ensure_remote_workspace_connected(&state, "remote")
+            .await
+            .expect_err("Reconnecting must not short-circuit ensure as Ready");
+        assert!(
+            !err.message().is_empty(),
+            "ensure must fall through to full connect and surface a failure without real SSH"
+        );
+        let removed = state
+            .remote_workspace_manager
+            .take_reusable_session_or_remove_stale(&state, "srv", "remote", &matching_identity)
+            .await
+            .expect("stale remove decision");
+        assert!(
+            removed.is_none(),
+            "Reconnecting session must not be reused by the production short-path"
+        );
+        assert!(
+            !state
+                .remote_workspace_manager
+                .has_session_for_test("srv", "remote"),
+            "production short-path must remove Reconnecting session so rebuild cannot attach"
         );
     }
 
