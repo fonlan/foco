@@ -1173,6 +1173,32 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("compacts the Fast toggle to a 2rem icon button under the phone breakpoint", () => {
+    const stylesCss = readFileSync("styles.css", "utf8");
+    const chatPanelSource = readFileSync("features/chat/ChatPanel.tsx", "utf8");
+
+    expect(chatPanelSource).toMatch(
+      /className=["']composer-fast-toggle-label["']/,
+    );
+    expect(chatPanelSource).toMatch(
+      /aria-label=\{t\(["']Fast mode["']\)\}/,
+    );
+
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*2rem[\s\S]*?min-width:\s*2rem[\s\S]*?max-width:\s*2rem[\s\S]*?height:\s*2rem[\s\S]*?flex:\s*0 0 2rem/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?padding-inline:\s*0/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/,
+    );
+    // Visible Fast label must remain shown outside the phone breakpoint.
+    expect(stylesCss).not.toMatch(
+      /^\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/m,
+    );
+  });
+
   it("does not mark Fast-capable models in the composer model picker", async () => {
     appTestState.settingsResponse = {
       ...settings,

@@ -1367,7 +1367,9 @@ function ChatPanelComponent({
                       type="button"
                     >
                       <Zap aria-hidden="true" className="size-3.5 shrink-0" />
-                      <span>{t("Fast")}</span>
+                      <span className="composer-fast-toggle-label">
+                        {t("Fast")}
+                      </span>
                       <span className="sr-only">
                         {selectedLatencyMode === "fast"
                           ? t("enabled")

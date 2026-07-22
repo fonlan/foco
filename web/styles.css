@@ -4058,6 +4058,7 @@ body,
   .message-composer-control-row .composer-run-button,
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
+  .composer-fast-toggle,
   .composer-model-provider-select,
   .composer-model-select,
   .composer-provider-select,
@@ -4072,7 +4073,8 @@ body,
 
   .message-composer-control-row .composer-select-summary,
   .message-composer-control-row > .composer-branch-select,
-  .composer-team-toggle {
+  .composer-team-toggle,
+  .composer-fast-toggle {
     width: 2rem;
     min-width: 2rem;
     max-width: 2rem;
@@ -4084,7 +4086,8 @@ body,
 
   .message-composer-control-row .composer-select-label,
   .message-composer-control-row .composer-select-summary > svg:last-child,
-  .composer-team-toggle-label {
+  .composer-team-toggle-label,
+  .composer-fast-toggle-label {
     display: none;
   }
 
