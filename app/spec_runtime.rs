@@ -2191,6 +2191,7 @@ fn workspace_spec_tool_definition() -> NeutralToolDefinition {
         name: WORKSPACE_SPEC_TOOL_NAME.to_string(),
         description: "Submit the generated Project Spec Markdown.".to_string(),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2211,6 +2212,7 @@ fn workspace_spec_update_tool_definition() -> NeutralToolDefinition {
         name: WORKSPACE_SPEC_UPDATE_TOOL_NAME.to_string(),
         description: "Submit whether the Project Spec needs an update and, when needed, ordered exact-text edits against the current Spec Markdown from the input.".to_string(),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -2250,6 +2252,7 @@ fn workspace_spec_update_compaction_tool_definition() -> NeutralToolDefinition {
         name: WORKSPACE_SPEC_UPDATE_COMPACTION_TOOL_NAME.to_string(),
         description: "Submit ordered exact-text edits that shrink the current oversized Project Spec candidate. Do not return full-document Markdown.".to_string(),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

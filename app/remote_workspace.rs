@@ -39743,6 +39743,7 @@ mod tests {
             description: "submit update".to_string(),
             input_schema: json!({ "type": "object" }),
             strict: true,
+            kind: foco_providers::NeutralToolKind::Function,
         }
     }
 
@@ -39844,6 +39845,7 @@ mod tests {
                         description: "other".to_string(),
                         input_schema: json!({ "type": "object" }),
                         strict: false,
+                        kind: foco_providers::NeutralToolKind::Function,
                     }
                 ],
                 &[],
@@ -40693,6 +40695,7 @@ mod tests {
                 description: "other".to_string(),
                 input_schema: json!({ "type": "object" }),
                 strict: false,
+                kind: foco_providers::NeutralToolKind::Function,
             },
         ];
         let (multi_response, multi_audit, _) = run_broker_control_llm_stream_text_json_fixture(

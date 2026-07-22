@@ -8,7 +8,7 @@ Foco depends on a long-lived `genai` fork for two maintained capabilities: API a
 - Foco fork: `fonlan/rust-genai`
 - Upstream baseline: `genai 0.6.4`, commit `bb38ad7d6c2c3bc86ecc84fd6f97a10ad7803e6d`
 - Patch branch: `foco/request-observer-0.6.4`
-- Pinned patch commit: `ed7419a1f10f532992e31f468910aadeed6daaf6`
+- Pinned patch commit: `d9a1e023920c531adb26137bece5df5b1cbf4d32`
 
 The root `Cargo.toml` pins the fork by the full commit SHA. Do not replace the `rev` with a floating branch or tag. The fork is a Foco-maintained patchset and its observer and Developer-role patches are not planned for upstream submission.
 

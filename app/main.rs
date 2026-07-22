@@ -5624,6 +5624,7 @@ fn git_commit_message_tool_definition() -> NeutralToolDefinition {
             "required": ["message"]
         }),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 
@@ -7044,9 +7045,16 @@ fn estimate_tool_schema_tokens(tools: &[NeutralToolDefinition]) -> u64 {
     tools
         .iter()
         .map(|tool| {
+            let kind_tokens = match tool.kind {
+                foco_providers::NeutralToolKind::Function => estimate_text_tokens("function"),
+                foco_providers::NeutralToolKind::ProviderWebSearch => {
+                    estimate_text_tokens("providerWebSearch")
+                }
+            };
             estimate_text_tokens(&tool.name)
                 + estimate_text_tokens(&tool.description)
                 + estimate_json_tokens(&tool.input_schema)
+                + kind_tokens
         })
         .sum()
 }
@@ -10150,6 +10158,7 @@ fn neutral_tool_definition(definition: foco_tools::ToolDefinition) -> NeutralToo
         description: definition.description.to_string(),
         input_schema: definition.input_schema,
         strict: definition.strict,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 
@@ -10162,6 +10171,7 @@ fn neutral_mcp_tool_definition(definition: &McpToolDefinition) -> NeutralToolDef
         ),
         input_schema: definition.input_schema.clone(),
         strict: false,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 

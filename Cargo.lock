@@ -1478,7 +1478,7 @@ dependencies = [
 [[package]]
 name = "genai"
 version = "0.6.4"
-source = "git+https://github.com/fonlan/rust-genai.git?rev=ed7419a1f10f532992e31f468910aadeed6daaf6#ed7419a1f10f532992e31f468910aadeed6daaf6"
+source = "git+https://github.com/fonlan/rust-genai.git?rev=d9a1e023920c531adb26137bece5df5b1cbf4d32#d9a1e023920c531adb26137bece5df5b1cbf4d32"
 dependencies = [
  "base64",
  "bytes",

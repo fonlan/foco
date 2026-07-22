@@ -2130,6 +2130,7 @@ fn memory_dream_planner_tool_definition() -> NeutralToolDefinition {
             "required": ["summary", "changes"]
         }),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 

@@ -1025,6 +1025,7 @@ fn skill_translation_tool_definition() -> NeutralToolDefinition {
         name: SKILL_TRANSLATION_TOOL_NAME.to_string(),
         description: "Submit the translated SKILL.md display Markdown.".to_string(),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

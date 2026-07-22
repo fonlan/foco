@@ -266,7 +266,7 @@ const PROVIDER_SERVICE_PRESETS: ProviderServicePreset[] = [
     defaultKindId: "anthropic",
   },
   { id: "gemini", label: "Gemini", kindIds: ["gemini"], defaultKindId: "gemini" },
-  { id: "xai", label: "xAI", kindIds: ["xai"], defaultKindId: "xai" },
+  { id: "xai", label: "xAI", kindIds: ["xai", "xai-responses"], defaultKindId: "xai" },
   {
     id: "deepseek",
     label: "DeepSeek",

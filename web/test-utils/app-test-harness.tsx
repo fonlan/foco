@@ -384,6 +384,12 @@ export const settings = {
       usesWebsocket: false,
     },
     {
+      defaultBaseUrl: "https://api.x.ai/v1",
+      kind: "xai-responses",
+      label: "xAI Responses",
+      usesWebsocket: false,
+    },
+    {
       defaultBaseUrl: "https://api.deepseek.com/v1",
       kind: "deepseek",
       label: "DeepSeek",

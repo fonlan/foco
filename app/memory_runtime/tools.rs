@@ -132,6 +132,7 @@ pub(crate) fn memory_tool_definitions() -> Vec<NeutralToolDefinition> {
                 "required": ["query", "scope", "limit", "includeRelated", "timeoutMs"]
             }),
             strict: true,
+            kind: foco_providers::NeutralToolKind::Function,
         },
         NeutralToolDefinition {
             name: MEMORY_WRITE_TOOL_NAME.to_string(),
@@ -177,6 +178,7 @@ pub(crate) fn memory_tool_definitions() -> Vec<NeutralToolDefinition> {
                 "required": ["scope", "kind", "fact", "confidence", "pinned", "reason", "timeoutMs"]
             }),
             strict: true,
+            kind: foco_providers::NeutralToolKind::Function,
         },
     ]
 }
@@ -714,6 +716,7 @@ pub(crate) fn memory_extraction_tool_definition() -> NeutralToolDefinition {
             "required": ["facts"]
         }),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 
@@ -737,6 +740,7 @@ pub(crate) fn memory_retrieval_tool_definition() -> NeutralToolDefinition {
             "required": ["factKeys"]
         }),
         strict: true,
+        kind: foco_providers::NeutralToolKind::Function,
     }
 }
 

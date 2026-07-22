@@ -48,6 +48,7 @@ pub(crate) const MASKED_AUTHORIZATION_VALUE: &str = "********";
 pub const OPENAI_CHAT_KIND: &str = "openai-chat";
 pub const OPENAI_RESPONSES_KIND: &str = "openai-responses";
 pub const OPENAI_RESPONSES_WEBSOCKET_KIND: &str = "openai-responses-websocket";
+pub const XAI_RESPONSES_KIND: &str = "xai-responses";
 
 pub type ProviderHttpHeadersDump = BTreeMap<String, Vec<String>>;
 
@@ -658,6 +659,12 @@ pub const SUPPORTED_PROVIDER_KINDS: &[ProviderKind] = &[
     ),
     provider_kind!(XAI_KIND, "xAI", Xai, "https://api.x.ai/v1/"),
     provider_kind!(
+        XAI_RESPONSES_KIND,
+        "xAI Responses",
+        OpenAIResp,
+        "https://api.x.ai/v1/"
+    ),
+    provider_kind!(
         DEEPSEEK_KIND,
         "DeepSeek",
         DeepSeek,
@@ -1135,12 +1142,27 @@ pub fn supports_fast_latency_mode(
     model_id: &str,
     redirects: &[ProviderModelRedirect],
 ) -> Result<bool, ProviderConfigError> {
-    if kind.adapter_kind() != AdapterKind::OpenAIResp {
+    // Fast/priority is an OpenAI Responses product capability, not a generic OpenAIResp
+    // transport feature. xAI Responses reuses the adapter but must not claim Fast.
+    if !is_openai_responses_provider_kind(kind) {
         return Ok(false);
     }
 
     let upstream_model_id = upstream_provider_model_id(model_id, redirects)?;
     Ok(openai_priority_processing_supports_model(upstream_model_id))
+}
+
+/// True for Foco OpenAI Responses HTTP/WebSocket kinds only (not xAI Responses).
+pub fn is_openai_responses_provider_kind(kind: ProviderKind) -> bool {
+    matches!(
+        kind.as_str(),
+        OPENAI_RESPONSES_KIND | OPENAI_RESPONSES_WEBSOCKET_KIND
+    )
+}
+
+/// True when Agent default headers (originator/User-Agent/session/WS beta) apply.
+pub fn uses_openai_resp_agent_headers(kind: ProviderKind) -> bool {
+    is_openai_responses_provider_kind(kind)
 }
 
 fn openai_priority_processing_supports_model(model_id: &str) -> bool {
@@ -1231,7 +1253,13 @@ pub fn native_web_search_support(
         return NativeWebSearchSupport::Unknown;
     }
 
-    match openai_responses_native_web_search_model_support(model_id) {
+    let known = if kind.as_str() == XAI_RESPONSES_KIND {
+        xai_responses_native_web_search_model_support(model_id)
+    } else {
+        openai_responses_native_web_search_model_support(model_id)
+    };
+
+    match known {
         Some(true) => NativeWebSearchSupport::Supported,
         Some(false) => NativeWebSearchSupport::Unsupported,
         None => NativeWebSearchSupport::Unknown,
@@ -1315,6 +1343,18 @@ fn openai_responses_native_web_search_model_support(model_id: &str) -> Option<bo
         return Some(false);
     }
 
+    None
+}
+
+fn xai_responses_native_web_search_model_support(model_id: &str) -> Option<bool> {
+    let model_id = model_id.trim().to_ascii_lowercase();
+    // Grok models on xAI Responses support native web_search.
+    if model_id.starts_with("grok-") || model_id == "grok" {
+        return Some(true);
+    }
+    if model_id.contains("embed") {
+        return Some(false);
+    }
     None
 }
 
@@ -1702,6 +1742,21 @@ pub enum NeutralChatStreamEvent {
     },
 }
 
+/// How a neutral tool should be mapped onto the provider wire.
+///
+/// Kind is explicit and never inferred from `name`. A function tool named `web_search`
+/// must remain a function tool; only [`NeutralToolKind::ProviderWebSearch`] becomes a
+/// provider-native web search tool.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum NeutralToolKind {
+    /// Ordinary function/custom tool (default for old serialized data).
+    #[default]
+    Function,
+    /// Provider-native web search (`Tool::new_web_search()` / `type=web_search`).
+    ProviderWebSearch,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NeutralToolDefinition {
@@ -1709,6 +1764,9 @@ pub struct NeutralToolDefinition {
     pub description: String,
     pub input_schema: serde_json::Value,
     pub strict: bool,
+    /// Wire kind. Missing field deserializes as [`NeutralToolKind::Function`].
+    #[serde(default)]
+    pub kind: NeutralToolKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2797,8 +2855,8 @@ fn apply_request_overrides_and_agent_headers(
     // persisted UI mode always describes the service tier sent to OpenAI Responses.
     apply_fast_latency_mode(&mut body, config, request, runtime_options)?;
 
-    // OpenAIResp only: built-in Agent headers first, then request_overrides (same name wins).
-    let headers = if config.kind.adapter_kind() == AdapterKind::OpenAIResp {
+    // OpenAI Responses only (not xAI Responses): built-in Agent headers first, then overrides.
+    let headers = if uses_openai_resp_agent_headers(config.kind) {
         merge_header_pairs(
             default_openai_resp_agent_headers(
                 config.kind.uses_websocket(),
@@ -3078,10 +3136,13 @@ fn normalize_stream_end(end: StreamEnd) -> Result<NeutralChatStreamEvent, Provid
 }
 
 fn genai_tool(tool: &NeutralToolDefinition) -> Tool {
-    Tool::new(tool.name.clone())
-        .with_description(tool.description.clone())
-        .with_schema(tool.input_schema.clone())
-        .with_strict(tool.strict)
+    match tool.kind {
+        NeutralToolKind::ProviderWebSearch => Tool::new_web_search(),
+        NeutralToolKind::Function => Tool::new(tool.name.clone())
+            .with_description(tool.description.clone())
+            .with_schema(tool.input_schema.clone())
+            .with_strict(tool.strict),
+    }
 }
 
 fn neutral_tool_call(tool_call: &GenaiToolCall) -> NeutralToolCall {
@@ -3592,6 +3653,7 @@ mod tests {
             description: "fixture tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
 
         let mut stream = stream_chat_with_capture(&config, request, true)
@@ -3979,6 +4041,8 @@ mod tests {
         let responses = openai_responses_kind();
         let chat = parse_provider_kind(OPENAI_CHAT_KIND).expect("chat kind");
         let ws = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws kind");
+        let xai_chat = parse_provider_kind(XAI_KIND).expect("xai chat");
+        let xai_resp = parse_provider_kind(XAI_RESPONSES_KIND).expect("xai responses");
 
         assert!(supports_native_web_search(responses, "gpt-4o"));
         assert!(supports_native_web_search(ws, "gpt-5.4"));
@@ -3995,6 +4059,119 @@ mod tests {
             native_web_search_support(chat, "gpt-4o"),
             NativeWebSearchSupport::Unsupported
         );
+        assert!(provider_protocol_supports_native_web_search(xai_resp));
+        assert!(!provider_protocol_supports_native_web_search(xai_chat));
+        assert!(supports_native_web_search(xai_resp, "grok-3"));
+        assert!(!supports_native_web_search(xai_chat, "grok-3"));
+    }
+
+    #[test]
+    fn neutral_tool_kind_defaults_to_function_and_is_not_inferred_from_name() {
+        let legacy = serde_json::json!({
+            "name": "web_search",
+            "description": "legacy",
+            "inputSchema": {"type": "object"},
+            "strict": false
+        });
+        let parsed: NeutralToolDefinition =
+            serde_json::from_value(legacy).expect("legacy tool definition");
+        assert_eq!(parsed.kind, NeutralToolKind::Function);
+        assert_eq!(parsed.name, "web_search");
+
+        let native = NeutralToolDefinition {
+            name: "web_search".to_string(),
+            description: "native".to_string(),
+            input_schema: serde_json::json!({}),
+            strict: false,
+            kind: NeutralToolKind::ProviderWebSearch,
+        };
+        let function = NeutralToolDefinition {
+            name: "web_search".to_string(),
+            description: "function".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "maxResults": {"type": "integer"},
+                    "timeoutMs": {"type": "integer"}
+                }
+            }),
+            strict: true,
+            kind: NeutralToolKind::Function,
+        };
+
+        let native_tool = genai_tool(&native);
+        let function_tool = genai_tool(&function);
+        assert_ne!(
+            serde_json::to_string(&native_tool).expect("native tool json"),
+            serde_json::to_string(&function_tool).expect("function tool json"),
+            "fingerprint must distinguish native vs function web_search"
+        );
+        assert!(matches!(native_tool.name, genai::chat::ToolName::WebSearch));
+        match &function_tool.name {
+            genai::chat::ToolName::Custom(name) => assert_eq!(name, "web_search"),
+            other => panic!("expected custom tool, got {other:?}"),
+        }
+        assert!(function_tool.schema.is_some());
+
+        let mut native_request =
+            neutral_request(vec![neutral_text_message(NeutralChatRole::User, "search")]);
+        native_request.tools.push(native);
+        let mut function_request = native_request.clone();
+        function_request.tools[0] = function;
+
+        let native_chat = genai_chat_request_for_adapter(&native_request, AdapterKind::OpenAIResp)
+            .expect("native chat request");
+        let function_chat =
+            genai_chat_request_for_adapter(&function_request, AdapterKind::OpenAIResp)
+                .expect("function chat request");
+        let native_tools = native_chat.tools.expect("native tools");
+        let function_tools = function_chat.tools.expect("function tools");
+        assert!(matches!(
+            native_tools[0].name,
+            genai::chat::ToolName::WebSearch
+        ));
+        assert!(matches!(
+            function_tools[0].name,
+            genai::chat::ToolName::Custom(_)
+        ));
+        assert!(function_tools[0].schema.is_some());
+        let schema = function_tools[0].schema.as_ref().expect("schema");
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("query"))
+                .is_some()
+        );
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("maxResults"))
+                .is_some()
+        );
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|p| p.get("timeoutMs"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn xai_responses_kind_reuses_openai_resp_adapter_without_openai_product_features() {
+        let xai_resp = parse_provider_kind(XAI_RESPONSES_KIND).expect("xai responses");
+        let xai_chat = parse_provider_kind(XAI_KIND).expect("xai chat");
+        let openai_resp = openai_responses_kind();
+
+        assert_eq!(xai_resp.adapter_kind(), AdapterKind::OpenAIResp);
+        assert_eq!(xai_chat.adapter_kind(), AdapterKind::Xai);
+        assert!(!xai_resp.uses_websocket());
+        assert!(is_openai_responses_provider_kind(openai_resp));
+        assert!(!is_openai_responses_provider_kind(xai_resp));
+        assert!(!uses_openai_resp_agent_headers(xai_resp));
+        assert!(uses_openai_resp_agent_headers(openai_resp));
+        assert!(!supports_fast_latency_mode(xai_resp, "grok-3", &[]).expect("fast check"));
+        assert!(supports_fast_latency_mode(openai_resp, "gpt-5", &[]).expect("openai fast"));
     }
 
     #[test]
@@ -4204,6 +4381,12 @@ mod tests {
                 .expect("xai kind")
                 .adapter_kind(),
             AdapterKind::Xai
+        );
+        assert_eq!(
+            parse_provider_kind(XAI_RESPONSES_KIND)
+                .expect("xai responses kind")
+                .adapter_kind(),
+            AdapterKind::OpenAIResp
         );
         assert_eq!(
             parse_provider_kind(DEEPSEEK_KIND)
@@ -5508,6 +5691,7 @@ mod tests {
         assert!(kinds.contains(&ANTHROPIC_KIND));
         assert!(kinds.contains(&GEMINI_KIND));
         assert!(kinds.contains(&XAI_KIND));
+        assert!(kinds.contains(&XAI_RESPONSES_KIND));
         assert!(kinds.contains(&DEEPSEEK_KIND));
         assert!(kinds.contains(&OLLAMA_KIND));
         assert!(
@@ -5815,6 +5999,7 @@ mod tests {
             description: "Read a file.".to_string(),
             input_schema: serde_json::json!({ "type": "object" }),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
 
         let chat_request = genai_chat_request(&request).expect("chat request");
@@ -6673,6 +6858,7 @@ mod tests {
             description: "pick memories".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
         request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
@@ -6703,6 +6889,7 @@ mod tests {
             description: "pick memories".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
         request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
@@ -6749,6 +6936,7 @@ mod tests {
             description: "pick memories".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
         empty.tool_choice = NeutralToolChoice::required_single_tool("   ");
         let err = genai_chat_options(&config, &empty).expect_err("empty tool name");
@@ -6782,6 +6970,7 @@ mod tests {
             description: "pick memories".to_string(),
             input_schema: serde_json::json!({"type": "object", "properties": {}}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
         request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
 
@@ -6849,6 +7038,7 @@ mod tests {
                 description: "update spec".to_string(),
                 input_schema: serde_json::json!({"type": "object"}),
                 strict: true,
+                kind: NeutralToolKind::Function,
             }],
             max_output_tokens: Some(128),
             thinking_level: None,
@@ -7526,6 +7716,7 @@ mod tests {
             description: "fixture tool".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
             strict: true,
+            kind: NeutralToolKind::Function,
         });
 
         let mut stream = stream_chat_with_capture(&config, request, true)
