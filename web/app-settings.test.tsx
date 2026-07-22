@@ -133,12 +133,14 @@ describe("app-settings verification surfaces", () => {
     };
     const remoteSkill: ConfiguredSkillSummary = {
       ...appTestState.settingsResponse.skills.detected[0]!,
+      canEnable: false,
       description: "Deploy the remote project.",
       id: "deploy",
       key: "workspace:workspace-remote-1:deploy",
       name: "Remote deploy",
       path: "/srv/project/.agents/skills/deploy/SKILL.md",
       scope: "workspace",
+      warnings: ["The remote Skill requires a newer runtime."],
       workspaceId: remoteWorkspace.id,
       workspaceName: "Incorrect response name",
     };
@@ -170,7 +172,10 @@ describe("app-settings verification surfaces", () => {
 
     expect(await screen.findByText("Remote deploy")).toBeInTheDocument();
     expect(screen.getByText("Remote workspace")).toBeInTheDocument();
+    expect(screen.getByText("Read-only")).toBeInTheDocument();
+    expect(screen.getByText("Cannot enable")).toBeInTheDocument();
     expect(screen.getByText("Remote project · build-box")).toBeInTheDocument();
+    expect(screen.getByText("The remote Skill requires a newer runtime.")).toBeInTheDocument();
     expect(screen.queryByText("Incorrect response name")).toBeNull();
     expect(screen.queryByRole("checkbox", { name: "Enable skill Remote deploy" })).toBeNull();
     expect(screen.queryByRole("button", { name: "Delete skill Remote deploy" })).toBeNull();
@@ -180,6 +185,79 @@ describe("app-settings verification surfaces", () => {
         String(url).includes("/api/workspaces/workspace-remote-1/skills"),
       ),
     ).toHaveLength(1);
+  });
+
+  it("keeps same-named remote workspace skills distinct while filtering remote global entries", async () => {
+    const firstWorkspace = {
+      ...appTestState.settingsResponse.workspaces[0]!,
+      connectionStatus: "connected",
+      id: "workspace-remote-first",
+      isDefault: false,
+      name: "First remote",
+      remotePath: "/srv/first",
+      serverId: "server-first",
+      serverName: "first-host",
+    };
+    const secondWorkspace = {
+      ...firstWorkspace,
+      id: "workspace-remote-second",
+      name: "Second remote",
+      remotePath: "/srv/second",
+      serverId: "server-second",
+      serverName: "second-host",
+    };
+    const remoteGlobalSkill: ConfiguredSkillSummary = {
+      ...appTestState.settingsResponse.skills.detected[0]!,
+      id: "shared",
+      key: "global:shared",
+      name: "Shared remote skill",
+      path: "/home/foco/.agents/skills/shared/SKILL.md",
+      scope: "global",
+      workspaceId: null,
+      workspaceName: null,
+    };
+    const firstWorkspaceSkill: ConfiguredSkillSummary = {
+      ...remoteGlobalSkill,
+      key: "workspace:workspace-remote-first:shared",
+      path: "/srv/first/.agents/skills/shared/SKILL.md",
+      scope: "workspace",
+      workspaceId: firstWorkspace.id,
+      workspaceName: firstWorkspace.name,
+    };
+    const secondWorkspaceSkill: ConfiguredSkillSummary = {
+      ...firstWorkspaceSkill,
+      key: "workspace:workspace-remote-second:shared",
+      path: "/srv/second/.agents/skills/shared/SKILL.md",
+      workspaceId: secondWorkspace.id,
+      workspaceName: secondWorkspace.name,
+    };
+    appTestState.settingsResponse = {
+      ...appTestState.settingsResponse,
+      workspaces: [
+        ...appTestState.settingsResponse.workspaces,
+        firstWorkspace,
+        secondWorkspace,
+      ],
+    };
+    appTestState.workspaceSkillsResponsesByWorkspaceId = {
+      [firstWorkspace.id]: {
+        skills: [remoteGlobalSkill, firstWorkspaceSkill],
+      },
+      [secondWorkspace.id]: {
+        skills: [remoteGlobalSkill, secondWorkspaceSkill],
+      },
+    };
+
+    renderApp();
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+
+    expect(await screen.findAllByText("Shared remote skill")).toHaveLength(2);
+    expect(screen.getByText("skills 3")).toBeInTheDocument();
+    expect(screen.getByText("First remote · first-host")).toBeInTheDocument();
+    expect(screen.getByText("Second remote · second-host")).toBeInTheDocument();
+    expect(screen.queryByText("/home/foco/.agents/skills/shared/SKILL.md")).toBeNull();
   });
 
   it("keeps a disconnected remote workspace isolated until the user retries discovery", async () => {

@@ -11881,6 +11881,11 @@ export function SettingsPanel({
                                 {isRemoteSkill ? (
                                   <>
                                     <CapabilityPill label={t("Remote workspace")} ok={true} />
+                                    <CapabilityPill label={t("Read-only")} ok={false} />
+                                    <CapabilityPill
+                                      label={skill.canEnable ? t("Can enable") : t("Cannot enable")}
+                                      ok={skill.canEnable}
+                                    />
                                     {remoteWorkspaceLabel ? (
                                       <CapabilityPill label={remoteWorkspaceLabel} ok={true} />
                                     ) : null}
