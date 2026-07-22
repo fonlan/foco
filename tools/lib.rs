@@ -2363,7 +2363,7 @@ mod tests {
     }
 
     #[test]
-    fn get_plans_schema_limits_page_size_and_limit_to_ten() {
+    fn get_plans_schema_limits_page_size_and_limit_and_accepts_next_offset() {
         let definition = builtin_tool_definitions()
             .into_iter()
             .find(|definition| definition.name == GET_PLANS_TOOL)
@@ -2382,6 +2382,18 @@ mod tests {
             assert!(description.contains("1 to 10"));
             assert!(description.contains("defaults to 10"));
         }
+
+        let offset = &properties["offset"];
+        assert_eq!(offset["minimum"], 0);
+        assert!(offset["type"].as_array().is_some_and(|types| {
+            types.iter().any(|value| value == "integer")
+                && types.iter().any(|value| value == "null")
+        }));
+        assert!(
+            definition.input_schema["required"]
+                .as_array()
+                .is_some_and(|required| required.iter().any(|value| value == "offset"))
+        );
     }
 
     #[test]
@@ -2835,13 +2847,19 @@ mod tests {
                 "page": null,
                 "pageSize": null,
                 "limit": null,
+                "offset": null,
                 "timeoutMs": null
             }),
         );
         assert!(!default_page.is_error, "{:?}", default_page.output);
         assert_eq!(default_page.output["pageSize"], 10);
+        assert_eq!(default_page.output["offset"], 0);
+        assert_eq!(default_page.output["returnedCount"], 10);
         assert_eq!(default_page.output["plans"].as_array().unwrap().len(), 10);
         assert_eq!(default_page.output["plans"][0]["id"], "plan-11");
+        assert_eq!(default_page.output["truncated"], false);
+        assert_eq!(default_page.output["hasMore"], true);
+        assert_eq!(default_page.output["nextOffset"], 10);
 
         for pagination in [
             json!({ "pageSize": 100, "limit": null }),
@@ -2856,6 +2874,7 @@ mod tests {
                     "page": 1,
                     "pageSize": pagination["pageSize"],
                     "limit": pagination["limit"],
+                    "offset": null,
                     "timeoutMs": null
                 }),
             );
@@ -2873,12 +2892,184 @@ mod tests {
                 "page": 1,
                 "pageSize": 3,
                 "limit": 9,
+                "offset": null,
                 "timeoutMs": null
             }),
         );
         assert!(!page_size_wins.is_error, "{:?}", page_size_wins.output);
         assert_eq!(page_size_wins.output["pageSize"], 3);
         assert_eq!(page_size_wins.output["plans"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn get_plans_offset_takes_precedence_over_page_and_rejects_negative_offsets() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..5 {
+            insert_test_plan(workspace.path(), &format!("offset-plan-{index:02}"), None);
+        }
+
+        let first_page = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": 1,
+                "pageSize": 2,
+                "limit": null,
+                "offset": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!first_page.is_error, "{:?}", first_page.output);
+
+        let offset_page = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": 1,
+                "pageSize": 2,
+                "limit": null,
+                "offset": 3,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!offset_page.is_error, "{:?}", offset_page.output);
+        assert_eq!(offset_page.output["page"], 1);
+        assert_eq!(offset_page.output["offset"], 3);
+        assert_ne!(
+            offset_page.output["plans"][0]["id"],
+            first_page.output["plans"][0]["id"]
+        );
+
+        let negative_offset = execute_builtin_tool(
+            workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": null,
+                "pageSize": null,
+                "limit": null,
+                "offset": -1,
+                "timeoutMs": null
+            }),
+        );
+        assert!(negative_offset.is_error);
+        assert_error_contains(&negative_offset, "offset must be a non-negative integer");
+    }
+
+    #[test]
+    fn get_plans_budget_prefix_uses_returned_count_for_next_offset() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        for index in 0..4 {
+            insert_test_plan_with_overview(
+                workspace.path(),
+                &format!("budget-plan-{index:02}"),
+                "p".repeat(24 * 1024),
+            );
+        }
+
+        let mut offset = 0_i64;
+        let mut seen_plan_ids = BTreeSet::new();
+        let mut saw_budget_truncation = false;
+        for _ in 0..4 {
+            let result = execute_builtin_tool(
+                workspace.path(),
+                GET_PLANS_TOOL,
+                json!({
+                    "view": "active",
+                    "status": null,
+                    "page": 1,
+                    "pageSize": 10,
+                    "limit": null,
+                    "offset": offset,
+                    "timeoutMs": null
+                }),
+            );
+            assert!(!result.is_error, "{:?}", result.output);
+            assert_eq!(result.output["offset"], offset);
+            let plans = result.output["plans"].as_array().expect("plans");
+            let returned_count = plans.len() as i64;
+            assert!(returned_count > 0);
+            assert_eq!(result.output["returnedCount"], returned_count);
+            let measurement =
+                output_budget::measure_tool_execution(&result).expect("measure result");
+            assert!(
+                measurement.serialized_bytes
+                    <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+                        .saturating_sub(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES)
+            );
+            assert!(measurement.text_lines <= output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT);
+            saw_budget_truncation |= result.output["truncated"] == true;
+            seen_plan_ids.extend(
+                plans
+                    .iter()
+                    .filter_map(|plan| plan["id"].as_str().map(ToOwned::to_owned)),
+            );
+
+            let Some(next_offset) = result.output["nextOffset"].as_i64() else {
+                assert!(!result.output["hasMore"].as_bool().expect("hasMore"));
+                break;
+            };
+            assert_eq!(next_offset, offset + returned_count);
+            assert!(result.output["hasMore"].as_bool().expect("hasMore"));
+            offset = next_offset;
+        }
+
+        assert!(saw_budget_truncation);
+        assert_eq!(seen_plan_ids.len(), 4);
+    }
+
+    #[test]
+    fn get_plans_rejects_a_single_record_that_exceeds_the_byte_or_line_budget() {
+        let byte_workspace = tempfile::tempdir().expect("byte workspace");
+        insert_test_plan_with_overview(
+            byte_workspace.path(),
+            "oversized-byte-plan",
+            "x".repeat(output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT),
+        );
+        let byte_result = execute_builtin_tool(
+            byte_workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": null,
+                "pageSize": null,
+                "limit": null,
+                "offset": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(byte_result.is_error);
+        assert_error_contains(&byte_result, "get_plans_plan_record_exceeds_output_budget");
+        assert_error_contains(&byte_result, "oversized-byte-plan");
+
+        let line_workspace = tempfile::tempdir().expect("line workspace");
+        insert_test_plan_with_overview(
+            line_workspace.path(),
+            "oversized-line-plan",
+            "line\n".repeat(output_budget::TOOL_OUTPUT_SOFT_LINE_LIMIT + 1),
+        );
+        let line_result = execute_builtin_tool(
+            line_workspace.path(),
+            GET_PLANS_TOOL,
+            json!({
+                "view": "active",
+                "status": null,
+                "page": null,
+                "pageSize": null,
+                "limit": null,
+                "offset": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(line_result.is_error);
+        assert_error_contains(&line_result, "get_plans_plan_record_exceeds_output_budget");
+        assert_error_contains(&line_result, "oversized-line-plan");
     }
 
     #[test]
@@ -3135,12 +3326,30 @@ mod tests {
     }
 
     fn insert_test_plan(workspace_path: &Path, plan_id: &str, source_chat_id: Option<&str>) {
+        insert_test_plan_with_overview_and_source_chat(
+            workspace_path,
+            plan_id,
+            "Plan inserted directly for ownership checks.".to_string(),
+            source_chat_id,
+        );
+    }
+
+    fn insert_test_plan_with_overview(workspace_path: &Path, plan_id: &str, overview: String) {
+        insert_test_plan_with_overview_and_source_chat(workspace_path, plan_id, overview, None);
+    }
+
+    fn insert_test_plan_with_overview_and_source_chat(
+        workspace_path: &Path,
+        plan_id: &str,
+        overview: String,
+        source_chat_id: Option<&str>,
+    ) {
         let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
         database
             .create_plan(NewPlan {
                 id: plan_id,
                 title: "Historical plan",
-                overview: "Plan inserted directly for ownership checks.",
+                overview: &overview,
                 status: "ready",
                 source_chat_id,
                 phases: vec![NewPlanPhase {

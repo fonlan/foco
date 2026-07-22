@@ -790,12 +790,17 @@ fn get_plans_definition() -> ToolDefinition {
                     "maximum": 10,
                     "description": "Optional alias for pageSize from 1 to 10, useful for active view. Null defaults to 10."
                 },
+                "offset": {
+                    "type": ["integer", "null"],
+                    "minimum": 0,
+                    "description": "Optional zero-based continuation offset returned as nextOffset. When non-null, it takes precedence over page; repeat the same view and status."
+                },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["view", "status", "page", "pageSize", "limit", "timeoutMs"]
+            "required": ["view", "status", "page", "pageSize", "limit", "offset", "timeoutMs"]
         }),
         strict: true,
     }
