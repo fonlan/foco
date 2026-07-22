@@ -96,13 +96,13 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    Migration,
+    MIGRATION_045, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 44;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 45;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -455,6 +455,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 44,
         sql: MIGRATION_044,
     },
+    Migration {
+        version: 45,
+        sql: MIGRATION_045,
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -600,6 +604,8 @@ pub enum PlanPhaseAttemptTrigger {
     Retry,
     ModelOverrideRetry,
     MergeAuto,
+    /// Manual Retry Merge after a previous merge attempt reached a terminal state.
+    MergeRetry,
 }
 
 impl PlanPhaseAttemptTrigger {
@@ -609,6 +615,22 @@ impl PlanPhaseAttemptTrigger {
             Self::Retry => "retry",
             Self::ModelOverrideRetry => "model_override_retry",
             Self::MergeAuto => "merge_auto",
+            Self::MergeRetry => "merge_retry",
+        }
+    }
+
+    pub fn is_merge(self) -> bool {
+        matches!(self, Self::MergeAuto | Self::MergeRetry)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "initial" => Some(Self::Initial),
+            "retry" => Some(Self::Retry),
+            "model_override_retry" => Some(Self::ModelOverrideRetry),
+            "merge_auto" => Some(Self::MergeAuto),
+            "merge_retry" => Some(Self::MergeRetry),
+            _ => None,
         }
     }
 }
@@ -2872,9 +2894,11 @@ impl WorkspaceDatabase {
                 ),
             })?;
         self.ensure_plan_phase_predecessors_completed(&plan, phase)?;
+        // Implementation attempts only care about non-merge active attempts.
+        // Stale merge_auto/merge_retry rows must not block phase retry/restart.
         if (!matches!(phase.status.as_str(), "failed" | "cancelled")
             && phase.agent_task_id.is_some())
-            || self.phase_has_active_attempt(&phase.id)?
+            || self.phase_has_active_implementation_attempt(&phase.id)?
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan phase '{}' already has an active attempt", phase.id),
@@ -2886,15 +2910,36 @@ impl WorkspaceDatabase {
         ) && !matches!(phase.status.as_str(), "failed" | "cancelled")
             && !(phase.status == "running"
                 && phase.attempts.iter().any(|attempt| {
-                    matches!(
-                        attempt.status.as_str(),
-                        "failed" | "cancelled" | "interrupted"
-                    )
+                    !Self::is_merge_attempt_trigger(&attempt.trigger)
+                        && matches!(
+                            attempt.status.as_str(),
+                            "failed" | "cancelled" | "interrupted"
+                        )
                 }))
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan phase '{}' is not retryable", phase.id),
             });
+        }
+
+        // Restarting a failed/cancelled phase cancels any leftover merge attempts
+        // so they cannot keep the plan in merge-in-flight after re-implementation.
+        if matches!(phase.status.as_str(), "failed" | "cancelled") {
+            let now = now_timestamp();
+            self.connection
+                .execute(
+                    "UPDATE plan_phase_attempts
+                     SET status = 'cancelled',
+                         error_message = COALESCE(error_message, 'superseded by phase retry'),
+                         completed_at = COALESCE(completed_at, ?3),
+                         updated_at = ?3
+                     WHERE plan_id = ?1
+                       AND phase_id = ?2
+                       AND trigger IN ('merge_auto', 'merge_retry')
+                       AND status IN ('queued', 'running')",
+                    params![plan.id.as_str(), phase.id.as_str(), now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
         }
 
         let sequence = self.next_plan_phase_attempt_sequence(&phase.id)?;
@@ -3083,7 +3128,10 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    #[allow(dead_code)] // retained for diagnostics / future callers that need any active attempt
     fn phase_has_active_attempt(&self, phase_id: &str) -> Result<bool, WorkspaceDatabaseError> {
+        // Includes merge attempts; prefer phase_has_active_implementation_attempt
+        // or phase_has_active_merge_attempt for lifecycle decisions.
         let count: i64 = self
             .connection
             .query_row(
@@ -3097,13 +3145,12 @@ impl WorkspaceDatabase {
         Ok(count > 0)
     }
 
-    /// True when this phase still has non-terminal execution: an active
-    /// `plan_phase_attempt`, or a bound Agent task that is Queued/Running/Waiting.
-    /// Step completion must not terminalize the phase while this is true;
-    /// lifecycle entry points (`complete_plan_phase_*` / fail / cancel / merge)
-    /// remain the source of truth for execution-managed phases.
+    /// True when this phase still has non-terminal *implementation* execution:
+    /// an active non-merge `plan_phase_attempt`, or a bound Agent task that is
+    /// Queued/Running/Waiting. Merge attempts are tracked separately and must
+    /// not keep a completed phase "running" via step aggregation.
     fn phase_has_active_execution(&self, phase_id: &str) -> Result<bool, WorkspaceDatabaseError> {
-        if self.phase_has_active_attempt(phase_id)? {
+        if self.phase_has_active_implementation_attempt(phase_id)? {
             return Ok(true);
         }
         let count: i64 = self
@@ -3121,11 +3168,48 @@ impl WorkspaceDatabase {
         Ok(count > 0)
     }
 
-    /// True when a bound Agent task is already terminal but the phase has not
-    /// been closed by a lifecycle entry point yet (`complete_plan_phase_*` /
-    /// fail / cancel / merge sync). Step aggregation must keep the phase
-    /// running so recovery still finds `phase.status = 'running'` and cannot
-    /// mark the plan implemented from checkboxes alone.
+    fn phase_has_active_implementation_attempt(
+        &self,
+        phase_id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1
+                   AND status IN ('queued', 'running')
+                   AND trigger NOT IN ('merge_auto', 'merge_retry')",
+                params![phase_id.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(count > 0)
+    }
+
+    fn phase_has_active_merge_attempt(
+        &self,
+        phase_id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1
+                   AND status IN ('queued', 'running')
+                   AND trigger IN ('merge_auto', 'merge_retry')",
+                params![phase_id.trim()],
+                |row| row.get(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(count > 0)
+    }
+
+    /// True when a bound *implementation* Agent task is already terminal but the
+    /// phase has not been closed by a lifecycle entry point yet. Merge tasks are
+    /// bound only on merge attempts, not on `plan_phases.agent_task_id` after
+    /// attach_plan_phase_merge_run stops overwriting phase identity.
     fn phase_awaits_execution_lifecycle(
         &self,
         phase: &PlanPhaseRecord,
@@ -3155,10 +3239,10 @@ impl WorkspaceDatabase {
         Ok(count > 0)
     }
 
-    /// True when this phase failed through an execution lifecycle (Agent task /
-    /// attempt outcome), not merely from aggregating a manual failed step.
-    /// Lifecycle failures stay sticky across step edits; manual step failures
-    /// remain recoverable when every step is later completed.
+    /// True when this phase failed through an implementation lifecycle (Agent
+    /// task / non-merge attempt outcome), not merely from aggregating a manual
+    /// failed step. Merge attempt failures must not sticky-fail a completed
+    /// phase via step aggregation.
     fn phase_has_lifecycle_failure(
         &self,
         phase: &PlanPhaseRecord,
@@ -3167,17 +3251,20 @@ impl WorkspaceDatabase {
             .error_message
             .as_ref()
             .is_some_and(|message| !message.trim().is_empty())
+            && phase.status == "failed"
         {
             return Ok(true);
         }
-        // Only inspect the latest attempt: historical failed attempts must not
-        // sticky-block a later successful retry while the phase is running.
+        // Only inspect the latest *implementation* attempt: historical failed
+        // attempts and merge attempts must not sticky-block a later successful
+        // retry or a completed phase awaiting merge retry.
         let latest_attempt_status: Option<String> = self
             .connection
             .query_row(
                 "SELECT status
                  FROM plan_phase_attempts
                  WHERE phase_id = ?1
+                   AND trigger NOT IN ('merge_auto', 'merge_retry')
                  ORDER BY sequence DESC
                  LIMIT 1",
                 params![phase.id.as_str()],
@@ -3434,7 +3521,9 @@ impl WorkspaceDatabase {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
-        transaction
+        // Bind only the queued merge attempt and plan-level running state.
+        // Do not rewrite the completed phase's implementation identity or commit_id.
+        let updated = transaction
             .execute(
                 "UPDATE plan_phase_attempts
                  SET status = 'running',
@@ -3447,7 +3536,7 @@ impl WorkspaceDatabase {
                      SELECT id FROM plan_phase_attempts
                      WHERE plan_id = ?1
                        AND phase_id = ?2
-                       AND trigger = 'merge_auto'
+                       AND trigger IN ('merge_auto', 'merge_retry')
                        AND status = 'queued'
                      ORDER BY sequence DESC
                      LIMIT 1
@@ -3462,25 +3551,52 @@ impl WorkspaceDatabase {
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
+        if updated == 0 {
+            // Compatibility: older local/manual merge runs may have incremented
+            // merge_attempt_count without a durable merge attempt row. Create a
+            // running merge_auto attempt so task-based lifecycle can resolve.
+            let sequence = transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) + 1
+                     FROM plan_phase_attempts
+                     WHERE phase_id = ?1",
+                    params![phase.id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let attempt_id = format!("plan-phase-attempt-{}-{sequence}", phase.id);
+            transaction
+                .execute(
+                    "INSERT INTO plan_phase_attempts (
+                        id, plan_id, phase_id, sequence, trigger, status,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        started_at, created_at, updated_at
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8, ?9, ?9, ?9)",
+                    params![
+                        attempt_id,
+                        plan.id.as_str(),
+                        phase.id.as_str(),
+                        sequence,
+                        PlanPhaseAttemptTrigger::MergeAuto.as_str(),
+                        implementation_chat_id.trim(),
+                        agent_team_id.as_str(),
+                        agent_task_id.as_str(),
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        // Keep completed phase implementation identity intact. Only clear phase
+        // error_message so UI reflects an in-flight merge rather than the prior
+        // block reason; plan-level error is cleared while merge is running.
         transaction
             .execute(
                 "UPDATE plan_phases
-                 SET status = 'running',
-                     implementation_chat_id = ?3,
-                     agent_team_id = ?4,
-                     agent_task_id = ?5,
-                     commit_id = NULL,
-                     completed_at = NULL,
-                     updated_at = ?6
+                 SET error_message = NULL,
+                     updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",
-                params![
-                    plan.id.as_str(),
-                    phase.id.as_str(),
-                    implementation_chat_id.trim(),
-                    agent_team_id.as_str(),
-                    agent_task_id.as_str(),
-                    now
-                ],
+                params![plan.id.as_str(), phase.id.as_str(), now],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
         transaction
@@ -3488,6 +3604,7 @@ impl WorkspaceDatabase {
                 "UPDATE plans
                  SET status = 'running',
                      active_phase_id = ?2,
+                     error_message = NULL,
                      completed_at = NULL,
                      completed_by_user_at = NULL,
                      updated_at = ?3
@@ -3511,19 +3628,7 @@ impl WorkspaceDatabase {
         &self,
         agent_task_id: &AgentTaskId,
     ) -> Result<Option<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
-        self.connection
-            .query_row(
-                "SELECT id, plan_id, phase_id, sequence, trigger, status,
-                        provider_id, model_id, thinking_level,
-                        implementation_chat_id, agent_team_id, agent_task_id,
-                        commit_id, error_message, started_at, completed_at, created_at, updated_at
-                 FROM plan_phase_attempts
-                 WHERE agent_task_id = ?1",
-                params![agent_task_id.as_str()],
-                plan_phase_attempt_from_row,
-            )
-            .optional()
-            .map_err(|source| self.sqlite_error(source))
+        self.plan_phase_attempt_for_agent_task_inner(agent_task_id)
     }
 
     /// Reverse-lookup `plan_id` when `chat_id` was bound as a phase implementation (or merge)
@@ -3832,6 +3937,7 @@ impl WorkspaceDatabase {
         &self,
         agent_task_id: &AgentTaskId,
     ) -> Result<Option<PlanPhaseRecord>, WorkspaceDatabaseError> {
+        // Prefer the phase currently bound on plan_phases (implementation runs).
         let Some(mut phase) = self
             .connection
             .query_row(
@@ -3847,11 +3953,73 @@ impl WorkspaceDatabase {
             .optional()
             .map_err(|source| self.sqlite_error(source))?
         else {
-            return Ok(None);
+            // Merge runs bind only on plan_phase_attempts after attach no longer
+            // overwrites plan_phases.agent_task_id.
+            let Some(phase_id) = self
+                .connection
+                .query_row(
+                    "SELECT phase_id
+                     FROM plan_phase_attempts
+                     WHERE agent_task_id = ?1
+                     ORDER BY sequence DESC
+                     LIMIT 1",
+                    params![agent_task_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|source| self.sqlite_error(source))?
+            else {
+                return Ok(None);
+            };
+            let Some(mut phase) = self
+                .connection
+                .query_row(
+                    "SELECT id, plan_id, sequence, title, summary, status,
+                            implementation_chat_id, agent_team_id, agent_task_id,
+                            commit_id, merge_attempt_count, error_message,
+                            started_at, completed_at, created_at, updated_at
+                     FROM plan_phases
+                     WHERE id = ?1",
+                    params![phase_id.as_str()],
+                    plan_phase_from_row,
+                )
+                .optional()
+                .map_err(|source| self.sqlite_error(source))?
+            else {
+                return Ok(None);
+            };
+            phase.steps = self.plan_steps_for_phase(&phase.id)?;
+            phase.attempts = self.plan_phase_attempts_for_phase_inner(&phase.id)?;
+            return Ok(Some(phase));
         };
         phase.steps = self.plan_steps_for_phase(&phase.id)?;
         phase.attempts = self.plan_phase_attempts_for_phase_inner(&phase.id)?;
         Ok(Some(phase))
+    }
+
+    fn plan_phase_attempt_for_agent_task_inner(
+        &self,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<Option<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT id, plan_id, phase_id, sequence, trigger, status,
+                        provider_id, model_id, thinking_level,
+                        implementation_chat_id, agent_team_id, agent_task_id,
+                        commit_id, error_message, started_at, completed_at, created_at, updated_at
+                 FROM plan_phase_attempts
+                 WHERE agent_task_id = ?1
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![agent_task_id.as_str()],
+                plan_phase_attempt_from_row,
+            )
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    fn is_merge_attempt_trigger(trigger: &str) -> bool {
+        matches!(trigger, "merge_auto" | "merge_retry")
     }
 
     fn ensure_plan_phase_predecessors_completed(
@@ -3900,6 +4068,28 @@ impl WorkspaceDatabase {
         commit_id: Option<&str>,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
         // Execution-managed terminal: Agent task outcome (not step checkboxes).
+        let Some(attempt) = self.plan_phase_attempt_for_agent_task_inner(agent_task_id)? else {
+            // Legacy path: phase bound without a durable attempt row.
+            let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
+                return Ok(None);
+            };
+            self.update_attempt_for_task(
+                agent_task_id,
+                PlanPhaseAttemptStatus::Completed,
+                commit_id,
+                None,
+            )?;
+            return self.complete_plan_phase_record(phase, commit_id).map(Some);
+        };
+        if Self::is_merge_attempt_trigger(&attempt.trigger) {
+            // Merge success records shared_merge_commit_id via
+            // record_plan_shared_merge_commit; do not treat the optional
+            // commit_id as a phase implementation commit or shared merge SHA.
+            let _ = commit_id;
+            return self
+                .complete_plan_merge_attempt_for_task(agent_task_id, None)
+                .map(Some);
+        }
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -3912,13 +4102,138 @@ impl WorkspaceDatabase {
         self.complete_plan_phase_record(phase, commit_id).map(Some)
     }
 
+    /// Complete a merge attempt without rewriting the phase implementation commit.
+    /// Optionally records `shared_merge_commit_id` when `commit_id` is provided.
+    pub fn complete_plan_merge_attempt_for_task(
+        &mut self,
+        agent_task_id: &AgentTaskId,
+        shared_merge_commit_id: Option<&str>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let attempt = self
+            .plan_phase_attempt_for_agent_task_inner(agent_task_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "merge attempt was not found for agent task '{}'",
+                    agent_task_id.as_str()
+                ),
+            })?;
+        if !Self::is_merge_attempt_trigger(&attempt.trigger) {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "agent task '{}' is not bound to a merge attempt",
+                    agent_task_id.as_str()
+                ),
+            });
+        }
+        self.complete_plan_merge_attempt(
+            &attempt.plan_id,
+            &attempt.phase_id,
+            shared_merge_commit_id,
+        )
+    }
+
+    pub fn complete_plan_merge_attempt(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        shared_merge_commit_id: Option<&str>,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        let now = now_timestamp();
+        let shared_merge_commit_id = shared_merge_commit_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'completed',
+                     error_message = NULL,
+                     completed_at = COALESCE(completed_at, ?3),
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND trigger IN ('merge_auto', 'merge_retry')
+                   AND status IN ('queued', 'running')",
+                params![phase.plan_id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        // Preserve implementation commit_id and completed phase status.
+        transaction
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed',
+                     error_message = NULL,
+                     completed_at = COALESCE(completed_at, ?3),
+                     updated_at = ?3
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![phase.plan_id.as_str(), phase.id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if let Some(commit_id) = shared_merge_commit_id {
+            transaction
+                .execute(
+                    "UPDATE plans
+                     SET status = 'implemented',
+                         active_phase_id = NULL,
+                         shared_merge_commit_id = ?2,
+                         error_message = NULL,
+                         completed_at = COALESCE(completed_at, ?3),
+                         completed_by_user_at = NULL,
+                         updated_at = ?3
+                     WHERE id = ?1",
+                    params![phase.plan_id.as_str(), commit_id, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        } else {
+            transaction
+                .execute(
+                    "UPDATE plans
+                     SET status = 'implemented',
+                         active_phase_id = NULL,
+                         error_message = NULL,
+                         completed_at = COALESCE(completed_at, ?2),
+                         completed_by_user_at = NULL,
+                         updated_at = ?2
+                     WHERE id = ?1",
+                    params![phase.plan_id.as_str(), now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if shared_merge_commit_id.is_some() {
+            self.clear_plan_auto_run_block()?;
+        }
+        self.plan(&phase.plan_id).and_then(|plan| {
+            plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan was not found after merge completion: {}",
+                    phase.plan_id
+                ),
+            })
+        })
+    }
+
     pub fn complete_plan_phase_by_id(
         &mut self,
         plan_id: &str,
         phase_id: &str,
         commit_id: Option<&str>,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
-        // Explicit lifecycle complete (e.g. merge path); steps are progress only.
+        // If a merge attempt is active, complete the merge attempt only. Do not
+        // overwrite the phase implementation commit; shared_merge_commit_id is
+        // recorded separately via record_plan_shared_merge_commit.
+        if self.phase_has_active_merge_attempt(phase_id)? {
+            let _ = commit_id; // intentionally unused for merge completion
+            return self.complete_plan_merge_attempt(plan_id, phase_id, None);
+        }
+        // Explicit lifecycle complete; steps are progress only.
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         self.update_latest_active_attempt_for_phase(
             plan_id,
@@ -3943,7 +4258,9 @@ impl WorkspaceDatabase {
             return Ok(plan);
         }
         let commit_id = commit_id.map(str::trim).filter(|value| !value.is_empty());
-        // ponytail: infer an out-of-band merge completion from a commit reported for an already blocked implemented plan; replace with an explicit outer-merge callback when Foco has one.
+        // Out-of-band merge completion for an already-implemented plan that is
+        // awaiting merge retry: record shared_merge_commit_id without rewriting
+        // the phase implementation commit.
         let record_shared_merge_commit = plan.status == "implemented"
             && plan.shared_merge_commit_id.is_none()
             && plan.error_message.is_some()
@@ -3959,6 +4276,39 @@ impl WorkspaceDatabase {
                 params![phase.plan_id.as_str(), phase.id.as_str(), now],
             )
             .map_err(|source| self.sqlite_error(source))?;
+        if record_shared_merge_commit {
+            // Keep original implementation commit_id; only clear merge error.
+            self.connection
+                .execute(
+                    "UPDATE plan_phases
+                     SET status = 'completed',
+                         error_message = NULL,
+                         completed_at = COALESCE(completed_at, ?3),
+                         updated_at = ?3
+                     WHERE plan_id = ?1 AND id = ?2",
+                    params![phase.plan_id.as_str(), phase.id.as_str(), now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            self.connection
+                .execute(
+                    "UPDATE plans
+                     SET shared_merge_commit_id = ?2,
+                         error_message = NULL,
+                         updated_at = ?3
+                     WHERE id = ?1",
+                    params![phase.plan_id.as_str(), commit_id, now],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            self.clear_plan_auto_run_block()?;
+            return self.plan(&phase.plan_id).and_then(|plan| {
+                plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!(
+                        "plan was not found after shared merge update: {}",
+                        phase.plan_id
+                    ),
+                })
+            });
+        }
         self.connection
             .execute(
                 "UPDATE plan_phases
@@ -3992,27 +4342,6 @@ impl WorkspaceDatabase {
                 })
                 .map(|plan| plan);
         }
-        if record_shared_merge_commit {
-            self.connection
-                .execute(
-                    "UPDATE plans
-                     SET shared_merge_commit_id = ?2,
-                         error_message = NULL,
-                         updated_at = ?3
-                     WHERE id = ?1",
-                    params![phase.plan_id.as_str(), commit_id, now],
-                )
-                .map_err(|source| self.sqlite_error(source))?;
-            self.clear_plan_auto_run_block()?;
-            return self.plan(&phase.plan_id).and_then(|plan| {
-                plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                    message: format!(
-                        "plan was not found after shared merge update: {}",
-                        phase.plan_id
-                    ),
-                })
-            });
-        }
         Ok(refreshed)
     }
 
@@ -4022,6 +4351,19 @@ impl WorkspaceDatabase {
         error_message: &str,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
         // Execution-managed terminal: task Failed/Interrupted (steps may already be completed).
+        if let Some(attempt) = self.plan_phase_attempt_for_agent_task_inner(agent_task_id)? {
+            if Self::is_merge_attempt_trigger(&attempt.trigger) {
+                let attempt_status = self.agent_task_attempt_terminal_status(agent_task_id)?;
+                return self
+                    .await_plan_merge_retry(
+                        &attempt.plan_id,
+                        &attempt.phase_id,
+                        error_message,
+                        attempt_status,
+                    )
+                    .map(Some);
+            }
+        }
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -4036,6 +4378,18 @@ impl WorkspaceDatabase {
         error_message: &str,
     ) -> Result<Option<PlanRecord>, WorkspaceDatabaseError> {
         // Execution-managed terminal: task Cancelled.
+        if let Some(attempt) = self.plan_phase_attempt_for_agent_task_inner(agent_task_id)? {
+            if Self::is_merge_attempt_trigger(&attempt.trigger) {
+                return self
+                    .await_plan_merge_retry(
+                        &attempt.plan_id,
+                        &attempt.phase_id,
+                        error_message,
+                        PlanPhaseAttemptStatus::Cancelled,
+                    )
+                    .map(Some);
+            }
+        }
         let Some(phase) = self.plan_phase_for_agent_task(agent_task_id)? else {
             return Ok(None);
         };
@@ -4292,9 +4646,9 @@ impl WorkspaceDatabase {
         &mut self,
         plan_id: Option<&str>,
     ) -> Result<usize, WorkspaceDatabaseError> {
-        // Only repair attempts whose phase is already terminal. Step-driven
-        // refresh must not mark a phase terminal while execution is still
-        // active, so this path does not complete live attempts early.
+        // Only repair *implementation* attempts whose phase is already terminal.
+        // Active merge attempts must stay queued/running while the phase remains
+        // completed (implementation done, integration still in flight).
         let now = now_timestamp();
         self.connection
             .execute(
@@ -4350,6 +4704,7 @@ impl WorkspaceDatabase {
                      ), completed_at, ?1),
                      updated_at = ?1
                  WHERE status IN ('queued', 'running')
+                   AND trigger NOT IN ('merge_auto', 'merge_retry')
                    AND (?2 IS NULL OR plan_id = ?2)
                    AND EXISTS (
                        SELECT 1
@@ -4369,6 +4724,16 @@ impl WorkspaceDatabase {
         phase_id: &str,
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        // Active merge attempts fail into "awaiting merge retry" rather than
+        // failing the completed implementation phase.
+        if self.phase_has_active_merge_attempt(phase_id)? {
+            return self.await_plan_merge_retry(
+                plan_id,
+                phase_id,
+                error_message,
+                PlanPhaseAttemptStatus::Failed,
+            );
+        }
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         self.update_latest_active_attempt_for_phase(
             plan_id,
@@ -4385,6 +4750,14 @@ impl WorkspaceDatabase {
         phase_id: &str,
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        if self.phase_has_active_merge_attempt(phase_id)? {
+            return self.await_plan_merge_retry(
+                plan_id,
+                phase_id,
+                error_message,
+                PlanPhaseAttemptStatus::Cancelled,
+            );
+        }
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         self.cancel_plan_phase_record(phase, error_message)
     }
@@ -4576,16 +4949,48 @@ impl WorkspaceDatabase {
             })
         })
     }
+    /// Unified merge-awaiting-retry terminal: dirty shared workspace, LLM merge
+    /// failure/cancel/interrupt, or other merge-path errors. Keeps the last
+    /// implementation phase completed with its original commit_id, terminals the
+    /// active merge attempt, returns the plan to implemented with a durable
+    /// error, and blocks auto-run with `merge_blocked`.
     pub fn block_plan_phase_merge(
         &mut self,
         plan_id: &str,
         phase_id: &str,
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        self.await_plan_merge_retry(
+            plan_id,
+            phase_id,
+            error_message,
+            PlanPhaseAttemptStatus::Failed,
+        )
+    }
+
+    pub fn await_plan_merge_retry(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+        merge_attempt_status: PlanPhaseAttemptStatus,
+    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
         let now = now_timestamp();
         let error_message = error_message.trim();
-        self.connection
+        let attempt_status = match merge_attempt_status {
+            PlanPhaseAttemptStatus::Cancelled => "cancelled",
+            PlanPhaseAttemptStatus::Interrupted => "interrupted",
+            _ => "failed",
+        };
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        // Preserve implementation identity: completed status + original commit_id.
+        // Only surface the merge error on the phase for UI; do not clear commit_id.
+        transaction
             .execute(
                 "UPDATE plan_phases
                  SET status = 'completed',
@@ -4600,27 +5005,28 @@ impl WorkspaceDatabase {
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plan_phase_attempts
-                 SET status = 'failed',
-                     error_message = ?3,
-                     completed_at = COALESCE(completed_at, ?4),
-                     updated_at = ?4
+                 SET status = ?3,
+                     error_message = ?4,
+                     completed_at = COALESCE(completed_at, ?5),
+                     updated_at = ?5
                  WHERE plan_id = ?1
                    AND phase_id = ?2
-                   AND trigger = 'merge_auto'
+                   AND trigger IN ('merge_auto', 'merge_retry')
                    AND status IN ('queued', 'running')",
                 params![
                     phase.plan_id.as_str(),
                     phase.id.as_str(),
+                    attempt_status,
                     error_message,
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
             .execute(
                 "UPDATE plans
                  SET status = 'implemented',
@@ -4632,7 +5038,10 @@ impl WorkspaceDatabase {
                  WHERE id = ?1",
                 params![phase.plan_id.as_str(), error_message, now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
         self.block_plan_auto_run(
             "merge_blocked",
             Some(phase.plan_id.as_str()),
@@ -4640,11 +5049,16 @@ impl WorkspaceDatabase {
         )?;
         self.plan(&phase.plan_id).and_then(|plan| {
             plan.ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan was not found after merge block: {}", phase.plan_id),
+                message: format!(
+                    "plan was not found after merge await-retry: {}",
+                    phase.plan_id
+                ),
             })
         })
     }
 
+    /// Begin the single automatic merge attempt for a phase. Returns false when
+    /// an automatic attempt was already recorded (`merge_attempt_count > 0`).
     pub fn try_begin_plan_phase_merge_attempt(
         &mut self,
         plan_id: &str,
@@ -4702,6 +5116,121 @@ impl WorkspaceDatabase {
                     phase.id.as_str(),
                     sequence,
                     PlanPhaseAttemptTrigger::MergeAuto.as_str(),
+                    error_message.trim(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
+    }
+
+    /// Atomically create a manual merge_retry attempt after a previous merge
+    /// attempt reached a terminal state. Rejects concurrent retries while a
+    /// merge attempt is still queued/running. Does not re-run phase implementation.
+    pub fn try_begin_plan_phase_merge_retry_attempt(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let phase = self.plan_phase_for_plan(plan_id, phase_id)?;
+        // Implementation must already be done; merge retry never reopens phase work.
+        if phase.status != "completed" {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' cannot start merge retry while {}",
+                    phase.id, phase.status
+                ),
+            });
+        }
+        let plan = self
+            .plan(plan_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan was not found: {}", plan_id.trim()),
+            })?;
+        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{}' cannot start merge retry while {}",
+                    plan.id, plan.status
+                ),
+            });
+        }
+        if plan.shared_merge_commit_id.is_some() {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{}' already has a shared merge commit", plan.id),
+            });
+        }
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let active_merge: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phase_attempts
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND trigger IN ('merge_auto', 'merge_retry')
+                   AND status IN ('queued', 'running')",
+                params![phase.plan_id.as_str(), phase.id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if active_merge > 0 {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+        // Manual retry may run even when merge_attempt_count already > 0.
+        // Still bump the counter for observability of total merge attempts.
+        transaction
+            .execute(
+                "UPDATE plan_phases
+                 SET merge_attempt_count = CASE
+                         WHEN merge_attempt_count = 0 THEN 1
+                         ELSE merge_attempt_count + 1
+                     END,
+                     error_message = ?3,
+                     updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    error_message.trim(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) + 1
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1",
+                params![phase.id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let attempt_id = format!("plan-phase-attempt-{}-{sequence}", phase.id);
+        transaction
+            .execute(
+                "INSERT INTO plan_phase_attempts (
+                    id, plan_id, phase_id, sequence, trigger, status,
+                    error_message, created_at, updated_at
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?7)",
+                params![
+                    attempt_id,
+                    phase.plan_id.as_str(),
+                    phase.id.as_str(),
+                    sequence,
+                    PlanPhaseAttemptTrigger::MergeRetry.as_str(),
                     error_message.trim(),
                     now
                 ],
@@ -4869,6 +5398,22 @@ impl WorkspaceDatabase {
                      updated_at = ?3
                  WHERE plan_id = ?1 AND id = ?2",
                 params![plan.id, next_phase_id, now],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        // Cancel leftover merge attempts when restarting a failed phase so they
+        // cannot block a subsequent implementation attempt or keep merge-in-flight.
+        self.connection
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'cancelled',
+                     error_message = COALESCE(error_message, 'superseded by phase restart'),
+                     completed_at = COALESCE(completed_at, ?3),
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND trigger IN ('merge_auto', 'merge_retry')
+                   AND status IN ('queued', 'running')",
+                params![plan.id.as_str(), next_phase_id.as_str(), now],
             )
             .map_err(|source| self.sqlite_error(source))?;
         self.connection
@@ -5074,6 +5619,15 @@ impl WorkspaceDatabase {
         let any_running = phases.iter().any(|phase| phase.status == "running");
         let all_completed =
             total_phases > 0 && phases.iter().all(|phase| phase.status == "completed");
+        // Active merge attempts keep the plan in flight even though the last
+        // implementation phase remains completed.
+        let mut any_active_merge = false;
+        for phase in &phases {
+            if self.phase_has_active_merge_attempt(&phase.id)? {
+                any_active_merge = true;
+                break;
+            }
+        }
         let current_status = self
             .connection
             .query_row(
@@ -5086,6 +5640,8 @@ impl WorkspaceDatabase {
             "paused"
         } else if any_failed {
             "failed"
+        } else if any_active_merge {
+            "running"
         } else if all_completed {
             "implemented"
         } else if current_status == "paused" {
@@ -5097,10 +5653,27 @@ impl WorkspaceDatabase {
         } else {
             "ready"
         };
-        let active_phase_id = phases
-            .iter()
-            .find(|phase| phase.status == "running")
-            .map(|phase| phase.id.as_str());
+        let active_phase_id = if any_active_merge {
+            phases
+                .iter()
+                .rev()
+                .find(|phase| {
+                    self.phase_has_active_merge_attempt(&phase.id)
+                        .unwrap_or(false)
+                })
+                .map(|phase| phase.id.as_str())
+                .or_else(|| {
+                    phases
+                        .iter()
+                        .find(|phase| phase.status == "running")
+                        .map(|phase| phase.id.as_str())
+                })
+        } else {
+            phases
+                .iter()
+                .find(|phase| phase.status == "running")
+                .map(|phase| phase.id.as_str())
+        };
         self.connection
             .execute(
                 "UPDATE plans

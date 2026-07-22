@@ -1941,7 +1941,7 @@ fn plan_auto_run_marks_running_plan_busy_without_candidate() {
 }
 
 #[test]
-fn plan_auto_run_legacy_enabled_metadata_migrates_to_desired_preference() {
+fn plan_auto_run_legacy_enabled_metadata_is_read_when_desired_key_missing() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     {
         let mut database = WorkspaceDatabase::open_or_create_ungated(workspace.path())
@@ -1957,15 +1957,12 @@ fn plan_auto_run_legacy_enabled_metadata_migrates_to_desired_preference() {
             "DELETE FROM workspace_metadata WHERE key = 'plan_auto_run_desired_enabled'",
             [],
         )
-        .expect("remove desired metadata before migration");
-    connection
-        .pragma_update(None, "user_version", 34)
-        .expect("rewind schema version");
+        .expect("remove desired metadata");
     drop(connection);
 
     let database = WorkspaceDatabase::open_or_create_ungated(workspace.path())
-        .expect("migrated workspace database");
-    let state = database.plan_auto_run_state().expect("migrated state");
+        .expect("reopened workspace database");
+    let state = database.plan_auto_run_state().expect("state");
     assert!(state.desired_enabled);
 }
 
@@ -3125,7 +3122,7 @@ fn blocked_merge_completion_records_shared_commit_and_clears_errors() {
     assert!(merged.error_message.is_none());
     assert_eq!(
         merged.phases[0].commit_id.as_deref(),
-        Some("shared-merge-commit")
+        Some("phase-worktree-commit")
     );
     assert!(merged.phases[0].error_message.is_none());
     let resumed_state = database
@@ -5077,7 +5074,7 @@ fn plan_phase_failed_status_stays_failed_after_step_edit_when_all_steps_complete
 }
 
 #[test]
-fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attempt() {
+fn plan_step_completion_keeps_plan_running_for_active_merge_attempt() {
     for (suffix, make_waiting) in [("queued", false), ("running", false), ("waiting", true)] {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let mut database =
@@ -5092,19 +5089,26 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
             &format!("merge-task-gate-{suffix}"),
         );
         let plan_before = database.plan(&plan_id).expect("plan").expect("plan");
-        assert!(
-            plan_before.phases[0].attempts.is_empty()
-                || plan_before.phases[0]
-                    .attempts
-                    .iter()
-                    .all(|attempt| !matches!(attempt.status.as_str(), "queued" | "running")),
-            "merge gate must not rely on an active plan_phase_attempt for {suffix}"
-        );
+        // Implementation phase stays completed; merge identity is on the attempt.
+        assert_eq!(plan_before.phases[0].status, "completed");
         assert_eq!(
+            plan_before.phases[0].commit_id.as_deref(),
+            Some("worktree-commit")
+        );
+        assert!(
+            plan_before.phases[0].attempts.iter().any(|attempt| {
+                matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                    && matches!(attempt.status.as_str(), "queued" | "running")
+            }),
+            "merge gate relies on an active merge attempt for {suffix}"
+        );
+        // Phase still points at the implementation task, not the merge task.
+        assert_ne!(
             plan_before.phases[0].agent_task_id.as_deref(),
             Some(merge_task_id.as_str())
         );
         assert_eq!(plan_before.phases[0].steps[0].status, "completed");
+        assert_eq!(plan_before.status, "running");
 
         let team_id = AgentTeamId::new(format!("agent-team-merge-task-gate-{suffix}-merge"))
             .expect("team id");
@@ -5141,15 +5145,24 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
                     status: Some("completed"),
                 },
             )
-            .expect("refresh steps while merge task active");
+            .expect("refresh steps while merge attempt active");
 
+        // Step aggregation must not drop the plan out of merge-in-flight.
         assert_eq!(updated.status, "running", "plan status for {suffix}");
         assert_eq!(
             updated.active_phase_id.as_deref(),
             Some(phase_id.as_str()),
             "active_phase_id for {suffix}"
         );
-        assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
+        assert_eq!(
+            updated.phases[0].status, "completed",
+            "phase stays completed for {suffix}"
+        );
+        assert_eq!(
+            updated.phases[0].commit_id.as_deref(),
+            Some("worktree-commit"),
+            "implementation commit for {suffix}"
+        );
         assert_eq!(
             updated.phases[0].steps[0].status, "completed",
             "step for {suffix}"
@@ -5170,7 +5183,7 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
                 .expect("resume merge task");
             let after_resume = database.plan(&plan_id).expect("plan").expect("plan");
             assert_eq!(after_resume.status, "running");
-            assert_eq!(after_resume.phases[0].status, "running");
+            assert_eq!(after_resume.phases[0].status, "completed");
 
             database
                 .update_agent_task_state(AgentTaskStateUpdate {
@@ -5190,16 +5203,23 @@ fn plan_step_completion_keeps_phase_running_for_merge_task_without_active_attemp
             assert_eq!(completed.status, "implemented");
             assert!(completed.active_phase_id.is_none());
             assert_eq!(completed.phases[0].status, "completed");
+            // Shared merge SHA is not written onto the phase implementation commit.
             assert_eq!(
                 completed.phases[0].commit_id.as_deref(),
-                Some("shared-merge-commit")
+                Some("worktree-commit")
             );
+            let merge_attempt = completed.phases[0]
+                .attempts
+                .iter()
+                .find(|attempt| attempt.trigger == "merge_auto")
+                .expect("merge attempt");
+            assert_eq!(merge_attempt.status, "completed");
         }
     }
 }
 
 #[test]
-fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecycle_sync() {
+fn plan_step_edit_keeps_plan_running_while_merge_task_is_terminal_before_lifecycle_sync() {
     for (suffix, transition) in [
         ("completed", AgentTaskTransition::Complete),
         ("failed", AgentTaskTransition::Fail),
@@ -5219,15 +5239,15 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
             &format!("terminal-before-sync-{suffix}"),
         );
         let plan_before = database.plan(&plan_id).expect("plan").expect("plan");
+        assert_eq!(plan_before.phases[0].status, "completed");
+        assert_eq!(plan_before.status, "running");
         assert!(
-            plan_before.phases[0].attempts.is_empty()
-                || plan_before.phases[0]
-                    .attempts
-                    .iter()
-                    .all(|attempt| !matches!(attempt.status.as_str(), "queued" | "running")),
-            "fixture must rely on bound task, not an active plan_phase_attempt, for {suffix}"
+            plan_before.phases[0].attempts.iter().any(|attempt| {
+                matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                    && matches!(attempt.status.as_str(), "queued" | "running")
+            }),
+            "fixture has an active merge attempt for {suffix}"
         );
-        assert_eq!(plan_before.phases[0].status, "running");
         assert_eq!(plan_before.phases[0].steps[0].status, "completed");
 
         let team_id = AgentTeamId::new(format!("agent-team-terminal-before-sync-{suffix}-merge"))
@@ -5254,6 +5274,8 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
             })
             .expect("finish merge task without phase lifecycle sync");
 
+        // Merge attempt remains active until lifecycle sync; step edit must not
+        // drop the plan out of merge-in-flight or reopen the completed phase.
         let updated = database
             .update_plan_step(
                 &plan_id,
@@ -5273,7 +5295,15 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
             Some(phase_id.as_str()),
             "active_phase_id for {suffix}"
         );
-        assert_eq!(updated.phases[0].status, "running", "phase for {suffix}");
+        assert_eq!(
+            updated.phases[0].status, "completed",
+            "phase stays completed for {suffix}"
+        );
+        assert_eq!(
+            updated.phases[0].commit_id.as_deref(),
+            Some("worktree-commit"),
+            "implementation commit for {suffix}"
+        );
         assert_eq!(
             updated.phases[0].steps[0].status, "completed",
             "step for {suffix}"
@@ -5303,19 +5333,25 @@ fn plan_step_edit_keeps_phase_running_while_bound_task_is_terminal_before_lifecy
                     closed.phases[0].status, "completed",
                     "final phase for {suffix}"
                 );
-            }
-            AgentTaskTransition::Cancel => {
-                assert_eq!(closed.status, "paused", "final plan for {suffix}");
                 assert_eq!(
-                    closed.phases[0].status, "cancelled",
-                    "final phase for {suffix}"
+                    closed.phases[0].commit_id.as_deref(),
+                    Some("worktree-commit"),
+                    "implementation commit preserved for {suffix}"
                 );
             }
-            AgentTaskTransition::Fail | AgentTaskTransition::Interrupt => {
-                assert_eq!(closed.status, "failed", "final plan for {suffix}");
+            AgentTaskTransition::Cancel
+            | AgentTaskTransition::Fail
+            | AgentTaskTransition::Interrupt => {
+                // Merge failure/cancel returns to implemented awaiting retry.
+                assert_eq!(closed.status, "implemented", "final plan for {suffix}");
                 assert_eq!(
-                    closed.phases[0].status, "failed",
+                    closed.phases[0].status, "completed",
                     "final phase for {suffix}"
+                );
+                assert_eq!(
+                    closed.phases[0].commit_id.as_deref(),
+                    Some("worktree-commit"),
+                    "implementation commit preserved for {suffix}"
                 );
             }
             _ => unreachable!("unexpected transition for {suffix}"),
@@ -5832,7 +5868,7 @@ fn reconcile_prematurely_completed_plan_phases_skips_real_commit_and_terminal_ta
 }
 
 #[test]
-fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
+fn plan_phase_attempt_reconciliation_on_open_repairs_stale_active_attempts() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
@@ -5840,7 +5876,7 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
         .create_plan(NewPlan {
             id: "plan-attempt-migration-024",
             title: "Attempt migration",
-            overview: "Migration repairs stale active attempts.",
+            overview: "Open repairs stale active attempts on terminal phases.",
             status: "ready",
             source_chat_id: None,
             phases: vec![
@@ -5908,10 +5944,7 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
     }
     connection
         .execute_batch(
-            "DROP INDEX IF EXISTS workspace_spec_jobs_active_retry_idx;
-             ALTER TABLE workspace_spec_jobs DROP COLUMN retry_of_job_id;
-             ALTER TABLE workspace_spec_jobs DROP COLUMN lease_renewed_at;
-             UPDATE plan_phases
+            "UPDATE plan_phases
              SET status = 'completed', commit_id = 'commit-from-phase', completed_at = '2026-07-02T00:00:00.000Z'
              WHERE id = 'plan-attempt-migration-024-completed';
              UPDATE plan_phases
@@ -5919,18 +5952,20 @@ fn plan_phase_attempt_migration_024_reconciles_terminal_phases() {
              WHERE id = 'plan-attempt-migration-024-failed';
              UPDATE plan_phases
              SET status = 'cancelled', completed_at = '2026-07-02T00:00:02.000Z'
-             WHERE id = 'plan-attempt-migration-024-cancelled';
-             PRAGMA user_version = 23;",
+             WHERE id = 'plan-attempt-migration-024-cancelled';",
         )
-        .expect("seed stale v23 data");
+        .expect("seed terminal phases with stale active attempts");
     drop(connection);
 
-    let database =
-        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrated database");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("reopened database");
     assert_eq!(
         database.schema_version().expect("schema version"),
         WORKSPACE_SCHEMA_VERSION
     );
+    database
+        .reconcile_plan_phase_attempts_for_terminal_phases()
+        .expect("reconcile");
     let completed = database
         .plan_phase_attempts_for_phase("plan-attempt-migration-024-completed")
         .expect("completed attempts");
@@ -6123,16 +6158,34 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
         running.active_phase_id.as_deref(),
         Some("plan-merge-running-phase")
     );
-    assert_eq!(running.phases[0].status, "running");
+    // Implementation phase stays completed with original commit; only plan is running.
+    assert_eq!(running.phases[0].status, "completed");
+    assert_eq!(
+        running.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
+    );
     assert_eq!(
         running.phases[0].implementation_chat_id.as_deref(),
-        Some("chat-merge-running-merge")
+        Some("chat-merge-running-phase")
     );
     assert_eq!(
         running.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-merge-running-phase")
+    );
+    let merge_attempt = running.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt");
+    assert_eq!(merge_attempt.status, "running");
+    assert_eq!(
+        merge_attempt.implementation_chat_id.as_deref(),
+        Some("chat-merge-running-merge")
+    );
+    assert_eq!(
+        merge_attempt.agent_task_id.as_deref(),
         Some("agent-task-merge-running-merge")
     );
-    assert!(running.phases[0].commit_id.is_none());
     complete_test_agent_task(
         &mut database,
         &merge_team_id,
@@ -6150,12 +6203,19 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
     assert_eq!(completed.status, "implemented");
     assert!(completed.active_phase_id.is_none());
     assert_eq!(completed.phases[0].status, "completed");
+    // Phase implementation commit is preserved; shared merge is separate.
     assert_eq!(
         completed.phases[0].commit_id.as_deref(),
-        Some("shared-merge-commit")
+        Some("worktree-commit")
     );
     assert!(completed.phases[0].error_message.is_none());
     assert!(completed.shared_merge_commit_id.is_none());
+    let merge_attempt = completed.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt completed");
+    assert_eq!(merge_attempt.status, "completed");
 
     let merged = database
         .record_plan_shared_merge_commit("plan-merge-running", "shared-head-commit")
@@ -6168,7 +6228,7 @@ fn plan_phase_merge_run_keeps_plan_running_until_merge_task_finishes() {
 }
 
 #[test]
-fn plan_phase_merge_run_failure_marks_plan_failed_without_shared_merge_commit() {
+fn plan_phase_merge_run_failure_returns_implemented_without_shared_merge_commit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -6184,20 +6244,31 @@ fn plan_phase_merge_run_failure_marks_plan_failed_without_shared_merge_commit() 
         .expect("fail merge task")
         .expect("plan");
 
-    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.status, "implemented");
     assert!(failed.active_phase_id.is_none());
     assert_eq!(failed.error_message.as_deref(), Some("merge task failed"));
     assert!(failed.shared_merge_commit_id.is_none());
-    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].status, "completed");
+    assert_eq!(
+        failed.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
+    );
     assert_eq!(
         failed.phases[0].error_message.as_deref(),
         Some("merge task failed")
     );
-    assert!(failed.phases[0].commit_id.is_none());
+    let merge_attempt = failed.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt");
+    assert_eq!(merge_attempt.status, "failed");
+    let auto_run = database.plan_auto_run_state().expect("auto-run state");
+    assert_eq!(auto_run.blocked_reason.as_deref(), Some("merge_blocked"));
 }
 
 #[test]
-fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_merge_commit() {
+fn plan_phase_merge_run_cancel_or_interrupt_returns_implemented_without_shared_merge_commit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
@@ -6223,13 +6294,23 @@ fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_mer
         .fail_plan_phase_run(&merge_task_id, "merge task cancelled")
         .expect("fail cancelled merge task")
         .expect("plan");
-    assert_eq!(cancelled.status, "failed");
+    assert_eq!(cancelled.status, "implemented");
     assert!(cancelled.shared_merge_commit_id.is_none());
-    assert_eq!(cancelled.phases[0].status, "failed");
+    assert_eq!(cancelled.phases[0].status, "completed");
+    assert_eq!(
+        cancelled.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
+    );
     assert_eq!(
         cancelled.phases[0].error_message.as_deref(),
         Some("merge task cancelled")
     );
+    let merge_attempt = cancelled.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt");
+    assert_eq!(merge_attempt.status, "cancelled");
 
     let merge_task_id = attach_test_plan_merge_run(
         &mut database,
@@ -6261,12 +6342,422 @@ fn plan_phase_merge_run_cancel_or_interrupt_marks_plan_failed_without_shared_mer
         .fail_plan_phase_run(&merge_task_id, "merge task interrupted")
         .expect("fail interrupted merge task")
         .expect("plan");
-    assert_eq!(interrupted.status, "failed");
+    assert_eq!(interrupted.status, "implemented");
     assert!(interrupted.shared_merge_commit_id.is_none());
-    assert_eq!(interrupted.phases[0].status, "failed");
+    assert_eq!(interrupted.phases[0].status, "completed");
     assert_eq!(
         interrupted.phases[0].error_message.as_deref(),
         Some("merge task interrupted")
+    );
+    let merge_attempt = interrupted.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt");
+    assert_eq!(merge_attempt.status, "interrupted");
+}
+
+#[test]
+fn completed_phase_stays_completed_across_merge_bind_fail_and_manual_retry() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-merge-phase-preserve",
+            title: "Preserve completed phase",
+            overview: "Merge lifecycle must not reopen the last phase.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-merge-phase-preserve-phase",
+                title: "Phase one",
+                summary: "Implemented once.",
+                steps: vec![NewPlanStep {
+                    id: "plan-merge-phase-preserve-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["phase completed".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-merge-phase-preserve", "start")
+        .expect("start plan");
+    let (phase_team_id, phase_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-merge-phase-preserve-phase",
+        "merge-phase-preserve-phase",
+    );
+    let phase_task_id = AgentTaskId::new("agent-task-merge-phase-preserve-phase").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &phase_task_id,
+            team_id: &phase_team_id,
+            owner_instance_id: &phase_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue phase task");
+    database
+        .attach_plan_phase_run(
+            "plan-merge-phase-preserve",
+            "plan-merge-phase-preserve-phase",
+            "chat-merge-phase-preserve-phase",
+            &phase_team_id,
+            &phase_task_id,
+        )
+        .expect("attach phase task");
+    complete_test_agent_task(
+        &mut database,
+        &phase_team_id,
+        &phase_task_id,
+        "agent-attempt-merge-phase-preserve-phase",
+    );
+    let implemented = database
+        .complete_plan_phase_run(&phase_task_id, Some("impl-commit-abc"))
+        .expect("complete phase")
+        .expect("plan");
+    assert_eq!(implemented.status, "implemented");
+    assert_eq!(implemented.phases[0].status, "completed");
+    assert_eq!(
+        implemented.phases[0].commit_id.as_deref(),
+        Some("impl-commit-abc")
+    );
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-phase-preserve",
+                "plan-merge-phase-preserve-phase",
+                "shared workspace HEAD changed",
+            )
+            .expect("begin auto merge")
+    );
+    let (merge_team_id, merge_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-merge-phase-preserve-merge",
+        "merge-phase-preserve-merge",
+    );
+    let merge_task_id =
+        AgentTaskId::new("agent-task-merge-phase-preserve-merge").expect("merge task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &merge_task_id,
+            team_id: &merge_team_id,
+            owner_instance_id: &merge_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue merge task");
+    let running = database
+        .attach_plan_phase_merge_run(
+            "plan-merge-phase-preserve",
+            "plan-merge-phase-preserve-phase",
+            "chat-merge-phase-preserve-merge",
+            &merge_team_id,
+            &merge_task_id,
+        )
+        .expect("attach merge");
+    assert_eq!(running.status, "running");
+    assert_eq!(running.phases[0].status, "completed");
+    assert_eq!(
+        running.phases[0].commit_id.as_deref(),
+        Some("impl-commit-abc")
+    );
+    assert_eq!(
+        running.phases[0].agent_task_id.as_deref(),
+        Some("agent-task-merge-phase-preserve-phase")
+    );
+
+    let blocked = database
+        .fail_plan_phase_run(&merge_task_id, "merge coordinator failed")
+        .expect("fail merge")
+        .expect("plan");
+    assert_eq!(blocked.status, "implemented");
+    assert!(blocked.active_phase_id.is_none());
+    assert_eq!(
+        blocked.error_message.as_deref(),
+        Some("merge coordinator failed")
+    );
+    assert!(blocked.shared_merge_commit_id.is_none());
+    assert_eq!(blocked.phases[0].status, "completed");
+    assert_eq!(
+        blocked.phases[0].commit_id.as_deref(),
+        Some("impl-commit-abc")
+    );
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_retry_attempt(
+                "plan-merge-phase-preserve",
+                "plan-merge-phase-preserve-phase",
+                "manual retry merge",
+            )
+            .expect("begin manual merge retry")
+    );
+    let after_retry = database
+        .plan("plan-merge-phase-preserve")
+        .expect("plan lookup")
+        .expect("plan");
+    assert_eq!(after_retry.phases[0].status, "completed");
+    assert_eq!(
+        after_retry.phases[0].commit_id.as_deref(),
+        Some("impl-commit-abc")
+    );
+    let retry_attempt = after_retry.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_retry")
+        .expect("merge_retry attempt");
+    assert_eq!(retry_attempt.status, "queued");
+}
+
+#[test]
+fn automatic_merge_attempt_once_manual_merge_retry_after_terminal_not_while_active() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .create_plan(NewPlan {
+            id: "plan-merge-retry-limits",
+            title: "Merge retry limits",
+            overview: "Auto once; manual after terminal; no concurrent retry.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-merge-retry-limits-phase",
+                title: "Phase one",
+                summary: "Needs merge.",
+                steps: vec![NewPlanStep {
+                    id: "plan-merge-retry-limits-step",
+                    title: "Do work",
+                    detail: "Complete the change.",
+                    acceptance: vec!["merge limits".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-merge-retry-limits", "start")
+        .expect("start");
+    let (phase_team_id, phase_instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-merge-retry-limits-phase",
+        "merge-retry-limits-phase",
+    );
+    let phase_task_id = AgentTaskId::new("agent-task-merge-retry-limits-phase").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &phase_task_id,
+            team_id: &phase_team_id,
+            owner_instance_id: &phase_instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    database
+        .attach_plan_phase_run(
+            "plan-merge-retry-limits",
+            "plan-merge-retry-limits-phase",
+            "chat-merge-retry-limits-phase",
+            &phase_team_id,
+            &phase_task_id,
+        )
+        .expect("attach");
+    complete_test_agent_task(
+        &mut database,
+        &phase_team_id,
+        &phase_task_id,
+        "agent-attempt-merge-retry-limits-phase",
+    );
+    database
+        .complete_plan_phase_run(&phase_task_id, Some("impl-commit"))
+        .expect("complete")
+        .expect("plan");
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "auto merge",
+            )
+            .expect("first auto")
+    );
+    assert!(
+        !database
+            .try_begin_plan_phase_merge_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "second auto",
+            )
+            .expect("second auto rejected")
+    );
+
+    // Active auto merge attempt blocks concurrent manual retry.
+    assert!(
+        !database
+            .try_begin_plan_phase_merge_retry_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "manual while active",
+            )
+            .expect("manual while active")
+    );
+
+    database
+        .block_plan_phase_merge(
+            "plan-merge-retry-limits",
+            "plan-merge-retry-limits-phase",
+            "auto merge failed",
+        )
+        .expect("terminalize auto merge");
+
+    assert!(
+        database
+            .try_begin_plan_phase_merge_retry_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "first manual retry",
+            )
+            .expect("first manual")
+    );
+    // Concurrent second manual while first is still queued.
+    assert!(
+        !database
+            .try_begin_plan_phase_merge_retry_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "second concurrent manual",
+            )
+            .expect("concurrent manual rejected")
+    );
+
+    database
+        .block_plan_phase_merge(
+            "plan-merge-retry-limits",
+            "plan-merge-retry-limits-phase",
+            "manual merge failed",
+        )
+        .expect("terminalize manual merge");
+
+    // After terminal, another manual retry is allowed.
+    assert!(
+        database
+            .try_begin_plan_phase_merge_retry_attempt(
+                "plan-merge-retry-limits",
+                "plan-merge-retry-limits-phase",
+                "second manual retry",
+            )
+            .expect("second manual after terminal")
+    );
+
+    let plan = database
+        .plan("plan-merge-retry-limits")
+        .expect("lookup")
+        .expect("plan");
+    let auto_count = plan.phases[0]
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.trigger == "merge_auto")
+        .count();
+    let retry_count = plan.phases[0]
+        .attempts
+        .iter()
+        .filter(|attempt| attempt.trigger == "merge_retry")
+        .count();
+    assert_eq!(auto_count, 1);
+    assert_eq!(retry_count, 2);
+    assert!(plan.phases[0].merge_attempt_count >= 2);
+}
+
+#[test]
+fn merge_failure_leaves_implemented_without_shared_commit_and_blocks_auto_run() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+    let merge_task_id = attach_test_plan_merge_run(
+        &mut database,
+        "plan-merge-barrier",
+        "plan-merge-barrier-phase",
+        "merge-barrier",
+    );
+    let failed = database
+        .fail_plan_phase_run(&merge_task_id, "merge barrier error")
+        .expect("fail")
+        .expect("plan");
+    assert_eq!(failed.status, "implemented");
+    assert!(failed.shared_merge_commit_id.is_none());
+    assert_eq!(failed.error_message.as_deref(), Some("merge barrier error"));
+    let state = database.plan_auto_run_state().expect("auto-run");
+    assert_eq!(state.blocked_reason.as_deref(), Some("merge_blocked"));
+    assert!(!state.enabled);
+    assert_eq!(state.blocked_plan_id.as_deref(), Some("plan-merge-barrier"));
+}
+
+#[test]
+fn merge_success_records_shared_commit_and_clears_auto_run_block() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+    let merge_task_id = attach_test_plan_merge_run(
+        &mut database,
+        "plan-merge-success",
+        "plan-merge-success-phase",
+        "merge-success",
+    );
+    complete_test_agent_task(
+        &mut database,
+        &AgentTeamId::new("agent-team-merge-success-merge").expect("team"),
+        &merge_task_id,
+        "agent-attempt-merge-success",
+    );
+    let completed = database
+        .complete_plan_merge_attempt_for_task(&merge_task_id, None)
+        .expect("complete merge attempt");
+    assert_eq!(completed.status, "implemented");
+    assert!(completed.shared_merge_commit_id.is_none());
+    assert_eq!(
+        completed.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
+    );
+    let merge_attempt = completed.phases[0]
+        .attempts
+        .iter()
+        .find(|attempt| attempt.trigger == "merge_auto")
+        .expect("merge attempt");
+    assert_eq!(merge_attempt.status, "completed");
+
+    let merged = database
+        .record_plan_shared_merge_commit("plan-merge-success", "shared-head-xyz")
+        .expect("record shared");
+    assert_eq!(
+        merged.shared_merge_commit_id.as_deref(),
+        Some("shared-head-xyz")
+    );
+    assert!(merged.error_message.is_none());
+    let state = database.plan_auto_run_state().expect("auto-run");
+    assert!(state.blocked_reason.is_none());
+    assert!(state.enabled);
+    // Phase implementation commit must not become the shared merge SHA.
+    assert_eq!(
+        merged.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
     );
 }
 
@@ -19190,6 +19681,12 @@ fn attach_test_plan_merge_run(
             &phase_task_id,
         )
         .expect("attach phase task");
+    complete_test_agent_task(
+        database,
+        &phase_team_id,
+        &phase_task_id,
+        &format!("agent-attempt-{suffix}-phase"),
+    );
     database
         .complete_plan_phase_run(&phase_task_id, Some("worktree-commit"))
         .expect("complete phase")
@@ -19199,19 +19696,6 @@ fn attach_test_plan_merge_run(
             .try_begin_plan_phase_merge_attempt(plan_id, phase_id, "shared workspace HEAD changed")
             .expect("record merge attempt")
     );
-
-    // Older local/manual merge runs record the once-only counter but have no durable
-    // `merge_auto` attempt. Keep their lifecycle tests representative of that state.
-    let connection = Connection::open(database.database_path()).expect("legacy merge connection");
-    let removed = connection
-        .execute(
-            "DELETE FROM plan_phase_attempts
-             WHERE plan_id = ?1 AND phase_id = ?2 AND trigger = 'merge_auto'",
-            params![plan_id, phase_id],
-        )
-        .expect("remove durable merge attempt for legacy fixture");
-    assert_eq!(removed, 1, "seed legacy merge fixture");
-    drop(connection);
 
     let (merge_team_id, merge_instance_id) = create_test_agent_team(
         database,
@@ -19239,7 +19723,12 @@ fn attach_test_plan_merge_run(
         )
         .expect("attach merge task");
     assert_eq!(running.status, "running");
-    assert_eq!(running.phases[0].status, "running");
+    // Phase implementation stays completed; merge identity lives on the attempt.
+    assert_eq!(running.phases[0].status, "completed");
+    assert_eq!(
+        running.phases[0].commit_id.as_deref(),
+        Some("worktree-commit")
+    );
     assert!(running.shared_merge_commit_id.is_none());
     merge_task_id
 }
