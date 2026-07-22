@@ -8274,4 +8274,471 @@ describe("app-chat-stream verification surfaces", () => {
       appTestState.activeChatStreamController?.close();
     });
   });
+
+  it("restores composer model after active-run reattach when settings load late", async () => {
+    const settingsGate = deferred<Response>();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/settings") {
+          return settingsGate.promise;
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "Persisted fallback text.",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [
+                  { text: "Persisted fallback reasoning.", type: "reasoning" },
+                  { text: "Persisted fallback text.", type: "text" },
+                ],
+                reasoning: "Persisted fallback reasoning.",
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              acceptingGuidance: true,
+              assistantMessageId: "message-assistant-stream",
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=0",
+        ),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Still running.",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("Still running.")).toBeInTheDocument();
+
+    // Settings still pending: model catalog is empty, but selection must not
+    // permanently clear to the empty-label state.
+    expect(screen.getByLabelText("Model")).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+
+    await act(async () => {
+      settingsGate.resolve(jsonResponse(settings));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    });
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    expect(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "gpt-test",
+          outputTokens: 1,
+          providerId: "openai",
+          totalLatencyMs: 20,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Still running.",
+        type: "complete",
+        usage: null,
+      });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("status", { name: "Chat is running" }),
+      ).not.toBeInTheDocument();
+    });
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue after reattach",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(String(queueCall![1]?.body))).toMatchObject({
+        message: "continue after reattach",
+        modelId: "gpt-test",
+        providerId: "openai",
+      });
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("keeps composer model when messages resolve after settings during active-run reattach", async () => {
+    // Race: loadChatMessages starts while settings are still loading (empty
+    // catalog in the request closure). Settings then finish and reconcile the
+    // model; messages resolve later. applyComposerModelForPlanMode must use the
+    // latest catalog, not the stale empty one from request start.
+    const settingsGate = deferred<Response>();
+    const messagesGate = deferred<Response>();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/settings") {
+          return settingsGate.promise;
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return messagesGate.promise;
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(([url]) => {
+          const value = typeof url === "string" ? url : url.toString();
+          return value.includes(
+            "/api/workspaces/workspace-1/chats/chat-1/messages",
+          );
+        }),
+      ).toBe(true);
+    });
+
+    await act(async () => {
+      settingsGate.resolve(jsonResponse(settings));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    });
+
+    await act(async () => {
+      messagesGate.resolve(
+        jsonResponse({
+          messages: [
+            chatMessages.messages[0],
+            {
+              ...chatMessages.messages[1],
+              content: "Persisted fallback text.",
+              id: "message-assistant-stream",
+              metrics: null,
+              parts: [
+                { text: "Persisted fallback reasoning.", type: "reasoning" },
+                { text: "Persisted fallback text.", type: "text" },
+              ],
+              reasoning: "Persisted fallback reasoning.",
+              toolCalls: [],
+            },
+          ],
+          activeRun: {
+            acceptingGuidance: true,
+            assistantMessageId: "message-assistant-stream",
+            chatId: "chat-1",
+            lastSequence: 0,
+            runId: "request-stream",
+            workspaceId: "workspace-1",
+          },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=0",
+        ),
+      ).toBe(true);
+    });
+
+    // Messages resolved after settings: model must stay restored, not cleared
+    // by a stale empty-catalog applyComposerModelForPlanMode closure.
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Still running.",
+        type: "textDelta",
+      });
+    });
+    expect(await screen.findByText("Still running.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    expect(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "gpt-test",
+          outputTokens: 1,
+          providerId: "openai",
+          totalLatencyMs: 20,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Still running.",
+        type: "complete",
+        usage: null,
+      });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("status", { name: "Chat is running" }),
+      ).not.toBeInTheDocument();
+    });
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "continue after late messages",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(String(queueCall![1]?.body))).toMatchObject({
+        message: "continue after late messages",
+        modelId: "gpt-test",
+        providerId: "openai",
+      });
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("restores plan mode model after active-run reattach when settings load late", async () => {
+    const baseModel = settings.configuredModels[0]!;
+    const settingsWithPlanModel = {
+      ...settings,
+      configuredModels: [
+        baseModel,
+        {
+          ...baseModel,
+          activeProviderId: "anthropic",
+          displayName: "GPT Alt",
+          id: "gpt-alt",
+          providerIds: ["anthropic"],
+          thinkingLevel: null,
+        },
+      ],
+      plan: {
+        ...settings.plan,
+        modeModelId: "gpt-alt",
+      },
+    };
+    const settingsGate = deferred<Response>();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/settings") {
+          return settingsGate.promise;
+        }
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              {
+                ...chatMessages.messages[0],
+                content: "Plan this feature.",
+                parts: [{ text: "Plan this feature.", type: "text" }],
+                sessionMode: "plan",
+              },
+              {
+                ...chatMessages.messages[1],
+                content: "Planning…",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [{ text: "Planning…", type: "text" }],
+                reasoning: null,
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              acceptingGuidance: true,
+              assistantMessageId: "message-assistant-stream",
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url]) =>
+            typeof url === "string" &&
+            url ===
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream?afterSequence=0",
+        ),
+      ).toBe(true);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Plan mode" })).toHaveAttribute(
+        "aria-pressed",
+        "true",
+      );
+    });
+
+    await act(async () => {
+      settingsGate.resolve(jsonResponse(settingsWithPlanModel));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
+      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
+        "aria-disabled",
+        "true",
+      );
+    });
+
+    await userEvent.click(screen.getByLabelText("Model"));
+    expect(
+      screen.getByRole("button", { name: "Model: GPT Alt" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Model: GPT Test" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "gpt-alt",
+          outputTokens: 1,
+          providerId: "anthropic",
+          totalLatencyMs: 20,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Planning…",
+        type: "complete",
+        usage: null,
+      });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("status", { name: "Chat is running" }),
+      ).not.toBeInTheDocument();
+    });
+
+    await userEvent.type(
+      screen.getByPlaceholderText(defaultComposerPlaceholder),
+      "plan follow-up",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    await waitFor(() => {
+      const queueCall = fetchMock.mock.calls.find(
+        ([url]) => url === "/api/workspaces/workspace-1/chat/queue",
+      );
+      expect(queueCall).toBeDefined();
+      expect(JSON.parse(String(queueCall![1]?.body))).toMatchObject({
+        message: "plan follow-up",
+        modelId: "gpt-alt",
+        providerId: "anthropic",
+        sessionMode: "plan",
+      });
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
 });

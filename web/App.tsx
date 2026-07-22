@@ -1888,6 +1888,8 @@ export function App() {
   const hasAppliedInitialBrowserRouteRef = useRef(false);
   const hasManuallySelectedModelRef = useRef(false);
   const hasManuallySelectedThinkingLevelRef = useRef(false);
+  const isLoadingSettingsRef = useRef(isLoadingSettings);
+  isLoadingSettingsRef.current = isLoadingSettings;
   const workspaceSidebarRef = useRef<HTMLElement | null>(null);
   const workspaceChatLongPressTimeoutRef = useRef<number | null>(null);
   const suppressNextWorkspaceChatClickRef = useRef(false);
@@ -2430,6 +2432,14 @@ export function App() {
       thinkingLevel: defaultThinkingLevelForModel(model),
     };
   }, [availableModels, defaultAgentDefinition]);
+  // Latest catalog/settings for async restore paths (e.g. loadChatMessages).
+  // Closures must not apply a stale empty catalog after settings have arrived.
+  const availableModelsRef = useRef(availableModels);
+  availableModelsRef.current = availableModels;
+  const defaultComposerSelectionRef = useRef(defaultComposerSelection);
+  defaultComposerSelectionRef.current = defaultComposerSelection;
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
   const {
     skills: availableSkills,
     status: skillCatalogStatus,
@@ -5099,7 +5109,38 @@ export function App() {
   }, [activeChatId, activeWorkspace?.id, activeWorkspaceId, workspaces]);
 
   useEffect(() => {
+    // Settings still loading: empty availableModels is temporary, not authoritative.
+    // Clearing selection here races with active-run/message restore and leaves the
+    // composer stuck on "No enabled models" after settings arrive.
+    if (isLoadingSettings) {
+      return;
+    }
+
+    const planModeModelId = isPlanModeEnabled
+      ? settings?.plan.modeModelId?.trim() || ""
+      : "";
+    const planModeModel =
+      planModeModelId.length > 0
+        ? (availableModels.find((model) => model.id === planModeModelId) ??
+          null)
+        : null;
+
     setSelectedModelId((current) => {
+      // Priority: valid manual pick; plan-mode dedicated model; default agent/first.
+      if (
+        hasManuallySelectedModelRef.current &&
+        current &&
+        availableModels.some((model) => model.id === current)
+      ) {
+        return current;
+      }
+
+      if (planModeModel) {
+        hasManuallySelectedModelRef.current = true;
+        hasManuallySelectedThinkingLevelRef.current = false;
+        return planModeModel.id;
+      }
+
       if (!defaultComposerSelection.modelId) {
         hasManuallySelectedModelRef.current = false;
         return "";
@@ -5116,16 +5157,31 @@ export function App() {
       hasManuallySelectedModelRef.current = false;
       return defaultComposerSelection.modelId;
     });
-  }, [availableModels, defaultComposerSelection.modelId]);
+  }, [
+    availableModels,
+    defaultComposerSelection.modelId,
+    isLoadingSettings,
+    isPlanModeEnabled,
+    settings?.plan.modeModelId,
+  ]);
 
   useEffect(() => {
+    if (isLoadingSettings) {
+      return;
+    }
+
     const selectedModel = availableModels.find(
       (model) => model.id === selectedModelId,
     );
     setSelectedThinkingLevel((current) => {
       if (!selectedModel) {
-        hasManuallySelectedThinkingLevelRef.current = false;
-        return "";
+        // Authoritative empty catalog only: do not clear thinking while the
+        // selected model id is still catching up after settings load.
+        if (!defaultComposerSelection.modelId) {
+          hasManuallySelectedThinkingLevelRef.current = false;
+          return "";
+        }
+        return current;
       }
 
       const defaultThinkingLevel =
@@ -5149,6 +5205,7 @@ export function App() {
     availableModels,
     defaultComposerSelection.modelId,
     defaultComposerSelection.thinkingLevel,
+    isLoadingSettings,
     selectedModelId,
   ]);
 
@@ -6808,12 +6865,25 @@ export function App() {
   }
 
   function applyComposerModelForPlanMode(enabled: boolean) {
+    // Settings still loading: empty availableModels is temporary. Defer to the
+    // authoritative model-catalog reconciliation effect once settings arrive.
+    if (isLoadingSettingsRef.current) {
+      return;
+    }
+
+    // Always read the latest catalog/settings. Async callers (loadChatMessages)
+    // may have started while settings were still loading and must not apply a
+    // stale empty catalog after settings have already reconciled the selection.
+    const availableModelsNow = availableModelsRef.current;
+    const defaultComposerSelectionNow = defaultComposerSelectionRef.current;
+    const settingsNow = settingsRef.current;
+
     if (enabled) {
-      const modeModelId = settings?.plan.modeModelId?.trim() || "";
+      const modeModelId = settingsNow?.plan.modeModelId?.trim() || "";
       if (!modeModelId) {
         return;
       }
-      const model = availableModels.find(
+      const model = availableModelsNow.find(
         (candidate) => candidate.id === modeModelId,
       );
       if (!model) {
@@ -6834,10 +6904,23 @@ export function App() {
       return;
     }
 
+    // Authoritative empty catalog: keep the existing empty-label behavior.
+    // Temporary empty catalog while settings load is handled above.
+    if (
+      !defaultComposerSelectionNow.modelId &&
+      availableModelsNow.length === 0
+    ) {
+      hasManuallySelectedModelRef.current = false;
+      hasManuallySelectedThinkingLevelRef.current = false;
+      setSelectedModelId("");
+      setSelectedThinkingLevel("");
+      return;
+    }
+
     hasManuallySelectedModelRef.current = false;
     hasManuallySelectedThinkingLevelRef.current = false;
-    setSelectedModelId(defaultComposerSelection.modelId);
-    setSelectedThinkingLevel(defaultComposerSelection.thinkingLevel);
+    setSelectedModelId(defaultComposerSelectionNow.modelId);
+    setSelectedThinkingLevel(defaultComposerSelectionNow.thinkingLevel);
   }
 
   function rememberPlanModeForChatKey(chatKey: string, value: boolean) {
