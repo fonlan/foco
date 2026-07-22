@@ -182,6 +182,14 @@ impl CountingSemaphore {
             .available
     }
 
+    fn queued_waiters(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .queue
+            .len()
+    }
+
     fn acquire_until(
         self: &Arc<Self>,
         started_at: Instant,
@@ -314,6 +322,39 @@ impl Drop for WorkspaceDatabaseHandle {
         // blocked behind a slow connection teardown.
         self._permits.take();
         self.database.take();
+    }
+}
+
+/// Wait until the ordinary gate for `workspace_path` has at least `min_queued`
+/// waiters enqueued (FIFO queue length after a blocked `acquire_until`).
+///
+/// Tests use this to prove a concurrent open has entered the gate wait queue
+/// before releasing holders. Production code must not rely on this helper.
+pub fn wait_for_ordinary_gate_queued_waiters(
+    workspace_path: impl AsRef<Path>,
+    min_queued: usize,
+    timeout: Duration,
+) -> bool {
+    let key = std::fs::canonicalize(workspace_path.as_ref())
+        .unwrap_or_else(|_| workspace_path.as_ref().to_path_buf());
+    let deadline = Instant::now() + timeout;
+    loop {
+        let queued = {
+            let gates = WORKSPACE_DATABASE_GATES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            gates
+                .get(&key)
+                .map(|gate| gate.ordinary.queued_waiters())
+                .unwrap_or(0)
+        };
+        if queued >= min_queued {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::yield_now();
     }
 }
 

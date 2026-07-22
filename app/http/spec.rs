@@ -239,6 +239,9 @@ pub(crate) async fn generate_workspace_spec(
         .map_err(spec_workspace_error)?;
     log_workspace_spec_job_status(&workspace_id, &job);
     let response = workspace_spec_job_summary(job.clone())?;
+    // Release ordinary before the runner can open the same workspace DB.
+    drop(database);
+
     let runtime_state = state.clone();
     let runtime_workspace_id = workspace_id.clone();
     let runtime_job_id = job.id.clone();
@@ -269,15 +272,22 @@ pub(crate) async fn workspace_spec_jobs(
 ) -> Result<Json<WorkspaceSpecJobsResponse>, ApiError> {
     let config = config_snapshot(&state)?;
     let workspace = workspace_by_id(&config, &workspace_id)?;
-    let database =
-        WorkspaceDatabase::open_or_create(&workspace.path).map_err(spec_workspace_error)?;
     let limit = spec_job_limit(query.limit)?;
 
-    let jobs = database
-        .workspace_spec_jobs(limit)
-        .map_err(spec_workspace_error)?
+    // Drop the ordinary handle before mapping/serde so list polling does not hold the gate.
+    // Dual-UI overlap is de-duplicated on the frontend (single-flight); avoid a sync path
+    // lock here so waiters do not block Tokio workers while ordinary is saturated.
+    let jobs = {
+        let database =
+            WorkspaceDatabase::open_or_create(&workspace.path).map_err(spec_workspace_error)?;
+        database
+            .workspace_spec_jobs_list(limit)
+            .map_err(spec_workspace_error)?
+    };
+
+    let jobs = jobs
         .into_iter()
-        .map(workspace_spec_job_summary)
+        .map(workspace_spec_job_list_summary)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(Json(WorkspaceSpecJobsResponse { jobs }))
@@ -446,19 +456,25 @@ fn workspace_spec_jobs_for_workspace(
     limit: i64,
     retryable_only: bool,
 ) -> Result<(Vec<WorkspaceSpecJobWithWorkspaceSummary>, i64), WorkspaceDatabaseError> {
-    let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
-    let total_count = database.workspace_spec_job_count_filtered(retryable_only)?;
-    let jobs = database.workspace_spec_jobs_filtered(limit, retryable_only)?;
-    let mut chat_ids = Vec::new();
-    let mut seen_chat_ids = std::collections::HashSet::new();
-    for job in &jobs {
-        if let Some(chat_id) = &job.chat_id
-            && seen_chat_ids.insert(chat_id.clone())
-        {
-            chat_ids.push(chat_id.clone());
+    // Drop the ordinary handle before mapping/serde so settings polling does not hold the gate.
+    // Dual-UI overlap is de-duplicated on the frontend (single-flight); avoid a sync path
+    // lock here so waiters do not block Tokio workers while ordinary is saturated.
+    let (jobs, total_count, chat_titles) = {
+        let database = WorkspaceDatabase::open_or_create(&workspace.path)?;
+        let total_count = database.workspace_spec_job_count_filtered(retryable_only)?;
+        let jobs = database.workspace_spec_jobs_list_filtered(limit, retryable_only)?;
+        let mut chat_ids = Vec::new();
+        let mut seen_chat_ids = std::collections::HashSet::new();
+        for job in &jobs {
+            if let Some(chat_id) = &job.chat_id
+                && seen_chat_ids.insert(chat_id.clone())
+            {
+                chat_ids.push(chat_id.clone());
+            }
         }
-    }
-    let chat_titles = database.chat_titles_by_ids(&chat_ids)?;
+        let chat_titles = database.chat_titles_by_ids(&chat_ids)?;
+        (jobs, total_count, chat_titles)
+    };
     let jobs = jobs
         .into_iter()
         .map(|job| {
@@ -466,7 +482,7 @@ fn workspace_spec_jobs_for_workspace(
                 .chat_id
                 .as_ref()
                 .and_then(|chat_id| chat_titles.get(chat_id).cloned());
-            let job = workspace_spec_job_summary(job).map_err(|error| {
+            let job = workspace_spec_job_list_summary(job).map_err(|error| {
                 WorkspaceDatabaseError::InvalidWorkspaceSpec {
                     message: error.message,
                 }
@@ -492,11 +508,11 @@ pub(crate) fn workspace_spec_response(
         .map(workspace_spec_view)
         .unwrap_or_else(default_workspace_spec_view);
     let latest_job = database
-        .workspace_spec_jobs(1)
+        .workspace_spec_jobs_list(1)
         .map_err(spec_workspace_error)?
         .into_iter()
         .next()
-        .map(workspace_spec_job_summary)
+        .map(workspace_spec_job_list_summary)
         .transpose()?;
 
     Ok(WorkspaceSpecResponse { latest_job, ..spec })
@@ -542,6 +558,31 @@ fn workspace_spec_job_summary(
         model_id: job.model_id,
         base_revision: job.base_revision,
         input_summary: workspace_spec_json(&job.input_summary_json, "input_summary_json")?,
+        output: job
+            .output_json
+            .map(|value| workspace_spec_json(&value, "output_json"))
+            .transpose()?,
+        error_message: job.error_message,
+        created_at: job.created_at,
+        started_at: job.started_at,
+        completed_at: job.completed_at,
+        has_retry: job.has_retry,
+    })
+}
+
+/// List/poll summary: input is always empty; output is already a bounded projection from Store.
+fn workspace_spec_job_list_summary(
+    job: WorkspaceSpecJobRecord,
+) -> Result<WorkspaceSpecJobSummary, ApiError> {
+    Ok(WorkspaceSpecJobSummary {
+        id: job.id,
+        trigger_type: job.trigger_type,
+        status: job.status,
+        chat_id: job.chat_id,
+        run_id: job.run_id,
+        model_id: job.model_id,
+        base_revision: job.base_revision,
+        input_summary: Value::Object(Default::default()),
         output: job
             .output_json
             .map(|value| workspace_spec_json(&value, "output_json"))

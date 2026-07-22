@@ -11,4 +11,5 @@ pub use workspace_gate::{
     WORKSPACE_DATABASE_TOTAL_CAPACITY, WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle,
     WorkspaceMemoryDatabaseHandle, open_workspace_database, open_workspace_database_critical,
     open_workspace_memory_database, open_workspace_memory_database_critical,
+    wait_for_ordinary_gate_queued_waiters,
 };

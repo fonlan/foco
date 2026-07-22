@@ -42,6 +42,7 @@ pub use crate::workspace_gate::{
     WORKSPACE_DATABASE_TOTAL_CAPACITY, WorkspaceDatabaseGateKind, WorkspaceDatabaseHandle,
     WorkspaceMemoryDatabaseHandle, open_workspace_database, open_workspace_database_critical,
     open_workspace_memory_database, open_workspace_memory_database_critical,
+    wait_for_ordinary_gate_queued_waiters,
 };
 pub use workspace_records::{
     AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
@@ -1537,33 +1538,88 @@ impl WorkspaceDatabase {
         self.workspace_spec_jobs_filtered(limit, false)
     }
 
+    /// Lightweight list for HTTP/settings polling: does not materialize full
+    /// `input_summary_json` (often tens of KB of current_spec_markdown). Output is
+    /// projected to a bounded JSON of UI fields only. Use [`Self::workspace_spec_job`]
+    /// or the full list helpers when prepare/retry/runner need complete payloads.
+    pub fn workspace_spec_jobs_list(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.workspace_spec_jobs_list_filtered(limit, false)
+    }
+
+    pub fn workspace_spec_jobs_list_filtered(
+        &self,
+        limit: i64,
+        retryable_only: bool,
+    ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.query_workspace_spec_jobs(limit, retryable_only, true)
+    }
+
     pub fn workspace_spec_jobs_filtered(
         &self,
         limit: i64,
         retryable_only: bool,
+    ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
+        self.query_workspace_spec_jobs(limit, retryable_only, false)
+    }
+
+    fn query_workspace_spec_jobs(
+        &self,
+        limit: i64,
+        retryable_only: bool,
+        list_only: bool,
     ) -> Result<Vec<WorkspaceSpecJobRecord>, WorkspaceDatabaseError> {
         if limit <= 0 {
             return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
                 message: "workspace spec job limit must be positive".to_string(),
             });
         }
+        // List path: never SELECT full input_summary_json; project output to small UI fields.
+        // Full path keeps complete JSON for prepare/retry/runner and internal tests.
+        let select_sql = if list_only {
+            "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                    '{}' AS input_summary_json,
+                    CASE
+                      WHEN output_json IS NULL THEN NULL
+                      ELSE json_object(
+                        'revision', json_extract(output_json, '$.revision'),
+                        'contentBytes', json_extract(output_json, '$.contentBytes'),
+                        'updateMode', json_extract(output_json, '$.updateMode'),
+                        'editCount', json_extract(output_json, '$.editCount')
+                      )
+                    END AS output_json,
+                    error_message, created_at,
+                    started_at, completed_at, lease_renewed_at,
+                    EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
+             FROM workspace_spec_jobs
+             WHERE (?2 = 0
+                    OR status IN (?3, ?4)
+                    OR (status = ?5 AND NOT EXISTS(
+                        SELECT 1 FROM workspace_spec_jobs retry
+                        WHERE retry.retry_of_job_id = workspace_spec_jobs.id
+                    )))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1"
+        } else {
+            "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
+                    input_summary_json, output_json, error_message, created_at,
+                    started_at, completed_at, lease_renewed_at,
+                    EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
+             FROM workspace_spec_jobs
+             WHERE (?2 = 0
+                    OR status IN (?3, ?4)
+                    OR (status = ?5 AND NOT EXISTS(
+                        SELECT 1 FROM workspace_spec_jobs retry
+                        WHERE retry.retry_of_job_id = workspace_spec_jobs.id
+                    )))
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1"
+        };
         let mut statement = self
             .connection
-            .prepare(
-                "SELECT id, trigger_type, status, chat_id, run_id, model_id, base_revision,
-                        input_summary_json, output_json, error_message, created_at,
-                        started_at, completed_at, lease_renewed_at,
-                        EXISTS(SELECT 1 FROM workspace_spec_jobs retry WHERE retry.retry_of_job_id = workspace_spec_jobs.id)
-                 FROM workspace_spec_jobs
-                 WHERE (?2 = 0
-                        OR status IN (?3, ?4)
-                        OR (status = ?5 AND NOT EXISTS(
-                            SELECT 1 FROM workspace_spec_jobs retry
-                            WHERE retry.retry_of_job_id = workspace_spec_jobs.id
-                        )))
-                 ORDER BY created_at DESC, id DESC
-                 LIMIT ?1",
-            )
+            .prepare(select_sql)
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(
@@ -2022,6 +2078,59 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| self.sqlite_error(source))?;
         Ok(deleted > 0)
+    }
+
+    /// Bounded ops prune for historical `failed` Spec jobs (same status gate as
+    /// [`Self::delete_failed_workspace_spec_job`]). Oldest completed_at first, then
+    /// created_at/id. Does not touch queued/running/completed/skipped, does not cascade
+    /// chats, and does not require a schema migration. Cap keeps a single call cheap.
+    ///
+    /// Skips every failed ancestor that still has an active (`queued`/`running`) retry
+    /// descendant anywhere in the retry chain (recursive), so `ON DELETE SET NULL` cannot
+    /// sever live retry provenance through intermediate terminal retries. Terminal-only
+    /// retry children do not block prune (same as single-row delete).
+    pub fn prune_failed_workspace_spec_jobs(
+        &mut self,
+        limit: i64,
+    ) -> Result<u64, WorkspaceDatabaseError> {
+        const MAX_PRUNE_BATCH: i64 = 500;
+        if limit <= 0 {
+            return Err(WorkspaceDatabaseError::InvalidWorkspaceSpec {
+                message: "workspace spec failed-job prune limit must be positive".to_string(),
+            });
+        }
+        let limit = limit.min(MAX_PRUNE_BATCH);
+        // Walk retry_of_job_id upward from every active retry so multi-hop chains
+        // (failed → failed → queued) keep all ancestors until the active leaf settles.
+        let deleted = self
+            .connection
+            .execute(
+                "WITH RECURSIVE protected_ancestors(id) AS (
+                   SELECT retry_of_job_id
+                   FROM workspace_spec_jobs
+                   WHERE status IN ('queued', 'running')
+                     AND retry_of_job_id IS NOT NULL
+                   UNION
+                   SELECT parent.retry_of_job_id
+                   FROM workspace_spec_jobs AS parent
+                   INNER JOIN protected_ancestors AS protected
+                     ON parent.id = protected.id
+                   WHERE parent.retry_of_job_id IS NOT NULL
+                 )
+                 DELETE FROM workspace_spec_jobs
+                 WHERE id IN (
+                   SELECT parent.id FROM workspace_spec_jobs AS parent
+                   WHERE parent.status = ?1
+                     AND parent.id NOT IN (SELECT id FROM protected_ancestors)
+                   ORDER BY parent.completed_at ASC NULLS FIRST,
+                            parent.created_at ASC,
+                            parent.id ASC
+                   LIMIT ?2
+                 )",
+                params![WorkspaceSpecJobStatus::Failed.as_str(), limit],
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(deleted as u64)
     }
 
     pub fn chat_spec_snapshot(

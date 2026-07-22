@@ -287,6 +287,7 @@ import {
   responseErrorMessage,
 } from "./shared/api-client";
 import { installUpdateAndWaitForRestart } from "./shared/update-install";
+import { fetchWorkspaceSpecJobsList } from "./shared/workspace-spec-jobs-list";
 const ScheduledTasksPage = lazy(() =>
   import("./features/scheduled-tasks/ScheduledTasksPage").then((m) => ({
     default: m.ScheduledTasksPage,
@@ -4020,9 +4021,7 @@ export function App() {
 
             let jobsResponse: WorkspaceSpecJobsResponse;
             try {
-              jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
-                `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
-              );
+              jobsResponse = await fetchWorkspaceSpecJobsList(workspaceId, 24);
             } catch (requestError) {
               if (
                 !observer.cancelled &&
@@ -6888,9 +6887,7 @@ export function App() {
     try {
       for (const delayMs of attempts) {
         await delay(delayMs);
-        const jobsResponse = await requestJson<WorkspaceSpecJobsResponse>(
-          `/api/workspaces/${encodeURIComponent(workspaceId)}/spec/jobs?limit=24`,
-        );
+        const jobsResponse = await fetchWorkspaceSpecJobsList(workspaceId, 24);
         const job = jobsResponse.jobs.find(
           (candidate) =>
             candidate.chatId === chatId &&

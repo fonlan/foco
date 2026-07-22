@@ -20172,14 +20172,19 @@ async fn remote_sidecar_spec_jobs(
         .and_then(|value| value.parse::<i64>().ok())
         .unwrap_or(50)
         .clamp(1, 100);
-    let database =
-        foco_store::workspace::WorkspaceDatabase::open_or_create(sidecar_workspace_path(&state))
-            .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
-    let jobs = database
-        .workspace_spec_jobs(limit)
-        .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    // Drop the ordinary handle before mapping/serde so list polling does not hold the gate.
+    let jobs = {
+        let database = foco_store::workspace::WorkspaceDatabase::open_or_create(
+            sidecar_workspace_path(&state),
+        )
+        .map_err(|e| ApiError::from_workspace_error(e).into_response())?;
+        database
+            .workspace_spec_jobs_list(limit)
+            .map_err(|e| ApiError::from_workspace_error(e).into_response())?
+    };
+    let jobs = jobs
         .into_iter()
-        .map(remote_sidecar_spec_job_json)
+        .map(remote_sidecar_spec_job_list_json)
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({ "jobs": jobs })))
 }
@@ -20250,6 +20255,37 @@ fn remote_sidecar_spec_job_json(
         "modelId": job.model_id,
         "baseRevision": job.base_revision,
         "inputSummary": input_summary,
+        "output": output,
+        "errorMessage": job.error_message,
+        "createdAt": job.created_at,
+        "startedAt": job.started_at,
+        "completedAt": job.completed_at,
+        "hasRetry": job.has_retry,
+    }))
+}
+
+/// List/poll summary: omit full input payloads; output is already a bounded Store projection.
+fn remote_sidecar_spec_job_list_json(
+    job: foco_store::workspace::WorkspaceSpecJobRecord,
+) -> Result<Value, axum::response::Response> {
+    let output = job
+        .output_json
+        .as_deref()
+        .map(|value| serde_json::from_str::<Value>(value))
+        .transpose()
+        .map_err(|e| {
+            ApiError::internal(format!("workspace spec output_json is invalid: {e}"))
+                .into_response()
+        })?;
+    Ok(json!({
+        "id": job.id,
+        "triggerType": job.trigger_type,
+        "status": job.status,
+        "chatId": job.chat_id,
+        "runId": job.run_id,
+        "modelId": job.model_id,
+        "baseRevision": job.base_revision,
+        "inputSummary": {},
         "output": output,
         "errorMessage": job.error_message,
         "createdAt": job.created_at,

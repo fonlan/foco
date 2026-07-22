@@ -23,6 +23,7 @@ use foco_store::{
         MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
         WORKSPACE_MEMORY_DREAM_SCHEMA_SQL, WORKSPACE_MEMORY_SCHEMA_SQL,
     },
+    wait_for_ordinary_gate_queued_waiters,
     workspace::{
         AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, LlmRequestAuditFilters,
         LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRollupFilters,
@@ -6382,6 +6383,576 @@ fn workspace_spec_jobs_redact_audit_json_fields() {
         serde_json::from_str(job.output_json.as_deref().expect("output json")).expect("output");
     assert_eq!(output["response"]["password"], "[REDACTED]");
     assert_eq!(output["contentBytes"], 12);
+}
+
+#[test]
+fn workspace_spec_jobs_list_omits_large_input_payload() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    let large_markdown = "x".repeat(48 * 1024);
+    let input_summary = json!({
+        "currentSpecMarkdown": large_markdown,
+        "currentSpecRevision": 3,
+        "userMessageId": "user-1",
+    })
+    .to_string();
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-large-input",
+            trigger_type: "chat_completed",
+            chat_id: None,
+            run_id: Some("run-1"),
+            model_id: Some("model-1"),
+            base_revision: Some(3),
+            input_summary_json: Some(&input_summary),
+        })
+        .expect("insert large-input job");
+    database
+        .mark_workspace_spec_job_completed(
+            "spec-job-large-input",
+            Some(r#"{"updateMode":"patch","editCount":2,"revision":4,"contentBytes":128,"extra":"ignored"}"#),
+        )
+        .expect("complete job");
+
+    let listed = database.workspace_spec_jobs_list(10).expect("list jobs");
+    assert_eq!(listed.len(), 1);
+    let listed = &listed[0];
+    assert_eq!(listed.id, "spec-job-large-input");
+    assert_eq!(listed.status, "completed");
+    assert_eq!(listed.run_id.as_deref(), Some("run-1"));
+    assert_eq!(listed.base_revision, Some(3));
+    assert_eq!(listed.input_summary_json, "{}");
+    assert!(!listed.input_summary_json.contains("currentSpecMarkdown"));
+    assert!(!listed.input_summary_json.contains(&large_markdown));
+    let listed_output: Value =
+        serde_json::from_str(listed.output_json.as_deref().expect("list output"))
+            .expect("list output json");
+    assert_eq!(listed_output["revision"], 4);
+    assert_eq!(listed_output["contentBytes"], 128);
+    assert_eq!(listed_output["updateMode"], "patch");
+    assert_eq!(listed_output["editCount"], 2);
+    assert!(listed_output.get("extra").is_none());
+
+    let full = database
+        .workspace_spec_job("spec-job-large-input")
+        .expect("full job lookup")
+        .expect("full job");
+    assert!(full.input_summary_json.contains("currentSpecMarkdown"));
+    assert!(full.input_summary_json.contains(&large_markdown));
+    let full_output: Value =
+        serde_json::from_str(full.output_json.as_deref().expect("full output"))
+            .expect("full output");
+    assert_eq!(full_output["extra"], "ignored");
+}
+
+#[test]
+fn workspace_spec_jobs_list_with_large_input_is_fast_under_gated_open() {
+    // Regression: list must not materialize tens of KB of input_summary_json, so a
+    // gated ordinary open + list stays well under the 5s ordinary timeout.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("seed database");
+        let large_markdown = "y".repeat(48 * 1024);
+        let input_summary = json!({
+            "currentSpecMarkdown": large_markdown,
+            "currentSpecRevision": 7,
+        })
+        .to_string();
+        for index in 0..40 {
+            let id = format!("spec-job-fat-{index}");
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id: &id,
+                    trigger_type: "chat_completed",
+                    chat_id: None,
+                    run_id: Some("run-fat"),
+                    model_id: Some("model-1"),
+                    base_revision: Some(7),
+                    input_summary_json: Some(&input_summary),
+                })
+                .expect("insert fat job");
+            database
+                .mark_workspace_spec_job_completed(
+                    &id,
+                    Some(r#"{"revision":8,"contentBytes":64,"updateMode":"patch","editCount":1}"#),
+                )
+                .expect("complete fat job");
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("gated list open");
+    let listed = database
+        .workspace_spec_jobs_list(20)
+        .expect("lightweight list");
+    drop(database);
+    let elapsed = started.elapsed();
+    assert_eq!(listed.len(), 20);
+    assert!(
+        listed.iter().all(|job| job.input_summary_json == "{}"
+            && !job.input_summary_json.contains("currentSpecMarkdown")),
+        "list rows must omit large input payloads"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "lightweight list under gated open should finish quickly, took {elapsed:?}"
+    );
+}
+
+#[test]
+fn workspace_spec_jobs_list_does_not_starve_concurrent_ordinary_open() {
+    // Two list holders occupy both ordinary slots after a lightweight list; a third
+    // ordinary open must wait while they hold, then succeed promptly after release
+    // (no fixed sleep as the correctness signal).
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("seed database");
+        let large_markdown = "z".repeat(40 * 1024);
+        let input_summary = json!({
+            "currentSpecMarkdown": large_markdown,
+            "currentSpecRevision": 2,
+        })
+        .to_string();
+        for index in 0..30 {
+            let id = format!("spec-job-list-starve-{index}");
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id: &id,
+                    trigger_type: "manual_refresh",
+                    chat_id: None,
+                    run_id: None,
+                    model_id: Some("model-1"),
+                    base_revision: Some(2),
+                    input_summary_json: Some(&input_summary),
+                })
+                .expect("insert job");
+            database
+                .mark_workspace_spec_job_completed(&id, None)
+                .expect("complete job");
+        }
+    }
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let holders_ready = Arc::new(Barrier::new(3));
+    let holders_release = Arc::new(Barrier::new(3));
+    let mut list_workers = Vec::new();
+    for _ in 0..2 {
+        let workspace_path = workspace_path.clone();
+        let holders_ready = holders_ready.clone();
+        let holders_release = holders_release.clone();
+        list_workers.push(thread::spawn(move || {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace_path.as_path()).expect("list open");
+            let jobs = database.workspace_spec_jobs_list(15).expect("list jobs");
+            assert_eq!(jobs.len(), 15);
+            assert!(jobs.iter().all(|job| job.input_summary_json == "{}"));
+            holders_ready.wait();
+            holders_release.wait();
+            drop(database);
+            jobs.len()
+        }));
+    }
+
+    holders_ready.wait();
+
+    let business_path = workspace_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let business = thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let database = WorkspaceDatabase::open_or_create(business_path.as_path())
+            .expect("business ordinary open must succeed after list holders release");
+        let count = database.workspace_spec_job_count().expect("job count");
+        drop(database);
+        done_tx
+            .send((count, started.elapsed()))
+            .expect("send business result");
+    });
+
+    // Prove the third ordinary open has entered the gate waiter queue before
+    // releasing holders (not merely that the business thread was scheduled).
+    assert!(
+        wait_for_ordinary_gate_queued_waiters(workspace_path.as_path(), 1, Duration::from_secs(2),),
+        "business open must enqueue on the ordinary gate while list holders are live"
+    );
+
+    match done_rx.recv_timeout(Duration::from_millis(250)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(_) => panic!("business open must wait while two ordinary list holders are live"),
+        Err(error) => panic!("business channel failed while holders live: {error}"),
+    }
+
+    holders_release.wait();
+    let (count, elapsed) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("business open after list holders release");
+    business.join().expect("business worker");
+    let list_counts: Vec<_> = list_workers
+        .into_iter()
+        .map(|worker| worker.join().expect("list worker"))
+        .collect();
+    assert!(list_counts.iter().all(|&count| count == 15));
+    assert_eq!(count, 30);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "business open should not wait near the 5s ordinary timeout; took {elapsed:?}"
+    );
+}
+
+#[test]
+fn prune_failed_workspace_spec_jobs_is_status_gated_and_bounded() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-running-keep",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert running");
+    assert!(
+        database
+            .mark_workspace_spec_job_running("spec-job-running-keep")
+            .expect("mark running")
+    );
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-completed-keep",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert completed");
+    database
+        .mark_workspace_spec_job_completed("spec-job-completed-keep", None)
+        .expect("mark completed");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-skipped-keep",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: None,
+        })
+        .expect("insert skipped");
+    database
+        .mark_workspace_spec_job_skipped("spec-job-skipped-keep", "not needed")
+        .expect("mark skipped");
+
+    for index in 0..5 {
+        let id = format!("spec-job-failed-prune-{index}");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: &id,
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: Some(r#"{"currentSpecMarkdown":"fat"}"#),
+            })
+            .expect("insert failed");
+        database
+            .mark_workspace_spec_job_failed(&id, "provider failed")
+            .expect("mark failed");
+    }
+
+    assert_eq!(
+        database
+            .prune_failed_workspace_spec_jobs(0)
+            .expect_err("zero limit")
+            .to_string()
+            .contains("positive"),
+        true
+    );
+
+    let deleted = database
+        .prune_failed_workspace_spec_jobs(3)
+        .expect("prune batch");
+    assert_eq!(deleted, 3);
+    assert_eq!(
+        database
+            .workspace_spec_job_count()
+            .expect("count after prune"),
+        5
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-running-keep")
+            .expect("running")
+            .is_some()
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-completed-keep")
+            .expect("completed")
+            .is_some()
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-skipped-keep")
+            .expect("skipped")
+            .is_some()
+    );
+
+    let deleted_rest = database
+        .prune_failed_workspace_spec_jobs(10)
+        .expect("prune remainder");
+    assert_eq!(deleted_rest, 2);
+    assert_eq!(database.workspace_spec_job_count().expect("final count"), 3);
+    assert_eq!(
+        database
+            .prune_failed_workspace_spec_jobs(10)
+            .expect("empty prune"),
+        0
+    );
+}
+
+#[test]
+fn prune_failed_workspace_spec_jobs_skips_parents_with_active_retry() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-parent-with-active-retry",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: Some(r#"{"currentSpecMarkdown":"fat-parent"}"#),
+        })
+        .expect("insert parent");
+    database
+        .mark_workspace_spec_job_failed("spec-job-parent-with-active-retry", "provider failed")
+        .expect("mark parent failed");
+    let retry = database
+        .retry_failed_workspace_spec_job(
+            "spec-job-parent-with-active-retry",
+            "spec-job-active-retry-child",
+            Some("model-2"),
+        )
+        .expect("retry")
+        .expect("retry job");
+    assert_eq!(retry.status, "queued");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-orphan-failed",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: Some(r#"{"currentSpecMarkdown":"fat-orphan"}"#),
+        })
+        .expect("insert orphan failed");
+    database
+        .mark_workspace_spec_job_failed("spec-job-orphan-failed", "provider failed")
+        .expect("mark orphan failed");
+
+    let deleted = database
+        .prune_failed_workspace_spec_jobs(10)
+        .expect("prune");
+    assert_eq!(deleted, 1);
+    assert!(
+        database
+            .workspace_spec_job("spec-job-parent-with-active-retry")
+            .expect("parent lookup")
+            .is_some(),
+        "failed parent with active retry must not be pruned"
+    );
+    let retry_after = database
+        .workspace_spec_job("spec-job-active-retry-child")
+        .expect("retry lookup")
+        .expect("retry retained");
+    assert_eq!(retry_after.status, "queued");
+
+    let connection = Connection::open(database.database_path()).expect("open db");
+    let retry_of: Option<String> = connection
+        .query_row(
+            "SELECT retry_of_job_id FROM workspace_spec_jobs WHERE id = ?1",
+            params!["spec-job-active-retry-child"],
+            |row| row.get(0),
+        )
+        .expect("retry_of");
+    assert_eq!(
+        retry_of.as_deref(),
+        Some("spec-job-parent-with-active-retry"),
+        "active retry provenance must survive prune"
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-orphan-failed")
+            .expect("orphan lookup")
+            .is_none(),
+        "failed job without active retry should be pruned"
+    );
+}
+
+#[test]
+fn prune_failed_workspace_spec_jobs_skips_multi_hop_active_retry_ancestors() {
+    // A(failed) → B(failed) → C(queued): both A and B must be protected so ON DELETE
+    // SET NULL cannot clear B.retry_of_job_id or C's chain root.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-chain-a",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: Some(r#"{"currentSpecMarkdown":"fat-a"}"#),
+        })
+        .expect("insert A");
+    database
+        .mark_workspace_spec_job_failed("spec-job-chain-a", "provider failed")
+        .expect("mark A failed");
+    let retry_b = database
+        .retry_failed_workspace_spec_job("spec-job-chain-a", "spec-job-chain-b", Some("model-2"))
+        .expect("retry B")
+        .expect("retry B job");
+    assert_eq!(retry_b.status, "queued");
+    database
+        .mark_workspace_spec_job_failed("spec-job-chain-b", "provider failed again")
+        .expect("mark B failed");
+    let retry_c = database
+        .retry_failed_workspace_spec_job("spec-job-chain-b", "spec-job-chain-c", Some("model-3"))
+        .expect("retry C")
+        .expect("retry C job");
+    assert_eq!(retry_c.status, "queued");
+
+    database
+        .insert_workspace_spec_job(NewWorkspaceSpecJob {
+            id: "spec-job-chain-orphan",
+            trigger_type: "manual_refresh",
+            chat_id: None,
+            run_id: None,
+            model_id: Some("model-1"),
+            base_revision: Some(1),
+            input_summary_json: Some(r#"{"currentSpecMarkdown":"fat-orphan"}"#),
+        })
+        .expect("insert orphan");
+    database
+        .mark_workspace_spec_job_failed("spec-job-chain-orphan", "provider failed")
+        .expect("mark orphan failed");
+
+    let deleted = database
+        .prune_failed_workspace_spec_jobs(10)
+        .expect("prune multi-hop");
+    assert_eq!(deleted, 1, "only the orphan failed job should be pruned");
+    assert!(
+        database
+            .workspace_spec_job("spec-job-chain-a")
+            .expect("A lookup")
+            .is_some(),
+        "root failed ancestor of active retry must not be pruned"
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-chain-b")
+            .expect("B lookup")
+            .is_some(),
+        "intermediate failed ancestor of active retry must not be pruned"
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-chain-c")
+            .expect("C lookup")
+            .is_some(),
+        "active retry leaf must remain"
+    );
+    assert!(
+        database
+            .workspace_spec_job("spec-job-chain-orphan")
+            .expect("orphan lookup")
+            .is_none(),
+        "unrelated failed job should be pruned"
+    );
+
+    let connection = Connection::open(database.database_path()).expect("open db");
+    let b_retry_of: Option<String> = connection
+        .query_row(
+            "SELECT retry_of_job_id FROM workspace_spec_jobs WHERE id = ?1",
+            params!["spec-job-chain-b"],
+            |row| row.get(0),
+        )
+        .expect("B retry_of");
+    let c_retry_of: Option<String> = connection
+        .query_row(
+            "SELECT retry_of_job_id FROM workspace_spec_jobs WHERE id = ?1",
+            params!["spec-job-chain-c"],
+            |row| row.get(0),
+        )
+        .expect("C retry_of");
+    assert_eq!(
+        b_retry_of.as_deref(),
+        Some("spec-job-chain-a"),
+        "intermediate retry provenance must survive prune"
+    );
+    assert_eq!(
+        c_retry_of.as_deref(),
+        Some("spec-job-chain-b"),
+        "active retry provenance must survive prune"
+    );
+}
+
+#[test]
+fn prune_failed_workspace_spec_jobs_caps_limit_at_500() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+
+    for index in 0..510 {
+        let id = format!("spec-job-failed-cap-{index:04}");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: &id,
+                trigger_type: "manual_refresh",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model-1"),
+                base_revision: Some(1),
+                input_summary_json: None,
+            })
+            .expect("insert failed");
+        database
+            .mark_workspace_spec_job_failed(&id, "provider failed")
+            .expect("mark failed");
+    }
+
+    let deleted = database
+        .prune_failed_workspace_spec_jobs(10_000)
+        .expect("prune with oversize limit");
+    assert_eq!(deleted, 500);
+    assert_eq!(
+        database
+            .workspace_spec_job_count()
+            .expect("count after capped prune"),
+        10
+    );
 }
 
 #[test]

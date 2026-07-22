@@ -139,7 +139,6 @@ import type {
   SettingsResponse,
   SettingsSection,
   SettingsWorkspaceSpecJobSummary,
-  SettingsWorkspaceSpecJobsResponse,
   SpecSettingsFormState,
   SkillLocationSummary,
   SystemPromptSummary,
@@ -163,6 +162,7 @@ import {
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { installUpdateAndWaitForRestart } from "../../shared/update-install";
 import { useI18n } from "../../shared/i18n";
+import { fetchSettingsWorkspaceSpecJobsList } from "../../shared/settings-spec-jobs-list";
 import {
   defaultThinkingLevelForModel,
   isModelThinkingLevelSupported,
@@ -605,6 +605,7 @@ export function SettingsPanel({
     Partial<Record<string, "retry" | "delete">>
   >({});
   const specJobOperationKeysRef = useRef<Set<string>>(new Set());
+  const specJobsRequestGenerationRef = useRef(0);
   const [isSavingPlanSettings, setIsSavingPlanSettings] = useState(false);
   const [isLoadingPlanHistory, setIsLoadingPlanHistory] = useState(false);
   const [planHistoryError, setPlanHistoryError] = useState<string | null>(null);
@@ -1568,18 +1569,20 @@ export function SettingsPanel({
   }, [memoryDreamPageSize]);
 
   const loadSpecJobs = useCallback(async () => {
+    const requestId = ++specJobsRequestGenerationRef.current;
     setIsLoadingSpecJobs(true);
     setSpecJobsError(null);
 
     try {
-      const params = new URLSearchParams({
-        page: String(specJobsPage),
-        pageSize: String(specJobsPageSize),
-        retryableOnly: String(showRetryableSpecJobsOnly),
+      const data = await fetchSettingsWorkspaceSpecJobsList({
+        page: specJobsPage,
+        pageSize: specJobsPageSize,
+        retryableOnly: showRetryableSpecJobsOnly,
       });
-      const data = await requestJson<SettingsWorkspaceSpecJobsResponse>(
-        `/api/settings/spec/jobs?${params.toString()}`,
-      );
+      // Ignore stale responses when page/filter changed mid-flight.
+      if (specJobsRequestGenerationRef.current !== requestId) {
+        return;
+      }
       if (data.totalPages > 0 && data.page > data.totalPages) {
         setSpecJobsPage(data.totalPages);
         return;
@@ -1599,12 +1602,17 @@ export function SettingsPanel({
         );
       }
     } catch (requestError) {
+      if (specJobsRequestGenerationRef.current !== requestId) {
+        return;
+      }
       setSpecJobs([]);
       setSpecJobsTotalCount(0);
       setSpecJobsTotalPages(0);
       setSpecJobsError(errorMessage(requestError));
     } finally {
-      setIsLoadingSpecJobs(false);
+      if (specJobsRequestGenerationRef.current === requestId) {
+        setIsLoadingSpecJobs(false);
+      }
     }
   }, [showRetryableSpecJobsOnly, specJobsPage, specJobsPageSize]);
 

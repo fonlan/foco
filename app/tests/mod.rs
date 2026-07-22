@@ -45,8 +45,10 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger, PlanStepPatch,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
-        WorkspaceSpecTriggerType,
+        WORKSPACE_DATABASE_ORDINARY_CAPACITY, WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+        WORKSPACE_DATABASE_TOTAL_CAPACITY, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
+        wait_for_ordinary_gate_queued_waiters,
     },
 };
 use foco_tools::{
@@ -18322,6 +18324,7 @@ async fn workspace_spec_http_queues_manual_generate_job() {
             .expect("spec jobs");
     let jobs_response = serde_json::to_value(jobs_response).expect("jobs response json");
     assert_eq!(jobs_response["jobs"][0]["id"], job_id);
+    assert_eq!(jobs_response["jobs"][0]["inputSummary"], json!({}));
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
     assert!(database.chats().expect("normal chats").is_empty());
@@ -18399,6 +18402,8 @@ async fn settings_workspace_spec_jobs_aggregates_workspace_history() {
         response["jobs"][0]["workspacePath"],
         workspace_one.path().display().to_string()
     );
+    // List path must not materialize full input_summary payloads.
+    assert_eq!(response["jobs"][0]["job"]["inputSummary"], json!({}));
     assert!(!missing_workspace.path().join(".foco").exists());
 }
 
@@ -18945,6 +18950,281 @@ fn workspace_spec_runtime_uses_evidence_language_and_writes_revision() {
     assert_eq!(job.status, "completed");
     assert!(job.input_summary_json.contains("public_api"));
     assert!(job.input_summary_json.contains("README.md"));
+}
+
+#[test]
+fn workspace_spec_generation_prepare_uses_one_ordinary_slot() {
+    // Regression: prepare must not nest WorkspaceDatabase open_or_create while a
+    // parent ordinary handle is alive, and must drop workspace DB before Memory
+    // (shared gate). Holding one ordinary elsewhere, prepare must still succeed.
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("README.md"),
+        "Foco is a local coding workspace with chat and project context.",
+    )
+    .expect("write README");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.memory.enabled = true;
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-one-ordinary-slot-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("spec job");
+    }
+    {
+        let mut memory =
+            MemoryDatabase::open_or_create_workspace(workspace.path()).expect("workspace memory");
+        memory
+            .upsert_profile(foco_store::memory::NewMemoryProfile {
+                id: "profile-spec-prepare",
+                scope: foco_store::memory::MemoryScope::Workspace,
+                chat_id: None,
+                profile_text: "Workspace prefers concise Project Spec prose.",
+                metadata_json: "{}",
+            })
+            .expect("seed memory profile");
+    }
+
+    let external_hold =
+        open_workspace_database(workspace.path()).expect("hold one ordinary permit");
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare must succeed with only one ordinary slot free")
+            .expect("prepared job");
+    assert_eq!(prepared.job_id, job_id);
+    drop(external_hold);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let job = database
+        .workspace_spec_job(job_id)
+        .expect("spec job lookup")
+        .expect("spec job");
+    assert_eq!(job.status, "running");
+    assert!(
+        job.input_summary_json
+            .contains("Workspace prefers concise Project Spec prose"),
+        "memory profiles should still be collected when memory is enabled"
+    );
+}
+
+#[test]
+fn workspace_spec_list_and_prepare_do_not_starve_ordinary_gate() {
+    // Two lightweight list holders occupy both ordinary slots; a third ordinary open
+    // must wait while they hold, then succeed promptly after release. Prepare still
+    // succeeds afterward (one ordinary at a time). No fixed sleep as correctness signal.
+    use std::sync::{Arc, Barrier, mpsc};
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    fs::write(
+        workspace.path().join("README.md"),
+        "Foco is a local coding workspace with chat and project context.",
+    )
+    .expect("write README");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.memory.enabled = false;
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-list-prepare-starve-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        let large_markdown = "w".repeat(40 * 1024);
+        let input_summary = json!({
+            "currentSpecMarkdown": large_markdown,
+            "currentSpecRevision": 1,
+        })
+        .to_string();
+        for index in 0..25 {
+            let id = format!("spec-job-history-{index}");
+            database
+                .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                    id: &id,
+                    trigger_type: "chat_completed",
+                    chat_id: None,
+                    run_id: Some("run-hist"),
+                    model_id: Some("model"),
+                    base_revision: Some(1),
+                    input_summary_json: Some(&input_summary),
+                })
+                .expect("history job");
+            database
+                .mark_workspace_spec_job_completed(&id, None)
+                .expect("complete history");
+        }
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("prepare job");
+    }
+
+    let workspace_path = Arc::new(workspace.path().to_path_buf());
+    let holders_ready = Arc::new(Barrier::new(3));
+    let holders_release = Arc::new(Barrier::new(3));
+    let mut list_workers = Vec::new();
+    for _ in 0..2 {
+        let workspace_path = workspace_path.clone();
+        let holders_ready = holders_ready.clone();
+        let holders_release = holders_release.clone();
+        list_workers.push(std::thread::spawn(move || {
+            let database =
+                WorkspaceDatabase::open_or_create(workspace_path.as_path()).expect("list open");
+            let jobs = database.workspace_spec_jobs_list(20).expect("list jobs");
+            assert_eq!(jobs.len(), 20);
+            assert!(jobs.iter().all(|job| job.input_summary_json == "{}"));
+            holders_ready.wait();
+            holders_release.wait();
+            drop(database);
+            jobs.len()
+        }));
+    }
+
+    holders_ready.wait();
+
+    let business_path = workspace_path.clone();
+    let (done_tx, done_rx) = mpsc::channel();
+    let business = std::thread::spawn(move || {
+        let started = Instant::now();
+        let database = open_workspace_database(business_path.as_path())
+            .expect("business ordinary open must succeed after list holders release");
+        let count = database.workspace_spec_job_count().expect("job count");
+        drop(database);
+        done_tx
+            .send((count, started.elapsed()))
+            .expect("send business result");
+    });
+
+    // Prove the third ordinary open has entered the gate waiter queue before
+    // releasing holders (not merely that the business thread was scheduled).
+    assert!(
+        wait_for_ordinary_gate_queued_waiters(workspace_path.as_path(), 1, Duration::from_secs(2),),
+        "business open must enqueue on the ordinary gate while list holders are live"
+    );
+
+    match done_rx.recv_timeout(Duration::from_millis(250)) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Ok(_) => panic!("business open must wait while two ordinary list holders are live"),
+        Err(error) => panic!("business channel failed while holders live: {error}"),
+    }
+
+    holders_release.wait();
+    let (count, elapsed) = done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("business open after list holders release");
+    business.join().expect("business thread");
+    let list_counts: Vec<_> = list_workers
+        .into_iter()
+        .map(|worker| worker.join().expect("list worker"))
+        .collect();
+    assert!(list_counts.iter().all(|&count| count == 20));
+    assert!(count >= 26);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "business open should not approach the 5s ordinary timeout; took {elapsed:?}"
+    );
+
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare must succeed after list holders release")
+            .expect("prepared job");
+    assert_eq!(prepared.job_id, job_id);
+
+    assert_eq!(
+        WORKSPACE_DATABASE_ORDINARY_CAPACITY, 2,
+        "phase must not raise ordinary capacity"
+    );
+    assert_eq!(
+        WORKSPACE_DATABASE_TOTAL_CAPACITY, 3,
+        "phase must not raise total capacity"
+    );
+    assert_eq!(
+        WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
+        Duration::from_secs(5)
+    );
+}
+
+#[test]
+fn workspace_spec_generation_prepare_skips_memory_when_disabled() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut config = prompt_test_config(workspace.path().to_path_buf());
+    config.memory.enabled = false;
+    let workspace_id = config.workspaces[0].id.clone();
+    let job_id = "workspace-spec-memory-disabled-job";
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .upsert_workspace_spec_settings(true, false)
+            .expect("spec settings");
+        database
+            .insert_workspace_spec_job(NewWorkspaceSpecJob {
+                id: job_id,
+                trigger_type: "manual_initial",
+                chat_id: None,
+                run_id: None,
+                model_id: Some("model"),
+                base_revision: Some(0),
+                input_summary_json: None,
+            })
+            .expect("spec job");
+    }
+    {
+        let mut memory =
+            MemoryDatabase::open_or_create_workspace(workspace.path()).expect("workspace memory");
+        memory
+            .upsert_profile(foco_store::memory::NewMemoryProfile {
+                id: "profile-should-be-ignored",
+                scope: foco_store::memory::MemoryScope::Workspace,
+                chat_id: None,
+                profile_text: "This profile must not appear when memory is disabled.",
+                metadata_json: "{}",
+            })
+            .expect("seed memory profile");
+    }
+
+    let external_hold =
+        open_workspace_database(workspace.path()).expect("hold one ordinary permit");
+    let prepared =
+        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
+            .expect("prepare with memory disabled")
+            .expect("prepared job");
+    drop(external_hold);
+    assert_eq!(prepared.job_id, job_id);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let job = database
+        .workspace_spec_job(job_id)
+        .expect("spec job lookup")
+        .expect("spec job");
+    assert!(!job.input_summary_json.contains("must not appear"));
+    assert!(
+        job.input_summary_json.contains(r#""memoryProfiles":[]"#)
+            || job.input_summary_json.contains("\"memoryProfiles\":[]"),
+        "disabled memory should yield empty profiles: {}",
+        job.input_summary_json
+    );
 }
 
 #[test]

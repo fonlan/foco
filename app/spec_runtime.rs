@@ -1259,6 +1259,8 @@ pub(crate) fn prepare_remote_workspace_spec_generation_job(
     generation_system_prompt: Option<&str>,
     app_language: &str,
 ) -> Result<Option<PreparedRemoteWorkspaceSpecJob>, ApiError> {
+    // Single ordinary open: job/spec reads, graph collect, and prepared-input write.
+    // Do not call open_or_create again while this handle is alive.
     let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let Some(job) = database
@@ -1286,8 +1288,12 @@ pub(crate) fn prepare_remote_workspace_spec_generation_job(
         return Ok(None);
     };
     let base_revision = spec.revision;
-    let input_summary =
-        collect_workspace_spec_input_without_memory(workspace_id, workspace_path, base_revision)?;
+    let input_summary = collect_workspace_spec_input_without_memory(
+        workspace_id,
+        workspace_path,
+        base_revision,
+        &database,
+    )?;
     let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize workspace spec input: {source}"
@@ -1332,35 +1338,49 @@ fn prepare_workspace_spec_generation_job(
     workspace_path: &std::path::Path,
     job_id: &str,
 ) -> Result<Option<PreparedWorkspaceSpecJob>, ApiError> {
-    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
-    let Some(job) = database
-        .workspace_spec_job(job_id)
-        .map_err(ApiError::from_workspace_error)?
-    else {
-        return Err(ApiError::bad_request(format!(
-            "workspace spec job was not found: {job_id}"
-        )));
+    // Segment ordinary opens so prepare never nests WorkspaceDatabase + Memory
+    // (they share the same gate). Holders at any moment stay ≤1 for this path.
+    let (job, base_revision, mut input_summary) = {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path)
+            .map_err(ApiError::from_workspace_error)?;
+        let Some(job) = database
+            .workspace_spec_job(job_id)
+            .map_err(ApiError::from_workspace_error)?
+        else {
+            return Err(ApiError::bad_request(format!(
+                "workspace spec job was not found: {job_id}"
+            )));
+        };
+
+        if job.status != WorkspaceSpecJobStatus::Queued.as_str()
+            && job.status != WorkspaceSpecJobStatus::Running.as_str()
+        {
+            return Ok(None);
+        }
+        let spec = database
+            .workspace_spec()
+            .map_err(ApiError::from_workspace_error)?;
+        let Some(spec) = spec.filter(|spec| spec.enabled) else {
+            database
+                .mark_workspace_spec_job_skipped(job_id, "workspace_spec_disabled")
+                .map_err(ApiError::from_workspace_error)?;
+            log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
+            return Ok(None);
+        };
+        let base_revision = spec.revision;
+        let input_summary = collect_workspace_spec_input_without_memory(
+            workspace_id,
+            workspace_path,
+            base_revision,
+            &database,
+        )?;
+        (job, base_revision, input_summary)
     };
 
-    if job.status != WorkspaceSpecJobStatus::Queued.as_str()
-        && job.status != WorkspaceSpecJobStatus::Running.as_str()
-    {
-        return Ok(None);
-    }
-    let spec = database
-        .workspace_spec()
+    input_summary.memory_profiles = workspace_memory_profiles(config, workspace_path)?;
+
+    let mut database = WorkspaceDatabase::open_or_create(workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    let Some(spec) = spec.filter(|spec| spec.enabled) else {
-        database
-            .mark_workspace_spec_job_skipped(job_id, "workspace_spec_disabled")
-            .map_err(ApiError::from_workspace_error)?;
-        log_workspace_spec_job_status_from_database(&database, workspace_id, job_id);
-        return Ok(None);
-    };
-    let base_revision = spec.revision;
-    let input_summary =
-        collect_workspace_spec_input(config, workspace_id, workspace_path, base_revision)?;
     let input_summary_json = serde_json::to_string(&input_summary).map_err(|source| {
         ApiError::internal(format!(
             "failed to serialize workspace spec input: {source}"
@@ -1952,25 +1972,12 @@ fn workspace_spec_update_assistant_message_id(
         })?;
     Ok(input.assistant_message_id)
 }
-fn collect_workspace_spec_input(
-    config: &GlobalConfig,
-    workspace_id: &str,
-    workspace_path: &std::path::Path,
-    base_revision: u64,
-) -> Result<WorkspaceSpecGenerationInput, ApiError> {
-    let mut input =
-        collect_workspace_spec_input_without_memory(workspace_id, workspace_path, base_revision)?;
-    input.memory_profiles = workspace_memory_profiles(config, workspace_path)?;
-    Ok(input)
-}
-
 fn collect_workspace_spec_input_without_memory(
     workspace_id: &str,
     workspace_path: &std::path::Path,
     base_revision: u64,
+    database: &WorkspaceDatabase,
 ) -> Result<WorkspaceSpecGenerationInput, ApiError> {
-    let database = WorkspaceDatabase::open_or_create(workspace_path)
-        .map_err(ApiError::from_workspace_error)?;
     let context = database
         .code_graph_context()
         .map_err(ApiError::from_workspace_error)?;
