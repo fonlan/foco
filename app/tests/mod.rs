@@ -25050,6 +25050,274 @@ async fn prepare_prompt_context_exposes_provider_native_web_search_without_funct
     remove_dir_if_exists(&profile_dir);
 }
 
+/// Table-driven local prompt assembly matrix: route → tool kind, catalog, Tavily/Brave path.
+#[tokio::test]
+async fn prepare_prompt_context_web_search_route_matrix() {
+    #[derive(Clone, Copy)]
+    struct Case {
+        name: &'static str,
+        provider_kind: &'static str,
+        model_id: &'static str,
+        mode: WebSearchMode,
+        enabled: bool,
+        tavily_key: Option<&'static str>,
+        expect_tool_kind: Option<foco_providers::NeutralToolKind>,
+        expect_catalog: bool,
+        expect_function_execution: bool,
+    }
+
+    let cases = [
+        Case {
+            name: "master_off",
+            provider_kind: OPENAI_RESPONSES_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Auto,
+            enabled: false,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: None,
+            expect_catalog: false,
+            expect_function_execution: false,
+        },
+        Case {
+            name: "openai_responses_native",
+            provider_kind: OPENAI_RESPONSES_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: None,
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::ProviderWebSearch),
+            expect_catalog: false,
+            expect_function_execution: false,
+        },
+        Case {
+            name: "xai_responses_native",
+            provider_kind: foco_providers::XAI_RESPONSES_KIND,
+            model_id: "grok-3",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::ProviderWebSearch),
+            expect_catalog: false,
+            expect_function_execution: false,
+        },
+        Case {
+            name: "anthropic_function_fallback",
+            provider_kind: foco_providers::ANTHROPIC_KIND,
+            model_id: "claude-sonnet-4-20250514",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "gemini_function_fallback",
+            provider_kind: foco_providers::GEMINI_KIND,
+            model_id: "gemini-2.5-pro",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "openai_chat_function_fallback",
+            provider_kind: OPENAI_CHAT_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "deepseek_function_fallback",
+            provider_kind: foco_providers::DEEPSEEK_KIND,
+            model_id: "deepseek-chat",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "ollama_function_fallback",
+            provider_kind: foco_providers::OLLAMA_KIND,
+            model_id: "llama3.2",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "no_key_disabled",
+            provider_kind: OPENAI_CHAT_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: None,
+            expect_tool_kind: None,
+            expect_catalog: false,
+            expect_function_execution: false,
+        },
+        Case {
+            name: "explicit_function_override_on_native_model",
+            provider_kind: OPENAI_RESPONSES_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Function,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+        Case {
+            name: "explicit_disabled_override",
+            provider_kind: OPENAI_RESPONSES_KIND,
+            model_id: "gpt-4o",
+            mode: WebSearchMode::Disabled,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: None,
+            expect_catalog: false,
+            expect_function_execution: false,
+        },
+        Case {
+            name: "auto_unknown_model_function_fallback",
+            provider_kind: OPENAI_RESPONSES_KIND,
+            model_id: "custom-gateway-model",
+            mode: WebSearchMode::Auto,
+            enabled: true,
+            tavily_key: Some("tvly"),
+            expect_tool_kind: Some(foco_providers::NeutralToolKind::Function),
+            expect_catalog: true,
+            expect_function_execution: true,
+        },
+    ];
+
+    for case in cases {
+        let workspace_dir =
+            env::temp_dir().join(unique_id(&format!("foco-web-search-matrix-{}", case.name)));
+        let profile_dir = env::temp_dir().join(unique_id(&format!(
+            "foco-web-search-matrix-profile-{}",
+            case.name
+        )));
+        fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+        let mut config = prompt_test_config(workspace_dir.clone());
+        config.web_search.enabled = case.enabled;
+        config.web_search.tavily_api_key = case.tavily_key.map(str::to_string);
+        config.web_search.brave_api_key = None;
+        config.providers[0].kind = case.provider_kind.to_string();
+        config.models[0].id = case.model_id.to_string();
+        config.models[0].web_search_mode = case.mode;
+
+        let state = test_app_state(config.clone(), profile_dir.clone());
+        let context = prepare_prompt_context(
+            &state,
+            &config,
+            &config.workspaces[0].id,
+            PromptContextRequest {
+                queued_user_message_id: None,
+                chat_id: None,
+                model_id: case.model_id.to_string(),
+                provider_id: None,
+                thinking_level: None,
+                latency_mode: foco_providers::LatencyMode::Standard,
+                skill_ids: None,
+                session_mode: None,
+                message: Some("hello".to_string()),
+                assistant_draft: None,
+                assistant_draft_reasoning: None,
+                attachments: Vec::new(),
+            },
+            None,
+            PromptAssemblyPurpose::ContextPreview,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("case `{}` prompt context: {err:?}", case.name));
+
+        let web_search_tools: Vec<_> = context
+            .provider_request
+            .tools
+            .iter()
+            .filter(|tool| tool.name == WEB_SEARCH_TOOL)
+            .collect();
+        assert!(
+            web_search_tools.len() <= 1,
+            "case `{}`: at most one web_search tool, got {}",
+            case.name,
+            web_search_tools.len()
+        );
+
+        match case.expect_tool_kind {
+            Some(kind) => {
+                assert_eq!(
+                    web_search_tools.len(),
+                    1,
+                    "case `{}`: expected one web_search tool",
+                    case.name
+                );
+                assert_eq!(
+                    web_search_tools[0].kind, kind,
+                    "case `{}`: tool kind",
+                    case.name
+                );
+            }
+            None => {
+                assert!(
+                    web_search_tools.is_empty(),
+                    "case `{}`: expected no web_search tool",
+                    case.name
+                );
+            }
+        }
+
+        let in_catalog = context
+            .default_agent_tool_capabilities
+            .iter()
+            .any(|tool| tool == WEB_SEARCH_TOOL);
+        assert_eq!(
+            in_catalog, case.expect_catalog,
+            "case `{}`: runtime catalog / allowlist",
+            case.name
+        );
+
+        // Function path may call Tavily/Brave only when catalog exposes executable web_search
+        // and settings allow function execution (master + key).
+        let function_execution =
+            crate::runtime::web_search_function_execution_allowed(&config.web_search) && in_catalog;
+        assert_eq!(
+            function_execution, case.expect_function_execution,
+            "case `{}`: would invoke Tavily/Brave function path",
+            case.name
+        );
+
+        // Native path must never enter the executable catalog (no Tavily/Brave).
+        if matches!(
+            case.expect_tool_kind,
+            Some(foco_providers::NeutralToolKind::ProviderWebSearch)
+        ) {
+            assert!(
+                !in_catalog && !case.expect_function_execution,
+                "case `{}`: native must not call Tavily/Brave",
+                case.name
+            );
+        }
+
+        drop(context);
+        drop(state);
+        fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+        remove_dir_if_exists(&profile_dir);
+    }
+}
+
 fn tool_names_contains(tools: &[NeutralToolDefinition], name: &str) -> bool {
     tools.iter().any(|tool| tool.name == name)
 }

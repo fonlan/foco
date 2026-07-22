@@ -4335,6 +4335,104 @@ mod tests {
             .expect("disabled web search without key should save");
     }
 
+    /// Config-level matrix: master switch and fallback key are independent; mode defaults.
+    #[test]
+    fn web_search_config_matrix_master_switch_and_fallback_independence() {
+        let profile = tempfile::tempdir().expect("temp profile");
+        let paths = FocoPaths::from_user_profile(profile.path());
+        fs::create_dir_all(&paths.workspace_dir).expect("workspace directory");
+        fs::create_dir_all(&paths.root_dir).expect("root directory");
+
+        struct Case {
+            name: &'static str,
+            enabled: bool,
+            tavily: Option<&'static str>,
+            brave: Option<&'static str>,
+            active: &'static str,
+            expect_fallback: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "enabled_no_keys",
+                enabled: true,
+                tavily: None,
+                brave: None,
+                active: WEB_SEARCH_PROVIDER_TAVILY,
+                expect_fallback: false,
+            },
+            Case {
+                name: "enabled_tavily_key",
+                enabled: true,
+                tavily: Some("tvly-test"),
+                brave: None,
+                active: WEB_SEARCH_PROVIDER_TAVILY,
+                expect_fallback: true,
+            },
+            Case {
+                name: "enabled_brave_key_active_brave",
+                enabled: true,
+                tavily: None,
+                brave: Some("brave-test"),
+                active: WEB_SEARCH_PROVIDER_BRAVE,
+                expect_fallback: true,
+            },
+            Case {
+                name: "disabled_with_key_still_has_fallback_available",
+                enabled: false,
+                tavily: Some("tvly-test"),
+                brave: None,
+                active: WEB_SEARCH_PROVIDER_TAVILY,
+                expect_fallback: true,
+            },
+            Case {
+                name: "enabled_wrong_active_provider_key_missing",
+                enabled: true,
+                tavily: Some("tvly-test"),
+                brave: None,
+                active: WEB_SEARCH_PROVIDER_BRAVE,
+                expect_fallback: false,
+            },
+        ];
+
+        for case in cases {
+            let mut config = GlobalConfig::first_run(paths.workspace_dir.clone());
+            config.web_search.enabled = case.enabled;
+            config.web_search.active_provider = case.active.to_string();
+            config.web_search.tavily_api_key = case.tavily.map(str::to_string);
+            config.web_search.brave_api_key = case.brave.map(str::to_string);
+            assert_eq!(
+                config.web_search.fallback_available(),
+                case.expect_fallback,
+                "case `{}`",
+                case.name
+            );
+            save_global_config(&paths.config_file, &config)
+                .unwrap_or_else(|err| panic!("case `{}` should save: {err}", case.name));
+            let reloaded = load_global_config(&paths.config_file).expect("reload");
+            assert_eq!(
+                reloaded.web_search.enabled, case.enabled,
+                "case `{}`",
+                case.name
+            );
+            assert_eq!(
+                reloaded.web_search.fallback_available(),
+                case.expect_fallback,
+                "case `{}` after reload",
+                case.name
+            );
+            // Secrets must remain in config file storage (not redacted on disk for local config).
+            if let Some(key) = case.tavily {
+                assert_eq!(
+                    reloaded.web_search.tavily_api_key.as_deref(),
+                    Some(key),
+                    "case `{}`",
+                    case.name
+                );
+            }
+        }
+    }
+
     #[test]
     fn model_web_search_mode_defaults_to_auto_when_missing() {
         let model: ModelSettings = serde_json::from_value(serde_json::json!({

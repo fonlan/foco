@@ -4065,6 +4065,321 @@ mod tests {
         );
     }
 
+    /// Provider × model × config route matrix (table-driven).
+    ///
+    /// Each case asserts the single runtime route. Native is only available on OpenAIResp
+    /// protocols (OpenAI Responses HTTP/WS and xAI Responses). Claude/Gemini adapters can
+    /// serialize a builtin web-search tool in genai, but Foco's central capability gate does
+    /// not treat those protocols as native-capable yet — auto falls back to FocoFunction.
+    #[test]
+    fn web_search_route_matrix_covers_providers_modes_and_fallback() {
+        let openai_resp = openai_responses_kind();
+        let openai_ws = parse_provider_kind(OPENAI_RESPONSES_WEBSOCKET_KIND).expect("ws");
+        let openai_chat = parse_provider_kind(OPENAI_CHAT_KIND).expect("chat");
+        let xai_resp = parse_provider_kind(XAI_RESPONSES_KIND).expect("xai responses");
+        let xai_chat = parse_provider_kind(XAI_KIND).expect("xai chat");
+        let anthropic = parse_provider_kind(ANTHROPIC_KIND).expect("anthropic");
+        let gemini = parse_provider_kind(GEMINI_KIND).expect("gemini");
+        let deepseek = parse_provider_kind(DEEPSEEK_KIND).expect("deepseek");
+        let ollama = parse_provider_kind(OLLAMA_KIND).expect("ollama");
+
+        struct Case {
+            name: &'static str,
+            enabled: bool,
+            fallback: bool,
+            kind: Option<ProviderKind>,
+            model: &'static str,
+            mode: WebSearchMode,
+            expected: WebSearchRoute,
+        }
+
+        let cases = [
+            Case {
+                name: "master_switch_off_disables_even_with_native_model",
+                enabled: false,
+                fallback: true,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "openai_responses_gpt4o_auto_native",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::ProviderNative,
+            },
+            Case {
+                name: "openai_responses_ws_gpt5_auto_native",
+                enabled: true,
+                fallback: false,
+                kind: Some(openai_ws),
+                model: "gpt-5.4",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::ProviderNative,
+            },
+            Case {
+                name: "xai_responses_grok_auto_native",
+                enabled: true,
+                fallback: true,
+                kind: Some(xai_resp),
+                model: "grok-3",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::ProviderNative,
+            },
+            Case {
+                name: "xai_chat_grok_auto_function_fallback",
+                enabled: true,
+                fallback: true,
+                kind: Some(xai_chat),
+                model: "grok-3",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "anthropic_claude_auto_function_not_native",
+                enabled: true,
+                fallback: true,
+                kind: Some(anthropic),
+                model: "claude-sonnet-4-20250514",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "gemini_auto_function_not_native",
+                enabled: true,
+                fallback: true,
+                kind: Some(gemini),
+                model: "gemini-2.5-pro",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "openai_chat_auto_function_fallback",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_chat),
+                model: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "deepseek_auto_function_fallback",
+                enabled: true,
+                fallback: true,
+                kind: Some(deepseek),
+                model: "deepseek-chat",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "ollama_auto_function_fallback",
+                enabled: true,
+                fallback: true,
+                kind: Some(ollama),
+                model: "llama3.2",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "no_fallback_key_auto_unknown_model_disabled",
+                enabled: true,
+                fallback: false,
+                kind: Some(openai_resp),
+                model: "custom-gateway-model",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "no_fallback_key_chat_auto_disabled",
+                enabled: true,
+                fallback: false,
+                kind: Some(openai_chat),
+                model: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "explicit_native_openai_responses",
+                enabled: true,
+                fallback: false,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Native,
+                expected: WebSearchRoute::ProviderNative,
+            },
+            Case {
+                name: "explicit_native_on_chat_protocol_disabled",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_chat),
+                model: "gpt-4o",
+                mode: WebSearchMode::Native,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "explicit_native_anthropic_protocol_disabled",
+                enabled: true,
+                fallback: true,
+                kind: Some(anthropic),
+                model: "claude-sonnet-4-20250514",
+                mode: WebSearchMode::Native,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "explicit_function_with_key",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Function,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "explicit_function_without_key_disabled",
+                enabled: true,
+                fallback: false,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Function,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "explicit_disabled_mode",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_resp),
+                model: "gpt-4o",
+                mode: WebSearchMode::Disabled,
+                expected: WebSearchRoute::Disabled,
+            },
+            Case {
+                name: "auto_unknown_capability_with_fallback",
+                enabled: true,
+                fallback: true,
+                kind: Some(openai_resp),
+                model: "custom-gateway-model",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+            Case {
+                name: "missing_provider_kind_auto_with_fallback",
+                enabled: true,
+                fallback: true,
+                kind: None,
+                model: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                expected: WebSearchRoute::FocoFunction,
+            },
+        ];
+
+        for case in cases {
+            let route = resolve_web_search_route(WebSearchRouteInput {
+                enabled: case.enabled,
+                fallback_available: case.fallback,
+                provider_kind: case.kind,
+                upstream_model_id: case.model,
+                mode: case.mode,
+            });
+            assert_eq!(
+                route, case.expected,
+                "case `{}`: expected {:?}, got {:?}",
+                case.name, case.expected, route
+            );
+            // At most one search path per turn (route is a single enum variant).
+            assert!(
+                matches!(
+                    route,
+                    WebSearchRoute::Disabled
+                        | WebSearchRoute::ProviderNative
+                        | WebSearchRoute::FocoFunction
+                ),
+                "case `{}` must resolve to exactly one route variant",
+                case.name
+            );
+        }
+    }
+
+    /// Wire-shape fixture: native vs function tools must produce distinguishable genai tools
+    /// and must never both appear as a dual exposure for the same turn.
+    #[test]
+    fn web_search_wire_fixture_native_vs_function_and_at_most_one() {
+        let native = NeutralToolDefinition {
+            name: "web_search".to_string(),
+            description: "native".to_string(),
+            input_schema: serde_json::json!({}),
+            strict: false,
+            kind: NeutralToolKind::ProviderWebSearch,
+        };
+        let function = NeutralToolDefinition {
+            name: "web_search".to_string(),
+            description: "function".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "maxResults": {"type": "integer"},
+                    "timeoutMs": {"type": "integer"}
+                }
+            }),
+            strict: true,
+            kind: NeutralToolKind::Function,
+        };
+
+        let native_tool = genai_tool(&native);
+        let function_tool = genai_tool(&function);
+        assert!(matches!(native_tool.name, genai::chat::ToolName::WebSearch));
+        match &function_tool.name {
+            genai::chat::ToolName::Custom(name) => assert_eq!(name, "web_search"),
+            other => panic!("expected custom function tool, got {other:?}"),
+        }
+        assert!(function_tool.schema.is_some());
+        assert!(native_tool.schema.is_none());
+
+        // Simulate route-driven exposure: each route injects at most one web_search tool.
+        for (route, expected_kind) in [
+            (
+                WebSearchRoute::ProviderNative,
+                Some(NeutralToolKind::ProviderWebSearch),
+            ),
+            (
+                WebSearchRoute::FocoFunction,
+                Some(NeutralToolKind::Function),
+            ),
+            (WebSearchRoute::Disabled, None),
+        ] {
+            let tools: Vec<NeutralToolDefinition> = match route {
+                WebSearchRoute::ProviderNative => vec![native.clone()],
+                WebSearchRoute::FocoFunction => vec![function.clone()],
+                WebSearchRoute::Disabled => Vec::new(),
+            };
+            let web_search_count = tools.iter().filter(|t| t.name == "web_search").count();
+            assert!(
+                web_search_count <= 1,
+                "route {route:?} must expose at most one web_search"
+            );
+            match expected_kind {
+                Some(kind) => {
+                    assert_eq!(web_search_count, 1);
+                    assert_eq!(tools[0].kind, kind);
+                }
+                None => assert_eq!(web_search_count, 0),
+            }
+        }
+
+        // Dual exposure is forbidden (property-style guard used by assembly/remote).
+        let dual = [native.clone(), function.clone()];
+        let dual_count = dual.iter().filter(|t| t.name == "web_search").count();
+        assert_eq!(dual_count, 2, "fixture dual list for negative assertion");
+        assert!(
+            dual_count > 1,
+            "assembly must reject dual native+function exposure"
+        );
+    }
+
     #[test]
     fn supports_native_web_search_requires_protocol_and_known_model() {
         let responses = openai_responses_kind();

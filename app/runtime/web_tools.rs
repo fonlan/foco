@@ -1739,6 +1739,22 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
 
+    #[test]
+    fn web_search_function_execution_requires_master_switch_and_fallback_key() {
+        let mut settings = WebSearchSettings::default();
+        settings.enabled = false;
+        settings.tavily_api_key = Some("tvly".to_string());
+        assert!(!web_search_function_execution_allowed(&settings));
+
+        settings.enabled = true;
+        settings.tavily_api_key = None;
+        settings.brave_api_key = None;
+        assert!(!web_search_function_execution_allowed(&settings));
+
+        settings.tavily_api_key = Some("tvly".to_string());
+        assert!(web_search_function_execution_allowed(&settings));
+    }
+
     fn large_body_lines(line_count: usize, line_width: usize) -> String {
         (0..line_count)
             .map(|i| format!("line-{i:05}-{}", "x".repeat(line_width)))

@@ -96,5 +96,6 @@ pub(crate) use tool_locks::{
 pub(crate) use tool_loop::ToolLoopGuard;
 pub(crate) use web_tools::{
     execute_web_tool, is_web_tool_name, materialize_brokered_web_result,
-    package_brokered_web_result_files, web_search_enabled, web_tool_timeout_ms,
+    package_brokered_web_result_files, web_search_enabled, web_search_function_execution_allowed,
+    web_tool_timeout_ms,
 };

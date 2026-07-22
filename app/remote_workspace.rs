@@ -38391,6 +38391,292 @@ mod tests {
         );
     }
 
+    /// Remote route matrix: local and sidecar resolvers agree; catalog vs native injection.
+    #[tokio::test]
+    async fn remote_sidecar_web_search_route_matrix() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            provider_kind: &'static str,
+            model_id: &'static str,
+            mode: WebSearchMode,
+            enabled: bool,
+            tavily: Option<&'static str>,
+            expected: WebSearchRoute,
+            expect_broker_web_search: bool,
+            expect_native_tool: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "master_off",
+                provider_kind: foco_providers::OPENAI_RESPONSES_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                enabled: false,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::Disabled,
+                expect_broker_web_search: false,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "openai_responses_native",
+                provider_kind: foco_providers::OPENAI_RESPONSES_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: None,
+                expected: WebSearchRoute::ProviderNative,
+                expect_broker_web_search: false,
+                expect_native_tool: true,
+            },
+            Case {
+                name: "xai_responses_native",
+                provider_kind: foco_providers::XAI_RESPONSES_KIND,
+                model_id: "grok-3",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::ProviderNative,
+                expect_broker_web_search: false,
+                expect_native_tool: true,
+            },
+            Case {
+                name: "anthropic_function",
+                provider_kind: foco_providers::ANTHROPIC_KIND,
+                model_id: "claude-sonnet-4-20250514",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "gemini_function",
+                provider_kind: foco_providers::GEMINI_KIND,
+                model_id: "gemini-2.5-pro",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "openai_chat_function",
+                provider_kind: foco_providers::OPENAI_CHAT_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "deepseek_function",
+                provider_kind: foco_providers::DEEPSEEK_KIND,
+                model_id: "deepseek-chat",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "ollama_function",
+                provider_kind: foco_providers::OLLAMA_KIND,
+                model_id: "llama3.2",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "no_key_disabled",
+                provider_kind: foco_providers::OPENAI_CHAT_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Auto,
+                enabled: true,
+                tavily: None,
+                expected: WebSearchRoute::Disabled,
+                expect_broker_web_search: false,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "explicit_function_override",
+                provider_kind: foco_providers::OPENAI_RESPONSES_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Function,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::FocoFunction,
+                expect_broker_web_search: true,
+                expect_native_tool: false,
+            },
+            Case {
+                name: "explicit_disabled",
+                provider_kind: foco_providers::OPENAI_RESPONSES_KIND,
+                model_id: "gpt-4o",
+                mode: WebSearchMode::Disabled,
+                enabled: true,
+                tavily: Some("tvly-test"),
+                expected: WebSearchRoute::Disabled,
+                expect_broker_web_search: false,
+                expect_native_tool: false,
+            },
+        ];
+
+        for case in cases {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let mut config =
+                foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+            config.web_search.enabled = case.enabled;
+            config.web_search.tavily_api_key = case.tavily.map(str::to_string);
+            config.web_search.brave_api_key = None;
+            config.providers.push(foco_store::config::ProviderSettings {
+                id: "matrix-provider".to_string(),
+                name: "Matrix Provider".to_string(),
+                kind: case.provider_kind.to_string(),
+                enabled: true,
+                base_url: None,
+                api_key: Some("provider-secret".to_string()),
+                auto_sync_models: false,
+                model_sync_filter_regex: None,
+                request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
+                api_proxy: Default::default(),
+            });
+            config.models.push(foco_store::config::ModelSettings {
+                id: case.model_id.to_string(),
+                display_name: case.model_id.to_string(),
+                enabled: true,
+                provider_ids: vec!["matrix-provider".to_string()],
+                active_provider_id: Some("matrix-provider".to_string()),
+                thinking_level: None,
+                web_search_mode: case.mode,
+                system_prompt_name: "Default".to_string(),
+                metadata_key: None,
+                metadata_source_url: None,
+                metadata_refreshed_at: None,
+                limits: None,
+                input_modalities: vec!["text".to_string()],
+                output_modalities: vec!["text".to_string()],
+            });
+
+            let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+                .expect("runtime bundle");
+            let bundle_json = serde_json::to_string(&bundle).expect("bundle json");
+            assert!(
+                !bundle_json.contains("tvly-test") && !bundle_json.contains("provider-secret"),
+                "case `{}`: bundle must not leak secrets",
+                case.name
+            );
+
+            let provider = config
+                .providers
+                .iter()
+                .find(|p| p.id == "matrix-provider")
+                .expect("provider");
+            let model = config
+                .models
+                .iter()
+                .find(|m| m.id == case.model_id)
+                .expect("model");
+            let local = resolve_web_search_route_for_turn(
+                &config.web_search,
+                model.web_search_mode,
+                provider,
+                &model.id,
+            );
+            let remote = remote_sidecar_resolve_web_search_route(&bundle, case.model_id);
+            assert_eq!(local, remote, "case `{}`: local/remote route", case.name);
+            assert_eq!(
+                remote, case.expected,
+                "case `{}`: expected route",
+                case.name
+            );
+
+            let host_function_available =
+                config.web_search.enabled && config.web_search.fallback_available();
+            let catalog = build_remote_tool_catalog(
+                Some(&bundle),
+                None,
+                RemoteBrokerToolDiscovery {
+                    web_search_function_available: host_function_available,
+                    apply_patch_available: false,
+                    local_mcp_tools: Vec::new(),
+                },
+                Arc::new(McpRegistry::default()),
+                "workspace",
+                false,
+                Some(case.model_id),
+            )
+            .await;
+            assert_eq!(
+                catalog.allows("web_search"),
+                case.expect_broker_web_search,
+                "case `{}`: broker catalog web_search",
+                case.name
+            );
+
+            let request = remote_sidecar_apply_web_search_route(
+                NeutralChatRequest {
+                    model_id: case.model_id.to_string(),
+                    messages: Vec::new(),
+                    tools: catalog.tools.clone(),
+                    thinking_level: None,
+                    max_output_tokens: None,
+                    prompt_cache_key: None,
+                    prompt_cache_retention: None,
+                    agent_correlation: None,
+                    tool_choice: foco_providers::NeutralToolChoice::Auto,
+                },
+                remote,
+            );
+            let web_search_tools: Vec<_> = request
+                .tools
+                .iter()
+                .filter(|tool| tool.name == "web_search")
+                .collect();
+            assert!(
+                web_search_tools.len() <= 1,
+                "case `{}`: at most one web_search on provider request",
+                case.name
+            );
+            if case.expect_native_tool {
+                assert_eq!(web_search_tools.len(), 1, "case `{}`", case.name);
+                assert_eq!(
+                    web_search_tools[0].kind,
+                    foco_providers::NeutralToolKind::ProviderWebSearch,
+                    "case `{}`",
+                    case.name
+                );
+            } else if case.expect_broker_web_search {
+                assert_eq!(web_search_tools.len(), 1, "case `{}`", case.name);
+                assert_eq!(
+                    web_search_tools[0].kind,
+                    foco_providers::NeutralToolKind::Function,
+                    "case `{}`",
+                    case.name
+                );
+            } else {
+                assert!(
+                    web_search_tools.is_empty()
+                        || web_search_tools
+                            .iter()
+                            .all(|t| t.kind != foco_providers::NeutralToolKind::ProviderWebSearch),
+                    "case `{}`: no native tool when not expected",
+                    case.name
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn remote_sidecar_tool_catalog_omits_broker_web_search_for_provider_native() {
         let workspace = tempfile::tempdir().expect("workspace");
