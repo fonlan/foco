@@ -37775,7 +37775,7 @@ mod tests {
             &catalog,
             "call-spec-read",
             "read_spec",
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
             None,
         )
         .await;

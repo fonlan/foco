@@ -1018,17 +1018,25 @@ fn delete_plan_definition() -> ToolDefinition {
 fn read_spec_definition() -> ToolDefinition {
     ToolDefinition {
         name: READ_SPEC_TOOL,
-        description: "Read the Project Spec for the active workspace. The spec is durable workspace context for product, architecture, runtime, data, UI, tool, and operational facts; it is not for temporary todos, logs, secrets, or personal preferences.",
+        description: "Read the Project Spec for the active workspace. The spec is durable workspace context for product, architecture, runtime, data, UI, tool, and operational facts; it is not for temporary todos, logs, secrets, or personal preferences. Large specs use the shared soft output budget (~50KiB / 2,000 lines) and ~128KiB complete envelope hard limit: when over the soft budget the tool succeeds (is_error=false) with an explicit complete-line prefix of contentMarkdown (truncated=true, nextStartLine, returnedLines/lastReturnedLine, totalLines/totalBytes, note). Continue with startLine=nextStartLine and expectedRevision set to the revision from the first page so the multi-page read is pinned to one snapshot; if the revision changed, restart from the first page without startLine. First page: startLine and expectedRevision may both be null. A single complete line over soft but under hard is returned fully with softBudgetExceeded=true and truncated=false (no fake nextStartLine past EOF). UTF-8 characters and Markdown lines are never split.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "startLine": {
+                    "type": ["integer", "null"],
+                    "description": "Optional 1-based first Markdown line to return. Null starts at line 1 (first page). After truncated=true, continue with startLine=nextStartLine from the previous result together with expectedRevision equal to that page's revision."
+                },
+                "expectedRevision": {
+                    "type": ["integer", "null"],
+                    "description": "Required when startLine is non-null: must match the workspace Spec revision from the first page of this multi-page read. On mismatch the tool returns a recoverable revision conflict and you must restart without startLine. Optional on the first page to pin a known revision."
+                },
                 "timeoutMs": {
                     "type": ["integer", "null"],
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["timeoutMs"]
+            "required": ["startLine", "expectedRevision", "timeoutMs"]
         }),
         strict: true,
     }
@@ -1037,7 +1045,7 @@ fn read_spec_definition() -> ToolDefinition {
 fn update_spec_definition() -> ToolDefinition {
     ToolDefinition {
         name: UPDATE_SPEC_TOOL,
-        description: "Update the Project Spec for the active workspace using expectedRevision optimistic locking. Call read_spec first and base the update on its latest revision and exact content. Prefer edits for precise patches; use contentMarkdown only when initializing the spec or when a complete rewrite is genuinely required. Provide exactly one non-null update payload. The spec is durable workspace context; do not use it for temporary todos, logs, secrets, personal preferences, or chat-only notes. Retry from the latest read_spec result if the update conflicts.",
+        description: "Update the Project Spec for the active workspace using expectedRevision optimistic locking. Call read_spec first and base the update on its latest revision and exact content (use read_spec continuation when the body is truncated). Prefer edits for precise patches; use contentMarkdown only when initializing the spec or when a complete rewrite is genuinely required. Provide exactly one non-null update payload. The spec is durable workspace context; do not use it for temporary todos, logs, secrets, personal preferences, or chat-only notes. Retry from the latest read_spec result if the update conflicts. On success, small results include contentMarkdown; large successful results may set contentOmitted=true and omit the body while still returning revision, updateMode, editCount, and line counts—do not retry the same write; call read_spec instead.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

@@ -5402,7 +5402,7 @@ mod tests {
         let initial = execute_builtin_tool(
             workspace.path(),
             READ_SPEC_TOOL,
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
         );
         assert!(!initial.is_error);
         assert_eq!(initial.output["enabled"], false);
@@ -5411,6 +5411,9 @@ mod tests {
         assert_eq!(initial.output["contentMarkdown"], "");
         assert_eq!(initial.output["generatedAt"], Value::Null);
         assert_eq!(initial.output["updatedAt"], Value::Null);
+        assert_eq!(initial.output["truncated"], false);
+        assert_eq!(initial.output["totalLines"], 0);
+        assert_eq!(initial.output["totalBytes"], 0);
 
         // Legacy calls that omit the newer edits field remain valid.
         let first_update = execute_builtin_tool(
@@ -5474,7 +5477,7 @@ mod tests {
         let read_back = execute_builtin_tool(
             workspace.path(),
             READ_SPEC_TOOL,
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
         );
         assert!(!read_back.is_error);
         assert_eq!(
@@ -5615,7 +5618,7 @@ mod tests {
         let read_before_concurrent_write = execute_builtin_tool(
             workspace.path(),
             READ_SPEC_TOOL,
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
         );
         assert_eq!(read_before_concurrent_write.output["revision"], 1);
 
@@ -5648,7 +5651,7 @@ mod tests {
         let read_back = execute_builtin_tool(
             workspace.path(),
             READ_SPEC_TOOL,
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
         );
         assert_eq!(read_back.output["revision"], 2);
         assert_eq!(
@@ -5730,7 +5733,7 @@ mod tests {
             let read_back = execute_builtin_tool(
                 workspace.path(),
                 READ_SPEC_TOOL,
-                json!({ "timeoutMs": null }),
+                json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
             );
             assert_eq!(read_back.output["revision"], 1);
             assert_eq!(read_back.output["contentMarkdown"], initial_content);
@@ -5754,10 +5757,394 @@ mod tests {
         let read_back = execute_builtin_tool(
             workspace.path(),
             READ_SPEC_TOOL,
-            json!({ "timeoutMs": null }),
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
         );
         assert_eq!(read_back.output["revision"], 1);
         assert_eq!(read_back.output["contentMarkdown"], initial_content);
+    }
+
+    #[test]
+    fn read_spec_schema_documents_continuation_fields() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == READ_SPEC_TOOL)
+            .expect("read_spec definition");
+        let properties = definition.input_schema["properties"]
+            .as_object()
+            .expect("read_spec properties");
+        let required = definition.input_schema["required"]
+            .as_array()
+            .expect("read_spec required");
+
+        assert!(definition.strict);
+        assert_eq!(definition.input_schema["additionalProperties"], false);
+        assert_eq!(properties["startLine"]["type"], json!(["integer", "null"]));
+        assert_eq!(
+            properties["expectedRevision"]["type"],
+            json!(["integer", "null"])
+        );
+        assert_eq!(
+            required,
+            &vec![
+                json!("startLine"),
+                json!("expectedRevision"),
+                json!("timeoutMs"),
+            ]
+        );
+        assert!(definition.description.contains("nextStartLine"));
+        assert!(definition.description.contains("expectedRevision"));
+        assert!(definition.description.contains("truncated=true"));
+    }
+
+    #[test]
+    fn read_spec_paginates_large_markdown_and_pins_revision() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // ~55 KiB of multi-line markdown so the full ToolExecution exceeds the 50 KiB soft budget.
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789-spec-line-padding-xx\n";
+        let large = format!("# Large Spec\n\n{}", line.repeat(950));
+        assert!(large.len() > 50 * 1024);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": large,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+        assert_eq!(written.output["revision"], 1);
+        // Large update success must keep metadata even when body is omitted.
+        assert!(
+            written.output["contentOmitted"].as_bool() == Some(true)
+                || written.output.get("contentMarkdown").is_some(),
+            "update_spec must return contentOmitted or contentMarkdown: {}",
+            written.output
+        );
+        if written.output["contentOmitted"] == true {
+            assert!(written.output.get("contentMarkdown").is_none());
+            assert_eq!(written.output["revision"], 1);
+            assert_eq!(written.output["updateMode"], "fullReplacement");
+            assert_eq!(written.output["editCount"], 0);
+            assert!(written.output["lineCountAfter"].as_u64().unwrap_or(0) > 0);
+            assert!(
+                written.output["note"]
+                    .as_str()
+                    .expect("note")
+                    .contains("read_spec")
+            );
+        }
+
+        let first = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({ "startLine": null, "expectedRevision": null, "timeoutMs": null }),
+        );
+        assert!(!first.is_error, "{}", first.output);
+        assert_eq!(first.output["revision"], 1);
+        assert_eq!(first.output["truncated"], true);
+        let next = first.output["nextStartLine"]
+            .as_u64()
+            .expect("nextStartLine") as usize;
+        assert!(next >= 2, "nextStartLine={next}");
+        assert!(first.output["returnedLines"].as_u64().unwrap_or(0) >= 1);
+        let first_chunk = first.output["contentMarkdown"]
+            .as_str()
+            .expect("first content")
+            .to_string();
+        assert!(!first_chunk.is_empty());
+        assert!(first_chunk.starts_with("# Large Spec"));
+
+        let second = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": next,
+                "expectedRevision": 1,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!second.is_error, "{}", second.output);
+        assert_eq!(second.output["revision"], 1);
+        let second_chunk = second.output["contentMarkdown"]
+            .as_str()
+            .expect("second content")
+            .to_string();
+
+        // Stale continuation after concurrent write must fail clearly.
+        let mut concurrent =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("concurrent database");
+        concurrent
+            .update_workspace_spec_content(1, "# Spec\n\nConcurrent")
+            .expect("concurrent update")
+            .expect("cas won");
+
+        let conflict = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": next,
+                "expectedRevision": 1,
+                "timeoutMs": null
+            }),
+        );
+        assert!(conflict.is_error);
+        assert!(
+            conflict.output["error"]
+                .as_str()
+                .expect("conflict error")
+                .contains("revision changed during read_spec continuation")
+        );
+
+        // Reassemble first two pages against the original large body (before concurrent write).
+        let reassembled = format!("{first_chunk}{second_chunk}");
+        assert!(
+            large.starts_with(&reassembled)
+                || reassembled.starts_with(&large[..reassembled.len().min(large.len())]),
+            "continuation pages must be complete-line prefixes of the original body"
+        );
+        assert_eq!(&large[..first_chunk.len()], first_chunk.as_str());
+        if !second_chunk.is_empty() {
+            assert_eq!(
+                &large[first_chunk.len()..first_chunk.len() + second_chunk.len()],
+                second_chunk.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn read_spec_eof_continuation_returns_empty_final_page() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let content = "# Spec\n\nLine three";
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": content,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error);
+
+        let past_eof = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": 100,
+                "expectedRevision": 1,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!past_eof.is_error, "{}", past_eof.output);
+        assert_eq!(past_eof.output["contentMarkdown"], "");
+        assert_eq!(past_eof.output["truncated"], false);
+        assert_eq!(past_eof.output["returnedLines"], 0);
+        assert_eq!(past_eof.output["revision"], 1);
+    }
+
+    #[test]
+    fn update_spec_small_result_keeps_content_markdown() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let result = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Small\n\nBody",
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output["contentOmitted"], false);
+        assert_eq!(result.output["contentMarkdown"], "# Small\n\nBody");
+        assert_eq!(result.output["revision"], 1);
+        assert_eq!(result.output["updateMode"], "fullReplacement");
+        assert_eq!(result.output["editCount"], 0);
+        assert_eq!(result.output["lineCountBefore"], 0);
+        assert_eq!(result.output["lineCountAfter"], 3);
+        assert_eq!(result.output["totalLines"], 3);
+    }
+
+    #[test]
+    fn update_spec_line_counts_use_complete_line_endings() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Lone CR is a complete-line ending for pagination; lineCount* must match totalLines.
+        let cr_only = "a\rb";
+        let result = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": cr_only,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output["contentOmitted"], false);
+        assert_eq!(result.output["lineCountAfter"], 2);
+        assert_eq!(result.output["totalLines"], 2);
+        assert_eq!(result.output["totalBytes"], cr_only.len());
+
+        let crlf = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 1,
+                "contentMarkdown": "a\r\nb\r\n",
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!crlf.is_error, "{}", crlf.output);
+        assert_eq!(crlf.output["lineCountBefore"], 2);
+        assert_eq!(crlf.output["lineCountAfter"], 2);
+        assert_eq!(crlf.output["totalLines"], 2);
+    }
+
+    #[test]
+    fn update_spec_omits_body_when_bare_execution_fits_but_envelope_reserve_does_not() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        // Multi-line body large enough that bare ToolExecution with contentMarkdown exceeds
+        // soft minus TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES (and usually the soft limit itself).
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789-envelope-pad-line\n";
+        let large = format!("# Envelope boundary\n\n{}", line.repeat(900));
+        assert!(large.len() > 40 * 1024);
+
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": large,
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error, "{}", written.output);
+        assert_eq!(written.output["revision"], 1);
+        assert_eq!(written.output["contentOmitted"], true);
+        assert!(written.output.get("contentMarkdown").is_none());
+        assert_eq!(written.output["updateMode"], "fullReplacement");
+        assert_eq!(written.output["editCount"], 0);
+        assert!(
+            written.output["note"]
+                .as_str()
+                .expect("note")
+                .contains("read_spec")
+        );
+
+        let measured = output_budget::measure_tool_execution(&written).expect("measure omitted");
+        let soft_with_reserve = output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT
+            .saturating_sub(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES);
+        assert!(
+            measured.serialized_bytes <= soft_with_reserve,
+            "omitted success must fit soft minus envelope reserve: {} > {}",
+            measured.serialized_bytes,
+            soft_with_reserve
+        );
+
+        // Outer normalizer must preserve structured contentOmitted metadata (not generic omission).
+        let budgeted = output_budget::normalize_tool_execution(
+            UPDATE_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::RetryUnsafe,
+            written.clone(),
+        );
+        assert!(!budgeted.execution.is_error);
+        assert_eq!(budgeted.execution.output["contentOmitted"], true);
+        assert_eq!(budgeted.execution.output["revision"], 1);
+        assert!(budgeted.execution.output.get("outputOmitted").is_none());
+
+        // Simulate a slightly larger transport envelope soft overage: still preserve metadata.
+        let envelope_over = ToolExecution {
+            output: {
+                let mut output = written.output.clone();
+                if let Some(object) = output.as_object_mut() {
+                    object.insert(
+                        "padding".to_string(),
+                        json!(
+                            "x".repeat(output_budget::TOOL_EXECUTION_ENVELOPE_RESERVE_BYTES + 64)
+                        ),
+                    );
+                }
+                output
+            },
+            is_error: false,
+        };
+        let envelope_budgeted = output_budget::normalize_tool_execution_for_envelope(
+            UPDATE_SPEC_TOOL,
+            output_budget::ToolOutputSemantics::RetryUnsafe,
+            envelope_over,
+            |execution| {
+                // Measure as if SSE wrapper added the padding field size already in output.
+                output_budget::serialized_json_size(execution)
+            },
+        );
+        assert!(!envelope_budgeted.execution.is_error);
+        assert_eq!(envelope_budgeted.execution.output["contentOmitted"], true);
+        assert_eq!(envelope_budgeted.execution.output["revision"], 1);
+        assert!(
+            envelope_budgeted
+                .execution
+                .output
+                .get("outputOmitted")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn read_spec_continuation_requires_expected_revision() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let written = execute_builtin_tool(
+            workspace.path(),
+            UPDATE_SPEC_TOOL,
+            json!({
+                "expectedRevision": 0,
+                "contentMarkdown": "# Spec\n\nBody",
+                "edits": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!written.is_error);
+
+        let missing = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": 2,
+                "expectedRevision": null,
+                "timeoutMs": null
+            }),
+        );
+        assert!(missing.is_error);
+        assert!(
+            missing.output["error"]
+                .as_str()
+                .expect("error")
+                .contains("expectedRevision")
+        );
+
+        let zero = execute_builtin_tool(
+            workspace.path(),
+            READ_SPEC_TOOL,
+            json!({
+                "startLine": 0,
+                "expectedRevision": 1,
+                "timeoutMs": null
+            }),
+        );
+        assert!(zero.is_error);
+        assert!(
+            zero.output["error"]
+                .as_str()
+                .expect("error")
+                .contains("positive 1-based")
+        );
     }
 
     #[test]

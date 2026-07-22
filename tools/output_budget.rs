@@ -615,6 +615,28 @@ fn is_get_plans_offset_pagination(tool_name: &str, execution: &ToolExecution) ->
             .is_some_and(|offset| offset > 0)
 }
 
+/// Whether `update_spec` already returned a structured success with body omitted.
+///
+/// Large successful writes drop `contentMarkdown` but keep `revision` / `updateMode` / line counts
+/// so the model does not retry the write. Preserve that metadata when only the outer transport
+/// envelope crosses a soft limit; hard envelope limits still apply.
+fn is_update_spec_content_omitted_success(tool_name: &str, execution: &ToolExecution) -> bool {
+    if tool_name != "update_spec" || execution.is_error {
+        return false;
+    }
+    let Some(fields) = execution.output.as_object() else {
+        return false;
+    };
+
+    matches!(fields.get("contentOmitted"), Some(Value::Bool(true)))
+        && fields.get("revision").and_then(Value::as_u64).is_some()
+        && fields
+            .get("updateMode")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| !mode.is_empty())
+        && fields.get("contentMarkdown").is_none()
+}
+
 pub fn normalize_tool_execution(
     tool_name: &str,
     semantics: ToolOutputSemantics,
@@ -701,12 +723,14 @@ where
     // - `softBudgetExceeded: true` + `truncated: false` (single soft-over line, full content).
     // - `get_command_output`'s `truncated: true` + `hasMore: true` + `nextCursor` cursor page.
     // - `get_plans`' `truncated: true` + `hasMore: true` + `nextOffset` record page.
+    // - `update_spec` success with `contentOmitted: true` (body dropped, CAS metadata kept).
     // Hard envelope limits still apply.
     if !execution.is_error
         && reason != ToolOutputBudgetReason::HardByteLimit
         && (is_line_bounded_budget_success(&execution)
             || is_command_output_cursor_pagination(tool_name, &execution)
-            || is_get_plans_offset_pagination(tool_name, &execution))
+            || is_get_plans_offset_pagination(tool_name, &execution)
+            || is_update_spec_content_omitted_success(tool_name, &execution))
     {
         return BudgetedToolExecution {
             execution,
