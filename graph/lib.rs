@@ -1781,6 +1781,294 @@ RUN echo hello
         }
     }
 
+    #[test]
+    fn semantic_fixture_preserves_legacy_function_invocations_as_reference_edges() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let relation = connection
+            .query_row(
+                "SELECT edge.edge_kind, edge.metadata_json
+                 FROM code_graph_edges edge
+                 JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+                 JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+                 WHERE source.name = 'result' AND target.name = 'local_helper'",
+                [],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .expect("legacy render relation");
+
+        assert_eq!(relation, ("references".to_string(), "{}".to_string()));
+    }
+
+    #[test]
+    fn semantic_fixture_exposes_same_name_candidates_and_legacy_mislink() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("graph database");
+        let candidates = database
+            .find_code_graph_symbols("same_name", Some("function"), Some("src/lib.rs"), 10)
+            .expect("same-name candidates")
+            .into_iter()
+            .map(|symbol| symbol.start_line)
+            .collect::<Vec<_>>();
+
+        assert_eq!(candidates, vec![Some(13), Some(20)]);
+
+        drop(database);
+        let connection = graph_connection(workspace.path());
+        let mut statement = connection
+            .prepare(
+                "SELECT source.name, source.start_line, target.name, target.start_line
+                 FROM code_graph_edges edge
+                 JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+                 JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+                 WHERE source.name IN ('call_inner', 'call_outer')
+                   AND target.name = 'same_name'
+                 ORDER BY source.name ASC",
+            )
+            .expect("prepare same-name edge query");
+        let relations = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("query same-name edges")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect same-name edges");
+
+        assert_eq!(
+            relations,
+            vec![
+                ("call_inner".to_string(), 22, "same_name".to_string(), 20),
+                ("call_outer".to_string(), 15, "same_name".to_string(), 20),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_fixture_records_variable_reads_as_references() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let edge_kind = connection
+            .query_row(
+                "SELECT edge.edge_kind
+                 FROM code_graph_edges edge
+                 JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+                 JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+                 WHERE source.name = 'render' AND target.name = 'result'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("variable read relation");
+
+        assert_eq!(edge_kind, "references");
+    }
+
+    #[test]
+    fn semantic_fixture_keeps_cross_file_imports_without_cross_file_edges() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let cross_file_edge_count = query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.file_id <> target.file_id",
+        );
+
+        assert_eq!(cross_file_edge_count, 0);
+    }
+
+    #[test]
+    fn semantic_fixture_reports_tree_sitter_error_status() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        let report = index_workspace(workspace.path()).expect("index fixture");
+
+        assert_eq!(report.parse_errors, 1);
+
+        let connection = graph_connection(workspace.path());
+        let parse_status = connection
+            .query_row(
+                "SELECT status
+                 FROM code_graph_parse_status parse_status
+                 JOIN code_graph_files file ON file.id = parse_status.file_id
+                 WHERE file.path = 'src/broken.rs'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("broken file parse status");
+
+        assert_eq!(parse_status, "error");
+    }
+
+    #[test]
+    fn semantic_fixture_keeps_tree_sitter_error_files_without_partial_symbols() {
+        let workspace = semantic_fixture_workspace("rust_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let broken_symbol_count = query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_symbols symbol
+             JOIN code_graph_files file ON file.id = symbol.file_id
+             WHERE file.path = 'src/broken.rs'",
+        );
+
+        assert_eq!(broken_symbol_count, 0);
+    }
+
+    #[test]
+    fn semantic_fixture_records_typescript_and_tsx_import_modules_without_aliases_yet() {
+        let workspace = semantic_fixture_workspace("typescript_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let mut statement = connection
+            .prepare(
+                "SELECT file.path, import.module, import.imported_symbol, import.alias
+                 FROM code_graph_imports import
+                 JOIN code_graph_files file ON file.id = import.file_id
+                 ORDER BY file.path ASC, import.id ASC",
+            )
+            .expect("prepare import query");
+        let imports = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })
+            .expect("query imports")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect imports");
+
+        assert_eq!(
+            imports,
+            vec![
+                (
+                    "src/Panel.tsx".to_string(),
+                    "./index".to_string(),
+                    None,
+                    None,
+                ),
+                (
+                    "src/index.ts".to_string(),
+                    "./public".to_string(),
+                    None,
+                    None,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn semantic_fixture_does_not_index_typescript_reexports_yet() {
+        let workspace = semantic_fixture_workspace("typescript_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let reexport_import_count = query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_imports import
+             JOIN code_graph_files file ON file.id = import.file_id
+             WHERE file.path = 'src/public.ts'",
+        );
+
+        assert_eq!(reexport_import_count, 0);
+    }
+
+    #[test]
+    fn semantic_fixture_does_not_create_cross_file_typescript_or_tsx_edges_yet() {
+        let workspace = semantic_fixture_workspace("typescript_workspace");
+
+        index_workspace(workspace.path()).expect("index fixture");
+
+        let connection = graph_connection(workspace.path());
+        let cross_file_edge_count = query_count(
+            &connection,
+            "SELECT COUNT(*)
+             FROM code_graph_edges edge
+             JOIN code_graph_symbols source ON source.id = edge.source_symbol_id
+             JOIN code_graph_symbols target ON target.id = edge.target_symbol_id
+             WHERE source.file_id <> target.file_id",
+        );
+
+        assert_eq!(cross_file_edge_count, 0);
+    }
+
+    #[test]
+    #[ignore = "run with --release to compare the fixed semantic graph performance fixture"]
+    fn semantic_fixture_performance_baseline_indexes_fixed_workspace() {
+        let workspace = semantic_fixture_workspace("performance_rust_workspace");
+        let started_at = Instant::now();
+
+        let report = index_workspace(workspace.path()).expect("index performance fixture");
+
+        eprintln!(
+            "semantic graph performance fixture indexed {} files in {} ms",
+            report.indexed_files,
+            started_at.elapsed().as_millis()
+        );
+        assert_eq!(report.parse_errors, 0);
+    }
+
+    fn semantic_fixture_workspace(name: &str) -> tempfile::TempDir {
+        let workspace = tempfile::tempdir().expect("fixture workspace");
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("semantic_baseline")
+            .join(name);
+
+        copy_fixture_tree(&fixture, workspace.path());
+        workspace
+    }
+
+    fn copy_fixture_tree(source: &Path, destination: &Path) {
+        for entry in fs::read_dir(source).expect("read fixture directory") {
+            let entry = entry.expect("fixture directory entry");
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            let file_type = entry.file_type().expect("fixture file type");
+
+            if file_type.is_dir() {
+                fs::create_dir_all(&destination_path).expect("create fixture directory");
+                copy_fixture_tree(&source_path, &destination_path);
+            } else {
+                fs::copy(&source_path, &destination_path).expect("copy fixture file");
+            }
+        }
+    }
+
+    fn graph_connection(workspace_path: &Path) -> Connection {
+        Connection::open(workspace_path.join(".foco").join("foco.sqlite"))
+            .expect("open graph database")
+    }
+
     fn query_count(connection: &Connection, sql: &str) -> i64 {
         connection
             .query_row(sql, [], |row| row.get(0))
