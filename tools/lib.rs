@@ -35,12 +35,16 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
 use foco_store::workspace::WorkspaceDatabaseError;
+#[cfg(unix)]
+use process_wrap::std::ProcessGroup;
+use process_wrap::std::{ChildWrapper, CommandWrap};
+#[cfg(windows)]
+use process_wrap::std::{CreationFlags, JobObject};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(windows)]
+use windows::Win32::System::Threading::PROCESS_CREATION_FLAGS;
 
 use crate::errors::{ToolRuntimeError, tool_error_output};
 
@@ -131,7 +135,7 @@ const MAX_TOOL_TIMEOUT_MS: u64 = 600_000;
 const COMMAND_WAIT_POLL_MS: u64 = 25;
 const MAX_COMMAND_PIPE_MESSAGES_PER_DRAIN: usize = 8;
 #[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
+const CREATE_NO_WINDOW: PROCESS_CREATION_FLAGS = PROCESS_CREATION_FLAGS(0x0800_0000);
 static RIPGREP_PATH: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -963,28 +967,31 @@ pub(crate) fn run_command_with_timeout(
     output_limits: Option<CommandOutputLimits>,
 ) -> Result<CommandRunOutput, ToolRuntimeError> {
     let command_label = command_label(command, args);
-    let mut command_process = Command::new(command);
-    command_process
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(windows)]
-    command_process.creation_flags(CREATE_NO_WINDOW);
-
-    let mut child = command_process
-        .spawn()
-        .map_err(|source| ToolRuntimeError::Command {
+    let mut child = spawn_foreground_command_process(command, args, cwd).map_err(|source| {
+        ToolRuntimeError::Command {
             command: command_label.clone(),
             source,
-        })?;
+        }
+    })?;
     let pid = child.id();
-    let stdout = child.stdout.take().ok_or_else(|| {
-        ToolRuntimeError::InvalidArguments("failed to capture stdout".to_string())
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        ToolRuntimeError::InvalidArguments("failed to capture stderr".to_string())
-    })?;
+    let stdout = match child.stdout().take() {
+        Some(stdout) => stdout,
+        None => {
+            terminate_command_process_tree(&mut child);
+            return Err(ToolRuntimeError::InvalidArguments(
+                "failed to capture stdout".to_string(),
+            ));
+        }
+    };
+    let stderr = match child.stderr().take() {
+        Some(stderr) => stderr,
+        None => {
+            terminate_command_process_tree(&mut child);
+            return Err(ToolRuntimeError::InvalidArguments(
+                "failed to capture stderr".to_string(),
+            ));
+        }
+    };
     let stdout_handle = read_command_pipe(stdout);
     let stderr_handle = read_command_pipe(stderr);
     let started = Instant::now();
@@ -1003,8 +1010,7 @@ pub(crate) fn run_command_with_timeout(
             .map(ToolCancellationToken::is_cancelled)
             .unwrap_or(false)
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_command_process_tree(&mut child);
 
             return Err(ToolRuntimeError::CommandCancelled {
                 command: command_label,
@@ -1024,8 +1030,7 @@ pub(crate) fn run_command_with_timeout(
             output_limits.and_then(|limits| limits.stdout_bytes),
             output_limits.is_some_and(|limits| limits.truncate),
         ) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_command_process_tree(&mut child);
             return Err(error);
         }
         if let Err(error) = drain_command_pipe(
@@ -1040,8 +1045,7 @@ pub(crate) fn run_command_with_timeout(
             output_limits.and_then(|limits| limits.stderr_bytes),
             output_limits.is_some_and(|limits| limits.truncate),
         ) {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_command_process_tree(&mut child);
             return Err(error);
         }
 
@@ -1071,8 +1075,7 @@ pub(crate) fn run_command_with_timeout(
         }
 
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_command_process_tree(&mut child);
 
             return Err(ToolRuntimeError::CommandTimedOut {
                 command: command_label,
@@ -1087,6 +1090,38 @@ pub(crate) fn run_command_with_timeout(
                 .min(Duration::from_millis(COMMAND_WAIT_POLL_MS)),
         );
     }
+}
+
+/// Spawn a foreground command with the same process-tree boundary as managed background commands:
+/// Unix process group leader, Windows Job Object (+ CREATE_NO_WINDOW).
+fn spawn_foreground_command_process(
+    command: &str,
+    args: &[String],
+    cwd: &Path,
+) -> io::Result<Box<dyn ChildWrapper>> {
+    let mut command_process = Command::new(command);
+    command_process
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut command = CommandWrap::from(command_process);
+
+    #[cfg(unix)]
+    command.wrap(ProcessGroup::leader());
+    #[cfg(windows)]
+    {
+        command.wrap(CreationFlags(CREATE_NO_WINDOW));
+        command.wrap(JobObject);
+    }
+
+    command.spawn()
+}
+
+/// Terminate the entire command process tree (process group / Job Object), not only the direct child.
+fn terminate_command_process_tree(child: &mut Box<dyn ChildWrapper>) {
+    let _ = child.start_kill();
+    let _ = child.wait();
 }
 
 pub(crate) struct CommandRunOutput {
@@ -7066,6 +7101,95 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn run_command_timeout_kills_entire_unix_process_group() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pid_path = workspace.path().join("grandchild.pid");
+        let started = Instant::now();
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": [
+                    "-c",
+                    "sleep 30 & echo $! > grandchild.pid; wait"
+                ],
+                "cwd": null,
+                "timeoutMs": 200
+            }),
+        );
+
+        assert!(result.is_error);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .expect("timeout error")
+                .contains("timed out")
+        );
+        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
+        wait_until_process_exits(grandchild_pid, Duration::from_secs(2));
+        assert!(
+            !process_is_alive(grandchild_pid),
+            "grandchild process should be killed with its process group on timeout"
+        );
+        // Ensure no leftover sleep if the assertion path somehow races.
+        force_kill_process(grandchild_pid);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_cancellation_kills_entire_unix_process_group() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let pid_path = workspace.path().join("grandchild.pid");
+        let cancellation = ToolCancellationToken::default();
+        let cancellation_trigger = cancellation.clone();
+        let pid_path_for_trigger = pid_path.clone();
+        let started = Instant::now();
+        let trigger = thread::spawn(move || {
+            // Wait until the shell has forked the long-lived grandchild and written its pid.
+            let _ = wait_for_pid_file(&pid_path_for_trigger, Duration::from_secs(2));
+            cancellation_trigger.cancel();
+        });
+
+        let result = execute_builtin_tool_for_chat_with_cancellation_and_output_sink(
+            workspace.path(),
+            None,
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": [
+                    "-c",
+                    "sleep 30 & echo $! > grandchild.pid; wait"
+                ],
+                "cwd": null,
+                "timeoutMs": 5_000
+            }),
+            Some(cancellation),
+            None,
+        );
+        trigger.join().expect("join cancellation trigger");
+
+        assert!(result.is_error);
+        assert!(
+            result.output["error"]
+                .as_str()
+                .expect("cancellation error")
+                .contains("cancelled")
+        );
+        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
+        wait_until_process_exits(grandchild_pid, Duration::from_secs(2));
+        assert!(
+            !process_is_alive(grandchild_pid),
+            "grandchild process should be killed with its process group on cancellation"
+        );
+        force_kill_process(grandchild_pid);
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
     #[test]
     fn run_command_times_out() {
         let workspace = tempfile::tempdir().expect("workspace");
@@ -7154,6 +7278,55 @@ mod tests {
     #[ignore]
     fn pipe_holder_child_process() {
         std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    fn wait_for_pid_file(path: &Path, timeout: Duration) -> u32 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Ok(contents) = fs::read_to_string(path)
+                && let Ok(pid) = contents.trim().parse::<u32>()
+                && pid > 0
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "command did not report grandchild pid at {}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(unix)]
+    fn wait_until_process_exits(pid: u32, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        while process_is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "process {pid} did not exit within {timeout:?}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn force_kill_process(pid: u32) {
+        let _ = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status();
     }
 
     fn run_test_command(workspace_path: &Path, command: &str, args: &[&str]) {
