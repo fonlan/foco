@@ -3804,6 +3804,28 @@ fn remote_sidecar_cancel_active_run(
     emit_events: bool,
     remove_pending: bool,
 ) {
+    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, true);
+}
+
+/// End an in-memory run after its task, queuedRun, and assistant were already
+/// terminalized by the caller's durable transaction. Keeping this separate
+/// avoids nesting a critical database open under that transaction.
+fn remote_sidecar_cancel_active_run_after_durable_closure(
+    state: &RemoteSidecarState,
+    run_id: &str,
+    emit_events: bool,
+    remove_pending: bool,
+) {
+    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, false);
+}
+
+fn remote_sidecar_cancel_active_run_inner(
+    state: &RemoteSidecarState,
+    run_id: &str,
+    emit_events: bool,
+    remove_pending: bool,
+    clear_durable_queued_run: bool,
+) {
     let Some(registration) = remote_sidecar_deactivate_active_run(state, run_id) else {
         return;
     };
@@ -3812,21 +3834,23 @@ fn remote_sidecar_cancel_active_run(
     // A terminal cancel must not leave durable queuedRun visible after the
     // heartbeat stops advertising the run. The owner tuple prevents a late
     // cancellation from clearing a newer run for the same chat.
-    if let Ok(mut database) =
-        WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))
-    {
-        if let Err(error) = database.clear_remote_queued_run_if_owned(
-            &run_stream.chat_id,
-            &registration.queued_user_message_id,
-            &registration.assistant_message_id,
-            run_id,
-        ) {
-            tracing::warn!(
-                error = %error,
-                chat_id = %run_stream.chat_id,
+    if clear_durable_queued_run {
+        if let Ok(mut database) =
+            WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))
+        {
+            if let Err(error) = database.clear_remote_queued_run_if_owned(
+                &run_stream.chat_id,
+                &registration.queued_user_message_id,
+                &registration.assistant_message_id,
                 run_id,
-                "failed to clear owned remote queuedRun before cancellation terminal event"
-            );
+            ) {
+                tracing::warn!(
+                    error = %error,
+                    chat_id = %run_stream.chat_id,
+                    run_id,
+                    "failed to clear owned remote queuedRun before cancellation terminal event"
+                );
+            }
         }
     }
 
@@ -4092,7 +4116,7 @@ fn remote_sidecar_cancel_active_run_for_plan_task(
         // The database transaction has already emitted the durable terminal
         // state. This only wakes an in-memory late runner and ends reconnectable
         // SSE subscriptions without allowing it to write another turn.
-        remote_sidecar_cancel_active_run(state, run_id, true, true);
+        remote_sidecar_cancel_active_run_after_durable_closure(state, run_id, true, true);
     }
 }
 
@@ -16673,7 +16697,9 @@ fn remote_plan_task_message_identity_from_input(
     let payload = payload.as_object().ok_or_else(|| {
         ApiError::bad_request("remote Plan Agent task input must be a JSON object")
     })?;
-    if !payload.contains_key(REMOTE_PLAN_TASK_KIND_FIELD) {
+    if !payload.contains_key("queuedUserMessageId")
+        && !payload.contains_key("visibleAssistantMessageId")
+    {
         return Ok(None);
     }
     Ok(Some((
@@ -22817,6 +22843,25 @@ mod tests {
         );
         assert!(direct_kind.requires_merge_attempt());
         assert!(isolated_kind.requires_merge_attempt());
+    }
+
+    #[test]
+    fn legacy_remote_plan_task_input_keeps_durable_message_identity_for_recovery() {
+        let input = json!({
+            "queuedUserMessageId": "user-legacy-plan",
+            "visibleAssistantMessageId": "assistant-legacy-plan",
+            "visibleAssistantSequence": 1,
+            "message": "Implement the plan phase",
+        })
+        .to_string();
+
+        assert_eq!(
+            remote_plan_task_message_identity_from_input(&input).expect("message identity"),
+            Some((
+                "user-legacy-plan".to_string(),
+                "assistant-legacy-plan".to_string(),
+            ))
+        );
     }
 
     #[test]

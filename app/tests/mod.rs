@@ -12573,6 +12573,285 @@ fn startup_reconciliation_preserves_attempt_with_active_durable_lease() {
     }));
 }
 
+#[test]
+fn concurrent_startup_scans_keep_live_plan_attempt_for_original_coordinator_completion() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let (team_id, _, task_id, attempt_id) = insert_claimed_agent_task_with_input_and_owner(
+        workspace.path(),
+        "restart-live-plan",
+        "{}",
+        Some("agent-owner-live-plan"),
+    );
+    {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .create_plan(NewPlan {
+                id: "plan-restart-live",
+                title: "Live restart plan",
+                overview: "A live coordinator must keep its implementation phase during recovery.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: "plan-restart-live-phase",
+                    title: "Live phase",
+                    summary: "The original owner will complete after concurrent startup scans.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-restart-live-step",
+                        title: "Keep the owner",
+                        detail: "A current lease proves the coordinator remains active.",
+                        acceptance: vec!["owner remains running".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-restart-live", "start")
+            .expect("start plan");
+        database
+            .attach_plan_phase_run(
+                "plan-restart-live",
+                "plan-restart-live-phase",
+                "chat-restart-live-plan",
+                &team_id,
+                &task_id,
+            )
+            .expect("attach phase");
+    }
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let scans = (0..2)
+        .map(|_| {
+            let state = state.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                reconcile_agent_runtime(&state).expect("concurrent startup reconciliation");
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for scan in scans {
+        scan.join().expect("startup scan joined");
+    }
+
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Running
+    );
+    let preserved = database
+        .plan("plan-restart-live")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(preserved.status, "running");
+    assert_eq!(preserved.phases[0].status, "running");
+
+    database
+        .update_agent_task_state_for_attempt(
+            foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"original coordinator completed"}"#),
+                error_json: None,
+                interruption_reason: None,
+            },
+            &attempt_id,
+        )
+        .expect("original coordinator completes");
+    let completed = database
+        .complete_plan_phase_run(&task_id, Some("live-owner-commit"))
+        .expect("complete plan phase")
+        .expect("completed plan");
+    assert_eq!(completed.status, "implemented");
+    assert_eq!(completed.phases[0].status, "completed");
+    assert_eq!(
+        completed.phases[0].commit_id.as_deref(),
+        Some("live-owner-commit")
+    );
+}
+
+#[test]
+fn expired_lease_reconciliation_closes_plan_chat_once_and_rejects_late_completion() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let input = json!({
+        "queuedUserMessageId": "user-restart-expired",
+        "visibleAssistantMessageId": "assistant-restart-expired",
+        "visibleAssistantSequence": 1,
+        "message": "Implement the expired phase",
+    })
+    .to_string();
+    let (team_id, _, task_id, attempt_id) = insert_claimed_agent_task_with_input_and_owner(
+        workspace.path(),
+        "restart-expired",
+        &input,
+        Some("agent-owner-expired-plan"),
+    );
+    let database_path = {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_message(NewMessage {
+                id: "user-restart-expired",
+                chat_id: "chat-restart-expired",
+                role: "user",
+                content: "Implement the expired phase",
+                sequence: 0,
+                metadata_json: Some(r#"{"queuedRun":{"status":"queued"}}"#),
+            })
+            .expect("user message");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-restart-expired",
+                chat_id: "chat-restart-expired",
+                role: "assistant",
+                content: "partial implementation",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("streaming assistant");
+        database
+            .mark_chat_queued_run_started(
+                "chat-restart-expired",
+                "user-restart-expired",
+                "assistant-restart-expired",
+                1,
+            )
+            .expect("mark queued run");
+        database
+            .claim_agent_chat_queued_run(
+                "chat-restart-expired",
+                "user-restart-expired",
+                "assistant-restart-expired",
+                1,
+                task_id.as_str(),
+                "run-restart-expired",
+            )
+            .expect("claim queued run");
+        database
+            .create_plan(NewPlan {
+                id: "plan-restart-expired",
+                title: "Expired restart plan",
+                overview: "A verified abandoned coordinator closes every durable owner state.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: "plan-restart-expired-phase",
+                    title: "Expired phase",
+                    summary: "The stale owner must not revive the implementation chat.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-restart-expired-step",
+                        title: "Close stale owner",
+                        detail: "The stale lease is terminalized once.",
+                        acceptance: vec!["implementation is consistently failed".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-restart-expired", "start")
+            .expect("start plan");
+        database
+            .attach_plan_phase_run(
+                "plan-restart-expired",
+                "plan-restart-expired-phase",
+                "chat-restart-expired",
+                &team_id,
+                &task_id,
+            )
+            .expect("attach phase");
+        database.database_path().to_path_buf()
+    };
+    Connection::open(&database_path)
+        .expect("open lease fixture")
+        .execute(
+            "UPDATE agent_attempts
+             SET lease_renewed_at = '2000-01-01T00:00:00Z'
+             WHERE id = ?1",
+            params![attempt_id.as_str()],
+        )
+        .expect("expire lease fixture");
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    reconcile_agent_runtime(&state).expect("first expired-lease reconciliation");
+    reconcile_agent_runtime(&state).expect("repeated expired-lease reconciliation");
+
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Failed
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Failed
+    );
+    let plan = database
+        .plan("plan-restart-expired")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "failed");
+    assert_eq!(plan.phases[0].status, "failed");
+    let chat = database
+        .chat("chat-restart-expired")
+        .expect("chat")
+        .expect("chat");
+    let chat_metadata = parse_json_value(&chat.metadata_json, "chat metadata").expect("metadata");
+    assert!(chat_metadata.get("queuedRun").is_none());
+    let assistant = database
+        .message("assistant-restart-expired")
+        .expect("assistant")
+        .expect("assistant");
+    let assistant_metadata =
+        parse_json_value(&assistant.metadata_json, "assistant metadata").expect("metadata");
+    assert_eq!(assistant_metadata["streamingState"], json!("failed"));
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event_type == "task_failed")
+            .count(),
+        1,
+        "repeated reconciliation must not write a second terminal closure"
+    );
+    assert!(
+        !database
+            .update_agent_task_state_for_attempt(
+                foco_store::workspace::AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &task_id,
+                    expected_status: foco_agent::AgentTaskStatus::Running,
+                    transition: foco_agent::AgentTaskTransition::Complete,
+                    result_json: Some(r#"{"text":"late owner"}"#),
+                    error_json: None,
+                    interruption_reason: None,
+                },
+                &attempt_id,
+            )
+            .expect("late completion check"),
+        "a late coordinator must not revive a terminalized attempt"
+    );
+}
+
 fn insert_claimed_agent_task_with_input(
     workspace_dir: &Path,
     suffix: &str,
