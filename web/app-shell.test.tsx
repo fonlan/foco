@@ -2681,7 +2681,7 @@ describe("app-shell verification surfaces", () => {
 
     const modelTrigger = await screen.findByRole("button", { name: /Model:/ });
     const thinkingTrigger = await screen.findByRole("button", { name: /Thinking/ });
-    const branchTrigger = await screen.findByLabelText("Git branch");
+    expect(screen.queryByLabelText("Git branch")).not.toBeInTheDocument();
 
     await user.click(modelTrigger);
     expect(await screen.findByRole("listbox")).toBeInTheDocument();
@@ -2697,77 +2697,6 @@ describe("app-shell verification surfaces", () => {
       expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     });
 
-    await user.click(branchTrigger);
-    expect(await screen.findByRole("listbox")).toBeInTheDocument();
-    await user.keyboard("{Escape}");
-    await waitFor(() => {
-      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    });
-  });
-
-  it("refreshes git branches and worktrees when opening the branch menu", async () => {
-    const user = userEvent.setup();
-    appTestState.workspaceGitBranchesResponses = [
-      {
-        branches: ["main"],
-        currentBranch: "main",
-        isGitRepository: true,
-        worktrees: [
-          {
-            branch: "main",
-            isCurrent: true,
-            name: "workspace",
-            path: "C:/Users/fonla/.foco/workspace",
-          },
-        ],
-      },
-      {
-        branches: ["feature/live-worktree", "main"],
-        currentBranch: "main",
-        isGitRepository: true,
-        worktrees: [
-          {
-            branch: "main",
-            isCurrent: true,
-            name: "workspace",
-            path: "C:/Users/fonla/.foco/workspace",
-          },
-          {
-            branch: "feature/live-worktree",
-            isCurrent: false,
-            name: "agent-worktree",
-            path: "C:/Users/fonla/.foco/workspace/.foco/agent-worktrees/agent-worktree",
-          },
-        ],
-      },
-    ];
-    renderApp();
-
-    await screen.findByPlaceholderText(defaultComposerPlaceholder);
-    await waitFor(() =>
-      expect(
-        vi
-          .mocked(fetch)
-          .mock.calls.filter(([input]) =>
-            String(input).includes("/api/workspaces/workspace-1/git/branches"),
-          ),
-      ).toHaveLength(1),
-    );
-
-    const branchTrigger = await screen.findByLabelText("Git branch");
-    await user.click(branchTrigger);
-
-    await waitFor(() =>
-      expect(
-        vi
-          .mocked(fetch)
-          .mock.calls.filter(([input]) =>
-            String(input).includes("/api/workspaces/workspace-1/git/branches"),
-          ),
-      ).toHaveLength(2),
-    );
-    expect((await screen.findAllByText("feature/live-worktree")).length).toBeGreaterThan(0);
-    expect((await screen.findAllByText("agent-worktree")).length).toBeGreaterThan(0);
   });
 
   it("keeps Shift+Enter in the composer as a newline", async () => {

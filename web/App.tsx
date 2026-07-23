@@ -170,7 +170,6 @@ import {
   CONTEXT_PANEL_MIN_HEIGHT,
   CONTEXT_PANEL_MIN_WIDTH,
   CONTEXT_PANEL_STACKED_BREAKPOINT_PX,
-  CREATE_BRANCH_OPTION_VALUE,
   MAX_CHAT_ATTACHMENTS,
   MAX_CHAT_ATTACHMENT_BYTES,
   MAX_CHAT_ATTACHMENT_TOTAL_BYTES,
@@ -225,7 +224,6 @@ import {
   FilePickerDialog,
   type FilePickerSelection,
 } from "./features/file-picker/FilePickerDialog";
-import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
 import { Button, ContextMenu, Input, Label, Modal, Spinner, TextArea, TextField } from "./shared/ui";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
@@ -1656,12 +1654,6 @@ export function App() {
   const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(
     null,
   );
-  const [selectedGitBranch, setSelectedGitBranch] = useState("");
-  const [isLoadingBranches, setIsLoadingBranches] = useState(false);
-  const [branchError, setBranchError] = useState<string | null>(null);
-  const [isBranchDialogOpen, setIsBranchDialogOpen] = useState(false);
-  const [newBranchName, setNewBranchName] = useState("");
-  const [isSavingBranch, setIsSavingBranch] = useState(false);
   const [isContextPanelOpen, setIsContextPanelOpen] = useState(
     () => typeof window !== "undefined" && window.innerWidth >= 768,
   );
@@ -4425,8 +4417,6 @@ export function App() {
     gitBranchesRequestIdRef.current = requestId;
     const abortController = new AbortController();
     gitBranchesRequestRef.current = abortController;
-    setIsLoadingBranches(true);
-    setBranchError(null);
 
     try {
       const data = await requestJson<GitBranchesResponse>(
@@ -4440,7 +4430,6 @@ export function App() {
         return;
       }
       setGitBranches(data);
-      setSelectedGitBranch(data.currentBranch ?? "");
     } catch (requestError) {
       if (abortController.signal.aborted) {
         return;
@@ -4449,14 +4438,9 @@ export function App() {
         return;
       }
       setGitBranches(null);
-      setSelectedGitBranch("");
-      setBranchError(errorMessage(requestError));
     } finally {
       if (gitBranchesRequestRef.current === abortController) {
         gitBranchesRequestRef.current = null;
-      }
-      if (gitBranchesRequestIdRef.current === requestId) {
-        setIsLoadingBranches(false);
       }
     }
   }, []);
@@ -4811,9 +4795,6 @@ export function App() {
       gitBranchesRequestRef.current = null;
       gitBranchesRequestIdRef.current += 1;
       setGitBranches(null);
-      setSelectedGitBranch("");
-      setIsLoadingBranches(false);
-      setBranchError(null);
       return;
     }
 
@@ -9055,96 +9036,6 @@ export function App() {
     setSelectedSkillIds((current) => current.filter((id) => id !== skillId));
   }
 
-  async function handleGitBranchChange(branch: string) {
-    if (branch === CREATE_BRANCH_OPTION_VALUE) {
-      setNewBranchName("");
-      setBranchError(null);
-      setIsBranchDialogOpen(true);
-      return;
-    }
-
-    if (!activeWorkspace || !gitBranches?.isGitRepository || !branch) {
-      return;
-    }
-
-    if (branch === selectedGitBranch) {
-      return;
-    }
-
-    setIsLoadingBranches(true);
-    setBranchError(null);
-
-    try {
-      const data = await requestJson<GitBranchesResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/branches/switch`,
-        {
-          body: JSON.stringify({ name: branch }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setGitBranches(data);
-      setSelectedGitBranch(data.currentBranch ?? "");
-
-      if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(
-          activeWorkspace.id,
-          selectedDiffPath,
-          sourceControlTarget,
-        );
-      }
-    } catch (requestError) {
-      setBranchError(errorMessage(requestError));
-    } finally {
-      setIsLoadingBranches(false);
-    }
-  }
-
-  async function handleCreateGitBranch(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
-    if (!activeWorkspace) {
-      setBranchError(t("Select a workspace before creating a branch."));
-      return;
-    }
-
-    const branch = newBranchName.trim();
-    if (!branch) {
-      setBranchError(t("Git branch name must not be empty."));
-      return;
-    }
-
-    setIsSavingBranch(true);
-    setBranchError(null);
-
-    try {
-      const data = await requestJson<GitBranchesResponse>(
-        `/api/workspaces/${encodeURIComponent(activeWorkspace.id)}/git/branches/create`,
-        {
-          body: JSON.stringify({ name: branch }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
-      setGitBranches(data);
-      setSelectedGitBranch(data.currentBranch ?? "");
-      setNewBranchName("");
-      setIsBranchDialogOpen(false);
-
-      if (isContextPanelOpen && contextPanelTab === "git") {
-        void loadGitDiff(
-          activeWorkspace.id,
-          selectedDiffPath,
-          sourceControlTarget,
-        );
-      }
-    } catch (requestError) {
-      setBranchError(errorMessage(requestError));
-    } finally {
-      setIsSavingBranch(false);
-    }
-  }
-
   async function handleQuestionSubmit(answer: QuestionAnswerSubmission) {
     if (!pendingQuestion || isAnsweringQuestion) {
       return;
@@ -13176,9 +13067,6 @@ export function App() {
   const handleAddPastedImageAttachmentsForChatPanel = useStableCallback(
     (files: File[]) => void handleAddPastedImageAttachments(files),
   );
-  const handleBranchChangeForChatPanel = useStableCallback(
-    (branch: string) => void handleGitBranchChange(branch),
-  );
   const handleGuideQueuedMessageForChatPanel = useStableCallback(
     (messageId: string) => void handleGuideQueuedMessage(messageId),
   );
@@ -14377,7 +14265,6 @@ export function App() {
                   activeWorkspaceName={activeWorkspace?.name ?? null}
                   helpers={chatPanelHelpers}
                   availableModels={availableModels}
-                  branchError={branchError}
                   chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
                   canGuideActiveRun={isGuidableActiveRun(
                     activeRunInfo?.chatKey === activeChatKey
@@ -14391,10 +14278,8 @@ export function App() {
                   draftUnsupportedAttachmentMessage={
                     unsupportedDraftAttachmentMessage
                   }
-                  gitBranches={gitBranches}
                   contextUsage={displayedContextUsage}
                   isLoadingSettings={isLoadingSettings}
-                  isLoadingBranches={isLoadingBranches}
                   isLoadingContextUsage={isLoadingContextUsage}
                   isLoadingMessages={isLoadingActiveChatMessages}
                   hasMoreMessagesBefore={
@@ -14410,12 +14295,6 @@ export function App() {
                   onAddPastedImageAttachments={
                     handleAddPastedImageAttachmentsForChatPanel
                   }
-                  onBranchChange={handleBranchChangeForChatPanel}
-                  onBranchMenuOpen={() => {
-                    if (activeWorkspace?.id) {
-                      void loadGitBranches(activeWorkspace.id);
-                    }
-                  }}
                   onDraftMessageChange={setDraftMessage}
                   onEditMessage={handleEditChatMessage}
                   onGuideQueuedMessage={handleGuideQueuedMessageForChatPanel}
@@ -14453,8 +14332,6 @@ export function App() {
                   canRetryRun={retryRunRequest !== null && !isSendingMessage}
                   queuedRunCount={queuedRunRequests.length}
                   queuedMessageIds={queuedMessageIds}
-                  selectedGitBranch={selectedGitBranch}
-                  worktreeBranch={activeChatWorktreeBranch}
                   selectedModelId={selectedModelId}
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
@@ -14702,16 +14579,6 @@ export function App() {
               setFilePickerRequest(null);
               filePickerRequest.onSelect(selection);
             }}
-          />
-        ) : null}
-        {isBranchDialogOpen ? (
-          <GitBranchDialog
-            branchName={newBranchName}
-            error={branchError}
-            isSaving={isSavingBranch}
-            onBranchNameChange={setNewBranchName}
-            onClose={() => setIsBranchDialogOpen(false)}
-            onSubmit={handleCreateGitBranch}
           />
         ) : null}
         {pendingDeleteChat ? (

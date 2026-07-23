@@ -58,8 +58,6 @@ import type {
   ConfiguredModelSummary,
   ConfiguredSkillSummary,
   ContextUsageResponse,
-  GitBranchesResponse,
-  GitWorktreeSummary,
   JsonValue,
   SettingsResponse,
   ShellMessage,
@@ -67,12 +65,9 @@ import type {
   Translate,
   WorkspaceSummary,
 } from "../../api/types";
-import {
-  CHAT_BOTTOM_LOCK_THRESHOLD_PX,
-  CREATE_BRANCH_OPTION_VALUE,
-} from "../../app/constants";
+import { CHAT_BOTTOM_LOCK_THRESHOLD_PX } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
-import { Chip, Header, Label, ListBox, Select, Spinner } from "../../shared/ui";
+import { Chip, Label, ListBox, Select } from "../../shared/ui";
 import { forwardWheelAtVerticalBoundary } from "../../shared/scroll-forwarding";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
@@ -198,7 +193,6 @@ export type ChatPanelHelpers = {
 function ChatPanelComponent({
   activeWorkspaceName,
   availableModels,
-  branchError,
   chatScrollKey,
   canGuideActiveRun,
   canRetryRun,
@@ -206,12 +200,10 @@ function ChatPanelComponent({
   draftAttachments,
   draftMessage,
   draftUnsupportedAttachmentMessage,
-  gitBranches,
   hasMoreMessagesBefore,
   helpers,
   queuedRunCount,
   readOnly,
-  isLoadingBranches,
   isLoadingContextUsage,
   isLoadingMoreMessages,
   isLoadingMessages,
@@ -222,8 +214,6 @@ function ChatPanelComponent({
   messages,
   onAddPastedImageAttachments,
   overviewRenderer,
-  onBranchChange,
-  onBranchMenuOpen,
   onCancelRun,
   onDraftMessageChange,
   onEditMessage,
@@ -244,7 +234,6 @@ function ChatPanelComponent({
   onLatencyModeChange,
   onToggleSkill,
   onWithdrawQueuedMessage,
-  selectedGitBranch,
   selectedModelId,
   selectedSkillIds,
   selectedThinkingLevel,
@@ -256,13 +245,11 @@ function ChatPanelComponent({
   skills,
   queuedMessageIds,
   thinkingLevels,
-  worktreeBranch,
   workspaces,
   workspaceId,
 }: {
   activeWorkspaceName: string | null;
   availableModels: ConfiguredModelSummary[];
-  branchError: string | null;
   chatScrollKey: string;
   canGuideActiveRun: boolean;
   canRetryRun: boolean;
@@ -270,12 +257,10 @@ function ChatPanelComponent({
   draftAttachments: ComposerAttachment[];
   draftMessage: string;
   draftUnsupportedAttachmentMessage: string | null;
-  gitBranches: GitBranchesResponse | null;
   hasMoreMessagesBefore: boolean;
   helpers: ChatPanelHelpers;
   queuedRunCount: number;
   readOnly: boolean;
-  isLoadingBranches: boolean;
   isLoadingContextUsage: boolean;
   isLoadingMoreMessages: boolean;
   isLoadingMessages: boolean;
@@ -286,8 +271,6 @@ function ChatPanelComponent({
   messages: ShellMessage[];
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
-  onBranchChange: (value: string) => void;
-  onBranchMenuOpen: () => void;
   onCancelRun: () => void;
   onDraftMessageChange: (value: string) => void;
   onEditMessage: (
@@ -319,7 +302,6 @@ function ChatPanelComponent({
   onLatencyModeChange: (value: "standard" | "fast") => void;
   onToggleSkill: (skillId: string) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
-  selectedGitBranch: string;
   selectedModelId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
@@ -331,7 +313,6 @@ function ChatPanelComponent({
   skills: ConfiguredSkillSummary[];
   queuedMessageIds: ReadonlySet<string>;
   thinkingLevels: ThinkingLevelSummary[];
-  worktreeBranch: string | null;
   workspaces: WorkspaceSummary[];
   workspaceId: string | null;
 }) {
@@ -1381,24 +1362,6 @@ function ChatPanelComponent({
                       </span>
                     </button>
                   ) : null}
-                  <BranchSelector
-                    branches={
-                      worktreeBranch
-                        ? [worktreeBranch]
-                        : (gitBranches?.branches ?? [])
-                    }
-                    currentBranch={worktreeBranch ?? selectedGitBranch}
-                    currentWorktreeBranch={worktreeBranch}
-                    disabled={isSendingMessage || worktreeBranch !== null}
-                    isGitRepository={
-                      worktreeBranch !== null ||
-                      (gitBranches?.isGitRepository ?? false)
-                    }
-                    isLoading={isLoadingBranches}
-                    onChange={onBranchChange}
-                    onOpen={onBranchMenuOpen}
-                    worktrees={gitBranches?.worktrees ?? []}
-                  />
                   {canRetryRun ? (
                     <button
                       aria-label={t("Retry last run")}
@@ -1497,11 +1460,6 @@ function ChatPanelComponent({
                   )}
                 </div>
               </div>
-              {branchError ? (
-                <div className="mt-2 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
-                  {branchError}
-                </div>
-              ) : null}
             </form>
             {isFastConfirmationOpen ? (
               <div
@@ -2089,154 +2047,6 @@ function ComposerSelectMenu({
       </Select.Popover>
     </Select>
   );
-}
-
-function BranchSelector({
-  branches,
-  currentBranch,
-  currentWorktreeBranch,
-  disabled,
-  isGitRepository,
-  isLoading,
-  onChange,
-  onOpen,
-  worktrees,
-}: {
-  branches: string[];
-  currentBranch: string;
-  currentWorktreeBranch: string | null;
-  disabled: boolean;
-  isGitRepository: boolean;
-  isLoading: boolean;
-  onChange: (value: string) => void;
-  onOpen: () => void;
-  worktrees: GitWorktreeSummary[];
-}) {
-  const { t } = useI18n();
-  const displayedWorktrees = currentWorktreeBranch
-    ? ensureCurrentWorktree(worktrees, currentWorktreeBranch)
-    : worktrees;
-  if (!isGitRepository) {
-    return (
-      <div
-        aria-label={t("Git branch")}
-        className="composer-branch-select inline-flex h-[1.875rem] max-w-full items-center gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium text-muted"
-      >
-        <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
-        <span className="composer-select-label min-w-0 flex-1 truncate" />
-      </div>
-    );
-  }
-
-  return (
-    <Select
-      aria-label={t("Git branch")}
-      className="composer-branch-select max-w-full"
-      isDisabled={disabled}
-      selectedKey={currentBranch || null}
-      onOpenChange={(open) => {
-        if (open) {
-          onOpen();
-        }
-      }}
-      onSelectionChange={(key) => {
-        if (key == null) {
-          return;
-        }
-        onChange(String(key));
-      }}
-    >
-      <Select.Trigger className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium">
-        <GitBranch aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
-        <Select.Value className="composer-select-label min-w-0 flex-1 truncate" />
-        {isLoading ? (
-          <Spinner color="current" size="sm" />
-        ) : (
-          <Select.Indicator />
-        )}
-      </Select.Trigger>
-      <Select.Popover className="composer-select-popover w-72 max-w-[min(18rem,calc(100vw-1rem))]" placement="top start">
-        <ListBox>
-          <ListBox.Section>
-            <Header className="px-2 py-1 text-[11px] font-semibold uppercase text-muted">
-              {t("Git branches")}
-            </Header>
-            {branches.length ? (
-              branches.map((branchName) => (
-                <ListBox.Item
-                  id={branchName}
-                  key={branchName}
-                  textValue={branchName}
-                >
-                  <Label className="min-w-0 flex-1 truncate">{branchName}</Label>
-                  <ListBox.ItemIndicator />
-                </ListBox.Item>
-              ))
-            ) : (
-              <ListBox.Item id="__no-branches" isDisabled textValue={t("No branches")}>
-                <Label>{t("No branches")}</Label>
-              </ListBox.Item>
-            )}
-          </ListBox.Section>
-          <ListBox.Section>
-            <Header className="px-2 py-1 text-[11px] font-semibold uppercase text-muted">
-              {t("Git worktrees")}
-            </Header>
-            {displayedWorktrees.length ? (
-              displayedWorktrees.map((worktree) => (
-                <ListBox.Item
-                  id={`worktree:${worktree.path}`}
-                  isDisabled
-                  key={worktree.path}
-                  textValue={worktree.name}
-                >
-                  <div className="min-w-0 flex-1">
-                    <Label className="block truncate">{worktree.name}</Label>
-                    <span className="block truncate text-xs font-normal text-muted">
-                      {worktree.branch ?? t("Detached HEAD")}
-                    </span>
-                  </div>
-                  {worktree.isCurrent ? (
-                    <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
-                  ) : null}
-                </ListBox.Item>
-              ))
-            ) : (
-              <ListBox.Item id="__no-worktrees" isDisabled textValue={t("No worktrees")}>
-                <Label>{t("No worktrees")}</Label>
-              </ListBox.Item>
-            )}
-          </ListBox.Section>
-          <ListBox.Item
-            id={CREATE_BRANCH_OPTION_VALUE}
-            textValue={t("New branch")}
-          >
-            <Plus aria-hidden="true" className="size-4" />
-            <Label>{t("New branch")}</Label>
-          </ListBox.Item>
-        </ListBox>
-      </Select.Popover>
-    </Select>
-  );
-}
-
-function ensureCurrentWorktree(
-  worktrees: GitWorktreeSummary[],
-  branch: string,
-): GitWorktreeSummary[] {
-  const existingCurrent = worktrees.find((worktree) => worktree.isCurrent);
-  if (existingCurrent) {
-    return worktrees;
-  }
-  return [
-    {
-      branch,
-      isCurrent: true,
-      name: branch,
-      path: "",
-    },
-    ...worktrees,
-  ];
 }
 
 function ReasoningBlock({

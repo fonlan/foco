@@ -845,10 +845,6 @@ summary {
   flex: 0 1 auto;
 }
 
-.composer-branch-select {
-  width: 10rem;
-}
-
 .context-usage-circle {
   --context-usage-ring: var(--accent);
   --context-usage-track: var(--default);
@@ -1224,21 +1220,13 @@ summary {
     flex: 0 0 4.25rem;
   }
 
-  .composer-branch-select {
-    width: 4.75rem;
-    min-width: 0;
-    flex: 0 0 4.75rem;
-  }
-
   .message-composer-actions .composer-select-summary,
-  .message-composer-actions > .composer-branch-select,
   .message-composer-actions > .context-usage-circle,
   .message-composer-actions > button {
     min-height: 2.5rem;
   }
 
-  .message-composer-actions .composer-select-summary,
-  .message-composer-actions > .composer-branch-select {
+  .message-composer-actions .composer-select-summary {
     gap: 0.25rem;
     padding-inline: 0.375rem;
   }
@@ -2493,7 +2481,6 @@ body,
 
 .composer-model-select,
 .composer-thinking-select,
-.composer-branch-select,
 .composer-provider-select {
   width: 11rem;
 }
@@ -3304,8 +3291,7 @@ body,
 
   .composer-model-select,
   .composer-provider-select,
-  .composer-thinking-select,
-  .composer-branch-select {
+  .composer-thinking-select {
     flex: 1 1 calc(50% - 0.375rem);
     min-width: 0;
     width: auto;
@@ -3634,17 +3620,15 @@ body,
 }
 
 .message-composer-control-row .composer-select-summary,
-.message-composer-control-row > .composer-branch-select {
+.message-composer-control-row .composer-select-summary {
   width: 100%;
 }
 
 .message-composer-control-row .composer-team-toggle,
-.message-composer-control-row .composer-select-summary,
-.message-composer-control-row > .composer-branch-select {
+.message-composer-control-row .composer-select-summary {
   border-radius: 0.4375rem;
 }
-.message-composer-control-row .composer-select-summary,
-.message-composer-control-row .composer-branch-select {
+.message-composer-control-row .composer-select-label {
   font-size: var(--foco-font-micro);
 }
 
@@ -3652,8 +3636,7 @@ body,
    Scoped to the control row so popover option emphasis (e.g. font-semibold) is unchanged. */
 .message-composer-control-row .composer-team-toggle,
 .message-composer-control-row .composer-select-summary,
-.message-composer-control-row .composer-fast-toggle,
-.message-composer-control-row > .composer-branch-select {
+.message-composer-control-row .composer-fast-toggle {
   font-weight: 400;
 }
 
@@ -3802,20 +3785,6 @@ body,
   color: white;
 }
 
-.composer-branch-select {
-  width: 8.25rem;
-  min-width: 8.25rem;
-  max-width: 8.25rem;
-  flex: 0 0 8.25rem;
-}
-
-.message-composer-control-row > .composer-branch-select {
-  width: 8.25rem;
-  min-width: 8.25rem;
-  max-width: 8.25rem;
-  flex: 0 0 8.25rem;
-}
-
 .settings-layout {
   height: 100%;
   max-width: none;
@@ -3933,8 +3902,7 @@ body,
   .composer-model-provider-select,
   .composer-model-select,
   .composer-provider-select,
-  .composer-thinking-select,
-  .composer-branch-select {
+  .composer-thinking-select {
     width: 2rem;
     min-width: 2rem;
     max-width: 2rem;
@@ -3943,7 +3911,6 @@ body,
   }
 
   .message-composer-control-row .composer-select-summary,
-  .message-composer-control-row > .composer-branch-select,
   .composer-team-toggle,
   .composer-fast-toggle {
     width: 2rem;
@@ -3962,8 +3929,7 @@ body,
     display: none;
   }
 
-  .message-composer-control-row .composer-select-menu,
-  .message-composer-control-row > details.composer-branch-select {
+  .message-composer-control-row .composer-select-menu {
     position: static;
   }
 
@@ -3980,10 +3946,6 @@ body,
 
   .message-composer-control-row .composer-thinking-select {
     order: 3;
-  }
-
-  .message-composer-control-row > .composer-branch-select {
-    order: 4;
   }
 
   .message-composer-control-row .composer-control-spacer {
@@ -4487,7 +4449,6 @@ summary:focus-visible {
 .composer-team-toggle,
 .composer-fast-toggle,
 .composer-select-summary,
-.composer-branch-select,
 .composer-run-button {
   border-color: var(--border);
   background: var(--surface);
@@ -4505,7 +4466,6 @@ summary:focus-visible {
   .composer-team-toggle,
   .composer-fast-toggle,
   .composer-select-summary,
-  .composer-branch-select,
   .composer-run-button
 ) svg {
   color: currentColor;
@@ -4515,7 +4475,6 @@ summary:focus-visible {
 .composer-team-toggle:hover,
 .composer-fast-toggle:hover,
 .composer-select-summary:hover,
-.composer-branch-select:hover,
 .composer-run-button:not(:disabled):hover {
   border-color: var(--accent);
   background: var(--accent-soft);
@@ -4526,7 +4485,6 @@ summary:focus-visible {
 .composer-team-toggle:focus-visible,
 .composer-fast-toggle:focus-visible,
 .composer-select-summary:focus-visible,
-.composer-branch-select:focus-visible,
 .composer-run-button:focus-visible {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
@@ -5090,8 +5048,7 @@ summary:focus-visible {
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
   .composer-fast-toggle,
-  .message-composer-control-row .composer-select-summary,
-  .message-composer-control-row > .composer-branch-select {
+  .message-composer-control-row .composer-select-summary {
     width: var(--foco-touch-target);
     min-width: var(--foco-touch-target);
     max-width: var(--foco-touch-target);
