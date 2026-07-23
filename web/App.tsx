@@ -228,6 +228,7 @@ import {
 } from "./features/file-picker/FilePickerDialog";
 import { GitBranchDialog } from "./features/git/GitBranchDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
+import { Button, ContextMenu, Input, Label, Modal, Spinner, TextArea, TextField } from "./shared/ui";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
 import { ModelRoutingPanel } from "./features/models/ModelRoutingPanel";
 import {
@@ -1524,7 +1525,6 @@ export function App() {
     useState<WorkspaceChatContextMenuState | null>(null);
   const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
     useState<WorkspaceFileContextMenuState | null>(null);
-  const workspaceFileContextMenuRef = useRef<HTMLDivElement>(null);
   // ponytail: keep inactive chat cache ref-only so hot streaming paths don't
   // rerender App; ceiling is App still owns too much chat state, upgrade path is
   // moving this cache into a dedicated hook/store.
@@ -4926,53 +4926,6 @@ export function App() {
     onResizeEnd: () => setIsResizingSidebar(false),
   });
 
-  useEffect(() => {
-    if (!workspaceChatContextMenu) {
-      return;
-    }
-
-    function closeWorkspaceChatContextMenuForPointer(event: PointerEvent) {
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest(".workspace-chat-context-menu")
-      ) {
-        return;
-      }
-      setWorkspaceChatContextMenu(null);
-    }
-
-    function closeWorkspaceChatContextMenuForKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setWorkspaceChatContextMenu(null);
-      }
-    }
-
-    function closeWorkspaceChatContextMenu() {
-      setWorkspaceChatContextMenu(null);
-    }
-
-    window.addEventListener(
-      "pointerdown",
-      closeWorkspaceChatContextMenuForPointer,
-    );
-    window.addEventListener("keydown", closeWorkspaceChatContextMenuForKey);
-    window.addEventListener("resize", closeWorkspaceChatContextMenu);
-    window.addEventListener("scroll", closeWorkspaceChatContextMenu, true);
-
-    return () => {
-      window.removeEventListener(
-        "pointerdown",
-        closeWorkspaceChatContextMenuForPointer,
-      );
-      window.removeEventListener(
-        "keydown",
-        closeWorkspaceChatContextMenuForKey,
-      );
-      window.removeEventListener("resize", closeWorkspaceChatContextMenu);
-      window.removeEventListener("scroll", closeWorkspaceChatContextMenu, true);
-    };
-  }, [workspaceChatContextMenu]);
 
   useEffect(() => {
     return () => {
@@ -4981,114 +4934,6 @@ export function App() {
       }
     };
   }, []);
-
-  useEffect(() => {
-    if (!workspaceFileContextMenu) {
-      return;
-    }
-
-    function closeWorkspaceFileContextMenuForPointer(event: PointerEvent) {
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest(".workspace-file-context-menu")
-      ) {
-        return;
-      }
-      setWorkspaceFileContextMenu(null);
-    }
-
-    function closeWorkspaceFileContextMenuForKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setWorkspaceFileContextMenu(null);
-      }
-    }
-
-    function closeWorkspaceFileContextMenu() {
-      setWorkspaceFileContextMenu(null);
-    }
-
-    // Only close on scrolls that can move the menu anchor (context panel / window).
-    // Message-list auto-scroll during streaming must not dismiss the file menu.
-    function closeWorkspaceFileContextMenuForScroll(event: Event) {
-      const target = event.target;
-      if (
-        target === document ||
-        target === document.documentElement ||
-        target === document.body ||
-        target === window
-      ) {
-        setWorkspaceFileContextMenu(null);
-        return;
-      }
-      if (target instanceof Element && target.closest(".context-panel")) {
-        setWorkspaceFileContextMenu(null);
-      }
-    }
-
-    window.addEventListener(
-      "pointerdown",
-      closeWorkspaceFileContextMenuForPointer,
-    );
-    window.addEventListener("keydown", closeWorkspaceFileContextMenuForKey);
-    window.addEventListener("resize", closeWorkspaceFileContextMenu);
-    window.addEventListener(
-      "scroll",
-      closeWorkspaceFileContextMenuForScroll,
-      true,
-    );
-
-    return () => {
-      window.removeEventListener(
-        "pointerdown",
-        closeWorkspaceFileContextMenuForPointer,
-      );
-      window.removeEventListener(
-        "keydown",
-        closeWorkspaceFileContextMenuForKey,
-      );
-      window.removeEventListener("resize", closeWorkspaceFileContextMenu);
-      window.removeEventListener(
-        "scroll",
-        closeWorkspaceFileContextMenuForScroll,
-        true,
-      );
-    };
-  }, [workspaceFileContextMenu]);
-
-  useLayoutEffect(() => {
-    if (!workspaceFileContextMenu || workspaceFileContextMenu.positioned) {
-      return;
-    }
-
-    const element = workspaceFileContextMenuRef.current;
-    if (!element || typeof window === "undefined") {
-      return;
-    }
-
-    const margin = 8;
-    const rect = element.getBoundingClientRect();
-    const nextLeft = Math.max(
-      margin,
-      Math.min(
-        workspaceFileContextMenu.left,
-        window.innerWidth - rect.width - margin,
-      ),
-    );
-    const nextTop = Math.max(
-      margin,
-      Math.min(
-        workspaceFileContextMenu.top,
-        window.innerHeight - rect.height - margin,
-      ),
-    );
-    setWorkspaceFileContextMenu({
-      ...workspaceFileContextMenu,
-      left: nextLeft,
-      positioned: true,
-      top: nextTop,
-    });
-  }, [workspaceFileContextMenu]);
 
   useEffect(() => {
     if (!workspaces.length) {
@@ -14171,194 +14016,184 @@ export function App() {
             </aside>
 
             {workspaceChatContextMenu ? (
-              <div
+              <ContextMenu
                 aria-label={workspaceChatContextMenu.chat.title}
-                className="workspace-chat-context-menu"
-                role="menu"
-                style={{
-                  left: workspaceChatContextMenu.left,
-                  top: workspaceChatContextMenu.top,
+                isOpen
+                items={[
+                  {
+                    danger: true,
+                    disabled: Boolean(
+                      workspaceChatContextMenu.chat.scheduledRunId,
+                    ),
+                    icon: <Trash2 aria-hidden="true" className="size-3.5" />,
+                    id: "delete-chat",
+                    label: t("Delete chat"),
+                  },
+                ]}
+                left={workspaceChatContextMenu.left}
+                top={workspaceChatContextMenu.top}
+                onAction={(key) => {
+                  if (key !== "delete-chat") {
+                    return;
+                  }
+                  const { chat, workspace } = workspaceChatContextMenu;
+                  setWorkspaceChatContextMenu(null);
+                  requestDeleteWorkspaceChat(workspace, chat);
                 }}
-              >
-                <button
-                  className="workspace-chat-context-menu-item workspace-chat-context-menu-item-danger"
-                  disabled={Boolean(
-                    workspaceChatContextMenu.chat.scheduledRunId,
-                  )}
-                  onClick={() => {
-                    const { chat, workspace } = workspaceChatContextMenu;
+                onOpenChange={(open) => {
+                  if (!open) {
                     setWorkspaceChatContextMenu(null);
-                    requestDeleteWorkspaceChat(workspace, chat);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Trash2 aria-hidden="true" className="size-3.5" />
-                  <span>{t("Delete chat")}</span>
-                </button>
-              </div>
+                  }
+                }}
+              />
             ) : null}
 
             {workspaceFileContextMenu ? (
-              <div
+              <ContextMenu
                 aria-label={workspaceFileContextMenu.node.name}
-                className="workspace-chat-context-menu workspace-file-context-menu"
-                ref={workspaceFileContextMenuRef}
-                role="menu"
-                style={{
-                  left: workspaceFileContextMenu.left,
-                  top: workspaceFileContextMenu.top,
-                  visibility: workspaceFileContextMenu.positioned
-                    ? "visible"
-                    : "hidden",
-                }}
-              >
-                <button
-                  className="workspace-chat-context-menu-item"
-                  onClick={() => {
-                    const { node } = workspaceFileContextMenu;
-                    setWorkspaceFileContextMenu(null);
-                    if (node.kind === "directory") {
-                      void toggleWorkspaceFileTreePath(node);
-                      return;
-                    }
-                    void openWorkspaceFileTab(node);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <FileText aria-hidden="true" className="size-3.5" />
-                  <span>{t("Open")}</span>
-                </button>
-                {workspaceFileContextMenu.node.kind === "file" &&
-                isHtmlFilePath(workspaceFileContextMenu.node.path) ? (
-                  <button
-                    className="workspace-chat-context-menu-item"
-                    onClick={() => {
-                      const { node } = workspaceFileContextMenu;
-                      setWorkspaceFileContextMenu(null);
-                      if (!activeWorkspace) {
-                        return;
+                isOpen
+                items={[
+                  {
+                    icon: <FileText aria-hidden="true" className="size-3.5" />,
+                    id: "open",
+                    label: t("Open"),
+                  },
+                  ...(
+                    workspaceFileContextMenu.node.kind === "file" &&
+                    isHtmlFilePath(workspaceFileContextMenu.node.path)
+                      ? [
+                          {
+                            icon: (
+                              <AppWindow
+                                aria-hidden="true"
+                                className="size-3.5"
+                              />
+                            ),
+                            id: "preview",
+                            label: t("Preview in new tab"),
+                          },
+                        ]
+                      : []
+                  ),
+                  ...(
+                    workspaceFileContextMenu.node.kind === "file"
+                      ? [
+                          {
+                            icon: (
+                              <Download
+                                aria-hidden="true"
+                                className="size-3.5"
+                              />
+                            ),
+                            id: "download",
+                            label: t("Download"),
+                          },
+                        ]
+                      : []
+                  ),
+                  {
+                    icon: <Pencil aria-hidden="true" className="size-3.5" />,
+                    id: "rename",
+                    label: t("Rename"),
+                  },
+                  {
+                    danger: true,
+                    icon: <Trash2 aria-hidden="true" className="size-3.5" />,
+                    id: "delete",
+                    label: t("Delete"),
+                  },
+                  {
+                    icon: <Copy aria-hidden="true" className="size-3.5" />,
+                    id: "copy-name",
+                    label: t("Copy file name"),
+                  },
+                  {
+                    icon: <Copy aria-hidden="true" className="size-3.5" />,
+                    id: "copy-relative",
+                    label: t("Copy relative path"),
+                  },
+                  {
+                    icon: <Copy aria-hidden="true" className="size-3.5" />,
+                    id: "copy-absolute",
+                    label: t("Copy absolute path"),
+                  },
+                ]}
+                left={workspaceFileContextMenu.left}
+                top={workspaceFileContextMenu.top}
+                onAction={(key) => {
+                  const { node, workspacePath } = workspaceFileContextMenu;
+                  setWorkspaceFileContextMenu(null);
+                  switch (String(key)) {
+                    case "open":
+                      if (node.kind === "directory") {
+                        void toggleWorkspaceFileTreePath(node);
+                      } else {
+                        void openWorkspaceFileTab(node);
                       }
-                      openWorkspaceHtmlPreviewTab({
-                        name: node.name,
-                        path: node.path,
-                        workspaceId: activeWorkspace.id,
-                        workspaceLogoUrl: activeWorkspace.logoUrl ?? null,
-                        workspaceName: activeWorkspace.name,
-                      });
-                    }}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <AppWindow aria-hidden="true" className="size-3.5" />
-                    <span>{t("Preview in new tab")}</span>
-                  </button>
-                ) : null}
-                {workspaceFileContextMenu.node.kind === "file" ? (
-                  <button
-                    className="workspace-chat-context-menu-item"
-                    onClick={() => {
-                      const { node } = workspaceFileContextMenu;
-                      setWorkspaceFileContextMenu(null);
-                      downloadWorkspaceFile(node);
-                    }}
-                    role="menuitem"
-                    type="button"
-                  >
-                    <Download aria-hidden="true" className="size-3.5" />
-                    <span>{t("Download")}</span>
-                  </button>
-                ) : null}
-                <button
-                  className="workspace-chat-context-menu-item"
-                  onClick={() => {
-                    const { node } = workspaceFileContextMenu;
-                    setWorkspaceFileContextMenu(null);
-                    const nextName = window.prompt(t("Rename file"), node.name);
-                    if (nextName === null) {
-                      return;
-                    }
-                    const trimmedName = nextName.trim();
-                    if (!trimmedName || trimmedName === node.name) {
-                      return;
-                    }
-                    void handleWorkspaceFileOperation(
-                      "rename",
-                      node.path,
-                      trimmedName,
-                    );
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Pencil aria-hidden="true" className="size-3.5" />
-                  <span>{t("Rename")}</span>
-                </button>
-                <button
-                  className="workspace-chat-context-menu-item workspace-chat-context-menu-item-danger"
-                  onClick={() => {
-                    const { node } = workspaceFileContextMenu;
-                    setWorkspaceFileContextMenu(null);
-                    if (
-                      !window.confirm(
-                        t("Delete this file or folder?\n\nPath: {path}", {
+                      break;
+                    case "preview":
+                      if (activeWorkspace) {
+                        openWorkspaceHtmlPreviewTab({
+                          name: node.name,
                           path: node.path,
-                        }),
-                      )
-                    ) {
-                      return;
+                          workspaceId: activeWorkspace.id,
+                          workspaceLogoUrl: activeWorkspace.logoUrl ?? null,
+                          workspaceName: activeWorkspace.name,
+                        });
+                      }
+                      break;
+                    case "download":
+                      downloadWorkspaceFile(node);
+                      break;
+                    case "rename": {
+                      const nextName = window.prompt(t("Rename file"), node.name);
+                      if (nextName === null) {
+                        break;
+                      }
+                      const trimmedName = nextName.trim();
+                      if (!trimmedName || trimmedName === node.name) {
+                        break;
+                      }
+                      void handleWorkspaceFileOperation(
+                        "rename",
+                        node.path,
+                        trimmedName,
+                      );
+                      break;
                     }
-                    void handleWorkspaceFileOperation("delete", node.path);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Trash2 aria-hidden="true" className="size-3.5" />
-                  <span>{t("Delete")}</span>
-                </button>
-                <button
-                  className="workspace-chat-context-menu-item"
-                  onClick={() => {
-                    const { node } = workspaceFileContextMenu;
+                    case "delete":
+                      if (
+                        !window.confirm(
+                          t("Delete this file or folder?\n\nPath: {path}", {
+                            path: node.path,
+                          }),
+                        )
+                      ) {
+                        break;
+                      }
+                      void handleWorkspaceFileOperation("delete", node.path);
+                      break;
+                    case "copy-name":
+                      void copyWorkspaceFileText(node.name);
+                      break;
+                    case "copy-relative":
+                      void copyWorkspaceFileText(node.path);
+                      break;
+                    case "copy-absolute":
+                      void copyWorkspaceFileText(
+                        workspaceFileAbsolutePath(workspacePath, node.path),
+                      );
+                      break;
+                    default:
+                      break;
+                  }
+                }}
+                onOpenChange={(open) => {
+                  if (!open) {
                     setWorkspaceFileContextMenu(null);
-                    void copyWorkspaceFileText(node.name);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Copy aria-hidden="true" className="size-3.5" />
-                  <span>{t("Copy file name")}</span>
-                </button>
-                <button
-                  className="workspace-chat-context-menu-item"
-                  onClick={() => {
-                    const { node } = workspaceFileContextMenu;
-                    setWorkspaceFileContextMenu(null);
-                    void copyWorkspaceFileText(node.path);
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Copy aria-hidden="true" className="size-3.5" />
-                  <span>{t("Copy relative path")}</span>
-                </button>
-                <button
-                  className="workspace-chat-context-menu-item"
-                  onClick={() => {
-                    const { node, workspacePath } = workspaceFileContextMenu;
-                    setWorkspaceFileContextMenu(null);
-                    void copyWorkspaceFileText(
-                      workspaceFileAbsolutePath(workspacePath, node.path),
-                    );
-                  }}
-                  role="menuitem"
-                  type="button"
-                >
-                  <Copy aria-hidden="true" className="size-3.5" />
-                  <span>{t("Copy absolute path")}</span>
-                </button>
-              </div>
+                  }
+                }}
+              />
             ) : null}
 
             <section className="app-main-panel flex min-w-0 flex-col">
@@ -14879,95 +14714,57 @@ function RipgrepMissingDialog({
   onClose: () => void;
   onInstall: () => void;
 }) {
-  const { language, t } = useI18n();
+  const { t } = useI18n();
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
-      role="presentation"
-    >
-      <section
-        aria-labelledby="ripgrep-dialog-title"
-        aria-modal="true"
-        className="w-full max-w-lg overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
-        role="dialog"
-      >
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <CircleAlert
-              aria-hidden="true"
-              className="size-5 shrink-0 text-amber-600"
-            />
-            <div className="min-w-0">
-              <h2
-                className="truncate text-base font-semibold text-stone-950"
-                id="ripgrep-dialog-title"
-              >
-                {t("rg command was not found")}
-              </h2>
-              <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                {installDir}
-              </p>
-            </div>
-          </div>
-          <button
-            aria-label={t("Dismiss ripgrep warning")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-            onClick={onClose}
-            title={t("Close")}
-            type="button"
-          >
-            <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
-
-        <div className="space-y-4 px-4 py-4">
-          <p className="text-sm leading-6 text-stone-700">
-            {t(
-              "Foco uses ripgrep for full-text search. Install it into {path} so the search_text tool can run.",
-              { path: installDir },
-            )}
-          </p>
-          {error ? (
-            <p className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700">
-              {error}
-            </p>
-          ) : null}
-          <div className="flex justify-end gap-2">
-            <button
-              aria-label={t("Cancel")}
-              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-              onClick={onClose}
-              title={t("Cancel")}
-              type="button"
-            >
-              <X aria-hidden="true" className="size-4" />
-            </button>
-            <button
-              aria-label={t("Download ripgrep")}
-              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-              disabled={isInstalling}
-              onClick={onInstall}
-              title={
-                isInstalling
-                  ? t("Installing ripgrep...")
-                  : t("Download ripgrep")
-              }
-              type="button"
-            >
-              {isInstalling ? (
-                <LoaderCircle
-                  aria-hidden="true"
-                  className="size-4 animate-spin"
-                />
-              ) : (
-                <Download aria-hidden="true" className="size-4" />
+    <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
+      <Modal.Container placement="center" size="md">
+        <Modal.Dialog aria-label={t("rg command was not found")}>
+          <Modal.CloseTrigger />
+          <Modal.Header>
+            <Modal.Icon className="bg-warning-soft text-warning-soft-foreground">
+              <CircleAlert aria-hidden="true" className="size-5" />
+            </Modal.Icon>
+            <Modal.Heading>{t("rg command was not found")}</Modal.Heading>
+            <p className="truncate text-xs font-medium text-muted">{installDir}</p>
+          </Modal.Header>
+          <Modal.Body className="space-y-3">
+            <p className="text-sm leading-6 text-foreground">
+              {t(
+                "Foco uses ripgrep for full-text search. Install it into {path} so the search_text tool can run.",
+                { path: installDir },
               )}
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
+            </p>
+            {error ? (
+              <p className="rounded-lg border border-danger bg-danger-soft px-3 py-2 text-sm font-medium text-danger-soft-foreground">
+                {error}
+              </p>
+            ) : null}
+          </Modal.Body>
+          <Modal.Footer>
+            <Button aria-label={t("Cancel")} variant="tertiary" onPress={onClose}>
+              {t("Cancel")}
+            </Button>
+            <Button
+              aria-label={t("Download ripgrep")}
+              isPending={isInstalling}
+              onPress={onInstall}
+            >
+              {({ isPending }) => (
+                <>
+                  {isPending ? (
+                    <Spinner color="current" size="sm" />
+                  ) : (
+                    <Download aria-hidden="true" className="size-4" />
+                  )}
+                  {isPending ? t("Installing ripgrep...") : t("Download ripgrep")}
+                </>
+              )}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
@@ -15053,176 +14850,151 @@ function QuestionDialog({
     });
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
-      role="presentation"
+    <Modal.Backdrop
+      isDismissable={false}
+      isOpen
+      onOpenChange={(open) => {
+        if (!open) {
+          onCancelRun();
+        }
+      }}
     >
-      <section
-        aria-labelledby="question-dialog-title"
-        aria-modal="true"
-        className="w-full max-w-xl overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
-        role="dialog"
-      >
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <MessageSquare
-              aria-hidden="true"
-              className="size-5 shrink-0 text-teal-700"
-            />
-            <div className="min-w-0">
-              <h2
-                className="truncate text-base font-semibold text-stone-950"
-                id="question-dialog-title"
-              >
-                {t("Foco needs your answer")}
-              </h2>
-              <p className="mt-1 truncate text-xs font-medium text-stone-500">
-                {t("Waiting for your answer")}
-              </p>
-            </div>
-          </div>
-          <button
-            aria-label={t("Cancel run")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-            onClick={onCancelRun}
-            title={t("Cancel run")}
-            type="button"
-          >
-            <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
+      <Modal.Container placement="center" scroll="inside" size="lg">
+        <Modal.Dialog aria-label={t("Foco needs your answer")}>
+          <Modal.Header>
+            <Modal.Icon className="bg-accent-soft text-accent-soft-foreground">
+              <MessageSquare aria-hidden="true" className="size-5" />
+            </Modal.Icon>
+            <Modal.Heading>{t("Foco needs your answer")}</Modal.Heading>
+            <p className="text-sm text-muted">{t("Waiting for your answer")}</p>
+          </Modal.Header>
+          <form onSubmit={submitAnswer}>
+            <Modal.Body className="space-y-4">
+              {question.questions.map((item, index) => {
+                const draft = draftAnswers[item.id] ?? {
+                  manualAnswer: "",
+                  selectedOptionValue: null,
+                };
 
-        <form
-          className="max-h-[min(72vh,720px)] space-y-4 overflow-y-auto px-4 py-4"
-          onSubmit={submitAnswer}
-        >
-          <div className="space-y-4">
-            {question.questions.map((item, index) => {
-              const draft = draftAnswers[item.id] ?? {
-                manualAnswer: "",
-                selectedOptionValue: null,
-              };
+                return (
+                  <section
+                    className="space-y-3 rounded-lg border border-border bg-surface p-3"
+                    key={item.id}
+                  >
+                    <p className="whitespace-pre-wrap text-sm font-semibold leading-6 text-foreground">
+                      {question.questions.length > 1
+                        ? `${index + 1}. ${item.question}`
+                        : item.question}
+                    </p>
 
-              return (
-                <section
-                  className="space-y-3 rounded-lg border border-stone-200 bg-stone-50/60 p-3"
-                  key={item.id}
-                >
-                  <p className="whitespace-pre-wrap text-sm font-semibold leading-6 text-stone-900">
-                    {question.questions.length > 1
-                      ? `${index + 1}. ${item.question}`
-                      : item.question}
-                  </p>
-
-                  {item.options.length ? (
-                    <div className="space-y-2">
-                      {item.options.map((option) => {
-                        const isSelected =
-                          draft.selectedOptionValue === option.value;
-                        return (
-                          <label
-                            className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${
-                              isSelected
-                                ? "border-teal-700 bg-teal-50 text-teal-950"
-                                : "border-stone-200 bg-white text-stone-800 hover:border-teal-200 hover:bg-teal-50/60"
-                            }`}
-                            key={option.value}
-                          >
-                            <input
-                              checked={isSelected}
-                              className="mt-1 size-4 accent-teal-800"
-                              name={`question-option-${item.id}`}
-                              onChange={() => {
-                                setDraftAnswers((current) => ({
-                                  ...current,
-                                  [item.id]: {
-                                    manualAnswer:
-                                      current[item.id]?.manualAnswer ?? "",
-                                    selectedOptionValue: option.value,
-                                  },
-                                }));
-                                setLocalError(null);
-                              }}
-                              type="radio"
-                            />
-                            <span className="min-w-0">
-                              <span className="block font-semibold">
-                                {option.label}
-                              </span>
-                              {option.description ? (
-                                <span className="mt-0.5 block text-xs leading-5 text-stone-500">
-                                  {option.description}
+                    {item.options.length ? (
+                      <div className="space-y-2">
+                        {item.options.map((option) => {
+                          const isSelected =
+                            draft.selectedOptionValue === option.value;
+                          return (
+                            <label
+                              className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${
+                                isSelected
+                                  ? "border-accent bg-accent-soft text-accent-soft-foreground"
+                                  : "border-border bg-background text-foreground hover:border-accent/40 hover:bg-accent-soft/40"
+                              }`}
+                              key={option.value}
+                            >
+                              <input
+                                checked={isSelected}
+                                className="mt-1 size-4"
+                                name={`question-option-${item.id}`}
+                                onChange={() => {
+                                  setDraftAnswers((current) => ({
+                                    ...current,
+                                    [item.id]: {
+                                      manualAnswer:
+                                        current[item.id]?.manualAnswer ?? "",
+                                      selectedOptionValue: option.value,
+                                    },
+                                  }));
+                                  setLocalError(null);
+                                }}
+                                type="radio"
+                              />
+                              <span className="min-w-0">
+                                <span className="block font-semibold">
+                                  {option.label}
                                 </span>
-                              ) : null}
-                            </span>
-                          </label>
-                        );
-                      })}
-                    </div>
-                  ) : null}
+                                {option.description ? (
+                                  <span className="mt-0.5 block text-xs leading-5 text-muted">
+                                    {option.description}
+                                  </span>
+                                ) : null}
+                              </span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    ) : null}
 
-                  {item.allowFreeText ? (
-                    <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                        {t("Custom answer")}
-                      </span>
-                      <textarea
-                        className="min-h-24 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                        onChange={(event) => {
+                    {item.allowFreeText ? (
+                      <TextField
+                        fullWidth
+                        name={`question-free-${item.id}`}
+                        value={draft.manualAnswer}
+                        onChange={(value) => {
                           setDraftAnswers((current) => ({
                             ...current,
                             [item.id]: {
-                              manualAnswer: event.target.value,
+                              manualAnswer: value,
                               selectedOptionValue: null,
                             },
                           }));
                           setLocalError(null);
                         }}
-                        value={draft.manualAnswer}
-                      />
-                    </label>
-                  ) : null}
-                </section>
-              );
-            })}
-          </div>
+                      >
+                        <Label>{t("Custom answer")}</Label>
+                        <TextArea className="min-h-24" />
+                      </TextField>
+                    ) : null}
+                  </section>
+                );
+              })}
 
-          {displayedError ? (
-            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
-              {displayedError}
-            </div>
-          ) : null}
-
-          <div className="flex justify-end gap-2">
-            <button
-              aria-label={t("Cancel run")}
-              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-              onClick={onCancelRun}
-              title={t("Cancel run")}
-              type="button"
-            >
-              <X aria-hidden="true" className="size-4" />
-            </button>
-            <button
-              aria-label={t("Continue run")}
-              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-              disabled={isSaving || !canSubmit}
-              title={t("Continue run")}
-              type="submit"
-            >
-              {isSaving ? (
-                <LoaderCircle
-                  aria-hidden="true"
-                  className="size-4 animate-spin"
-                />
-              ) : (
-                <CheckCircle2 aria-hidden="true" className="size-4" />
-              )}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+              {displayedError ? (
+                <div className="rounded-lg border border-danger bg-danger-soft px-3 py-2 text-sm text-danger-soft-foreground">
+                  {displayedError}
+                </div>
+              ) : null}
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                aria-label={t("Cancel run")}
+                type="button"
+                variant="tertiary"
+                onPress={onCancelRun}
+              >
+                {t("Cancel run")}
+              </Button>
+              <Button
+                aria-label={t("Continue run")}
+                isDisabled={!canSubmit}
+                isPending={isSaving}
+                type="submit"
+              >
+                {({ isPending }) => (
+                  <>
+                    {isPending ? (
+                      <Spinner color="current" size="sm" />
+                    ) : (
+                      <CheckCircle2 aria-hidden="true" className="size-4" />
+                    )}
+                    {t("Continue run")}
+                  </>
+                )}
+              </Button>
+            </Modal.Footer>
+          </form>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
@@ -15251,7 +15023,6 @@ function MainTabBar({
   const tabsContainerRef = useRef<HTMLDivElement>(null);
   const tabListRef = useRef<HTMLDivElement>(null);
   const tabItemRefs = useRef(new Map<string, HTMLDivElement>());
-  const contextMenuRef = useRef<HTMLDivElement>(null);
   const hasTrackedTabKeysRef = useRef(false);
   const previousTabKeysRef = useRef<string[]>([]);
   const [contextMenu, setContextMenu] =
@@ -15349,42 +15120,6 @@ function MainTabBar({
     };
   }, [updateScrollState]);
 
-  useEffect(() => {
-    if (!contextMenu) {
-      return;
-    }
-
-    function closeContextMenuForPointer(event: PointerEvent) {
-      const target = event.target;
-      if (
-        target instanceof Element &&
-        target.closest(".main-tab-context-menu")
-      ) {
-        return;
-      }
-      setContextMenu(null);
-    }
-
-    function closeContextMenuForKey(event: KeyboardEvent) {
-      if (event.key === "Escape") {
-        setContextMenu(null);
-      }
-    }
-
-    function closeContextMenu() {
-      setContextMenu(null);
-    }
-
-    window.addEventListener("pointerdown", closeContextMenuForPointer);
-    window.addEventListener("keydown", closeContextMenuForKey);
-    window.addEventListener("resize", closeContextMenu);
-
-    return () => {
-      window.removeEventListener("pointerdown", closeContextMenuForPointer);
-      window.removeEventListener("keydown", closeContextMenuForKey);
-      window.removeEventListener("resize", closeContextMenu);
-    };
-  }, [contextMenu]);
 
   useEffect(() => {
     if (!contextMenu) {
@@ -15397,33 +15132,6 @@ function MainTabBar({
     }
   }, [contextMenu, tabs]);
 
-  useLayoutEffect(() => {
-    if (!contextMenu || contextMenu.positioned) {
-      return;
-    }
-
-    const element = contextMenuRef.current;
-    if (!element || typeof window === "undefined") {
-      return;
-    }
-
-    const margin = 8;
-    const rect = element.getBoundingClientRect();
-    const nextLeft = Math.max(
-      margin,
-      Math.min(contextMenu.left, window.innerWidth - rect.width - margin),
-    );
-    const nextTop = Math.max(
-      margin,
-      Math.min(contextMenu.top, window.innerHeight - rect.height - margin),
-    );
-    setContextMenu({
-      ...contextMenu,
-      left: nextLeft,
-      positioned: true,
-      top: nextTop,
-    });
-  }, [contextMenu]);
 
   function scrollTabs(direction: -1 | 1) {
     const element = tabListRef.current;
@@ -15547,31 +15255,26 @@ function MainTabBar({
   ];
 
   const contextMenuElement = contextMenu ? (
-    <div
+    <ContextMenu
       aria-label={contextMenu.tab.title}
-      className="workspace-chat-context-menu main-tab-context-menu"
-      ref={contextMenuRef}
-      role="menu"
-      style={{
-        left: contextMenu.left,
-        top: contextMenu.top,
-        visibility: contextMenu.positioned ? "visible" : "hidden",
+      isOpen
+      items={contextMenuItems.map((item) => ({
+        disabled: !hasClosableTabs(item.scope, contextMenu.tab),
+        icon: <X aria-hidden="true" className="size-3.5" />,
+        id: item.scope,
+        label: t(item.label),
+      }))}
+      left={contextMenu.left}
+      top={contextMenu.top}
+      onAction={(key) => {
+        closeTabsFromMenu(String(key) as MainTabCloseScope);
       }}
-    >
-      {contextMenuItems.map((item) => (
-        <button
-          className="workspace-chat-context-menu-item"
-          disabled={!hasClosableTabs(item.scope, contextMenu.tab)}
-          key={item.scope}
-          onClick={() => closeTabsFromMenu(item.scope)}
-          role="menuitem"
-          type="button"
-        >
-          <X aria-hidden="true" className="size-3.5" />
-          <span>{t(item.label)}</span>
-        </button>
-      ))}
-    </div>
+      onOpenChange={(open) => {
+        if (!open) {
+          setContextMenu(null);
+        }
+      }}
+    />
   ) : null;
 
   return (

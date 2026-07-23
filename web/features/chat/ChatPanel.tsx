@@ -72,6 +72,7 @@ import {
   CREATE_BRANCH_OPTION_VALUE,
 } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
+import { Chip, Header, Label, ListBox, Select, Spinner } from "../../shared/ui";
 import { forwardWheelAtVerticalBoundary } from "../../shared/scroll-forwarding";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
@@ -2040,76 +2041,46 @@ function ComposerSelectMenu({
   options: ComposerSelectOption[];
   selectedValue: string;
 }) {
-  const selectedOption =
-    options.find((option) => option.value === selectedValue) ?? null;
-  const selectedLabel = selectedOption?.label ?? emptyLabel;
-  const detailsRef = useCloseDetailsOnOutsidePointerDown();
-
-  function handleSelect(
-    value: string,
-    event: ReactMouseEvent<HTMLButtonElement>,
-  ) {
-    event.currentTarget.closest("details")?.removeAttribute("open");
-    onChange(value);
-  }
-
   return (
-    <details
-      className={`composer-select-menu group relative ${className}`}
-      ref={detailsRef}
+    <Select
+      aria-label={ariaLabel}
+      className={`composer-select-menu ${className}`}
+      isDisabled={disabled || options.length === 0}
+      placeholder={emptyLabel}
+      selectedKey={selectedValue || null}
+      onSelectionChange={(key) => {
+        if (key == null) {
+          return;
+        }
+        onChange(String(key));
+      }}
     >
-      <summary
-        aria-disabled={disabled}
-        aria-label={ariaLabel}
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-900 outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
-          disabled
-            ? "pointer-events-none text-stone-400"
-            : "hover:border-stone-300"
-        }`}
-        title={selectedLabel}
-      >
-        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-        <span className="composer-select-label min-w-0 flex-1 truncate">
-          {selectedLabel}
-        </span>
-        <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
-      </summary>
-      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-64 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
-        <div className="panel-scroll max-h-52 overflow-y-auto py-1">
-          {options.length ? (
-            options.map((option) => (
-              <button
-                aria-label={`${ariaLabel}: ${option.label}`}
-                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 ${
-                  option.value === selectedValue
-                    ? "font-semibold text-teal-900"
-                    : "text-stone-700"
-                }`}
-                key={option.value}
-                onClick={(event) => handleSelect(option.value, event)}
-                type="button"
-              >
-                <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-                <span className="min-w-0 flex-1 truncate">{option.label}</span>
-                {option.badge ? (
-                  <span className="rounded-md border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
-                    {option.badge}
-                  </span>
-                ) : null}
-                {option.value === selectedValue ? (
-                  <CheckCircle2
-                    aria-hidden="true"
-                    className="size-3.5 shrink-0"
-                  />
-                ) : null}
-              </button>
-            ))
-          ) : (
-            <div className="px-3 py-3 text-sm text-stone-500">{emptyLabel}</div>
-          )}
-        </div>
-      </div>
-    </details>
+      <Select.Trigger className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium">
+        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
+        <Select.Value className="composer-select-label min-w-0 flex-1 truncate" />
+        <Select.Indicator />
+      </Select.Trigger>
+      <Select.Popover className="composer-select-popover w-64 max-w-[min(16rem,calc(100vw-1rem))]" placement="top start">
+        <ListBox>
+          {options.map((option) => (
+            <ListBox.Item
+              id={option.value}
+              key={option.value}
+              textValue={option.label}
+            >
+              <Icon aria-hidden="true" className="size-3.5 shrink-0" />
+              <Label className="min-w-0 flex-1 truncate">{option.label}</Label>
+              {option.badge ? (
+                <Chip className="ms-auto" size="sm" variant="soft">
+                  {option.badge}
+                </Chip>
+              ) : null}
+              <ListBox.ItemIndicator />
+            </ListBox.Item>
+          ))}
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
@@ -2135,7 +2106,6 @@ function BranchSelector({
   worktrees: GitWorktreeSummary[];
 }) {
   const { t } = useI18n();
-  const detailsRef = useCloseDetailsOnOutsidePointerDown();
   const displayedWorktrees = currentWorktreeBranch
     ? ensureCurrentWorktree(worktrees, currentWorktreeBranch)
     : worktrees;
@@ -2143,7 +2113,7 @@ function BranchSelector({
     return (
       <div
         aria-label={t("Git branch")}
-        className="composer-branch-select inline-flex h-[1.875rem] max-w-full items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium text-stone-400"
+        className="composer-branch-select inline-flex h-[1.875rem] max-w-full items-center gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium text-muted"
       >
         <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
         <span className="composer-select-label min-w-0 flex-1 truncate" />
@@ -2151,127 +2121,97 @@ function BranchSelector({
     );
   }
 
-  function handleSelect(
-    value: string,
-    event: ReactMouseEvent<HTMLButtonElement>,
-  ) {
-    event.currentTarget.closest("details")?.removeAttribute("open");
-    onChange(value);
-  }
-
   return (
-    <details
-      className="composer-branch-select group relative max-w-full rounded-lg"
-      onToggle={(event) => {
-        if (event.currentTarget.open) {
+    <Select
+      aria-label={t("Git branch")}
+      className="composer-branch-select max-w-full"
+      isDisabled={disabled}
+      selectedKey={currentBranch || null}
+      onOpenChange={(open) => {
+        if (open) {
           onOpen();
         }
       }}
-      ref={detailsRef}
+      onSelectionChange={(key) => {
+        if (key == null) {
+          return;
+        }
+        onChange(String(key));
+      }}
     >
-      <summary
-        aria-disabled={disabled}
-        className={`composer-select-summary flex h-[1.875rem] w-full cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-2 text-xs font-medium outline-none transition marker:hidden focus-visible:ring-2 focus-visible:ring-teal-100 ${
-          disabled ? "text-stone-500" : "text-stone-900 hover:border-stone-300"
-        }`}
-        title={t("Git branch")}
-      >
-        <GitBranch
-          aria-hidden="true"
-          className="size-3.5 shrink-0 text-teal-700"
-        />
-        <span className="composer-select-label min-w-0 flex-1 truncate">
-          {currentBranch}
-        </span>
+      <Select.Trigger className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium">
+        <GitBranch aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
+        <Select.Value className="composer-select-label min-w-0 flex-1 truncate" />
         {isLoading ? (
-          <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+          <Spinner color="current" size="sm" />
         ) : (
-          <ChevronDown aria-hidden="true" className="size-3.5" />
+          <Select.Indicator />
         )}
-      </summary>
-      <div className="composer-select-popover absolute bottom-full left-0 z-20 mb-2 w-72 overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
-        <div className="panel-scroll max-h-64 overflow-y-auto py-1">
-          <div className="px-3 pb-1 pt-2 text-[11px] font-semibold uppercase text-stone-400">
-            {t("Git branches")}
-          </div>
-          {branches.length ? (
-            branches.map((branch) => (
-              <button
-                aria-label={t("Switch to branch {name}", { name: branch })}
-                className={`flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm hover:bg-stone-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent ${
-                  branch === currentBranch
-                    ? "font-semibold text-teal-900"
-                    : "text-stone-700"
-                }`}
-                disabled={disabled}
-                key={branch}
-                onClick={(event) => handleSelect(branch, event)}
-                type="button"
-              >
-                <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
-                <span className="min-w-0 flex-1 truncate">{branch}</span>
-                {branch === currentBranch ? (
-                  <CheckCircle2
-                    aria-hidden="true"
-                    className="size-3.5 shrink-0"
-                  />
-                ) : null}
-              </button>
-            ))
-          ) : (
-            <div className="px-3 py-3 text-sm text-stone-500">
-              {t("No branches")}
-            </div>
-          )}
-          <div className="mt-1 border-t border-stone-100 px-3 pb-1 pt-2 text-[11px] font-semibold uppercase text-stone-400">
-            {t("Git worktrees")}
-          </div>
-          {displayedWorktrees.length ? (
-            displayedWorktrees.map((worktree) => (
-              <div
-                className={`flex min-h-11 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm ${
-                  worktree.isCurrent
-                    ? "font-semibold text-teal-900"
-                    : "text-stone-700"
-                }`}
-                key={worktree.path}
-                title={worktree.path}
-              >
-                <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate">{worktree.name}</span>
-                  <span className="block truncate text-xs font-normal text-stone-500">
-                    {worktree.branch ?? t("Detached HEAD")}
-                  </span>
-                </span>
-                {worktree.isCurrent ? (
-                  <CheckCircle2
-                    aria-hidden="true"
-                    className="size-3.5 shrink-0"
-                  />
-                ) : null}
-              </div>
-            ))
-          ) : (
-            <div className="px-3 py-3 text-sm text-stone-500">
-              {t("No worktrees")}
-            </div>
-          )}
-        </div>
-        <div className="border-t border-stone-100 bg-white p-1.5">
-          <button
-            aria-label={t("Create git branch")}
-            className="flex h-9 w-full items-center gap-2 rounded-lg px-2 text-sm font-semibold text-teal-800 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent"
-            disabled={disabled}
-            onClick={(event) => handleSelect(CREATE_BRANCH_OPTION_VALUE, event)}
-            type="button"
+      </Select.Trigger>
+      <Select.Popover className="composer-select-popover w-72 max-w-[min(18rem,calc(100vw-1rem))]" placement="top start">
+        <ListBox>
+          <ListBox.Section>
+            <Header className="px-2 py-1 text-[11px] font-semibold uppercase text-muted">
+              {t("Git branches")}
+            </Header>
+            {branches.length ? (
+              branches.map((branchName) => (
+                <ListBox.Item
+                  id={branchName}
+                  key={branchName}
+                  textValue={branchName}
+                >
+                  <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+                  <Label className="min-w-0 flex-1 truncate">{branchName}</Label>
+                  <ListBox.ItemIndicator />
+                </ListBox.Item>
+              ))
+            ) : (
+              <ListBox.Item id="__no-branches" isDisabled textValue={t("No branches")}>
+                <Label>{t("No branches")}</Label>
+              </ListBox.Item>
+            )}
+          </ListBox.Section>
+          <ListBox.Section>
+            <Header className="px-2 py-1 text-[11px] font-semibold uppercase text-muted">
+              {t("Git worktrees")}
+            </Header>
+            {displayedWorktrees.length ? (
+              displayedWorktrees.map((worktree) => (
+                <ListBox.Item
+                  id={`worktree:${worktree.path}`}
+                  isDisabled
+                  key={worktree.path}
+                  textValue={worktree.name}
+                >
+                  <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
+                  <div className="min-w-0 flex-1">
+                    <Label className="block truncate">{worktree.name}</Label>
+                    <span className="block truncate text-xs font-normal text-muted">
+                      {worktree.branch ?? t("Detached HEAD")}
+                    </span>
+                  </div>
+                  {worktree.isCurrent ? (
+                    <CheckCircle2 aria-hidden="true" className="size-3.5 shrink-0" />
+                  ) : null}
+                </ListBox.Item>
+              ))
+            ) : (
+              <ListBox.Item id="__no-worktrees" isDisabled textValue={t("No worktrees")}>
+                <Label>{t("No worktrees")}</Label>
+              </ListBox.Item>
+            )}
+          </ListBox.Section>
+          <ListBox.Item
+            id={CREATE_BRANCH_OPTION_VALUE}
+            textValue={t("New branch")}
           >
             <Plus aria-hidden="true" className="size-4" />
-            <span className="min-w-0 flex-1 text-left">{t("New branch")}</span>
-          </button>
-        </div>
-      </div>
-    </details>
+            <Label>{t("New branch")}</Label>
+          </ListBox.Item>
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
@@ -2292,29 +2232,6 @@ function ensureCurrentWorktree(
     },
     ...worktrees,
   ];
-}
-
-function useCloseDetailsOnOutsidePointerDown() {
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-
-  useEffect(() => {
-    function handlePointerDown(event: PointerEvent) {
-      const details = detailsRef.current;
-      if (!details?.open) {
-        return;
-      }
-      const target = event.target;
-      if (!(target instanceof Node) || details.contains(target)) {
-        return;
-      }
-      details.removeAttribute("open");
-    }
-
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, []);
-
-  return detailsRef;
 }
 
 function ReasoningBlock({

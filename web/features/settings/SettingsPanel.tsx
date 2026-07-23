@@ -171,6 +171,7 @@ import {
 import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
 import { FilePickerDialog, type FilePickerSelection } from "../file-picker/FilePickerDialog";
+import { Button, Modal, Spinner } from "../../shared/ui";
 import { useRemoteWorkspaceSkillCatalog } from "./use-remote-workspace-skill-catalog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
 import {
@@ -12997,82 +12998,79 @@ function RemoteServersSettingsSection({
   return (
     <section className="grid gap-4">
       {pendingHostKeyTrust ? (
-        <>
-          <button
-            aria-label={t("Close host key confirmation")}
-            className="fixed inset-0 z-[60] bg-stone-950/40 backdrop-blur-sm"
-            onClick={onCancelHostKeyTrust}
-            type="button"
-          />
-          <div
-            aria-labelledby="remote-server-host-key-title"
-            aria-modal="true"
-            className="panel-scroll fixed left-1/2 top-1/2 z-[70] w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-amber-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.32)]"
-            role="dialog"
-          >
-            <div className="mb-3 flex items-start gap-2">
-              <KeyRound aria-hidden="true" className="mt-0.5 size-5 shrink-0 text-amber-700" />
-              <div className="min-w-0">
-                <h3
-                  className="text-sm font-semibold text-stone-950"
-                  id="remote-server-host-key-title"
-                >
-                  {t("Unknown SSH host key")}
-                </h3>
-                <p className="mt-1 text-xs text-stone-600">
+        <Modal.Backdrop
+          isDismissable={!isTrustingHostKey}
+          isOpen
+          onOpenChange={(open) => {
+            if (!open && !isTrustingHostKey) {
+              onCancelHostKeyTrust();
+            }
+          }}
+        >
+          <Modal.Container placement="center" size="sm">
+            <Modal.Dialog aria-label={t("Unknown SSH host key")}>
+              <Modal.Header>
+                <Modal.Icon className="bg-warning-soft text-warning-soft-foreground">
+                  <KeyRound aria-hidden="true" className="size-5" />
+                </Modal.Icon>
+                <Modal.Heading>{t("Unknown SSH host key")}</Modal.Heading>
+                <p className="text-sm text-muted">
                   {t(
                     "Trust this host and retry the connection? Only confirm if you trust this server.",
                   )}
                 </p>
-              </div>
-            </div>
-            <dl className="grid gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-800">
-              <div className="flex justify-between gap-3">
-                <dt className="shrink-0 font-semibold text-stone-500">{t("SSH hostname / IP")}</dt>
-                <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.host}</dd>
-              </div>
-              <div className="flex justify-between gap-3">
-                <dt className="shrink-0 font-semibold text-stone-500">{t("SSH port")}</dt>
-                <dd className="font-mono">{pendingHostKeyTrust.hostKey.port}</dd>
-              </div>
-              <div className="flex justify-between gap-3">
-                <dt className="shrink-0 font-semibold text-stone-500">{t("Host key algorithm")}</dt>
-                <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.algorithm}</dd>
-              </div>
-              <div className="grid gap-1">
-                <dt className="font-semibold text-stone-500">{t("SHA-256 fingerprint")}</dt>
-                <dd className="break-all font-mono text-[11px] leading-relaxed">
-                  {pendingHostKeyTrust.hostKey.fingerprintSha256}
-                </dd>
-              </div>
-            </dl>
-            <div className="mt-4 flex justify-end gap-2">
-              <button
-                aria-label={t("Cancel host key trust")}
-                className="inline-flex h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-                disabled={isTrustingHostKey}
-                onClick={onCancelHostKeyTrust}
-                type="button"
-              >
-                {t("Cancel")}
-              </button>
-              <button
-                aria-label={t("Confirm and continue")}
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-amber-700 px-3 text-sm font-semibold text-white hover:bg-amber-800 disabled:cursor-not-allowed disabled:bg-stone-300"
-                disabled={isTrustingHostKey}
-                onClick={onConfirmHostKeyTrust}
-                type="button"
-              >
-                {isTrustingHostKey ? (
-                  <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                ) : (
-                  <CheckCircle2 aria-hidden="true" className="size-4" />
-                )}
-                {t("Confirm and continue")}
-              </button>
-            </div>
-          </div>
-        </>
+              </Modal.Header>
+              <Modal.Body>
+                <dl className="grid gap-2 rounded-lg border border-border bg-surface px-3 py-2 text-xs text-foreground">
+                  <div className="flex justify-between gap-3">
+                    <dt className="shrink-0 font-semibold text-muted">{t("SSH hostname / IP")}</dt>
+                    <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.host}</dd>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <dt className="shrink-0 font-semibold text-muted">{t("SSH port")}</dt>
+                    <dd className="font-mono">{pendingHostKeyTrust.hostKey.port}</dd>
+                  </div>
+                  <div className="flex justify-between gap-3">
+                    <dt className="shrink-0 font-semibold text-muted">{t("Host key algorithm")}</dt>
+                    <dd className="truncate font-mono">{pendingHostKeyTrust.hostKey.algorithm}</dd>
+                  </div>
+                  <div className="grid gap-1">
+                    <dt className="font-semibold text-muted">{t("SHA-256 fingerprint")}</dt>
+                    <dd className="break-all font-mono text-[11px] leading-relaxed">
+                      {pendingHostKeyTrust.hostKey.fingerprintSha256}
+                    </dd>
+                  </div>
+                </dl>
+              </Modal.Body>
+              <Modal.Footer>
+                <Button
+                  aria-label={t("Cancel host key trust")}
+                  isDisabled={isTrustingHostKey}
+                  variant="tertiary"
+                  onPress={onCancelHostKeyTrust}
+                >
+                  {t("Cancel")}
+                </Button>
+                <Button
+                  aria-label={t("Confirm and continue")}
+                  isPending={isTrustingHostKey}
+                  onPress={onConfirmHostKeyTrust}
+                >
+                  {({ isPending }) => (
+                    <>
+                      {isPending ? (
+                        <Spinner color="current" size="sm" />
+                      ) : (
+                        <CheckCircle2 aria-hidden="true" className="size-4" />
+                      )}
+                      {t("Confirm and continue")}
+                    </>
+                  )}
+                </Button>
+              </Modal.Footer>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
       ) : null}
 
       {isDialogOpen ? (

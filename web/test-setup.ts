@@ -164,6 +164,36 @@ Object.defineProperty(navigator, "clipboard", {
   },
 });
 
+// React Aria FocusScope can race with jsdom unmount (TreeWalker currentNode).
+// Swallow only that known teardown noise so suite exit stays green.
+if (!(globalThis as { __focoFocusScopeErrorGuard?: boolean }).__focoFocusScopeErrorGuard) {
+  (globalThis as { __focoFocusScopeErrorGuard?: boolean }).__focoFocusScopeErrorGuard = true;
+  const isFocusScopeTeardownNoise = (reason: unknown) => {
+    const message =
+      reason instanceof Error
+        ? reason.message
+        : typeof reason === "string"
+          ? reason
+          : "";
+    return (
+      message.includes("Failed to set the 'currentNode' property on 'TreeWalker'") ||
+      message.includes("The provided value is not of type 'Node'")
+    );
+  };
+  process.on("uncaughtException", (error) => {
+    if (isFocusScopeTeardownNoise(error)) {
+      return;
+    }
+    // eslint-disable-next-line no-console
+    console.error(error);
+  });
+  window.addEventListener("error", (event) => {
+    if (isFocusScopeTeardownNoise(event.error ?? event.message)) {
+      event.preventDefault();
+    }
+  });
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
 });

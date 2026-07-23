@@ -1,5 +1,17 @@
-import { ChevronRight, File, Folder, FolderOpen, LoaderCircle, RefreshCw, X } from "lucide-react";
-import { KeyboardEvent as ReactKeyboardEvent, useEffect, useMemo, useState } from "react";
+import {
+  ChevronRight,
+  File,
+  Folder,
+  FolderOpen,
+  RefreshCw,
+  X,
+} from "lucide-react";
+import {
+  KeyboardEvent as ReactKeyboardEvent,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import type {
   FilePickerEntry,
@@ -10,6 +22,15 @@ import type {
   Translate,
 } from "../../api/types";
 import { errorMessage, requestJson } from "../../shared/api-client";
+import {
+  Button,
+  Input,
+  Label,
+  Modal,
+  Spinner,
+  Switch,
+  TextField,
+} from "../../shared/ui";
 
 export type FilePickerSelection = {
   path: string;
@@ -49,7 +70,9 @@ export function FilePickerDialog({
   const [path, setPath] = useState(initialPath?.trim() ?? "");
   const [draftPath, setDraftPath] = useState(initialPath?.trim() ?? "");
   const [response, setResponse] = useState<FilePickerListResponse | null>(null);
-  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(() => new Set());
+  const [selectedPaths, setSelectedPaths] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [isLoading, setIsLoading] = useState(false);
   const [isConfirming, setIsConfirming] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -96,8 +119,13 @@ export function FilePickerDialog({
         setResponse(data);
         setPath(data.path);
         setDraftPath(data.path);
-        setSelectedPaths((current) =>
-          new Set([...current].filter((selected) => data.entries.some((entry) => entry.path === selected))),
+        setSelectedPaths(
+          (current) =>
+            new Set(
+              [...current].filter((selected) =>
+                data.entries.some((entry) => entry.path === selected),
+              ),
+            ),
         );
       })
       .catch((requestError) => {
@@ -114,17 +142,23 @@ export function FilePickerDialog({
       });
 
     return () => controller.abort();
-  }, [allowOutsideWorkspace, mode, open, path, refreshRevision, showHidden, target, targetIdentity]);
+  }, [
+    allowOutsideWorkspace,
+    mode,
+    open,
+    path,
+    refreshRevision,
+    showHidden,
+    target,
+    targetIdentity,
+  ]);
 
   const selectableEntries = useMemo(
     () => response?.entries.filter((entry) => isSelectable(entry, mode)) ?? [],
     [mode, response],
   );
-  const canConfirm = selectedPaths.size > 0 || (mode === "directory" && Boolean(response?.path));
-
-  if (!open) {
-    return null;
-  }
+  const canConfirm =
+    selectedPaths.size > 0 || (mode === "directory" && Boolean(response?.path));
 
   function openPath(nextPath: string) {
     setPath(nextPath);
@@ -149,7 +183,12 @@ export function FilePickerDialog({
 
   async function confirmSelection(pathsOverride?: string[]) {
     const paths = pathsOverride ?? [...selectedPaths];
-    const finalPaths = paths.length ? paths : mode === "directory" && response?.path ? [response.path] : [];
+    const finalPaths =
+      paths.length
+        ? paths
+        : mode === "directory" && response?.path
+          ? [response.path]
+          : [];
     if (!finalPaths.length) {
       return;
     }
@@ -158,15 +197,18 @@ export function FilePickerDialog({
     setError(null);
     try {
       if (readFiles) {
-        const data = await requestJson<{ files: NativeSelectedFile[] }>("/api/file-picker/read-files", {
-          body: JSON.stringify({
-            allowOutsideWorkspace,
-            paths: finalPaths,
-            target,
-          }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        });
+        const data = await requestJson<{ files: NativeSelectedFile[] }>(
+          "/api/file-picker/read-files",
+          {
+            body: JSON.stringify({
+              allowOutsideWorkspace,
+              paths: finalPaths,
+              target,
+            }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
         onSelect(data.files.map((file) => ({ file, path: file.path })));
       } else {
         onSelect(finalPaths.map((selectedPath) => ({ path: selectedPath })));
@@ -179,7 +221,10 @@ export function FilePickerDialog({
     }
   }
 
-  function handleEntryKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, entry: FilePickerEntry) {
+  function handleEntryKeyDown(
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    entry: FilePickerEntry,
+  ) {
     if (event.key !== "Enter") {
       return;
     }
@@ -198,155 +243,203 @@ export function FilePickerDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-stone-950/40 px-4 py-6" role="presentation">
-      <div
-        aria-label={title}
-        aria-modal="true"
-        className="flex max-h-[86vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-2xl"
-        onKeyDown={(event) => {
-          if (event.key === "Escape") {
-            onClose();
-          }
-        }}
-        role="dialog"
-      >
-        <div className="flex items-center justify-between border-b border-stone-200 px-4 py-3">
-          <div>
-            <h2 className="text-sm font-semibold text-stone-900">{title}</h2>
-            <p className="text-xs text-stone-500">{mode === "directory" ? t("Select a folder") : t("Select file")}</p>
-          </div>
-          <button className="rounded-lg p-2 text-stone-500 hover:bg-stone-100" onClick={onClose} type="button">
-            <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
-
-        <form
-          className="flex gap-2 border-b border-stone-200 px-4 py-3"
-          onSubmit={(event) => {
-            event.preventDefault();
-            openPath(draftPath.trim());
-          }}
-        >
-          <input
-            aria-label={t("Path")}
-            className="min-w-0 flex-1 rounded-lg border border-stone-200 px-3 py-2 text-sm outline-none focus:border-stone-400 focus:ring-2 focus:ring-stone-200"
-            onChange={(event) => setDraftPath(event.target.value)}
-            value={draftPath}
-          />
-          <button className="rounded-lg border border-stone-200 px-3 py-2 text-sm hover:bg-stone-50" type="submit">
-            {t("Open")}
-          </button>
-          <button
-            aria-label={t("Refresh")}
-            className="rounded-lg border border-stone-200 px-3 py-2 text-sm hover:bg-stone-50"
-            onClick={() => setRefreshRevision((value) => value + 1)}
-            type="button"
-          >
-            <RefreshCw aria-hidden="true" className="size-4" />
-          </button>
-        </form>
-
-        <label className="flex items-center gap-2 border-b border-stone-100 px-4 py-2 text-xs font-medium text-stone-600">
-          <input
-            checked={showHidden}
-            className="size-4 rounded border-stone-300 text-stone-900 focus:ring-stone-300"
-            onChange={(event) => setShowHidden(event.target.checked)}
-            type="checkbox"
-          />
-          <span>{t("Show hidden files")}</span>
-        </label>
-
-        <div className="flex items-center gap-2 border-b border-stone-100 px-4 py-2 text-xs text-stone-500">
-          <button
-            className="rounded px-2 py-1 hover:bg-stone-100 disabled:opacity-50"
-            disabled={!response?.parentPath}
-            onClick={() => response?.parentPath && openPath(response.parentPath)}
-            type="button"
-          >
-            {t("Up")}
-          </button>
-          <ChevronRight aria-hidden="true" className="size-3" />
-          <span className="truncate">{response?.path || path || "/"}</span>
-        </div>
-
-        <div className="min-h-64 flex-1 overflow-auto px-2 py-2">
-          {isLoading ? (
-            <div className="flex h-40 items-center justify-center text-sm text-stone-500">
-              <LoaderCircle aria-hidden="true" className="mr-2 size-4 animate-spin" />
-              {t("Loading")}
+    <Modal.Backdrop
+      isDismissable
+      isOpen={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen) {
+          onClose();
+        }
+      }}
+    >
+      <Modal.Container placement="center" scroll="inside" size="lg">
+        <Modal.Dialog aria-label={title}>
+          <Modal.Header className="flex-row items-start justify-between gap-3">
+            <div className="min-w-0">
+              <Modal.Heading>{title}</Modal.Heading>
+              <p className="text-xs text-muted">
+                {mode === "directory" ? t("Select a folder") : t("Select file")}
+              </p>
             </div>
-          ) : error ? (
-            <div className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>
-          ) : response?.entries.length ? (
-            <div className="space-y-1">
-              {response.entries.map((entry) => {
-                const selected = selectedPaths.has(entry.path);
-                const selectable = isSelectable(entry, mode) && !entry.disabled;
-                return (
-                  <button
-                    aria-disabled={!selectable && !(entry.isDirectory && mode === "file")}
-                    aria-pressed={selected}
-                    className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm outline-none focus:ring-2 focus:ring-stone-300 ${selected ? "bg-stone-900 text-white" : "hover:bg-stone-100"} ${entry.disabled ? "opacity-50" : ""}`}
-                    key={entry.path}
-                    onClick={() => {
-                      if (entry.isDirectory && mode === "file") {
-                        openPath(entry.path);
-                        return;
-                      }
-                      toggleEntry(entry);
-                    }}
-                    onDoubleClick={() => {
-                      if (entry.isDirectory) {
-                        openPath(entry.path);
-                      }
-                    }}
-                    onKeyDown={(event) => handleEntryKeyDown(event, entry)}
-                    type="button"
-                  >
-                    {entry.isDirectory ? (
-                      <Folder aria-hidden="true" className="size-4 shrink-0" />
-                    ) : (
-                      <File aria-hidden="true" className="size-4 shrink-0" />
-                    )}
-                    <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-                    {entry.isDirectory ? <FolderOpen aria-hidden="true" className="size-3.5 shrink-0 opacity-60" /> : null}
-                  </button>
-                );
-              })}
+            <Button
+              aria-label={t("Close")}
+              isIconOnly
+              size="sm"
+              variant="ghost"
+              onPress={onClose}
+            >
+              <X aria-hidden="true" className="size-4" />
+            </Button>
+          </Modal.Header>
+
+          <Modal.Body className="flex min-h-0 flex-col gap-0 p-0">
+            <form
+              className="flex gap-2 border-b border-border px-4 py-3"
+              onSubmit={(event) => {
+                event.preventDefault();
+                openPath(draftPath.trim());
+              }}
+            >
+              <TextField
+                className="min-w-0 flex-1"
+                fullWidth
+                name="file-picker-path"
+                value={draftPath}
+                onChange={setDraftPath}
+              >
+                <Label className="sr-only">{t("Path")}</Label>
+                <Input aria-label={t("Path")} />
+              </TextField>
+              <Button size="sm" type="submit" variant="secondary">
+                {t("Open")}
+              </Button>
+              <Button
+                aria-label={t("Refresh")}
+                isIconOnly
+                size="sm"
+                type="button"
+                variant="secondary"
+                onPress={() => setRefreshRevision((value) => value + 1)}
+              >
+                <RefreshCw aria-hidden="true" className="size-4" />
+              </Button>
+            </form>
+
+            <div className="flex items-center gap-2 border-b border-border px-4 py-2 text-xs font-medium text-muted">
+              <Switch isSelected={showHidden} onChange={setShowHidden}>
+                <Switch.Content>
+                  <Switch.Control>
+                    <Switch.Thumb />
+                  </Switch.Control>
+                  <span>{t("Show hidden files")}</span>
+                </Switch.Content>
+              </Switch>
             </div>
-          ) : (
-            <div className="flex h-40 items-center justify-center text-sm text-stone-500">{t("No files")}</div>
-          )}
-        </div>
 
-        {response?.truncated ? (
-          <div className="border-t border-amber-200 bg-amber-50 px-4 py-2 text-xs text-amber-700">
-            {t("Showing first {count} entries", { count: String(FILE_PICKER_LIMIT) })}
-          </div>
-        ) : null}
-        {response?.warnings?.length ? (
-          <div className="border-t border-stone-200 px-4 py-2 text-xs text-stone-500">{response.warnings[0]}</div>
-        ) : null}
-        {selectableEntries.length === 0 && response?.entries.length ? (
-          <div className="border-t border-stone-200 px-4 py-2 text-xs text-stone-500">{t("No selectable files in this folder")}</div>
-        ) : null}
+            <div className="flex items-center gap-2 border-b border-border px-4 py-2 text-xs text-muted">
+              <Button
+                isDisabled={!response?.parentPath}
+                size="sm"
+                variant="ghost"
+                onPress={() =>
+                  response?.parentPath && openPath(response.parentPath)
+                }
+              >
+                {t("Up")}
+              </Button>
+              <ChevronRight aria-hidden="true" className="size-3" />
+              <span className="truncate">{response?.path || path || "/"}</span>
+            </div>
 
-        <div className="flex justify-end gap-2 border-t border-stone-200 px-4 py-3">
-          <button className="rounded-lg border border-stone-200 px-3 py-2 text-sm hover:bg-stone-50" onClick={onClose} type="button">
-            {t("Cancel")}
-          </button>
-          <button
-            className="inline-flex items-center rounded-lg bg-stone-900 px-3 py-2 text-sm font-medium text-white hover:bg-stone-800 disabled:opacity-50"
-            disabled={!canConfirm || isConfirming}
-            onClick={() => void confirmSelection()}
-            type="button"
-          >
-            {isConfirming ? <LoaderCircle aria-hidden="true" className="mr-2 size-4 animate-spin" /> : null}
-            {t("Select")}
-          </button>
-        </div>
-      </div>
-    </div>
+            <div className="min-h-64 flex-1 overflow-auto px-2 py-2">
+              {isLoading ? (
+                <div className="flex h-40 items-center justify-center gap-2 text-sm text-muted">
+                  <Spinner color="current" size="sm" />
+                  {t("Loading")}
+                </div>
+              ) : error ? (
+                <div className="rounded-xl border border-danger bg-danger-soft px-3 py-2 text-sm text-danger-soft-foreground">
+                  {error}
+                </div>
+              ) : response?.entries.length ? (
+                <div className="space-y-1">
+                  {response.entries.map((entry) => {
+                    const selected = selectedPaths.has(entry.path);
+                    const selectable =
+                      isSelectable(entry, mode) && !entry.disabled;
+                    return (
+                      <button
+                        aria-disabled={
+                          !selectable && !(entry.isDirectory && mode === "file")
+                        }
+                        aria-pressed={selected}
+                        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-focus ${selected ? "bg-accent text-accent-foreground" : "hover:bg-default"} ${entry.disabled ? "opacity-50" : ""}`}
+                        key={entry.path}
+                        onClick={() => {
+                          if (entry.isDirectory && mode === "file") {
+                            openPath(entry.path);
+                            return;
+                          }
+                          toggleEntry(entry);
+                        }}
+                        onDoubleClick={() => {
+                          if (entry.isDirectory) {
+                            openPath(entry.path);
+                          }
+                        }}
+                        onKeyDown={(event) => handleEntryKeyDown(event, entry)}
+                        type="button"
+                      >
+                        {entry.isDirectory ? (
+                          <Folder
+                            aria-hidden="true"
+                            className="size-4 shrink-0"
+                          />
+                        ) : (
+                          <File
+                            aria-hidden="true"
+                            className="size-4 shrink-0"
+                          />
+                        )}
+                        <span className="min-w-0 flex-1 truncate">
+                          {entry.name}
+                        </span>
+                        {entry.isDirectory ? (
+                          <FolderOpen
+                            aria-hidden="true"
+                            className="size-3.5 shrink-0 opacity-60"
+                          />
+                        ) : null}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="flex h-40 items-center justify-center text-sm text-muted">
+                  {t("No files")}
+                </div>
+              )}
+            </div>
+
+            {response?.truncated ? (
+              <div className="border-t border-warning bg-warning-soft px-4 py-2 text-xs text-warning-soft-foreground">
+                {t("Showing first {count} entries", {
+                  count: String(FILE_PICKER_LIMIT),
+                })}
+              </div>
+            ) : null}
+            {response?.warnings?.length ? (
+              <div className="border-t border-border px-4 py-2 text-xs text-muted">
+                {response.warnings[0]}
+              </div>
+            ) : null}
+            {selectableEntries.length === 0 && response?.entries.length ? (
+              <div className="border-t border-border px-4 py-2 text-xs text-muted">
+                {t("No selectable files in this folder")}
+              </div>
+            ) : null}
+          </Modal.Body>
+
+          <Modal.Footer>
+            <Button variant="tertiary" onPress={onClose}>
+              {t("Cancel")}
+            </Button>
+            <Button
+              isDisabled={!canConfirm}
+              isPending={isConfirming}
+              onPress={() => void confirmSelection()}
+            >
+              {({ isPending }) => (
+                <>
+                  {isPending ? <Spinner color="current" size="sm" /> : null}
+                  {t("Select")}
+                </>
+              )}
+            </Button>
+          </Modal.Footer>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 

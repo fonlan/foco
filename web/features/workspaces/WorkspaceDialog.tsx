@@ -2,13 +2,11 @@ import {
   CheckCircle2,
   FolderPlus,
   FolderSearch,
-  LoaderCircle,
   ScrollText,
   Server,
   Terminal,
   Trash2,
   Upload,
-  X,
 } from "lucide-react";
 import { FormEvent } from "react";
 
@@ -18,6 +16,17 @@ import type {
   WorkspaceIconDraft,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import {
+  Button,
+  Input,
+  Label,
+  ListBox,
+  Modal,
+  Select,
+  Spinner,
+  Switch,
+  TextField,
+} from "../../shared/ui";
 import { WorkspaceIcon } from "./WorkspaceIcon";
 
 export function WorkspaceDialog({
@@ -83,342 +92,408 @@ export function WorkspaceDialog({
 }) {
   const { t } = useI18n();
   const title = t("Add workspace");
-  const selectedServer = remoteServers.find((server) => server.id === selectedServerId) ?? null;
-  const selectedServerAvailable = selectedServer?.sidecarInstallState === "available" || selectedServer?.sidecarInstallState === "customCommand";
+  const selectedServer =
+    remoteServers.find((server) => server.id === selectedServerId) ?? null;
+  const selectedServerAvailable =
+    selectedServer?.sidecarInstallState === "available" ||
+    selectedServer?.sidecarInstallState === "customCommand";
   const isRemote = mode === "ssh";
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
-      role="presentation"
-    >
-      <section
-        aria-labelledby="workspace-dialog-title"
-        aria-modal="true"
-        className="panel-scroll max-h-[88vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
-        role="dialog"
-      >
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-          <div className="min-w-0">
-            <h2
-              className="truncate text-base font-semibold text-stone-950"
-              id="workspace-dialog-title"
-            >
-              {title}
-            </h2>
-            <p className="mt-1 truncate text-xs font-medium text-stone-500">
-              {isRemote ? t("Register an SSH workspace.") : t("Create or register a local folder.")}
+    <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
+      <Modal.Container placement="center" scroll="inside" size="lg">
+        <Modal.Dialog aria-label={title}>
+          <Modal.CloseTrigger />
+          <Modal.Header>
+            <Modal.Heading>{title}</Modal.Heading>
+            <p className="text-sm text-muted">
+              {isRemote
+                ? t("Register an SSH workspace.")
+                : t("Create or register a local folder.")}
             </p>
-          </div>
-          <button
-            aria-label={t("Close workspace dialog")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-            onClick={onClose}
-            title={t("Close")}
-            type="button"
+          </Modal.Header>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void onSubmit(event);
+            }}
           >
-            <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
-
-        <form className="space-y-4 px-4 py-4" onSubmit={(event) => void onSubmit(event)}>
-          <div className="grid grid-cols-2 gap-2 rounded-lg bg-stone-100 p-1">
-            <button
-              aria-pressed={!isRemote}
-              className={`inline-flex h-10 items-center justify-center gap-2 rounded-md text-sm font-semibold ${!isRemote
-                  ? "bg-white text-stone-950 shadow-sm"
-                  : "text-stone-500 hover:text-stone-800"
-                }`}
-              onClick={() => onModeChange("local")}
-              type="button"
-            >
-              <FolderPlus aria-hidden="true" className="size-4" />
-              {t("Local")}
-            </button>
-            <button
-              aria-pressed={isRemote}
-              className={`inline-flex h-10 items-center justify-center gap-2 rounded-md text-sm font-semibold ${isRemote
-                  ? "bg-white text-stone-950 shadow-sm"
-                  : "text-stone-500 hover:text-stone-800"
-                }`}
-              onClick={() => onModeChange("ssh")}
-              type="button"
-            >
-              <Server aria-hidden="true" className="size-4" />
-              {t("SSH")}
-            </button>
-          </div>
-
-          {isRemote ? (
-            <section className="grid gap-3 rounded-lg border border-stone-200 bg-stone-50/70 p-3">
-              <label className="block">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                  {t("Remote Server")}
-                </span>
-                <select
-                  className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => onServerChange(event.target.value)}
-                  value={selectedServerId}
-                >
-                  <option value="">{t("Select remote server")}</option>
-                  {remoteServers.map((server) => {
-                    const isServerAvailable = server.sidecarInstallState === "available" || server.sidecarInstallState === "customCommand";
-                    return (
-                      <option disabled={!isServerAvailable} key={server.id} value={server.id}>
-                        {server.name} ({server.hostAlias})
-                      </option>
-                    );
-                  })}
-                </select>
-              </label>
-              {selectedServer ? (
-                <div className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-600">
-                  <span className="min-w-0 truncate">
-                    {selectedServer.name}: {selectedServer.defaultRemoteRoot ?? selectedServer.hostAlias}
-                  </span>
-                  <span className={`size-2.5 shrink-0 rounded-full ${remoteDialogStatusDotClass(selectedServer.status)}`} />
-                </div>
-              ) : null}
-              <div className="grid gap-2 sm:grid-cols-2">
-                <input
-                  autoComplete="off"
-                  className="h-10 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                  onChange={(event) => onInlineServerNameChange(event.target.value)}
-                  placeholder={t("Server name")}
-                  value={inlineServerName}
-                />
-                <div className="flex gap-2">
-                  <input
-                    autoComplete="off"
-                    className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                    onChange={(event) => onInlineServerHostChange(event.target.value)}
-                    placeholder={t("SSH hostname / IP")}
-                    value={inlineServerHost}
-                  />
-                  <button
-                    aria-label={t("Add remote server")}
-                    className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                    disabled={isCreatingInlineServer}
-                    onClick={onCreateInlineServer}
-                    title={t("Add remote server")}
-                    type="button"
-                  >
-                    {isCreatingInlineServer ? (
-                      <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                    ) : (
-                      <Server aria-hidden="true" className="size-4" />
-                    )}
-                  </button>
-                </div>
-              </div>
-            </section>
-          ) : null}
-
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-              {t("Name")}
-            </span>
-            <input
-              autoComplete="off"
-              className="h-11 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-              name="workspace-name"
-              onChange={(event) => onNameChange(event.target.value)}
-              placeholder={t("Workspace name")}
-              value={name}
-            />
-          </label>
-          <label className="block">
-            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-              {isRemote ? t("Remote path") : t("Path")}
-            </span>
-            <div className="flex gap-2">
-              <input
-                autoComplete="off"
-                className="h-11 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                name="workspace-path"
-                onChange={(event) => onPathChange(event.target.value)}
-                placeholder={isRemote ? "/home/name/workspace" : "C:/Users/name/workspace"}
-                value={path}
-              />
-              <button
-                aria-label={t("Choose workspace path")}
-                className="inline-flex size-11 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                disabled={isRemote && (!selectedServerId || !selectedServerAvailable)}
-                onClick={onSelectPath}
-                title={t("Choose workspace path")}
-                type="button"
-              >
-                <FolderSearch aria-hidden="true" className="size-4" />
-              </button>
-            </div>
-          </label>
-
-          {isRemote ? (
-            <div className="rounded-lg border border-stone-200 bg-white p-3">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-700">
-                  <Terminal aria-hidden="true" className="size-4 shrink-0 text-teal-700" />
-                  <span className="truncate">{t("Test connection")}</span>
-                </div>
-                <button
-                  aria-label={t("Test connection")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-                  disabled={isTestingConnection || !selectedServerId}
-                  onClick={onTestConnection}
-                  title={t("Test connection")}
+            <Modal.Body className="space-y-4">
+              <div className="grid grid-cols-2 gap-2 rounded-lg bg-default p-1">
+                <Button
+                  aria-pressed={!isRemote}
+                  className={!isRemote ? undefined : "bg-transparent shadow-none"}
                   type="button"
+                  variant={!isRemote ? "secondary" : "ghost"}
+                  onPress={() => onModeChange("local")}
                 >
-                  {isTestingConnection ? (
-                    <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  ) : (
-                    <CheckCircle2 aria-hidden="true" className="size-4" />
-                  )}
-                </button>
+                  <FolderPlus aria-hidden="true" className="size-4" />
+                  {t("Local")}
+                </Button>
+                <Button
+                  aria-pressed={isRemote}
+                  className={isRemote ? undefined : "bg-transparent shadow-none"}
+                  type="button"
+                  variant={isRemote ? "secondary" : "ghost"}
+                  onPress={() => onModeChange("ssh")}
+                >
+                  <Server aria-hidden="true" className="size-4" />
+                  {t("SSH")}
+                </Button>
               </div>
-              {testStages.length ? (
-                <div className="mt-3 grid gap-1.5 text-xs text-stone-600">
-                  {testStages.map((stage) => (
-                    <div key={stage.stage} className="flex items-center gap-2">
-                      <span className={`size-2 rounded-full ${remoteDialogStageDotClass(stage.status)}`} />
-                      <span className="font-medium text-stone-700">
-                        {remoteDialogStageLabel(stage.stage, t)}
+
+              {isRemote ? (
+                <section className="grid gap-3 rounded-lg border border-border bg-surface p-3">
+                  <Select
+                    className="w-full"
+                    placeholder={t("Select remote server")}
+                    selectedKey={selectedServerId || null}
+                    onSelectionChange={(key) =>
+                      onServerChange(key == null ? "" : String(key))
+                    }
+                  >
+                    <Label>{t("Remote Server")}</Label>
+                    <Select.Trigger>
+                      <Select.Value />
+                      <Select.Indicator />
+                    </Select.Trigger>
+                    <Select.Popover>
+                      <ListBox>
+                        {remoteServers.map((server) => {
+                          const isServerAvailable =
+                            server.sidecarInstallState === "available" ||
+                            server.sidecarInstallState === "customCommand";
+                          return (
+                            <ListBox.Item
+                              id={server.id}
+                              isDisabled={!isServerAvailable}
+                              key={server.id}
+                              textValue={`${server.name} (${server.hostAlias})`}
+                            >
+                              {server.name} ({server.hostAlias})
+                              <ListBox.ItemIndicator />
+                            </ListBox.Item>
+                          );
+                        })}
+                      </ListBox>
+                    </Select.Popover>
+                  </Select>
+                  {selectedServer ? (
+                    <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-background px-3 py-2 text-xs text-muted">
+                      <span className="min-w-0 truncate">
+                        {selectedServer.name}:{" "}
+                        {selectedServer.defaultRemoteRoot ??
+                          selectedServer.hostAlias}
                       </span>
-                      <span className="min-w-0 truncate text-stone-500">{stage.message}</span>
+                      <span
+                        className={`size-2.5 shrink-0 rounded-full ${remoteDialogStatusDotClass(selectedServer.status)}`}
+                      />
                     </div>
-                  ))}
+                  ) : null}
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    <TextField
+                      fullWidth
+                      name="inline-server-name"
+                      value={inlineServerName}
+                      onChange={onInlineServerNameChange}
+                    >
+                      <Label className="sr-only">{t("Server name")}</Label>
+                      <Input
+                        autoComplete="off"
+                        placeholder={t("Server name")}
+                      />
+                    </TextField>
+                    <div className="flex gap-2">
+                      <TextField
+                        className="min-w-0 flex-1"
+                        fullWidth
+                        name="inline-server-host"
+                        value={inlineServerHost}
+                        onChange={onInlineServerHostChange}
+                      >
+                        <Label className="sr-only">
+                          {t("SSH hostname / IP")}
+                        </Label>
+                        <Input
+                          autoComplete="off"
+                          placeholder={t("SSH hostname / IP")}
+                        />
+                      </TextField>
+                      <Button
+                        aria-label={t("Add remote server")}
+                        isDisabled={isCreatingInlineServer}
+                        isIconOnly
+                        isPending={isCreatingInlineServer}
+                        type="button"
+                        variant="secondary"
+                        onPress={onCreateInlineServer}
+                      >
+                        {({ isPending }) =>
+                          isPending ? (
+                            <Spinner color="current" size="sm" />
+                          ) : (
+                            <Server aria-hidden="true" className="size-4" />
+                          )
+                        }
+                      </Button>
+                    </div>
+                  </div>
+                </section>
+              ) : null}
+
+              <TextField
+                fullWidth
+                name="workspace-name"
+                value={name}
+                onChange={onNameChange}
+              >
+                <Label>{t("Name")}</Label>
+                <Input
+                  autoComplete="off"
+                  placeholder={t("Workspace name")}
+                />
+              </TextField>
+
+              <div className="flex items-end gap-2">
+                <TextField
+                  className="min-w-0 flex-1"
+                  fullWidth
+                  name="workspace-path"
+                  value={path}
+                  onChange={onPathChange}
+                >
+                  <Label>{isRemote ? t("Remote path") : t("Path")}</Label>
+                  <Input
+                    autoComplete="off"
+                    placeholder={
+                      isRemote
+                        ? "/home/name/workspace"
+                        : "C:/Users/name/workspace"
+                    }
+                  />
+                </TextField>
+                <Button
+                  aria-label={t("Choose workspace path")}
+                  isDisabled={
+                    isRemote && (!selectedServerId || !selectedServerAvailable)
+                  }
+                  isIconOnly
+                  type="button"
+                  variant="secondary"
+                  onPress={onSelectPath}
+                >
+                  <FolderSearch aria-hidden="true" className="size-4" />
+                </Button>
+              </div>
+
+              {isRemote ? (
+                <div className="rounded-lg border border-border bg-background p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+                      <Terminal
+                        aria-hidden="true"
+                        className="size-4 shrink-0 text-accent"
+                      />
+                      <span className="truncate">{t("Test connection")}</span>
+                    </div>
+                    <Button
+                      aria-label={t("Test connection")}
+                      isDisabled={isTestingConnection || !selectedServerId}
+                      isIconOnly
+                      isPending={isTestingConnection}
+                      type="button"
+                      variant="secondary"
+                      onPress={onTestConnection}
+                    >
+                      {({ isPending }) =>
+                        isPending ? (
+                          <Spinner color="current" size="sm" />
+                        ) : (
+                          <CheckCircle2
+                            aria-hidden="true"
+                            className="size-4"
+                          />
+                        )
+                      }
+                    </Button>
+                  </div>
+                  {testStages.length ? (
+                    <div className="mt-3 grid gap-1.5 text-xs text-muted">
+                      {testStages.map((stage) => (
+                        <div
+                          className="flex items-center gap-2"
+                          key={stage.stage}
+                        >
+                          <span
+                            className={`size-2 rounded-full ${remoteDialogStageDotClass(stage.status)}`}
+                          />
+                          <span className="font-medium text-foreground">
+                            {remoteDialogStageLabel(stage.stage, t)}
+                          </span>
+                          <span className="min-w-0 truncate text-muted">
+                            {stage.message}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
-            </div>
-          ) : null}
 
-          <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-            <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-700">
-              <ScrollText aria-hidden="true" className="size-4 shrink-0 text-teal-700" />
-              <span className="truncate">{t("Enable Project Spec")}</span>
-            </span>
-            <input
-              checked={specEnabled}
-              className="size-4 accent-teal-700"
-              disabled={isSaving}
-              onChange={(event) => onSpecEnabledChange(event.target.checked)}
-              type="checkbox"
-            />
-          </label>
-
-          <details className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
-            <summary className="cursor-pointer text-sm font-semibold text-stone-700">
-              {t("Advanced")}
-            </summary>
-            <label className="mt-3 block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
-                {t("Terminal shell override")}
-              </span>
-              <input
-                autoComplete="off"
-                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
-                onChange={(event) => onTerminalShellChange(event.target.value)}
-                placeholder={isRemote ? "/bin/bash" : ""}
-                value={terminalShell}
-              />
-            </label>
-          </details>
-
-          <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="flex min-w-0 items-center gap-2">
-                <WorkspaceIcon
-                  className="size-10 rounded-lg border border-stone-200 bg-white object-cover p-1"
-                  fallbackClassName="size-10 rounded-lg border border-stone-200 bg-white p-2 text-teal-700"
-                  isRemote={isRemote}
-                  logoUrl={iconDraft?.previewUrl || null}
-                />
-                <div className="min-w-0">
-                  <span className="block text-sm font-semibold text-stone-800">
-                    {t("Workspace icon")}
-                  </span>
-                  <span className="block truncate text-xs text-stone-500">
-                    {iconDraft?.name ?? (isRemote ? t("Remote workspace icon") : t("Folder icon"))}
-                  </span>
-                </div>
+              <div className="flex items-center justify-between gap-3 rounded-lg border border-border bg-surface px-3 py-2">
+                <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-foreground">
+                  <ScrollText
+                    aria-hidden="true"
+                    className="size-4 shrink-0 text-accent"
+                  />
+                  <span className="truncate">{t("Enable Project Spec")}</span>
+                </span>
+                <Switch
+                  isDisabled={isSaving}
+                  isSelected={specEnabled}
+                  onChange={onSpecEnabledChange}
+                >
+                  <Switch.Content>
+                    <Switch.Control>
+                      <Switch.Thumb />
+                    </Switch.Control>
+                  </Switch.Content>
+                </Switch>
               </div>
-              <button
-                aria-label={t("Clear workspace icon")}
-                className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
-                disabled={isSaving || !iconDraft}
-                onClick={onClearIcon}
-                title={t("Clear workspace icon")}
+
+              <details className="rounded-lg border border-border bg-surface p-3">
+                <summary className="cursor-pointer text-sm font-semibold text-foreground">
+                  {t("Advanced")}
+                </summary>
+                <TextField
+                  className="mt-3"
+                  fullWidth
+                  name="terminal-shell"
+                  value={terminalShell}
+                  onChange={onTerminalShellChange}
+                >
+                  <Label>{t("Terminal shell override")}</Label>
+                  <Input
+                    autoComplete="off"
+                    placeholder={isRemote ? "/bin/bash" : ""}
+                  />
+                </TextField>
+              </details>
+
+              <div className="rounded-lg border border-border bg-surface p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <WorkspaceIcon
+                      className="size-10 rounded-lg border border-border bg-background object-cover p-1"
+                      fallbackClassName="size-10 rounded-lg border border-border bg-background p-2 text-accent"
+                      isRemote={isRemote}
+                      logoUrl={iconDraft?.previewUrl || null}
+                    />
+                    <div className="min-w-0">
+                      <span className="block text-sm font-semibold text-foreground">
+                        {t("Workspace icon")}
+                      </span>
+                      <span className="block truncate text-xs text-muted">
+                        {iconDraft?.name ??
+                          (isRemote
+                            ? t("Remote workspace icon")
+                            : t("Folder icon"))}
+                      </span>
+                    </div>
+                  </div>
+                  <Button
+                    aria-label={t("Clear workspace icon")}
+                    isDisabled={isSaving || !iconDraft}
+                    isIconOnly
+                    type="button"
+                    variant="danger-soft"
+                    onPress={onClearIcon}
+                  >
+                    <Trash2 aria-hidden="true" className="size-4" />
+                  </Button>
+                </div>
+                <Button
+                  aria-label={t("Upload icon")}
+                  isDisabled={
+                    isSaving ||
+                    (isRemote &&
+                      (!selectedServerId || !selectedServerAvailable))
+                  }
+                  size="sm"
+                  type="button"
+                  variant="secondary"
+                  onPress={onSelectIcon}
+                >
+                  <Upload aria-hidden="true" className="size-3.5" />
+                  {t("Upload icon")}
+                </Button>
+              </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button
+                aria-label={t("Cancel workspace dialog")}
                 type="button"
+                variant="tertiary"
+                onPress={onClose}
               >
-                <Trash2 aria-hidden="true" className="size-4" />
-              </button>
-            </div>
-            <button
-              aria-label={t("Upload icon")}
-              className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
-              disabled={isSaving || (isRemote && (!selectedServerId || !selectedServerAvailable))}
-              onClick={onSelectIcon}
-              title={t("Upload icon")}
-              type="button"
-            >
-              <Upload aria-hidden="true" className="size-3.5" />
-              {t("Upload icon")}
-            </button>
-          </div>
-          <div className="flex justify-end gap-2">
-            <button
-              aria-label={t("Cancel workspace dialog")}
-              className="inline-flex size-11 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-              onClick={onClose}
-              title={t("Cancel")}
-              type="button"
-            >
-              <X aria-hidden="true" className="size-4" />
-            </button>
-            <button
-              aria-label={title}
-              className="inline-flex size-11 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-              disabled={isSaving || (isRemote && (!selectedServerId || !selectedServerAvailable))}
-              title={title}
-              type="submit"
-            >
-              {isSaving ? (
-                <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-              ) : (
-                <FolderPlus aria-hidden="true" className="size-4" />
-              )}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+                {t("Cancel")}
+              </Button>
+              <Button
+                aria-label={title}
+                isDisabled={
+                  isRemote && (!selectedServerId || !selectedServerAvailable)
+                }
+                isPending={isSaving}
+                type="submit"
+              >
+                {({ isPending }) => (
+                  <>
+                    {isPending ? (
+                      <Spinner color="current" size="sm" />
+                    ) : (
+                      <FolderPlus aria-hidden="true" className="size-4" />
+                    )}
+                    {title}
+                  </>
+                )}
+              </Button>
+            </Modal.Footer>
+          </form>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
 function remoteDialogStatusDotClass(status: string) {
   const normalized = status.toLowerCase();
   if (normalized === "connected" || normalized === "ready") {
-    return "bg-emerald-500";
+    return "bg-success";
   }
-  if (normalized === "checking" || normalized === "connecting" || normalized === "reconnecting") {
-    return "bg-amber-500";
+  if (
+    normalized === "checking" ||
+    normalized === "connecting" ||
+    normalized === "reconnecting"
+  ) {
+    return "bg-warning";
   }
   if (normalized === "failed" || normalized === "failedauth") {
-    return "bg-rose-500";
+    return "bg-danger";
   }
-  return "bg-stone-300";
+  return "bg-default";
 }
 
 function remoteDialogStageDotClass(status: string) {
   if (status === "success") {
-    return "bg-emerald-500";
+    return "bg-success";
   }
   if (status === "failed") {
-    return "bg-rose-500";
+    return "bg-danger";
   }
   if (status === "skipped") {
-    return "bg-stone-300";
+    return "bg-default";
   }
-  return "bg-amber-500";
+  return "bg-warning";
 }
 
 function remoteDialogStageLabel(stage: string, t: (key: string) => string) {

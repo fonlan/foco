@@ -2594,37 +2594,32 @@ describe("app-shell verification surfaces", () => {
 
   it("closes composer menus when clicking outside", async () => {
     const user = userEvent.setup();
-    const { container } = renderApp();
+    renderApp();
 
-    const modelSummary = await screen.findByLabelText("Model");
-    const thinkingSummary = await screen.findByLabelText("Thinking");
-    const branchDetails = await waitFor(() => {
-      const element = container.querySelector<HTMLDetailsElement>(
-        ".composer-branch-select",
-      );
-      if (!element) {
-        throw new Error("branch selector details was not rendered");
-      }
-      expect(element.tagName).toBe("DETAILS");
-      return element;
+    const modelTrigger = await screen.findByLabelText("Model");
+    const thinkingTrigger = await screen.findByLabelText("Thinking");
+    const branchTrigger = await screen.findByLabelText("Git branch");
+
+    await user.click(modelTrigger);
+    expect(await screen.findByRole("listbox")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
     });
-    const branchSummary = branchDetails.querySelector("summary");
-    expect(branchSummary).not.toBeNull();
 
-    await user.click(modelSummary);
-    expect(modelSummary.closest("details")).toHaveAttribute("open");
-    await user.click(document.body);
-    expect(modelSummary.closest("details")).not.toHaveAttribute("open");
+    await user.click(thinkingTrigger);
+    expect(await screen.findByRole("listbox")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    });
 
-    await user.click(thinkingSummary);
-    expect(thinkingSummary.closest("details")).toHaveAttribute("open");
-    await user.click(document.body);
-    expect(thinkingSummary.closest("details")).not.toHaveAttribute("open");
-
-    await user.click(branchSummary as HTMLElement);
-    expect(branchDetails).toHaveAttribute("open");
-    await user.click(document.body);
-    expect(branchDetails).not.toHaveAttribute("open");
+    await user.click(branchTrigger);
+    expect(await screen.findByRole("listbox")).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    });
   });
 
   it("refreshes git branches and worktrees when opening the branch menu", async () => {
@@ -2663,7 +2658,7 @@ describe("app-shell verification surfaces", () => {
         ],
       },
     ];
-    const { container } = renderApp();
+    renderApp();
 
     await screen.findByPlaceholderText(defaultComposerPlaceholder);
     await waitFor(() =>
@@ -2676,13 +2671,8 @@ describe("app-shell verification surfaces", () => {
       ).toHaveLength(1),
     );
 
-    const branchDetails = container.querySelector<HTMLDetailsElement>(
-      ".composer-branch-select",
-    );
-    const branchSummary = branchDetails?.querySelector("summary");
-    expect(branchSummary).toBeTruthy();
-
-    await user.click(branchSummary as HTMLElement);
+    const branchTrigger = await screen.findByLabelText("Git branch");
+    await user.click(branchTrigger);
 
     await waitFor(() =>
       expect(
@@ -2694,7 +2684,7 @@ describe("app-shell verification surfaces", () => {
       ).toHaveLength(2),
     );
     expect((await screen.findAllByText("feature/live-worktree")).length).toBeGreaterThan(0);
-    expect(await screen.findByText("agent-worktree")).toBeInTheDocument();
+    expect((await screen.findAllByText("agent-worktree")).length).toBeGreaterThan(0);
   });
 
   it("keeps Shift+Enter in the composer as a newline", async () => {
