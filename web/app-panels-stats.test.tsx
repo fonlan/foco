@@ -213,13 +213,17 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
-    const targetSelect = await screen.findByRole("combobox", {
-      name: "Source Control target",
-    });
-    expect(targetSelect).toBeInTheDocument();
-    await waitFor(() =>
-      expect(targetSelect).toHaveValue(`worktree:${worktreePath}`),
-    );
+    const selectedTarget = (await screen.findAllByText(
+      "foco/agent-worktrees/agent-instance-coordinator",
+    )).find((element) => element.dataset.slot === "select-value");
+    if (!selectedTarget) {
+      throw new Error("Source Control target value is missing");
+    }
+    const targetSelect = selectedTarget.closest("button");
+    if (!targetSelect) {
+      throw new Error("Source Control target trigger is missing");
+    }
+    expect(targetSelect).toHaveAttribute("aria-label", "Source Control target");
     expect(
       screen.queryByRole("heading", {
         name: "foco/agent-worktrees/agent-instance-coordinator",
@@ -228,8 +232,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.queryByRole("heading", { name: "Workspace changes" }),
     ).toBeNull();
+    await userEvent.click(targetSelect);
     expect(
-      within(targetSelect).getByRole("option", {
+      await screen.findByRole("option", {
         name: "foco/agent-worktrees/agent-instance-coordinator",
       }),
     ).toBeInTheDocument();
@@ -315,24 +320,33 @@ describe("app-panels-stats verification surfaces", () => {
     renderApp();
 
     await userEvent.click(await screen.findByRole("tab", { name: "Git" }));
-    const targetSelect = await screen.findByRole("combobox", {
-      name: "Source Control target",
-    });
-    await waitFor(() =>
-      expect(targetSelect).toHaveValue(`worktree:${firstWorktreePath}`),
-    );
+    const selectedTarget = (await screen.findAllByText(
+      "foco/agent-worktrees/agent-instance-coordinator",
+    )).find((element) => element.dataset.slot === "select-value");
+    if (!selectedTarget) {
+      throw new Error("Source Control target value is missing");
+    }
+    const targetSelect = selectedTarget.closest("button");
+    if (!targetSelect) {
+      throw new Error("Source Control target trigger is missing");
+    }
+    expect(targetSelect).toHaveAttribute("aria-label", "Source Control target");
     expect(
       screen.queryByRole("heading", {
         name: "foco/agent-worktrees/agent-instance-coordinator",
       }),
     ).toBeNull();
-    await userEvent.selectOptions(
-      targetSelect,
-      `worktree:${secondWorktreePath}`,
+    await userEvent.click(targetSelect);
+    await userEvent.click(
+      await screen.findByRole("option", {
+        name: "foco/agent-worktrees/agent-instance-review",
+      }),
     );
 
     await screen.findByText("review.md");
-    expect(targetSelect).toHaveValue(`worktree:${secondWorktreePath}`);
+    expect(targetSelect).toHaveTextContent(
+      "foco/agent-worktrees/agent-instance-review",
+    );
     expect(
       fetchCallUrls().some(
         (url) =>
@@ -1303,7 +1317,13 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     // Provider is derived from the selected model's active route.
     expect(screen.queryByLabelText("Provider")).toBeNull();
-    await user.selectOptions(screen.getByLabelText("Thinking level"), "high");
+    expect(
+      screen.getByRole("button", {
+        name: /Model default.*Thinking level/i,
+      }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Thinking level/ }));
+    await user.click(screen.getByRole("option", { name: /high/i }));
     await user.click(screen.getByRole("button", { name: "Retry" }));
 
     await waitFor(() => {
@@ -2140,9 +2160,14 @@ describe("app-panels-stats verification surfaces", () => {
       name: "Retry Merge",
     });
     expect(retryButton).toHaveAttribute(
-      "title",
-      "Clean the shared workspace, then retry merge",
+      "aria-describedby",
+      "plan-merge-retry-hint-plan-merge-blocked",
     );
+    expect(
+      within(planCard as HTMLElement).getByText(
+        "Clean the shared workspace, then retry merge",
+      ),
+    ).toHaveClass("sr-only");
     expect(
       within(planCard as HTMLElement).getByText(blockedMessage),
     ).toBeInTheDocument();
@@ -2159,9 +2184,12 @@ describe("app-panels-stats verification surfaces", () => {
       );
     });
     expect(await screen.findByText("1234567")).toHaveAttribute(
-      "title",
-      "Merged into shared workspace",
+      "aria-describedby",
+      "plan-merge-status-plan-merge-blocked",
     );
+    expect(
+      within(planCard as HTMLElement).getByText("Merged into shared workspace"),
+    ).toHaveClass("sr-only");
     expect(
       screen.queryByRole("button", { name: "Retry Merge" }),
     ).not.toBeInTheDocument();
@@ -2316,9 +2344,12 @@ describe("app-panels-stats verification surfaces", () => {
       name: "Retry Merge",
     });
     expect(retryButton).toHaveAttribute(
-      "title",
-      "Retry merging into the shared workspace",
+      "aria-describedby",
+      "plan-merge-retry-hint-plan-llm-merge-fail",
     );
+    expect(
+      within(card).getByText("Retry merging into the shared workspace"),
+    ).toHaveClass("sr-only");
     expect(within(card).getByText(mergeError)).toBeInTheDocument();
     expect(within(card).getByText("Completed")).toBeInTheDocument();
     expect(
@@ -2631,17 +2662,19 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     const mergedCommitBadge = screen.getByText("fedcba9");
     expect(mergedCommitBadge).toHaveAttribute(
-      "title",
-      "Merged into shared workspace",
+      "aria-describedby",
+      "plan-merge-status-plan-merged",
     );
-    expect(screen.queryByText("Merged")).not.toBeInTheDocument();
+    expect(screen.getByText("Merged into shared workspace")).toHaveClass(
+      "sr-only",
+    );
 
     const phaseCommitOnlyPlanCard = screen
       .getByText("Implemented plan with phase commit only")
       .closest("article");
     expect(phaseCommitOnlyPlanCard).not.toBeNull();
     expect(
-      within(phaseCommitOnlyPlanCard as HTMLElement).queryByTitle(
+      within(phaseCommitOnlyPlanCard as HTMLElement).queryByText(
         "Merged into shared workspace",
       ),
     ).not.toBeInTheDocument();

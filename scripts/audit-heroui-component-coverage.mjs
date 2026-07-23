@@ -17,7 +17,34 @@ const workspaceRoot = basename(process.cwd()) === "web"
 const root = resolve(workspaceRoot, "web");
 const productionDirectoryNames = new Set(["__tests__", "dist", "node_modules", "test-utils"]);
 
-const targetFor = (kind, inputType) => {
+const targetFor = (kind, inputType, exceptionKind) => {
+  if (exceptionKind === "native-form-submit") {
+    return {
+      target: "native form submit (written exception)",
+      status: "exception",
+      reason: "Modifier-aware queueing must preserve the native form submit event and submitter.",
+      owner: "The button remains labelled and keeps the existing Ctrl queue and normal submit behavior.",
+      removal: "Remove when HeroUI Button can preserve the same native submitter and modifier semantics.",
+    };
+  }
+  if (exceptionKind === "native-plan-drag") {
+    return {
+      target: "native plan drag handle (written exception)",
+      status: "exception",
+      reason: "Plan ordering depends on native draggable and DragEvent dataTransfer semantics.",
+      owner: "The handle remains labelled and is only used for pointer drag/reorder; selection and actions use HeroUI controls.",
+      removal: "Remove when HeroUI Button exposes draggable and typed drag handlers without changing the reorder flow.",
+    };
+  }
+  if (exceptionKind === "native-chat-tab") {
+    return {
+      target: "native composite chat tab (written exception)",
+      status: "exception",
+      reason: "The tab must retain its established tab role, title, custom scroll behavior, context menu, and a separate close action.",
+      owner: "The selectable tab remains keyboard-addressable; adjacent scrolling and close controls use HeroUI Button.",
+      removal: "Remove when HeroUI Tabs supports this composite closable-tab anatomy without nested interactive controls.",
+    };
+  }
   if (kind === "button") return { target: "Button", status: "migrate" };
   if (kind === "textarea") return { target: "TextArea", status: "migrate" };
   if (kind === "select") return { target: "Select + ListBox", status: "migrate" };
@@ -81,6 +108,7 @@ for (const file of await filesIn(root)) {
     if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
       const element = node.tagName.getText(sourceFile);
       const inputType = element === "input" ? attributeValue(node.attributes, "type")?.toLowerCase() : undefined;
+      const exceptionKind = attributeValue(node.attributes, "data-heroui-exception");
       const role = attributeValue(node.attributes, "role");
       const kind = ["button", "input", "select", "textarea", "dialog"].includes(element)
         ? element
@@ -95,7 +123,7 @@ for (const file of await filesIn(root)) {
           line,
           kind,
           ...(kind === "input" ? { inputType: inputType ?? "text" } : {}),
-          ...targetFor(kind, inputType),
+          ...targetFor(kind, inputType, exceptionKind),
         });
       }
     }

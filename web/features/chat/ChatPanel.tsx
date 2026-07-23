@@ -67,7 +67,17 @@ import type {
 } from "../../api/types";
 import { CHAT_BOTTOM_LOCK_THRESHOLD_PX } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
-import { Chip, Label, ListBox, Select } from "../../shared/ui";
+import {
+  Button,
+  Chip,
+  Description,
+  Label,
+  ListBox,
+  Modal,
+  Select,
+  TextArea,
+  TextField,
+} from "../../shared/ui";
 import { forwardWheelAtVerticalBoundary } from "../../shared/scroll-forwarding";
 import { thinkingLevelOptionsForModel } from "../../shared/thinking-levels";
 import { selectedSkillPrefix, toolDisplayName } from "./chat-helpers";
@@ -845,9 +855,7 @@ function ChatPanelComponent({
     return event.ctrlKey || isCtrlKeyPressed;
   }
 
-  function handleRunningRunButtonClick(
-    event: ReactMouseEvent<HTMLButtonElement>,
-  ) {
+  function handleRunningRunButtonClick(event: { ctrlKey: boolean }) {
     if (!runningButtonSendsMessage) {
       onCancelRun();
       return;
@@ -1033,10 +1041,10 @@ function ChatPanelComponent({
             <>
               {hasMoreMessagesBefore || isLoadingMoreMessages ? (
                 <div className="flex justify-center">
-                  <button
+                  <Button
                     className="chat-toolbar-button inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] px-3 py-1.5 text-xs font-semibold text-[var(--muted)]"
-                    disabled={isLoadingMoreMessages}
-                    onClick={requestMoreMessages}
+                    isDisabled={isLoadingMoreMessages}
+                    onPress={requestMoreMessages}
                     type="button"
                   >
                     {isLoadingMoreMessages ? (
@@ -1052,7 +1060,7 @@ function ChatPanelComponent({
                         ? t("Loading…")
                         : t("Load earlier messages")}
                     </span>
-                  </button>
+                  </Button>
                 </div>
               ) : null}
               {messages.map((message) => (
@@ -1149,17 +1157,16 @@ function ChatPanelComponent({
                         key={skill.key}
                       >
                         <span className="max-w-44 truncate">{skill.name}</span>
-                        <button
+                        <Button
                           aria-label={t("Remove skill {name}", {
                             name: skill.name,
                           })}
                           className="inline-flex size-4 items-center justify-center rounded-full text-[var(--accent-soft-foreground)] hover:bg-[var(--accent-soft)]"
-                          onClick={() => onRemoveSkill(skill.key)}
-                          title={t("Remove skill")}
+                          onPress={() => onRemoveSkill(skill.key)}
                           type="button"
                         >
                           <X aria-hidden="true" className="size-3" />
-                        </button>
+                        </Button>
                       </span>
                     ))}
                   </div>
@@ -1176,36 +1183,39 @@ function ChatPanelComponent({
                     ))}
                   </div>
                 ) : null}
-                <textarea
-                  className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-[var(--foreground)] outline-none placeholder:text-[var(--muted)]"
-                  name="message"
-                  onChange={(event) => onDraftMessageChange(event.target.value)}
-                  onKeyDown={(
-                    event: ReactKeyboardEvent<HTMLTextAreaElement>,
-                  ) => {
-                    if (
-                      event.key !== "Enter" ||
-                      event.shiftKey ||
-                      event.nativeEvent.isComposing
-                    ) {
-                      return;
-                    }
+                <TextField aria-label={t("Message")} className="contents">
+                  <TextArea
+                    className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-[var(--foreground)] outline-none placeholder:text-[var(--muted)]"
+                    name="message"
+                    onChange={(event) => onDraftMessageChange(event.target.value)}
+                    // IME composition and modifier-aware queueing require the native keyboard event.
+                    onKeyDown={(
+                      event: ReactKeyboardEvent<HTMLTextAreaElement>,
+                    ) => {
+                      if (
+                        event.key !== "Enter" ||
+                        event.shiftKey ||
+                        event.nativeEvent.isComposing
+                      ) {
+                        return;
+                      }
 
-                    event.preventDefault();
-                    if (isQueueModifierActive(event)) {
-                      onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
-                        schedule: true,
-                      });
-                      return;
-                    }
+                      event.preventDefault();
+                      if (isQueueModifierActive(event)) {
+                        onSubmit(event as unknown as FormEvent<HTMLFormElement>, {
+                          schedule: true,
+                        });
+                        return;
+                      }
 
-                    event.currentTarget.form?.requestSubmit();
-                  }}
-                  onPaste={handlePaste}
-                  placeholder={composerPlaceholder}
-                  ref={messageTextareaRef}
-                  value={draftMessage}
-                />
+                      event.currentTarget.form?.requestSubmit();
+                    }}
+                    onPaste={handlePaste}
+                    placeholder={composerPlaceholder}
+                    ref={messageTextareaRef}
+                    value={draftMessage}
+                  />
+                </TextField>
                 {skillQuery !== null ? (
                   <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
                     <div className="panel-scroll max-h-64 overflow-y-auto py-1">
@@ -1230,37 +1240,50 @@ function ChatPanelComponent({
                               })}
                             </div>
                           ) : null}
-                          {visibleSkills.map((skill) => (
-                          <button
-                            aria-label={t("Select skill {name}", {
-                              name: skill.name,
-                            })}
-                            className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                            disabled={!skill.enabled}
-                            key={skill.key}
-                            onClick={() => handleSkillSelect(skill)}
-                            title={
-                              skill.enabled
-                                ? skill.description
-                                : t("Skill is disabled")
-                            }
-                            type="button"
+                          <ListBox
+                            aria-label={t("Matching skills")}
+                            disabledKeys={visibleSkills
+                              .filter((skill) => !skill.enabled)
+                              .map((skill) => skill.key)}
+                            onAction={(key) => {
+                              const skill = visibleSkills.find(
+                                (candidate) => candidate.key === key,
+                              );
+                              if (skill) {
+                                handleSkillSelect(skill);
+                              }
+                            }}
                           >
-                            <span className="min-w-0">
-                              <span className="block truncate text-sm font-semibold text-[var(--foreground)]">
-                                {skill.name}
-                              </span>
-                              <span className="mt-0.5 block truncate text-xs text-[var(--muted)]">
-                                {skill.description}
-                              </span>
-                            </span>
-                            <span className="self-center rounded-md border border-[var(--border)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)]">
-                              {skill.enabled
-                                ? skillScopeLabel(skill, t)
-                                : t("disabled")}
-                            </span>
-                          </button>
-                          ))}
+                            {visibleSkills.map((skill) => (
+                              <ListBox.Item
+                                aria-label={t("Select skill {name}", {
+                                  name: skill.name,
+                                })}
+                                className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                                id={skill.key}
+                                key={skill.key}
+                                textValue={skill.name}
+                              >
+                                <div className="min-w-0">
+                                  <Label className="block truncate text-sm font-semibold text-[var(--foreground)]">
+                                    {skill.name}
+                                  </Label>
+                                  <Description
+                                    className="mt-0.5 block truncate text-xs text-[var(--muted)]"
+                                  >
+                                    {skill.enabled
+                                      ? skill.description
+                                      : t("Skill is disabled")}
+                                  </Description>
+                                </div>
+                                <span className="self-center rounded-md border border-[var(--border)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)]">
+                                  {skill.enabled
+                                    ? skillScopeLabel(skill, t)
+                                    : t("disabled")}
+                                </span>
+                              </ListBox.Item>
+                            ))}
+                          </ListBox>
                         </>
                       ) : (
                         <div className="px-3 py-3 text-sm text-[var(--muted)]">
@@ -1279,12 +1302,11 @@ function ChatPanelComponent({
                     canRetryRun ? "message-composer-actions-with-retry" : ""
                   }`}
                 >
-                  <button
+                  <Button
                     aria-label={t("Add attachment")}
                     className="composer-tool-button"
-                    disabled={isSelectingAttachments}
-                    onClick={onSelectAttachments}
-                    title={t("Add attachment")}
+                    isDisabled={isSelectingAttachments}
+                    onPress={onSelectAttachments}
                     type="button"
                   >
                     {isSelectingAttachments ? (
@@ -1295,15 +1317,14 @@ function ChatPanelComponent({
                     ) : (
                       <Plus aria-hidden="true" className="size-4" />
                     )}
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     aria-label={t("Plan mode")}
                     aria-pressed={isPlanModeEnabled}
                     className={`composer-team-toggle ${
                       isPlanModeEnabled ? "composer-team-toggle-enabled" : ""
                     }`}
-                    onClick={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
-                    title={t("Plan mode")}
+                    onPress={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
                     type="button"
                   >
                     <ListChecks
@@ -1313,7 +1334,7 @@ function ChatPanelComponent({
                     <span className="composer-team-toggle-label">
                       {t("Plan")}
                     </span>
-                  </button>
+                  </Button>
                   <ComposerSelectMenu
                     ariaLabel={t("Model")}
                     className="composer-model-select max-w-full"
@@ -1335,7 +1356,7 @@ function ChatPanelComponent({
                     selectedValue={selectedThinkingLevel}
                   />
                   {supportsFast ? (
-                    <button
+                    <Button
                       aria-label={t("Fast mode")}
                       aria-pressed={selectedLatencyMode === "fast"}
                       className={`composer-fast-toggle ${
@@ -1343,12 +1364,7 @@ function ChatPanelComponent({
                           ? "composer-fast-toggle-enabled"
                           : ""
                       }`}
-                      onClick={handleFastToggle}
-                      title={
-                        selectedLatencyMode === "fast"
-                          ? t("Fast mode enabled")
-                          : t("Fast mode")
-                      }
+                      onPress={handleFastToggle}
                       type="button"
                     >
                       <Zap aria-hidden="true" className="size-3.5 shrink-0" />
@@ -1360,18 +1376,17 @@ function ChatPanelComponent({
                           ? t("enabled")
                           : t("disabled")}
                       </span>
-                    </button>
+                    </Button>
                   ) : null}
                   {canRetryRun ? (
-                    <button
+                    <Button
                       aria-label={t("Retry last run")}
                       className="composer-retry-button composer-run-button"
-                      onClick={onRetryRun}
-                      title={t("Retry last run")}
+                      onPress={onRetryRun}
                       type="button"
                     >
                       <RefreshCw aria-hidden="true" className="size-4" />
-                    </button>
+                    </Button>
                   ) : null}
                   <span
                     aria-hidden="true"
@@ -1382,21 +1397,20 @@ function ChatPanelComponent({
                     usage={contextUsage}
                   />
                   {isSendingMessage ? (
-                    <button
+                    <Button
                       aria-label={runningButtonLabel}
                       className={
                         runningButtonSendsMessage
                           ? "composer-run-button"
                           : "composer-run-button composer-run-button-danger"
                       }
-                      disabled={
+                      isDisabled={
                         runningButtonSendsMessage &&
                         (!canGuideActiveRun ||
                           !selectedModelId ||
                           Boolean(draftUnsupportedAttachmentMessage))
                       }
-                      onClick={handleRunningRunButtonClick}
-                      title={runningButtonTitle}
+                      onPress={handleRunningRunButtonClick}
                       type="button"
                     >
                       {runningButtonSendsMessage ? (
@@ -1404,7 +1418,7 @@ function ChatPanelComponent({
                       ) : (
                         <X aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </Button>
                   ) : (
                     <span
                       className="composer-send-button-shell"
@@ -1413,6 +1427,7 @@ function ChatPanelComponent({
                       onMouseEnter={() => setIsSendButtonTooltipOpen(true)}
                       onMouseLeave={() => setIsSendButtonTooltipOpen(false)}
                     >
+                      {/* Modifier-aware native form submission needs the DOM button event. */}
                       <button
                         aria-describedby={
                           showSendButtonTooltip
@@ -1421,11 +1436,13 @@ function ChatPanelComponent({
                         }
                         aria-label={t("Send message")}
                         className="composer-run-button"
+                        data-heroui-exception="native-form-submit"
                         disabled={
                           (!draftMessage.trim() && !draftAttachments.length) ||
                           !selectedModelId ||
                           Boolean(draftUnsupportedAttachmentMessage)
                         }
+                        /* Queue modifiers are pointer-specific; normal submit remains native form behavior. */
                         onClick={(event) => {
                           if (isQueueModifierActive(event)) {
                             event.preventDefault();
@@ -1462,49 +1479,42 @@ function ChatPanelComponent({
               </div>
             </form>
             {isFastConfirmationOpen ? (
-              <div
-                aria-describedby="fast-mode-confirmation-description"
-                aria-labelledby="fast-mode-confirmation-title"
-                aria-modal="true"
-                className="fast-mode-confirmation-backdrop"
-                onMouseDown={(event) => {
-                  if (event.target === event.currentTarget) {
-                    setIsFastConfirmationOpen(false);
-                  }
-                }}
-                role="dialog"
-              >
-                <div className="fast-mode-confirmation-card">
-                  <div className="fast-mode-confirmation-icon">
-                    <Zap aria-hidden="true" className="size-4" />
-                  </div>
-                  <h2 id="fast-mode-confirmation-title">
-                    {t("Enable Fast mode?")}
-                  </h2>
-                  <p id="fast-mode-confirmation-description">
-                    {t(
-                      "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.",
-                    )}
-                  </p>
-                  <div className="fast-mode-confirmation-actions">
-                    <button
-                      className="composer-dialog-button"
-                      onClick={() => setIsFastConfirmationOpen(false)}
-                      type="button"
+              <Modal.Backdrop
+              isDismissable
+              isOpen={isFastConfirmationOpen}
+              onOpenChange={(open) => !open && setIsFastConfirmationOpen(false)}
+            >
+              <Modal.Container placement="center" size="sm">
+                <Modal.Dialog aria-label={t("Enable Fast mode?")}>
+                  <Modal.Header>
+                    <Modal.Icon className="bg-warning-soft text-warning-soft-foreground">
+                      <Zap aria-hidden="true" className="size-4" />
+                    </Modal.Icon>
+                    <Modal.Heading>{t("Enable Fast mode?")}</Modal.Heading>
+                  </Modal.Header>
+                  <Modal.Body>
+                    <p>
+                      {t(
+                        "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.",
+                      )}
+                    </p>
+                  </Modal.Body>
+                  <Modal.Footer>
+                    <Button
+                      slot="close"
+                      variant="tertiary"
+                      onPress={() => setIsFastConfirmationOpen(false)}
                     >
                       {t("Cancel")}
-                    </button>
-                    <button
-                      className="composer-dialog-button composer-dialog-button-primary"
-                      onClick={confirmFastMode}
-                      type="button"
-                    >
+                    </Button>
+                    <Button onPress={confirmFastMode}>
                       <Zap aria-hidden="true" className="size-3.5" />
                       {t("Enable Fast")}
-                    </button>
-                  </div>
-                </div>
-              </div>
+                    </Button>
+                  </Modal.Footer>
+                </Modal.Dialog>
+              </Modal.Container>
+              </Modal.Backdrop>
             ) : null}
           </div>
         </>
@@ -1699,44 +1709,40 @@ const MessageRow = memo(function MessageRow({
               </span>
               <span className="message-action-group">
                 {canEdit ? (
-                  <button
+                  <Button
                     aria-label={t("Edit message")}
                     className="message-action-menu"
-                    onClick={() => onBeginEdit(message)}
-                    title={t("Edit message")}
+                    onPress={() => onBeginEdit(message)}
                     type="button"
                   >
                     <Pencil aria-hidden="true" className="size-3.5" />
-                  </button>
+                  </Button>
                 ) : null}
                 {canManageQueuedMessage ? (
                   <>
-                    <button
+                    <Button
                       aria-label={t("Convert queued message to guidance")}
                       className="message-action-menu"
-                      onClick={() => onGuideQueuedMessage(message.id)}
-                      title={t("Convert queued message to guidance")}
+                      onPress={() => onGuideQueuedMessage(message.id)}
                       type="button"
                     >
                       <ArrowUp aria-hidden="true" className="size-3.5" />
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       aria-label={t("Withdraw queued message")}
                       className="message-action-menu"
-                      onClick={() => onWithdrawQueuedMessage(message.id)}
-                      title={t("Withdraw queued message")}
+                      onPress={() => onWithdrawQueuedMessage(message.id)}
                       type="button"
                     >
                       <X aria-hidden="true" className="size-3.5" />
-                    </button>
+                    </Button>
                   </>
                 ) : null}
-                <button
+                <Button
                   aria-label={copyLabel}
                   className="message-action-menu"
-                  disabled={!copyText}
-                  onClick={() => onCopyMessage(message.id, copyText)}
-                  title={copyLabel}
+                  isDisabled={!copyText}
+                  onPress={() => onCopyMessage(message.id, copyText)}
                   type="button"
                 >
                   {isCopied ? (
@@ -1744,7 +1750,7 @@ const MessageRow = memo(function MessageRow({
                   ) : (
                     <Copy aria-hidden="true" className="size-3.5" />
                   )}
-                </button>
+                </Button>
               </span>
             </div>
             {isEditing ? (
@@ -1754,48 +1760,60 @@ const MessageRow = memo(function MessageRow({
                     {editingSkillIds.map((skillId) => {
                       const skill = skills.find((item) => item.key === skillId);
                       return (
-                        <button
+                        <Button
+                          aria-label={t("Remove skill")}
                           className="rounded-full border border-[color-mix(in_oklab,var(--accent)_20%,transparent)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-2 py-0.5 text-xs text-[var(--accent-soft-foreground)]"
                           key={skillId}
-                          onClick={() =>
+                          onPress={() =>
                             onEditingSkillIdsChange(
                               editingSkillIds.filter((id) => id !== skillId),
                             )
                           }
-                          title={t("Remove skill")}
                           type="button"
                         >
                           {skill?.name ?? skillId} ×
-                        </button>
+                        </Button>
                       );
                     })}
                   </div>
                 ) : null}
                 <div className="flex flex-wrap items-center gap-1.5">
-                  <select
+                  <Select
                     aria-label={t("Add skill")}
-                    className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-2 py-1 text-xs"
-                    onChange={(event) => {
-                      const skillId = event.target.value;
+                    className="min-w-32"
+                    placeholder={t("Add skill")}
+                    selectedKey={null}
+                    onSelectionChange={(key) => {
+                      const skillId = String(key ?? "");
                       if (skillId && !editingSkillIds.includes(skillId)) {
                         onEditingSkillIdsChange([...editingSkillIds, skillId]);
                       }
-                      event.target.value = "";
                     }}
-                    value=""
                   >
-                    <option value="">{t("Add skill")}</option>
-                    {skills
-                      .filter((skill) => !editingSkillIds.includes(skill.key))
-                      .map((skill) => (
-                        <option key={skill.key} value={skill.key}>
-                          {skill.name}
-                        </option>
-                      ))}
-                  </select>
-                  <button
+                    <Select.Trigger className="h-7 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-2 text-xs">
+                      <Select.Value />
+                      <Select.Indicator />
+                    </Select.Trigger>
+                    <Select.Popover placement="bottom start">
+                      <ListBox>
+                        {skills
+                          .filter((skill) => !editingSkillIds.includes(skill.key))
+                          .map((skill) => (
+                            <ListBox.Item
+                              id={skill.key}
+                              key={skill.key}
+                              textValue={skill.name}
+                            >
+                              {skill.name}
+                              <ListBox.ItemIndicator />
+                            </ListBox.Item>
+                          ))}
+                      </ListBox>
+                    </Select.Popover>
+                  </Select>
+                  <Button
                     className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-2 py-1 text-xs"
-                    onClick={() =>
+                    onPress={() =>
                       onSelectEditAttachments((attachments) =>
                         onEditingAttachmentsChange([
                           ...editingAttachments,
@@ -1806,65 +1824,64 @@ const MessageRow = memo(function MessageRow({
                     type="button"
                   >
                     {t("Add attachment")}
-                  </button>
+                  </Button>
                 </div>
                 {editingAttachments.length ? (
                   <div className="flex flex-wrap gap-1.5">
                     {editingAttachments.map((attachment) => (
-                      <button
+                      <Button
+                        aria-label={t("Remove attachment {name}", {
+                          name: attachment.name,
+                        })}
                         className="rounded-full border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-2 py-0.5 text-xs"
                         key={attachment.id}
-                        onClick={() =>
+                        onPress={() =>
                           onEditingAttachmentsChange(
                             editingAttachments.filter(
                               (item) => item.id !== attachment.id,
                             ),
                           )
                         }
-                        title={t("Remove attachment {name}", {
-                          name: attachment.name,
-                        })}
                         type="button"
                       >
                         {attachment.name} ×
-                      </button>
+                      </Button>
                     ))}
                   </div>
                 ) : null}
-                <textarea
-                  aria-label={t("Edit message")}
-                  autoFocus
-                  className="min-h-24 w-full resize-y rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-[var(--accent)]"
-                  disabled={isSavingEdit}
-                  onChange={(event) => onEditingTextChange(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      onCancelEdit();
-                    } else if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      onSaveEdit(message);
-                    }
-                  }}
-                  value={editingText}
-                />
+                <TextField aria-label={t("Edit message")} className="contents">
+                  <TextArea
+                    autoFocus
+                    className="min-h-24 w-full resize-y rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-[var(--accent)]"
+                    disabled={isSavingEdit}
+                    onChange={(event) => onEditingTextChange(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape") {
+                        event.preventDefault();
+                        onCancelEdit();
+                      } else if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        onSaveEdit(message);
+                      }
+                    }}
+                    value={editingText}
+                  />
+                </TextField>
                 <div className="flex justify-end gap-1.5">
-                  <button
+                  <Button
                     aria-label={t("Cancel editing")}
                     className="message-action-menu"
-                    disabled={isSavingEdit}
-                    onClick={onCancelEdit}
-                    title={t("Cancel editing")}
+                    isDisabled={isSavingEdit}
+                    onPress={onCancelEdit}
                     type="button"
                   >
                     <X aria-hidden="true" className="size-4" />
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     aria-label={t("Save and regenerate")}
                     className="message-action-menu"
-                    disabled={isSavingEdit || !editingText.trim()}
-                    onClick={() => onSaveEdit(message)}
-                    title={t("Save and regenerate")}
+                    isDisabled={isSavingEdit || !editingText.trim()}
+                    onPress={() => onSaveEdit(message)}
                     type="button"
                   >
                     {isSavingEdit ? (
@@ -1875,7 +1892,7 @@ const MessageRow = memo(function MessageRow({
                     ) : (
                       <Send aria-hidden="true" className="size-4" />
                     )}
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : null}
@@ -2079,12 +2096,11 @@ function ReasoningBlock({
 
   return (
     <div className="reasoning-block min-w-0 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] p-2 text-[var(--muted)]">
-      <button
+      <Button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
         className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-[var(--muted)] hover:text-[var(--foreground)]"
-        onClick={() => setIsExpanded((current) => !current)}
-        title={toggleLabel}
+        onPress={() => setIsExpanded((current) => !current)}
         type="button"
       >
         {isExpanded ? (
@@ -2115,7 +2131,7 @@ function ReasoningBlock({
             {durationLabel}
           </span>
         ) : null}
-      </button>
+      </Button>
       {isExpanded ? (
         <div className="mt-2 border-l border-[var(--border)] pl-3 text-[var(--muted)]">
           <MarkdownContent
@@ -2258,15 +2274,14 @@ function ComposerAttachmentChip({
         <FileText aria-hidden="true" className="size-4 shrink-0" />
       )}
       <span className="min-w-0 truncate">{attachment.name}</span>
-      <button
+      <Button
         aria-label={t("Remove attachment {name}", { name: attachment.name })}
         className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--default)] hover:text-[var(--foreground)]"
-        onClick={onRemove}
-        title={t("Remove attachment {name}", { name: attachment.name })}
+        onPress={onRemove}
         type="button"
       >
         <X aria-hidden="true" className="size-3" />
-      </button>
+      </Button>
     </span>
   );
 }
@@ -2337,15 +2352,14 @@ function ChatReplyMetricsLine({
         ))}
       </div>
       {onOpenApiRequests ? (
-        <button
+        <Button
           aria-label={t("View API requests for this reply")}
           className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-          onClick={onOpenApiRequests}
-          title={t("View API requests for this reply")}
+          onPress={onOpenApiRequests}
           type="button"
         >
           <Server aria-hidden="true" className="size-3.5" />
-        </button>
+        </Button>
       ) : null}
     </div>
   );
@@ -3609,16 +3623,16 @@ function ToolCallBlock({
                 </span>
               </span>
             </div>
-            <button
+            <Button
               aria-label={toggleLabel}
               className="shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[11px] font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-              onClick={() =>
+              onPress={() =>
                 setViewMode(viewMode === "compact" ? "raw" : "compact")
               }
               type="button"
             >
               {toggleLabel}
-            </button>
+            </Button>
           </div>
           {viewMode === "compact" ? (
             <CompactToolCallView

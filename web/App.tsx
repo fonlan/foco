@@ -225,7 +225,7 @@ import {
   type FilePickerSelection,
 } from "./features/file-picker/FilePickerDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
-import { Button, ContextMenu, Input, Label, Modal, Spinner, TextArea, TextField } from "./shared/ui";
+import { Button, ContextMenu, Input, Label, Modal, Radio, RadioGroup, Spinner, TextArea, TextField } from "./shared/ui";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
 import { ModelRoutingPanel } from "./features/models/ModelRoutingPanel";
 import {
@@ -13440,15 +13440,14 @@ export function App() {
           >
             <CircleAlert aria-hidden="true" className="app-error-toast-icon" />
             <div className="app-error-toast-message">{error}</div>
-            <button
+            <Button
               aria-label={t("Close error message")}
               className="app-error-toast-close"
-              onClick={() => setError(null)}
-              title={t("Close error message")}
+              onPress={() => setError(null)}
               type="button"
             >
               <X aria-hidden="true" className="size-4" />
-            </button>
+            </Button>
           </section>
         ) : null}
         {updateInstallNotice ? (
@@ -13462,15 +13461,14 @@ export function App() {
               className="app-status-toast-icon"
             />
             <div className="app-error-toast-message">{updateInstallNotice}</div>
-            <button
+            <Button
               aria-label={t("Dismiss update message")}
               className="app-status-toast-close"
-              onClick={() => setUpdateInstallNotice(null)}
-              title={t("Close")}
+              onPress={() => setUpdateInstallNotice(null)}
               type="button"
             >
               <X aria-hidden="true" className="size-4" />
-            </button>
+            </Button>
           </section>
         ) : null}
         {isGlobalView ? (
@@ -13562,10 +13560,10 @@ export function App() {
             }
           >
             {isMobileWorkspaceOpen ? (
-              <button
+              <Button
                 aria-label={t("Close")}
                 className="mobile-sidebar-backdrop"
-                onClick={() => setIsMobileWorkspaceOpen(false)}
+                onPress={() => setIsMobileWorkspaceOpen(false)}
                 type="button"
               />
             ) : null}
@@ -13650,66 +13648,63 @@ export function App() {
                     </span>
                   </div>
                   <div className="flex shrink-0 items-center gap-1.5">
-                    <button
+                    <Button
                       aria-label={t("Refresh workspaces")}
                       className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
-                      disabled={isLoading}
-                      onClick={() => void refreshWorkspaces()}
-                      title={t("Refresh workspaces")}
+                      isDisabled={isLoading}
+                      onPress={() => void refreshWorkspaces()}
                       type="button"
                     >
                       <RefreshCw
                         aria-hidden="true"
                         className={`size-3.5 ${isLoading ? "animate-spin" : ""}`}
                       />
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
                       className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-                      onClick={() =>
+                      onPress={() =>
                         setWorkspaceChatSearchOpen((current) => !current)
                       }
-                      title={t("Search chats")}
                       type="button"
                     >
                       <Search aria-hidden="true" className="size-3.5" />
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       aria-label={t("Close")}
                       className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                      onClick={() => setIsMobileWorkspaceOpen(false)}
-                      title={t("Close")}
+                      onPress={() => setIsMobileWorkspaceOpen(false)}
                       type="button"
                     >
                       <X aria-hidden="true" className="size-4" />
-                    </button>
+                    </Button>
                   </div>
                 </div>
 
                 {workspaceChatSearchOpen ? (
                   <div className="border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
                     <div className="relative">
-                      <input
-                        aria-label={t("Search chats")}
-                        className="workspace-chat-search-input h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 pr-8 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-                        onChange={(event) =>
-                          setWorkspaceChatSearchQuery(event.target.value)
-                        }
-                        placeholder={t("Search chats placeholder")}
-                        type="search"
-                        value={workspaceChatSearchQuery}
-                      />
+                      <TextField aria-label={t("Search chats")} className="contents">
+                        <Input
+                          className="workspace-chat-search-input h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 pr-8 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+                          onChange={(event) =>
+                            setWorkspaceChatSearchQuery(event.target.value)
+                          }
+                          placeholder={t("Search chats placeholder")}
+                          type="search"
+                          value={workspaceChatSearchQuery}
+                        />
+                      </TextField>
                       {workspaceChatSearchQuery.length ? (
-                        <button
+                        <Button
                           aria-label={t("Clear search")}
                           className="absolute right-2 top-1/2 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--muted)]"
-                          onClick={() => setWorkspaceChatSearchQuery("")}
-                          title={t("Clear search")}
+                          onPress={() => setWorkspaceChatSearchQuery("")}
                           type="button"
                         >
                           <X aria-hidden="true" className="size-3.5" />
-                        </button>
+                        </Button>
                       ) : null}
                     </div>
                   </div>
@@ -13769,15 +13764,10 @@ export function App() {
                           onDrop={(event) => void handleWorkspaceDrop(event)}
                         >
                           <div className={workspaceMenuClass(isActive)}>
-                            <button
+                            <Button
                               aria-expanded={isExpanded}
                               className={workspaceItemClass(isActive)}
-                              onClick={() => toggleWorkspace(workspace.id)}
-                              title={
-                                isExpanded
-                                  ? t("Collapse chat history")
-                                  : t("Expand chat history")
-                              }
+                              onPress={() => toggleWorkspace(workspace.id)}
                               type="button"
                             >
                               {isExpanded ? (
@@ -13812,14 +13802,14 @@ export function App() {
                                   {workspace.displayPath}
                                 </span>
                               </span>
-                            </button>
-                            <button
+                            </Button>
+                            <Button
                               aria-label={t("New chat in {name}", {
                                 name: workspace.name,
                               })}
                               className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-[var(--muted)] hover:text-[var(--accent-soft-foreground)]"
-                              disabled={isRemoteWorkspace && !isRemoteReady}
-                              onClick={() => {
+                              isDisabled={isRemoteWorkspace && !isRemoteReady}
+                              onPress={() => {
                                 if (isRemoteWorkspace && !isRemoteReady) {
                                   setError(
                                     t(
@@ -13830,15 +13820,10 @@ export function App() {
                                 }
                                 startNewWorkspaceChat(workspace.id);
                               }}
-                              title={
-                                isRemoteWorkspace && !isRemoteReady
-                                  ? t("Remote workspace is offline")
-                                  : t("New chat")
-                              }
                               type="button"
                             >
                               <Plus aria-hidden="true" className="size-4" />
-                            </button>
+                            </Button>
                           </div>
                           {isRemoteWorkspace && !isRemoteReady ? (
                             <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-[var(--muted)]">
@@ -13847,12 +13832,12 @@ export function App() {
                                   {workspace.lastRemoteError}
                                 </span>
                               ) : null}
-                              <button
+                              <Button
                                 className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-                                disabled={
+                                isDisabled={
                                   retryingRemoteWorkspaceId === workspace.id
                                 }
-                                onClick={() =>
+                                onPress={() =>
                                   void retryRemoteWorkspace(workspace)
                                 }
                                 type="button"
@@ -13869,7 +13854,7 @@ export function App() {
                                   />
                                 )}
                                 {t("Retry")}
-                              </button>
+                              </Button>
                             </div>
                           ) : null}
                           {isExpanded ? (
@@ -13900,12 +13885,13 @@ export function App() {
                                     const chatDiffStats = chat.codeChangeStats;
 
                                     return (
-                                      <button
+                                      <Button
                                         aria-current={
                                           isChatActive ? "page" : undefined
                                         }
                                         className={chatItemClass(isChatActive)}
                                         key={chat.id}
+                                        // Long-press and context-menu state need their pointer handlers below.
                                         onClick={() => {
                                           if (
                                             suppressNextWorkspaceChatClickRef.current
@@ -13942,7 +13928,6 @@ export function App() {
                                         onPointerUp={
                                           cancelWorkspaceChatLongPress
                                         }
-                                        title={chat.title}
                                         type="button"
                                       >
                                         <span
@@ -13992,11 +13977,11 @@ export function App() {
                                             ) : null}
                                           </span>
                                         </span>
-                                      </button>
+                                      </Button>
                                     );
                                   })}
                                   {hiddenChatCount > 0 ? (
-                                    <button
+                                    <Button
                                       aria-label={t(
                                         "Show {count} more chats in {name}",
                                         {
@@ -14005,8 +13990,8 @@ export function App() {
                                         },
                                       )}
                                       className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
-                                      disabled={paging?.isLoading}
-                                      onClick={() =>
+                                      isDisabled={paging?.isLoading}
+                                      onPress={() =>
                                         void showMoreWorkspaceChats(
                                           workspace.id,
                                         )
@@ -14029,7 +14014,7 @@ export function App() {
                                           })}
                                         </span>
                                       </span>
-                                    </button>
+                                    </Button>
                                   ) : null}
                                 </>
                               ) : (
@@ -14902,36 +14887,28 @@ function QuestionDialog({
                     </p>
 
                     {item.options.length ? (
-                      <div className="space-y-2">
-                        {item.options.map((option) => {
-                          const isSelected =
-                            draft.selectedOptionValue === option.value;
-                          return (
-                            <label
-                              className={`flex cursor-pointer gap-3 rounded-lg border px-3 py-2 text-sm transition ${
-                                isSelected
-                                  ? "border-accent bg-accent-soft text-accent-soft-foreground"
-                                  : "border-border bg-background text-foreground hover:border-accent/40 hover:bg-accent-soft/40"
-                              }`}
-                              key={option.value}
-                            >
-                              <input
-                                checked={isSelected}
-                                className="mt-1 size-4"
-                                name={`question-option-${item.id}`}
-                                onChange={() => {
-                                  setDraftAnswers((current) => ({
-                                    ...current,
-                                    [item.id]: {
-                                      manualAnswer:
-                                        current[item.id]?.manualAnswer ?? "",
-                                      selectedOptionValue: option.value,
-                                    },
-                                  }));
-                                  setLocalError(null);
-                                }}
-                                type="radio"
-                              />
+                      <RadioGroup
+                        aria-label={item.question}
+                        className="space-y-2"
+                        name={`question-option-${item.id}`}
+                        value={draft.selectedOptionValue ?? undefined}
+                        onChange={(value) => {
+                          setDraftAnswers((current) => ({
+                            ...current,
+                            [item.id]: {
+                              manualAnswer: current[item.id]?.manualAnswer ?? "",
+                              selectedOptionValue: value,
+                            },
+                          }));
+                          setLocalError(null);
+                        }}
+                      >
+                        {item.options.map((option) => (
+                          <Radio key={option.value} value={option.value}>
+                            <Radio.Content className="flex cursor-pointer gap-3 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground transition hover:border-accent/40 hover:bg-accent-soft/40 data-[selected=true]:border-accent data-[selected=true]:bg-accent-soft data-[selected=true]:text-accent-soft-foreground">
+                              <Radio.Control className="mt-1 size-4 shrink-0">
+                                <Radio.Indicator />
+                              </Radio.Control>
                               <span className="min-w-0">
                                 <span className="block font-semibold">
                                   {option.label}
@@ -14942,10 +14919,10 @@ function QuestionDialog({
                                   </span>
                                 ) : null}
                               </span>
-                            </label>
-                          );
-                        })}
-                      </div>
+                            </Radio.Content>
+                          </Radio>
+                        ))}
+                      </RadioGroup>
                     ) : null}
 
                     {item.allowFreeText ? (
@@ -15298,16 +15275,15 @@ function MainTabBar({
         ref={tabsContainerRef}
       >
         {scrollState.hasOverflow ? (
-          <button
+          <Button
             aria-label={t("Scroll chat tabs left")}
             className="chat-tab-scroll-button"
-            disabled={!scrollState.canScrollLeft}
-            onClick={() => scrollTabs(-1)}
-            title={t("Scroll chat tabs left")}
+            isDisabled={!scrollState.canScrollLeft}
+            onPress={() => scrollTabs(-1)}
             type="button"
           >
             <ChevronLeft aria-hidden="true" className="size-4" />
-          </button>
+          </Button>
         ) : null}
         <div
           aria-label={t("Chat")}
@@ -15365,6 +15341,7 @@ function MainTabBar({
                   <button
                     aria-selected={isActive}
                     className="min-w-0 flex-1 text-left"
+                    data-heroui-exception="native-chat-tab"
                     onClick={() => onSelectTab(tab)}
                     role="tab"
                     title={title}
@@ -15419,15 +15396,14 @@ function MainTabBar({
                     </span>
                   </button>
                   <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
-                    <button
+                    <Button
                       aria-label={t("Close chat tab {title}", { title })}
                       className="inline-flex size-7 items-center justify-center rounded-md text-[var(--muted)] opacity-0 hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
-                      onClick={() => onCloseTab(tab)}
-                      title={t("Close")}
+                      onPress={() => onCloseTab(tab)}
                       type="button"
                     >
                       <X aria-hidden="true" className="size-3.5" />
-                    </button>
+                    </Button>
                   </span>
                 </div>
               );
@@ -15439,16 +15415,15 @@ function MainTabBar({
           )}
         </div>
         {scrollState.hasOverflow ? (
-          <button
+          <Button
             aria-label={t("Scroll chat tabs right")}
             className="chat-tab-scroll-button"
-            disabled={!scrollState.canScrollRight}
-            onClick={() => scrollTabs(1)}
-            title={t("Scroll chat tabs right")}
+            isDisabled={!scrollState.canScrollRight}
+            onPress={() => scrollTabs(1)}
             type="button"
           >
             <ChevronRight aria-hidden="true" className="size-4" />
-          </button>
+          </Button>
         ) : null}
       </div>
       {contextMenuElement && typeof document !== "undefined"
@@ -15511,15 +15486,14 @@ function FocoNavRail({
   return (
     <nav aria-label="Foco" className="foco-nav-rail">
       <div className="foco-nav-rail-main">
-        <button
+        <Button
           aria-label="Foco"
           className="foco-nav-logo-button"
-          onClick={onReturnHome}
-          title="Foco"
+          onPress={onReturnHome}
           type="button"
         >
           <FocoLogoMark />
-        </button>
+        </Button>
         <NavRailButton
           active={activeMode === "chat"}
           icon={Home}
@@ -15589,16 +15563,15 @@ function NavRailButton({
   onClick,
 }: NavRailAction) {
   return (
-    <button
+    <Button
       aria-label={label}
       className={`foco-nav-rail-button ${active ? "foco-nav-rail-button-active" : ""}`}
-      disabled={disabled}
-      onClick={onClick}
-      title={label}
+      isDisabled={disabled}
+      onPress={onClick}
       type="button"
     >
       <Icon aria-hidden="true" className="size-4" />
-    </button>
+    </Button>
   );
 }
 
@@ -16089,27 +16062,29 @@ function LoginView({
             <p className="foco-eyebrow mt-1.5">{t("Password required")}</p>
           </div>
         </div>
-        <label className="mt-5 block">
-          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
+        <TextField
+          className="mt-5 block"
+          value={password}
+          onChange={onPasswordChange}
+        >
+          <Label className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
             {t("Password")}
-          </span>
-          <input
+          </Label>
+          <Input
             autoComplete="current-password"
             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-            onChange={(event) => onPasswordChange(event.target.value)}
             type="password"
-            value={password}
           />
-        </label>
+        </TextField>
         {error ? (
           <div className="mt-4 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
             {error}
           </div>
         ) : null}
-        <button
+        <Button
           aria-label={t("Log in")}
           className="mt-4 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
-          disabled={isLoggingIn || !password.trim()}
+          isDisabled={isLoggingIn || !password.trim()}
           type="submit"
         >
           {isLoggingIn ? (
@@ -16118,7 +16093,7 @@ function LoginView({
             <Lock aria-hidden="true" className="size-4" />
           )}
           {t("Log in")}
-        </button>
+        </Button>
       </form>
     </main>
   );

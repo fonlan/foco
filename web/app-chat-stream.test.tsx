@@ -456,16 +456,16 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+      await screen.findByRole("option", { name: "Select skill gitmemo" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Select skill Current skill" }),
+      screen.getByRole("option", { name: "Select skill Current skill" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Disabled skill" }),
+      screen.queryByRole("option", { name: "Select skill Disabled skill" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Other skill" }),
+      screen.queryByRole("option", { name: "Select skill Other skill" }),
     ).not.toBeInTheDocument();
   });
 
@@ -559,18 +559,18 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
+      await screen.findByRole("option", {
         name: "Select skill Remote workspace skill",
       }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Select skill Remote global skill" }),
+      screen.getByRole("option", { name: "Select skill Remote global skill" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Select skill gitmemo" }),
+      screen.getByRole("option", { name: "Select skill gitmemo" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Host only skill" }),
+      screen.queryByRole("option", { name: "Select skill Host only skill" }),
     ).not.toBeInTheDocument();
   });
 
@@ -604,7 +604,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.type(composer, "/");
     await userEvent.click(
-      await screen.findByRole("button", {
+      await screen.findByRole("option", {
         name: "Select skill Remote workspace skill",
       }),
     );
@@ -671,11 +671,11 @@ describe("app-chat-stream verification surfaces", () => {
       "/",
     );
 
-    const matches = await screen.findAllByRole("button", {
+    const matches = await screen.findAllByRole("option", {
       name: "Select skill gitmemo",
     });
     expect(matches).toHaveLength(1);
-    expect(matches[0]).toHaveAttribute("title", "Remote copy wins.");
+    expect(matches[0]).toHaveAccessibleDescription("Remote copy wins.");
   });
 
   it("does not flash a cached prior workspace skill when switching workspaces", async () => {
@@ -715,7 +715,7 @@ describe("app-chat-stream verification surfaces", () => {
       "/",
     );
     expect(
-      await screen.findByRole("button", { name: "Select skill Current skill" }),
+      await screen.findByRole("option", { name: "Select skill Current skill" }),
     ).toBeInTheDocument();
 
     // Switch while the local catalog is already cached; the remote menu must
@@ -737,7 +737,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.type(remoteComposer, "/");
 
     expect(
-      screen.queryByRole("button", { name: "Select skill Current skill" }),
+      screen.queryByRole("option", { name: "Select skill Current skill" }),
     ).not.toBeInTheDocument();
     expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
 
@@ -763,12 +763,12 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
+      await screen.findByRole("option", {
         name: "Select skill Remote workspace skill",
       }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Current skill" }),
+      screen.queryByRole("option", { name: "Select skill Current skill" }),
     ).not.toBeInTheDocument();
   });
 
@@ -816,7 +816,7 @@ describe("app-chat-stream verification surfaces", () => {
       "/",
     );
     await userEvent.click(
-      await screen.findByRole("button", { name: "Select skill Current skill" }),
+      await screen.findByRole("option", { name: "Select skill Current skill" }),
     );
     expect(
       screen.getByLabelText("Remove skill Current skill"),
@@ -947,7 +947,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
     expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Late local skill" }),
+      screen.queryByRole("option", { name: "Select skill Late local skill" }),
     ).not.toBeInTheDocument();
 
     remoteGate.resolve(
@@ -972,12 +972,12 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
+      await screen.findByRole("option", {
         name: "Select skill Remote workspace skill",
       }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill Late local skill" }),
+      screen.queryByRole("option", { name: "Select skill Late local skill" }),
     ).not.toBeInTheDocument();
   });
 
@@ -1012,7 +1012,7 @@ describe("app-chat-stream verification surfaces", () => {
       "/",
     );
     await userEvent.click(
-      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+      await screen.findByRole("option", { name: "Select skill gitmemo" }),
     );
     expect(screen.getByLabelText("Remove skill gitmemo")).toBeInTheDocument();
 
@@ -1050,7 +1050,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", {
+      await screen.findByRole("option", {
         name: "Select skill Remote only skill",
       }),
     ).toBeInTheDocument();
@@ -1078,7 +1078,7 @@ describe("app-chat-stream verification surfaces", () => {
       "/",
     );
     await userEvent.click(
-      await screen.findByRole("button", { name: "Select skill gitmemo" }),
+      await screen.findByRole("option", { name: "Select skill gitmemo" }),
     );
 
     await userEvent.click(await screen.findByText("Remote project"));
@@ -1142,7 +1142,7 @@ describe("app-chat-stream verification surfaces", () => {
       await screen.findByText(/Failed to load skills/i),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Select skill gitmemo" }),
+      screen.queryByRole("option", { name: "Select skill gitmemo" }),
     ).not.toBeInTheDocument();
   });
 

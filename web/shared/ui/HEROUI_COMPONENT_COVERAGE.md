@@ -19,12 +19,15 @@ coverage.
 | `input[type=radio]` | `RadioGroup` + `Radio` | Must migrate |
 | `role="dialog"` | `Modal.Backdrop` + `Modal.Container` + `Modal.Dialog` | Must migrate |
 | `input[type=file]` | browser-native input, HeroUI `Button` trigger | Written exception |
+| `button[data-heroui-exception="native-form-submit"]` | native submitter for modifier-aware form submission | Written exception |
 
 The audit emits the exception reason, accessibility owner, and removal
-condition next to every file-input occurrence. No other native interactive
-element is an approved exception without adding the same three fields to the
-audit. This gives later phases a line-level migration queue instead of a
-misleading token-usage count.
+condition next to every approved exception. The native submitter exception is
+limited to controls that must preserve browser form submission plus modifier
+semantics; all other buttons still migrate. No other native interactive element
+is an approved exception without adding the same three fields to the audit.
+This gives later phases a line-level migration queue instead of a misleading
+token-usage count.
 
 ## Known look-alikes
 

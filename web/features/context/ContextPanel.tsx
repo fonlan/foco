@@ -82,6 +82,18 @@ import { diffLineClass, parseGitDiffSections, type GitDiffSection } from "../git
 import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
 import {
+  Button,
+  Checkbox,
+  Dropdown,
+  Label,
+  ListBox,
+  Modal,
+  Select,
+  Tabs,
+  TextArea,
+  TextField,
+} from "../../shared/ui";
+import {
   defaultThinkingLevelForModel,
   isModelThinkingLevelSupported,
   thinkingLevelOptionsForModel,
@@ -99,6 +111,8 @@ export type PlanPhaseRetryOverride = {
 };
 
 type PlanAction = "mark_complete" | "pause" | "resume" | "retry_merge" | "start";
+
+const PLAN_RETRY_DEFAULT_OPTION_KEY = "__foco-plan-retry-default__";
 
 export function ResponsiveContextPanelIcon({
   className,
@@ -289,26 +303,32 @@ const ContextPanel = memo(function ContextPanel({
 
   return (
     <section className="context-panel flex h-full min-h-0 min-w-0 flex-col">
-      <div className="context-panel-tabs panel-scroll" role="tablist">
-        {tabs.map((tab) => {
-          const Icon = tab.icon;
-          const isActive = activeTab === tab.id;
+      <Tabs
+        className="context-panel-tabs panel-scroll"
+        onSelectionChange={(key) => onTabChange(key as ContextPanelTab)}
+        selectedKey={activeTab}
+      >
+        <Tabs.ListContainer>
+          <Tabs.List aria-label={t("Context panel sections")}>
+            {tabs.map((tab) => {
+              const Icon = tab.icon;
+              const isActive = activeTab === tab.id;
 
-          return (
-            <button
-              aria-selected={isActive}
-              className={`context-panel-tab ${isActive ? "context-panel-tab-active" : ""}`}
-              key={tab.id}
-              onClick={() => onTabChange(tab.id)}
-              role="tab"
-              type="button"
-            >
-              <Icon aria-hidden="true" className="size-3.5" />
-              <span>{t(tab.label)}</span>
-            </button>
-          );
-        })}
-      </div>
+              return (
+                <Tabs.Tab
+                  className={`context-panel-tab ${isActive ? "context-panel-tab-active" : ""}`}
+                  id={tab.id}
+                  key={tab.id}
+                >
+                  <Icon aria-hidden="true" className="size-3.5" />
+                  <span>{t(tab.label)}</span>
+                  <Tabs.Indicator />
+                </Tabs.Tab>
+              );
+            })}
+          </Tabs.List>
+        </Tabs.ListContainer>
+      </Tabs>
 
       <div className="flex min-h-0 flex-1 flex-col">
         {activeTab === "todo" ? (
@@ -465,12 +485,11 @@ function WorkspaceFilesTab({
             </p>
           </div>
         </div>
-        <button
+        <Button
           aria-label={t("Refresh files")}
           className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:opacity-60"
-          disabled={isLoading}
-          onClick={onRefresh}
-          title={t("Refresh files")}
+          isDisabled={isLoading}
+          onPress={onRefresh}
           type="button"
         >
           <RefreshCw
@@ -478,7 +497,7 @@ function WorkspaceFilesTab({
             className="context-refresh-icon size-4"
             data-loading={isLoading ? "true" : undefined}
           />
-        </button>
+        </Button>
       </div>
 
       {error ? (
@@ -562,17 +581,15 @@ function WorkspaceFileTreeNodeRow({
         role="treeitem"
         style={{ paddingLeft: `${depth * 0.875 + 0.25}rem` }}
       >
-        <button
+        <Button
           aria-label={isExpanded ? t("Collapse folder") : t("Expand folder")}
           className="workspace-file-tree-toggle"
-          disabled={!isDirectory}
-          onClick={(event) => {
-            event.stopPropagation();
+          isDisabled={!isDirectory}
+          onPress={() => {
             if (isDirectory) {
               void onTogglePath(node);
             }
           }}
-          tabIndex={isDirectory ? 0 : -1}
           type="button"
         >
           {isDirectory ? (
@@ -582,7 +599,7 @@ function WorkspaceFileTreeNodeRow({
               <ChevronRight aria-hidden="true" className="size-3.5" />
             )
           ) : null}
-        </button>
+        </Button>
         {isDirectory ? (
           <Folder aria-hidden="true" className="workspace-file-tree-icon workspace-file-tree-folder-icon" />
         ) : (
@@ -750,7 +767,6 @@ function ContextPlanTab({
   const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
     () => new Set(),
   );
-  const [retryMenuPhaseKey, setRetryMenuPhaseKey] = useState<string | null>(null);
   const [overrideRetryPhase, setOverrideRetryPhase] = useState<{
     plan: Plan;
     phase: PlanPhase;
@@ -880,20 +896,6 @@ function ContextPlanTab({
     return () => window.cancelAnimationFrame(animationFrameId);
   }, [runningPlanId]);
 
-  useEffect(() => {
-    if (!retryMenuPhaseKey) {
-      return;
-    }
-    const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        setRetryMenuPhaseKey(null);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [retryMenuPhaseKey]);
-
   const locateRunningPlan = () => {
     const planListPanel = planListPanelRef.current;
     const runningPlanArticle = runningPlanArticleRef.current;
@@ -914,23 +916,26 @@ function ContextPlanTab({
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
-        <label className="flex min-w-0 items-start gap-2 text-xs text-[var(--muted)]">
-          <input
-            checked={autoRunEnabled}
-            className="mt-0.5 size-3.5 shrink-0 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={autoRunToggleDisabled}
-            onChange={(event) => onAutoRunToggle(event.currentTarget.checked)}
-            type="checkbox"
-          />
-          <span className="min-w-0">
-            <span className="block truncate font-semibold text-[var(--foreground)]">
-              {t("Auto run plans")}
+        <Checkbox
+          className="flex min-w-0 items-start gap-2 text-xs text-[var(--muted)]"
+          isDisabled={autoRunToggleDisabled}
+          isSelected={autoRunEnabled}
+          onChange={onAutoRunToggle}
+        >
+          <Checkbox.Content>
+            <Checkbox.Control className="mt-0.5 size-3.5 shrink-0 rounded border-[var(--border)]">
+              <Checkbox.Indicator />
+            </Checkbox.Control>
+            <span className="min-w-0">
+              <span className="block truncate font-semibold text-[var(--foreground)]">
+                {t("Auto run plans")}
+              </span>
+              <span className="block truncate text-[var(--muted)]">
+                {t("Run every active plan in order")}
+              </span>
             </span>
-            <span className="block truncate text-[var(--muted)]">
-              {t("Run every active plan in order")}
-            </span>
-          </span>
-        </label>
+          </Checkbox.Content>
+        </Checkbox>
         {showAutoRunBusy ? (
           <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-[var(--warning)] bg-[var(--warning-soft)] px-2 text-xs font-medium text-[var(--warning)]">
             <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
@@ -941,17 +946,16 @@ function ContextPlanTab({
             {autoRunBlockedLabel}
           </span>
         ) : null}
-        <button
+        <Button
           aria-label={t("Locate running plan")}
           className="plan-locate-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-          disabled={!runningPlanId}
-          onClick={locateRunningPlan}
-          title={runningPlanId ? t("Locate running plan") : t("No plan is running")}
+          isDisabled={!runningPlanId}
+          onPress={locateRunningPlan}
           type="button"
         >
           <LocateFixed aria-hidden="true" className="size-3.5" />
           <span className="plan-locate-button-label">{t("Locate")}</span>
-        </button>
+        </Button>
       </div>
 
       <div className="context-list-panel panel-scroll" ref={planListPanelRef}>
@@ -1027,36 +1031,55 @@ function ContextPlanTab({
                         {completedSteps}/{totalSteps}
                       </span>
                       {mergedCommitId ? (
-                        <span
-                          className="context-memory-pin inline-flex items-center gap-1"
-                          title={t("Merged into shared workspace")}
-                        >
-                          <CheckCircle2 aria-hidden="true" className="size-3" />
-                          {mergedCommitId}
-                        </span>
+                        <>
+                          <span
+                            aria-describedby={`plan-merge-status-${plan.id}`}
+                            className="context-memory-pin inline-flex items-center gap-1"
+                          >
+                            <CheckCircle2 aria-hidden="true" className="size-3" />
+                            {mergedCommitId}
+                          </span>
+                          <span
+                            className="sr-only"
+                            id={`plan-merge-status-${plan.id}`}
+                          >
+                            {t("Merged into shared workspace")}
+                          </span>
+                        </>
                       ) : canRetryMerge ? (
-                        <button
-                          aria-label={t("Retry Merge")}
-                          className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                          disabled={operationKey !== null}
-                          onClick={() => onAction(plan.id, "retry_merge")}
-                          title={t(planMergeRetryHint(plan))}
-                          type="button"
-                        >
-                          {isRetryingMerge ? (
-                            <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
-                          ) : (
-                            <RefreshCw aria-hidden="true" className="size-3" />
-                          )}
-                          {t("Retry Merge")}
-                        </button>
+                        <>
+                          <span
+                            className="sr-only"
+                            id={`plan-merge-retry-hint-${plan.id}`}
+                          >
+                            {t(planMergeRetryHint(plan))}
+                          </span>
+                          <Button
+                            aria-describedby={`plan-merge-retry-hint-${plan.id}`}
+                            aria-label={t("Retry Merge")}
+                            className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                            isDisabled={operationKey !== null}
+                            onPress={() => onAction(plan.id, "retry_merge")}
+                            type="button"
+                          >
+                            {isRetryingMerge ? (
+                              <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                            ) : (
+                              <RefreshCw aria-hidden="true" className="size-3" />
+                            )}
+                            {t("Retry Merge")}
+                          </Button>
+                        </>
                       ) : null}
                     </div>
                     <div className="flex shrink-0 items-center gap-1.5">
+                      {/* Native drag events must stay on this control: HeroUI Button deliberately
+                          omits `draggable` and drag handlers, while plan ordering depends on them. */}
                       {canReorderPlan ? (
                         <button
                           aria-label={t("Reorder plan")}
                           className="inline-flex size-8 shrink-0 cursor-grab items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] active:cursor-grabbing disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                          data-heroui-exception="native-plan-drag"
                           draggable
                           onDragEnd={handlePlanDragEnd}
                           onDragStart={(event) => handlePlanDragStart(event, plan)}
@@ -1067,12 +1090,11 @@ function ContextPlanTab({
                         </button>
                       ) : null}
                       {action ? (
-                        <button
+                        <Button
                           aria-label={t(planActionLabel(action))}
                           className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                          disabled={operationKey !== null}
-                          onClick={() => onAction(plan.id, action)}
-                          title={t(planActionLabel(action))}
+                          isDisabled={operationKey !== null}
+                          onPress={() => onAction(plan.id, action)}
                           type="button"
                         >
                           {operationKey === actionKey ? (
@@ -1081,14 +1103,13 @@ function ContextPlanTab({
                             <CheckCircle2 aria-hidden="true" className="size-3.5" />
                           )}
                           {t(planActionLabel(action))}
-                        </button>
+                        </Button>
                       ) : null}
-                      <button
+                      <Button
                         aria-label={t("Delete plan")}
                         className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                        disabled={operationKey !== null}
-                        onClick={() => onDeletePlan(plan.id)}
-                        title={t("Delete plan")}
+                        isDisabled={operationKey !== null}
+                        onPress={() => onDeletePlan(plan.id)}
                         type="button"
                       >
                         {operationKey === `delete:${plan.id}` ? (
@@ -1096,7 +1117,7 @@ function ContextPlanTab({
                         ) : (
                           <Trash2 aria-hidden="true" className="size-3.5" />
                         )}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                   <h3 className="break-words text-sm font-semibold text-[var(--foreground)]">
@@ -1113,7 +1134,6 @@ function ContextPlanTab({
                   {plan.errorMessage ? (
                     <div
                       className="mt-2 rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1.5 text-xs text-[var(--danger)]"
-                      title={canRetryMerge ? t(planMergeRetryHint(plan)) : undefined}
                     >
                       {plan.errorMessage}
                     </div>
@@ -1130,7 +1150,6 @@ function ContextPlanTab({
                       const canRetryPhase = isRetryablePlanPhase(phase);
                       const retryOperationKey = planPhaseRetryOperationKey(plan.id, phase.id);
                       const isRetrying = operationKey === retryOperationKey;
-                      const isRetryMenuOpen = retryMenuPhaseKey === phaseKey;
                       const implementationChatId = phase.implementationChatId;
 
                       return (
@@ -1139,10 +1158,10 @@ function ContextPlanTab({
                           key={phase.id}
                         >
                           <div className="flex min-w-0 items-start justify-between gap-2">
-                            <button
+                            <Button
                               aria-expanded={isExpanded}
                               className="flex min-w-0 flex-1 items-start gap-2 text-left"
-                              onClick={() => {
+                              onPress={() => {
                                 setExpandedPhaseKeys((current) => {
                                   const next = new Set(current);
                                   if (next.has(phaseKey)) {
@@ -1171,37 +1190,34 @@ function ContextPlanTab({
                                   </div>
                                 ) : null}
                               </div>
-                            </button>
+                            </Button>
                             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
                               <span className={planPhaseStatusClass(phase.status)}>
                                 {t(planPhaseStatusLabel(phase.status))}
                               </span>
                               {implementationChatId ? (
-                                <button
+                                <Button
                                   aria-label={t("Open implementation chat")}
                                   className="inline-flex size-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-                                  onClick={() => onOpenPhaseChat(implementationChatId)}
-                                  title={t("Open implementation chat")}
+                                  onPress={() => onOpenPhaseChat(implementationChatId)}
                                   type="button"
                                 >
                                   <MessageSquare aria-hidden="true" className="size-3.5" />
-                                </button>
+                                </Button>
                               ) : null}
                               {canRetryPhase ? (
                                 <div className="relative inline-flex h-7 shrink-0 rounded-md shadow-sm">
-                                  <button
+                                  <Button
                                     aria-label={t("Retry plan phase")}
                                     className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                                    disabled={operationKey !== null}
-                                    onClick={() => {
-                                      setRetryMenuPhaseKey(null);
+                                    isDisabled={operationKey !== null}
+                                    onPress={() => {
                                       onPhaseRetry(
                                         plan.id,
                                         phase.id,
                                         phase.implementationChatId,
                                       );
                                     }}
-                                    title={isRetrying ? t("Retrying phase…") : t("Retry plan phase")}
                                     type="button"
                                   >
                                     {isRetrying ? (
@@ -1212,42 +1228,31 @@ function ContextPlanTab({
                                     <span className="truncate">
                                       {isRetrying ? t("Retrying…") : t("Retry")}
                                     </span>
-                                  </button>
-                                  <button
-                                    aria-expanded={isRetryMenuOpen}
-                                    aria-haspopup="menu"
-                                    aria-label={t("Retry phase options")}
-                                    className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                                    disabled={operationKey !== null}
-                                    onClick={() => {
-                                      setRetryMenuPhaseKey((current) =>
-                                        current === phaseKey ? null : phaseKey,
-                                      );
-                                    }}
-                                    title={t("Retry phase options")}
-                                    type="button"
-                                  >
-                                    <ChevronDown aria-hidden="true" className="size-3.5" />
-                                  </button>
-                                  {isRetryMenuOpen ? (
-                                    <div
-                                      className="absolute right-0 top-8 z-20 min-w-40 rounded-lg border border-[var(--border)] bg-[var(--surface)] py-1 text-xs shadow-lg"
-                                      role="menu"
+                                  </Button>
+                                  <Dropdown>
+                                    <Button
+                                      aria-label={t("Retry phase options")}
+                                      className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                                      isDisabled={operationKey !== null}
+                                      type="button"
                                     >
-                                      <button
-                                        className="flex w-full items-center gap-2 px-3 py-2 text-left font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
-                                        onClick={() => {
-                                          setRetryMenuPhaseKey(null);
-                                          setOverrideRetryPhase({ plan, phase });
-                                        }}
-                                        role="menuitem"
-                                        type="button"
+                                      <ChevronDown aria-hidden="true" className="size-3.5" />
+                                    </Button>
+                                    <Dropdown.Popover className="min-w-40">
+                                      <Dropdown.Menu
+                                        aria-label={t("Retry phase options")}
+                                        onAction={() => setOverrideRetryPhase({ plan, phase })}
                                       >
-                                        <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                                        <span className="truncate">{t("Retry with another model…")}</span>
-                                      </button>
-                                    </div>
-                                  ) : null}
+                                        <Dropdown.Item
+                                          id="retry-with-another-model"
+                                          textValue={t("Retry with another model")}
+                                        >
+                                          <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+                                          <Label>{t("Retry with another model…")}</Label>
+                                        </Dropdown.Item>
+                                      </Dropdown.Menu>
+                                    </Dropdown.Popover>
+                                  </Dropdown>
                                 </div>
                               ) : null}
                             </div>
@@ -1393,42 +1398,21 @@ function PlanPhaseRetryDialog({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_oklab,var(--foreground)_35%,transparent)] p-4 backdrop-blur-sm"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose();
-        }
-      }}
-      role="presentation"
-    >
-      <section
-        aria-labelledby="plan-phase-retry-dialog-title"
-        aria-modal="true"
-        className="w-full max-w-md overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
-        role="dialog"
-      >
-        <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
-          <div className="min-w-0">
-            <h2
-              className="truncate text-base font-semibold text-[var(--foreground)]"
-              id="plan-phase-retry-dialog-title"
-            >
-              {t("Retry with another model")}
-            </h2>
-            <p className="truncate text-xs text-[var(--muted)]">{phase.title}</p>
-          </div>
-          <button
-            aria-label={t("Close retry dialog")}
-            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-            onClick={onClose}
-            title={t("Close")}
-            type="button"
-          >
-            <X aria-hidden="true" className="size-4" />
-          </button>
-        </div>
-        <form className="space-y-4 px-4 py-4" onSubmit={submitRetry}>
+    <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
+      <Modal.Container placement="center" size="md">
+        <Modal.Dialog aria-label={t("Retry with another model")}>
+          <Modal.CloseTrigger aria-label={t("Close retry dialog")} />
+          <Modal.Header>
+            <Modal.Icon className="bg-accent-soft text-accent-soft-foreground">
+              <RefreshCw aria-hidden="true" className="size-4" />
+            </Modal.Icon>
+            <div className="min-w-0">
+              <Modal.Heading>{t("Retry with another model")}</Modal.Heading>
+              <p className="truncate text-xs text-[var(--muted)]">{phase.title}</p>
+            </div>
+          </Modal.Header>
+          <form className="space-y-4" onSubmit={submitRetry}>
+            <Modal.Body className="space-y-4">
           <PlanRetrySelect
             autoFocus
             disabled={isSubmitting || selectableModels.length === 0}
@@ -1439,29 +1423,29 @@ function PlanPhaseRetryDialog({
               setFormError(null);
               setThinkingLevel(defaultThinkingLevelForModel(nextModel));
             }}
+            options={[
+              { label: t("Select model"), value: "" },
+              ...selectableModels.map((model) => ({
+                label: model.displayName,
+                value: model.id,
+              })),
+            ]}
             value={modelId}
-          >
-            <option value="">{t("Select model")}</option>
-            {selectableModels.map((model) => (
-              <option key={model.id} value={model.id}>
-                {model.displayName}
-              </option>
-            ))}
-          </PlanRetrySelect>
+          />
           {supportsThinking ? (
             <PlanRetrySelect
               disabled={isSubmitting}
               label={t("Thinking level")}
               onChange={setThinkingLevel}
+              options={[
+                { label: t("Model default"), value: "" },
+                ...thinkingOptions.map((level) => ({
+                  label: t(level.label),
+                  value: level.value,
+                })),
+              ]}
               value={thinkingLevel}
-            >
-              <option value="">{t("Model default")}</option>
-              {thinkingOptions.map((level) => (
-                <option key={level.value} value={level.value}>
-                  {t(level.label)}
-                </option>
-              ))}
-            </PlanRetrySelect>
+            />
           ) : null}
           <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
             {t("Scope: this retry only")}
@@ -1471,63 +1455,77 @@ function PlanPhaseRetryDialog({
               {formError}
             </div>
           ) : null}
-          <div className="flex flex-wrap justify-end gap-2">
-            <button
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-              onClick={onClose}
-              type="button"
-            >
-              {t("Cancel")}
-            </button>
-            <button
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent)] px-3 text-xs font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--default)] disabled:text-[var(--muted)]"
-              disabled={isSubmitting || !modelId || !resolvedProviderId}
-              type="submit"
-            >
-              {isSubmitting ? (
-                <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-              ) : (
-                <RefreshCw aria-hidden="true" className="size-3.5" />
-              )}
-              {isSubmitting ? t("Retrying…") : t("Retry")}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+            </Modal.Body>
+            <Modal.Footer>
+              <Button slot="close" variant="tertiary" onPress={onClose}>
+                {t("Cancel")}
+              </Button>
+              <Button
+                isDisabled={isSubmitting || !modelId || !resolvedProviderId}
+                type="submit"
+              >
+                {isSubmitting ? (
+                  <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw aria-hidden="true" className="size-3.5" />
+                )}
+                {isSubmitting ? t("Retrying…") : t("Retry")}
+              </Button>
+            </Modal.Footer>
+          </form>
+        </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
 function PlanRetrySelect({
   autoFocus,
-  children,
   disabled,
   label,
   onChange,
+  options,
   value,
 }: {
   autoFocus?: boolean;
-  children: ReactNode;
   disabled?: boolean;
   label: string;
   onChange: (value: string) => void;
+  options: { label: string; value: string }[];
   value: string;
 }) {
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-        {label}
-      </span>
-      <select
-        autoFocus={autoFocus}
-        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-        disabled={disabled}
-        onChange={(event) => onChange(event.target.value)}
-        value={value}
-      >
-        {children}
-      </select>
-    </label>
+    <Select
+      aria-label={label}
+      autoFocus={autoFocus}
+      isDisabled={disabled}
+      selectedKey={value || PLAN_RETRY_DEFAULT_OPTION_KEY}
+      onSelectionChange={(key) =>
+        onChange(
+          key === PLAN_RETRY_DEFAULT_OPTION_KEY ? "" : String(key ?? ""),
+        )
+      }
+    >
+      <Label>{label}</Label>
+      <Select.Trigger className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)]">
+        <Select.Value />
+        <Select.Indicator />
+      </Select.Trigger>
+      <Select.Popover>
+        <ListBox>
+          {options.map((option) => (
+            <ListBox.Item
+              id={option.value || PLAN_RETRY_DEFAULT_OPTION_KEY}
+              key={option.value || PLAN_RETRY_DEFAULT_OPTION_KEY}
+              textValue={option.label}
+            >
+              {option.label}
+              <ListBox.ItemIndicator />
+            </ListBox.Item>
+          ))}
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
@@ -1693,12 +1691,11 @@ function ContextMemoryGroup({
                     <span className="context-memory-pin">pinned</span>
                   ) : null}
                 </div>
-                <button
+                <Button
                   aria-label={t("Delete memory")}
                   className="context-memory-delete-button"
-                  disabled={deletingMemoryId === memory.id}
-                  onClick={() => onForgetMemory(memory)}
-                  title={t("Delete memory")}
+                  isDisabled={deletingMemoryId === memory.id}
+                  onPress={() => onForgetMemory(memory)}
                   type="button"
                 >
                   {deletingMemoryId === memory.id ? (
@@ -1706,7 +1703,7 @@ function ContextMemoryGroup({
                   ) : (
                     <Trash2 aria-hidden="true" />
                   )}
-                </button>
+                </Button>
               </div>
               <p>{memory.fact}</p>
               <small>
@@ -1720,16 +1717,15 @@ function ContextMemoryGroup({
                 aria-label={t("Memory pagination")}
                 className="context-memory-pagination"
               >
-                <button
+                <Button
                   aria-label={t("Previous page")}
                   className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                  disabled={meta.page <= 1}
-                  onClick={() => onPageChange(meta.page - 1)}
-                  title={t("Previous page")}
+                  isDisabled={meta.page <= 1}
+                  onPress={() => onPageChange(meta.page - 1)}
                   type="button"
                 >
                   <ChevronLeft aria-hidden="true" className="size-4" />
-                </button>
+                </Button>
                 {paginationItems.map((item, index) =>
                   item === "ellipsis" ? (
                     <span
@@ -1740,7 +1736,7 @@ function ContextMemoryGroup({
                       ...
                     </span>
                   ) : (
-                    <button
+                    <Button
                       aria-current={
                         item === meta.page ? "page" : undefined
                       }
@@ -1753,26 +1749,22 @@ function ContextMemoryGroup({
                           : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                         }`}
                       key={item}
-                      onClick={() => onPageChange(item)}
-                      title={t("Go to page {page}", {
-                        page: formatNumber(item, language),
-                      })}
+                      onPress={() => onPageChange(item)}
                       type="button"
                     >
                       {formatNumber(item, language)}
-                    </button>
+                    </Button>
                   ),
                 )}
-                <button
+                <Button
                   aria-label={t("Next page")}
                   className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                  disabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
-                  onClick={() => onPageChange(meta.page + 1)}
-                  title={t("Next page")}
+                  isDisabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
+                  onPress={() => onPageChange(meta.page + 1)}
                   type="button"
                 >
                   <ChevronRight aria-hidden="true" className="size-4" />
-                </button>
+                </Button>
               </nav>
             </div>
           ) : null}
@@ -1852,12 +1844,11 @@ function ContextSpecTab({
             </p>
           </div>
         </div>
-        <button
+        <Button
           aria-label={t("Reload spec")}
           className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--default)]/80 hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-          disabled={isLoading}
-          onClick={onReload}
-          title={t("Reload spec")}
+          isDisabled={isLoading}
+          onPress={onReload}
           type="button"
         >
           <RefreshCw
@@ -1865,7 +1856,7 @@ function ContextSpecTab({
             className="context-refresh-icon size-4"
             data-loading={isLoading ? "true" : undefined}
           />
-        </button>
+        </Button>
       </div>
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-3 py-3">
@@ -1876,11 +1867,10 @@ function ContextSpecTab({
         ) : null}
 
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_2.25rem_2.25rem_2.25rem] items-center gap-2">
-          <button
+          <Button
             className="inline-flex min-h-9 min-w-0 items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--accent)]/45 disabled:text-white/70"
-            disabled={!enabled || isBusy || isLoading}
-            onClick={onGenerate}
-            title={generateLabel}
+            isDisabled={!enabled || isBusy || isLoading}
+            onPress={onGenerate}
             type="button"
           >
             {operationKey === "generate" ? (
@@ -1889,13 +1879,12 @@ function ContextSpecTab({
               <Sparkles aria-hidden="true" className="size-4" />
             )}
             <span className="truncate">{generateLabel}</span>
-          </button>
-          <button
+          </Button>
+          <Button
             aria-label={t("Save")}
             className="inline-flex size-9 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-            disabled={!canEdit || !isDirty || isBusy || isLoading}
-            onClick={onSave}
-            title={t("Save")}
+            isDisabled={!canEdit || !isDirty || isBusy || isLoading}
+            onPress={onSave}
             type="button"
           >
             {operationKey === "save" ? (
@@ -1903,16 +1892,15 @@ function ContextSpecTab({
             ) : (
               <Save aria-hidden="true" className="size-4" />
             )}
-          </button>
-          <button
+          </Button>
+          <Button
             aria-label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
             aria-pressed={previewEnabled}
             className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm ${previewEnabled
                 ? "border-[var(--accent)] bg-[var(--accent)] text-white hover:bg-[var(--accent)]"
                 : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
               }`}
-            onClick={() => onPreviewChange(!previewEnabled)}
-            title={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
+            onPress={() => onPreviewChange(!previewEnabled)}
             type="button"
           >
             {previewEnabled ? (
@@ -1920,17 +1908,16 @@ function ContextSpecTab({
             ) : (
               <Eye aria-hidden="true" className="size-4" />
             )}
-          </button>
-          <button
+          </Button>
+          <Button
             aria-label={t("Inject into new chats")}
             aria-pressed={injectEnabled}
             className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)] ${injectEnabled
                 ? "border-[var(--accent)] bg-[var(--accent)] text-white hover:bg-[var(--accent)]"
                 : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
               }`}
-            disabled={!enabled || isBusy || isLoading}
-            onClick={() => onSettingsChange(enabled, !injectEnabled)}
-            title={t("Inject into new chats")}
+            isDisabled={!enabled || isBusy || isLoading}
+            onPress={() => onSettingsChange(enabled, !injectEnabled)}
             type="button"
           >
             {operationKey === "settings" ? (
@@ -1938,15 +1925,15 @@ function ContextSpecTab({
             ) : (
               <MessageSquare aria-hidden="true" className="size-4" />
             )}
-          </button>
+          </Button>
         </div>
 
         {conflictMessage ? (
           <div className="rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-xs font-medium text-[var(--warning)]">
             <div>{conflictMessage}</div>
-            <button
+            <Button
               className="mt-2 inline-flex items-center gap-2 rounded-md border border-[var(--warning)] bg-[var(--surface)] px-2.5 py-1.5 text-xs font-semibold text-[var(--warning)] hover:bg-[var(--warning-soft)]"
-              onClick={onReload}
+              onPress={onReload}
               type="button"
             >
               <RefreshCw
@@ -1955,7 +1942,7 @@ function ContextSpecTab({
                 data-loading={isLoading ? "true" : undefined}
               />
               {t("Reload spec")}
-            </button>
+            </Button>
           </div>
         ) : null}
 
@@ -1973,14 +1960,18 @@ function ContextSpecTab({
               )}
             </div>
           ) : (
-            <textarea
+            <TextField
               aria-label={t("Project Spec Markdown")}
-              className="h-full min-h-0 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-[13px] leading-5 text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-              disabled={!canEdit || isLoading}
-              onChange={(event) => onContentChange(event.target.value)}
-              placeholder={t("Generate or paste a Project Spec Markdown document.")}
+              className="h-full"
+              isDisabled={!canEdit || isLoading}
               value={contentDraft}
-            />
+              onChange={onContentChange}
+            >
+              <TextArea
+                className="h-full min-h-0 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-[13px] leading-5 text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                placeholder={t("Generate or paste a Project Spec Markdown document.")}
+              />
+            </TextField>
           )}
         </div>
 
@@ -2471,11 +2462,11 @@ function TodoGraphTaskItem({
         className="rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-sm transition hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
         style={{ marginLeft: level ? Math.min(level * 14, 42) : 0 }}
       >
-        <button
+        <Button
           aria-controls={bodyId}
           aria-expanded={isExpanded}
           className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-[var(--border)]"
-          onClick={() => setIsExpanded((current) => !current)}
+          onPress={() => setIsExpanded((current) => !current)}
           type="button"
         >
           {isExpanded ? (
@@ -2513,7 +2504,7 @@ function TodoGraphTaskItem({
               </p>
             ) : null}
           </div>
-        </button>
+        </Button>
         {isExpanded ? (
           <div className="px-3 pb-2 pl-8" id={bodyId}>
             {task.dependsOn.length ? (
@@ -2610,28 +2601,42 @@ function SourceControlPanel({
           </span>
           <div className="min-w-0 flex-1">
             <span className="foco-eyebrow">{t("Source Control")}</span>
-            <select
+            <Select
               aria-label={t("Source Control target")}
-              className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--muted)] shadow-sm outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-              disabled={sourceControlTargets.length <= 1 || isLoading}
-              onChange={(event) => onTargetChange(event.target.value)}
-              title={t("Source Control target")}
-              value={sourceControlTargetKey}
+              isDisabled={sourceControlTargets.length <= 1 || isLoading}
+              selectedKey={sourceControlTargetKey}
+              onSelectionChange={(key) => onTargetChange(String(key ?? ""))}
             >
-              {sourceControlTargets.map((target) => (
-                <option key={target.key} title={target.description} value={target.key}>
-                  {target.label}
-                </option>
-              ))}
-            </select>
+              <Label className="sr-only">{t("Source Control target")}</Label>
+              <Select.Trigger
+                aria-label={t("Source Control target")}
+                className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--muted)] shadow-sm outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+              >
+                <Select.Value />
+                <Select.Indicator />
+              </Select.Trigger>
+              <Select.Popover>
+                <ListBox>
+                  {sourceControlTargets.map((target) => (
+                    <ListBox.Item
+                      id={target.key}
+                      key={target.key}
+                      textValue={target.label}
+                    >
+                      {target.label}
+                      <ListBox.ItemIndicator />
+                    </ListBox.Item>
+                  ))}
+                </ListBox>
+              </Select.Popover>
+            </Select>
           </div>
         </div>
-        <button
+        <Button
           aria-label={t("Refresh diff")}
           className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--default)]/80 hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-          disabled={isLoading}
-          onClick={onRefresh}
-          title={t("Refresh diff")}
+          isDisabled={isLoading}
+          onPress={onRefresh}
           type="button"
         >
           <RefreshCw
@@ -2639,7 +2644,7 @@ function SourceControlPanel({
             className="context-refresh-icon size-4"
             data-loading={isLoading ? "true" : undefined}
           />
-        </button>
+        </Button>
       </div>
 
       {diffError ? (
@@ -2651,19 +2656,22 @@ function SourceControlPanel({
       <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3">
         <form className="mb-3 space-y-2 px-1" onSubmit={onCommit}>
           <div className="relative">
-            <textarea
-              className="min-h-20 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-11 text-sm text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-              disabled={isCommitMessageInputDisabled}
-              onChange={(event) => onCommitMessageChange(event.target.value)}
-              placeholder={t("Commit message")}
+            <TextField
+              aria-label={t("Commit message")}
+              isDisabled={isCommitMessageInputDisabled}
               value={gitCommitMessage}
-            />
-            <button
+              onChange={onCommitMessageChange}
+            >
+              <TextArea
+                className="min-h-20 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-11 text-sm text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+                placeholder={t("Commit message")}
+              />
+            </TextField>
+            <Button
               aria-label={t("Generate commit message")}
               className="absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-md text-[var(--accent-soft-foreground)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
-              disabled={isCommitMessageInputDisabled || stagedFiles.length === 0}
-              onClick={onGenerateCommitMessage}
-              title={t("Generate commit message")}
+              isDisabled={isCommitMessageInputDisabled || stagedFiles.length === 0}
+              onPress={onGenerateCommitMessage}
               type="button"
             >
               {isGeneratingCommitMessage ? (
@@ -2671,16 +2679,16 @@ function SourceControlPanel({
               ) : (
                 <Sparkles aria-hidden="true" className="size-4" />
               )}
-            </button>
+            </Button>
           </div>
-          <button
+          <Button
             className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:text-[var(--muted)]"
-            disabled={isCommitMessageInputDisabled || !gitCommitMessage.trim() || stagedFiles.length === 0}
+            isDisabled={isCommitMessageInputDisabled || !gitCommitMessage.trim() || stagedFiles.length === 0}
             type="submit"
           >
             {isCommitting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : null}
             {t("Commit")}
-          </button>
+          </Button>
         </form>
 
         <section className="mb-3">
@@ -2713,16 +2721,16 @@ function SourceControlPanel({
         </section>
 
         <section>
-          <button
+          <Button
             className={diffFileButtonClass(selectedPath === null)}
-            onClick={() => onSelectFile(null)}
+            onPress={() => onSelectFile(null)}
             type="button"
           >
             <span className="truncate text-[11px] font-semibold uppercase tracking-wide">
               {t("Changes")}
             </span>
             <span className="text-xs text-[var(--muted)]">{files.length}</span>
-          </button>
+          </Button>
           <div className="mt-1 space-y-0.5">
             {files.length ? (
               files.map((file) => (
@@ -2784,10 +2792,10 @@ function GitFileRow({
   return (
     <div>
       <div className={diffFileButtonClass(isExpanded)}>
-        <button
+        <Button
           aria-label={`${file.path} ${label}`}
           className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left"
-          onClick={() => onSelectFile(isExpanded ? null : file.path)}
+          onPress={() => onSelectFile(isExpanded ? null : file.path)}
           type="button"
         >
           {isExpanded ? (
@@ -2805,17 +2813,15 @@ function GitFileRow({
               </span>
             ) : null}
           </span>
-        </button>
+        </Button>
         <span className={gitStatusBadgeClass(label)}>{label}</span>
-        <button
+        <Button
           aria-label={t(action === "stage" ? "Stage file" : "Unstage file")}
           className="inline-flex size-6 shrink-0 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--default)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-          disabled={gitOperationKey !== null}
-          onClick={(event) => {
-            event.stopPropagation();
+          isDisabled={gitOperationKey !== null}
+          onPress={() => {
             onFileOperation(action, file.path);
           }}
-          title={t(action === "stage" ? "Stage file" : "Unstage file")}
           type="button"
         >
           {isActionLoading ? (
@@ -2825,17 +2831,15 @@ function GitFileRow({
           ) : (
             <Minus aria-hidden="true" className="size-3.5" />
           )}
-        </button>
+        </Button>
         {showDiscard ? (
-          <button
+          <Button
             aria-label={t("Discard file changes")}
             className="inline-flex size-6 shrink-0 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-            disabled={gitOperationKey !== null}
-            onClick={(event) => {
-              event.stopPropagation();
+            isDisabled={gitOperationKey !== null}
+            onPress={() => {
               onFileOperation("discard", file.path);
             }}
-            title={t("Discard file changes")}
             type="button"
           >
             {isDiscardLoading ? (
@@ -2843,7 +2847,7 @@ function GitFileRow({
             ) : (
               <Undo2 aria-hidden="true" className="size-3.5" />
             )}
-          </button>
+          </Button>
         ) : null}
       </div>
       {isExpanded ? (

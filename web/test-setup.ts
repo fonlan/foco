@@ -91,6 +91,13 @@ Object.defineProperty(window.HTMLElement.prototype, "scrollIntoView", {
   value: vi.fn(),
 });
 
+// HeroUI Tabs checks shared-element animations while changing panels. jsdom
+// intentionally has no Web Animations API, so model the no-animation path.
+Object.defineProperty(window.Element.prototype, "getAnimations", {
+  configurable: true,
+  value: () => [],
+});
+
 Object.defineProperty(window.HTMLElement.prototype, "setPointerCapture", {
   configurable: true,
   value: vi.fn(),
