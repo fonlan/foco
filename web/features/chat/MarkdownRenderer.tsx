@@ -23,6 +23,7 @@ import remarkMath from "remark-math";
 import type { PluggableList } from "unified";
 
 import { useI18n } from "../../shared/i18n";
+import { Button } from "../../shared/ui";
 import type { MarkdownImageUrlTransform } from "./MarkdownContent";
 
 type MarkdownRendererProps = {
@@ -293,15 +294,13 @@ function CodeBlock({
 
   return (
     <div className="markdown-code-block">
-      <button
+      <Button
         aria-label={label}
         className="markdown-code-copy-button"
-        onClick={() => void copyCode()}
-        title={label}
-        type="button"
+        onPress={() => void copyCode()}
       >
         <Icon aria-hidden="true" size={14} />
-      </button>
+      </Button>
       <pre {...preProps}>{children}</pre>
     </div>
   );

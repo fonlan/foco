@@ -15,6 +15,7 @@ import {
 import { MarkdownContent } from "../chat/MarkdownContent";
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import { Button } from "../../shared/ui";
 
 type AgentTranscriptItem = AgentTranscriptItemView;
 type AgentTranscriptWirePart = ChatMessagePart | {
@@ -492,15 +493,13 @@ export function AgentTranscriptPanel({
     <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
       <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3">
         <div className="flex min-w-0 items-center gap-3">
-          <button
+          <Button
             aria-label={t("Main chat")}
             className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
-            onClick={onOpenMainChat}
-            title={t("Main chat")}
-            type="button"
+            onPress={onOpenMainChat}
           >
             <ArrowLeft aria-hidden="true" className="size-4" />
-          </button>
+          </Button>
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
               <Bot aria-hidden="true" className="size-4 shrink-0 text-[var(--accent-soft-foreground)]" />
@@ -524,19 +523,17 @@ export function AgentTranscriptPanel({
             </div>
           </div>
         </div>
-        <button
+        <Button
           aria-label={t("Refresh")}
           className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-          disabled={loading}
-          onClick={() => void refreshTranscript()}
-          title={t("Refresh")}
-          type="button"
+          isDisabled={loading}
+          onPress={() => void refreshTranscript()}
         >
           <RefreshCw
             aria-hidden="true"
             className={`size-4 ${loading ? "animate-spin" : ""}`}
           />
-        </button>
+        </Button>
       </header>
 
       <div
@@ -586,17 +583,16 @@ export function AgentTranscriptPanel({
 
           {snapshotMatchesChat && instance && items.length && hasMore ? (
             <div className="flex justify-center pt-1">
-              <button
+              <Button
                 className="inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-                disabled={loading}
-                onClick={() => void loadMoreTranscript()}
-                type="button"
+                isDisabled={loading}
+                onPress={() => void loadMoreTranscript()}
               >
                 {loading ? (
                   <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
                 ) : null}
                 {t("Load more")}
-              </button>
+              </Button>
             </div>
           ) : null}
         </div>

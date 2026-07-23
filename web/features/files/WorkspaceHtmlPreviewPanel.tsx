@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PreviewSessionResponse } from "../../api/types";
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import { Button } from "../../shared/ui";
 
 export type OpenHtmlPreviewTab = {
   workspaceId: string;
@@ -82,7 +83,9 @@ export function WorkspaceHtmlPreviewPanel({
   const [iframeReloadKey, setIframeReloadKey] = useState(0);
   const tokenRef = useRef<string | null>(null);
   const generationRef = useRef(0);
+  const translateRef = useRef(t);
   const workspaceIdRef = useRef(tab.workspaceId);
+  translateRef.current = t;
   workspaceIdRef.current = tab.workspaceId;
 
   const releaseSession = useCallback(async (workspaceId: string, token: string) => {
@@ -128,7 +131,7 @@ export function WorkspaceHtmlPreviewPanel({
           tokenRef.current = null;
           setSession(null);
           setError(
-            t(
+            translateRef.current(
               "HTML preview returned an unsafe preview URL. Only *.preview.localhost origins are allowed.",
             ),
           );
@@ -147,11 +150,11 @@ export function WorkspaceHtmlPreviewPanel({
 
         tokenRef.current = null;
         setSession(null);
-        setError(mapPreviewSessionError(errorMessage(requestError), t));
+        setError(mapPreviewSessionError(errorMessage(requestError), translateRef.current));
         setIsLoading(false);
       }
     },
-    [releaseSession, t, tab.path, tab.workspaceId],
+    [releaseSession, tab.path, tab.workspaceId],
   );
 
   useEffect(() => {
@@ -183,19 +186,17 @@ export function WorkspaceHtmlPreviewPanel({
         className="workspace-html-preview-toolbar"
         role="toolbar"
       >
-        <button
+        <Button
           aria-label={t("Refresh HTML preview")}
           className="workspace-file-editor-toolbar-button"
-          disabled={isLoading}
-          onClick={handleRefresh}
-          title={t("Refresh HTML preview")}
-          type="button"
+          isDisabled={isLoading}
+          onPress={handleRefresh}
         >
           <RefreshCw
             aria-hidden="true"
             className={`size-4 ${isLoading ? "animate-spin" : ""}`}
           />
-        </button>
+        </Button>
         <span className="workspace-html-preview-path" title={tab.path}>
           {tab.path}
         </span>
@@ -204,13 +205,12 @@ export function WorkspaceHtmlPreviewPanel({
       {error ? (
         <div className="workspace-html-preview-status workspace-html-preview-status-error">
           <p>{error}</p>
-          <button
+          <Button
             className="workspace-html-preview-retry"
-            onClick={() => void createSession({ recreate: true })}
-            type="button"
+            onPress={() => void createSession({ recreate: true })}
           >
             {t("Retry HTML preview")}
-          </button>
+          </Button>
         </div>
       ) : null}
 

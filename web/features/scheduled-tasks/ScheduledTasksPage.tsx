@@ -44,6 +44,7 @@ import type {
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 import {
+  Drawer,
   SettingsButton,
   SettingsInput,
   SettingsSelect,
@@ -1104,20 +1105,13 @@ function ScheduledTaskDrawer({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)]">
-      <SettingsButton
-        aria-label={t("Close scheduled task editor backdrop")}
-        className="absolute inset-0 cursor-default"
-        onClick={onClose}
-        type="button"
-      />
-      <form
+    <Drawer.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
+      <Drawer.Content placement="right">
+      <Drawer.Dialog
         aria-label={t("Scheduled task editor")}
-        aria-modal="true"
         className="panel-scroll relative h-full w-full max-w-2xl overflow-y-auto bg-[var(--surface)] shadow-2xl"
-        onSubmit={(event) => void saveTask(event)}
-        role="dialog"
       >
+      <form onSubmit={(event) => void saveTask(event)}>
         <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-4">
           <div>
             <h3 className="text-base font-semibold text-[var(--foreground)]">
@@ -1404,7 +1398,9 @@ function ScheduledTaskDrawer({
           </SettingsButton>
         </div>
       </form>
-    </div>
+      </Drawer.Dialog>
+      </Drawer.Content>
+    </Drawer.Backdrop>
   );
 }
 

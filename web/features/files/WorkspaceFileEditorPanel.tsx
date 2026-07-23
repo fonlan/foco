@@ -26,6 +26,7 @@ import type * as Monaco from "monaco-editor";
 import { MarkdownContent } from "../chat/MarkdownContent";
 import { errorMessage } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import { Button, Modal } from "../../shared/ui";
 
 export type OpenFileTab = {
   workspaceId: string;
@@ -501,41 +502,38 @@ function MonacoFileEditor({
         </div>
       ) : null}
       {isReloadConfirmOpen ? (
-        <div className="workspace-file-reload-dialog-backdrop">
-          <div
-            aria-describedby={reloadConfirmDescriptionId}
-            aria-labelledby={reloadConfirmTitleId}
-            aria-modal="true"
-            className="workspace-file-reload-dialog"
-            role="dialog"
-          >
-            <h2 id={reloadConfirmTitleId}>{t("Reload file")}</h2>
-            <p id={reloadConfirmDescriptionId}>{t("Save changes before reloading this file?")}</p>
-            <div className="workspace-file-reload-dialog-actions">
-              <button
+        <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && void handleReloadConfirm("cancel")}>
+          <Modal.Container placement="center" size="sm">
+            <Modal.Dialog aria-describedby={reloadConfirmDescriptionId} aria-labelledby={reloadConfirmTitleId} className="workspace-file-reload-dialog">
+              <Modal.Header>
+                <Modal.Heading id={reloadConfirmTitleId}>{t("Reload file")}</Modal.Heading>
+              </Modal.Header>
+              <Modal.Body>
+                <p id={reloadConfirmDescriptionId}>{t("Save changes before reloading this file?")}</p>
+              </Modal.Body>
+              <Modal.Footer className="workspace-file-reload-dialog-actions">
+              <Button
                 className="rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white hover:bg-[var(--foreground)]"
-                onClick={() => void handleReloadConfirm("save")}
-                type="button"
+                onPress={() => void handleReloadConfirm("save")}
               >
                 {t("Yes")}
-              </button>
-              <button
+              </Button>
+              <Button
                 className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
-                onClick={() => void handleReloadConfirm("discard")}
-                type="button"
+                onPress={() => void handleReloadConfirm("discard")}
               >
                 {t("No")}
-              </button>
-              <button
+              </Button>
+              <Button
                 className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
-                onClick={() => void handleReloadConfirm("cancel")}
-                type="button"
+                onPress={() => void handleReloadConfirm("cancel")}
               >
                 {t("Cancel")}
-              </button>
-            </div>
-          </div>
-        </div>
+              </Button>
+              </Modal.Footer>
+            </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
       ) : null}
     </div>
   );
@@ -555,17 +553,15 @@ function EditorToolbarButton({
   onClick: () => void;
 }) {
   return (
-    <button
+    <Button
       aria-label={label}
       aria-pressed={isActive || undefined}
       className={`workspace-file-editor-toolbar-button ${isActive ? "workspace-file-editor-toolbar-button-active" : ""}`}
-      disabled={disabled}
-      onClick={onClick}
-      title={label}
-      type="button"
+      isDisabled={disabled}
+      onPress={onClick}
     >
       <Icon aria-hidden="true" className="size-4" />
-    </button>
+    </Button>
   );
 }
 

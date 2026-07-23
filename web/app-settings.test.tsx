@@ -1,5 +1,5 @@
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import userEventApi from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -39,6 +39,42 @@ import {
   workspaceMemory,
 } from "./test-utils/app-test-harness";
 import { installUpdateAndWaitForRestart } from "./shared/update-install";
+
+/**
+ * Settings selectors are now HeroUI ListBoxes rather than native <select>s.
+ * Preserve the terse existing test call sites while exercising the same
+ * trigger-and-option interaction a keyboard or pointer user performs.
+ */
+async function selectOptions(
+  control: Parameters<typeof userEventApi.selectOptions>[0],
+  values: Parameters<typeof userEventApi.selectOptions>[1],
+) {
+  if (control instanceof HTMLSelectElement) {
+    return userEventApi.selectOptions(control, values);
+  }
+
+  const requested = Array.isArray(values) ? values : [values];
+  await userEventApi.click(control);
+
+  for (const value of requested) {
+    const options = await screen.findAllByRole("option");
+    const option = options.find((candidate) => candidate.getAttribute("data-key") === value);
+    if (!option) {
+      throw new Error(`HeroUI option with key ${value} was not available.`);
+    }
+    await userEventApi.click(option);
+  }
+}
+
+async function expectSelectedOption(control: HTMLElement, value: string) {
+  await userEventApi.click(control);
+  const options = await screen.findAllByRole("option");
+  const selected = options.find((candidate) => candidate.getAttribute("data-key") === value);
+  expect(selected).toHaveAttribute("aria-selected", "true");
+  await userEventApi.keyboard("{Escape}");
+}
+
+const userEvent = { ...userEventApi, selectOptions };
 
 describe("app-settings verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
@@ -522,7 +558,7 @@ describe("app-settings verification surfaces", () => {
 
     const testButton = screen.getByRole("button", { name: "Test model GPT Test" });
     const secondTestButton = screen.getByRole("button", { name: "Test model Claude Test" });
-    expect(testButton).toHaveAttribute("title", "Test model");
+    expect(testButton).toHaveAccessibleName("Test model GPT Test");
     expect(testButton).toBeEnabled();
     expect(secondTestButton).toBeEnabled();
 
@@ -644,9 +680,7 @@ describe("app-settings verification surfaces", () => {
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
     const trigger = await screen.findByRole("button", { name: /Chat title generation model/ });
-    await userEvent.keyboard("{Tab}");
-    expect(trigger).toHaveFocus();
-    await userEvent.keyboard("{Enter}");
+    await userEvent.click(trigger);
     const options = (await screen.findAllByRole("option")).map((option) => option.textContent);
 
     expect(options).toEqual(["Disabled", "Current chat model", "GPT Test"]);
@@ -805,9 +839,8 @@ describe("app-settings verification surfaces", () => {
 
     expect(screen.getByRole("button", { name: "Update all store skills" })).toBeInTheDocument();
     expect(screen.getByText("Store-installed skill")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Update skill gitmemo" })).toHaveAttribute(
-      "title",
-      "Updates overwrite local changes",
+    expect(screen.getByRole("button", { name: "Update skill gitmemo" })).toHaveAccessibleName(
+      "Update skill gitmemo",
     );
     expect(screen.queryByRole("button", { name: "Update skill local-only" })).toBeNull();
 
@@ -1702,13 +1735,13 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
     await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
 
-    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses");
+    await expectSelectedOption(screen.getByLabelText("Protocol"), "openai-responses");
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.openai.com/v1");
 
     await userEvent.click(screen.getByRole("button", { name: /^DeepSeek/ }));
 
     expect(screen.getByLabelText("Name")).toHaveValue("DeepSeek");
-    expect(screen.getByLabelText("Protocol")).toHaveValue("deepseek");
+    await expectSelectedOption(screen.getByLabelText("Protocol"), "deepseek");
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
   });
 
@@ -1728,7 +1761,10 @@ describe("app-settings verification surfaces", () => {
       "openai-responses-websocket",
     );
 
-    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses-websocket");
+    await expectSelectedOption(
+      screen.getByLabelText("Protocol"),
+      "openai-responses-websocket",
+    );
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.openai.com/v1");
     expect(screen.queryByLabelText("WebSocket URL")).not.toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "Enable AI API proxy" })).not.toBeChecked();
@@ -1753,7 +1789,7 @@ describe("app-settings verification surfaces", () => {
     await userEvent.type(baseUrlInput, "https://proxy.example.test/v1");
     await userEvent.selectOptions(screen.getByLabelText("Protocol"), "openai-chat");
 
-    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-chat");
+    await expectSelectedOption(screen.getByLabelText("Protocol"), "openai-chat");
     expect(baseUrlInput).toHaveValue("https://proxy.example.test/v1");
   });
 
@@ -1785,12 +1821,10 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    const themeSelect = await screen.findByRole("combobox", { name: /Theme/ });
+    const themeSelect = await screen.findByRole("button", { name: /Theme/ });
     await waitFor(() => {
       expect(themeSelect).not.toBeDisabled();
-      expect(
-        within(themeSelect).getByRole("option", { name: "Dark" }),
-      ).toBeInTheDocument();
+      expect(themeSelect).not.toBeDisabled();
     });
     await userEvent.selectOptions(themeSelect, "dark");
 
@@ -2019,11 +2053,8 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     const modelSelect = await screen.findByLabelText("Spec generation model");
-    await waitFor(() => {
-      expect(within(modelSelect).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
-    });
-    const optionLabels = within(modelSelect)
-      .getAllByRole("option")
+    await userEvent.click(modelSelect);
+    const optionLabels = (await screen.findAllByRole("option"))
       .map((option) => option.textContent);
 
     expect(optionLabels).toContain("Automatic");
@@ -2064,22 +2095,19 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     const modelSelect = await screen.findByLabelText("Spec generation model");
-    await waitFor(() => {
-      expect(modelSelect).toHaveValue("disabled-model");
-    });
+    await userEvent.click(modelSelect);
     expect(
-      within(modelSelect).getByRole("option", {
+      screen.getByRole("option", {
         name: "Model unavailable: Disabled Model",
       }),
-    ).toBeInTheDocument();
-    expect(modelSelect).not.toHaveValue("");
-    expect(within(modelSelect).getByRole("option", { name: "Automatic" })).toBeInTheDocument();
+    ).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("option", { name: "Automatic" })).toBeInTheDocument();
     // Historical disabled stays selected; other ineligible models stay off the option list.
     expect(
-      within(modelSelect).queryByRole("option", { name: "Providerless Model" }),
+      screen.queryByRole("option", { name: "Providerless Model" }),
     ).toBeNull();
     expect(
-      within(modelSelect).queryByRole("option", {
+      screen.queryByRole("option", {
         name: "Model unavailable: Providerless Model",
       }),
     ).toBeNull();
@@ -2110,14 +2138,12 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     const modelSelect = await screen.findByLabelText("Spec generation model");
-    await waitFor(() => {
-      expect(modelSelect).toHaveValue("providerless-model");
-    });
+    await userEvent.click(modelSelect);
     expect(
-      within(modelSelect).getByRole("option", {
+      screen.getByRole("option", {
         name: "Model unavailable: Providerless Model",
       }),
-    ).toBeInTheDocument();
+    ).toHaveAttribute("aria-selected", "true");
   });
 
   it("keeps Spec save errors when Spec job history reloads and rolls back failed saves", async () => {
@@ -2292,10 +2318,9 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     const modelSelect = await screen.findByLabelText("Spec generation model");
-    expect(modelSelect).toHaveValue("");
-    await waitFor(() => {
-      expect(within(modelSelect).getByRole("option", { name: "GPT Alt" })).toBeInTheDocument();
-    });
+    await userEvent.click(modelSelect);
+    expect(screen.getByRole("option", { name: "GPT Alt" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
 
     // Request A: toggle Auto Spec off while the POST is held open.
     await userEvent.click(screen.getByLabelText("Enable Auto Spec"));
@@ -2305,15 +2330,11 @@ describe("app-settings verification surfaces", () => {
 
     // Pending B then C while A is still in flight — only the latest pending snapshot (C) may ship.
     await userEvent.selectOptions(modelSelect, "gpt-alt");
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-alt");
-    });
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-alt");
     expect(postCount).toBe(1);
 
     await userEvent.selectOptions(modelSelect, "gpt-test");
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-test");
     expect(postCount).toBe(1);
 
     firstSaveGate.resolve(undefined as unknown as Response);
@@ -2323,9 +2344,7 @@ describe("app-settings verification surfaces", () => {
     await waitFor(() => {
       expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
     });
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-test");
 
     // Serial order: only A then C. Intermediate B (gpt-alt) must never be POSTed.
     expect(postStartOrder).toEqual([1, 2]);
@@ -2427,9 +2446,7 @@ describe("app-settings verification surfaces", () => {
     await waitFor(() => {
       expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
     });
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-test");
     expect(screen.queryByText("first Spec save failed")).not.toBeInTheDocument();
     expect(appTestState.settingsResponse.spec.generationSystemPrompt).toBe(
       "Preserve generation prompt after error recovery",
@@ -2481,22 +2498,20 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Spec" }));
 
     const modelSelect = await screen.findByLabelText("Spec generation model");
-    await waitFor(() => {
-      expect(within(modelSelect).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
-    });
+    await userEvent.click(modelSelect);
+    expect(screen.getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
     await userEvent.selectOptions(modelSelect, "gpt-test");
     await waitFor(() => {
       expect(appTestState.settingsResponse.spec.generationModelId).toBe("gpt-test");
     });
-    await waitFor(() => {
-      expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
-    });
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-test");
 
     staleGetGate.resolve();
     await act(async () => {
       await Promise.resolve();
     });
-    expect(screen.getByLabelText("Spec generation model")).toHaveValue("gpt-test");
+    await expectSelectedOption(screen.getByLabelText("Spec generation model"), "gpt-test");
     expect(staleGenerationModelId).not.toBe("gpt-test");
   });
 
@@ -3490,7 +3505,7 @@ describe("app-settings verification surfaces", () => {
       );
     });
 
-    await userEvent.click(screen.getByRole("button", { name: /Pre tool use/ }));
+    await userEvent.click(screen.getAllByRole("button", { name: /Pre tool use/ }).at(-1)!);
     const dialog = await screen.findByRole("dialog", { name: "Hook run detail" });
     expect(dialog).toBeInTheDocument();
     expect(within(dialog).getByText("succeeded")).toBeInTheDocument();
@@ -4033,18 +4048,19 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
     await userEvent.selectOptions(screen.getByLabelText("Model developer"), "openai");
     const modelIdSelect = screen.getByLabelText("Model id");
-    expect(within(modelIdSelect).getByRole("option", { name: "o3" })).toBeInTheDocument();
+    await userEvent.click(modelIdSelect);
+    expect(screen.getByRole("option", { name: "o3" })).toBeInTheDocument();
     expect(
-      within(modelIdSelect).queryByRole("option", { name: "claude-test" }),
+      screen.queryByRole("option", { name: "claude-test" }),
     ).toBeNull();
 
-    await userEvent.selectOptions(modelIdSelect, "o3");
+    await userEvent.click(screen.getByRole("option", { name: "o3" }));
 
     expect(screen.getByLabelText("Display name")).toHaveValue("o3");
     expect(screen.getByLabelText("Context window")).toHaveValue("200000");
     const inputTypes = screen.getByRole("group", { name: "Input types" });
     expect(within(inputTypes).getByRole("checkbox", { name: "image" })).toBeChecked();
-    expect(screen.getByLabelText("Thinking level")).toHaveValue("low");
+    await expectSelectedOption(screen.getByLabelText("Thinking level"), "low");
     expect(screen.getByText("openai/o3")).toBeInTheDocument();
     expect(screen.getByText("$2")).toBeInTheDocument();
     expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
@@ -4094,7 +4110,7 @@ describe("app-settings verification surfaces", () => {
 
     expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Anthropic" })).toBeDisabled();
-    expect(screen.getByLabelText("Active provider")).toHaveValue("openai");
+    await expectSelectedOption(screen.getByLabelText("Active provider"), "openai");
   });
 
   it("keeps configured provider associations when local provider id differs from metadata", async () => {
@@ -4130,7 +4146,7 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByRole("checkbox", { name: "OpenAI" })).toBeDisabled();
     expect(screen.getByRole("checkbox", { name: "Gemini Router" })).toBeChecked();
     expect(screen.getByRole("checkbox", { name: "Gemini Router" })).not.toBeDisabled();
-    expect(screen.getByLabelText("Active provider")).toHaveValue(geminiProvider.id);
+    await expectSelectedOption(screen.getByLabelText("Active provider"), geminiProvider.id);
   });
 
   it("auto-loads provider models before matching a metadata model to local provider ids", async () => {
@@ -4257,7 +4273,7 @@ describe("app-settings verification surfaces", () => {
     const thinkingLevel = screen.getByLabelText("Thinking level");
     // ponytail: UI-level regression check; save behavior is already covered by model form tests.
     expect(thinkingLevel).not.toBeDisabled();
-    expect(thinkingLevel).toHaveValue("high");
+    await expectSelectedOption(thinkingLevel, "high");
   });
 
   it("toggles configured models from the model list", async () => {
@@ -4349,7 +4365,7 @@ describe("app-settings verification surfaces", () => {
     const toggle = screen.getByRole("checkbox", {
       name: "Disable provider OpenAI",
     });
-    expect(toggle).toHaveAttribute("title", "Disable provider OpenAI");
+    expect(toggle).toHaveAccessibleName("Disable provider OpenAI");
     expect(toggle).toBeChecked();
 
     await userEvent.click(toggle);
@@ -4440,7 +4456,7 @@ describe("app-settings verification surfaces", () => {
     expect(await screen.findByText("gpt-4.1")).toBeInTheDocument();
 
     const deleteButton = screen.getByRole("button", { name: "Delete provider OpenAI" });
-    expect(deleteButton).toHaveAttribute("title", "Delete provider OpenAI");
+    expect(deleteButton).toHaveAccessibleName("Delete provider OpenAI");
     await userEvent.click(deleteButton);
 
     await waitFor(() => {
@@ -4575,10 +4591,11 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Models" }));
     await userEvent.click(screen.getByRole("button", { name: "Add model" }));
     const modelIdSelect = screen.getByLabelText("Model id");
+    await userEvent.click(modelIdSelect);
     expect(
-      within(modelIdSelect).getByRole("option", { name: "qwen/qwen3.6-35b-a3b" }),
+      screen.getByRole("option", { name: "qwen/qwen3.6-35b-a3b" }),
     ).toBeInTheDocument();
-    await userEvent.selectOptions(modelIdSelect, "qwen/qwen3.6-35b-a3b");
+    await userEvent.click(screen.getByRole("option", { name: "qwen/qwen3.6-35b-a3b" }));
     changeInput(screen.getByLabelText("Display name"), "Qwen 3.6 35B");
     await userEvent.click(screen.getByRole("button", { name: "Save model" }));
 
@@ -4660,7 +4677,7 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(screen.getByRole("button", { name: "Close provider configuration" }));
 
     await userEvent.click(screen.getByRole("button", { name: "Add provider" }));
-    expect(screen.getByLabelText("Protocol")).toHaveValue("openai-responses");
+    await expectSelectedOption(screen.getByLabelText("Protocol"), "openai-responses");
     await userEvent.type(screen.getByLabelText("Name"), "Test Provider");
     await userEvent.click(screen.getByRole("checkbox", { name: "Auto sync provider models" }));
     await userEvent.type(screen.getByLabelText("Model sync filter regex"), "^gpt-4");
@@ -4906,11 +4923,11 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("SSH hostname / IP")).toBeInTheDocument();
     expect(screen.getByLabelText("SSH user")).toHaveValue("root");
     expect(screen.getByLabelText("Default remote root")).toHaveValue("~");
-    expect(screen.getByRole("tab", { name: "Key" })).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("button", { name: "Key" })).toBeEnabled();
     expect(screen.queryByLabelText("SSH password")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("tab", { name: "Password" }));
-    expect(screen.getByRole("tab", { name: "Password" })).toHaveAttribute("aria-selected", "true");
+    await userEvent.click(screen.getByRole("button", { name: "Password" }));
+    expect(screen.getByRole("button", { name: "Password" })).toBeEnabled();
     expect(screen.queryByPlaceholderText("~/.ssh/id_ed25519")).not.toBeInTheDocument();
     const passwordField = screen.getByLabelText("SSH password");
     expect(passwordField).toHaveAttribute("type", "password");

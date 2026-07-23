@@ -3,7 +3,6 @@ import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { Play, Plus, Terminal, X } from "lucide-react";
 import {
-  MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
   useRef,
@@ -21,6 +20,7 @@ import type {
   WorkspaceSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import { Button, Dropdown, Label } from "../../shared/ui";
 import { fallbackTerminalInputForKeyEvent } from "./terminal-key-events";
 
 /** Project-scoped CSS family for the bundled Cascadia Mono PL Regular face. */
@@ -62,8 +62,6 @@ function TerminalCommandButton({
   onRun: (command: WorkspaceCommonCommandSummary) => void;
 }) {
   const { t } = useI18n();
-  const detailsRef = useCloseDetailsOnOutsidePointerDown();
-
   if (!commands.length) {
     return null;
   }
@@ -71,60 +69,47 @@ function TerminalCommandButton({
   if (commands.length === 1) {
     const command = commands[0];
     return (
-      <button
+      <Button
         aria-label={t("Run common command {name}", { name: command.name })}
         className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
-        disabled={disabled}
-        onClick={() => onRun(command)}
-        title={t("Run common command {name}", { name: command.name })}
-        type="button"
+        isDisabled={disabled}
+        onPress={() => onRun(command)}
       >
         <Play aria-hidden="true" className="size-3.5 fill-current" />
-      </button>
+      </Button>
     );
   }
 
-  function handleSelect(
-    command: WorkspaceCommonCommandSummary,
-    event: ReactMouseEvent<HTMLButtonElement>,
-  ) {
-    event.currentTarget.closest("details")?.removeAttribute("open");
-    onRun(command);
-  }
-
   return (
-    <details className="relative" ref={detailsRef}>
-      <summary
-        aria-disabled={disabled}
+    <Dropdown>
+      <Button
+        isDisabled={disabled}
         aria-label={t("Run common command")}
-        className={`inline-flex size-6 cursor-pointer list-none items-center justify-center rounded-md text-[var(--muted)] outline-none marker:hidden focus-visible:ring-2 focus-visible:ring-[var(--focus)] [&::-webkit-details-marker]:hidden ${disabled
-            ? "pointer-events-none text-[var(--muted)]"
-            : "hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-          }`}
-        title={t("Run common command")}
+        className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
       >
         <Play aria-hidden="true" className="size-3.5 fill-current" />
-      </summary>
-      <div className="absolute right-0 top-full z-30 mt-2 w-56 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
-        <div className="panel-scroll max-h-56 overflow-y-auto py-1">
+      </Button>
+      <Dropdown.Popover className="w-56">
+        <Dropdown.Menu
+          aria-label={t("Run common command")}
+          onAction={(key) => onRun(commands[Number(key)])}
+        >
           {commands.map((command, index) => (
-            <button
-              aria-label={t("Run common command {name}", { name: command.name })}
-              className="flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-xs font-semibold text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
+            <Dropdown.Item
+              id={String(index)}
               key={`${command.name}-${index}`}
-              onClick={(event) => handleSelect(command, event)}
-              type="button"
+              textValue={t("Run common command {name}", { name: command.name })}
             >
               <Play
                 aria-hidden="true"
                 className="size-3.5 shrink-0 fill-current text-[var(--accent-soft-foreground)]"
               />
-              <span className="min-w-0 flex-1 truncate">{command.name}</span>
-            </button>
+              <Label>{command.name}</Label>
+            </Dropdown.Item>
           ))}
-        </div>
-      </div>
-    </details>
+        </Dropdown.Menu>
+      </Dropdown.Popover>
+    </Dropdown>
   );
 }
 
@@ -317,24 +302,20 @@ export function TerminalPanel({
                 disabled={!activeSession || !isTerminalConnected(activeSession.status)}
                 onRun={runWorkspaceCommonCommand}
               />
-              <button
+              <Button
                 aria-label={t("New terminal")}
                 className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-                onClick={createSession}
-                title={t("New terminal")}
-                type="button"
+                onPress={createSession}
               >
                 <Plus aria-hidden="true" className="size-3.5" />
-              </button>
-              <button
+              </Button>
+              <Button
                 aria-label={t("Close terminal")}
                 className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                onClick={onClose}
-                title={t("Close terminal")}
-                type="button"
+                onPress={onClose}
               >
                 <X aria-hidden="true" className="size-3.5" />
-              </button>
+              </Button>
             </span>
           </div>
           <div className="relative min-h-0 flex-1">
@@ -365,10 +346,9 @@ export function TerminalPanel({
                   }`}
                 key={session.clientId}
               >
-                <button
+                <Button
                   className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
-                  onClick={() => setActiveClientId(session.clientId)}
-                  type="button"
+                  onPress={() => setActiveClientId(session.clientId)}
                 >
                   <span
                     aria-label={terminalStatusText(session.status, t)}
@@ -386,18 +366,16 @@ export function TerminalPanel({
                       {session.cwd || workspacePath}
                     </span>
                   </span>
-                </button>
-                <button
+                </Button>
+                <Button
                   aria-label={t("Close terminal {number}", {
                     number: session.number,
                   })}
                   className="mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-                  onClick={() => closeSession(session.clientId)}
-                  title={t("Close terminal {number}", { number: session.number })}
-                  type="button"
+                  onPress={() => closeSession(session.clientId)}
                 >
                   <X aria-hidden="true" className="size-3.5" />
-                </button>
+                </Button>
               </div>
             ))}
           </aside>
@@ -722,29 +700,6 @@ function quotePosixSingle(value: string) {
   return value.replaceAll("'", "'\\''");
 }
 
-function useCloseDetailsOnOutsidePointerDown() {
-  const detailsRef = useRef<HTMLDetailsElement | null>(null);
-
-  useEffect(() => {
-    function handlePointerDown(event: PointerEvent) {
-      const details = detailsRef.current;
-      if (!details?.open) {
-        return;
-      }
-      const target = event.target;
-      if (!(target instanceof Node) || details.contains(target)) {
-        return;
-      }
-      details.removeAttribute("open");
-    }
-
-    window.addEventListener("pointerdown", handlePointerDown);
-    return () => window.removeEventListener("pointerdown", handlePointerDown);
-  }, []);
-
-  return detailsRef;
-}
-
 function terminalStatusText(
   status: "closed" | "connected" | "connecting" | "error",
   t: Translate,
@@ -816,6 +771,3 @@ function isTerminalServerEvent(value: unknown): value is TerminalServerEvent {
 
   return false;
 }
-
-
-

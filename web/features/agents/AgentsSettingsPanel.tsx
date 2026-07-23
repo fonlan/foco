@@ -18,6 +18,7 @@ import type {
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
 import {
+  Modal,
   SettingsButton,
   SettingsInput,
   SettingsSelect,
@@ -347,23 +348,13 @@ export function AgentsSettingsPanel({
       </div>
 
       {dialogMode ? (
-        <div
-          aria-label={t("Close agent dialog backdrop")}
-          className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[color-mix(in_oklab,var(--foreground)_35%,transparent)] p-4 backdrop-blur-sm"
-          onMouseDown={(event) => {
-            if (event.target === event.currentTarget) {
-              closeDialog();
-            }
-          }}
-          role="presentation"
-        >
-          <form
+        <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && closeDialog()}>
+          <Modal.Container placement="center" size="lg">
+          <Modal.Dialog
             aria-label={dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
-            aria-modal="true"
             className="my-auto w-[min(94vw,52rem)] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--overlay-shadow)]"
-            onSubmit={(event) => void submitDefinition(event)}
-            role="dialog"
           >
+          <form onSubmit={(event) => void submitDefinition(event)}>
             <div className="flex items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2">
                 {dialogMode === "edit" ? (
@@ -574,7 +565,9 @@ export function AgentsSettingsPanel({
               </SettingsButton>
             </div>
           </form>
-        </div>
+          </Modal.Dialog>
+          </Modal.Container>
+        </Modal.Backdrop>
       ) : null}
     </section>
   );

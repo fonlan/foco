@@ -15,53 +15,71 @@ const workspaceRoot = basename(process.cwd()) === "web"
   ? resolve(process.cwd(), "..")
   : process.cwd();
 const root = resolve(workspaceRoot, "web");
-const productionDirectoryNames = new Set(["__tests__", "dist", "node_modules", "test-utils"]);
+const productionDirectoryNames = new Set([".mem", "__tests__", "dist", "node_modules", "test-utils"]);
 
-const targetFor = (kind, inputType, exceptionKind) => {
-  if (exceptionKind === "native-form-submit") {
+/**
+ * The only native production controls permitted by the migration contract.
+ * An entry is valid only at its named file, for its named element, and with the
+ * matching data-heroui-exception marker. This prevents a future native control
+ * from bypassing the guard simply by copying an exception attribute.
+ */
+const writtenExceptions = {
+  "native-file-input": {
+    file: "web/shared/ui/settings-controls.tsx",
+    kind: "input",
+    inputType: "file",
+    target: "browser file input (written exception)",
+    reason: "Browser file selection requires an actual input[type=file].",
+    owner: "The visible trigger remains a HeroUI Button; the input stays labelled and hidden.",
+    removal: "Remove when HeroUI offers an equivalent browser-file capability.",
+  },
+  "native-form-submit": {
+    file: "web/features/chat/ChatPanel.tsx",
+    kind: "button",
+    target: "native form submit (written exception)",
+    reason: "Modifier-aware queueing must preserve the native form submit event and submitter.",
+    owner: "The button remains labelled and keeps the existing Ctrl queue and normal submit behavior.",
+    removal: "Remove when HeroUI Button can preserve the same native submitter and modifier semantics.",
+  },
+  "native-plan-drag": {
+    file: "web/features/context/ContextPanel.tsx",
+    kind: "button",
+    target: "native plan drag handle (written exception)",
+    reason: "Plan ordering depends on native draggable and DragEvent dataTransfer semantics.",
+    owner: "The handle remains labelled and is only used for pointer drag/reorder; selection and actions use HeroUI controls.",
+    removal: "Remove when HeroUI Button exposes draggable and typed drag handlers without changing the reorder flow.",
+  },
+  "native-chat-tab": {
+    file: "web/App.tsx",
+    kind: "button",
+    target: "native composite chat tab (written exception)",
+    reason: "The tab must retain its established tab role, title, custom scroll behavior, context menu, and a separate close action.",
+    owner: "The selectable tab remains keyboard-addressable; adjacent scrolling and close controls use HeroUI Button.",
+    removal: "Remove when HeroUI Tabs supports this composite closable-tab anatomy without nested interactive controls.",
+  },
+};
+
+const targetFor = (file, kind, inputType, exceptionKind) => {
+  const exception = exceptionKind ? writtenExceptions[exceptionKind] : undefined;
+  if (exception) {
+    const matches = exception.file === file && exception.kind === kind && exception.inputType === inputType;
+    if (matches) return { ...exception, status: "exception" };
     return {
-      target: "native form submit (written exception)",
-      status: "exception",
-      reason: "Modifier-aware queueing must preserve the native form submit event and submitter.",
-      owner: "The button remains labelled and keeps the existing Ctrl queue and normal submit behavior.",
-      removal: "Remove when HeroUI Button can preserve the same native submitter and modifier semantics.",
-    };
-  }
-  if (exceptionKind === "native-plan-drag") {
-    return {
-      target: "native plan drag handle (written exception)",
-      status: "exception",
-      reason: "Plan ordering depends on native draggable and DragEvent dataTransfer semantics.",
-      owner: "The handle remains labelled and is only used for pointer drag/reorder; selection and actions use HeroUI controls.",
-      removal: "Remove when HeroUI Button exposes draggable and typed drag handlers without changing the reorder flow.",
-    };
-  }
-  if (exceptionKind === "native-chat-tab") {
-    return {
-      target: "native composite chat tab (written exception)",
-      status: "exception",
-      reason: "The tab must retain its established tab role, title, custom scroll behavior, context menu, and a separate close action.",
-      owner: "The selectable tab remains keyboard-addressable; adjacent scrolling and close controls use HeroUI Button.",
-      removal: "Remove when HeroUI Tabs supports this composite closable-tab anatomy without nested interactive controls.",
+      target: `invalid ${exceptionKind} exception`,
+      status: "migrate",
     };
   }
   if (kind === "button") return { target: "Button", status: "migrate" };
   if (kind === "textarea") return { target: "TextArea", status: "migrate" };
   if (kind === "select") return { target: "Select + ListBox", status: "migrate" };
-  if (kind === "[role=dialog]" || kind === "dialog") {
+  if (kind === "[role=dialog]" || kind === "[aria-modal]" || kind === "dialog") {
     return { target: "Modal", status: "migrate" };
   }
 
-  // Browser file picking still needs the actual file-input element. Its visible
-  // trigger must be HeroUI Button, and the exception ends once HeroUI exposes a
-  // browser-file capability that keeps the same user-agent permission flow.
   if (inputType === "file") {
     return {
-      target: "browser file input (written exception)",
-      status: "exception",
-      reason: "Browser file selection requires an actual input[type=file].",
-      owner: "The visible trigger remains a HeroUI Button; the input stays labelled and hidden.",
-      removal: "Remove when HeroUI offers an equivalent browser-file capability.",
+      target: "documented browser file input exception",
+      status: "migrate",
     };
   }
 
@@ -93,9 +111,26 @@ async function filesIn(directory) {
 }
 
 const rows = [];
+const herouiConsumers = [];
 for (const file of await filesIn(root)) {
   const source = await readFile(file, "utf8");
   const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  const relativeFile = relative(workspaceRoot, file);
+  const importedComponents = sourceFile.statements.flatMap((statement) => {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) return [];
+    if (!statement.moduleSpecifier.text.endsWith("shared/ui")) return [];
+    const bindings = statement.importClause?.namedBindings;
+    if (!bindings) return [];
+    if (ts.isNamespaceImport(bindings)) return ["*"];
+    return bindings.elements.map((specifier) => specifier.name.text);
+  });
+  if (importedComponents.length) {
+    herouiConsumers.push({ file: relativeFile, components: importedComponents.sort() });
+  }
+  const hasAttribute = (attributes, name) =>
+    attributes.properties.some(
+      (property) => ts.isJsxAttribute(property) && property.name.text === name,
+    );
   const attributeValue = (attributes, name) => {
     const attribute = attributes.properties.find(
       (property) => ts.isJsxAttribute(property) && property.name.text === name,
@@ -110,20 +145,23 @@ for (const file of await filesIn(root)) {
       const inputType = element === "input" ? attributeValue(node.attributes, "type")?.toLowerCase() : undefined;
       const exceptionKind = attributeValue(node.attributes, "data-heroui-exception");
       const role = attributeValue(node.attributes, "role");
+      const hasAriaModal = hasAttribute(node.attributes, "aria-modal");
       const kind = ["button", "input", "select", "textarea", "dialog"].includes(element)
         ? element
         : role === "dialog"
           ? "[role=dialog]"
+          : hasAriaModal
+            ? "[aria-modal]"
           : undefined;
 
       if (kind) {
         const line = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1;
         rows.push({
-          file: relative(workspaceRoot, file),
+          file: relativeFile,
           line,
           kind,
           ...(kind === "input" ? { inputType: inputType ?? "text" } : {}),
-          ...targetFor(kind, inputType, exceptionKind),
+          ...targetFor(relativeFile, kind, inputType, exceptionKind),
         });
       }
     }
@@ -143,7 +181,13 @@ console.log("# HeroUI component coverage audit\n");
 console.log(`Native JSX controls: ${rows.length}`);
 console.log(`Mapped for migration: ${rows.filter((row) => row.status === "migrate").length}`);
 console.log(`Written exceptions: ${rows.filter((row) => row.status === "exception").length}\n`);
-console.log("This report maps native JSX only. CSS semantic-token usage is not component coverage.\n");
+console.log("This report is a source-contract guard. CSS semantic-token usage is not component coverage.\n");
+
+console.log("## HeroUI shared-barrel consumers\n");
+for (const consumer of herouiConsumers.sort((a, b) => a.file.localeCompare(b.file))) {
+  console.log(`- ${consumer.file}: ${consumer.components.join(", ")}`);
+}
+console.log("");
 
 for (const [file, fileRows] of [...byFile].sort(([a], [b]) => a.localeCompare(b))) {
   const summary = Object.entries(
@@ -156,10 +200,19 @@ for (const [file, fileRows] of [...byFile].sort(([a], [b]) => a.localeCompare(b)
     const exception = row.status === "exception"
       ? ` — exception: ${row.reason} Accessibility: ${row.owner} Remove: ${row.removal}`
       : "";
-    const source = row.kind === "[role=dialog]"
-      ? "[role=\"dialog\"]"
+    const source = row.kind === "[role=dialog]" || row.kind === "[aria-modal]"
+      ? row.kind === "[aria-modal]" ? "[aria-modal]" : "[role=\"dialog\"]"
       : `<${row.kind}${row.inputType ? ` type=\"${row.inputType}\"` : ""}>`;
     console.log(`- L${row.line}: ${source} → ${row.target}${exception}`);
   }
   console.log("");
+}
+
+const migrationRows = rows.filter((row) => row.status === "migrate");
+if (migrationRows.length) {
+  console.error(
+    `HeroUI source-contract failed: ${migrationRows.length} native control(s) need migration. ` +
+      "Use a shared HeroUI component, or add a narrowly-scoped documented exception to this script.",
+  );
+  process.exitCode = 1;
 }

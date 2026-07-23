@@ -7425,14 +7425,9 @@ export function SettingsPanel({
           {activeSection === "memory" ? (
             <section className="grid gap-4">
               {isMemoryDialogOpen ? (
-                <>
-                  <SettingsButton
-                    aria-label={t("Close memory dialog backdrop")}
-                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
-                    onClick={closeMemoryDialog}
-                    type="button"
-                  />
-                  <form
+                <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && closeMemoryDialog()}>
+                  <Modal.Container placement="center" size={memoryDialogMode === "edit" ? "lg" : "sm"}>
+                  <Modal.Dialog
                     aria-label={
                       memoryDialogMode === "create"
                         ? t("Create memory")
@@ -7440,9 +7435,8 @@ export function SettingsPanel({
                     }
                     className={`fixed left-1/2 top-1/2 z-50 max-h-[88vh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)] ${memoryDialogMode === "edit" ? "w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)]"
                       }`}
-                    onSubmit={(event) => void saveMemoryDialog(event)}
-                    role="dialog"
                   >
+                  <form onSubmit={(event) => void saveMemoryDialog(event)}>
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
@@ -7802,7 +7796,9 @@ export function SettingsPanel({
                       </SettingsButton>
                     </div>
                   </form>
-                </>
+                  </Modal.Dialog>
+                  </Modal.Container>
+                </Modal.Backdrop>
               ) : null}
 
               <form
@@ -8606,18 +8602,11 @@ export function SettingsPanel({
                 </div>
 
                 {memoryDreamDetailJob ? (
-                  <>
-                    <SettingsButton
-                      aria-label={t("Close Dream job details backdrop")}
-                      className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
-                      onClick={closeMemoryDreamDetailDialog}
-                      type="button"
-                    />
-                    <div
+                  <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && closeMemoryDreamDetailDialog()}>
+                    <Modal.Container placement="center" size="lg">
+                    <Modal.Dialog
                       aria-labelledby="memory-dream-detail-title"
-                      aria-modal="true"
                       className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(94vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
-                      role="dialog"
                     >
                       <div className="mb-4 flex items-start justify-between gap-3">
                         <div className="min-w-0">
@@ -8762,8 +8751,9 @@ export function SettingsPanel({
                           ))
                         )}
                       </div>
-                    </div>
-                  </>
+                    </Modal.Dialog>
+                    </Modal.Container>
+                  </Modal.Backdrop>
                 ) : null}
               </section>
 
@@ -9706,18 +9696,11 @@ export function SettingsPanel({
           ) : null}
 
           {activeSection === "workspaces" && pendingDeleteWorkspace ? (
-            <>
-              <SettingsButton
-                aria-label={t("Close workspace delete confirmation backdrop")}
-                className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
-                onClick={() => setPendingDeleteWorkspace(null)}
-                type="button"
-              />
-              <section
+            <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && setPendingDeleteWorkspace(null)}>
+              <Modal.Container placement="center" size="sm">
+              <Modal.Dialog
                 aria-labelledby="delete-workspace-dialog-title"
-                aria-modal="true"
                 className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
-                role="dialog"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
@@ -9769,24 +9752,19 @@ export function SettingsPanel({
                     <span>{t("Delete workspace")}</span>
                   </SettingsButton>
                 </div>
-              </section>
-            </>
+              </Modal.Dialog>
+              </Modal.Container>
+            </Modal.Backdrop>
           ) : null}
 
           {activeSection === "hooks" ? (
             <section className="grid gap-4">
               {hookRunDetail ? (
-                <>
-                  <SettingsButton
-                    aria-label={t("Close hook run detail backdrop")}
-                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
-                    onClick={() => setHookRunDetail(null)}
-                    type="button"
-                  />
-                  <div
+                <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && setHookRunDetail(null)}>
+                  <Modal.Container placement="center" size="lg">
+                  <Modal.Dialog
                     aria-label={t("Hook run detail")}
                     className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,46rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
-                    role="dialog"
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
@@ -9844,8 +9822,9 @@ export function SettingsPanel({
                         </pre>
                       </div>
                     </div>
-                  </div>
-                </>
+                  </Modal.Dialog>
+                  </Modal.Container>
+                </Modal.Backdrop>
               ) : null}
 
               {isHookDialogOpen ? (
@@ -12901,17 +12880,11 @@ export function SettingsPanel({
                 </div>
               </section>
               {updateConfirm ? (
-                <>
-                  <SettingsButton
-                    aria-label={t("Close update dialog backdrop")}
-                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
-                    onClick={() => setUpdateConfirm(null)}
-                    type="button"
-                  />
-                  <section
-                    aria-modal="true"
+                <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && setUpdateConfirm(null)}>
+                  <Modal.Container placement="center" size="sm">
+                  <Modal.Dialog
                     className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
-                    role="dialog"
+                    aria-label={updateConfirm.source === "install" ? t("Update is installing") : t("Update available")}
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
@@ -12962,8 +12935,9 @@ export function SettingsPanel({
                         </SettingsButton>
                       </div>
                     ) : null}
-                  </section>
-                </>
+                  </Modal.Dialog>
+                  </Modal.Container>
+                </Modal.Backdrop>
               ) : null}
             </>
           ) : null}

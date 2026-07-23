@@ -77,10 +77,8 @@ describe("skill store app surface", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Skill Store" }));
     expect(await screen.findAllByText("Browser Scout")).not.toHaveLength(0);
 
-    await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: "Sort skills" }),
-      "name_asc",
-    );
+    await userEvent.click(screen.getByRole("button", { name: /Sort skills/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Name A-Z" }));
 
     await waitFor(() =>
       expect(
@@ -236,7 +234,7 @@ describe("skill store app surface", () => {
     );
 
     const detailPane = await screen.findByRole("region", { name: "Skill details" });
-    const scriptsItem = within(detailPane).getByText("scripts").closest("li");
+    const scriptsItem = (await within(detailPane).findByText("scripts")).closest("li");
     expect(scriptsItem).not.toBeNull();
     expect(within(scriptsItem as HTMLElement).getByText("search.md")).toBeInTheDocument();
     expect(within(detailPane).getByTitle("scripts/search.md")).toBeInTheDocument();

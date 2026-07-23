@@ -52,6 +52,16 @@ import type {
 import { type AiStatsColumnId } from "../../app/constants";
 import { useI18n } from "../../shared/i18n";
 import {
+  Button,
+  Dropdown,
+  Input,
+  Label,
+  ListBox,
+  Modal,
+  Select,
+  TextField,
+} from "../../shared/ui";
+import {
   findVerticalScrollAncestor,
   forwardWheelAtVerticalBoundary,
   wheelDeltaPixels,
@@ -421,15 +431,13 @@ export function ApiStatsPanel({
       id: "details",
       label: t("Details"),
       render: (request) => (
-        <button
+        <Button
           aria-label={t("View request details")}
           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-          onClick={() => void openRequestDetail(request)}
-          title={t("View request details")}
-          type="button"
+          onPress={() => void openRequestDetail(request)}
         >
           <Eye aria-hidden="true" className="size-4" />
-        </button>
+        </Button>
       ),
     },
   ];
@@ -518,33 +526,27 @@ export function ApiStatsPanel({
                 </p>
               </div>
             </div>
-            <button
+            <Button
               aria-label={
                 autoRefreshEnabled
                   ? t("Pause auto refresh")
                   : t("Resume auto refresh")
               }
               className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-              onClick={() => {
+              onPress={() => {
                 if (autoRefreshEnabled) {
                   pauseAutoRefresh();
                 } else {
                   resumeAutoRefresh();
                 }
               }}
-              title={
-                autoRefreshEnabled
-                  ? t("Pause auto refresh")
-                  : t("Resume auto refresh")
-              }
-              type="button"
             >
               {autoRefreshEnabled ? (
                 <Pause aria-hidden="true" className="size-4" />
               ) : (
                 <Play aria-hidden="true" className="size-4" />
               )}
-            </button>
+            </Button>
           </div>
           <div className="mt-4 grid gap-3 border-t border-[var(--border)] pt-4 md:grid-cols-2 xl:grid-cols-8">
             <FilterSelect
@@ -597,36 +599,14 @@ export function ApiStatsPanel({
               placeholder={t("All statuses")}
               value={filters.status}
             />
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-                {t("Started after")}
-              </span>
-              <input
-                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
-                onChange={(event) =>
-                  updateFilters({
-                    startedAfter: event.target.value,
-                  })
-                }
-                type="datetime-local"
-                value={filters.startedAfter}
-              />
-            </label>
-            <label className="block">
-              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-                {t("Started before")}
-              </span>
-              <input
-                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
-                onChange={(event) =>
-                  updateFilters({
-                    startedBefore: event.target.value,
-                  })
-                }
-                type="datetime-local"
-                value={filters.startedBefore}
-              />
-            </label>
+            <TextField className="block" value={filters.startedAfter} onChange={(startedAfter) => updateFilters({ startedAfter })}>
+              <Label className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{t("Started after")}</Label>
+              <Input className="h-10 w-full" type="datetime-local" />
+            </TextField>
+            <TextField className="block" value={filters.startedBefore} onChange={(startedBefore) => updateFilters({ startedBefore })}>
+              <Label className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{t("Started before")}</Label>
+              <Input className="h-10 w-full" type="datetime-local" />
+            </TextField>
           </div>
         </section>
 
@@ -728,32 +708,33 @@ export function ApiStatsPanel({
                 {t("Output tokens")}:{" "}
                 {formatCompactNumber(totalOutputTokens, language)}
               </div>
-              <details className="relative">
-                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] [&::-webkit-details-marker]:hidden">
+              <Dropdown>
+                <Button
+                  aria-label={t("Choose visible columns")}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                >
                   <SlidersHorizontal aria-hidden="true" className="size-4" />
                   {t("Columns")}
-                </summary>
-                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 shadow-[var(--overlay-shadow)]">
-                  {aiStatsColumns.map((column) => (
-                    <label
-                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
-                      key={column.id}
-                    >
-                      <input
-                        checked={visibleColumnIds.has(column.id)}
-                        className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
-                        disabled={
-                          visibleColumnIds.has(column.id) &&
-                          visibleColumnIds.size === 1
-                        }
-                        onChange={() => toggleAiStatsColumn(column.id)}
-                        type="checkbox"
-                      />
-                      <span className="min-w-0 truncate">{column.label}</span>
-                    </label>
-                  ))}
-                </div>
-              </details>
+                </Button>
+                <Dropdown.Popover className="w-56">
+                  <Dropdown.Menu
+                    aria-label={t("Choose visible columns")}
+                    onAction={(key) => toggleAiStatsColumn(String(key) as AiStatsColumnId)}
+                  >
+                    {aiStatsColumns.map((column) => (
+                      <Dropdown.Item
+                        id={column.id}
+                        isDisabled={visibleColumnIds.has(column.id) && visibleColumnIds.size === 1}
+                        key={column.id}
+                        textValue={column.label}
+                      >
+                        <Label>{column.label}</Label>
+                        {visibleColumnIds.has(column.id) ? <CheckCircle2 aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" /> : null}
+                      </Dropdown.Item>
+                    ))}
+                  </Dropdown.Menu>
+                </Dropdown.Popover>
+              </Dropdown>
             </div>
           </div>
 
@@ -815,33 +796,22 @@ export function ApiStatsPanel({
               })}
             </div>
             <div className="flex flex-wrap items-center justify-end gap-3">
-              <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
-                <span>{t("Page size")}</span>
-                <input
-                  className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
-                  max={500}
-                  min={1}
-                  onChange={(event) =>
-                    updateFilters({ pageSize: event.target.value })
-                  }
-                  type="number"
-                  value={filters.pageSize}
-                />
-              </label>
+              <TextField className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]" value={filters.pageSize} onChange={(pageSize) => updateFilters({ pageSize })}>
+                <Label>{t("Page size")}</Label>
+                <Input className="h-9 w-20" max={500} min={1} type="number" />
+              </TextField>
               <nav
                 aria-label={t("Request audit pagination")}
                 className="flex items-center gap-1"
               >
-                <button
+                <Button
                   aria-label={t("Previous page")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                  disabled={isLoading || currentPage <= 1}
-                  onClick={() => goToAuditPage(currentPage - 1)}
-                  title={t("Previous page")}
-                  type="button"
+                  isDisabled={isLoading || currentPage <= 1}
+                  onPress={() => goToAuditPage(currentPage - 1)}
                 >
                   <ChevronLeft aria-hidden="true" className="size-4" />
-                </button>
+                </Button>
                 {paginationItems.map((item, index) =>
                   item === "ellipsis" ? (
                     <span
@@ -852,7 +822,7 @@ export function ApiStatsPanel({
                       ...
                     </span>
                   ) : (
-                    <button
+                    <Button
                       aria-current={item === currentPage ? "page" : undefined}
                       aria-label={t("Go to page {page}", {
                         page: formatNumber(item, language),
@@ -862,30 +832,24 @@ export function ApiStatsPanel({
                           ? "border-[var(--accent)] bg-[var(--accent)] text-white"
                           : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       }`}
-                      disabled={isLoading}
+                      isDisabled={isLoading}
                       key={item}
-                      onClick={() => goToAuditPage(item)}
-                      title={t("Go to page {page}", {
-                        page: formatNumber(item, language),
-                      })}
-                      type="button"
+                      onPress={() => goToAuditPage(item)}
                     >
                       {formatNumber(item, language)}
-                    </button>
+                    </Button>
                   ),
                 )}
-                <button
+                <Button
                   aria-label={t("Next page")}
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                  disabled={
+                  isDisabled={
                     isLoading || totalPages === 0 || currentPage >= totalPages
                   }
-                  onClick={() => goToAuditPage(currentPage + 1)}
-                  title={t("Next page")}
-                  type="button"
+                  onPress={() => goToAuditPage(currentPage + 1)}
                 >
                   <ChevronRight aria-hidden="true" className="size-4" />
-                </button>
+                </Button>
               </nav>
             </div>
           </div>
@@ -893,12 +857,20 @@ export function ApiStatsPanel({
       </div>
       {selectedRequestId ? (
         <AiRequestDetailDialog
+          autoRefreshEnabled={autoRefreshEnabled}
           copiedKey={copiedKey}
           detail={detail}
           error={detailError}
           isLoading={isLoadingDetail}
           onClose={closeRequestDetail}
           onCopy={(key, text) => void copyAuditText(key, text)}
+          onToggleAutoRefresh={() => {
+            if (autoRefreshEnabled) {
+              pauseAutoRefresh();
+            } else {
+              resumeAutoRefresh();
+            }
+          }}
         />
       ) : null}
     </div>
@@ -918,41 +890,51 @@ function FilterSelect({
   placeholder: string;
   value: string;
 }) {
+  const allOptionId = "__all__";
+
   return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-        {label}
-      </span>
-      <select
-        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
-        onChange={(event) => onChange(event.target.value)}
-        value={value}
-      >
-        <option value="">{placeholder}</option>
-        {options.map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </select>
-    </label>
+    <Select
+      aria-label={label}
+      className="block"
+      placeholder={placeholder}
+      value={value || allOptionId}
+      onChange={(next) => onChange(next === allOptionId || next === null ? "" : String(next))}
+    >
+      <Label className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{label}</Label>
+      <Select.Trigger className="h-10 w-full">
+        <Select.Value />
+        <Select.Indicator />
+      </Select.Trigger>
+      <Select.Popover>
+        <ListBox>
+          <ListBox.Item id={allOptionId} textValue={placeholder}>{placeholder}<ListBox.ItemIndicator /></ListBox.Item>
+          {options.map((option) => (
+            <ListBox.Item id={option.value} key={option.value} textValue={option.label}>{option.label}<ListBox.ItemIndicator /></ListBox.Item>
+          ))}
+        </ListBox>
+      </Select.Popover>
+    </Select>
   );
 }
 
 function AiRequestDetailDialog({
+  autoRefreshEnabled,
   copiedKey,
   detail,
   error,
   isLoading,
   onClose,
   onCopy,
+  onToggleAutoRefresh,
 }: {
+  autoRefreshEnabled: boolean;
   copiedKey: string | null;
   detail: AiRequestDetailResponse | null;
   error: string | null;
   isLoading: boolean;
   onClose: () => void;
   onCopy: (key: string, text: string) => void;
+  onToggleAutoRefresh: () => void;
 }) {
   const { language, t } = useI18n();
   const request = detail?.request ?? null;
@@ -961,21 +943,9 @@ function AiRequestDetailDialog({
     : null;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex min-h-0 items-center justify-center overflow-y-auto bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] p-4 backdrop-blur-sm"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) {
-          onClose();
-        }
-      }}
-      role="presentation"
-    >
-      <section
-        aria-labelledby="ai-request-detail-title"
-        aria-modal="true"
-        className="flex h-[min(90dvh,56rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
-        role="dialog"
-      >
+    <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
+      <Modal.Container placement="center" size="full">
+      <Modal.Dialog aria-labelledby="ai-request-detail-title" className="flex h-[min(90dvh,56rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
         <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
           <div className="min-w-0">
             <h2
@@ -988,15 +958,28 @@ function AiRequestDetailDialog({
               {request ? request.id : t("Loading…")}
             </p>
           </div>
-          <button
+          <Button
+            aria-label={
+              autoRefreshEnabled
+                ? t("Pause auto refresh")
+                : t("Resume auto refresh")
+            }
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+            onPress={onToggleAutoRefresh}
+          >
+            {autoRefreshEnabled ? (
+              <Pause aria-hidden="true" className="size-4" />
+            ) : (
+              <Play aria-hidden="true" className="size-4" />
+            )}
+          </Button>
+          <Button
             aria-label={t("Close request details")}
             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
-            onClick={onClose}
-            title={t("Close")}
-            type="button"
+            onPress={onClose}
           >
             <X aria-hidden="true" className="size-4" />
-          </button>
+          </Button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
           {error ? (
@@ -1107,8 +1090,9 @@ function AiRequestDetailDialog({
             </div>
           ) : null}
         </div>
-      </section>
-    </div>
+      </Modal.Dialog>
+      </Modal.Container>
+    </Modal.Backdrop>
   );
 }
 
@@ -1629,39 +1613,33 @@ function AuditJsonBlock({
           <span>{label}</span>
         </span>
         <div className="audit-json-actions">
-          <button
+          <Button
             aria-label={t("Collapse all {label}", { label })}
             className="audit-json-icon-button"
-            disabled={collapsiblePaths.length === 0}
-            onClick={collapseAll}
-            title={t("Collapse all")}
-            type="button"
+            isDisabled={collapsiblePaths.length === 0}
+            onPress={collapseAll}
           >
             <ArrowUp aria-hidden="true" className="size-3.5" />
-          </button>
-          <button
+          </Button>
+          <Button
             aria-label={t("Expand all {label}", { label })}
             className="audit-json-icon-button"
-            disabled={collapsedPaths.size === 0}
-            onClick={expandAll}
-            title={t("Expand all")}
-            type="button"
+            isDisabled={collapsedPaths.size === 0}
+            onPress={expandAll}
           >
             <ArrowDown aria-hidden="true" className="size-3.5" />
-          </button>
-          <button
+          </Button>
+          <Button
             aria-label={t("Copy {label}", { label })}
             className="audit-json-icon-button"
-            onClick={onCopy}
-            title={t("Copy {label}", { label })}
-            type="button"
+            onPress={onCopy}
           >
             {copied ? (
               <CheckCircle2 aria-hidden="true" className="size-3.5" />
             ) : (
               <Copy aria-hidden="true" className="size-3.5" />
             )}
-          </button>
+          </Button>
         </div>
       </div>
       <div
@@ -1991,13 +1969,12 @@ function JsonContainerNode({
   return (
     <>
       <JsonLine depth={depth}>
-        <button
+        <Button
           aria-label={
             isCollapsed ? t("Expand JSON node") : t("Collapse JSON node")
           }
           className="audit-json-node-toggle"
-          onClick={() => onToggle(path)}
-          type="button"
+          onPress={() => onToggle(path)}
         >
           <ChevronRight
             aria-hidden="true"
@@ -2007,7 +1984,7 @@ function JsonContainerNode({
                 : "audit-json-node-toggle-icon audit-json-node-toggle-icon-open"
             }
           />
-        </button>
+        </Button>
         <JsonKey name={name} />
         <JsonPunctuation>{openToken}</JsonPunctuation>
         {isCollapsed ? (

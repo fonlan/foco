@@ -348,14 +348,14 @@ export function FilePickerDialog({
                     const selectable =
                       isSelectable(entry, mode) && !entry.disabled;
                     return (
-                      <button
+                      <Button
                         aria-disabled={
                           !selectable && !(entry.isDirectory && mode === "file")
                         }
                         aria-pressed={selected}
                         className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-focus ${selected ? "bg-accent text-accent-foreground" : "hover:bg-default"} ${entry.disabled ? "opacity-50" : ""}`}
                         key={entry.path}
-                        onClick={() => {
+                        onPress={() => {
                           if (entry.isDirectory && mode === "file") {
                             openPath(entry.path);
                             return;
@@ -368,7 +368,6 @@ export function FilePickerDialog({
                           }
                         }}
                         onKeyDown={(event) => handleEntryKeyDown(event, entry)}
-                        type="button"
                       >
                         {entry.isDirectory ? (
                           <Folder
@@ -390,7 +389,7 @@ export function FilePickerDialog({
                             className="size-3.5 shrink-0 opacity-60"
                           />
                         ) : null}
-                      </button>
+                      </Button>
                     );
                   })}
                 </div>

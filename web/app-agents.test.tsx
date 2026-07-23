@@ -472,10 +472,12 @@ describe("app agents verification surfaces", () => {
     );
     const dialog = screen.getByRole("dialog", { name: "Edit agent" });
     const modelSelect = within(dialog).getByLabelText("Model");
-    expect(within(dialog).queryByRole("option", { name: "GPT Image 2" })).not.toBeInTheDocument();
-    expect(within(dialog).queryByRole("option", { name: "GPT Image 3" })).not.toBeInTheDocument();
-    expect(within(dialog).getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
-    expect(modelSelect).toHaveValue("gpt-test");
+    await userEvent.click(modelSelect);
+    expect(screen.queryByRole("option", { name: "GPT Image 2" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "GPT Image 3" })).not.toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "GPT Test" })).toBeInTheDocument();
+    expect(modelSelect).toHaveTextContent("GPT Test");
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     expect(
       within(dialog).getByText(
         "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.",

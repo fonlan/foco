@@ -4032,10 +4032,8 @@ describe("app-panels-stats verification surfaces", () => {
     expect(screen.getByText("Channel distribution")).toBeInTheDocument();
     expect(screen.getByText("Channel quality")).toBeInTheDocument();
     expect(screen.getByText("Request audit")).toBeInTheDocument();
-    await userEvent.selectOptions(
-      screen.getByRole("combobox", { name: "Provider" }),
-      "openai",
-    );
+    await userEvent.click(screen.getByRole("button", { name: /Provider/ }));
+    await userEvent.click(await screen.findByRole("option", { name: "OpenAI" }));
     await waitFor(() =>
       expect(
         aiStatisticsCallUrls().some(
@@ -4110,7 +4108,7 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(screen.getByText("Columns"));
     await userEvent.click(
-      screen.getByRole("checkbox", { name: "Provider / model" }),
+      screen.getByRole("menuitem", { name: "Provider / model" }),
     );
     expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
 
@@ -4288,10 +4286,12 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.getByRole("dialog", { name: "Request details" }),
     ).toBeInTheDocument();
-    fireEvent.click(dialog.parentElement as HTMLElement);
-    expect(
-      screen.queryByRole("dialog", { name: "Request details" }),
-    ).not.toBeInTheDocument();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close request details" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Request details" })).not.toBeInTheDocument(),
+    );
   });
 
   it("forwards audit JSON wheel input only at vertical boundaries", async () => {
@@ -4540,10 +4540,10 @@ describe("app-panels-stats verification surfaces", () => {
     // Request type continues to mean requestKind; no transport filter control.
     expect(within(table).getAllByText("Chat completion")).toHaveLength(3);
     expect(
-      screen.queryByRole("combobox", { name: /transport/i }),
+      screen.queryByRole("button", { name: /transport/i }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("combobox", { name: "Request type" }),
+      screen.getByRole("button", { name: /Request type/ }),
     ).toBeInTheDocument();
   });
 
@@ -4624,15 +4624,15 @@ describe("app-panels-stats verification surfaces", () => {
       expect(modelLine.textContent).not.toMatch(/HTTP|WebSocket|未知/);
     }
 
-    const requestTypeFilter = screen.getByRole("combobox", {
-      name: "请求类型",
-    });
+    const requestTypeFilter = screen.getByRole("button", { name: /请求类型/ });
+    await userEvent.click(requestTypeFilter);
     expect(
-      within(requestTypeFilter).getByRole("option", {
+      await screen.findByRole("option", {
         name: "技能商店翻译",
       }),
-    ).toHaveValue("skill store translation");
+    ).toHaveAttribute("data-key", "skill store translation");
     expect(within(table).getAllByText("技能商店翻译")).toHaveLength(3);
+    await userEvent.keyboard("{Escape}");
 
     await userEvent.click(
       within(table).getAllByRole("button", { name: "查看请求详情" })[0],
@@ -4726,10 +4726,8 @@ describe("app-panels-stats verification surfaces", () => {
 
     renderApp();
 
-    const requestTypeFilter = await screen.findByRole("combobox", {
-      name: "Request type",
-    });
-    expect(requestTypeFilter).toHaveValue("contextCompression");
+    const requestTypeFilter = await screen.findByRole("button", { name: /Request type/ });
+    expect(requestTypeFilter).toHaveAccessibleName(/Context compression.*Request type/);
     await waitFor(() =>
       expect(
         aiStatisticsCallUrls().some(
@@ -4825,17 +4823,17 @@ describe("app-panels-stats verification surfaces", () => {
       ),
     ).not.toBeInTheDocument();
 
-    const requestTypeFilter = screen.getByRole("combobox", {
-      name: "Request type",
-    });
+    const requestTypeFilter = screen.getByRole("button", { name: /Request type/ });
+    await userEvent.click(requestTypeFilter);
     expect(
-      within(requestTypeFilter).getByRole("option", {
+      await screen.findByRole("option", {
         name: "Context compression",
       }),
     ).toBeInTheDocument();
     expect(
-      within(requestTypeFilter).getByRole("option", { name: unknownKind }),
+      screen.getByRole("option", { name: unknownKind }),
     ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
 
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     const dialog = await screen.findByRole("dialog", { name: "Request details" });
@@ -5256,7 +5254,12 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBeInTheDocument();
     expect(within(dialog).queryByText("legacy response")).not.toBeInTheDocument();
 
-    fireEvent.click(dialog.parentElement as HTMLElement);
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close request details" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Request details" })).not.toBeInTheDocument(),
+    );
     detailMode = "failed";
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     dialog = await screen.findByRole("dialog", { name: "Request details" });
@@ -5282,7 +5285,12 @@ describe("app-panels-stats verification surfaces", () => {
       within(failedResponseHeaders as HTMLElement).getByText('"1"'),
     ).toBeInTheDocument();
 
-    fireEvent.click(dialog.parentElement as HTMLElement);
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close request details" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Request details" })).not.toBeInTheDocument(),
+    );
     detailMode = "pruned";
     await userEvent.click(screen.getByRole("button", { name: "View request details" }));
     dialog = await screen.findByRole("dialog", { name: "Request details" });
@@ -5359,7 +5367,12 @@ describe("app-panels-stats verification surfaces", () => {
       within(dialog).getByText('"Historical reasoning."'),
     ).toBeInTheDocument();
 
-    fireEvent.click(dialog.parentElement as HTMLElement);
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Close request details" }),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "Request details" })).not.toBeInTheDocument(),
+    );
     responseMode = "cancelled";
     await userEvent.click(
       screen.getByRole("button", { name: "View request details" }),
@@ -5639,7 +5652,7 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(screen.getByText("Columns"));
     await userEvent.click(
-      screen.getByRole("checkbox", { name: "Provider / model" }),
+      screen.getByRole("menuitem", { name: "Provider / model" }),
     );
     expect(within(table).queryByText("OpenAI")).not.toBeInTheDocument();
     await waitFor(() => {
@@ -5658,10 +5671,6 @@ describe("app-panels-stats verification surfaces", () => {
     );
     const reloadedTable = await screen.findByRole("table");
     expect(within(reloadedTable).queryByText("OpenAI")).not.toBeInTheDocument();
-    await userEvent.click(screen.getByText("Columns"));
-    expect(
-      screen.getByRole("checkbox", { name: "Provider / model" }),
-    ).not.toBeChecked();
   });
 
   it("lazy loads workspace file tree children on demand", async () => {

@@ -311,7 +311,7 @@ describe("ModelRoutingPanel", () => {
     renderPanel(onRouteChange);
 
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
-    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Azure" }));
 
     await waitFor(() => {
       expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
@@ -332,23 +332,25 @@ describe("ModelRoutingPanel", () => {
     renderPanel(onRouteChange);
 
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
-    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Azure" }));
 
     await waitFor(() => {
       expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
     });
 
-    const azure = screen.getByRole("radio", { name: /Azure/ });
-    expect(azure).toHaveAttribute("aria-checked", "true");
+    const azure = screen.getByRole("button", { name: "Azure" });
+    expect(azure).toHaveAttribute("aria-current", "true");
     expect(azure).toHaveClass("model-routing-provider-active");
-    expect(screen.getByTitle(/GPT-4.1 · Azure/)).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /GPT-4\.1.*Azure/ }),
+    ).toBeInTheDocument();
 
     resolveRoute({ ok: true });
     // Without a parent models update, optimistic overlay clears after settle and
     // props (openai) reappear — App.tsx owns the durable activeProviderId.
     await waitFor(() => {
-      expect(screen.getByRole("radio", { name: /OpenAI/ })).toHaveAttribute(
-        "aria-checked",
+      expect(screen.getByRole("button", { name: "OpenAI" })).toHaveAttribute(
+        "aria-current",
         "true",
       );
     });
@@ -367,11 +369,11 @@ describe("ModelRoutingPanel", () => {
     renderPanel(onRouteChange);
 
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
-    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Azure" }));
 
     await waitFor(() => {
-      expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
-        "aria-checked",
+      expect(screen.getByRole("button", { name: "Azure" })).toHaveAttribute(
+        "aria-current",
         "true",
       );
     });
@@ -379,14 +381,13 @@ describe("ModelRoutingPanel", () => {
     resolveRoute({ ok: false, error: "route failed" });
 
     await waitFor(() => {
-      expect(screen.getByRole("radio", { name: /OpenAI/ })).toHaveAttribute(
-        "aria-checked",
+      expect(screen.getByRole("button", { name: "OpenAI" })).toHaveAttribute(
+        "aria-current",
         "true",
       );
     });
-    expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
-      "aria-checked",
-      "false",
+    expect(screen.getByRole("button", { name: "Azure" })).not.toHaveAttribute(
+      "aria-current",
     );
     expect(await screen.findByRole("alert")).toHaveTextContent("route failed");
   });
@@ -404,16 +405,16 @@ describe("ModelRoutingPanel", () => {
     renderPanel(onRouteChange);
 
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
-    fireEvent.click(screen.getByRole("radio", { name: /Azure/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Azure" }));
     // Second click is ignored while the first request is in flight (busy lock).
-    fireEvent.click(screen.getByRole("radio", { name: /OpenAI/ }));
+    fireEvent.click(screen.getByRole("button", { name: "OpenAI" }));
 
     await waitFor(() => {
       expect(onRouteChange).toHaveBeenCalledTimes(1);
     });
     expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
-    expect(screen.getByRole("radio", { name: /Azure/ })).toHaveAttribute(
-      "aria-checked",
+    expect(screen.getByRole("button", { name: "Azure" })).toHaveAttribute(
+      "aria-current",
       "true",
     );
 
@@ -436,11 +437,13 @@ describe("ModelRoutingPanel", () => {
       ],
     });
 
-    expect(screen.getByTitle("GPT-4.1 · Anthropic")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /GPT-4\.1.*Anthropic/ }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
 
-    expect(screen.queryByRole("radio", { name: /Anthropic/ })).toBeNull();
-    const azure = screen.getByRole("radio", { name: /Azure/ });
+    expect(screen.queryByRole("button", { name: "Anthropic" })).toBeNull();
+    const azure = screen.getByRole("button", { name: "Azure" });
     expect(azure).not.toBeDisabled();
 
     fireEvent.click(azure);
@@ -461,11 +464,13 @@ describe("ModelRoutingPanel", () => {
       ],
     });
 
-    expect(screen.getByTitle("GPT-4.1 · Anthropic")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /GPT-4\.1.*Anthropic/ }),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
 
     expect(screen.getByText("No linked providers")).toBeTruthy();
-    expect(screen.queryByRole("radio", { name: /Anthropic/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Anthropic" })).toBeNull();
   });
 
   it("retains unknown providers for their missing-provider diagnostic", () => {
@@ -483,7 +488,7 @@ describe("ModelRoutingPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: /GPT-4.1/ }));
 
     expect(
-      screen.getByRole("radio", {
+      screen.getByRole("button", {
         name: /missing-provider.*Provider not found/,
       }),
     ).toBeDisabled();

@@ -32,6 +32,7 @@ export {
   Chip,
   CloseButton,
   Description,
+  Drawer,
   Dropdown,
   EmptyState,
   FieldError,

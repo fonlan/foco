@@ -19,6 +19,7 @@ import type {
   AgentTeamSnapshotResponse,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import { Button } from "../../shared/ui";
 
 export function AgentsRuntimePanel({
   activeChatId,
@@ -54,20 +55,18 @@ export function AgentsRuntimePanel({
             </p>
           </div>
         </div>
-        <button
+        <Button
           aria-label={t("Refresh")}
           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-          disabled={!activeChatId || isLoading}
-          onClick={() => void onRefresh()}
-          title={t("Refresh")}
-          type="button"
+          isDisabled={!activeChatId || isLoading}
+          onPress={() => void onRefresh()}
         >
           <RefreshCw
             aria-hidden="true"
             className="context-refresh-icon size-4"
             data-loading={isLoading ? "true" : undefined}
           />
-        </button>
+        </Button>
       </div>
 
       {error ? (
@@ -143,7 +142,7 @@ function AgentInstanceCard({
   const StatusIcon = status.icon;
 
   return (
-    <button
+    <Button
       aria-label={t("Open agent {name}", {
         name: instance.definitionSnapshot.name,
       })}
@@ -152,8 +151,7 @@ function AgentInstanceCard({
           ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--foreground)] shadow-sm"
           : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
         }`}
-      onClick={onSelect}
-      type="button"
+      onPress={onSelect}
     >
       <div className="flex min-w-0 items-start gap-2">
         <span
@@ -200,7 +198,7 @@ function AgentInstanceCard({
         <AgentKeyValue label={t("Definition")} value={instance.definitionId} />
         <AgentKeyValue label={t("Created")} value={formatAgentTimestamp(instance.createdAt)} />
       </dl>
-    </button>
+    </Button>
   );
 }
 

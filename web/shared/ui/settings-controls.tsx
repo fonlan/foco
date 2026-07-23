@@ -21,6 +21,9 @@ import {
   type ReactNode,
   type SelectHTMLAttributes,
   type TextareaHTMLAttributes,
+  useLayoutEffect,
+  useRef,
+  useState,
 } from "react";
 
 const RadioControl: any = Radio;
@@ -67,24 +70,44 @@ export const SettingsInput = forwardRef<HTMLInputElement, SettingsInputProps>(fu
 }: SettingsInputProps, ref) {
   if (type === "file") {
     // Browser file selection remains the documented native-control exception.
-    return <input {...props} ref={ref} disabled={disabled} onChange={onChange} type="file" value={value} />;
+    return <input {...props} data-heroui-exception="native-file-input" ref={ref} disabled={disabled} onChange={onChange} type="file" value={value} />;
   }
 
   if (type === "checkbox") {
+    if (props.role === "switch") {
+      return (
+        <Switch
+          {...(props as any)}
+          aria-label={props["aria-label"]}
+          isDisabled={disabled}
+          isSelected={Boolean(checked)}
+          onChange={(selected: boolean) =>
+            onChange?.(browserChange<HTMLInputElement>(selected ? "on" : "", selected))
+          }
+        >
+          <Switch.Content>
+            <Switch.Control>
+              <Switch.Thumb />
+            </Switch.Control>
+          </Switch.Content>
+        </Switch>
+      );
+    }
+
     return (
-      <Switch
+      <Checkbox
         {...(props as any)}
         aria-label={props["aria-label"]}
         isDisabled={disabled}
         isSelected={Boolean(checked)}
         onChange={(selected: boolean) => onChange?.(browserChange<HTMLInputElement>(selected ? "on" : "", selected))}
       >
-        <Switch.Content>
-          <Switch.Control>
-            <Switch.Thumb />
-          </Switch.Control>
-        </Switch.Content>
-      </Switch>
+        <Checkbox.Content>
+          <Checkbox.Control>
+            <Checkbox.Indicator />
+          </Checkbox.Control>
+        </Checkbox.Content>
+      </Checkbox>
     );
   }
 
@@ -153,17 +176,42 @@ export function SettingsSelect({
   ...props
 }: SettingsSelectProps) {
   const items = optionItems(children);
+  const selectRef = useRef<HTMLElement>(null);
+  const [inferredLabel, setInferredLabel] = useState<string | undefined>();
   const change = (next: string) => onChange?.(browserChange<HTMLSelectElement>(next));
+
+  // Existing settings fields wrap their control with a visible HTML label. A
+  // React Aria combobox is not a labelable HTML element, so that implicit
+  // browser association does not carry over. Preserve the visible label as the
+  // combobox's accessible name until call sites can be expressed as direct
+  // HeroUI <Label> children.
+  useLayoutEffect(() => {
+    if (props["aria-label"] || props["aria-labelledby"]) return;
+
+    const wrapper = selectRef.current?.closest("label");
+    const label = wrapper?.querySelector("span")?.textContent?.trim();
+    if (label && label !== inferredLabel) setInferredLabel(label);
+  }, [inferredLabel, props]);
 
   return (
     <Select
       {...(props as any)}
-      aria-label={props["aria-label"] ?? "Setting select"}
+      ref={selectRef as any}
+      aria-label={props["aria-label"] ?? inferredLabel ?? "Setting select"}
       className={className}
       isDisabled={disabled}
       selectionMode={multiple ? "multiple" : "single"}
-      value={value ?? null}
-      onChange={(next: string | number | null) => change(String(next ?? ""))}
+      selectedKey={multiple || value == null ? null : String(value)}
+      selectedKeys={
+        multiple
+          ? new Set(Array.isArray(value) ? value.map(String) : value == null ? [] : [String(value)])
+          : undefined
+      }
+      onSelectionChange={(next) => {
+        const selection = next as unknown;
+        const selected = selection instanceof Set ? [...(selection as Set<string>)][0] : next;
+        change(selected == null ? "" : String(selected));
+      }}
     >
       <Select.Trigger>
         <Select.Value />

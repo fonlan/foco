@@ -2186,23 +2186,38 @@ describe("app-shell verification surfaces", () => {
     expect(await screen.findByText("Next five runs")).toBeInTheDocument();
 
     const statusSelect = screen.getByLabelText("Status");
-    expect(within(statusSelect).getByRole("option", { name: "Enabled" })).toBeInTheDocument();
-    expect(within(statusSelect).getByRole("option", { name: "Paused" })).toBeInTheDocument();
-    expect(within(statusSelect).queryByRole("option", { name: "Completed" })).not.toBeInTheDocument();
-    expect(within(statusSelect).queryByRole("option", { name: "Archived" })).not.toBeInTheDocument();
-    await waitFor(() =>
-      expect(screen.getByLabelText("Agent")).toHaveValue("agent-definition-coordinator"),
+    await userEvent.click(statusSelect);
+    expect(screen.getByRole("option", { name: "Enabled" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Paused" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Completed" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Archived" })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("option", { name: "Enabled" }));
+    const agentSelect = screen.getByLabelText("Agent");
+    await userEvent.click(agentSelect);
+    expect(screen.getByRole("option", { name: "Coordinator" })).toHaveAttribute(
+      "aria-selected",
+      "true",
     );
-    expect(screen.getByLabelText("Model")).toHaveValue("gpt-test");
+    await userEvent.click(screen.getByRole("option", { name: "Coordinator" }));
+    const modelSelect = screen.getByLabelText("Model");
+    await userEvent.click(modelSelect);
+    expect(screen.getByRole("option", { name: "GPT Test" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     // Provider is chosen by global model routing, not the scheduled-task form.
     expect(screen.queryByLabelText("Provider")).toBeNull();
     expect(screen.getByRole("checkbox", { name: "Enable Team mode" })).toBeChecked();
 
     const unitSelect = screen.getByLabelText("Unit");
-    expect(within(unitSelect).getByRole("option", { name: "Weeks" })).toBeInTheDocument();
-    expect(within(unitSelect).getByRole("option", { name: "Months" })).toBeInTheDocument();
-    await userEvent.selectOptions(unitSelect, "months");
-    await userEvent.selectOptions(screen.getByLabelText("Concurrency"), "force_run");
+    await userEvent.click(unitSelect);
+    expect(screen.getByRole("option", { name: "Weeks" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "Months" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("option", { name: "Months" }));
+    const concurrencySelect = screen.getByLabelText("Concurrency");
+    await userEvent.click(concurrencySelect);
+    await userEvent.click(screen.getByRole("option", { name: "Force run" }));
     await userEvent.type(screen.getByLabelText("Title"), "Morning report");
     await userEvent.type(
       screen.getByLabelText("Prompt"),
