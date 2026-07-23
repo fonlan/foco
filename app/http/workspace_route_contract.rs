@@ -1335,10 +1335,23 @@ mod tests {
         route_path: &str,
         method: WorkspaceRouteMethod,
     ) -> bool {
-        router_registers_method(compact_source, route_path, method)
-            || route_path.rsplit_once('/').is_some_and(|(parent, _)| {
-                router_registers_method(compact_source, &format!("{parent}/{{*path}}"), method)
-            })
+        if router_registers_method(compact_source, route_path, method) {
+            return true;
+        }
+
+        let mut parent = route_path;
+        while let Some((next_parent, _)) = parent.rsplit_once('/') {
+            if next_parent.is_empty() {
+                break;
+            }
+            if router_registers_method(compact_source, &format!("{next_parent}/{{*path}}"), method)
+            {
+                return true;
+            }
+            parent = next_parent;
+        }
+
+        false
     }
 
     fn local_workspace_router_methods(compact_source: &str) -> Vec<(&str, WorkspaceRouteMethod)> {
