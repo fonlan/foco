@@ -1009,6 +1009,8 @@ function ContextPlanTab({
               const action = primaryPlanAction(plan);
               const actionKey = action ? `${action}:${plan.id}` : null;
               const mergedCommitId = planMergedIntoSharedWorkspace(plan);
+              const mergeInProgress = planMergeInProgress(plan);
+              const mergeChatId = mergeInProgress?.implementationChatId ?? null;
               const canRetryMerge = planNeedsMergeRetry(plan);
               const retryMergeKey = planRetryMergeOperationKey(plan.id);
               const isRetryingMerge = operationKey === retryMergeKey;
@@ -1045,6 +1047,38 @@ function ContextPlanTab({
                           >
                             {t("Merged into shared workspace")}
                           </span>
+                        </>
+                      ) : mergeInProgress ? (
+                        <>
+                          <span
+                            className="sr-only"
+                            id={`plan-merge-in-progress-status-${plan.id}`}
+                          >
+                            {t("Merging")}
+                          </span>
+                          {mergeChatId ? (
+                            <span title={t("Open merge chat")}>
+                              <Button
+                                aria-describedby={`plan-merge-in-progress-status-${plan.id}`}
+                                aria-label={t("Open merge chat")}
+                                className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                                onPress={() => onOpenPhaseChat(mergeChatId)}
+                                type="button"
+                              >
+                                <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                                {t("Merging")}
+                              </Button>
+                            </span>
+                          ) : (
+                            <span
+                              aria-describedby={`plan-merge-in-progress-status-${plan.id}`}
+                              className="context-memory-pin inline-flex items-center gap-1"
+                              title={t("Merging")}
+                            >
+                              <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
+                              {t("Merging")}
+                            </span>
+                          )}
                         </>
                       ) : canRetryMerge ? (
                         <>
@@ -3223,6 +3257,39 @@ function planActionLabel(action: PlanAction) {
 function planMergedIntoSharedWorkspace(plan: Plan) {
   const commitId = plan.sharedMergeCommitId?.trim();
   return commitId ? commitId.slice(0, 7) : null;
+}
+
+function planMergeInProgress(plan: Plan) {
+  if (plan.sharedMergeCommitId?.trim()) {
+    return null;
+  }
+
+  const activeMergeAttempt = plan.phases
+    .flatMap((phase) => phase.attempts ?? [])
+    .filter(
+      (attempt) =>
+        (attempt.trigger === "merge_auto" || attempt.trigger === "merge_retry") &&
+        (attempt.status === "queued" || attempt.status === "running"),
+    )
+    .reduce<typeof plan.phases[number]["attempts"][number] | null>(
+      (latestAttempt, attempt) =>
+        !latestAttempt || attempt.sequence > latestAttempt.sequence
+          ? attempt
+          : latestAttempt,
+      null,
+    );
+  if (activeMergeAttempt) {
+    return {
+      implementationChatId: activeMergeAttempt.implementationChatId?.trim() || null,
+    };
+  }
+
+  const allPhasesCompleted =
+    plan.phases.length > 0 &&
+    plan.phases.every((phase) => phase.status === "completed");
+  return plan.status === "running" && allPhasesCompleted
+    ? { implementationChatId: null }
+    : null;
 }
 
 function planStatusLabel(status: string) {

@@ -399,6 +399,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Retrying…": "正在重试…",
     "Retrying phase…": "正在重试阶段…",
     "Retry Merge": "重试合并",
+    Merging: "合并中",
+    "Open merge chat": "打开合并会话",
     "Clean the shared workspace, then retry merge":
       "先清理共享工作区，然后重试合并",
     "Retry merging into the shared workspace": "重试合并到共享工作区",

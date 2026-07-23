@@ -2195,6 +2195,241 @@ describe("app-panels-stats verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows active merge status, opens its merge chat, and switches to the shared commit after refresh", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-23T12:00:00Z";
+    const mergeChat = chatSummary(
+      "plan-chat-active-merge",
+      "Active merge coordinator chat",
+      timestamp,
+      timestamp,
+    );
+    const completedPhase = {
+      agentTaskId: "agent-task-implementation",
+      agentTeamId: "agent-team-implementation",
+      attempts: [
+        {
+          agentTaskId: "agent-task-implementation",
+          agentTeamId: "agent-team-implementation",
+          commitId: "implementation123456",
+          completedAt: timestamp,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "attempt-implementation",
+          implementationChatId: "plan-chat-implementation",
+          modelId: null,
+          phaseId: "plan-phase-active-merge",
+          planId: "plan-active-merge",
+          providerId: null,
+          sequence: 0,
+          startedAt: timestamp,
+          status: "completed",
+          thinkingLevel: null,
+          trigger: "start",
+          updatedAt: timestamp,
+        },
+        {
+          agentTaskId: "agent-task-old-merge",
+          agentTeamId: "agent-team-old-merge",
+          commitId: null,
+          completedAt: null,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "attempt-old-merge",
+          implementationChatId: "plan-chat-old-merge",
+          modelId: null,
+          phaseId: "plan-phase-active-merge",
+          planId: "plan-active-merge",
+          providerId: null,
+          sequence: 1,
+          startedAt: timestamp,
+          status: "queued",
+          thinkingLevel: null,
+          trigger: "merge_auto",
+          updatedAt: timestamp,
+        },
+        {
+          agentTaskId: "agent-task-active-merge",
+          agentTeamId: "agent-team-active-merge",
+          commitId: null,
+          completedAt: null,
+          createdAt: timestamp,
+          errorMessage: null,
+          id: "attempt-active-merge",
+          implementationChatId: "plan-chat-active-merge",
+          modelId: null,
+          phaseId: "plan-phase-active-merge",
+          planId: "plan-active-merge",
+          providerId: null,
+          sequence: 2,
+          startedAt: timestamp,
+          status: "running",
+          thinkingLevel: null,
+          trigger: "merge_retry",
+          updatedAt: timestamp,
+        },
+      ],
+      commitId: "implementation123456",
+      completedAt: timestamp,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-phase-active-merge",
+      implementationChatId: "plan-chat-implementation",
+      mergeAttemptCount: 1,
+      planId: "plan-active-merge",
+      sequence: 0,
+      startedAt: timestamp,
+      status: "completed",
+      steps: [],
+      summary: "Implementation is complete while merge is running.",
+      title: "Completed implementation",
+      updatedAt: timestamp,
+    };
+    const activeMergePlan = {
+      activePhaseId: null,
+      completedAt: null,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      sharedMergeCommitId: null,
+      id: "plan-active-merge",
+      overview: "Open the active merge coordinator transcript.",
+      pauseRequestedAt: null,
+      phases: [completedPhase],
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "running",
+      title: "Active merge plan",
+      updatedAt: timestamp,
+    };
+    const mergeWithoutChatPlan = {
+      ...activeMergePlan,
+      id: "plan-merge-without-chat",
+      phases: [
+        {
+          ...completedPhase,
+          attempts: [
+            {
+              ...completedPhase.attempts[2],
+              id: "attempt-merge-without-chat",
+              implementationChatId: null,
+              phaseId: "plan-phase-merge-without-chat",
+              planId: "plan-merge-without-chat",
+            },
+          ],
+          id: "plan-phase-merge-without-chat",
+          planId: "plan-merge-without-chat",
+        },
+      ],
+      title: "Merge without chat plan",
+    };
+    const mergeFallbackPlan = {
+      ...activeMergePlan,
+      id: "plan-merge-fallback",
+      phases: [
+        {
+          ...completedPhase,
+          attempts: [],
+          id: "plan-phase-merge-fallback",
+          planId: "plan-merge-fallback",
+        },
+      ],
+      title: "Merge fallback plan",
+    };
+    const mergedPlan = {
+      ...activeMergePlan,
+      sharedMergeCommitId: "fedcba987654321",
+      status: "implemented",
+      updatedAt: "2026-07-23T12:01:00Z",
+    };
+    let showMergedPlan = false;
+    appTestState.workspaceResponseWorkspaces = [
+      { ...workspace, chats: [mergeChat, ...workspace.chats] },
+      secondaryWorkspace,
+    ];
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/plan-chat-active-merge": {
+        ...chatMessages,
+        chat: {
+          ...chatMessages.chat,
+          id: "plan-chat-active-merge",
+          title: "Active merge coordinator chat",
+        },
+        messages: [
+          {
+            ...chatMessages.messages[0],
+            content: "Active merge coordinator transcript.",
+            parts: [
+              { text: "Active merge coordinator transcript.", type: "text" },
+            ],
+          },
+        ],
+      },
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = new URL(url, "http://127.0.0.1").pathname;
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: showMergedPlan
+              ? [mergedPlan]
+              : [activeMergePlan, mergeWithoutChatPlan, mergeFallbackPlan],
+            totalCount: showMergedPlan ? 1 : 3,
+            totalPages: 1,
+          });
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    const activeMergeCard = (await screen.findByText("Active merge plan")).closest(
+      "article",
+    ) as HTMLElement;
+    expect(within(activeMergeCard).getAllByText("Merging")).toHaveLength(2);
+    const fallbackMergeCard = screen.getByText("Merge fallback plan").closest("article") as HTMLElement;
+    expect(within(fallbackMergeCard).getAllByText("Merging")).toHaveLength(2);
+    expect(
+      within(fallbackMergeCard).queryByRole("button", { name: "Open merge chat" }),
+    ).not.toBeInTheDocument();
+    const noChatCard = screen.getByText("Merge without chat plan").closest("article") as HTMLElement;
+    expect(within(noChatCard).getAllByText("Merging")).toHaveLength(2);
+    expect(
+      within(noChatCard).queryByRole("button", { name: "Open merge chat" }),
+    ).not.toBeInTheDocument();
+    await user.click(
+      within(activeMergeCard).getByRole("button", { name: "Open merge chat" }),
+    );
+    expect(
+      await screen.findByText("Active merge coordinator transcript."),
+    ).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/workspaces/workspace-1/chats/plan-chat-active-merge/messages?limit=60",
+      expect.any(Object),
+    );
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/workspaces/workspace-1/chats/plan-chat-implementation/messages?limit=60",
+      expect.any(Object),
+    );
+
+    showMergedPlan = true;
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 3100));
+    });
+    expect(await screen.findByText("fedcba9")).toBeInTheDocument();
+    expect(screen.queryByText("Merging")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Open merge chat" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows retry merge for LLM merge failures without phase retry", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-07-22T18:00:00Z";
