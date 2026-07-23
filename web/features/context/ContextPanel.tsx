@@ -16,6 +16,7 @@ import {
   GripVertical,
   ListChecks,
   LoaderCircle,
+  LocateFixed,
   MessageSquare,
   Minus,
   PanelBottom,
@@ -59,8 +60,6 @@ import type {
   PlanPhase,
   PlanStatus,
   PlanStep,
-  PlanWorktreeAuditItem,
-  PlanWorktreeAuditResponse,
   TaskStatus,
   TodoGraphResponse,
   TodoGraphTask,
@@ -145,8 +144,6 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingWorkspaceSpec,
   isLoadingWorkspaceFiles,
   onDeletePlan,
-  onLoadPlanWorktreeAudit,
-  onCleanupPlanWorktree,
   onForgetContextMemory,
   onGenerateGitCommitMessage,
   onGenerateWorkspaceSpec,
@@ -223,8 +220,6 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingWorkspaceSpec: boolean;
   isLoadingWorkspaceFiles: boolean;
   onDeletePlan: (planId: string) => void;
-  onLoadPlanWorktreeAudit: () => Promise<PlanWorktreeAuditResponse>;
-  onCleanupPlanWorktree: (agentInstanceId: string) => Promise<void>;
   onForgetContextMemory: (memory: MemoryFactRecord) => void;
   onGenerateGitCommitMessage: () => void;
   onGenerateWorkspaceSpec: () => void;
@@ -334,9 +329,7 @@ const ContextPanel = memo(function ContextPanel({
             isLoading={isLoadingPlans}
             onAction={onPlanAction}
             onAutoRunToggle={onPlanAutoRunToggle}
-            onCleanupWorktree={onCleanupPlanWorktree}
             onDeletePlan={onDeletePlan}
-            onLoadWorktreeAudit={onLoadPlanWorktreeAudit}
             onOpenPhaseChat={onOpenPlanPhaseChat}
             onOrderChange={onPlanOrderChange}
             onPhaseRetry={onPlanPhaseRetry}
@@ -714,9 +707,7 @@ function ContextPlanTab({
   isLoading,
   onAction,
   onAutoRunToggle,
-  onCleanupWorktree,
   onDeletePlan,
-  onLoadWorktreeAudit,
   onOpenPhaseChat,
   onOrderChange,
   onPhaseRetry,
@@ -735,9 +726,7 @@ function ContextPlanTab({
   isLoading: boolean;
   onAction: (planId: string, action: PlanAction) => void;
   onAutoRunToggle: (enabled: boolean) => void;
-  onCleanupWorktree: (agentInstanceId: string) => Promise<void>;
   onDeletePlan: (planId: string) => void;
-  onLoadWorktreeAudit: () => Promise<PlanWorktreeAuditResponse>;
   onOpenPhaseChat: (chatId: string) => void;
   onOrderChange: (planIds: string[]) => void;
   onPhaseRetry: (
@@ -761,10 +750,6 @@ function ContextPlanTab({
   const [expandedPhaseKeys, setExpandedPhaseKeys] = useState<Set<string>>(
     () => new Set(),
   );
-  const [worktreeAudit, setWorktreeAudit] = useState<PlanWorktreeAuditResponse | null>(null);
-  const [worktreeAuditError, setWorktreeAuditError] = useState<string | null>(null);
-  const [isLoadingWorktreeAudit, setIsLoadingWorktreeAudit] = useState(false);
-  const [showWorktreeAudit, setShowWorktreeAudit] = useState(false);
   const [retryMenuPhaseKey, setRetryMenuPhaseKey] = useState<string | null>(null);
   const [overrideRetryPhase, setOverrideRetryPhase] = useState<{
     plan: Plan;
@@ -864,10 +849,8 @@ function ContextPlanTab({
   };
 
   useEffect(() => {
-    if (showWorktreeAudit || !runningPlanId) {
-      if (!runningPlanId) {
-        lastScrolledRunningPlanId.current = null;
-      }
+    if (!runningPlanId) {
+      lastScrolledRunningPlanId.current = null;
       return;
     }
     if (lastScrolledRunningPlanId.current === runningPlanId) {
@@ -895,7 +878,7 @@ function ContextPlanTab({
     });
 
     return () => window.cancelAnimationFrame(animationFrameId);
-  }, [runningPlanId, showWorktreeAudit]);
+  }, [runningPlanId]);
 
   useEffect(() => {
     if (!retryMenuPhaseKey) {
@@ -911,42 +894,21 @@ function ContextPlanTab({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [retryMenuPhaseKey]);
 
-  const refreshWorktreeAudit = async () => {
-    setIsLoadingWorktreeAudit(true);
-    setWorktreeAuditError(null);
-    try {
-      const response = await onLoadWorktreeAudit();
-      setWorktreeAudit(response);
-      return response;
-    } catch (auditError) {
-      const message = auditError instanceof Error ? auditError.message : String(auditError);
-      setWorktreeAuditError(message);
-      return null;
-    } finally {
-      setIsLoadingWorktreeAudit(false);
-    }
-  };
-
-  const toggleWorktreeAudit = () => {
-    if (showWorktreeAudit) {
-      setShowWorktreeAudit(false);
+  const locateRunningPlan = () => {
+    const planListPanel = planListPanelRef.current;
+    const runningPlanArticle = runningPlanArticleRef.current;
+    if (!planListPanel || !runningPlanArticle) {
       return;
     }
-
-    setShowWorktreeAudit(true);
-    void refreshWorktreeAudit();
-  };
-
-  const cleanupWorktree = async (item: PlanWorktreeAuditItem) => {
-    const commit = item.headCommitShort ?? item.commitId?.slice(0, 7) ?? t("unknown commit");
-    if (!window.confirm(t("Clean up plan worktree confirmation", {
-      commit,
-      path: item.worktreePath,
-    }))) {
-      return;
-    }
-    await onCleanupWorktree(item.agentInstanceId);
-    await refreshWorktreeAudit();
+    const containerRect = planListPanel.getBoundingClientRect();
+    const articleRect = runningPlanArticle.getBoundingClientRect();
+    planListPanel.scrollTop = Math.max(
+      0,
+      planListPanel.scrollTop +
+        articleRect.top -
+        containerRect.top -
+        (planListPanel.clientHeight - articleRect.height) / 2,
+    );
   };
 
   return (
@@ -980,34 +942,19 @@ function ContextPlanTab({
           </span>
         ) : null}
         <button
-          aria-label={t("Audit plan worktrees")}
-          className="plan-worktree-audit-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-          disabled={isLoadingWorktreeAudit}
-          onClick={toggleWorktreeAudit}
-          title={t("Audit plan worktrees")}
+          aria-label={t("Locate running plan")}
+          className="plan-locate-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+          disabled={!runningPlanId}
+          onClick={locateRunningPlan}
+          title={runningPlanId ? t("Locate running plan") : t("No plan is running")}
           type="button"
         >
-          {isLoadingWorktreeAudit ? (
-            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-          ) : (
-            <Eye aria-hidden="true" className="size-3.5" />
-          )}
-          <span className="plan-worktree-audit-button-label">{t("Audit")}</span>
+          <LocateFixed aria-hidden="true" className="size-3.5" />
+          <span className="plan-locate-button-label">{t("Locate")}</span>
         </button>
       </div>
 
-      {showWorktreeAudit ? (
-        <PlanWorktreeAuditPanel
-          error={worktreeAuditError}
-          isLoading={isLoadingWorktreeAudit}
-          items={worktreeAudit?.items ?? []}
-          onCleanup={cleanupWorktree}
-          onRefresh={refreshWorktreeAudit}
-          operationKey={operationKey}
-          recoveryNote={worktreeAudit?.recoveryNote ?? null}
-        />
-      ) : (
-        <div className="context-list-panel panel-scroll" ref={planListPanelRef}>
+      <div className="context-list-panel panel-scroll" ref={planListPanelRef}>
         {isLoading && plans.length === 0 ? (
           <div className="context-empty-state">
             <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
@@ -1336,8 +1283,7 @@ function ContextPlanTab({
             })}
           </div>
         ) : null}
-        </div>
-      )}
+      </div>
       {overrideRetryPhase ? (
         <PlanPhaseRetryDialog
           availableModels={availableModels}
@@ -1598,127 +1544,7 @@ function defaultPlanPhaseRetryModelId(
   return models[0]?.id ?? "";
 }
 
-function PlanWorktreeAuditPanel({
-  error,
-  isLoading,
-  items,
-  onCleanup,
-  onRefresh,
-  operationKey,
-  recoveryNote,
-}: {
-  error: string | null;
-  isLoading: boolean;
-  items: PlanWorktreeAuditItem[];
-  onCleanup: (item: PlanWorktreeAuditItem) => void | Promise<void>;
-  onRefresh: () => void | Promise<PlanWorktreeAuditResponse | null>;
-  operationKey: string | null;
-  recoveryNote: string | null;
-}) {
-  const { t } = useI18n();
 
-  return (
-    <div className="panel-scroll flex min-h-0 flex-1 flex-col overflow-y-auto border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] px-3 py-3">
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div className="min-w-0">
-          <h3 className="truncate text-xs font-semibold text-[var(--foreground)]">
-            {t("Legacy worktrees")}
-          </h3>
-          <p className="line-clamp-2 text-xs text-[var(--muted)]">
-            {recoveryNote ?? t("Unmerged implemented plans need manual cherry-pick, merge, or rerun.")}
-          </p>
-        </div>
-        <button
-          aria-label={t("Refresh audit")}
-          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-          disabled={isLoading}
-          onClick={() => void onRefresh()}
-          title={t("Refresh audit")}
-          type="button"
-        >
-          {isLoading ? (
-            <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-          ) : (
-            <RefreshCw aria-hidden="true" className="size-3.5" />
-          )}
-        </button>
-      </div>
-      {error ? (
-        <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1.5 text-xs text-[var(--danger)]">
-          {error}
-        </div>
-      ) : null}
-      {!error && !isLoading && items.length === 0 ? (
-        <div className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)]">
-          {t("No legacy worktrees found")}
-        </div>
-      ) : null}
-      {items.length > 0 ? (
-        <div className="min-h-0 space-y-2">
-          {items.map((item) => {
-            const cleanupKey = `cleanup-worktree:${item.agentInstanceId}`;
-            const isCleanupBusy = operationKey === cleanupKey;
-            return (
-              <div
-                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs text-[var(--muted)] shadow-sm"
-                key={`${item.planId}:${item.phaseId}:${item.agentInstanceId}`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="min-w-0 space-y-1">
-                    <div className="flex flex-wrap items-center gap-1.5">
-                      <span className={planStatusClass(item.planStatus as PlanStatus)}>
-                        {item.planStatus}
-                      </span>
-                      <span className={planPhaseStatusClass(item.phaseStatus)}>
-                        {item.phaseStatus}
-                      </span>
-                      {item.headCommitShort ? (
-                        <span className="context-memory-kind">{item.headCommitShort}</span>
-                      ) : null}
-                    </div>
-                    <div className="break-all font-mono text-[11px] text-[var(--muted)]">
-                      {item.planId} / {item.phaseId}
-                    </div>
-                    <div className="break-all font-mono text-[11px] text-[var(--muted)]">
-                      {item.worktreePath}
-                    </div>
-                    <div className="break-all text-[11px] text-[var(--muted)]">
-                      {t("Base")}: {item.baseRevision ?? t("unknown")} | {t("Ref")}: {item.refName ?? item.branch ?? t("unknown")}
-                    </div>
-                    {item.implementationChatId || item.agentTaskId ? (
-                      <div className="break-all text-[11px] text-[var(--muted)]">
-                        {item.implementationChatId ?? t("No implementation chat")} · {item.agentTaskId ?? t("No agent task")}
-                      </div>
-                    ) : null}
-                    {item.errorMessage ? (
-                      <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1 text-[11px] text-[var(--danger)]">
-                        {item.errorMessage}
-                      </div>
-                    ) : null}
-                  </div>
-                  <button
-                    aria-label={t("Clean up worktree")}
-                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-                    disabled={!item.cleanupAllowed || operationKey !== null}
-                    onClick={() => void onCleanup(item)}
-                    title={item.cleanupAllowed ? t("Clean up worktree") : t("Cleanup unavailable while plan or phase is running")}
-                    type="button"
-                  >
-                    {isCleanupBusy ? (
-                      <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                    ) : (
-                      <Trash2 aria-hidden="true" className="size-3.5" />
-                    )}
-                  </button>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 function PlanStepRow({ step }: { step: PlanStep }) {
   const { t } = useI18n();

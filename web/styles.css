@@ -4985,7 +4985,7 @@ summary:focus-visible {
     display: none;
   }
 
-  .plan-worktree-audit-button {
+  .plan-locate-button {
     position: relative;
     width: 2rem;
     min-width: 2rem;
@@ -4994,7 +4994,7 @@ summary:focus-visible {
     gap: 0;
   }
 
-  .plan-worktree-audit-button-label {
+  .plan-locate-button-label {
     position: absolute;
     width: 1px;
     height: 1px;

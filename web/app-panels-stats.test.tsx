@@ -918,6 +918,9 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       screen.getByText("No active plans for this workspace."),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Locate running plan" }),
+    ).toBeDisabled();
   });
 
   it("hides Resume behind Retry when the earliest incomplete phase is cancelled", async () => {
@@ -1453,6 +1456,11 @@ describe("app-panels-stats verification surfaces", () => {
     await waitFor(() => {
       expect(planListPanel?.scrollTop).toBe(450);
     });
+    planListPanel!.scrollTop = 0;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Locate running plan" }),
+    );
+    expect(planListPanel?.scrollTop).toBe(450);
     expect(screen.getByText("Ready scroll decoy")).toBeInTheDocument();
     expect(
       scrollIntoView.mock.contexts.some(
@@ -1463,103 +1471,18 @@ describe("app-panels-stats verification surfaces", () => {
     ).toBe(false);
   });
 
-  it("toggles the plan worktree audit view back to the plan list", async () => {
-    const user = userEvent.setup();
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        const path = url.startsWith("http://127.0.0.1")
-          ? new URL(url).pathname
-          : url.split("?")[0];
-
-        if (path === "/api/workspaces/workspace-1/plans") {
-          return jsonResponse({
-            page: 1,
-            pageSize: 50,
-            plans: [],
-            totalCount: 0,
-            totalPages: 1,
-          });
-        }
-
-        if (path === "/api/workspaces/workspace-1/plans/worktrees/audit") {
-          return jsonResponse({
-            items: [
-              {
-                agentInstanceId: "agent-instance-audit",
-                agentTaskId: "agent-task-audit",
-                agentTaskStatus: "completed",
-                baseRevision: "main",
-                branch: "foco/plan-audit",
-                cleanupAllowed: true,
-                commitId: "abcdef1234567890",
-                errorMessage: null,
-                headCommitId: "abcdef1234567890",
-                headCommitShort: "abcdef1",
-                implementationChatId: "chat-audit",
-                phaseId: "phase-audit",
-                phaseStatus: "completed",
-                planId: "plan-audit",
-                planStatus: "implemented",
-                refName: "refs/heads/foco/plan-audit",
-                worktreePath: "C:\\work\\foco\\.worktrees\\plan-audit",
-                worktreeStatus: "kept",
-              },
-            ],
-            recoveryNote: "Recover manually.",
-          });
-        }
-
-        return mockFetch(input, init);
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
-
-    renderApp();
-
-    await user.click(await screen.findByRole("tab", { name: "Plan" }));
-    expect(
-      await screen.findByText("No active plans for this workspace."),
-    ).toBeInTheDocument();
-
-    const auditButton = screen.getByRole("button", {
-      name: "Audit plan worktrees",
-    });
-    expect(auditButton).toHaveClass("plan-worktree-audit-button");
-    expect(auditButton.querySelector(".plan-worktree-audit-button-label")).toHaveTextContent(
-      "Audit",
-    );
-    await user.click(auditButton);
-
-    expect(await screen.findByText("Legacy worktrees")).toBeInTheDocument();
-    expect(screen.getByText("plan-audit / phase-audit")).toBeInTheDocument();
-    expect(
-      screen.queryByText("No active plans for this workspace."),
-    ).not.toBeInTheDocument();
-
-    await user.click(auditButton);
-
-    await waitFor(() => {
-      expect(screen.queryByText("Legacy worktrees")).not.toBeInTheDocument();
-    });
-    expect(
-      screen.getByText("No active plans for this workspace."),
-    ).toBeInTheDocument();
-  });
-
-  it("hides plan worktree audit label only under the phone breakpoint", () => {
+  it("hides the Plan locate label only under the phone breakpoint", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
 
     expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.plan-worktree-audit-button-label\s*\{[\s\S]*?clip:\s*rect\(0,\s*0,\s*0,\s*0\)/,
+      /@media \(max-width: 767px\)[\s\S]*?\.plan-locate-button-label\s*\{[\s\S]*?clip:\s*rect\(0,\s*0,\s*0,\s*0\)/,
     );
     expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.plan-worktree-audit-button\s*\{[\s\S]*?width:\s*2rem/,
+      /@media \(max-width: 767px\)[\s\S]*?\.plan-locate-button\s*\{[\s\S]*?width:\s*2rem/,
     );
     // Label must remain visible outside the phone breakpoint (no global hide).
     expect(stylesCss).not.toMatch(
-      /^\.plan-worktree-audit-button-label\s*\{[\s\S]*?clip:\s*rect/m,
+      /^\.plan-locate-button-label\s*\{[\s\S]*?clip:\s*rect/m,
     );
   });
 
