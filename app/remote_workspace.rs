@@ -27,11 +27,12 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::{SecondsFormat, Utc};
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceId,
-    AgentInstanceStatus, AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTeamId,
-    AgentTeamStatus, ContextBudget, PendingToolCall, RejectedToolCall, TeamActivationRequest,
-    build_available_tools_prompt, build_memory_prompt_section, build_project_spec_prompt_section,
-    calculate_context_budget, estimate_text_tokens, plan_tool_execution, rejected_tool_batch,
+    AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentExecutionWorkspaceMode,
+    AgentInstanceId, AgentInstanceStatus, AgentRole, AgentTaskId, AgentTaskStatus,
+    AgentTaskTransition, AgentTeamId, AgentTeamStatus, ContextBudget, PendingToolCall,
+    RejectedToolCall, TeamActivationRequest, build_available_tools_prompt,
+    build_memory_prompt_section, build_project_spec_prompt_section, calculate_context_budget,
+    estimate_text_tokens, plan_tool_execution, rejected_tool_batch,
 };
 use foco_mcp::{McpExecutionHost, McpRegistry, McpToolDefinition};
 use foco_providers::{
@@ -54,15 +55,16 @@ use foco_store::{
         MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
-        AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
-        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
-        NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        PlanPhaseAttemptTrigger, RemotePreStreamFailureClosureOutcome, RewriteChatFromUserMessage,
-        TerminalSessionRecord, TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase,
-        WorkspaceDatabaseError, WorkspaceDatabaseHandle, WorkspaceSpecJobRecord,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        AgentAttemptRecoveryDisposition, AgentTaskStateUpdate,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION, LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
+        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
+        NewAgentInstance, NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent,
+        NewMessage, NewRunEvent, PlanPhaseAttemptTrigger, RemotePreStreamFailureClosureOutcome,
+        RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -3068,6 +3070,30 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             "reconciled running LLM request audits when the remote sidecar started"
         );
     }
+    let reconciliation_state = state.clone();
+    if let Err(error) = reconcile_remote_sidecar_agent_attempt_leases(&reconciliation_state) {
+        tracing::error!(
+            workspace_id = %state.workspace_id,
+            error = %error,
+            "failed to reconcile remote Agent attempt leases at sidecar startup"
+        );
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = reconcile_remote_sidecar_agent_attempt_leases(&reconciliation_state)
+            {
+                tracing::warn!(
+                    workspace_id = %reconciliation_state.workspace_id,
+                    error = %error,
+                    "failed to recheck remote Agent attempt leases"
+                );
+            }
+        }
+    });
 
     let heartbeat_state = state.clone();
     let shutdown_state = state.clone();
@@ -3921,6 +3947,43 @@ impl Drop for RemoteRunCleanupGuard {
         }
         remote_sidecar_cancel_active_run(&self.state, &self.run_id, false, true);
     }
+}
+
+fn reconcile_remote_sidecar_agent_attempt_leases(
+    state: &RemoteSidecarState,
+) -> Result<usize, WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))?;
+    let mut interrupted = 0;
+    for record in database.startup_agent_reconciliation()? {
+        if record.task.status != AgentTaskStatus::Running
+            || database.agent_attempt_recovery_disposition(&record.attempt, Duration::from_secs(30))
+                == AgentAttemptRecoveryDisposition::LeaseActive
+        {
+            continue;
+        }
+        let updated = database.update_agent_task_state_for_attempt(
+            AgentTaskStateUpdate {
+                team_id: &record.task.team_id,
+                task_id: &record.task.id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Interrupt,
+                result_json: None,
+                error_json: Some(
+                    r#"{"message":"remote sidecar lost the Agent attempt owner lease"}"#,
+                ),
+                interruption_reason: Some("remote sidecar lost the Agent attempt owner lease"),
+            },
+            &record.attempt.id,
+        )?;
+        if updated {
+            database.fail_plan_phase_run(
+                &record.task.id,
+                "remote sidecar lost the Agent attempt owner lease",
+            )?;
+            interrupted += 1;
+        }
+    }
+    Ok(interrupted)
 }
 
 #[derive(Clone)]
@@ -16350,6 +16413,8 @@ fn remote_sidecar_subscribe_run_stream(
 #[derive(Clone, Debug)]
 struct RemotePlanTaskBinding {
     task_id: AgentTaskId,
+    attempt_id: AgentAttemptId,
+    owner_incarnation: String,
 }
 
 const REMOTE_PLAN_TASK_KIND_FIELD: &str = "planTaskKind";
@@ -16544,6 +16609,25 @@ fn remote_sidecar_validate_plan_task_binding(
             task.id
         )));
     }
+    let attempts = database
+        .agent_attempts_for_task(&task.id)
+        .map_err(ApiError::from_workspace_error)?;
+    let attempt = attempts
+        .into_iter()
+        .rev()
+        .find(|attempt| attempt.status == AgentAttemptStatus::Running)
+        .ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "remote Plan Agent task '{}' has no running attempt",
+                task.id
+            ))
+        })?;
+    let owner_incarnation = attempt.owner_incarnation.ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "remote Plan Agent task '{}' has a legacy attempt without an owner lease",
+            task.id
+        ))
+    })?;
     let task_kind = remote_plan_task_kind_from_input(&task.input_json)?;
     if let Some((expected_queued_user_message_id, expected_assistant_message_id)) =
         remote_plan_task_message_identity_from_input(&task.input_json)?
@@ -16708,7 +16792,11 @@ fn remote_sidecar_validate_plan_task_binding(
             task.id
         )));
     }
-    Ok(Some(RemotePlanTaskBinding { task_id: task.id }))
+    Ok(Some(RemotePlanTaskBinding {
+        task_id: task.id,
+        attempt_id: attempt.id,
+        owner_incarnation,
+    }))
 }
 
 /// Owned state for a remote chat run that outlives any single SSE subscription.
@@ -16736,6 +16824,66 @@ struct RemoteSidecarChatRunContext {
     skill_read_root_dirs: Vec<PathBuf>,
     attachment_read_allowlist: Vec<PathBuf>,
     initial_runtime_tool_state: RemoteSidecarRuntimeToolState,
+}
+
+struct RemotePlanAttemptLeaseHeartbeat {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RemotePlanAttemptLeaseHeartbeat {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn renew_remote_plan_attempt_lease(
+    state: &RemoteSidecarState,
+    plan_task: &RemotePlanTaskBinding,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let mut database = WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))?;
+    database.renew_agent_attempt_lease(
+        &plan_task.task_id,
+        &plan_task.attempt_id,
+        &plan_task.owner_incarnation,
+    )
+}
+
+fn spawn_remote_plan_attempt_lease_heartbeat(
+    state: RemoteSidecarState,
+    plan_task: RemotePlanTaskBinding,
+    run_id: String,
+) -> RemotePlanAttemptLeaseHeartbeat {
+    let task = tokio::spawn(async move {
+        let mut heartbeat = tokio::time::interval(Duration::from_secs(5));
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        heartbeat.tick().await;
+        loop {
+            heartbeat.tick().await;
+            match renew_remote_plan_attempt_lease(&state, &plan_task) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!(
+                        task_id = %plan_task.task_id,
+                        attempt_id = %plan_task.attempt_id,
+                        "remote Plan attempt lease owner changed; cancelling late runner"
+                    );
+                    remote_sidecar_cancel_active_run(&state, &run_id, false, true);
+                    return;
+                }
+                Err(error) => {
+                    // As in the local scheduler, a transient database failure is not proof
+                    // that this owner disappeared. Keep the runner alive and retry.
+                    tracing::warn!(
+                        task_id = %plan_task.task_id,
+                        attempt_id = %plan_task.attempt_id,
+                        error = %error,
+                        "failed to renew remote Plan attempt lease; retrying"
+                    );
+                }
+            }
+        }
+    });
+    RemotePlanAttemptLeaseHeartbeat { task }
 }
 
 async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext) {
@@ -16768,6 +16916,13 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         queued_user_message_id.clone(),
         assistant_message_id.clone(),
     );
+    let _lease_heartbeat = plan_task.as_ref().map(|plan_task| {
+        spawn_remote_plan_attempt_lease_heartbeat(
+            stream_state.clone(),
+            plan_task.clone(),
+            run_id.clone(),
+        )
+    });
     // Claim the durable queuedRun in one synchronous section; the permit is released
     // before this background runner enters broker, hook, tool, or Git work.
     if let Err(error) = with_sidecar_workspace_database(&stream_state, |database| {
@@ -18482,7 +18637,12 @@ async fn remote_sidecar_dispatch_plan_merge(
         let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         database
-            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &task_id,
+                &agent_attempt_id,
+                Some(agent_attempt_id.as_str()),
+            )
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| {
                 ApiError::internal("queued remote Plan merge Coordinator was not claimable")
@@ -22121,7 +22281,12 @@ async fn remote_sidecar_dispatch_plan_phase(
         let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         database
-            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &task_id,
+                &agent_attempt_id,
+                Some(agent_attempt_id.as_str()),
+            )
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| {
                 ApiError::internal("queued remote Plan Coordinator was not claimable")
@@ -23775,7 +23940,12 @@ mod tests {
         let agent_attempt_id =
             AgentAttemptId::new("agent-attempt-remote-direct-merge").expect("agent attempt id");
         database
-            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &task_id,
+                &agent_attempt_id,
+                Some(agent_attempt_id.as_str()),
+            )
             .expect("claim task")
             .expect("task claimed");
         let shared_workspace_path = fs::canonicalize(workspace.path()).expect("shared workspace");
@@ -23913,7 +24083,12 @@ mod tests {
         let agent_attempt_id =
             AgentAttemptId::new("agent-attempt-remote-cancel").expect("agent attempt id");
         database
-            .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &task_id,
+                &agent_attempt_id,
+                Some(agent_attempt_id.as_str()),
+            )
             .expect("claim task")
             .expect("task claimed");
         let tool_workspace_path =
@@ -37138,7 +37313,12 @@ mod tests {
             .expect("enqueue task");
         let attempt_id = AgentAttemptId::new("agent-attempt-terminal-history").expect("attempt id");
         database
-            .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &task_id,
+                &attempt_id,
+                Some(attempt_id.as_str()),
+            )
             .expect("claim task")
             .expect("task claimed");
         database

@@ -254,6 +254,24 @@ pub struct AgentAttemptRecord {
     pub started_at: String,
     pub completed_at: Option<String>,
     pub interruption_reason: Option<String>,
+    /// Scheduler process incarnation currently allowed to renew this attempt.
+    /// Legacy attempts have no owner and are conservatively treated as abandoned.
+    pub owner_incarnation: Option<String>,
+    /// Last durable liveness renewal for `owner_incarnation`.
+    pub lease_renewed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentAttemptRecoveryDisposition {
+    /// No owner/lease was written by an older build, so no live coordinator can
+    /// be verified and normal startup interruption remains safe.
+    VerifiedAbandonedLegacy,
+    /// A coordinator has recently renewed its durable lease.
+    LeaseActive,
+    /// The owner was known, but its durable renewal expired.
+    VerifiedAbandonedLeaseExpired,
+    /// Malformed owner/lease state is never treated as live.
+    VerifiedAbandonedInvalidLease,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

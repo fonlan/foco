@@ -1552,6 +1552,18 @@ CREATE INDEX plan_phase_attempts_agent_task_idx
 ON plan_phase_attempts (agent_task_id);
 "#;
 
+// Agent coordinators may briefly overlap a scheduler restart. A durable owner
+// incarnation and renewed lease let recovery distinguish that live runner from
+// an actually abandoned attempt without trusting process-local state.
+pub(crate) const MIGRATION_046: &str = r#"
+ALTER TABLE agent_attempts ADD COLUMN owner_incarnation TEXT;
+ALTER TABLE agent_attempts ADD COLUMN lease_renewed_at TEXT;
+
+CREATE INDEX agent_attempts_active_lease_idx
+ON agent_attempts (status, lease_renewed_at)
+WHERE status IN ('running', 'suspended');
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

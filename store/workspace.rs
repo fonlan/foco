@@ -45,16 +45,16 @@ pub use crate::workspace_gate::{
     wait_for_ordinary_gate_queued_waiters,
 };
 pub use workspace_records::{
-    AgentAttemptRecord, AgentContextEntryRecord, AgentContextSnapshotRecord, AgentEventRecord,
-    AgentInstanceRecord, AgentMessageRecord, AgentReconciliationRecord, AgentTaskDependencyRecord,
-    AgentTaskRecord, AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, AgentTeamRecord,
-    ChatPage, ChatPageCursor, ChatRecord, ChatSpecSnapshotRecord, CodeChangeStats,
-    CodeGraphContextRecord, CodeGraphFileSummaryRecord, CodeGraphImportRecord,
-    CodeGraphReferenceRecord, CodeGraphRelatedFileRecord, CodeGraphResolverFileRecord,
-    CodeGraphResolverImportRecord, CodeGraphResolverReferenceRecord, CodeGraphResolverSnapshot,
-    CodeGraphResolverSymbolRecord, CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord,
-    ContextCompressionSnapshotRecord, HookRunRecord, LlmRequestAuditFilters,
-    LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
+    AgentAttemptRecord, AgentAttemptRecoveryDisposition, AgentContextEntryRecord,
+    AgentContextSnapshotRecord, AgentEventRecord, AgentInstanceRecord, AgentMessageRecord,
+    AgentReconciliationRecord, AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate,
+    AgentTaskWaitRegistrationOutcome, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
+    ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord,
+    CodeGraphImportRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
+    CodeGraphResolverFileRecord, CodeGraphResolverImportRecord, CodeGraphResolverReferenceRecord,
+    CodeGraphResolverSnapshot, CodeGraphResolverSymbolRecord, CodeGraphSymbolRecord,
+    CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
+    LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
     LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
     LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsForAssistantRecord,
     LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRecord,
@@ -96,13 +96,13 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    MIGRATION_045, Migration,
+    MIGRATION_045, MIGRATION_046, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 45;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 46;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -458,6 +458,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 45,
         sql: MIGRATION_045,
+    },
+    Migration {
+        version: 46,
+        sql: MIGRATION_046,
     },
 ];
 
@@ -14542,6 +14546,24 @@ impl WorkspaceDatabase {
         task_id: &AgentTaskId,
         attempt_id: &AgentAttemptId,
     ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.claim_runnable_agent_task_with_owner(team_id, task_id, attempt_id, None)
+    }
+
+    /// Claim a runnable task and bind its new attempt to one scheduler incarnation.
+    /// A NULL owner is retained only for legacy fixtures and callers that cannot
+    /// yet supply an incarnation; recovery treats it as verified abandoned.
+    pub fn claim_runnable_agent_task_with_owner(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        attempt_id: &AgentAttemptId,
+        owner_incarnation: Option<&str>,
+    ) -> Result<Option<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if owner_incarnation.is_some_and(|owner| owner.trim().is_empty()) {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent attempt owner incarnation must not be empty".to_string(),
+            });
+        }
         let now = now_timestamp();
         let database_path = self.database_path.clone();
         let transaction = self
@@ -14650,14 +14672,17 @@ impl WorkspaceDatabase {
         transaction
             .execute(
                 "INSERT INTO agent_attempts
-                    (id, team_id, task_id, sequence, status, started_at)
-                 VALUES (?1, ?2, ?3, ?4, 'running', ?5)",
+                    (id, team_id, task_id, sequence, status, started_at,
+                     owner_incarnation, lease_renewed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, ?6,
+                         CASE WHEN ?6 IS NULL THEN NULL ELSE ?5 END)",
                 params![
                     attempt_id.as_str(),
                     team_id.as_str(),
                     task_id.as_str(),
                     attempt_sequence,
-                    now
+                    now,
+                    owner_incarnation,
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -14682,6 +14707,63 @@ impl WorkspaceDatabase {
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
         self.agent_task(task_id)
+    }
+
+    /// Renew one active attempt lease. The owner check prevents a late process
+    /// from keeping a successor-owned attempt alive.
+    pub fn renew_agent_attempt_lease(
+        &mut self,
+        task_id: &AgentTaskId,
+        attempt_id: &AgentAttemptId,
+        owner_incarnation: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        if owner_incarnation.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent attempt owner incarnation must not be empty".to_string(),
+            });
+        }
+        self.connection
+            .execute(
+                "UPDATE agent_attempts
+                 SET lease_renewed_at = ?4
+                 WHERE id = ?1 AND task_id = ?2 AND owner_incarnation = ?3
+                   AND status IN ('running', 'suspended')",
+                params![
+                    attempt_id.as_str(),
+                    task_id.as_str(),
+                    owner_incarnation,
+                    now_timestamp(),
+                ],
+            )
+            .map(|updated| updated == 1)
+            .map_err(|source| self.sqlite_error(source))
+    }
+
+    pub fn agent_attempt_recovery_disposition(
+        &self,
+        attempt: &AgentAttemptRecord,
+        lease_timeout: Duration,
+    ) -> AgentAttemptRecoveryDisposition {
+        let (Some(owner_incarnation), Some(lease_renewed_at)) = (
+            attempt.owner_incarnation.as_deref(),
+            attempt.lease_renewed_at.as_deref(),
+        ) else {
+            return AgentAttemptRecoveryDisposition::VerifiedAbandonedLegacy;
+        };
+        if owner_incarnation.trim().is_empty() {
+            return AgentAttemptRecoveryDisposition::VerifiedAbandonedInvalidLease;
+        }
+        let Ok(lease_renewed_at) = DateTime::parse_from_rfc3339(lease_renewed_at) else {
+            return AgentAttemptRecoveryDisposition::VerifiedAbandonedInvalidLease;
+        };
+        let lease_age = Utc::now().signed_duration_since(lease_renewed_at.with_timezone(&Utc));
+        if lease_age
+            <= chrono::Duration::from_std(lease_timeout).unwrap_or(chrono::Duration::zero())
+        {
+            AgentAttemptRecoveryDisposition::LeaseActive
+        } else {
+            AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired
+        }
     }
 
     pub fn update_agent_task_state(
@@ -14890,7 +14972,8 @@ impl WorkspaceDatabase {
             .connection
             .prepare(
                 "SELECT id, team_id, task_id, sequence, status, started_at,
-                        completed_at, interruption_reason
+                        completed_at, interruption_reason, owner_incarnation,
+                        lease_renewed_at
                  FROM agent_attempts WHERE task_id = ?1 ORDER BY sequence ASC",
             )
             .map_err(|source| self.sqlite_error(source))?;
@@ -14905,6 +14988,8 @@ impl WorkspaceDatabase {
                     started_at: row.get(5)?,
                     completed_at: row.get(6)?,
                     interruption_reason: row.get(7)?,
+                    owner_incarnation: row.get(8)?,
+                    lease_renewed_at: row.get(9)?,
                 })
             })
             .map_err(|source| self.sqlite_error(source))?;
@@ -15779,7 +15864,8 @@ impl WorkspaceDatabase {
                 "SELECT
                     attempt.id, attempt.team_id, attempt.task_id, attempt.sequence,
                     attempt.status, attempt.started_at, attempt.completed_at,
-                    attempt.interruption_reason,
+                    attempt.interruption_reason, attempt.owner_incarnation,
+                    attempt.lease_renewed_at,
                     task.id, task.team_id, task.owner_instance_id, task.origin_instance_id,
                     task.parent_task_id, task.sequence, task.status, task.input_json,
                     task.result_json, task.error_json, task.created_at, task.updated_at,
@@ -15803,22 +15889,24 @@ impl WorkspaceDatabase {
                         started_at: row.get(5)?,
                         completed_at: row.get(6)?,
                         interruption_reason: row.get(7)?,
+                        owner_incarnation: row.get(8)?,
+                        lease_renewed_at: row.get(9)?,
                     },
                     task: AgentTaskRecord {
-                        id: agent_id_from_row(row, 8)?,
-                        team_id: agent_id_from_row(row, 9)?,
-                        owner_instance_id: agent_id_from_row(row, 10)?,
-                        origin_instance_id: optional_agent_id_from_row(row, 11)?,
-                        parent_task_id: optional_agent_id_from_row(row, 12)?,
-                        sequence: row.get(13)?,
-                        status: agent_enum_from_row(row, 14)?,
-                        input_json: row.get(15)?,
-                        result_json: row.get(16)?,
-                        error_json: row.get(17)?,
-                        created_at: row.get(18)?,
-                        updated_at: row.get(19)?,
-                        started_at: row.get(20)?,
-                        completed_at: row.get(21)?,
+                        id: agent_id_from_row(row, 10)?,
+                        team_id: agent_id_from_row(row, 11)?,
+                        owner_instance_id: agent_id_from_row(row, 12)?,
+                        origin_instance_id: optional_agent_id_from_row(row, 13)?,
+                        parent_task_id: optional_agent_id_from_row(row, 14)?,
+                        sequence: row.get(15)?,
+                        status: agent_enum_from_row(row, 16)?,
+                        input_json: row.get(17)?,
+                        result_json: row.get(18)?,
+                        error_json: row.get(19)?,
+                        created_at: row.get(20)?,
+                        updated_at: row.get(21)?,
+                        started_at: row.get(22)?,
+                        completed_at: row.get(23)?,
                     },
                 })
             })

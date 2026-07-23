@@ -19,10 +19,11 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall, Neutr
 use foco_store::{
     config::{AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS, AgentDefinitionSettings},
     workspace::{
-        AgentAttemptRecord, AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
-        AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord,
-        NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, WorkspaceDatabase,
+        AgentAttemptRecord, AgentAttemptRecoveryDisposition, AgentContextEntryRecord,
+        AgentInstanceRecord, AgentMessageRecord, AgentTaskDependencyRecord, AgentTaskRecord,
+        AgentTaskStateUpdate, AgentTeamRecord, NewAgentContextEntry, NewAgentContextSnapshot,
+        NewAgentEvent, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+        WorkspaceDatabase,
     },
 };
 use futures_util::FutureExt;
@@ -55,6 +56,8 @@ const AGENT_SCHEDULER_WAKE_CAPACITY: usize = 1;
 const AGENT_SCHEDULER_SCAN_LIMIT: i64 = 64;
 const AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS: u64 = 1_000;
 const AGENT_SCHEDULER_ERROR_RETRY_SECS: i64 = 30;
+const AGENT_ATTEMPT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
+const AGENT_ATTEMPT_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 10;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
 const AGENT_TEAM_PROTOCOL_VERSION: u32 = 2;
@@ -168,13 +171,28 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     let mut runs = JoinSet::new();
     let mut run_identities = HashMap::new();
     let mut shutdown_rx = state.app_shutdown_rx.clone();
+    let owner_incarnation = unique_id("agent-owner");
     let mut scan = true;
     let mut next_deadline_at: Option<DateTime<Utc>> = None;
 
     loop {
         if scan {
             scan = false;
-            match schedule_runnable_tasks(&state, &permits, &mut runs, &mut run_identities).await {
+            if let Err(error) = reconcile_agent_attempt_leases(&state) {
+                tracing::error!(
+                    error = %error.message,
+                    "Agent scheduler lease reconciliation failed"
+                );
+            }
+            match schedule_runnable_tasks(
+                &state,
+                &permits,
+                &mut runs,
+                &mut run_identities,
+                &owner_incarnation,
+            )
+            .await
+            {
                 Ok(result) => next_deadline_at = result.next_deadline_at,
                 Err(error) => {
                     next_deadline_at = Some(
@@ -205,7 +223,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
                 }
                 scan = true;
             }
-            _ = &mut deadline_sleep, if next_deadline_at.is_some() => {
+            _ = &mut deadline_sleep => {
                 scan = true;
             }
         }
@@ -345,6 +363,12 @@ pub(crate) fn reconcile_running_llm_request_audits_on_startup(state: &AppState) 
 
 pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> {
     reconcile_running_llm_request_audits_on_startup(state);
+    reconcile_agent_attempt_leases(state)
+}
+
+/// Reconcile only Agent lifecycle state after startup. Unlike the full startup
+/// path, this is safe to repeat while coordinators and provider requests run.
+fn reconcile_agent_attempt_leases(state: &AppState) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
     for workspace in config.local_workspaces() {
         let reconciliation = (|| -> Result<(), ApiError> {
@@ -355,6 +379,22 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
             {
                 let expected_status = record.task.status;
                 if expected_status != AgentTaskStatus::Running {
+                    continue;
+                }
+                let recovery = database.agent_attempt_recovery_disposition(
+                    &record.attempt,
+                    AGENT_ATTEMPT_LEASE_TIMEOUT,
+                );
+                if recovery == AgentAttemptRecoveryDisposition::LeaseActive {
+                    insert_agent_event(
+                        &mut database,
+                        &record.task.team_id,
+                        "attempt_recovery_deferred",
+                        Some(&record.task.owner_instance_id),
+                        Some(&record.task.id),
+                        Some(&record.attempt.id),
+                        json!({ "reason": "lease_active" }),
+                    )?;
                     continue;
                 }
                 if database
@@ -419,7 +459,10 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                     Some(&record.task.owner_instance_id),
                     Some(&record.task.id),
                     Some(&record.attempt.id),
-                    json!({ "reason": RESTART_INTERRUPTION_REASON }),
+                    json!({
+                        "reason": RESTART_INTERRUPTION_REASON,
+                        "recovery": recovery_diagnostic_code(&recovery),
+                    }),
                 )?;
                 database
                     .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
@@ -492,6 +535,19 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
         tracing::warn!(error = %error.message, "failed to reconcile integrated plan derived effects");
     }
     Ok(())
+}
+
+fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'static str {
+    match recovery {
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLegacy => "verified_abandoned_legacy",
+        AgentAttemptRecoveryDisposition::LeaseActive => "lease_active",
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired => {
+            "verified_abandoned_lease_expired"
+        }
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedInvalidLease => {
+            "verified_abandoned_invalid_lease"
+        }
+    }
 }
 
 /// Close a Coordinator-owned implementation chat during startup recovery.
@@ -586,6 +642,7 @@ struct AgentCoordinatorRunIdentity {
     workspace: WorkspaceConfig,
     task_id: AgentTaskId,
     attempt_id: AgentAttemptId,
+    owner_incarnation: String,
 }
 
 enum AgentCoordinatorRunExit {
@@ -608,6 +665,7 @@ async fn schedule_runnable_tasks(
     permits: &Arc<Semaphore>,
     runs: &mut JoinSet<AgentCoordinatorRunCompletion>,
     run_identities: &mut HashMap<TokioTaskId, AgentCoordinatorRunIdentity>,
+    owner_incarnation: &str,
 ) -> Result<AgentSchedulerScan, ApiError> {
     let config = config_snapshot(state)?;
     let mut scan = AgentSchedulerScan::default();
@@ -670,7 +728,12 @@ async fn schedule_runnable_tasks(
             let attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
                 .map_err(|error| ApiError::internal(error.to_string()))?;
             let Some(claimed) = database
-                .claim_runnable_agent_task(&task.team_id, &task.id, &attempt_id)
+                .claim_runnable_agent_task_with_owner(
+                    &task.team_id,
+                    &task.id,
+                    &attempt_id,
+                    Some(owner_incarnation),
+                )
                 .map_err(ApiError::from_workspace_error)?
             else {
                 drop(permit);
@@ -681,6 +744,7 @@ async fn schedule_runnable_tasks(
                 workspace: workspace.clone(),
                 task_id: claimed.id.clone(),
                 attempt_id: attempt_id.clone(),
+                owner_incarnation: owner_incarnation.to_string(),
             };
             if let Err(error) =
                 crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task(
@@ -740,6 +804,7 @@ async fn schedule_runnable_tasks(
                     run_identity.workspace.clone(),
                     run_identity.task_id.clone(),
                     run_identity.attempt_id.clone(),
+                    run_identity.owner_incarnation.clone(),
                 ))
                 .await;
                 AgentCoordinatorRunCompletion {
@@ -814,7 +879,10 @@ fn record_next_agent_deadline(
 
 fn agent_scheduler_deadline_delay(next_deadline_at: Option<&DateTime<Utc>>) -> Duration {
     let Some(next_deadline_at) = next_deadline_at else {
-        return Duration::from_secs(86_400);
+        // Lease expiry is a durable recovery deadline even when no task
+        // dependency deadline exists. This re-check is what eventually closes
+        // a coordinator that was live during startup but later proved absent.
+        return AGENT_ATTEMPT_LEASE_TIMEOUT;
     };
     let now = Utc::now();
     if next_deadline_at <= &now {
@@ -826,7 +894,7 @@ fn agent_scheduler_deadline_delay(next_deadline_at: Option<&DateTime<Utc>>) -> D
     if millis_until_deadline <= 0 {
         return Duration::from_millis(AGENT_SCHEDULER_MIN_DEADLINE_DELAY_MS);
     }
-    Duration::from_millis(millis_until_deadline as u64)
+    Duration::from_millis(millis_until_deadline as u64).min(AGENT_ATTEMPT_LEASE_TIMEOUT)
 }
 
 async fn run_coordinator_task(
@@ -834,14 +902,23 @@ async fn run_coordinator_task(
     workspace: WorkspaceConfig,
     task_id: AgentTaskId,
     attempt_id: AgentAttemptId,
+    owner_incarnation: String,
 ) {
     let identity = AgentCoordinatorRunIdentity {
         workspace: workspace.clone(),
         task_id: task_id.clone(),
         attempt_id: attempt_id.clone(),
+        owner_incarnation: owner_incarnation.clone(),
     };
-    if let Err(error) = run_coordinator_task_inner(&state, &workspace, &task_id, &attempt_id).await
-    {
+    let result = run_coordinator_task_with_lease_heartbeat(
+        &state,
+        &workspace,
+        &task_id,
+        &attempt_id,
+        &owner_incarnation,
+    )
+    .await;
+    if let Err(error) = result {
         tracing::error!(
             workspace_id = %workspace.id,
             task_id = %task_id,
@@ -871,6 +948,54 @@ async fn run_coordinator_task(
             error = %wake_error.message,
             "failed to wake Agent scheduler after Coordinator task closure"
         );
+    }
+}
+
+async fn run_coordinator_task_with_lease_heartbeat(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    task_id: &AgentTaskId,
+    attempt_id: &AgentAttemptId,
+    owner_incarnation: &str,
+) -> Result<(), ApiError> {
+    let run = run_coordinator_task_inner(state, workspace, task_id, attempt_id);
+    tokio::pin!(run);
+    let mut heartbeat = time::interval(AGENT_ATTEMPT_LEASE_HEARTBEAT);
+    heartbeat.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+    // Claiming the attempt writes its first lease renewal.
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            result = &mut run => return result,
+            _ = heartbeat.tick() => {
+                let renewal = (|| -> Result<bool, ApiError> {
+                    let mut database = open_workspace_database_critical(&workspace.path)?;
+                    database
+                        .renew_agent_attempt_lease(task_id, attempt_id, owner_incarnation)
+                        .map_err(ApiError::from_workspace_error)
+                })();
+                match renewal {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Err(ApiError::conflict(
+                            "Agent attempt lease is no longer owned by this coordinator",
+                        ));
+                    }
+                    Err(error) => {
+                        // A failed renewal does not prove another owner took over. Keep the
+                        // coordinator alive so a transient gate/SQLite failure cannot turn
+                        // into an incorrect terminal transition; the next heartbeat retries.
+                        tracing::warn!(
+                            workspace_id = %workspace.id,
+                            task_id = %task_id,
+                            attempt_id = %attempt_id,
+                            error = %error.message,
+                            "failed to renew Agent attempt lease; retrying on next heartbeat"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1317,6 +1442,7 @@ pub(crate) async fn recover_panicked_coordinator_for_test(
         workspace,
         task_id,
         attempt_id,
+        owner_incarnation: "agent-owner-test-panic-recovery".to_string(),
     };
     let reason = format!("Coordinator task panicked: {message}");
     recover_abnormal_coordinator_exit(state, &identity, &reason).await;
@@ -3216,9 +3342,15 @@ mod tests {
         let mut runs = JoinSet::new();
         let mut run_identities = HashMap::new();
 
-        schedule_runnable_tasks(&state, &permits, &mut runs, &mut run_identities)
-            .await
-            .expect("remote workspace should not abort the local scheduler scan");
+        schedule_runnable_tasks(
+            &state,
+            &permits,
+            &mut runs,
+            &mut run_identities,
+            "agent-owner-test-scheduler",
+        )
+        .await
+        .expect("remote workspace should not abort the local scheduler scan");
 
         assert!(runs.is_empty());
     }

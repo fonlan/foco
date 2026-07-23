@@ -12531,10 +12531,66 @@ fn insert_claimed_agent_task(
     insert_claimed_agent_task_with_input(workspace_dir, suffix, "{}")
 }
 
+#[test]
+fn startup_reconciliation_preserves_attempt_with_active_durable_lease() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let (team_id, _, task_id, attempt_id) = insert_claimed_agent_task_with_input_and_owner(
+        workspace.path(),
+        "restart-active-lease",
+        "{}",
+        Some("agent-owner-live-coordinator"),
+    );
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Running,
+        "a recently renewed owner lease proves the coordinator remains live"
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Running
+    );
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "attempt_recovery_deferred"
+            && event.payload_json.contains("lease_active")
+            && event.attempt_id.as_ref() == Some(&attempt_id)
+    }));
+}
+
 fn insert_claimed_agent_task_with_input(
     workspace_dir: &Path,
     suffix: &str,
     input_json: &str,
+) -> (
+    foco_agent::AgentTeamId,
+    foco_agent::AgentInstanceId,
+    foco_agent::AgentTaskId,
+    foco_agent::AgentAttemptId,
+) {
+    insert_claimed_agent_task_with_input_and_owner(workspace_dir, suffix, input_json, None)
+}
+
+fn insert_claimed_agent_task_with_input_and_owner(
+    workspace_dir: &Path,
+    suffix: &str,
+    input_json: &str,
+    owner_incarnation: Option<&str>,
 ) -> (
     foco_agent::AgentTeamId,
     foco_agent::AgentInstanceId,
@@ -12591,7 +12647,7 @@ fn insert_claimed_agent_task_with_input(
         })
         .expect("enqueue");
     database
-        .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
+        .claim_runnable_agent_task_with_owner(&team_id, &task_id, &attempt_id, owner_incarnation)
         .expect("claim")
         .expect("claimed");
     (team_id, instance_id, task_id, attempt_id)
