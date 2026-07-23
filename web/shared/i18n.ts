@@ -67,6 +67,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Workspace Spec compaction": "Workspace Spec compaction",
     "Workspace Spec update compaction": "Workspace Spec update compaction",
     "Git commit message generation": "Git commit message generation",
+    "Skill Store translation": "Skill Store translation",
     "Delete Spec job": "Delete Spec job",
     "Delete Spec job confirmation":
       "Delete this failed Spec job? This only removes the history entry.",
@@ -751,6 +752,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Workspace Spec compaction": "Workspace Spec 压缩",
     "Workspace Spec update compaction": "Workspace Spec 更新压缩",
     "Git commit message generation": "Git 提交信息生成",
+    "Skill Store translation": "技能商店翻译",
     "Refresh request audit": "刷新请求审计",
     "Refresh request audit to load charts": "刷新请求审计以加载图表",
     "Pause auto refresh": "暂停自动刷新",

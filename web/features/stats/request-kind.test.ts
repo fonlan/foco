@@ -32,6 +32,7 @@ describe("request-kind", () => {
         "Git commit message generation",
         "Git 提交信息生成",
       ],
+      ["skill store translation", "Skill Store translation", "技能商店翻译"],
     ] as const;
 
     expect(STABLE_REQUEST_KINDS).toEqual(expectedLabels.map(([requestKind]) => requestKind));

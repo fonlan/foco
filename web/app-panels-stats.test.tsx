@@ -4593,7 +4593,7 @@ describe("app-panels-stats verification surfaces", () => {
     ).map(([id, transport]) => ({
       ...aiStatistics.requests[0],
       id,
-      requestKind: "workspace spec update",
+      requestKind: "skill store translation",
       transport,
     }));
     vi.mocked(fetch).mockImplementation((input, init) => {
@@ -4627,7 +4627,7 @@ describe("app-panels-stats verification surfaces", () => {
             ...aiStatisticsDetail,
             request: {
               ...aiStatisticsDetail.request,
-              requestKind: "workspace spec update",
+              requestKind: "skill store translation",
             },
           }),
         );
@@ -4661,17 +4661,17 @@ describe("app-panels-stats verification surfaces", () => {
     });
     expect(
       within(requestTypeFilter).getByRole("option", {
-        name: "Workspace Spec 更新",
+        name: "技能商店翻译",
       }),
-    ).toHaveValue("workspace spec update");
-    expect(within(table).getAllByText("Workspace Spec 更新")).toHaveLength(3);
+    ).toHaveValue("skill store translation");
+    expect(within(table).getAllByText("技能商店翻译")).toHaveLength(3);
 
     await userEvent.click(
       within(table).getAllByRole("button", { name: "查看请求详情" })[0],
     );
     const dialog = await screen.findByRole("dialog", { name: "请求详情" });
     expect(within(dialog).getByText("请求类型")).toBeInTheDocument();
-    expect(within(dialog).getByText("Workspace Spec 更新")).toBeInTheDocument();
+    expect(within(dialog).getByText("技能商店翻译")).toBeInTheDocument();
   });
 
   it("forwards vertical request audit wheel input with a non-passive listener", async () => {

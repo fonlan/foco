@@ -17,6 +17,7 @@ export const STABLE_REQUEST_KINDS = [
   "workspace spec compaction",
   "workspace spec update compaction",
   "git_commit_message_generation",
+  "skill store translation",
 ] as const;
 
 type StableRequestKind = (typeof STABLE_REQUEST_KINDS)[number];
@@ -35,6 +36,7 @@ const REQUEST_KIND_TRANSLATION_KEYS: Record<StableRequestKind, string> = {
   "workspace spec compaction": "Workspace Spec compaction",
   "workspace spec update compaction": "Workspace Spec update compaction",
   git_commit_message_generation: "Git commit message generation",
+  "skill store translation": "Skill Store translation",
 };
 
 export function requestKindLabel(requestKind: string, t: Translate) {
