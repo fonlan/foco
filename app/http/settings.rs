@@ -353,10 +353,17 @@ pub(crate) struct RevealProviderApiKeyResponse {
     pub(crate) api_key: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DeleteSettingsItemRequest {
     pub(crate) id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RemoteWorkspaceSkillToggleRequest {
+    pub(crate) key: String,
+    pub(crate) enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -2439,6 +2446,92 @@ pub(crate) async fn workspace_skills(
             &workspace_id,
         ),
     ))
+}
+
+pub(crate) async fn save_remote_workspace_skill(
+    State(state): State<AppState>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+    Json(request): Json<RemoteWorkspaceSkillToggleRequest>,
+) -> Result<Json<WorkspaceSkillsDiscoveryResponse>, ApiError> {
+    let key = request.key.trim();
+    if key.is_empty() {
+        return Err(ApiError::bad_request("skill key must not be empty"));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    if !workspace.is_remote() {
+        return Err(ApiError::bad_request(
+            "remote skill settings require a remote workspace",
+        ));
+    }
+
+    let response = crate::remote_workspace::set_remote_workspace_skill_enabled(
+        &state,
+        &workspace_id,
+        request.clone(),
+    )
+    .await?;
+
+    let mut config = config_update_snapshot(&state).await?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    if !workspace.is_remote() {
+        return Err(ApiError::bad_request(
+            "remote skill settings require a remote workspace",
+        ));
+    }
+    if request.enabled {
+        config
+            .skills
+            .disabled
+            .retain(|disabled_key| disabled_key != key);
+    } else if !config
+        .skills
+        .disabled
+        .iter()
+        .any(|disabled_key| disabled_key == key)
+    {
+        config.skills.disabled.push(key.to_string());
+    }
+    config
+        .validate(Some(&state.config_file))
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    save_config(&state, &mut config)?;
+
+    Ok(response)
+}
+
+pub(crate) async fn delete_remote_workspace_skill(
+    State(state): State<AppState>,
+    axum::extract::Path(workspace_id): axum::extract::Path<String>,
+    Json(request): Json<DeleteSettingsItemRequest>,
+) -> Result<Json<WorkspaceSkillsDiscoveryResponse>, ApiError> {
+    let id = request.id.trim();
+    if id.is_empty() {
+        return Err(ApiError::bad_request("skill id must not be empty"));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    if !workspace.is_remote() {
+        return Err(ApiError::bad_request(
+            "remote skill deletion requires a remote workspace",
+        ));
+    }
+
+    let response = crate::remote_workspace::delete_remote_workspace_skill(
+        &state,
+        &workspace_id,
+        request.clone(),
+    )
+    .await?;
+    let mut config = config_update_snapshot(&state).await?;
+    config
+        .skills
+        .disabled
+        .retain(|key| key != request.id.trim());
+    save_config(&state, &mut config)?;
+    Ok(response)
 }
 
 pub(crate) async fn test_provider(

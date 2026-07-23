@@ -119,7 +119,7 @@ describe("app-settings verification surfaces", () => {
     expect(githubLink).toHaveAttribute("rel", "noreferrer");
   });
 
-  it("lazily aggregates only matching remote workspace skills without local write controls", async () => {
+  it("lazily aggregates matching remote workspace skills with remote controls", async () => {
     const fetchMock = vi.mocked(fetch);
     const remoteWorkspace = {
       ...appTestState.settingsResponse.workspaces[0]!,
@@ -133,7 +133,7 @@ describe("app-settings verification surfaces", () => {
     };
     const remoteSkill: ConfiguredSkillSummary = {
       ...appTestState.settingsResponse.skills.detected[0]!,
-      canEnable: false,
+      canEnable: true,
       description: "Deploy the remote project.",
       id: "deploy",
       key: "workspace:workspace-remote-1:deploy",
@@ -171,20 +171,44 @@ describe("app-settings verification surfaces", () => {
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
 
     expect(await screen.findByText("Remote deploy")).toBeInTheDocument();
-    expect(screen.getByText("Remote workspace")).toBeInTheDocument();
-    expect(screen.getByText("Read-only")).toBeInTheDocument();
-    expect(screen.getByText("Cannot enable")).toBeInTheDocument();
-    expect(screen.getByText("Remote project · build-box")).toBeInTheDocument();
     expect(screen.getByText("The remote Skill requires a newer runtime.")).toBeInTheDocument();
     expect(screen.queryByText("Incorrect response name")).toBeNull();
-    expect(screen.queryByRole("checkbox", { name: "Enable skill Remote deploy" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Delete skill Remote deploy" })).toBeNull();
+    expect(screen.queryByText("Remote workspace")).toBeNull();
+    expect(screen.queryByText("Read-only")).toBeNull();
+    expect(screen.queryByText("Can enable")).toBeNull();
+    expect(screen.queryByText("Remote project · build-box")).toBeNull();
+    const remoteToggle = screen.getByRole("checkbox", { name: "Enable skill Remote deploy" });
+    expect(remoteToggle).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Delete skill Remote deploy" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "Update skill Remote deploy" })).toBeNull();
+    await userEvent.click(remoteToggle);
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(
+        ([url, init]) =>
+          url === "/api/workspaces/workspace-remote-1/skills/manual" && init?.method === "POST",
+      );
+      expect(call).toBeDefined();
+      expect(JSON.parse(String(call?.[1]?.body))).toEqual({
+        enabled: false,
+        key: remoteSkill.key,
+      });
+    });
+
+    vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    await userEvent.click(screen.getByRole("button", { name: "Delete skill Remote deploy" }));
+    await waitFor(() => {
+      expect(
+        fetchMock.mock.calls.some(
+          ([url, init]) =>
+            url === "/api/workspaces/workspace-remote-1/skills/delete" && init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
     expect(
       fetchMock.mock.calls.filter(([url]) =>
         String(url).includes("/api/workspaces/workspace-remote-1/skills"),
       ),
-    ).toHaveLength(1);
+    ).not.toHaveLength(0);
   });
 
   it("keeps same-named remote workspace skills distinct while filtering remote global entries", async () => {
@@ -255,8 +279,9 @@ describe("app-settings verification surfaces", () => {
 
     expect(await screen.findAllByText("Shared remote skill")).toHaveLength(2);
     expect(screen.getByText("skills 3")).toBeInTheDocument();
-    expect(screen.getByText("First remote · first-host")).toBeInTheDocument();
-    expect(screen.getByText("Second remote · second-host")).toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox", { name: "Enable skill Shared remote skill" })).toHaveLength(2);
+    expect(screen.queryByText("First remote · first-host")).toBeNull();
+    expect(screen.queryByText("Second remote · second-host")).toBeNull();
     expect(screen.queryByText("/home/foco/.agents/skills/shared/SKILL.md")).toBeNull();
   });
 

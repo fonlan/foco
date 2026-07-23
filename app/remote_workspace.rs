@@ -3145,6 +3145,14 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             get(remote_sidecar_skills_discover),
         )
         .route(
+            "/api/remote/workspace/skills/manual",
+            post(remote_sidecar_skills_manual),
+        )
+        .route(
+            "/api/remote/workspace/skills/delete",
+            post(remote_sidecar_skills_delete),
+        )
+        .route(
             "/api/remote/workspace/hooks/settings",
             get(remote_sidecar_hooks_settings).post(remote_sidecar_hooks_save),
         )
@@ -9032,6 +9040,50 @@ pub(crate) async fn discover_remote_workspace_skills(
         ApiError::bad_gateway(format!(
             "invalid sidecar skills discover response: {source}"
         ))
+    })
+}
+
+pub(crate) async fn set_remote_workspace_skill_enabled(
+    state: &AppState,
+    workspace_id: &str,
+    request: crate::http::settings::RemoteWorkspaceSkillToggleRequest,
+) -> Result<Json<crate::http::settings::WorkspaceSkillsDiscoveryResponse>, ApiError> {
+    let payload = serde_json::to_value(request).map_err(|source| {
+        ApiError::internal(format!("failed to serialize remote skill update: {source}"))
+    })?;
+    let value = proxy_sidecar_json_request(
+        state,
+        workspace_id,
+        reqwest::Method::POST,
+        "skills/manual",
+        Some(payload),
+    )
+    .await?;
+    serde_json::from_value(value).map(Json).map_err(|source| {
+        ApiError::bad_gateway(format!("invalid sidecar skill update response: {source}"))
+    })
+}
+
+pub(crate) async fn delete_remote_workspace_skill(
+    state: &AppState,
+    workspace_id: &str,
+    request: crate::http::settings::DeleteSettingsItemRequest,
+) -> Result<Json<crate::http::settings::WorkspaceSkillsDiscoveryResponse>, ApiError> {
+    let payload = serde_json::to_value(request).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize remote skill deletion: {source}"
+        ))
+    })?;
+    let value = proxy_sidecar_json_request(
+        state,
+        workspace_id,
+        reqwest::Method::POST,
+        "skills/delete",
+        Some(payload),
+    )
+    .await?;
+    serde_json::from_value(value).map(Json).map_err(|source| {
+        ApiError::bad_gateway(format!("invalid sidecar skill deletion response: {source}"))
     })
 }
 
@@ -19798,6 +19850,155 @@ async fn remote_sidecar_skills_discover(
         .and_then(|guard| guard.clone());
     let catalog = build_remote_effective_skill_catalog(&state, bundle.as_ref());
     Ok(Json(catalog.to_discovery_response()))
+}
+
+async fn remote_sidecar_skills_manual(
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<crate::http::settings::RemoteWorkspaceSkillToggleRequest>,
+) -> Result<Json<crate::http::settings::WorkspaceSkillsDiscoveryResponse>, axum::response::Response>
+{
+    let key = request.key.trim();
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let catalog =
+        build_remote_effective_skill_catalog(&state, bundle.as_ref()).to_discovery_response();
+    let skill = catalog
+        .skills
+        .iter()
+        .find(|skill| {
+            skill.key == key
+                && skill.scope == foco_store::config::SKILL_SCOPE_WORKSPACE
+                && skill.workspace_id.as_deref() == Some(state.workspace_id.as_str())
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("remote workspace skill was not found: {key}"))
+                .into_response()
+        })?;
+    if !skill.can_enable {
+        return Err(ApiError::bad_request(format!(
+            "remote workspace skill cannot be enabled: {key}"
+        ))
+        .into_response());
+    }
+
+    let mut runtime_config = state.runtime_config.lock().map_err(|_| {
+        ApiError::internal("remote sidecar runtime configuration lock is unavailable")
+            .into_response()
+    })?;
+    let bundle = runtime_config.as_mut().ok_or_else(|| {
+        ApiError::bad_request("remote runtime configuration has not been synchronized")
+            .into_response()
+    })?;
+    if request.enabled {
+        bundle
+            .payload
+            .disabled_skill_keys
+            .retain(|disabled_key| disabled_key != key);
+    } else if !bundle
+        .payload
+        .disabled_skill_keys
+        .iter()
+        .any(|disabled_key| disabled_key == key)
+    {
+        bundle.payload.disabled_skill_keys.push(key.to_string());
+    }
+    drop(runtime_config);
+
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    Ok(Json(
+        build_remote_effective_skill_catalog(&state, bundle.as_ref()).to_discovery_response(),
+    ))
+}
+
+async fn remote_sidecar_skills_delete(
+    State(state): State<RemoteSidecarState>,
+    Json(request): Json<crate::http::settings::DeleteSettingsItemRequest>,
+) -> Result<Json<crate::http::settings::WorkspaceSkillsDiscoveryResponse>, axum::response::Response>
+{
+    let key = request.id.trim();
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    let catalog =
+        build_remote_effective_skill_catalog(&state, bundle.as_ref()).to_discovery_response();
+    let skill = catalog
+        .skills
+        .iter()
+        .find(|skill| {
+            skill.key == key
+                && skill.scope == foco_store::config::SKILL_SCOPE_WORKSPACE
+                && skill.workspace_id.as_deref() == Some(state.workspace_id.as_str())
+        })
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("remote workspace skill was not found: {key}"))
+                .into_response()
+        })?;
+    let skill_path = Path::new(&skill.path);
+    let skill_dir = skill_path.parent().ok_or_else(|| {
+        ApiError::bad_request("remote workspace skill path has no parent directory").into_response()
+    })?;
+    let allowed_roots = [
+        sidecar_workspace_path(&state).join(".agents/skills"),
+        sidecar_workspace_path(&state).join(".claude/skills"),
+    ];
+    let skill_root = allowed_roots
+        .iter()
+        .find(|root| skill_dir.parent() == Some(root.as_path()))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "remote skill directory is not a direct child of a workspace skill root",
+            )
+            .into_response()
+        })?;
+    for (path, label) in [
+        (skill_root.as_path(), "skills root"),
+        (skill_dir, "skill directory"),
+    ] {
+        let metadata = std::fs::symlink_metadata(path).map_err(|source| {
+            ApiError::bad_request(format!(
+                "failed to inspect remote {label} {}: {source}",
+                path.display()
+            ))
+            .into_response()
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(ApiError::bad_request(format!(
+                "remote {label} is a symlink and must be deleted manually: {}",
+                path.display()
+            ))
+            .into_response());
+        }
+    }
+    std::fs::remove_dir_all(skill_dir).map_err(|source| {
+        ApiError::internal(format!("failed to delete remote skill directory: {source}"))
+            .into_response()
+    })?;
+
+    if let Ok(mut runtime_config) = state.runtime_config.lock() {
+        if let Some(bundle) = runtime_config.as_mut() {
+            bundle
+                .payload
+                .disabled_skill_keys
+                .retain(|disabled_key| disabled_key != key);
+        }
+    }
+    let bundle = state
+        .runtime_config
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    Ok(Json(
+        build_remote_effective_skill_catalog(&state, bundle.as_ref()).to_discovery_response(),
+    ))
 }
 
 async fn remote_sidecar_hooks_settings(

@@ -4383,6 +4383,20 @@ export async function mockFetch(input: RequestInfo | URL, init?: RequestInit): P
     });
   }
 
+  const workspaceSkillMutationMatch = path.match(
+    /^\/api\/workspaces\/([^/]+)\/skills\/(?:manual|delete)$/,
+  );
+  if (workspaceSkillMutationMatch && init?.method === "POST") {
+    const workspaceId = decodeURIComponent(workspaceSkillMutationMatch[1]);
+    const override = appTestState.workspaceSkillsResponsesByWorkspaceId[workspaceId];
+    const skills = Array.isArray(override)
+      ? []
+      : (override?.skills ?? []).filter(
+          (skill) => skill.scope === "workspace" && skill.workspaceId === workspaceId,
+        );
+    return jsonResponse({ errors: [], skills });
+  }
+
   if (path === "/api/skill-store/update") {
     return jsonResponse(skillStoreUpdateSettings(init));
   }

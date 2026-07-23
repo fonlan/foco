@@ -4664,6 +4664,53 @@ export function SettingsPanel({
     }
   }
 
+  async function toggleRemoteWorkspaceSkill(
+    workspaceId: string,
+    skill: ConfiguredSkillSummary,
+    enabled: boolean,
+  ) {
+    setIsSavingSkills(true);
+    setError(null);
+
+    try {
+      await requestJson(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/manual`, {
+        body: JSON.stringify({ enabled, key: skill.key }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      reloadRemoteWorkspaceSkillCatalogs();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSkills(false);
+    }
+  }
+
+  async function deleteRemoteWorkspaceSkill(
+    workspaceId: string,
+    skill: ConfiguredSkillSummary,
+  ) {
+    if (!window.confirm(t("Delete skill confirmation"))) {
+      return;
+    }
+
+    setIsSavingSkills(true);
+    setError(null);
+
+    try {
+      await requestJson(`/api/workspaces/${encodeURIComponent(workspaceId)}/skills/delete`, {
+        body: JSON.stringify({ id: skill.key }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      });
+      reloadRemoteWorkspaceSkillCatalogs();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+    } finally {
+      setIsSavingSkills(false);
+    }
+  }
+
   async function refreshSkills() {
     setIsRefreshingSkills(true);
     setError(null);
@@ -11884,12 +11931,6 @@ export function SettingsPanel({
                       const isStoreUpdateable =
                         !isRemoteSkill && Boolean(skill.store?.updateable);
                       const isUpdatingSkill = updatingSkillKey === skill.key;
-                      const remoteWorkspaceLabel = row.workspace
-                        ? [row.workspace.name, row.workspace.serverName ?? row.workspace.serverId]
-                          .filter(Boolean)
-                          .join(" · ")
-                        : null;
-
                       return (
                         <div className="px-4 py-3" key={row.key}>
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
@@ -11906,19 +11947,6 @@ export function SettingsPanel({
                                   label={skillScopeLabel(skill, t)}
                                   ok={skill.scope === "global"}
                                 />
-                                {isRemoteSkill ? (
-                                  <>
-                                    <CapabilityPill label={t("Remote workspace")} ok={true} />
-                                    <CapabilityPill label={t("Read-only")} ok={false} />
-                                    <CapabilityPill
-                                      label={skill.canEnable ? t("Can enable") : t("Cannot enable")}
-                                      ok={skill.canEnable}
-                                    />
-                                    {remoteWorkspaceLabel ? (
-                                      <CapabilityPill label={remoteWorkspaceLabel} ok={true} />
-                                    ) : null}
-                                  </>
-                                ) : null}
                                 {isStoreUpdateable ? (
                                   <CapabilityPill
                                     label={t("Store-installed skill")}
@@ -11937,10 +11965,9 @@ export function SettingsPanel({
                                 {skill.path}
                               </div>
                             </div>
-                            {!isRemoteSkill ? (
-                              <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
-                                {isStoreUpdateable ? (
-                                  <button
+                            <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
+                              {!isRemoteSkill && isStoreUpdateable ? (
+                                <button
                                     aria-label={t("Update skill {name}", { name: skill.name })}
                                     className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={
@@ -11959,8 +11986,8 @@ export function SettingsPanel({
                                       <RefreshCw aria-hidden="true" className="size-4" />
                                     )}
                                     <span>{isUpdatingSkill ? t("Updating…") : t("Update skill")}</span>
-                                  </button>
-                                ) : null}
+                                </button>
+                              ) : null}
                                 <button
                                   aria-label={t("Delete skill {name}", { name: skill.name })}
                                   className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
@@ -11970,7 +11997,13 @@ export function SettingsPanel({
                                     isUpdatingAllSkills ||
                                     updatingSkillKey !== null
                                   }
-                                  onClick={() => void deleteSkill(skill)}
+                                  onClick={() => {
+                                    if (isRemoteSkill && row.workspace) {
+                                      void deleteRemoteWorkspaceSkill(row.workspace.id, skill);
+                                      return;
+                                    }
+                                    void deleteSkill(skill);
+                                  }}
                                   title={t("Delete skill")}
                                   type="button"
                                 >
@@ -11990,16 +12023,23 @@ export function SettingsPanel({
                                       updatingSkillKey !== null ||
                                       !skill.canEnable
                                     }
-                                    onChange={(event) =>
-                                      toggleSkill(skill.key, event.target.checked)
-                                    }
+                                    onChange={(event) => {
+                                      if (isRemoteSkill && row.workspace) {
+                                        void toggleRemoteWorkspaceSkill(
+                                          row.workspace.id,
+                                          skill,
+                                          event.target.checked,
+                                        );
+                                        return;
+                                      }
+                                      toggleSkill(skill.key, event.target.checked);
+                                    }}
                                     type="checkbox"
                                   />
                                   <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
                                   <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                                 </label>
                               </div>
-                            ) : null}
                           </div>
                           <Warnings warnings={skill.warnings} />
                         </div>
