@@ -10,7 +10,7 @@ export function useDocumentLanguage(language: string) {
 }
 
 const THEME_COLOR_LIGHT = "#f7f7f7";
-const THEME_COLOR_DARK = "#1c1b1f";
+const THEME_COLOR_DARK = "#181818";
 
 /** Sync HeroUI v3 theme contract: class + data-theme + color-scheme. */
 export function useDocumentTheme(theme: string) {

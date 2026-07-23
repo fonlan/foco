@@ -59,11 +59,14 @@ describe("useDocumentTheme", () => {
     expect(document.documentElement.style.colorScheme).toBe("dark");
     expect(
       document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
-    ).toBe("#1c1b1f");
+    ).toBe("#181818");
 
     rerender({ theme: "light" });
     expect(document.documentElement.classList.contains("light")).toBe(true);
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(
+      document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
+    ).toBe("#f7f7f7");
   });
 });
