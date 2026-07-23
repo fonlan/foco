@@ -93,8 +93,8 @@ use crate::{
         unstage_git_file,
     },
     hooks::{
-        HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookExecutor,
-        PromptHookExecutorRequest, PromptHookFuture,
+        HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookError,
+        PromptHookExecutor, PromptHookExecutorRequest, PromptHookFuture,
     },
     http::{
         chat::{ContextUsageRequest, ContextUsageResponse},
@@ -15072,7 +15072,11 @@ struct RemoteSidecarPromptHookExecutor {
 impl PromptHookExecutor for RemoteSidecarPromptHookExecutor {
     fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture {
         let state = self.state.clone();
-        Box::pin(async move { remote_sidecar_run_broker_prompt_hook(&state, request).await })
+        Box::pin(async move {
+            remote_sidecar_run_broker_prompt_hook(&state, request)
+                .await
+                .map_err(PromptHookError::message)
+        })
     }
 }
 

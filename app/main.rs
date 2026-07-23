@@ -1050,6 +1050,47 @@ async fn sleep_until_shutdown(shutdown_rx: &mut watch::Receiver<bool>, duration:
     }
 }
 
+/// Wait for a 429 staircase delay while remaining responsive to app shutdown and run cancel.
+/// Returns `true` when the wait was interrupted by cancel/shutdown.
+async fn wait_provider_retry_backoff_cancellable(
+    app_shutdown_rx: &mut watch::Receiver<bool>,
+    run_cancellation_rx: &mut watch::Receiver<bool>,
+    duration: Duration,
+) -> bool {
+    if *app_shutdown_rx.borrow() || *run_cancellation_rx.borrow() {
+        return true;
+    }
+    if duration.is_zero() {
+        return false;
+    }
+    let sleep = tokio::time::sleep(duration);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            changed = app_shutdown_rx.changed() => {
+                if changed.is_err() || *app_shutdown_rx.borrow() {
+                    return true;
+                }
+            }
+            changed = run_cancellation_rx.changed() => {
+                if changed.is_err() || *run_cancellation_rx.borrow() {
+                    return true;
+                }
+            }
+        }
+    }
+}
+
+/// Sleep for a 429 staircase delay on internal (non-chat) provider retry paths.
+async fn wait_provider_429_retry_backoff(status_code: Option<i64>, retry_ordinal: u32) {
+    if let Some(delay) =
+        crate::provider_retry::provider_429_retry_backoff_i64(status_code, retry_ordinal)
+    {
+        tokio::time::sleep(delay).await;
+    }
+}
+
 async fn sync_all_mcp_workspaces(
     registry: &Arc<McpRegistry>,
     config: &GlobalConfig,
@@ -3264,6 +3305,7 @@ impl PreparedChatContext {
 
             let mut turn_index = 0usize;
             let mut turn_retry_count = 0u32;
+            let mut rate_limit_retry_count = 0u32;
             let mut reasoning_loop_recovery_count = 0usize;
 
             'agent_turns: loop {
@@ -3634,6 +3676,49 @@ impl PreparedChatContext {
                             };
                             events.push(captured_event(&event));
                             yield event;
+                            let retry_ordinal = if error.status_code() == Some(429) {
+                                rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                                Some(rate_limit_retry_count)
+                            } else {
+                                None
+                            };
+                            if let Some(delay) = retry_ordinal.and_then(|retry_ordinal| {
+                                crate::provider_retry::provider_429_retry_backoff(
+                                    error.status_code(),
+                                    retry_ordinal,
+                                )
+                            }) {
+                                if wait_provider_retry_backoff_cancellable(
+                                    &mut app_shutdown_rx,
+                                    &mut run_cancellation_rx,
+                                    delay,
+                                )
+                                .await
+                                {
+                                    let message =
+                                        chat_run_cancel_message(&app_shutdown_rx);
+                                    if *app_shutdown_rx.borrow() {
+                                        cancellation.cancel();
+                                    }
+                                    let event = match finish_cancelled_chat_run_with_message(
+                                        &self,
+                                        &request_started_at,
+                                        started_at,
+                                        &mut events,
+                                        &executed_tool_calls,
+                                        message,
+                                    )
+                                    .await
+                                    {
+                                        Ok(event) => event,
+                                        Err(error) => ChatSseEvent::Error {
+                                            message: error.message,
+                                        },
+                                    };
+                                    yield event;
+                                    return;
+                                }
+                            }
                             continue 'agent_turns;
                         }
                         let event = ChatSseEvent::Error {
@@ -3797,6 +3882,50 @@ impl PreparedChatContext {
                                 };
                                 events.push(captured_event(&event));
                                 yield event;
+                                let retry_ordinal = if error.status_code() == Some(429) {
+                                    rate_limit_retry_count =
+                                        rate_limit_retry_count.saturating_add(1);
+                                    Some(rate_limit_retry_count)
+                                } else {
+                                    None
+                                };
+                                if let Some(delay) = retry_ordinal.and_then(|retry_ordinal| {
+                                    crate::provider_retry::provider_429_retry_backoff(
+                                        error.status_code(),
+                                        retry_ordinal,
+                                    )
+                                }) {
+                                    if wait_provider_retry_backoff_cancellable(
+                                        &mut app_shutdown_rx,
+                                        &mut run_cancellation_rx,
+                                        delay,
+                                    )
+                                    .await
+                                    {
+                                        let message =
+                                            chat_run_cancel_message(&app_shutdown_rx);
+                                        if *app_shutdown_rx.borrow() {
+                                            cancellation.cancel();
+                                        }
+                                        let event = match finish_cancelled_chat_run_with_message(
+                                            &self,
+                                            &request_started_at,
+                                            started_at,
+                                            &mut events,
+                                            &executed_tool_calls,
+                                            message,
+                                        )
+                                        .await
+                                        {
+                                            Ok(event) => event,
+                                            Err(error) => ChatSseEvent::Error {
+                                                message: error.message,
+                                            },
+                                        };
+                                        yield event;
+                                        return;
+                                    }
+                                }
                                 continue 'agent_turns;
                             }
                             let event = ChatSseEvent::Error {
@@ -3965,6 +4094,7 @@ impl PreparedChatContext {
                                         yield event;
                                     }
                                     turn_retry_count = 0;
+                                    rate_limit_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -4277,6 +4407,7 @@ impl PreparedChatContext {
                                         yield event;
                                     }
                                     turn_retry_count = 0;
+                                    rate_limit_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -4321,6 +4452,7 @@ impl PreparedChatContext {
                                         ],
                                     );
                                     turn_retry_count = 0;
+                                    rate_limit_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -4452,6 +4584,7 @@ impl PreparedChatContext {
                                 if recovered {
                                     tool_loop_guard.reset_after_compression();
                                     turn_retry_count = 0;
+                                    rate_limit_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
                                 }
@@ -5004,6 +5137,7 @@ impl PreparedChatContext {
 
                 if completed_turn {
                     turn_retry_count = 0;
+                    rate_limit_retry_count = 0;
                     turn_index = turn_index.saturating_add(1);
                     continue;
                 }
@@ -5800,6 +5934,7 @@ pub(crate) async fn audited_provider_text_request(
     retry_count: u32,
     save_details: bool,
 ) -> Result<String, ApiError> {
+    let mut rate_limit_retry_count = 0u32;
     for attempt_index in 0..=retry_count {
         let request_id = unique_id("llm");
         let request_started_at = utc_timestamp();
@@ -5949,6 +6084,11 @@ pub(crate) async fn audited_provider_text_request(
                 if attempt_index >= retry_count {
                     return Err(ApiError::internal(error.message));
                 }
+                if error.status_code == Some(429) {
+                    rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                    wait_provider_429_retry_backoff(error.status_code, rate_limit_retry_count)
+                        .await;
+                }
             }
         }
     }
@@ -6016,6 +6156,7 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
     let base_request = request;
     let mut active_request = base_request.clone();
     let mut provider_attempts_used: u32 = 0;
+    let mut rate_limit_retry_count = 0u32;
     let mut output_repair_used = false;
     let mut next_attempt_index: u32 = 1;
     // Distinguishes each stream attempt: initial vs provider_retry vs output_repair.
@@ -6377,7 +6518,10 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                                 failure_category = failure_kind.category_label(),
                                 "scheduling single-tool output repair after protocol failure"
                             );
-                        } else {
+                        } else if matches!(
+                            retry_kind,
+                            structured_llm_outcome::StructuredLlmRetryKind::ProviderRetry
+                        ) {
                             tracing::debug!(
                                 request_kind,
                                 provider_attempts_used,
@@ -6386,6 +6530,16 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                                 status_code = ?error.status_code,
                                 "retrying single-tool provider transport failure"
                             );
+                            // Only transport ProviderRetry waits on 429; output repair neither
+                            // waits nor resets the rate-limit staircase for this call.
+                            if error.status_code == Some(429) {
+                                rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                                wait_provider_429_retry_backoff(
+                                    error.status_code,
+                                    rate_limit_retry_count,
+                                )
+                                .await;
+                            }
                         }
                         continue;
                     }

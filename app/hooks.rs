@@ -26,8 +26,13 @@ use foco_store::{
 use regex::Regex;
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::{io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    io::AsyncWriteExt,
+    process::Command,
+    time::{sleep, timeout},
+};
 
+use crate::provider_retry::provider_429_retry_backoff;
 use crate::{
     LLM_REQUEST_TIMEOUT_MS, persistable_audit_response_body_json, remaining_llm_request_timeout,
     runtime::ProviderAuditCapture,
@@ -54,10 +59,54 @@ pub struct HookRuntime {
 }
 
 pub(crate) type PromptHookFuture =
-    Pin<Box<dyn Future<Output = Result<HookExecution, String>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<HookExecution, PromptHookError>> + Send>>;
 
 pub(crate) trait PromptHookExecutor: Send + Sync {
     fn execute(&self, request: PromptHookExecutorRequest) -> PromptHookFuture;
+}
+
+/// Prompt-hook attempt failure that can carry an optional provider HTTP status.
+///
+/// Outer retry loops use `status_code` only for 429 staircase backoff; database,
+/// protocol, and non-provider errors leave it unset so they are never treated as 429.
+#[derive(Debug, Clone)]
+pub(crate) struct PromptHookError {
+    pub(crate) message: String,
+    pub(crate) status_code: Option<u16>,
+}
+
+impl PromptHookError {
+    pub(crate) fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            status_code: None,
+        }
+    }
+
+    pub(crate) fn provider(message: impl Into<String>, status_code: Option<u16>) -> Self {
+        Self {
+            message: message.into(),
+            status_code,
+        }
+    }
+}
+
+impl From<String> for PromptHookError {
+    fn from(message: String) -> Self {
+        Self::message(message)
+    }
+}
+
+impl From<&str> for PromptHookError {
+    fn from(message: &str) -> Self {
+        Self::message(message)
+    }
+}
+
+impl std::fmt::Display for PromptHookError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 #[derive(Clone)]
@@ -766,11 +815,23 @@ async fn run_prompt_hook(
         timeout_ms,
     };
 
+    let mut rate_limit_retry_count = 0u32;
     for attempt_index in 0..=request.llm_request_retry_count {
         match executor.execute(executor_request.clone()).await {
             Ok(execution) => return Ok(execution),
-            Err(error) if attempt_index >= request.llm_request_retry_count => return Err(error),
-            Err(_) => {}
+            Err(error) if attempt_index >= request.llm_request_retry_count => {
+                return Err(error.message);
+            }
+            Err(error) => {
+                if error.status_code == Some(429) {
+                    rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                    if let Some(delay) =
+                        provider_429_retry_backoff(error.status_code, rate_limit_retry_count)
+                    {
+                        sleep(delay).await;
+                    }
+                }
+            }
         }
     }
 
@@ -780,7 +841,7 @@ async fn run_prompt_hook(
 async fn run_prompt_hook_attempt(
     provider_config: &ProviderConnectionConfig,
     request: PromptHookExecutorRequest,
-) -> Result<HookExecution, String> {
+) -> Result<HookExecution, PromptHookError> {
     let timeout_ms = request.timeout_ms;
     let mut audited_stream = audited_prompt_hook_stream(provider_config, request.clone()).await?;
     let mut first_token_at = None;
@@ -794,18 +855,25 @@ async fn run_prompt_hook_attempt(
             audited_stream.stream.next_event(),
         )
         .await
-        .map_err(|_| format!("prompt hook timed out after {timeout_ms} ms"))
+        .map_err(|_| {
+            PromptHookError::message(format!("prompt hook timed out after {timeout_ms} ms"))
+        })
         .map_err(|message| {
-            audited_stream.fail_with_diagnostic(&message);
+            audited_stream.fail_with_diagnostic(&message.message);
             message
         })?
         else {
             break;
         };
         let event = event
-            .map_err(|source| format!("prompt hook stream failed: {source}"))
+            .map_err(|source| {
+                PromptHookError::provider(
+                    format!("prompt hook stream failed: {source}"),
+                    source.status_code(),
+                )
+            })
             .map_err(|message| {
-                audited_stream.fail_with_diagnostic(&message);
+                audited_stream.fail_with_diagnostic(&message.message);
                 message
             })?;
         audited_stream.events.push(event.clone());
@@ -836,7 +904,7 @@ async fn run_prompt_hook_attempt(
                     tool_call.name
                 );
                 audited_stream.fail_with_diagnostic(&message);
-                return Err(message);
+                return Err(PromptHookError::message(message));
             }
             NeutralChatStreamEvent::Complete {
                 text,
@@ -847,7 +915,7 @@ async fn run_prompt_hook_attempt(
                 if !tool_calls.is_empty() {
                     let message = "prompt hook completed with unsupported tool calls".to_string();
                     audited_stream.fail_with_diagnostic(&message);
-                    return Err(message);
+                    return Err(PromptHookError::message(message));
                 }
                 if output.trim().is_empty() {
                     output = text;
@@ -860,7 +928,7 @@ async fn run_prompt_hook_attempt(
             NeutralChatStreamEvent::Error { message } => {
                 let message = format!("prompt hook stream error: {message}");
                 audited_stream.fail_with_diagnostic(&message);
-                return Err(message);
+                return Err(PromptHookError::message(message));
             }
         }
     }
@@ -1013,7 +1081,7 @@ impl AuditedPromptHookStream {
 async fn audited_prompt_hook_stream(
     provider_config: &ProviderConnectionConfig,
     request: PromptHookExecutorRequest,
-) -> Result<AuditedPromptHookStream, String> {
+) -> Result<AuditedPromptHookStream, PromptHookError> {
     let workspace_id = &request.workspace_id;
     let provider_id = request
         .provider_id
@@ -1151,7 +1219,10 @@ async fn audited_prompt_hook_stream(
                 request.api_audit_save_details,
                 &[],
             )?;
-            Err(format!("prompt hook provider call failed: {source}"))
+            Err(PromptHookError::provider(
+                format!("prompt hook provider call failed: {source}"),
+                source.status_code(),
+            ))
         }
         Err(_) => {
             let message = format!("prompt hook timed out after {} ms", request.timeout_ms);
@@ -1168,7 +1239,7 @@ async fn audited_prompt_hook_stream(
                 request.api_audit_save_details,
                 &[],
             )?;
-            Err(message)
+            Err(PromptHookError::message(message))
         }
     }
 }
