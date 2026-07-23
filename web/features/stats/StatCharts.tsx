@@ -129,7 +129,7 @@ export function LineChartCard({
   const chartData = data.slice(-12);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {chartData.length ? (
         <div className="mt-3 h-52 w-full">
@@ -207,7 +207,7 @@ export function DualLineChartCard({
   const chartData = data.slice(-12);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {chartData.length ? (
         <>
@@ -313,7 +313,7 @@ export function DonutChartCard({
   const total = chartData.reduce((sum, item) => sum + item.value, 0);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {total > 0 ? (
         <div className="mt-4 grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center">
@@ -396,7 +396,7 @@ export function DoubleDonutChartCard({
   const colorForItem = (item: ChartDatum) => chartColor(colorIds.indexOf(item.id));
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {outerTotal > 0 || innerTotal > 0 ? (
         <div className="mt-4 grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center">
@@ -493,7 +493,7 @@ export function BarChartCard({
   const chartMax = Math.max(maxValue ?? 0, ...chartData.map((item) => item.value), 1);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {chartData.length ? (
         <>
@@ -576,7 +576,7 @@ export function ScatterChartCard({
   const xMax = Math.max(...chartData.map((item) => item.x), 1);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
       <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
       {chartData.length ? (
         <>

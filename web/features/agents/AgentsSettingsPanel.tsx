@@ -236,7 +236,7 @@ export function AgentsSettingsPanel({
   }
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 p-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+    <section className="rounded-2xl border border-stone-200 bg-white/85 p-4 shadow-[var(--overlay-shadow)]">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <Bot aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
@@ -471,7 +471,7 @@ export function AgentsSettingsPanel({
                     {t("{count} selected", { count: draft.allowedTools.length })}
                   </span>
                 </summary>
-                <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-stone-200 bg-white p-2 shadow-[0_18px_42px_rgba(75,63,42,0.16)]">
+                <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-stone-200 bg-white p-2 shadow-[var(--overlay-shadow)]">
                   {selectableTools.map((tool) => (
                     <AgentCheckbox
                       checked={draft.allowedTools.includes(tool)}

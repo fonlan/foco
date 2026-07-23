@@ -2415,6 +2415,27 @@ describe("app-shell verification surfaces", () => {
     }
   });
 
+  it("Phase 2 mobile shell CSS contract uses HeroUI surfaces, safe-area, and touch targets", () => {
+    const stylesCss = readFileSync("styles.css", "utf8");
+
+    expect(stylesCss).toContain("var(--surface)");
+    expect(stylesCss).toContain("var(--background)");
+    expect(stylesCss).toContain("env(safe-area-inset-top");
+    expect(stylesCss).toContain("env(safe-area-inset-bottom");
+    expect(stylesCss).toContain("--foco-touch-target");
+    expect(stylesCss).toContain("100dvh");
+    expect(stylesCss).not.toMatch(/rgba\(255,\s*252,\s*246/);
+    expect(stylesCss).not.toMatch(/rgba\(200,\s*101,\s*27/);
+    expect(stylesCss).not.toMatch(/rgba\(232,\s*146,\s*60/);
+
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?--foco-touch-target/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 430px\)[\s\S]*?max-width:\s*100vw/,
+    );
+  });
+
   it("keeps stacked context panel height and horizontal splitter styles at the 1199px breakpoint", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
 

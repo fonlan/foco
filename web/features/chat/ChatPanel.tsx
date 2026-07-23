@@ -1422,7 +1422,7 @@ function ChatPanelComponent({
                       aria-label={runningButtonLabel}
                       className={
                         runningButtonSendsMessage
-                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[var(--overlay-shadow)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                           : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
                       }
                       disabled={
@@ -1456,7 +1456,7 @@ function ChatPanelComponent({
                             : undefined
                         }
                         aria-label={t("Send message")}
-                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(200,101,27,0.24)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[var(--overlay-shadow)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
                         disabled={
                           (!draftMessage.trim() && !draftAttachments.length) ||
                           !selectedModelId ||
@@ -1646,7 +1646,7 @@ const MessageRow = memo(function MessageRow({
     >
       <div className="message-card-shell">
         <div
-          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[var(--overlay-shadow)] sm:max-w-[78%] ${
             isUser
               ? "message-bubble-user flex-row rounded-tr-md"
               : "message-bubble-assistant flex-row rounded-tl-md"

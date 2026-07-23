@@ -5410,7 +5410,7 @@ export function SettingsPanel({
         </aside>
 
         <div className="min-w-0 flex flex-col gap-5">
-          <section className="rounded-2xl border border-stone-200 bg-white/75 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+          <section className="rounded-2xl border border-stone-200 bg-white/75 px-4 py-4 shadow-[var(--overlay-shadow)]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
                 <h2 className="text-lg font-semibold text-stone-950">
@@ -5455,7 +5455,7 @@ export function SettingsPanel({
           {activeSection === "general" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveGeneralSettings(event)}
               >
                 <div className="flex items-center gap-2">
@@ -5871,7 +5871,7 @@ export function SettingsPanel({
                 </div>
               </form>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Saved bind")}
@@ -5895,7 +5895,7 @@ export function SettingsPanel({
           {activeSection === "web-search" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveWebSearchSettings(event)}
               >
                 <div className="flex items-center justify-between gap-3">
@@ -6172,7 +6172,7 @@ export function SettingsPanel({
           {activeSection === "prompts" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void savePromptSettings(event)}
               >
                 <label className="block">
@@ -6659,7 +6659,7 @@ export function SettingsPanel({
 
           {activeSection === "spec" ? (
             <section className="grid gap-4">
-              <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
                     <FileText aria-hidden="true" className="size-5 text-teal-700" />
@@ -6797,7 +6797,7 @@ export function SettingsPanel({
                 </div>
               </div>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <div className="min-w-0">
                     <h3 className="text-sm font-semibold text-stone-950">
@@ -7059,7 +7059,7 @@ export function SettingsPanel({
           {activeSection === "plan" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void savePlanSettings(event)}
               >
                 <div className="flex items-center gap-2">
@@ -7119,7 +7119,7 @@ export function SettingsPanel({
                 </button>
               </form>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <div className="min-w-0">
                     <h3 className="text-sm font-semibold text-stone-950">
@@ -7749,7 +7749,7 @@ export function SettingsPanel({
               ) : null}
 
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveMemorySettings(event)}
               >
                 <div className="flex items-center gap-2">
@@ -8189,7 +8189,7 @@ export function SettingsPanel({
                 </button>
               </form>
 
-              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
@@ -8710,7 +8710,7 @@ export function SettingsPanel({
                 ) : null}
               </section>
 
-              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
                     <h3 className="text-sm font-semibold text-stone-950">
@@ -9502,7 +9502,7 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Workspace list")}
@@ -10114,7 +10114,7 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
                   <div className="inline-flex h-10 rounded-lg border border-stone-200 bg-stone-100 p-1">
                     {(["global", "workspace"] as HookScope[]).map((scope) => (
@@ -10213,7 +10213,7 @@ export function SettingsPanel({
                 </label>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Hook rules")}
@@ -10422,7 +10422,7 @@ export function SettingsPanel({
               </section>
 
               <div className="grid gap-4 xl:grid-cols-2">
-                <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+                <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                   <div className="flex items-center justify-between gap-3">
                     <h3 className="text-sm font-semibold text-stone-950">
                       {t("Import Claude hooks")}
@@ -10493,7 +10493,7 @@ export function SettingsPanel({
                 </section>
 
                 <form
-                  className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]"
+                  className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
                   onSubmit={(event) => void testHooks(event)}
                 >
                   <h3 className="text-sm font-semibold text-stone-950">
@@ -10557,7 +10557,7 @@ export function SettingsPanel({
                 </form>
               </div>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Effective hooks")}
@@ -10620,7 +10620,7 @@ export function SettingsPanel({
                 </div>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Recent hook runs")}
@@ -11222,7 +11222,7 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="order-1 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="order-1 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Configured providers")}
@@ -11695,7 +11695,7 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("MCP servers")}
@@ -11797,7 +11797,7 @@ export function SettingsPanel({
 
           {activeSection === "skills" ? (
             <section className="grid gap-4">
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <label className="block">
                   <span className="mb-1.5 block text-xs font-semibold text-stone-600">
                     {t("Skill translation model")}
@@ -11819,7 +11819,7 @@ export function SettingsPanel({
                 </label>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Detected skills")}
@@ -12050,7 +12050,7 @@ export function SettingsPanel({
                 ) : null}
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center gap-2">
                   <Wrench aria-hidden="true" className="size-5 text-teal-700" />
                   <h3 className="text-sm font-semibold text-stone-950">
@@ -12116,7 +12116,7 @@ export function SettingsPanel({
 
           {activeSection === "models" ? (
             <section className="grid gap-4">
-              <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
                   <h3 className="text-sm font-semibold text-stone-950">
                     {t("Models")}
@@ -12725,7 +12725,7 @@ export function SettingsPanel({
           ) : null}
           {activeSection === "about" ? (
             <>
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-start">
                   <div className="min-w-0 space-y-4">
                     <div className="flex items-center gap-3">
@@ -13320,7 +13320,7 @@ function RemoteServersSettingsSection({
         </>
       ) : null}
 
-      <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+      <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
         <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
           <h3 className="text-sm font-semibold text-stone-950">
             {t("Remote server list")}

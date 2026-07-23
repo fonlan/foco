@@ -501,7 +501,7 @@ export function ApiStatsPanel({
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
-        <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[var(--overlay-shadow)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
               <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
@@ -711,7 +711,7 @@ export function ApiStatsPanel({
           </Suspense>
         )}
 
-        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[0_18px_42px_rgba(75,63,42,0.07)]">
+        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
             <div>
               <h3 className="text-sm font-semibold text-stone-950">
@@ -733,7 +733,7 @@ export function ApiStatsPanel({
                   <SlidersHorizontal aria-hidden="true" className="size-4" />
                   {t("Columns")}
                 </summary>
-                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[0_18px_42px_rgba(75,63,42,0.16)]">
+                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[var(--overlay-shadow)]">
                   {aiStatsColumns.map((column) => (
                     <label
                       className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-stone-700 hover:bg-stone-50"

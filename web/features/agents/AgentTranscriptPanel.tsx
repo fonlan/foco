@@ -632,7 +632,7 @@ function AgentTranscriptBubble({
     >
       <div className="message-card-shell">
         <div
-          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[0_18px_42px_rgba(75,63,42,0.08)] sm:max-w-[78%] ${
+          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[var(--overlay-shadow)] sm:max-w-[78%] ${
             isUser
               ? "message-bubble-user flex-row rounded-tr-md"
               : "message-bubble-assistant flex-row rounded-tl-md"

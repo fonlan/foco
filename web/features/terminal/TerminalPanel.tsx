@@ -265,7 +265,7 @@ export function TerminalPanel({
   return (
     <section
       aria-hidden={!isVisible}
-      className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[#16130f]"
+      className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[var(--background-inverse)]"
       hidden={!isVisible}
       style={{ "--terminal-panel-height": `${panelHeight}px` } as CSSProperties}
     >
