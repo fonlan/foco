@@ -419,33 +419,65 @@ fn reconcile_agent_attempt_leases(state: &AppState) -> Result<(), ApiError> {
                 )?;
                     continue;
                 }
-                if close_restarted_coordinator_chat_run(
+                match close_restarted_coordinator_chat_run(
                     &mut database,
                     &record.task,
                     &record.attempt,
                 )? {
-                    database
-                        .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
-                        .map_err(ApiError::from_workspace_error)?;
-                    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                    RestartedCoordinatorChatClosure::Applied => {
+                        crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                            &mut database,
+                            &record.task.id,
+                        )?;
+                        continue;
+                    }
+                    RestartedCoordinatorChatClosure::OwnerChanged => {
+                        insert_agent_event(
+                            &mut database,
+                            &record.task.team_id,
+                            "attempt_recovery_skipped",
+                            Some(&record.task.owner_instance_id),
+                            Some(&record.task.id),
+                            Some(&record.attempt.id),
+                            json!({ "reason": "owner_changed" }),
+                        )?;
+                        continue;
+                    }
+                    RestartedCoordinatorChatClosure::NotApplicable => {}
+                }
+                let updated = database
+                    .update_agent_task_state_for_attempt_lease(
+                        AgentTaskStateUpdate {
+                            team_id: &record.task.team_id,
+                            task_id: &record.task.id,
+                            expected_status,
+                            transition: AgentTaskTransition::Interrupt,
+                            result_json: None,
+                            error_json: Some(
+                                r#"{"message":"backend restarted while Agent attempt was active"}"#,
+                            ),
+                            interruption_reason: Some(RESTART_INTERRUPTION_REASON),
+                        },
+                        &record.attempt.id,
+                        record.attempt.owner_incarnation.as_deref(),
+                        record.attempt.lease_renewed_at.as_deref(),
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                if !updated {
+                    // The owner renewed after this recovery pass took its
+                    // snapshot. It is still live, so this scheduler must not
+                    // pause its instance or terminalize its Plan phase.
+                    insert_agent_event(
                         &mut database,
-                        &record.task.id,
+                        &record.task.team_id,
+                        "attempt_recovery_skipped",
+                        Some(&record.task.owner_instance_id),
+                        Some(&record.task.id),
+                        Some(&record.attempt.id),
+                        json!({ "reason": "owner_changed" }),
                     )?;
                     continue;
                 }
-                database
-                    .update_agent_task_state(AgentTaskStateUpdate {
-                        team_id: &record.task.team_id,
-                        task_id: &record.task.id,
-                        expected_status,
-                        transition: AgentTaskTransition::Interrupt,
-                        result_json: None,
-                        error_json: Some(
-                            r#"{"message":"backend restarted while Agent attempt was active"}"#,
-                        ),
-                        interruption_reason: Some(RESTART_INTERRUPTION_REASON),
-                    })
-                    .map_err(ApiError::from_workspace_error)?;
                 database
                     .transition_agent_instance_status(
                         &record.task.owner_instance_id,
@@ -555,34 +587,40 @@ fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'sta
 /// The task, attempt, streaming assistant, and queuedRun must transition in
 /// one transaction so a runner left over from the previous process cannot
 /// continue writing after its Plan phase has become terminal.
+enum RestartedCoordinatorChatClosure {
+    Applied,
+    OwnerChanged,
+    NotApplicable,
+}
+
 fn close_restarted_coordinator_chat_run(
     database: &mut WorkspaceDatabase,
     task: &AgentTaskRecord,
     attempt: &AgentAttemptRecord,
-) -> Result<bool, ApiError> {
+) -> Result<RestartedCoordinatorChatClosure, ApiError> {
     let Ok(input) = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json) else {
-        return Ok(false);
+        return Ok(RestartedCoordinatorChatClosure::NotApplicable);
     };
     let (Some(assistant_message_id), Some(assistant_sequence)) = (
         input.visible_assistant_message_id.as_deref(),
         input.visible_assistant_sequence,
     ) else {
-        return Ok(false);
+        return Ok(RestartedCoordinatorChatClosure::NotApplicable);
     };
     let Some(team) = database
         .agent_team(&task.team_id)
         .map_err(ApiError::from_workspace_error)?
     else {
-        return Ok(false);
+        return Ok(RestartedCoordinatorChatClosure::NotApplicable);
     };
     let Some(instance) = database
         .agent_instance(&task.owner_instance_id)
         .map_err(ApiError::from_workspace_error)?
     else {
-        return Ok(false);
+        return Ok(RestartedCoordinatorChatClosure::NotApplicable);
     };
     if instance.role != AgentRole::Coordinator {
-        return Ok(false);
+        return Ok(RestartedCoordinatorChatClosure::NotApplicable);
     }
 
     let error_json = json!({
@@ -620,11 +658,15 @@ fn close_restarted_coordinator_chat_run(
             error_json: &error_json,
             assistant_content: RESTART_INTERRUPTION_REASON,
             assistant_metadata_json: &assistant_metadata_json,
+            expected_attempt_owner_incarnation: attempt.owner_incarnation.as_deref(),
+            expected_attempt_lease_renewed_at: attempt.lease_renewed_at.as_deref(),
+            expected_queued_run_agent_task_id: None,
+            expected_queued_run_id: None,
             materialize_assistant: true,
         })
         .map_err(ApiError::from_workspace_error)?;
     match result {
-        PreStreamChatFailureClosureResult::Applied => Ok(true),
+        PreStreamChatFailureClosureResult::Applied => Ok(RestartedCoordinatorChatClosure::Applied),
         PreStreamChatFailureClosureResult::Skipped { reason } => {
             tracing::info!(
                 task_id = %task.id,
@@ -632,7 +674,7 @@ fn close_restarted_coordinator_chat_run(
                 reason = %reason,
                 "startup Coordinator chat closure skipped because the durable owner changed"
             );
-            Ok(false)
+            Ok(RestartedCoordinatorChatClosure::OwnerChanged)
         }
     }
 }
@@ -1695,6 +1737,10 @@ fn fail_claimed_task_with_pre_stream_closure(
                                 error_json: &error_json,
                                 assistant_content: &failure.user_message,
                                 assistant_metadata_json: &assistant_metadata,
+                                expected_attempt_owner_incarnation: None,
+                                expected_attempt_lease_renewed_at: None,
+                                expected_queued_run_agent_task_id: None,
+                                expected_queued_run_id: None,
                                 materialize_assistant,
                             })
                             .map_err(ApiError::from_workspace_error)?;

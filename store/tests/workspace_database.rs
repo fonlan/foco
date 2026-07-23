@@ -15896,6 +15896,10 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
             error_json: &error_json,
             assistant_content: "Reply has not started: workspace database is busy. Please retry.",
             assistant_metadata_json: &assistant_metadata,
+            expected_attempt_owner_incarnation: None,
+            expected_attempt_lease_renewed_at: None,
+            expected_queued_run_agent_task_id: None,
+            expected_queued_run_id: None,
             materialize_assistant: true,
         })
         .expect("closure");
@@ -16015,6 +16019,10 @@ fn close_pre_stream_chat_failure_skips_when_queued_run_replaced() {
             error_json: r#"{"message":"stale"}"#,
             assistant_content: "stale",
             assistant_metadata_json: r#"{"streamingState":"failed"}"#,
+            expected_attempt_owner_incarnation: None,
+            expected_attempt_lease_renewed_at: None,
+            expected_queued_run_agent_task_id: None,
+            expected_queued_run_id: None,
             materialize_assistant: true,
         })
         .expect("closure");
@@ -16035,6 +16043,180 @@ fn close_pre_stream_chat_failure_skips_when_queued_run_replaced() {
         chat_metadata["queuedRun"]["assistantMessageId"], "assistant-new",
         "must not clear replaced queuedRun"
     );
+}
+
+#[test]
+fn close_pre_stream_chat_failure_skips_when_attempt_lease_snapshot_changed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, "chat-prestream-lease", "prestream-lease");
+    let task_id = AgentTaskId::new("agent-task-prestream-lease").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    let attempt_id = AgentAttemptId::new("agent-attempt-prestream-lease").expect("attempt");
+    database
+        .claim_runnable_agent_task_with_owner(
+            &team_id,
+            &task_id,
+            &attempt_id,
+            Some("scheduler-incarnation"),
+        )
+        .expect("claim")
+        .expect("claimed");
+    let snapshot = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts")
+        .pop()
+        .expect("attempt snapshot");
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert!(
+        database
+            .renew_agent_attempt_lease(&task_id, &attempt_id, "scheduler-incarnation")
+            .expect("renew lease")
+    );
+
+    let result = database
+        .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+            task_id: &task_id,
+            attempt_id: &attempt_id,
+            chat_id: "chat-prestream-lease",
+            user_message_id: "user-prestream-lease",
+            assistant_message_id: "assistant-prestream-lease",
+            assistant_sequence: 1,
+            error_json: r#"{"message":"stale recovery"}"#,
+            assistant_content: "stale recovery",
+            assistant_metadata_json: r#"{"streamingState":"failed"}"#,
+            expected_attempt_owner_incarnation: snapshot.owner_incarnation.as_deref(),
+            expected_attempt_lease_renewed_at: snapshot.lease_renewed_at.as_deref(),
+            expected_queued_run_agent_task_id: None,
+            expected_queued_run_id: None,
+            materialize_assistant: false,
+        })
+        .expect("closure");
+
+    assert!(matches!(
+        result,
+        PreStreamChatFailureClosureResult::Skipped { .. }
+    ));
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Running
+    );
+}
+
+#[test]
+fn close_pre_stream_chat_failure_skips_when_remote_plan_queued_run_owner_is_replaced() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let chat_id = "chat-prestream-remote-owner";
+    let (team_id, instance_id) =
+        create_test_agent_team(&mut database, chat_id, "prestream-remote-owner");
+    let task_id = AgentTaskId::new("agent-task-prestream-remote-owner").expect("task id");
+    let attempt_id = AgentAttemptId::new("agent-attempt-prestream-remote-owner").expect("attempt");
+    let successor_task_id = "agent-task-prestream-remote-successor";
+    let user_message_id = "user-prestream-remote-owner";
+    let assistant_message_id = "assistant-prestream-remote-owner";
+    database
+        .insert_message(NewMessage {
+            id: user_message_id,
+            chat_id,
+            role: "user",
+            content: "continue plan",
+            sequence: 0,
+            metadata_json: Some(
+                &json!({
+                    "queuedRun": {
+                        "status": "running",
+                        "userMessageId": user_message_id,
+                        "assistantMessageId": assistant_message_id,
+                        "assistantSequence": 1,
+                        "agentTaskId": successor_task_id,
+                        "runId": "remote-run-successor",
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .expect("insert user");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .claim_runnable_agent_task_with_owner(
+            &team_id,
+            &task_id,
+            &attempt_id,
+            Some("remote-owner-incarnation"),
+        )
+        .expect("claim")
+        .expect("claimed");
+    let attempt = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts")
+        .pop()
+        .expect("attempt");
+
+    let result = database
+        .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+            task_id: &task_id,
+            attempt_id: &attempt_id,
+            chat_id,
+            user_message_id,
+            assistant_message_id,
+            assistant_sequence: 1,
+            error_json: r#"{"message":"stale remote recovery"}"#,
+            assistant_content: "stale remote recovery",
+            assistant_metadata_json: r#"{"streamingState":"failed"}"#,
+            expected_attempt_owner_incarnation: attempt.owner_incarnation.as_deref(),
+            expected_attempt_lease_renewed_at: attempt.lease_renewed_at.as_deref(),
+            expected_queued_run_agent_task_id: Some(&task_id),
+            expected_queued_run_id: Some("remote-run-old"),
+            materialize_assistant: true,
+        })
+        .expect("closure");
+
+    assert!(matches!(
+        result,
+        PreStreamChatFailureClosureResult::Skipped { .. }
+    ));
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Running,
+        "an old recovery closure must not terminalize its task"
+    );
+    let user = database
+        .message(user_message_id)
+        .expect("user")
+        .expect("user");
+    let metadata: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
+    assert_eq!(metadata["queuedRun"]["agentTaskId"], successor_task_id);
+    assert_eq!(metadata["queuedRun"]["runId"], "remote-run-successor");
 }
 
 #[test]

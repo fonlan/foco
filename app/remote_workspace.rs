@@ -60,7 +60,8 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
         LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
         NewAgentInstance, NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewRunEvent, PlanPhaseAttemptTrigger, RemotePreStreamFailureClosureOutcome,
+        NewMessage, NewRunEvent, PlanPhaseAttemptTrigger, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, RemotePreStreamFailureClosureOutcome,
         RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
         UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
@@ -3961,7 +3962,91 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
         {
             continue;
         }
-        let updated = database.update_agent_task_state_for_attempt(
+        if let Some((user_message_id, assistant_message_id)) =
+            remote_plan_task_message_identity_from_input(&record.task.input_json)
+                .ok()
+                .flatten()
+            && let Some(team) = database.agent_team(&record.task.team_id)?
+            && let Some(user_message) = database.message(&user_message_id)?
+        {
+            let assistant_sequence = serde_json::from_str::<Value>(&record.task.input_json)
+                .ok()
+                .and_then(|input| {
+                    input
+                        .get("visibleAssistantSequence")
+                        .and_then(Value::as_i64)
+                })
+                .unwrap_or_else(|| user_message.sequence.saturating_add(1));
+            let error_json = json!({
+                "message": "remote sidecar lost the Agent attempt owner lease",
+                "code": "remote_sidecar_owner_lease_lost",
+                "stage": "startup_reconciliation",
+                "retryable": false,
+            })
+            .to_string();
+            let assistant_metadata_json = json!({
+                "streamingState": "failed",
+                "runFailure": {
+                    "code": "remote_sidecar_owner_lease_lost",
+                    "stage": "startup_reconciliation",
+                    "retryable": false,
+                    "taskId": record.task.id.as_str(),
+                    "attemptId": record.attempt.id.as_str(),
+                    "message": "remote sidecar lost the Agent attempt owner lease",
+                },
+                "parts": [{
+                    "type": "error",
+                    "text": "remote sidecar lost the Agent attempt owner lease",
+                }],
+                "partsVersion": 6,
+                "partsSource": "startup_reconciliation",
+            })
+            .to_string();
+            let Some(run_id) = remote_plan_queued_run_id_from_message(
+                &user_message.metadata_json,
+                &record.task.id,
+                &assistant_message_id,
+            ) else {
+                tracing::info!(
+                    task_id = %record.task.id,
+                    attempt_id = %record.attempt.id,
+                    "remote lease recovery skipped chat closure without a matching durable queuedRun owner"
+                );
+                continue;
+            };
+            match database.close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+                task_id: &record.task.id,
+                attempt_id: &record.attempt.id,
+                chat_id: &team.chat_id,
+                user_message_id: &user_message_id,
+                assistant_message_id: &assistant_message_id,
+                assistant_sequence,
+                error_json: &error_json,
+                assistant_content: "remote sidecar lost the Agent attempt owner lease",
+                assistant_metadata_json: &assistant_metadata_json,
+                expected_attempt_owner_incarnation: record.attempt.owner_incarnation.as_deref(),
+                expected_attempt_lease_renewed_at: record.attempt.lease_renewed_at.as_deref(),
+                expected_queued_run_agent_task_id: Some(&record.task.id),
+                expected_queued_run_id: Some(&run_id),
+                materialize_assistant: true,
+            })? {
+                PreStreamChatFailureClosureResult::Applied => {
+                    remote_sidecar_cancel_active_run_for_plan_task(state, &record.task.id, &run_id);
+                    interrupted += 1;
+                    continue;
+                }
+                PreStreamChatFailureClosureResult::Skipped { reason } => {
+                    tracing::info!(
+                        task_id = %record.task.id,
+                        attempt_id = %record.attempt.id,
+                        reason,
+                        "remote lease recovery skipped because the durable owner changed"
+                    );
+                    continue;
+                }
+            }
+        }
+        let updated = database.update_agent_task_state_for_attempt_lease(
             AgentTaskStateUpdate {
                 team_id: &record.task.team_id,
                 task_id: &record.task.id,
@@ -3974,6 +4059,8 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
                 interruption_reason: Some("remote sidecar lost the Agent attempt owner lease"),
             },
             &record.attempt.id,
+            record.attempt.owner_incarnation.as_deref(),
+            record.attempt.lease_renewed_at.as_deref(),
         )?;
         if updated {
             database.fail_plan_phase_run(
@@ -3984,6 +4071,45 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
         }
     }
     Ok(interrupted)
+}
+
+fn remote_sidecar_cancel_active_run_for_plan_task(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+    run_id: &str,
+) {
+    let owns_run = state
+        .active_run_streams
+        .lock()
+        .ok()
+        .is_some_and(|registry| {
+            registry
+                .by_run_id
+                .get(run_id)
+                .is_some_and(|registration| registration.plan_task_id.as_ref() == Some(task_id))
+        });
+    if owns_run {
+        // The database transaction has already emitted the durable terminal
+        // state. This only wakes an in-memory late runner and ends reconnectable
+        // SSE subscriptions without allowing it to write another turn.
+        remote_sidecar_cancel_active_run(state, run_id, true, true);
+    }
+}
+
+fn remote_plan_queued_run_id_from_message(
+    message_metadata_json: &str,
+    task_id: &AgentTaskId,
+    assistant_message_id: &str,
+) -> Option<String> {
+    let metadata = serde_json::from_str::<Value>(message_metadata_json).ok()?;
+    let queued_run = metadata.get("queuedRun")?.as_object()?;
+    if queued_run.get("status")?.as_str()? != "running"
+        || queued_run.get("assistantMessageId")?.as_str()? != assistant_message_id
+        || queued_run.get("agentTaskId")?.as_str()? != task_id.as_str()
+    {
+        return None;
+    }
+    queued_run.get("runId")?.as_str().map(str::to_string)
 }
 
 #[derive(Clone)]
@@ -19063,14 +19189,22 @@ async fn remote_sidecar_start_chat_run(
             run_stream.subscribe_cancel(),
         )
         .await?;
-        database
-            .claim_remote_queued_run(
+        match plan_task.as_ref() {
+            Some(plan_task) => database.claim_remote_plan_queued_run(
                 &chat_id,
                 &queued_user_message_id,
                 &assistant_message_id,
                 &run_id,
-            )
-            .map_err(ApiError::from_workspace_error)?;
+                &plan_task.task_id,
+            ),
+            None => database.claim_remote_queued_run(
+                &chat_id,
+                &queued_user_message_id,
+                &assistant_message_id,
+                &run_id,
+            ),
+        }
+        .map_err(ApiError::from_workspace_error)?;
         Ok::<(), ApiError>(())
     }
     .await;

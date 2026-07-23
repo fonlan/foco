@@ -191,6 +191,16 @@ pub struct PreStreamChatFailureClosure<'a> {
     pub error_json: &'a str,
     pub assistant_content: &'a str,
     pub assistant_metadata_json: &'a str,
+    /// Optional CAS snapshot for recovery paths. When provided, the active
+    /// attempt must still have this exact owner/lease pair before it can close.
+    /// Normal pre-stream failures leave these unset.
+    pub expected_attempt_owner_incarnation: Option<&'a str>,
+    pub expected_attempt_lease_renewed_at: Option<&'a str>,
+    /// Optional durable queuedRun owner for remote Plan recovery. When set,
+    /// the queued user message must still belong to this exact task/run pair
+    /// before any lifecycle state is terminalized.
+    pub expected_queued_run_agent_task_id: Option<&'a AgentTaskId>,
+    pub expected_queued_run_id: Option<&'a str>,
     /// When false (worker/subagent), only task/event close; no main-chat assistant row.
     pub materialize_assistant: bool,
 }

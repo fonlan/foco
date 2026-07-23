@@ -6826,6 +6826,42 @@ impl WorkspaceDatabase {
         assistant_message_id: &str,
         run_id: &str,
     ) -> Result<RemoteQueuedRunClaimOutcome, WorkspaceDatabaseError> {
+        self.claim_remote_queued_run_inner(
+            chat_id,
+            user_message_id,
+            assistant_message_id,
+            run_id,
+            None,
+        )
+    }
+
+    /// Claim a remote queuedRun for a Plan coordinator and persist its durable
+    /// task owner alongside the remote stream id.
+    pub fn claim_remote_plan_queued_run(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+        agent_task_id: &AgentTaskId,
+    ) -> Result<RemoteQueuedRunClaimOutcome, WorkspaceDatabaseError> {
+        self.claim_remote_queued_run_inner(
+            chat_id,
+            user_message_id,
+            assistant_message_id,
+            run_id,
+            Some(agent_task_id),
+        )
+    }
+
+    fn claim_remote_queued_run_inner(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+        agent_task_id: Option<&AgentTaskId>,
+    ) -> Result<RemoteQueuedRunClaimOutcome, WorkspaceDatabaseError> {
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -6895,10 +6931,25 @@ impl WorkspaceDatabase {
                 }
                 queued_run.insert("status".to_string(), Value::String("running".to_string()));
                 queued_run.insert("runId".to_string(), Value::String(run_id.to_string()));
+                if let Some(agent_task_id) = agent_task_id {
+                    queued_run.insert(
+                        "agentTaskId".to_string(),
+                        Value::String(agent_task_id.to_string()),
+                    );
+                }
                 RemoteQueuedRunClaimOutcome::Claimed
             }
             Some("running") => match queued_run.get("runId").and_then(Value::as_str) {
                 Some(owner_run_id) if owner_run_id == run_id => {
+                    if let Some(agent_task_id) = agent_task_id
+                        && queued_run.get("agentTaskId").and_then(Value::as_str)
+                            != Some(agent_task_id.as_str())
+                    {
+                        return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                            message: "remote queuedRun is already owned by another Agent task"
+                                .to_string(),
+                        });
+                    }
                     RemoteQueuedRunClaimOutcome::AlreadyOwned
                 }
                 Some(_) => {
@@ -7642,11 +7693,15 @@ impl WorkspaceDatabase {
         let attempt_matches = transaction
             .query_row(
                 "SELECT 1 FROM agent_attempts
-                 WHERE id = ?1 AND task_id = ?2 AND team_id = ?3 AND status = 'running'",
+                 WHERE id = ?1 AND task_id = ?2 AND team_id = ?3 AND status = 'running'
+                   AND (?4 IS NULL OR owner_incarnation = ?4)
+                   AND (?5 IS NULL OR lease_renewed_at = ?5)",
                 params![
                     closure.attempt_id.as_str(),
                     closure.task_id.as_str(),
-                    team_id
+                    team_id,
+                    closure.expected_attempt_owner_incarnation,
+                    closure.expected_attempt_lease_renewed_at,
                 ],
                 |_| Ok(1_i64),
             )
@@ -7660,6 +7715,56 @@ impl WorkspaceDatabase {
             return Ok(PreStreamChatFailureClosureResult::Skipped {
                 reason: "attempt is not the active running attempt".to_string(),
             });
+        }
+
+        if closure.expected_queued_run_agent_task_id.is_some()
+            || closure.expected_queued_run_id.is_some()
+        {
+            let Some(user_message) =
+                message_from_transaction(&transaction, &database_path, closure.user_message_id)?
+            else {
+                transaction
+                    .commit()
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                return Ok(PreStreamChatFailureClosureResult::Skipped {
+                    reason: "queued user message not found".to_string(),
+                });
+            };
+            let queued_run_matches = user_message.chat_id == closure.chat_id
+                && user_message.role == "user"
+                && parse_json_object(&user_message.metadata_json, "user message metadata")?
+                    .get(QUEUED_MESSAGE_METADATA_KEY)
+                    .and_then(Value::as_object)
+                    .is_some_and(|queued_run| {
+                        queued_run.get("status").and_then(Value::as_str) == Some("running")
+                            && queued_run
+                                .get("userMessageId")
+                                .or_else(|| queued_run.get("user_message_id"))
+                                .and_then(Value::as_str)
+                                == Some(closure.user_message_id)
+                            && queued_run
+                                .get("assistantMessageId")
+                                .or_else(|| queued_run.get("assistant_message_id"))
+                                .and_then(Value::as_str)
+                                == Some(closure.assistant_message_id)
+                            && closure
+                                .expected_queued_run_agent_task_id
+                                .is_none_or(|task_id| {
+                                    queued_run.get("agentTaskId").and_then(Value::as_str)
+                                        == Some(task_id.as_str())
+                                })
+                            && closure.expected_queued_run_id.is_none_or(|run_id| {
+                                queued_run.get("runId").and_then(Value::as_str) == Some(run_id)
+                            })
+                    });
+            if !queued_run_matches {
+                transaction
+                    .commit()
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                return Ok(PreStreamChatFailureClosureResult::Skipped {
+                    reason: "queuedRun owner was replaced".to_string(),
+                });
+            }
         }
 
         // Fail task + attempt while still in the same Immediate transaction.
@@ -7694,8 +7799,16 @@ impl WorkspaceDatabase {
             .execute(
                 "UPDATE agent_attempts
                  SET status = 'failed', completed_at = ?3
-                 WHERE id = ?1 AND task_id = ?2 AND status = 'running'",
-                params![closure.attempt_id.as_str(), closure.task_id.as_str(), now],
+                 WHERE id = ?1 AND task_id = ?2 AND status = 'running'
+                   AND (?4 IS NULL OR owner_incarnation = ?4)
+                   AND (?5 IS NULL OR lease_renewed_at = ?5)",
+                params![
+                    closure.attempt_id.as_str(),
+                    closure.task_id.as_str(),
+                    now,
+                    closure.expected_attempt_owner_incarnation,
+                    closure.expected_attempt_lease_renewed_at,
+                ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
         if attempt_updated != 1 {
@@ -7919,22 +8032,20 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
 
+        // The phase, its durable attempt, and the implementation chat must
+        // become terminal together. A later coordinator can otherwise observe a
+        // failed chat/task while the Plan still advertises a live phase.
+        fail_plan_phase_for_agent_task_transaction(
+            &transaction,
+            &database_path,
+            closure.task_id,
+            closure.error_json,
+            &now,
+        )?;
+
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
-
-        // Plan phase / scheduled-task sync after commit (own transactions).
-        let phase_error_message = serde_json::from_str::<Value>(closure.error_json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "pre-stream failure".to_string());
-        let _ = self.fail_plan_phase_run(closure.task_id, &phase_error_message)?;
-
         Ok(PreStreamChatFailureClosureResult::Applied)
     }
 
@@ -14770,7 +14881,7 @@ impl WorkspaceDatabase {
         &mut self,
         update: AgentTaskStateUpdate<'_>,
     ) -> Result<bool, WorkspaceDatabaseError> {
-        self.update_agent_task_state_inner(update, None)
+        self.update_agent_task_state_inner(update, None, None, None)
     }
 
     pub fn update_agent_task_state_for_attempt(
@@ -14778,13 +14889,33 @@ impl WorkspaceDatabase {
         update: AgentTaskStateUpdate<'_>,
         expected_attempt_id: &AgentAttemptId,
     ) -> Result<bool, WorkspaceDatabaseError> {
-        self.update_agent_task_state_inner(update, Some(expected_attempt_id))
+        self.update_agent_task_state_inner(update, Some(expected_attempt_id), None, None)
+    }
+
+    /// Terminalize an active task only when the attempt's owner/lease snapshot
+    /// still matches. Recovery callers use this to avoid racing a heartbeat from
+    /// the prior coordinator process.
+    pub fn update_agent_task_state_for_attempt_lease(
+        &mut self,
+        update: AgentTaskStateUpdate<'_>,
+        expected_attempt_id: &AgentAttemptId,
+        expected_owner_incarnation: Option<&str>,
+        expected_lease_renewed_at: Option<&str>,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        self.update_agent_task_state_inner(
+            update,
+            Some(expected_attempt_id),
+            expected_owner_incarnation,
+            expected_lease_renewed_at,
+        )
     }
 
     fn update_agent_task_state_inner(
         &mut self,
         update: AgentTaskStateUpdate<'_>,
         expected_attempt_id: Option<&AgentAttemptId>,
+        expected_owner_incarnation: Option<&str>,
+        expected_lease_renewed_at: Option<&str>,
     ) -> Result<bool, WorkspaceDatabaseError> {
         if update.transition == AgentTaskTransition::Start {
             return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
@@ -14817,15 +14948,19 @@ impl WorkspaceDatabase {
                        ?4 IS NULL
                        OR EXISTS (
                            SELECT 1 FROM agent_attempts
-                           WHERE id = ?4 AND task_id = ?1 AND team_id = ?2
+                             WHERE id = ?4 AND task_id = ?1 AND team_id = ?2
                              AND status = CASE WHEN ?3 = 'waiting' THEN 'suspended' ELSE 'running' END
+                             AND (?5 IS NULL OR owner_incarnation = ?5)
+                             AND (?6 IS NULL OR lease_renewed_at = ?6)
                        )
                    )",
                 params![
                     update.task_id.as_str(),
                     update.team_id.as_str(),
                     update.expected_status.as_str(),
-                    expected_attempt_id.map(AgentAttemptId::as_str)
+                    expected_attempt_id.map(AgentAttemptId::as_str),
+                    expected_owner_incarnation,
+                    expected_lease_renewed_at,
                 ],
                 |row| row.get::<_, String>(0),
             )
@@ -14898,7 +15033,9 @@ impl WorkspaceDatabase {
                      SET status = ?3, completed_at = ?4, interruption_reason = ?5
                      WHERE task_id = ?1 AND team_id = ?2
                        AND status = ?6
-                       AND (?7 IS NULL OR id = ?7)",
+                       AND (?7 IS NULL OR id = ?7)
+                       AND (?8 IS NULL OR owner_incarnation = ?8)
+                       AND (?9 IS NULL OR lease_renewed_at = ?9)",
                     params![
                         update.task_id.as_str(),
                         update.team_id.as_str(),
@@ -14906,7 +15043,9 @@ impl WorkspaceDatabase {
                         attempt_completed_at,
                         update.interruption_reason,
                         source_attempt_status,
-                        expected_attempt_id.map(AgentAttemptId::as_str)
+                        expected_attempt_id.map(AgentAttemptId::as_str),
+                        expected_owner_incarnation,
+                        expected_lease_renewed_at,
                     ],
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
@@ -20762,6 +20901,185 @@ fn chat_from_transaction(
         )
         .optional()
         .map_err(|source| sqlite_error(database_path, source))
+}
+
+/// Apply the Plan-side terminal effects for a coordinator failure inside the
+/// caller's lifecycle transaction. This intentionally covers only the attempt
+/// bound to `agent_task_id`, so a late owner cannot terminalize a successor.
+fn fail_plan_phase_for_agent_task_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    agent_task_id: &AgentTaskId,
+    error_json: &str,
+    now: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let error_message = serde_json::from_str::<Value>(error_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "pre-stream failure".to_string());
+    let attempt = transaction
+        .query_row(
+            "SELECT id, plan_id, phase_id, trigger
+             FROM plan_phase_attempts
+             WHERE agent_task_id = ?1
+             ORDER BY sequence DESC
+             LIMIT 1",
+            params![agent_task_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let Some((plan_attempt_id, plan_id, phase_id, trigger)) = attempt else {
+        return Ok(());
+    };
+    let plan_status = transaction
+        .query_row(
+            "SELECT status FROM plans WHERE id = ?1",
+            params![plan_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?;
+    if matches!(
+        plan_status.as_deref(),
+        None | Some("completed" | "cancelled")
+    ) {
+        return Ok(());
+    }
+
+    if matches!(trigger.as_str(), "merge_auto" | "merge_retry") {
+        transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'failed', error_message = ?2,
+                     completed_at = COALESCE(completed_at, ?3), updated_at = ?3
+                 WHERE agent_task_id = ?1 AND status IN ('queued', 'running')",
+                params![agent_task_id.as_str(), error_message, now],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'completed', error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4), updated_at = ?4
+                 WHERE plan_id = ?1 AND id = ?2",
+                params![plan_id, phase_id, error_message, now],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plans
+                 SET status = 'implemented', active_phase_id = NULL,
+                     error_message = ?2, completed_at = COALESCE(completed_at, ?3),
+                     completed_by_user_at = NULL, updated_at = ?3
+                 WHERE id = ?1",
+                params![plan_id, error_message, now],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+        block_plan_auto_run_transaction(
+            transaction,
+            database_path,
+            "merge_blocked",
+            &plan_id,
+            &phase_id,
+            now,
+        )?;
+        return Ok(());
+    }
+
+    transaction
+        .execute(
+            "UPDATE plan_phase_attempts
+             SET status = 'failed', error_message = ?2,
+                 completed_at = COALESCE(completed_at, ?3), updated_at = ?3
+             WHERE agent_task_id = ?1 AND status IN ('queued', 'running')",
+            params![agent_task_id.as_str(), error_message, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE plan_steps
+             SET status = 'failed', checked_at = NULL, updated_at = ?3
+             WHERE plan_id = ?1 AND phase_id = ?2 AND status IN ('pending', 'running')",
+            params![plan_id, phase_id, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE plan_phases
+             SET status = 'failed', error_message = ?3,
+                 completed_at = COALESCE(completed_at, ?4), updated_at = ?4
+             WHERE plan_id = ?1 AND id = ?2",
+            params![plan_id, phase_id, error_message, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE plans
+             SET status = 'failed', active_phase_id = NULL, error_message = ?2,
+                 completed_at = ?3, completed_by_user_at = NULL, updated_at = ?3
+             WHERE id = ?1",
+            params![plan_id, error_message, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    transaction
+        .execute(
+            "UPDATE plan_phase_derived_effects
+             SET status = 'discarded', terminal_reason = ?2,
+                 discarded_at = COALESCE(discarded_at, ?3), updated_at = ?3
+             WHERE attempt_id = ?1
+               AND status = 'awaiting_integration'
+               AND integration_confirmed_at IS NULL",
+            params![plan_attempt_id, error_message, now],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    block_plan_auto_run_transaction(
+        transaction,
+        database_path,
+        "waiting_for_retry",
+        &plan_id,
+        &phase_id,
+        now,
+    )?;
+    Ok(())
+}
+
+fn block_plan_auto_run_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    reason: &str,
+    plan_id: &str,
+    phase_id: &str,
+    now: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    for (key, value) in [
+        (PLAN_AUTO_RUN_BLOCKED_REASON_KEY, reason),
+        (PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY, plan_id),
+        (PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY, phase_id),
+    ] {
+        transaction
+            .execute(
+                "INSERT INTO workspace_metadata (key, value, updated_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at",
+                params![key, value, now],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?;
+    }
+    Ok(())
 }
 
 fn message_from_transaction(
