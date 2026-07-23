@@ -140,15 +140,17 @@ use crate::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
         AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, BrokeredTransferFile,
-        CodeGraphIndexState, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
-        QuestionRegistry, REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT,
-        ReadOnlyToolProgressAction, ReasoningLoopDetector, SidecarRuntimeConfigBundle,
-        ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        CodeGraphIndexState, CodeGraphReadinessError, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
+        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
+        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
+        SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
         build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
         execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
         materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
         package_brokered_web_result_files, pre_stream_failure_user_message,
-        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
+        reasoning_loop_guard_message, release_code_graph_then_delete_worktree, run_post_tool_hooks,
+        spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
+        web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -2999,7 +3001,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         user_profile_dir: resolve_remote_sidecar_user_profile_dir(),
         last_config_hash: Arc::new(Mutex::new(None)),
         runtime_config: Arc::new(Mutex::new(None)),
-        code_graph_watcher: Arc::new(Mutex::new(None)),
+        code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         ws_count: ws_count.clone(),
         active_run_count: active_run_count.clone(),
         active_runs: active_runs.clone(),
@@ -3873,7 +3875,10 @@ pub(crate) struct RemoteSidecarState {
     token: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
     runtime_config: Arc<Mutex<Option<SidecarRuntimeConfigBundle>>>,
-    code_graph_watcher: Arc<Mutex<Option<foco_graph::CodeGraphWatcher>>>,
+    /// Per canonical execution-root code graph lifecycle (index + watcher).
+    /// Ordinary HTTP Graph requests use the shared remote workspace root; Agent
+    /// chat Graph tools use the validated `tool_workspace_path`.
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     ws_count: Arc<AtomicUsize>,
     active_run_count: Arc<AtomicUsize>,
     active_runs: Arc<Mutex<Vec<RemoteActiveRunSummary>>>,
@@ -3928,7 +3933,7 @@ async fn sidecar_bearer_auth(
         return StatusCode::UNAUTHORIZED.into_response();
     }
     if request.headers().contains_key("x-foco-ensure-code-graph") {
-        if let Err(response) = ensure_sidecar_code_graph(&state) {
+        if let Err(response) = ensure_sidecar_code_graph(&state, sidecar_workspace_path(&state)) {
             return response;
         }
     }
@@ -9062,37 +9067,114 @@ fn sidecar_workspace_path(state: &RemoteSidecarState) -> &Path {
     Path::new(&state.workspace_path)
 }
 
-fn ensure_sidecar_code_graph(state: &RemoteSidecarState) -> Result<(), axum::response::Response> {
-    if state
-        .code_graph_watcher
-        .lock()
-        .map_err(|_| {
-            ApiError::internal("remote code graph watcher lock is poisoned").into_response()
-        })?
-        .is_some()
-    {
-        return Ok(());
-    }
-
-    // ponytail: first code-graph touch indexes under a short global lock; upgrade to per-workspace async init if remote repos make this slow.
-    let workspace_path = sidecar_workspace_path(state).to_path_buf();
-    let report = foco_graph::index_workspace(&workspace_path).map_err(|e| {
-        ApiError::internal(format!("failed to index remote code graph: {e}")).into_response()
-    })?;
-    let watcher = foco_graph::start_code_graph_watcher(&workspace_path).map_err(|e| {
-        ApiError::internal(format!("failed to watch remote code graph: {e}")).into_response()
-    })?;
-    tracing::info!(
-        workspace_path = %workspace_path.display(),
-        scanned_files = report.scanned_files,
-        indexed_files = report.indexed_files,
-        "initialized remote sidecar code graph"
+fn ensure_sidecar_code_graph(
+    state: &RemoteSidecarState,
+    execution_root: &Path,
+) -> Result<(), axum::response::Response> {
+    // HTTP Graph compatibility path: ensure the requested execution root is
+    // claimed/initialized and wait until Ready (or surface a clear failure).
+    // Agent chat tools use the shared registry via execute_tool readiness instead.
+    spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        execution_root.to_path_buf(),
+        "remote-sidecar-http-graph",
     );
-    let mut lock = state.code_graph_watcher.lock().map_err(|_| {
-        ApiError::internal("remote code graph watcher lock is poisoned").into_response()
-    })?;
-    if lock.is_none() {
-        *lock = Some(watcher);
+    wait_for_code_graph_ready(&state.code_graph_indexes, execution_root, None, None).map_err(
+        |error| match error {
+            CodeGraphReadinessError::Failed {
+                execution_root,
+                stage,
+                error,
+            } => ApiError::internal(format!(
+                "failed to initialize remote code graph for {}: {stage}: {error}",
+                execution_root.display()
+            ))
+            .into_response(),
+            CodeGraphReadinessError::TimedOut { execution_root } => ApiError::internal(format!(
+                "timed out waiting for remote code graph readiness: {}",
+                execution_root.display()
+            ))
+            .into_response(),
+            CodeGraphReadinessError::Cancelled => {
+                ApiError::internal("remote code graph readiness wait was cancelled").into_response()
+            }
+            CodeGraphReadinessError::InvalidPath { path, error } => ApiError::internal(format!(
+                "invalid remote code graph execution root {}: {error}",
+                path.display()
+            ))
+            .into_response(),
+        },
+    )
+}
+
+fn prewarm_sidecar_code_graph_execution_root(
+    state: &RemoteSidecarState,
+    execution_root: &Path,
+    label: impl Into<String>,
+) {
+    spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        execution_root.to_path_buf(),
+        label,
+    );
+}
+
+fn release_sidecar_code_graph_then_delete_worktree(
+    state: &RemoteSidecarState,
+    workspace_path: &Path,
+    worktree_path: &Path,
+) -> Result<(), ApiError> {
+    release_code_graph_then_delete_worktree(&state.code_graph_indexes, worktree_path, || {
+        delete_agent_worktree(workspace_path, worktree_path, true)
+    })
+}
+
+fn release_sidecar_plan_worktrees_after_merge(
+    state: &RemoteSidecarState,
+    plan_id: &str,
+) -> Result<(), ApiError> {
+    let workspace_path = sidecar_workspace_path(state).to_path_buf();
+    let records = WorkspaceDatabase::open_or_create(&workspace_path)
+        .map_err(ApiError::from_workspace_error)?
+        .plan_worktree_audit()
+        .map_err(ApiError::from_workspace_error)?
+        .into_iter()
+        .filter(|record| record.plan_id == plan_id)
+        .collect::<Vec<_>>();
+    let mut deleted_roots = HashMap::<PathBuf, bool>::new();
+
+    for record in records {
+        let root_path =
+            crate::git_backend::resolve_agent_worktree_path(&workspace_path, &record.worktree_path);
+        let deleted = match deleted_roots.get(&root_path) {
+            Some(deleted) => *deleted,
+            None => {
+                let deleted = match release_sidecar_code_graph_then_delete_worktree(
+                    state,
+                    &workspace_path,
+                    &root_path,
+                ) {
+                    Ok(()) => true,
+                    Err(error) => {
+                        tracing::warn!(
+                            plan_id,
+                            worktree_path = %root_path.display(),
+                            error = %error.message,
+                            "remote Plan merge completed but an isolated worktree could not be removed"
+                        );
+                        false
+                    }
+                };
+                deleted_roots.insert(root_path, deleted);
+                deleted
+            }
+        };
+        if deleted {
+            WorkspaceDatabase::open_or_create(&workspace_path)
+                .map_err(ApiError::from_workspace_error)?
+                .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
+                .map_err(ApiError::from_workspace_error)?;
+        }
     }
     Ok(())
 }
@@ -10760,7 +10842,11 @@ async fn remote_sidecar_create_agent_instances(
         Ok(created) => created,
         Err(error) => {
             for worktree in &worktrees {
-                let _ = delete_agent_worktree(&workspace_path, &worktree.root_path, true);
+                let _ = release_sidecar_code_graph_then_delete_worktree(
+                    &state,
+                    &workspace_path,
+                    &worktree.root_path,
+                );
             }
             return Err(ApiError::from_workspace_error(error).into_response());
         }
@@ -14293,7 +14379,7 @@ async fn remote_sidecar_execute_tool_call(
         &tool_call.name,
         tool_call.arguments.clone(),
         foco_tools::BuiltinToolRuntime::new(state.background_command_registry.clone()),
-        Arc::new(Mutex::new(CodeGraphIndexState::default())),
+        state.code_graph_indexes.clone(),
     )
     .await;
 
@@ -17770,7 +17856,11 @@ fn remote_sidecar_finalize_plan_merge_task(
     }
 
     if let Some(worktree) = worktree {
-        if let Err(error) = delete_agent_worktree(&workspace_path, &worktree.root_path, true) {
+        if let Err(error) = release_sidecar_code_graph_then_delete_worktree(
+            state,
+            &workspace_path,
+            &worktree.root_path,
+        ) {
             tracing::warn!(
                 task_id = %task.id,
                 error = %error.message,
@@ -18272,7 +18362,11 @@ async fn remote_sidecar_dispatch_plan_merge(
     })();
     if let Err(error) = dispatched {
         if let Some(worktree) = merge_worktree.as_ref() {
-            let _ = delete_agent_worktree(&workspace_path, &worktree.root_path, true);
+            let _ = release_sidecar_code_graph_then_delete_worktree(
+                state,
+                &workspace_path,
+                &worktree.root_path,
+            );
         }
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
@@ -18332,11 +18426,14 @@ async fn remote_sidecar_finalize_plan_worktree(
     ) {
         Ok(_) => {
             let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace_path)?;
-            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
-                .map_err(ApiError::from_workspace_error)?;
+            {
+                let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            release_sidecar_plan_worktrees_after_merge(state, &plan.id)?;
             Ok(())
         }
         Err(error) => match classify_plan_merge_failure(&error) {
@@ -18642,6 +18739,15 @@ async fn remote_sidecar_start_chat_run(
             plan_task,
         )
     };
+    // Prewarm only after the chat and, when present, Plan task binding have
+    // confirmed ownership of this execution root. The first Graph tool then
+    // waits for this same-path single-flight initialization rather than starting
+    // a cold index itself.
+    prewarm_sidecar_code_graph_execution_root(
+        &state,
+        &tool_workspace_path,
+        format!("remote-chat:{chat_id}"),
+    );
 
     let (run_id, run_stream) = match remote_sidecar_reserve_active_run(
         &state,
@@ -22055,7 +22161,7 @@ async fn remote_sidecar_plans_worktree_cleanup(
     }
     let root_path =
         crate::git_backend::resolve_agent_worktree_path(&workspace_path, &record.worktree_path);
-    crate::git_backend::delete_agent_worktree(&workspace_path, &root_path, true)
+    release_sidecar_code_graph_then_delete_worktree(&state, &workspace_path, &root_path)
         .map_err(|e| e.into_response())?;
     database
         .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
@@ -23783,7 +23889,7 @@ mod tests {
                 token: "token".to_string(),
                 last_config_hash: Arc::new(Mutex::new(None)),
                 runtime_config: Arc::new(Mutex::new(None)),
-                code_graph_watcher: Arc::new(Mutex::new(None)),
+                code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
                 ws_count: Arc::new(AtomicUsize::new(ws_count)),
                 active_run_count: Arc::new(AtomicUsize::new(0)),
                 active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -27624,7 +27730,7 @@ mod tests {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
-            code_graph_watcher: Arc::new(Mutex::new(None)),
+            code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -30677,7 +30783,7 @@ mod tests {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
-            code_graph_watcher: Arc::new(Mutex::new(None)),
+            code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -37127,7 +37233,7 @@ mod tests {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
-            code_graph_watcher: Arc::new(Mutex::new(None)),
+            code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -37197,7 +37303,7 @@ mod tests {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
-            code_graph_watcher: Arc::new(Mutex::new(None)),
+            code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
             ws_count: Arc::new(AtomicUsize::new(0)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -37943,6 +38049,209 @@ mod tests {
         assert!(
             !workspace.path().join("worktree-only.txt").exists(),
             "file tool must retain the isolated worktree as its execution root"
+        );
+    }
+
+    fn wait_for_remote_code_graph_watchers(
+        indexes: &Arc<Mutex<CodeGraphIndexState>>,
+        expected_count: usize,
+    ) {
+        for _ in 0..250 {
+            if indexes
+                .lock()
+                .expect("code graph index lock")
+                .watcher_count()
+                == expected_count
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            indexes
+                .lock()
+                .expect("code graph index lock")
+                .watcher_count(),
+            expected_count,
+            "remote code graph watcher count should reach {expected_count}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_isolated_worktree_code_graph_indexes_execution_root_not_canonical() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let workspace_path = workspace.path().to_path_buf();
+        fs::write(
+            workspace_path.join("lib.rs"),
+            "pub fn shared_only_symbol() -> i32 { 1 }\n",
+        )
+        .expect("shared source");
+        let repo = gix::init(&workspace_path).expect("init repository");
+        let mut index = gix::index::File::from_state(
+            gix::index::State::new(repo.object_hash()),
+            repo.index_path(),
+        );
+        index.write(Default::default()).expect("empty index");
+        fs::write(
+            workspace_path.join(".git").join("config"),
+            "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+        )
+        .expect("git config");
+        crate::git_backend::stage_git_file(&workspace_path, "lib.rs").expect("stage");
+        crate::git_backend::commit_staged_changes(&workspace_path, "initial".to_string())
+            .expect("commit");
+
+        let worktree = create_agent_worktree(&workspace_path, "agent-instance-remote-graph")
+            .expect("worktree");
+        fs::write(
+            worktree.root_path.join("lib.rs"),
+            "pub fn worktree_only_symbol() -> i32 { 2 }\n",
+        )
+        .expect("worktree source");
+
+        let (state, catalog) = test_remote_sidecar_local_catalog(&workspace_path, None).await;
+
+        // Prewarm the isolated execution root the same way chat-run startup does.
+        prewarm_sidecar_code_graph_execution_root(
+            &state,
+            &worktree.root_path,
+            "test-remote-worktree-prewarm",
+        );
+        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 1);
+
+        let (symbols, symbols_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
+            &state,
+            &worktree.root_path,
+            &catalog,
+            "call-graph-find-symbols",
+            "graph_find_symbols",
+            json!({
+                "query": "worktree_only_symbol",
+                "kind": null,
+                "path": null,
+                "limit": 5,
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!symbols_error, "{symbols}");
+        let symbols_text = symbols.to_string();
+        assert!(
+            symbols_text.contains("worktree_only_symbol"),
+            "graph tool should return worktree content: {symbols}"
+        );
+        assert!(
+            !symbols_text.contains("shared_only_symbol"),
+            "worktree graph must not surface shared-only symbols: {symbols}"
+        );
+
+        let worktree_db =
+            WorkspaceDatabase::open_or_create(&worktree.root_path).expect("worktree graph db");
+        let worktree_symbols = worktree_db
+            .find_code_graph_symbols("worktree_only_symbol", None, None, 10)
+            .expect("worktree symbols");
+        assert_eq!(worktree_symbols.len(), 1, "{worktree_symbols:?}");
+        assert!(
+            worktree.root_path.join(".foco/foco.sqlite").exists(),
+            "graph index must live under the worktree .foco database"
+        );
+
+        // Canonical workspace graph must remain unpolluted until explicitly prewarmed.
+        let shared_db =
+            WorkspaceDatabase::open_or_create(&workspace_path).expect("shared workspace db");
+        let shared_symbols = shared_db
+            .find_code_graph_symbols("worktree_only_symbol", None, None, 10)
+            .expect("shared symbols");
+        assert!(
+            shared_symbols.is_empty(),
+            "canonical graph must not index worktree-only symbols: {shared_symbols:?}"
+        );
+
+        // Untracked .foco runtime data must not appear in worktree changed paths.
+        let status = crate::git_backend::git_status_response(&worktree.root_path)
+            .expect("worktree git status");
+        let changed_paths = status
+            .files
+            .iter()
+            .map(|file| file.path.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            changed_paths
+                .iter()
+                .all(|path| !crate::git_backend::is_foco_reserved_repo_path(path)),
+            "untracked .foco runtime data must not appear in changed paths: {changed_paths:?}"
+        );
+        assert!(
+            changed_paths.iter().any(|path| path == "lib.rs"),
+            "worktree source edits should still appear: {changed_paths:?}"
+        );
+
+        // Database tools still write the canonical workspace DB.
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_path).expect("canonical workspace db");
+        database
+            .insert_chat_with_metadata("chat-tools", "Remote tools", "{}")
+            .expect("insert chat");
+        drop(database);
+        let (todo, todo_error, _, _) = test_execute_remote_sidecar_local_tool_at_workspace(
+            &state,
+            &worktree.root_path,
+            &catalog,
+            "call-isolated-todo-from-graph",
+            "create_todo_graph",
+            json!({
+                "tasks": [{
+                    "id": "graph-isolated-task",
+                    "title": "Canonical database task",
+                    "status": "ready",
+                    "dependsOn": [],
+                    "acceptance": ["persisted in canonical database"],
+                    "summary": "created from isolated worktree during graph test",
+                    "createdAt": null,
+                    "updatedAt": null,
+                    "subtasks": []
+                }],
+                "timeoutMs": null
+            }),
+            None,
+        )
+        .await;
+        assert!(!todo_error, "{todo}");
+        let graph = WorkspaceDatabase::open_or_create(&workspace_path)
+            .expect("reopen canonical workspace db")
+            .todo_graph("chat-tools")
+            .expect("read canonical todo graph")
+            .expect("canonical todo graph");
+        assert_eq!(graph.tasks[0].id, "graph-isolated-task");
+
+        // Release + delete must drop the worktree registry entry without touching
+        // a separately prewarmed canonical root.
+        prewarm_sidecar_code_graph_execution_root(
+            &state,
+            &workspace_path,
+            "test-remote-canonical-prewarm",
+        );
+        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 2);
+        release_sidecar_code_graph_then_delete_worktree(
+            &state,
+            &workspace_path,
+            &worktree.root_path,
+        )
+        .expect("delete worktree after graph release");
+        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 1);
+        assert!(
+            !worktree.root_path.exists(),
+            "worktree directory should be removed after release+delete"
+        );
+        assert_eq!(
+            state
+                .code_graph_indexes
+                .lock()
+                .expect("code graph index lock")
+                .watcher_count(),
+            1,
+            "canonical registry entry must remain after worktree release"
         );
     }
 
@@ -43242,7 +43551,7 @@ mod tests {
             token: "token".to_string(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
-            code_graph_watcher: Arc::new(Mutex::new(None)),
+            code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
             ws_count: Arc::new(AtomicUsize::new(1)),
             active_run_count: Arc::new(AtomicUsize::new(0)),
             active_runs: Arc::new(Mutex::new(Vec::new())),
@@ -43668,6 +43977,64 @@ mod tests {
         *state.runtime_config.lock().expect("runtime config") = Some(bundle);
         let broker = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
         (state, broker)
+    }
+
+    #[tokio::test]
+    async fn remote_finalize_fast_forward_releases_graph_and_worktree() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (plan, source_worktree, _) =
+            setup_remote_plan_merge_fixture(workspace.path(), "fast-forward-cleanup", false);
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        prewarm_sidecar_code_graph_execution_root(
+            &state,
+            &source_worktree.root_path,
+            "test-remote-fast-forward-cleanup",
+        );
+        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 1);
+
+        remote_sidecar_finalize_plan_worktree(&state, &plan, false)
+            .await
+            .expect("fast-forward finalize");
+
+        wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 0);
+        assert!(
+            !source_worktree.root_path.exists(),
+            "fast-forward finalization should remove the isolated worktree"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.path().join("phase-change.txt"))
+                .expect("merged phase change"),
+            "source Plan change\n"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
+        assert!(
+            refreshed.shared_merge_commit_id.is_some(),
+            "fast-forward finalization should record the shared merge commit"
+        );
+        let team_id = AgentTeamId::new(
+            refreshed.phases[0]
+                .agent_team_id
+                .clone()
+                .expect("implementation team id"),
+        )
+        .expect("implementation team id");
+        let coordinator = database
+            .agent_team(&team_id)
+            .expect("team lookup")
+            .and_then(|team| {
+                database
+                    .agent_instance(&team.coordinator_instance_id)
+                    .expect("instance lookup")
+            })
+            .expect("implementation coordinator");
+        assert_eq!(
+            coordinator.execution_workspace_mode,
+            AgentExecutionWorkspaceMode::Shared
+        );
+        assert!(coordinator.execution_root_path.is_none());
     }
 
     #[tokio::test]
