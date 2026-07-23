@@ -133,19 +133,10 @@ summary {
   transform: translateY(1px);
 }
 
-button:focus-visible,
-input:focus-visible,
-select:focus-visible,
-textarea:focus-visible,
-summary:focus-visible {
-  outline: 2px solid var(--foco-accent);
-  outline-offset: 2px;
-}
-
 .app-root {
   height: 100dvh;
   overflow: hidden;
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .app-shell {
@@ -413,7 +404,7 @@ summary:focus-visible {
 }
 
 .markdown-content a {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
   font-weight: 600;
   text-decoration: underline;
   text-underline-offset: 0.18em;
@@ -424,7 +415,7 @@ summary:focus-visible {
 }
 
 .markdown-content-user a {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
 }
 
 .message-skill-chip-row {
@@ -444,11 +435,11 @@ summary:focus-visible {
   min-height: 1.5rem;
   vertical-align: baseline;
   align-items: center;
-  border: 1px solid var(--foco-user-border);
+  border: 1px solid var(--accent);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.62);
   padding: 0.12rem 0.52rem;
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
   font-size: 0.78rem;
   font-weight: 700;
   line-height: 1.25;
@@ -466,7 +457,7 @@ summary:focus-visible {
   height: 0.42rem;
   margin-right: 0.38rem;
   border-radius: 999px;
-  background: var(--foco-accent);
+  background: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in oklab, var(--accent) 18%, transparent);
 }
 
@@ -480,7 +471,7 @@ summary:focus-visible {
 
 .markdown-content-user code {
   background: color-mix(in oklab, var(--accent) 14%, transparent);
-  color: var(--foco-primary);
+  color: var(--foreground);
 }
 
 .markdown-content pre {
@@ -550,11 +541,11 @@ summary:focus-visible {
   min-height: 4rem;
   max-width: 100%;
   overflow-x: auto;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.75rem;
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .markdown-content .mermaid-diagram {
@@ -573,14 +564,14 @@ summary:focus-visible {
   background:
     linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent)
       0 0 / 12rem 100% no-repeat,
-    var(--foco-panel-soft);
+    var(--surface-secondary);
   animation: mermaid-loading-shimmer 1.2s ease-in-out infinite;
 }
 
 .mermaid-diagram-error {
   border-color: rgba(225, 29, 72, 0.3);
-  background: var(--foco-error-soft);
-  color: var(--foco-danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .mermaid-diagram-error-title {
@@ -596,7 +587,7 @@ summary:focus-visible {
 .markdown-content .mermaid-diagram-error pre {
   margin-bottom: 0;
   background: rgba(136, 19, 55, 0.08);
-  color: var(--foco-danger);
+  color: var(--danger);
 }
 
 @keyframes mermaid-loading-shimmer {
@@ -614,14 +605,14 @@ summary:focus-visible {
 }
 
 .markdown-content blockquote {
-  border-left: 3px solid var(--foco-accent-line);
+  border-left: 3px solid var(--accent);
   padding-left: 0.75rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .markdown-content-user blockquote {
-  border-left-color: var(--foco-user-border);
-  color: var(--foco-text-muted);
+  border-left-color: var(--accent);
+  color: var(--muted);
 }
 
 .markdown-content table {
@@ -647,18 +638,18 @@ summary:focus-visible {
 
 .markdown-content th,
 .markdown-content td {
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   padding: 0.35rem 0.5rem;
   text-align: left;
 }
 
 .markdown-content-user th,
 .markdown-content-user td {
-  border-color: var(--foco-user-border);
+  border-color: var(--accent);
 }
 
 .markdown-content-reasoning {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.78rem;
   line-height: 1.55;
 }
@@ -679,11 +670,11 @@ summary:focus-visible {
   min-height: 2.25rem;
   align-items: center;
   gap: 0.375rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.25rem 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.75rem;
   font-weight: 600;
 }
@@ -706,17 +697,17 @@ summary:focus-visible {
   min-height: 2.75rem;
   align-items: center;
   gap: 0.5rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.375rem 0.5rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .message-attachment-part-user {
-  border-color: var(--foco-user-border);
+  border-color: var(--accent);
   background: rgba(255, 255, 255, 0.48);
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .message-attachment-part img {
@@ -735,13 +726,13 @@ summary:focus-visible {
   align-items: center;
   justify-content: center;
   border-radius: 0.5rem;
-  background: var(--foco-panel-muted);
-  color: var(--foco-text-muted);
+  background: var(--default);
+  color: var(--muted);
 }
 
 .message-attachment-part-user .message-attachment-file-icon {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .generated-image-file-list {
@@ -753,10 +744,10 @@ summary:focus-visible {
 .generated-image-file {
   min-width: 0;
   overflow: hidden;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel-soft);
-  color: var(--foco-text-muted);
+  background: var(--surface-secondary);
+  color: var(--muted);
 }
 
 .generated-image-file img {
@@ -764,7 +755,7 @@ summary:focus-visible {
   width: 100%;
   max-height: min(28rem, 58vh);
   object-fit: contain;
-  background: var(--foco-panel);
+  background: var(--surface);
 }
 
 .generated-image-file figcaption {
@@ -788,7 +779,7 @@ summary:focus-visible {
 
 .generated-image-file-size {
   flex: 0 0 auto;
-  color: var(--foco-text-subtle);
+  color: var(--muted);
 }
 
 .composer-model-provider-select {
@@ -816,9 +807,9 @@ summary:focus-visible {
 }
 
 .context-usage-circle {
-  --context-usage-ring: var(--foco-accent);
-  --context-usage-track: var(--foco-panel-muted);
-  --context-usage-fill: var(--foco-panel);
+  --context-usage-ring: var(--accent);
+  --context-usage-track: var(--default);
+  --context-usage-fill: var(--surface);
   display: inline-flex;
   position: relative;
   width: 2rem;
@@ -837,7 +828,7 @@ summary:focus-visible {
       var(--context-usage-ring) var(--context-usage-percent, 0%),
       var(--context-usage-track) 0
     );
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
   font-size: 0.625rem;
   font-weight: 800;
   line-height: 1;
@@ -845,15 +836,15 @@ summary:focus-visible {
 }
 
 .context-usage-circle-warn {
-  --context-usage-ring: var(--foco-warning);
-  --context-usage-track: var(--foco-warning-soft);
-  color: var(--foco-warning);
+  --context-usage-ring: var(--warning);
+  --context-usage-track: var(--warning-soft);
+  color: var(--warning);
 }
 
 .context-usage-circle-critical {
-  --context-usage-ring: var(--foco-error);
-  --context-usage-track: var(--foco-error-soft);
-  color: var(--foco-danger);
+  --context-usage-ring: var(--danger);
+  --context-usage-track: var(--danger-soft);
+  color: var(--danger);
 }
 
 .context-usage-circle-loading {
@@ -862,10 +853,10 @@ summary:focus-visible {
 
 .audit-json-block {
   overflow: hidden;
-  border: 1px solid var(--foco-json-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: var(--foco-json-surface);
-  color: var(--foco-json-text);
+  background: var(--surface);
+  color: var(--foreground);
 }
 
 .audit-json-header {
@@ -874,8 +865,8 @@ summary:focus-visible {
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  border-bottom: 1px solid var(--foco-json-border);
-  background: var(--foco-json-header);
+  border-bottom: 1px solid var(--border);
+  background: var(--surface-secondary);
   padding: 0.5rem 0.75rem;
 }
 
@@ -884,14 +875,14 @@ summary:focus-visible {
   min-width: 0;
   align-items: center;
   gap: 0.375rem;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: 0.875rem;
   font-weight: 700;
 }
 
 .audit-json-title svg {
   flex: 0 0 auto;
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 .audit-json-actions {
@@ -908,14 +899,14 @@ summary:focus-visible {
   flex: 0 0 auto;
   align-items: center;
   gap: 0.375rem;
-  border: 1px solid var(--foco-json-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-json-surface);
+  background: var(--surface);
   padding: 0 0.5rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.75rem;
   font-weight: 700;
-  box-shadow: var(--foco-shadow-subtle);
+  box-shadow: var(--surface-shadow);
 }
 
 .audit-json-icon-button {
@@ -932,18 +923,18 @@ summary:focus-visible {
 
 .audit-json-icon-button:hover:not(:disabled),
 .audit-json-copy-button:hover {
-  border-color: var(--foco-border-active);
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .audit-json-code {
   max-height: 32rem;
   overflow: auto;
   margin: 0;
-  background: var(--foco-json-surface);
+  background: var(--surface);
   padding: 0.875rem;
-  color: var(--foco-json-text);
+  color: var(--foreground);
   font-family: "Cascadia Mono", "Fira Code", Consolas, ui-monospace, monospace;
   font-size: 0.75rem;
   line-height: 1.65;
@@ -991,13 +982,13 @@ summary:focus-visible {
   border-radius: 0.35rem;
   background: transparent;
   padding: 0;
-  color: var(--foco-text-faint);
+  color: var(--muted);
   box-shadow: none;
 }
 
 .audit-json-node-toggle:hover {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .audit-json-node-toggle-icon {
@@ -1012,29 +1003,29 @@ summary:focus-visible {
 
 .audit-json-collapsed-marker {
   margin: 0 0.25rem;
-  color: var(--foco-text-faint);
+  color: var(--muted);
   font-style: italic;
 }
 
 .audit-json-token-key {
-  color: var(--foco-json-key);
+  color: var(--accent-soft-foreground);
 }
 
 .audit-json-token-string {
-  color: var(--foco-json-string);
+  color: var(--warning);
 }
 
 .audit-json-token-number {
-  color: var(--foco-json-number);
+  color: var(--success);
 }
 
 .audit-json-token-literal {
-  color: var(--foco-json-literal);
+  color: var(--danger);
   font-weight: 700;
 }
 
 .audit-json-token-punctuation {
-  color: var(--foco-json-punctuation);
+  color: var(--muted);
 }
 
 @media (max-width: 1199px) {
@@ -1253,9 +1244,7 @@ summary:focus-visible {
   }
 }
 
-/* Foco layout/typography tokens + transitional --foco-* color aliases.
-   Color aliases map only to HeroUI default semantic tokens and must be
-   deleted as call sites migrate (see web/shared/ui/FOCO_TOKEN_MIGRATION.md). */
+/* Foco layout / typography / safe-area tokens (not a color palette). */
 :root {
   /* Layout / typography (not color system) */
   --foco-header-height: 2.75rem;
@@ -1273,86 +1262,13 @@ summary:focus-visible {
     system-ui, sans-serif;
   --foco-line-body: 1.55;
 
-  /* Transitional color aliases → HeroUI semantic tokens */
-  --foco-canvas: var(--background);
-  --foco-canvas-raised: var(--background-secondary);
-  --foco-rail: var(--background-inverse);
-  --foco-rail-soft: var(--surface-tertiary);
-  --foco-sidebar: var(--surface);
-  --foco-panel: var(--surface);
-  --foco-panel-soft: var(--surface-secondary);
-  --foco-panel-muted: var(--default);
-  --foco-panel-selected: var(--accent-soft);
-  --foco-border: var(--border);
-  --foco-border-strong: var(--border-secondary);
-  --foco-border-active: var(--accent);
-  --foco-text: var(--foreground);
-  --foco-text-muted: var(--muted);
-  --foco-text-faint: var(--muted);
-  --foco-text-subtle: var(--muted);
-  --foco-foreground: var(--foreground);
-  --foco-muted: var(--muted);
-  --foco-muted-foreground: var(--muted);
-  --foco-primary: var(--foreground);
-  --foco-primary-hover: var(--accent);
-  --foco-accent: var(--accent);
-  --foco-accent-hover: var(--accent-hover);
-  --foco-accent-strong: var(--accent-soft-foreground);
-  --foco-accent-soft: var(--accent-soft);
-  --foco-accent-muted: var(--accent-soft-hover);
-  --foco-accent-line: var(--accent);
-  --foco-user-surface: var(--accent-soft);
-  --foco-user-border: var(--accent);
-  --foco-user-avatar: var(--accent);
-  --foco-success: var(--success);
-  --foco-success-soft: var(--success-soft);
-  --foco-warning: var(--warning);
-  --foco-warning-soft: var(--warning-soft);
-  --foco-error: var(--danger);
-  --foco-error-soft: var(--danger-soft);
-  --foco-danger: var(--danger);
-  --foco-shadow-subtle: var(--surface-shadow);
-  --foco-shadow-soft: var(--overlay-shadow);
-  --foco-shadow-raised: var(--overlay-shadow);
-  --foco-shadow-accent: var(--overlay-shadow);
-  --foco-focus-ring: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
-  --foco-sidebar-gradient: var(--surface);
-  --foco-header-surface: var(--surface);
-  --foco-row-hover: var(--surface-hover);
-  --foco-chat-row-hover: var(--surface-hover);
-  --foco-active-surface-gradient: var(--accent-soft);
-  --foco-active-inset-shadow: none;
-  --foco-toolbar-surface: var(--surface);
-  --foco-main-panel-gradient: var(--background);
-  --foco-row-border: var(--border);
-  --foco-empty-surface: var(--surface-secondary);
-  --foco-composer-shell-gradient: var(--background);
-  --foco-composer-top-shadow: none;
-  --foco-context-tabs-surface: var(--surface);
-  --foco-graph-line: var(--border-secondary);
-  --foco-settings-main-gradient: var(--background);
-  --foco-settings-card-surface: var(--surface);
-  --foco-json-surface: var(--surface);
-  --foco-json-header: var(--surface-secondary);
-  --foco-json-border: var(--border);
-  --foco-json-text: var(--foreground);
-  --foco-json-key: var(--accent-soft-foreground);
-  --foco-json-string: var(--warning);
-  --foco-json-number: var(--success);
-  --foco-json-literal: var(--danger);
-  --foco-json-punctuation: var(--muted);
 }
 
-/* Dark theme is driven by HeroUI `.dark` / `[data-theme="dark"]`.
-   Keep a no-op selector only if legacy tests still set data-foco-theme. */
-html[data-foco-theme="dark"] {
-  /* Prefer HeroUI contract; this only mirrors class for transitional tests. */
-}
 
 body,
 .foco-workbench,
 .app-root {
-  background: var(--foco-canvas);
+  background: var(--background);
   font-size: var(--foco-font-ui);
 }
 
@@ -1363,7 +1279,7 @@ body,
     var(--sidebar-width, 16.25rem)
     minmax(0, 1fr)
     var(--diff-panel-width, 26.25rem);
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .app-shell-with-context {
@@ -1381,8 +1297,8 @@ body,
   min-height: 0;
   flex-direction: column;
   justify-content: space-between;
-  border-right: 1px solid var(--foco-border);
-  background: var(--foco-rail-soft);
+  border-right: 1px solid var(--border);
+  background: var(--surface-tertiary);
   padding: 0.5rem 0.375rem;
 }
 
@@ -1425,18 +1341,18 @@ body,
   align-items: center;
   justify-content: center;
   border-radius: 0.625rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .foco-nav-rail-button:hover,
 .foco-nav-rail-button-active {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .workspace-sidebar {
   width: auto;
-  background: var(--foco-sidebar);
+  background: var(--surface);
   box-shadow: none;
 }
 
@@ -1458,7 +1374,7 @@ body,
   right: 0;
   width: 1px;
   content: "";
-  background: var(--foco-border-strong);
+  background: var(--border-secondary);
   transition:
     background 120ms ease,
     width 120ms ease;
@@ -1468,7 +1384,7 @@ body,
 .workspace-sidebar-splitter:focus-visible::before,
 .workspace-sidebar-splitter-active::before {
   width: 2px;
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 .workspace-sidebar-splitter:focus-visible {
@@ -1490,12 +1406,12 @@ body,
   min-height: var(--foco-header-height);
   height: var(--foco-header-height);
   padding: 0 0.75rem;
-  background: var(--foco-sidebar);
+  background: var(--surface);
 }
 
 .workspace-sidebar-title {
   display: block;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-family: var(--foco-font-display);
   font-size: 0.8rem;
   font-weight: 500;
@@ -1513,8 +1429,8 @@ body,
   flex-direction: column;
   flex: 0 0 auto;
   min-height: 0;
-  border-top: 1px solid var(--foco-border-strong);
-  background: var(--foco-sidebar);
+  border-top: 1px solid var(--border-secondary);
+  background: var(--surface);
 }
 
 .model-routing-panel-expanded {
@@ -1542,7 +1458,7 @@ body,
   left: 0.75rem;
   height: 1px;
   content: "";
-  background: var(--foco-border-strong);
+  background: var(--border-secondary);
   transition:
     background 120ms ease,
     height 120ms ease,
@@ -1553,12 +1469,12 @@ body,
 .model-routing-resize-splitter:focus-visible::before,
 .model-routing-resize-splitter-active::before {
   height: 2px;
-  background: var(--foco-accent);
-  box-shadow: 0 0 0 1px color-mix(in srgb, var(--foco-accent) 25%, transparent);
+  background: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 25%, transparent);
 }
 
 .model-routing-resize-splitter:focus-visible {
-  outline: 2px solid var(--foco-accent);
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
@@ -1569,7 +1485,7 @@ body,
   width: 100%;
   min-height: 2.25rem;
   padding: 0.5rem 0.75rem;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: 0.8rem;
   font-weight: 600;
   text-align: left;
@@ -1579,18 +1495,18 @@ body,
 }
 
 .model-routing-header:hover {
-  background: color-mix(in srgb, var(--foco-accent) 8%, transparent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
 .model-routing-header:focus-visible {
-  outline: 2px solid var(--foco-accent);
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
 .model-routing-header-label {
   letter-spacing: 0.04em;
   text-transform: uppercase;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-family: var(--foco-font-display);
   font-size: 0.75rem;
   font-weight: 500;
@@ -1602,7 +1518,7 @@ body,
   overflow-y: auto;
   padding: 0.25rem 0.5rem 0.75rem;
   border-top: 1px solid
-    color-mix(in srgb, var(--foco-border-strong) 70%, transparent);
+    color-mix(in srgb, var(--border-secondary) 70%, transparent);
 }
 
 .model-routing-error {
@@ -1649,7 +1565,7 @@ body,
   align-items: center;
   justify-content: center;
   width: 1.5rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   border-radius: 0.375rem;
 }
 
@@ -1670,13 +1586,13 @@ body,
 .model-routing-model-button:hover,
 .model-routing-model-toggle:hover,
 .model-routing-provider-button:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--foco-accent) 9%, transparent);
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
 }
 
 .model-routing-model-button:focus-visible,
 .model-routing-model-toggle:focus-visible,
 .model-routing-provider-button:focus-visible {
-  outline: 2px solid var(--foco-accent);
+  outline: 2px solid var(--accent);
   outline-offset: 0;
 }
 
@@ -1684,13 +1600,13 @@ body,
   width: 0.375rem;
   height: 0.375rem;
   border-radius: 999px;
-  background: color-mix(in srgb, var(--foco-text-muted) 45%, transparent);
+  background: color-mix(in srgb, var(--muted) 45%, transparent);
   flex-shrink: 0;
 }
 
 .model-routing-route-dot-active {
-  background: var(--foco-accent);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--foco-accent) 20%, transparent);
+  background: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .model-routing-providers {
@@ -1698,24 +1614,24 @@ body,
   margin: 0.1rem 0 0.35rem 1.1rem;
   padding: 0.15rem 0 0.15rem 0.55rem;
   border-left: 1.5px solid
-    color-mix(in srgb, var(--foco-accent) 45%, transparent);
+    color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
 .model-routing-provider-button {
   width: 100%;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .model-routing-provider-active {
-  color: var(--foco-accent-strong, #0f766e);
+  color: var(--accent-soft-foreground);
   font-weight: 600;
-  background: color-mix(in srgb, var(--foco-accent) 12%, transparent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
 }
 
 .model-routing-item-muted,
 .model-routing-item-muted .model-routing-model-button,
 .model-routing-item-muted .model-routing-provider-button {
-  color: color-mix(in srgb, var(--foco-text-muted) 70%, transparent);
+  color: color-mix(in srgb, var(--muted) 70%, transparent);
 }
 
 .model-routing-provider-button:disabled,
@@ -1726,7 +1642,7 @@ body,
 }
 
 .model-routing-empty {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .workspace-menu {
@@ -1737,8 +1653,8 @@ body,
 }
 
 .workspace-menu-active {
-  border-color: var(--foco-accent-line);
-  background: var(--foco-accent-soft);
+  border-color: var(--accent);
+  background: var(--accent-soft);
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 12%, transparent);
 }
 
@@ -1746,19 +1662,19 @@ body,
   height: 1.875rem;
   gap: 0.375rem;
   padding-inline: 0.375rem;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-compact);
 }
 
 .workspace-item-active {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
 }
 
 .workspace-expand-icon {
   width: 0.875rem;
   height: 0.875rem;
   flex: 0 0 0.875rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .workspace-menu > button:last-child {
@@ -1771,15 +1687,15 @@ body,
   border-radius: 0.5rem;
   border-color: transparent;
   padding: 0.3125rem 0.45rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .chat-item:hover,
 .chat-item-active {
   border-color: transparent;
-  background: var(--foco-accent-soft);
+  background: var(--accent-soft);
   box-shadow: none;
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .session-status-dot,
@@ -1832,10 +1748,10 @@ body,
   z-index: 80;
   min-width: 9.5rem;
   overflow: hidden;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: var(--foco-panel);
-  box-shadow: var(--foco-shadow-raised);
+  background: var(--surface);
+  box-shadow: var(--overlay-shadow);
   padding: 0.25rem;
 }
 
@@ -1850,7 +1766,7 @@ body,
   gap: 0.5rem;
   border-radius: 0.55rem;
   padding: 0.5rem 0.625rem;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-compact);
   font-weight: 600;
   text-align: left;
@@ -1858,8 +1774,9 @@ body,
 
 .workspace-chat-context-menu-item:hover,
 .workspace-chat-context-menu-item:focus-visible {
-  background-color: rgba(245, 245, 244, 1);
-  outline: none;
+  background-color: var(--surface-secondary);
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
 }
 
 .workspace-chat-context-menu-item:disabled:hover,
@@ -1868,7 +1785,7 @@ body,
 }
 
 .workspace-chat-context-menu-item-danger {
-  color: var(--foco-error);
+  color: var(--danger);
 }
 
 .workspace-chat-context-menu-item:disabled {
@@ -1948,7 +1865,7 @@ body,
 
 .context-list-dot-green,
 .terminal-status-dot-running {
-  background: var(--foco-success);
+  background: var(--success);
 }
 
 .session-status-dot-running {
@@ -1960,15 +1877,15 @@ body,
 }
 
 .context-list-dot-yellow {
-  background: var(--foco-warning);
+  background: var(--warning);
 }
 
 .context-list-dot-red {
-  background: var(--foco-error);
+  background: var(--danger);
 }
 
 .context-list-dot-blue {
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 @keyframes session-status-dot-spin {
@@ -1978,12 +1895,12 @@ body,
 }
 
 .app-main-panel {
-  background: var(--foco-panel);
+  background: var(--surface);
 }
 
 .workspace-file-editor {
   min-height: 0;
-  background: var(--foco-panel);
+  background: var(--surface);
 }
 
 .workspace-file-editor-body {
@@ -2006,8 +1923,8 @@ body,
   flex-shrink: 0;
   align-items: center;
   gap: 0.25rem;
-  border-bottom: 1px solid var(--foco-border);
-  background: color-mix(in srgb, var(--foco-panel) 92%, var(--foco-muted) 8%);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, var(--muted) 8%);
   padding: 0.25rem 0.5rem;
 }
 
@@ -2018,7 +1935,7 @@ body,
   align-items: center;
   justify-content: center;
   border-radius: 0.5rem;
-  color: var(--foco-muted-foreground);
+  color: var(--muted);
   transition:
     background-color 150ms ease,
     color 150ms ease;
@@ -2026,8 +1943,8 @@ body,
 
 .workspace-file-editor-toolbar-button:hover:not(:disabled),
 .workspace-file-editor-toolbar-button-active {
-  background: var(--foco-muted);
-  color: var(--foco-foreground);
+  background: var(--muted);
+  color: var(--foreground);
 }
 
 .workspace-file-editor-toolbar-button:disabled {
@@ -2038,7 +1955,7 @@ body,
 .workspace-file-editor-toolbar-separator {
   height: 1.25rem;
   width: 1px;
-  background: var(--foco-border);
+  background: var(--border);
   margin: 0 0.25rem;
 }
 
@@ -2081,7 +1998,7 @@ body,
   min-height: 100%;
   overflow: auto;
   place-items: center;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 1rem;
 }
 
@@ -2094,7 +2011,7 @@ body,
 
 .workspace-html-preview {
   min-height: 0;
-  background: var(--foco-panel, #fff);
+  background: var(--surface);
 }
 
 .workspace-html-preview-toolbar {
@@ -2102,8 +2019,8 @@ body,
   align-items: center;
   gap: 0.5rem;
   flex-shrink: 0;
-  border-bottom: 1px solid var(--foco-border);
-  background: color-mix(in srgb, var(--foco-panel, #fff) 92%, transparent);
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
   padding: 0.35rem 0.6rem;
 }
 
@@ -2112,7 +2029,7 @@ body,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--foco-muted, #78716c);
+  color: var(--muted);
   font-size: 0.75rem;
   font-weight: 500;
 }
@@ -2135,7 +2052,7 @@ body,
   justify-content: center;
   gap: 0.75rem;
   padding: 1.5rem;
-  color: var(--foco-muted, #78716c);
+  color: var(--muted);
   font-size: 0.875rem;
   text-align: center;
 }
@@ -2174,16 +2091,16 @@ body,
 
 .workspace-file-reload-dialog {
   width: min(92vw, 24rem);
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   box-shadow: 0 18px 48px rgba(28, 25, 23, 0.24);
   padding: 1rem;
 }
 
 .workspace-file-reload-dialog h2 {
   margin: 0;
-  color: var(--foco-foreground);
+  color: var(--foreground);
   font-size: 1rem;
   font-weight: 700;
   text-wrap: balance;
@@ -2191,7 +2108,7 @@ body,
 
 .workspace-file-reload-dialog p {
   margin: 0.5rem 0 0;
-  color: var(--foco-muted-foreground);
+  color: var(--muted);
   font-size: 0.875rem;
   line-height: 1.5;
 }
@@ -2206,14 +2123,14 @@ body,
 .workspace-file-editor .monaco-editor,
 .workspace-file-editor .monaco-editor-background,
 .workspace-file-editor .monaco-editor .margin {
-  background: var(--foco-panel) !important;
+  background: var(--surface) !important;
 }
 
 .app-toolbar {
   min-height: var(--foco-header-height);
   height: var(--foco-header-height);
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
 }
 
 .chat-tab-list {
@@ -2227,8 +2144,8 @@ body,
   max-width: 15rem;
   border-width: 0 1px 0 0;
   border-radius: 0;
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
   font-size: var(--foco-font-ui);
 }
 
@@ -2238,7 +2155,7 @@ body,
 }
 
 .chat-tab-item:has([aria-selected="true"]) {
-  border-color: var(--foco-border);
+  border-color: var(--border);
   box-shadow: none;
 }
 
@@ -2250,7 +2167,7 @@ body,
   left: 0.75rem;
   height: 2px;
   border-radius: 999px;
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 .chat-toolbar-button,
@@ -2263,15 +2180,15 @@ body,
   justify-content: center;
   border: 1px solid transparent;
   border-radius: 0.5rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .chat-toolbar-button:hover,
 .chat-toolbar-button-active,
 .chat-toolbar-profile:hover {
-  border-color: var(--foco-border);
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  border-color: var(--border);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .terminal-toolbar-button {
@@ -2279,7 +2196,7 @@ body,
 }
 
 .message-list {
-  background: var(--foco-canvas);
+  background: var(--background);
   padding: 1rem 1.5rem;
   overscroll-behavior: contain;
 }
@@ -2291,7 +2208,7 @@ body,
 
 .message-row {
   display: block;
-  border-bottom: 1px solid var(--foco-border);
+  border-bottom: 1px solid var(--border);
   padding: 1rem 0;
   /* ponytail: native offscreen rendering hint; virtualize only if long chats still profile poorly. */
   content-visibility: auto;
@@ -2322,12 +2239,12 @@ body,
 .message-bubble-assistant {
   border-color: transparent;
   background: transparent;
-  color: var(--foco-text);
+  color: var(--foreground);
   box-shadow: none;
 }
 
 .message-bubble-pending {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .message-avatar {
@@ -2335,12 +2252,12 @@ body,
   height: 1.75rem;
   flex-basis: 1.75rem;
   border-radius: 999px;
-  background: var(--foco-panel-muted);
-  color: var(--foco-text);
+  background: var(--default);
+  color: var(--foreground);
 }
 
 .message-bubble-user .message-avatar {
-  background: var(--foco-user-avatar);
+  background: var(--accent);
   color: #ffffff;
 }
 
@@ -2349,7 +2266,7 @@ body,
   min-height: 1.75rem;
   align-items: center;
   justify-content: space-between;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: 0.8125rem;
   font-weight: 650;
 }
@@ -2362,7 +2279,7 @@ body,
 }
 
 .message-created-at {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 500;
   white-space: nowrap;
@@ -2372,7 +2289,7 @@ body,
   min-width: 0;
   max-width: 16rem;
   overflow: hidden;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.72rem;
   font-weight: 600;
   text-overflow: ellipsis;
@@ -2383,10 +2300,10 @@ body,
   display: inline-flex;
   align-items: center;
   border: 1px solid
-    color-mix(in srgb, var(--foco-accent) 38%, var(--foco-border));
+    color-mix(in srgb, var(--accent) 38%, var(--border));
   border-radius: 999px;
-  background: color-mix(in srgb, var(--foco-accent) 10%, var(--foco-panel));
-  color: var(--foco-text-muted);
+  background: color-mix(in srgb, var(--accent) 10%, var(--surface));
+  color: var(--muted);
   font-size: 0.68rem;
   font-weight: 650;
   line-height: 1;
@@ -2397,10 +2314,10 @@ body,
 .message-pending-badge {
   display: inline-flex;
   align-items: center;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 999px;
-  background: var(--foco-panel);
-  color: var(--foco-text-muted);
+  background: var(--surface);
+  color: var(--muted);
   font-size: 0.68rem;
   font-weight: 650;
   line-height: 1;
@@ -2421,16 +2338,16 @@ body,
   align-items: center;
   justify-content: center;
   border-radius: 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .message-action-menu:hover:not(:disabled) {
-  background: var(--foco-panel-muted);
-  color: var(--foco-text);
+  background: var(--default);
+  color: var(--foreground);
 }
 
 .message-action-menu:focus-visible {
-  outline: 2px solid var(--foco-primary);
+  outline: 2px solid var(--foreground);
   outline-offset: 2px;
 }
 
@@ -2442,29 +2359,29 @@ body,
 .reasoning-block,
 .message-row details {
   border-radius: 0.5rem;
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
 }
 
 .message-row .border-t {
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.625rem;
 }
 
 .empty-chat-state {
   max-width: 32rem;
   min-height: 16rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   box-shadow: none;
 }
 
 .composer-shell {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
   padding: 0.625rem 1.25rem;
 }
 
@@ -2473,7 +2390,7 @@ body,
 }
 
 .composer-surface {
-  border-color: var(--foco-border);
+  border-color: var(--border);
   border-radius: 0.75rem;
   box-shadow: none;
 }
@@ -2491,7 +2408,7 @@ body,
   align-items: center;
   justify-content: space-between;
   gap: 0.5rem;
-  border-top: 1px solid var(--foco-border);
+  border-top: 1px solid var(--border);
   padding: 0.375rem 0.5rem;
 }
 
@@ -2509,17 +2426,17 @@ body,
   height: 1.75rem;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.4375rem;
-  background: var(--foco-panel);
-  color: var(--foco-text);
+  background: var(--surface);
+  color: var(--foreground);
   font-size: var(--foco-font-micro);
   font-weight: 600;
 }
 
 .composer-tool-button:hover {
-  border-color: var(--foco-border-strong);
-  background: var(--foco-panel-soft);
+  border-color: var(--border-secondary);
+  background: var(--surface-secondary);
 }
 
 .composer-tool-button-label {
@@ -2528,7 +2445,7 @@ body,
 
 .message-composer-actions {
   justify-content: flex-start;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
 }
 
 .composer-model-select,
@@ -2545,7 +2462,7 @@ body,
   flex-basis: 1.625rem;
   align-items: center;
   justify-content: center;
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
   font-size: 0.58rem;
   font-weight: 750;
   line-height: 1;
@@ -2555,16 +2472,16 @@ body,
   width: 1.75rem;
   height: 1.75rem;
   border-radius: 0.4375rem;
-  background: var(--foco-primary);
+  background: var(--foreground);
   box-shadow: none;
 }
 
 .composer-run-button:not(:disabled):hover {
-  background: var(--foco-primary-hover);
+  background: var(--accent);
 }
 
 .context-sidebar {
-  background: var(--foco-panel);
+  background: var(--surface);
 }
 
 .context-sidebar::before {
@@ -2579,7 +2496,7 @@ body,
   height: var(--foco-header-height);
   align-items: stretch;
   overflow-x: auto;
-  border-bottom: 1px solid var(--foco-border);
+  border-bottom: 1px solid var(--border);
   padding: 0 0.625rem;
 }
 
@@ -2590,18 +2507,18 @@ body,
   gap: 0.3125rem;
   border-bottom: 2px solid transparent;
   padding: 0 0.4375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
   font-weight: 600;
 }
 
 .context-panel-tab:hover,
 .context-panel-tab-active {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
 }
 
 .context-panel-tab-active {
-  border-bottom-color: var(--foco-accent);
+  border-bottom-color: var(--accent);
 }
 
 @container (max-width: 32rem) {
@@ -2631,12 +2548,12 @@ body,
   align-content: center;
   gap: 0.625rem;
   padding: 1rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   text-align: center;
 }
 
 .context-empty-state h2 {
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-ui);
   font-weight: 650;
   text-wrap: balance;
@@ -2644,7 +2561,7 @@ body,
 
 .context-empty-state p,
 .context-empty-inline {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
 }
 
@@ -2661,13 +2578,13 @@ body,
   position: relative;
   min-height: 24rem;
   overflow: hidden;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
   background:
-    linear-gradient(var(--foco-border) 1px, transparent 1px) 0 0 / 32px 32px,
-    linear-gradient(90deg, var(--foco-border) 1px, transparent 1px) 0 0 / 32px
+    linear-gradient(var(--border) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, var(--border) 1px, transparent 1px) 0 0 / 32px
       32px,
-    var(--foco-panel);
+    var(--surface);
 }
 
 .context-graph-node {
@@ -2677,29 +2594,29 @@ body,
   display: grid;
   min-width: 8.5rem;
   gap: 0.125rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.625rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.45rem 0.55rem;
   box-shadow: 0 12px 28px rgba(17, 24, 39, 0.08);
 }
 
 .context-graph-node strong,
 .context-list-item strong {
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-compact);
   font-weight: 650;
 }
 
 .context-graph-node small,
 .context-list-item small {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
 }
 
 .context-panel-section-title {
   margin: 0.625rem 0 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
   font-weight: 700;
   letter-spacing: 0.06em;
@@ -2715,9 +2632,9 @@ body,
 
 .context-list-item-card {
   margin-bottom: 0.375rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.625rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.5rem;
 }
 
@@ -2754,9 +2671,9 @@ body,
 
 .context-memory-item {
   margin-bottom: 0.375rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.625rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.5rem;
 }
 
@@ -2779,16 +2696,16 @@ body,
 .context-memory-kind,
 .context-memory-pin {
   border-radius: 0.375rem;
-  background: var(--foco-panel-muted);
+  background: var(--default);
   padding: 0.125rem 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
   font-weight: 650;
 }
 
 .context-memory-pin {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .context-memory-delete-button {
@@ -2800,7 +2717,7 @@ body,
   justify-content: center;
   border: 1px solid rgba(225, 29, 72, 0.2);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   color: rgb(190, 18, 60);
   transition:
     background 150ms ease,
@@ -2826,7 +2743,7 @@ body,
 
 .context-memory-item p {
   margin-top: 0.375rem;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-compact);
   line-height: 1.5;
 }
@@ -2834,7 +2751,7 @@ body,
 .context-memory-item small {
   display: block;
   margin-top: 0.375rem;
-  color: var(--foco-text-faint);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
 }
 
@@ -2847,23 +2764,23 @@ body,
 }
 
 .context-stats-header h2 {
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-ui);
   font-weight: 700;
 }
 
 .context-stats-header p {
   margin-top: 0.125rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
 }
 
 .context-usage-timeline-panel {
   min-width: 0;
   margin-top: 0.75rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.625rem;
   --context-bar-label-width: 4.25rem;
   --context-bar-value-width: 3.25rem;
@@ -2874,7 +2791,7 @@ body,
   flex-wrap: wrap;
   gap: 0.375rem 0.625rem;
   margin-top: 0.625rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
 }
 
@@ -2913,7 +2830,7 @@ body,
   grid-row: 1;
   min-width: 0;
   height: 0.875rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: 0.5625rem;
   font-weight: 700;
   line-height: 1;
@@ -2965,13 +2882,13 @@ body,
 }
 
 .context-usage-bar-label {
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: var(--foco-font-compact);
   font-weight: 700;
 }
 
 .context-usage-bar-meta {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
 }
 
@@ -2984,8 +2901,8 @@ body,
   height: 0.875rem;
   overflow: visible;
   border-radius: 999px;
-  background: var(--foco-panel-muted);
-  box-shadow: inset 0 0 0 1px var(--foco-border);
+  background: var(--default);
+  box-shadow: inset 0 0 0 1px var(--border);
 }
 
 .context-usage-bar-segment {
@@ -3029,7 +2946,7 @@ body,
   align-items: center;
   justify-content: flex-end;
   gap: 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -3070,16 +2987,16 @@ body,
 
 .context-stat-metric {
   min-width: 0;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.5rem;
 }
 
 .context-stat-metric span {
   display: block;
   overflow-wrap: anywhere;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
   font-weight: 650;
 }
@@ -3088,7 +3005,7 @@ body,
   display: block;
   margin-top: 0.25rem;
   overflow-wrap: anywhere;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: 1rem;
   font-weight: 750;
   line-height: 1.15;
@@ -3101,9 +3018,9 @@ body,
 .context-mini-chart {
   width: 100%;
   min-width: 0;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.625rem;
   --context-bar-label-width: 4.25rem;
   --context-bar-value-width: 4.75rem;
@@ -3130,14 +3047,14 @@ body,
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--foco-text-muted, #57534e);
+  color: var(--muted);
 }
 
 .context-mini-bar-track {
   position: relative;
   height: 0.5rem;
   border-radius: 999px;
-  background: var(--foco-border);
+  background: var(--border);
   overflow: hidden;
 }
 
@@ -3154,7 +3071,7 @@ body,
   text-align: right;
   text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
-  color: var(--foco-text, #1c1917);
+  color: var(--foreground);
   white-space: nowrap;
 }
 
@@ -3169,28 +3086,28 @@ body,
 
 .context-stats-inline {
   margin-bottom: 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
 }
 
 .context-stats-inline strong,
 .context-stats-row strong {
   flex: 0 0 auto;
-  color: var(--foco-text);
+  color: var(--foreground);
   font-variant-numeric: tabular-nums;
   font-weight: 700;
 }
 
 .context-stats-rows {
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
 }
 
 .context-stats-row {
   padding: 0.5rem;
-  border-bottom: 1px solid var(--foco-border);
-  color: var(--foco-text-muted);
+  border-bottom: 1px solid var(--border);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
 }
 
@@ -3207,22 +3124,22 @@ body,
   display: flex;
   align-items: center;
   justify-content: space-between;
-  border-bottom: 1px solid var(--foco-border);
+  border-bottom: 1px solid var(--border);
   padding: 0.625rem 0;
 }
 
 .context-metric span {
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-compact);
 }
 
 .context-metric strong {
-  color: var(--foco-text);
+  color: var(--foreground);
   font-size: 0.9rem;
 }
 
 .diff-sidebar {
-  border-left: 1px solid var(--foco-border);
+  border-left: 1px solid var(--border);
   box-shadow: none;
 }
 
@@ -3360,7 +3277,7 @@ body,
   overflow: hidden;
   grid-template-areas: "nav main";
   grid-template-columns: 3rem minmax(0, 1fr);
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .global-shell .foco-nav-rail {
@@ -3373,7 +3290,7 @@ body,
   height: 100%;
   min-height: 0;
   overflow: hidden;
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .app-shell {
@@ -3418,7 +3335,7 @@ body,
   align-items: center;
   height: var(--foco-header-height);
   min-height: var(--foco-header-height);
-  background: var(--foco-panel);
+  background: var(--surface);
   padding-top: 0;
   padding-right: 0;
   padding-bottom: 0;
@@ -3468,7 +3385,7 @@ body,
   border-radius: 0;
   border-top-width: 0;
   border-bottom-width: 0;
-  background: var(--foco-panel);
+  background: var(--surface);
   box-shadow: none;
 }
 
@@ -3481,7 +3398,7 @@ body,
 
 .app-main-panel,
 .message-list {
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .message-list {
@@ -3500,11 +3417,11 @@ body,
 .message-bubble {
   max-width: 100%;
   gap: 0.625rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.75rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding: 0.75rem 0.875rem;
-  box-shadow: var(--foco-shadow-soft);
+  box-shadow: var(--overlay-shadow);
 }
 
 .message-bubble .markdown-content {
@@ -3528,20 +3445,20 @@ body,
 
 .message-bubble-user,
 .message-bubble-assistant {
-  border-color: var(--foco-border);
-  color: var(--foco-text);
-  box-shadow: var(--foco-shadow-soft);
+  border-color: var(--border);
+  color: var(--foreground);
+  box-shadow: var(--overlay-shadow);
 }
 
 .message-bubble-assistant {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
 }
 
 .message-bubble-user {
-  border-color: var(--foco-user-border);
-  background: var(--foco-user-surface);
-  box-shadow: var(--foco-shadow-accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  box-shadow: var(--overlay-shadow);
 }
 
 .message-bubble-user .message-avatar,
@@ -3549,8 +3466,8 @@ body,
   width: 1.625rem;
   height: 1.625rem;
   flex-basis: 1.625rem;
-  background: var(--foco-panel-muted);
-  color: var(--foco-text);
+  background: var(--default);
+  color: var(--foreground);
 }
 
 .message-author-row {
@@ -3567,7 +3484,7 @@ body,
 .message-row details,
 .message-row .border-t {
   border-radius: 0.625rem;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.5rem;
   font-size: var(--foco-font-compact);
 }
@@ -3577,10 +3494,10 @@ body,
   min-width: 0;
   align-items: center;
   gap: 0.375rem;
-  border-top: 1px solid var(--foco-border);
+  border-top: 1px solid var(--border);
   border-bottom-right-radius: inherit;
   border-bottom-left-radius: inherit;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.375rem 0.5rem;
 }
 
@@ -3603,7 +3520,7 @@ body,
   width: max-content;
   max-width: 12rem;
   border-radius: 0.5rem;
-  background: var(--foco-primary);
+  background: var(--foreground);
   padding: 0.3125rem 0.5rem;
   color: #ffffff;
   font-size: var(--foco-font-micro);
@@ -3621,7 +3538,7 @@ body,
   width: 0.5rem;
   height: 0.5rem;
   transform: rotate(45deg);
-  background: var(--foco-primary);
+  background: var(--foreground);
 }
 
 .message-composer-control-row .composer-tool-button,
@@ -3639,37 +3556,37 @@ body,
   flex: 0 0 auto;
   align-items: center;
   gap: 0.375rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel);
+  background: var(--surface);
   padding-inline: 0.625rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   font-size: var(--foco-font-micro);
   font-weight: 700;
 }
 
 .composer-team-toggle:hover {
-  border-color: var(--foco-border-active);
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-team-toggle:focus-visible {
-  border-color: var(--foco-accent);
-  box-shadow: var(--foco-focus-ring);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
   outline: none;
 }
 
 .composer-team-toggle.composer-team-toggle-enabled {
-  border-color: var(--foco-accent);
-  background: var(--foco-accent-strong);
+  border-color: var(--accent);
+  background: var(--accent-soft-foreground);
   color: #ffffff;
   box-shadow: var(--overlay-shadow);
 }
 
 .composer-team-toggle.composer-team-toggle-enabled:hover {
-  border-color: var(--foco-accent-strong);
-  background: var(--foco-accent-strong);
+  border-color: var(--accent-soft-foreground);
+  background: var(--accent-soft-foreground);
   color: #ffffff;
 }
 
@@ -3705,16 +3622,14 @@ body,
 .message-composer-control-row
   .composer-select-popover
   .composer-model-provider-summary {
-  /* ponytail: 显式 alpha=0 基础色，使 hover 过渡只在 alpha 0→1 间插值，
-     避免从 transparent(=透明黑) 过渡到不透明色时穿过黑色产生脏色中间帧。 */
-  background-color: rgba(245, 245, 244, 0);
+  /* Use an explicit transparent semantic color so the hover transition does not
+     interpolate through transparent black. */
+  background-color: color-mix(in oklab, var(--surface-secondary) 0%, transparent);
   transition:
     background-color 180ms ease,
     color 180ms ease;
 }
 
-/* stone-50(#fafaf9) 在白色 popover 上对比度极低；用 stone-100(#f5f5f4) 提升可见度。
-   选择器特异性高于 Tailwind hover:bg-stone-50 单类，确保覆盖。 */
 .message-composer-control-row
   .composer-select-popover
   .panel-scroll
@@ -3722,7 +3637,7 @@ body,
 .message-composer-control-row
   .composer-select-popover
   .composer-model-provider-summary:hover {
-  background-color: rgba(245, 245, 244, 1);
+  background-color: var(--surface-hover);
 }
 
 .composer-model-select,
@@ -3746,10 +3661,10 @@ body,
   align-items: center;
   justify-content: center;
   gap: 0.25rem;
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.4375rem;
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  background: var(--surface-secondary);
+  color: var(--foreground);
   padding: 0.375rem 0.5rem;
   font-size: var(--foco-font-micro);
   font-weight: 600;
@@ -3757,13 +3672,13 @@ body,
 }
 
 .composer-fast-toggle:not(.composer-fast-toggle-enabled) > svg {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-fast-toggle:hover {
-  border-color: var(--foco-border-active);
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-fast-toggle:focus-visible {
@@ -3898,7 +3813,7 @@ body,
   align-self: stretch;
   border-width: 0 1px 0 0;
   border-radius: 0;
-  background: var(--foco-sidebar);
+  background: var(--surface);
   padding: 0;
   box-shadow: none;
 }
@@ -4090,7 +4005,7 @@ body,
 html,
 body,
 .app-root {
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 button:focus-visible,
@@ -4098,9 +4013,9 @@ input:focus-visible,
 select:focus-visible,
 textarea:focus-visible,
 summary:focus-visible {
-  outline: 2px solid var(--foco-accent);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
-  box-shadow: var(--foco-focus-ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
 }
 
 .message-composer-textarea:focus-visible {
@@ -4110,195 +4025,17 @@ summary:focus-visible {
 }
 
 .workspace-sidebar-splitter:focus-visible {
-  outline: 2px solid var(--foco-accent);
+  outline: 2px solid var(--accent);
   outline-offset: -2px;
 }
 
-.app-root .border-stone-100,
-.app-root .border-stone-200,
-.app-root .border-stone-200\/80,
-.app-root .border-stone-300,
-.app-root .ring-stone-200\/80 {
-  border-color: var(--foco-border);
-}
 
-.app-root :where(.divide-stone-100 > :not(:last-child)),
-.app-root :where(.divide-stone-200 > :not(:last-child)) {
-  border-color: var(--foco-border);
-}
-
-.app-root .bg-stone-50,
-.app-root .bg-stone-50\/60,
-.app-root .bg-stone-50\/70,
-.app-root .bg-stone-50\/80,
-.app-root .bg-stone-100,
-.app-root .bg-stone-100\/60 {
-  background-color: var(--foco-panel-soft);
-}
-
-.app-root .bg-stone-200,
-.app-root .bg-stone-300 {
-  background-color: var(--foco-panel-muted);
-}
-
-.app-root .bg-white,
-.app-root .bg-white\/55,
-.app-root .bg-white\/60,
-.app-root .bg-white\/70,
-.app-root .bg-white\/80,
-.app-root .bg-white\/85,
-.app-root .bg-white\/90 {
-  background-color: var(--foco-panel);
-}
-
-/* Include .app-root itself: main uses text-stone-950 and children inherit. */
-.app-root.text-stone-950,
-.app-root.text-stone-900,
-.app-root.text-stone-800,
-.app-root .text-stone-950,
-.app-root .text-stone-900,
-.app-root .text-stone-800 {
-  color: var(--foco-text);
-}
-
-.app-root.text-stone-700,
-.app-root.text-stone-600,
-.app-root .text-stone-700,
-.app-root .text-stone-600 {
-  color: var(--foco-text-muted);
-}
-
-.app-root.text-stone-500,
-.app-root.text-stone-400,
-.app-root .text-stone-500,
-.app-root .text-stone-400 {
-  color: var(--foco-text-faint);
-}
-
-.app-root .bg-stone-950,
-.app-root .bg-stone-800 {
-  background-color: var(--foco-primary);
-}
-
-.app-root .hover\:bg-stone-800:hover {
-  background-color: var(--foco-primary-hover);
-}
-
-.app-root .hover\:bg-stone-50:hover,
-.app-root .hover\:bg-stone-100:hover,
-.app-root .hover\:bg-white:hover,
-.app-root .hover\:bg-white\/80:hover,
-.app-root .hover\:bg-white\/90:hover {
-  background-color: var(--foco-panel);
-}
-
-.app-root .hover\:text-stone-950:hover,
-.app-root .hover\:text-stone-900:hover {
-  color: var(--foco-text);
-}
-
-.app-root .hover\:border-stone-200:hover,
-.app-root .hover\:border-stone-300:hover {
-  border-color: var(--foco-border-strong);
-}
-
-.app-root .bg-teal-50,
-.app-root .bg-teal-50\/40,
-.app-root .bg-teal-50\/60,
-.app-root .bg-teal-50\/70,
-.app-root .bg-teal-100 {
-  background-color: var(--foco-accent-soft);
-}
-
-.app-root .bg-teal-700,
-.app-root .bg-teal-800,
-.app-root .bg-teal-900,
-.app-root .peer:checked ~ .peer-checked\:bg-teal-700 {
-  background-color: var(--foco-accent);
-}
-
-.app-root .bg-teal-950\/45 {
-  background-color: var(--foco-user-avatar);
-}
-
-.app-root .hover\:bg-teal-50:hover,
-.app-root .hover\:bg-teal-100:hover {
-  background-color: var(--foco-accent-soft);
-}
-
-.app-root .hover\:bg-teal-900:hover {
-  background-color: var(--foco-accent-hover);
-}
-
-.app-root .text-teal-700,
-.app-root .text-teal-800,
-.app-root .text-teal-900,
-.app-root .text-teal-950,
-.app-root .hover\:text-teal-800:hover {
-  color: var(--foco-accent-strong);
-}
-
-.app-root .border-teal-100,
-.app-root .border-teal-200,
-.app-root .border-teal-700,
-.app-root .hover\:border-teal-100:hover,
-.app-root .hover\:border-teal-200:hover {
-  border-color: var(--foco-border-active);
-}
-
-.app-root .focus\:border-teal-700:focus {
-  border-color: var(--foco-accent);
-}
-
-.app-root .focus\:ring-teal-100:focus,
-.app-root .focus-visible\:ring-teal-100:focus-visible,
-.app-root .ring-teal-200 {
-  --tw-ring-color: color-mix(in oklab, var(--accent) 28%, transparent);
-}
-
-.app-root .accent-teal-700,
-.app-root .accent-teal-800 {
-  accent-color: var(--foco-accent);
-}
-
-.app-root .bg-rose-50,
-.app-root .bg-rose-100 {
-  background-color: var(--foco-error-soft);
-}
-
-.app-root .border-rose-200 {
-  border-color: #fecdd3;
-}
-
-.app-root .text-rose-700,
-.app-root .text-rose-800,
-.app-root .hover\:text-rose-700:hover {
-  color: var(--foco-danger);
-}
-
-.app-root .bg-rose-700,
-.app-root .bg-rose-800 {
-  background-color: var(--foco-danger);
-}
-
-.app-root .bg-amber-50 {
-  background-color: var(--foco-warning-soft);
-}
-
-.app-root .border-amber-200 {
-  border-color: #fde68a;
-}
-
-.app-root .text-amber-600,
-.app-root .text-amber-800 {
-  color: var(--foco-warning);
-}
 
 .foco-nav-rail {
   border-right-color: rgba(255, 255, 255, 0.08);
   background:
     linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 28%),
-    linear-gradient(180deg, var(--foco-rail), var(--foco-rail-soft));
+    linear-gradient(180deg, var(--background-inverse), var(--surface-tertiary));
   box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.05);
 }
 
@@ -4322,7 +4059,7 @@ summary:focus-visible {
 
 .foco-nav-rail-button {
   position: relative;
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 .foco-nav-rail-button:hover {
@@ -4332,7 +4069,7 @@ summary:focus-visible {
 }
 
 .foco-nav-rail-button-active {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
   background: color-mix(in oklab, var(--accent) 16%, transparent);
   box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 32%, transparent);
 }
@@ -4345,32 +4082,25 @@ summary:focus-visible {
   height: 0.85rem;
   content: "";
   transform: translateY(-50%);
-  background: var(--foco-accent);
+  background: var(--accent);
   border-radius: 999px;
 }
 
 .workspace-sidebar,
 .settings-section-nav-card {
-  border-right: 1px solid var(--foco-border);
-  background: var(--foco-sidebar-gradient), var(--foco-sidebar);
-}
-
-/* Beat .app-root .bg-white (0,2,0) so settings rail keeps theme surface. */
-.app-root .settings-section-nav-card.bg-white,
-.app-root .settings-section-nav-card {
-  background: var(--foco-sidebar-gradient), var(--foco-sidebar);
-  background-color: var(--foco-sidebar);
+  border-right: 1px solid var(--border);
+  background: var(--surface), var(--surface);
 }
 
 .workspace-sidebar-header,
 .settings-sidebar-header {
-  border-bottom-color: var(--foco-border);
-  background: var(--foco-header-surface);
+  border-bottom-color: var(--border);
+  background: var(--surface);
 }
 
 .workspace-sidebar-title,
 .context-panel-section-title {
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 .workspace-menu {
@@ -4383,16 +4113,16 @@ summary:focus-visible {
 }
 
 .workspace-menu:hover {
-  border-color: var(--foco-border);
-  background: var(--foco-row-hover);
+  border-color: var(--border);
+  background: var(--surface-hover);
 }
 
 .workspace-menu-active {
   overflow: hidden;
-  border-color: var(--foco-border-active);
-  background: var(--foco-active-surface-gradient), var(--foco-accent-soft);
+  border-color: var(--accent);
+  background: var(--accent-soft), var(--accent-soft);
   box-shadow:
-    var(--foco-active-inset-shadow),
+    none,
     var(--overlay-shadow);
 }
 
@@ -4404,7 +4134,7 @@ summary:focus-visible {
   width: 3px;
   border-radius: 999px;
   content: "";
-  background: var(--foco-accent);
+  background: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--accent) 16%, transparent);
 }
 
@@ -4413,30 +4143,30 @@ summary:focus-visible {
 }
 
 .workspace-item {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .workspace-item-active {
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .workspace-menu > button:last-child {
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 .workspace-menu > button:last-child:hover {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .workspace-nav .border-l {
-  border-left-color: var(--foco-border);
+  border-left-color: var(--border);
 }
 
 .chat-item {
   border-color: transparent;
   background: transparent;
-  color: var(--foco-text-muted);
+  color: var(--muted);
   transition:
     border-color 150ms ease,
     background-color 150ms ease,
@@ -4444,45 +4174,45 @@ summary:focus-visible {
 }
 
 .chat-item:hover {
-  border-color: var(--foco-border);
-  background: var(--foco-chat-row-hover);
-  color: var(--foco-text);
+  border-color: var(--border);
+  background: var(--surface-hover);
+  color: var(--foreground);
 }
 
 .chat-item-active {
-  border-color: var(--foco-border-active);
-  background: var(--foco-panel);
-  color: var(--foco-text);
+  border-color: var(--accent);
+  background: var(--surface);
+  color: var(--foreground);
   box-shadow:
-    inset 2px 0 0 var(--foco-accent),
-    var(--foco-shadow-subtle);
+    inset 2px 0 0 var(--accent),
+    var(--surface-shadow);
 }
 
 .app-toolbar,
 .chat-tab-list {
-  border-bottom-color: var(--foco-border);
-  background: var(--foco-toolbar-surface);
+  border-bottom-color: var(--border);
+  background: var(--surface);
 }
 
 .chat-tab-item {
-  border-color: var(--foco-border);
+  border-color: var(--border);
   background: transparent;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .chat-tab-item:hover {
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .chat-tab-item:has([aria-selected="true"]) {
-  background: var(--foco-panel);
-  color: var(--foco-text);
-  box-shadow: inset 0 -1px 0 var(--foco-panel);
+  background: var(--surface);
+  color: var(--foreground);
+  box-shadow: inset 0 -1px 0 var(--surface);
 }
 
 .chat-tab-item:has([aria-selected="true"])::after {
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 .agent-running-status-spinner,
@@ -4524,26 +4254,26 @@ summary:focus-visible {
 .chat-toolbar-profile {
   border-color: transparent;
   background: transparent;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .chat-tab-scroll-button:hover,
 .chat-toolbar-button:hover,
 .chat-toolbar-button-active,
 .chat-toolbar-profile:hover {
-  border-color: var(--foco-border);
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  border-color: var(--border);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .app-main-panel,
 .global-main-panel {
-  background: var(--foco-main-panel-gradient), var(--foco-canvas);
+  background: var(--background), var(--background);
 }
 
 .message-list {
   /* ponytail: flat scroll surface avoids repainting a gradient behind every long chat row. */
-  background: var(--foco-canvas);
+  background: var(--background);
 }
 
 .message-stack {
@@ -4551,34 +4281,34 @@ summary:focus-visible {
 }
 
 .message-row {
-  border-bottom-color: var(--foco-row-border);
+  border-bottom-color: var(--border);
 }
 
 .message-bubble {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
   box-shadow: none;
 }
 
 .message-bubble-assistant {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-color: var(--border);
+  background: var(--surface);
 }
 
 .message-bubble-user {
-  border-color: var(--foco-user-border);
-  background: var(--foco-user-surface);
+  border-color: var(--accent);
+  background: var(--accent-soft);
   box-shadow: none;
 }
 
 .message-bubble-user .message-avatar {
-  background: var(--foco-user-avatar);
+  background: var(--accent);
   color: #ffffff;
 }
 
 .message-bubble-assistant .message-avatar {
-  background: var(--foco-panel-muted);
-  color: var(--foco-primary);
+  background: var(--default);
+  color: var(--foreground);
 }
 
 .message-waiting-spinner {
@@ -4593,11 +4323,11 @@ summary:focus-visible {
 }
 
 .message-author-row {
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .message-action-menu:hover:not(:disabled) {
-  background: var(--foco-panel-muted);
+  background: var(--default);
 }
 
 .reasoning-block,
@@ -4605,17 +4335,17 @@ summary:focus-visible {
 .message-row .border-t,
 .message-attachment-part,
 .composer-attachment-chip {
-  border-color: var(--foco-border);
-  background: var(--foco-panel-soft);
-  color: var(--foco-text-muted);
+  border-color: var(--border);
+  background: var(--surface-secondary);
+  color: var(--muted);
 }
 
 .message-row details.tool-call-block {
-  border: 1px solid var(--foco-border);
+  border: 1px solid var(--border);
   border-radius: 0.5rem;
-  background: var(--foco-panel-soft);
+  background: var(--surface-secondary);
   padding: 0.25rem 0.375rem;
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .message-row details.tool-call-block[open] {
@@ -4637,9 +4367,9 @@ summary:focus-visible {
 }
 
 .empty-chat-state {
-  border-color: var(--foco-border-strong);
-  background: var(--foco-empty-surface);
-  box-shadow: var(--foco-shadow-soft);
+  border-color: var(--border-secondary);
+  background: var(--surface-secondary);
+  box-shadow: var(--overlay-shadow);
 }
 
 .chat-panel {
@@ -4654,7 +4384,7 @@ summary:focus-visible {
   cursor: row-resize;
   touch-action: none;
   user-select: none;
-  background: var(--foco-main-panel-gradient), var(--foco-canvas);
+  background: var(--background), var(--background);
 }
 
 .composer-resize-splitter::before {
@@ -4664,7 +4394,7 @@ summary:focus-visible {
   left: 0;
   height: 1px;
   content: "";
-  background: var(--foco-border);
+  background: var(--border);
   transition:
     background 120ms ease,
     height 120ms ease;
@@ -4674,24 +4404,24 @@ summary:focus-visible {
 .composer-resize-splitter:focus-visible::before,
 .composer-resize-splitter-active::before {
   height: 2px;
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 .composer-resize-splitter:focus-visible {
-  outline: 2px solid var(--foco-primary);
+  outline: 2px solid var(--foreground);
   outline-offset: -2px;
 }
 
 .composer-shell {
   border-top: 0;
-  background: var(--foco-composer-shell-gradient);
+  background: var(--background);
 }
 
 .composer-surface {
-  border-color: var(--foco-border-strong);
-  background: var(--foco-panel);
+  border-color: var(--border-secondary);
+  background: var(--surface);
   box-shadow:
-    var(--foco-composer-top-shadow),
+    none,
     var(--overlay-shadow);
   transition:
     border-color 150ms ease,
@@ -4699,9 +4429,9 @@ summary:focus-visible {
 }
 
 .composer-surface:focus-within {
-  border-color: var(--foco-accent);
+  border-color: var(--accent);
   box-shadow:
-    var(--foco-focus-ring),
+    0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent),
     var(--overlay-shadow);
 }
 
@@ -4710,72 +4440,72 @@ summary:focus-visible {
 }
 
 .message-composer-control-row {
-  border-top-color: var(--foco-border);
-  background: var(--foco-panel-soft);
+  border-top-color: var(--border);
+  background: var(--surface-secondary);
 }
 
 .composer-tool-button,
 .composer-team-toggle,
 .composer-select-summary,
 .composer-branch-select {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
-  color: var(--foco-text-muted);
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--muted);
 }
 
 .composer-team-toggle:not(.composer-team-toggle-enabled) {
-  border-color: var(--foco-border);
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  border-color: var(--border);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .composer-team-toggle:not(.composer-team-toggle-enabled) > svg {
-  color: var(--foco-accent-strong);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-tool-button:hover,
 .composer-team-toggle:hover,
 .composer-select-summary:hover,
 .composer-branch-select:hover {
-  border-color: var(--foco-border-active);
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-tool-button:focus-visible,
 .composer-team-toggle:focus-visible,
 .composer-select-summary:focus-visible,
 .composer-branch-select:focus-visible {
-  border-color: var(--foco-accent);
-  box-shadow: var(--foco-focus-ring);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
 }
 
 .composer-select-popover {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
-  box-shadow: var(--foco-shadow-raised);
+  border-color: var(--border);
+  background: var(--surface);
+  box-shadow: var(--overlay-shadow);
 }
 
 .context-usage-circle {
-  --context-usage-ring: var(--foco-accent);
-  --context-usage-track: var(--foco-panel-muted);
-  color: var(--foco-accent-strong);
+  --context-usage-ring: var(--accent);
+  --context-usage-track: var(--default);
+  color: var(--accent-soft-foreground);
 }
 
 .composer-run-button {
-  background: var(--foco-primary);
+  background: var(--foreground);
   color: #ffffff;
   box-shadow: var(--overlay-shadow);
 }
 
 .composer-run-button:not(:disabled):hover {
-  background: var(--foco-primary-hover);
+  background: var(--accent);
 }
 
 .context-sidebar,
 .diff-sidebar {
-  border-left-color: var(--foco-border);
-  background: var(--foco-panel);
+  border-left-color: var(--border);
+  background: var(--surface);
   box-shadow: none;
 }
 
@@ -4784,147 +4514,145 @@ summary:focus-visible {
 }
 
 .context-panel-tabs {
-  border-bottom-color: var(--foco-border);
-  background: var(--foco-context-tabs-surface);
+  border-bottom-color: var(--border);
+  background: var(--surface);
 }
 
 .context-panel-tab {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .context-panel-tab:hover,
 .context-panel-tab-active {
-  color: var(--foco-text);
+  color: var(--foreground);
 }
 
 .context-panel-tab-active {
-  border-bottom-color: var(--foco-accent);
+  border-bottom-color: var(--accent);
 }
 
 .context-graph-canvas {
-  border-color: var(--foco-border);
+  border-color: var(--border);
   background:
-    linear-gradient(var(--foco-graph-line) 1px, transparent 1px) 0 0 / 32px 32px,
-    linear-gradient(90deg, var(--foco-graph-line) 1px, transparent 1px) 0 0 /
+    linear-gradient(var(--border-secondary) 1px, transparent 1px) 0 0 / 32px 32px,
+    linear-gradient(90deg, var(--border-secondary) 1px, transparent 1px) 0 0 /
       32px 32px,
-    var(--foco-panel);
+    var(--surface);
 }
 
 .context-graph-node,
 .context-list-item-card,
 .context-memory-item {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
-  box-shadow: var(--foco-shadow-subtle);
+  border-color: var(--border);
+  background: var(--surface);
+  box-shadow: var(--surface-shadow);
 }
 
 .context-memory-kind,
 .context-memory-pin {
-  background: var(--foco-panel-muted);
+  background: var(--default);
 }
 
 .context-memory-pin {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 .diff-file-button {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .diff-file-button:hover {
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .diff-file-button-active {
-  background: var(--foco-accent-soft);
-  color: var(--foco-accent-strong);
-  box-shadow: inset 2px 0 0 var(--foco-accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .settings-layout {
-  background: var(--foco-canvas);
-  color: var(--foco-text);
+  background: var(--background);
+  color: var(--foreground);
 }
 
 .settings-layout > .min-w-0 {
-  background: var(--foco-settings-main-gradient), var(--foco-canvas);
+  background: var(--background), var(--background);
 }
 
 .settings-layout section.rounded-2xl,
 .settings-layout .rounded-2xl.border {
-  border-color: var(--foco-border);
-  background: var(--foco-settings-card-surface);
-  box-shadow: var(--foco-shadow-soft);
+  border-color: var(--border);
+  background: var(--surface);
+  box-shadow: var(--overlay-shadow);
 }
 
 .settings-section-nav > button {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .app-root .settings-section-nav > button:not([aria-current="page"]) {
-  color: var(--foco-text-muted);
+  color: var(--muted);
 }
 
 .settings-section-nav > button:hover {
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .app-root .settings-section-nav > button:not([aria-current="page"]):hover {
-  background: var(--foco-panel-soft);
-  color: var(--foco-text);
+  background: var(--surface-secondary);
+  color: var(--foreground);
 }
 
 .settings-section-nav > button[aria-current="page"] {
-  background: var(--foco-accent);
+  background: var(--accent);
   color: #ffffff;
-  box-shadow: var(--foco-shadow-accent);
+  box-shadow: var(--overlay-shadow);
 }
 
 .app-root .settings-section-nav > button[aria-current="page"] {
-  background: var(--foco-accent);
+  background: var(--accent);
   color: #ffffff;
-  box-shadow: var(--foco-shadow-accent);
+  box-shadow: var(--overlay-shadow);
 }
 
 .app-root
   :is(input, select, textarea):not(.message-composer-textarea):not(
     [type="checkbox"]
   ):not([type="radio"]) {
-  border-color: var(--foco-border);
-  background-color: var(--foco-panel);
-  color: var(--foco-text);
+  border-color: var(--border);
+  background-color: var(--surface);
+  color: var(--foreground);
 }
 
 .app-root
   :is(input, select, textarea):not(.message-composer-textarea):not(
     [type="checkbox"]
   ):not([type="radio"])::placeholder {
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 .app-root
   :is(input, select, textarea):not(.message-composer-textarea):not(
     [type="checkbox"]
   ):not([type="radio"]):focus {
-  border-color: var(--foco-accent);
-  box-shadow: var(--foco-focus-ring);
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
 }
 
 .app-root [aria-modal="true"],
 .app-root .panel-scroll[role="dialog"] {
-  border-color: var(--foco-border);
-  background: var(--foco-panel);
-  color: var(--foco-text);
-  box-shadow: var(--foco-shadow-raised);
+  border-color: var(--border);
+  background: var(--surface);
+  color: var(--foreground);
+  box-shadow: var(--overlay-shadow);
   overscroll-behavior: contain;
 }
 
-.app-root .bg-stone-950\/35 {
-  background-color: rgba(16, 24, 38, 0.42);
-}
+
 
 /* ── Optical Instrument: the reticle ──────────────────────────────
    The signature element. L-shaped corner brackets drawn with
@@ -4945,7 +4673,7 @@ summary:focus-visible {
   pointer-events: none;
   opacity: 0;
   transition: opacity 160ms ease 40ms;
-  border-color: var(--foco-accent);
+  border-color: var(--accent);
   border-style: solid;
 }
 
@@ -4996,7 +4724,7 @@ summary:focus-visible {
   width: 0.7rem;
   height: 2px;
   content: "";
-  background: var(--foco-accent);
+  background: var(--accent);
   transform: scaleX(0);
   transform-origin: right;
   transition: transform 180ms cubic-bezier(0.22, 1, 0.36, 1);
@@ -5050,7 +4778,7 @@ summary:focus-visible {
   font-size: 0.74rem;
   letter-spacing: 0.16em;
   text-transform: uppercase;
-  color: var(--foco-text-faint);
+  color: var(--muted);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -5103,11 +4831,11 @@ summary:focus-visible {
 .context-sidebar-splitter:focus-visible::before,
 .context-sidebar-splitter-active::before {
   width: 2px;
-  background: var(--foco-accent);
+  background: var(--accent);
 }
 
 .context-sidebar-splitter:focus-visible {
-  outline: 2px solid var(--foco-primary);
+  outline: 2px solid var(--foreground);
   outline-offset: -2px;
 }
 
@@ -5138,7 +4866,7 @@ summary:focus-visible {
     left: 0.75rem;
     width: auto;
     height: 1px;
-    background: var(--foco-border-strong);
+    background: var(--border-secondary);
     transition:
       background 120ms ease,
       height 120ms ease;
@@ -5149,7 +4877,7 @@ summary:focus-visible {
   .context-sidebar-splitter-active::before {
     width: auto;
     height: 2px;
-    background: var(--foco-accent);
+    background: var(--accent);
   }
 }
 

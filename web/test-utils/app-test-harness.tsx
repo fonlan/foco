@@ -32,8 +32,8 @@ vi.mock("mermaid", () => ({
 }));
 
 
-export const defaultComposerPlaceholder = "Ask Foco anything about Default...";
-export const sideProjectComposerPlaceholder = "Ask Foco anything about Side project...";
+export const defaultComposerPlaceholder = "Ask Foco anything about Default…";
+export const sideProjectComposerPlaceholder = "Ask Foco anything about Side project…";
 export const defaultPlanModeSystemPrompt =
   "You are Foco Plan Mode, a planning partner for software work.";
 export const defaultReviewSystemPrompt =

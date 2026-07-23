@@ -393,24 +393,24 @@ export function ScheduledTasksPage({
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
-        <section className="rounded-lg border border-stone-200 bg-white/85 px-4 py-4 shadow-sm">
+        <section className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
-              <span className="inline-flex size-10 items-center justify-center rounded-lg bg-amber-50 text-amber-800">
+              <span className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--warning-soft)] text-[var(--warning)]">
                 <CalendarClock aria-hidden="true" className="size-5" />
               </span>
               <div className="min-w-0">
-                <h2 className="truncate text-lg font-semibold text-stone-950">
+                <h2 className="truncate text-lg font-semibold text-[var(--foreground)]">
                   {t("Scheduled tasks")}
                 </h2>
-                <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                <p className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                   {t("tasks {count}", { count: taskTotalCount })}
                 </p>
               </div>
             </div>
             <div className="flex items-center gap-2">
               <button
-                className="inline-flex h-10 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 text-sm font-semibold text-amber-900 shadow-sm hover:bg-amber-100"
+                className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 text-sm font-semibold text-[var(--warning)] shadow-sm hover:bg-[var(--warning-soft)]"
                 onClick={() => setFormMode({ type: "create" })}
                 type="button"
               >
@@ -419,7 +419,7 @@ export function ScheduledTasksPage({
               </button>
               <button
                 aria-label={t("Refresh scheduled tasks")}
-                className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-amber-200 hover:bg-amber-50 hover:text-amber-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                 disabled={isLoading}
                 onClick={() => void loadTasks()}
                 title={t("Refresh scheduled tasks")}
@@ -439,17 +439,17 @@ export function ScheduledTasksPage({
           {TASK_STATUSES.map((status) => (
             <button
               className={`rounded-lg border px-4 py-3 text-left shadow-sm transition ${statusFilter === status
-                  ? "border-amber-300 bg-amber-50"
-                  : "border-stone-200 bg-white/85 hover:border-amber-200 hover:bg-amber-50/60"
+                  ? "border-[var(--warning)] bg-[var(--warning-soft)]"
+                  : "border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)]"
                 }`}
               key={status}
               onClick={() => setStatusFilter(statusFilter === status ? "all" : status)}
               type="button"
             >
-              <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+              <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                 {statusLabel(status, t)}
               </div>
-              <div className="mt-2 text-2xl font-semibold text-stone-950">
+              <div className="mt-2 text-2xl font-semibold text-[var(--foreground)]">
                 {formatNumber(statusCounts[status] ?? 0, language)}
               </div>
             </button>
@@ -457,32 +457,35 @@ export function ScheduledTasksPage({
         </section>
 
         {error ? (
-          <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          <div
+            role="alert"
+            className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]"
+          >
             {error}
           </div>
         ) : null}
 
         <section className="grid min-h-[520px] min-w-0 gap-4 xl:grid-cols-[minmax(0,0.95fr)_minmax(380px,1.05fr)]">
-          <div className="min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white/85 shadow-sm">
-            <div className="flex flex-wrap items-center gap-3 border-b border-stone-200 px-4 py-3">
+          <div className="min-w-0 overflow-hidden rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-sm">
+            <div className="flex flex-wrap items-center gap-3 border-b border-[var(--border)] px-4 py-3">
               <div className="min-w-0 flex-1">
-                <h3 className="text-sm font-semibold text-stone-950">
+                <h3 className="text-sm font-semibold text-[var(--foreground)]">
                   {t("Task list")}
                 </h3>
-                <p className="mt-1 text-xs text-stone-500">
+                <p className="mt-1 text-xs text-[var(--muted)]">
                   {isLoading
-                    ? t("Loading...")
+                    ? t("Loading…")
                     : t("tasks {count}", { count: taskTotalCount })}
                 </p>
               </div>
               <label className="relative min-w-48 flex-1 sm:max-w-64">
                 <Search
                   aria-hidden="true"
-                  className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-stone-400"
+                  className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--muted)]"
                 />
                 <input
                   aria-label={t("Search scheduled tasks")}
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white pl-9 pr-3 text-sm outline-none focus:border-amber-700 focus:ring-2 focus:ring-amber-100"
+                  className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] pl-9 pr-3 text-sm outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
                   onChange={(event) => setSearchQuery(event.target.value)}
                   placeholder={t("Search")}
                   value={searchQuery}
@@ -490,7 +493,7 @@ export function ScheduledTasksPage({
               </label>
               <select
                 aria-label={t("Filter scheduled tasks by workspace")}
-                className="h-10 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none focus:border-amber-700 focus:ring-2 focus:ring-amber-100"
+                className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
                 onChange={(event) => setWorkspaceFilter(event.target.value)}
                 value={workspaceFilter}
               >
@@ -504,10 +507,10 @@ export function ScheduledTasksPage({
             </div>
             <div className="panel-scroll max-h-[640px] min-w-0 overflow-y-auto">
               {tasks.length ? (
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {tasks.map((task) => (
                     <button
-                      className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left transition ${selectedTask?.id === task.id ? "bg-amber-50" : "hover:bg-amber-50/40"
+                      className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left transition ${selectedTask?.id === task.id ? "bg-[var(--warning-soft)]" : "hover:bg-[var(--warning-soft)]"
                         }`}
                       key={task.id}
                       onClick={() => setSelectedTaskId(task.id)}
@@ -515,7 +518,7 @@ export function ScheduledTasksPage({
                     >
                       <span className="min-w-0">
                         <span className="flex min-w-0 items-center gap-2">
-                          <span className="truncate font-semibold text-stone-950">
+                          <span className="truncate font-semibold text-[var(--foreground)]">
                             {task.title}
                           </span>
                           <span
@@ -524,15 +527,15 @@ export function ScheduledTasksPage({
                             {statusLabel(task.status, t)}
                           </span>
                         </span>
-                        <span className="mt-1 block truncate text-xs text-stone-500">
+                        <span className="mt-1 block truncate text-xs text-[var(--muted)]">
                           {task.workspaceName} / {scheduleSummary(task.schedule, t)}
                         </span>
-                        <span className="mt-2 block truncate text-xs text-stone-600">
+                        <span className="mt-2 block truncate text-xs text-[var(--muted)]">
                           {actionSummary(task.action, t)}
                         </span>
                       </span>
-                      <span className="whitespace-nowrap text-right text-xs text-stone-500">
-                        <span className="block font-semibold text-stone-700">
+                      <span className="whitespace-nowrap text-right text-xs text-[var(--muted)]">
+                        <span className="block font-semibold text-[var(--muted)]">
                           {t("Next run")}
                         </span>
                         <span className="mt-1 block">
@@ -543,8 +546,8 @@ export function ScheduledTasksPage({
                   ))}
                 </div>
               ) : (
-                <div className="px-4 py-12 text-center text-sm text-stone-500">
-                  {isLoading ? t("Loading...") : t("No scheduled tasks")}
+                <div className="px-4 py-12 text-center text-sm text-[var(--muted)]">
+                  {isLoading ? t("Loading…") : t("No scheduled tasks")}
                 </div>
               )}
             </div>
@@ -666,7 +669,7 @@ function TaskDetails({
 }) {
   if (!task) {
     return (
-      <div className="grid min-h-[360px] place-items-center rounded-lg border border-stone-200 bg-white/85 px-4 text-sm text-stone-500 shadow-sm">
+      <div className="grid min-h-[360px] place-items-center rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 text-sm text-[var(--muted)] shadow-sm">
         {t("Select a scheduled task")}
       </div>
     );
@@ -680,11 +683,11 @@ function TaskDetails({
   const usage = task.usage;
 
   return (
-    <div className="min-w-0 overflow-hidden rounded-lg border border-stone-200 bg-white/85 shadow-sm">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-stone-200 px-4 py-4">
+    <div className="min-w-0 overflow-hidden rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-[var(--border)] px-4 py-4">
         <div className="min-w-0">
           <div className="flex flex-wrap items-center gap-2">
-            <h3 className="truncate text-base font-semibold text-stone-950">
+            <h3 className="truncate text-base font-semibold text-[var(--foreground)]">
               {task.title}
             </h3>
             <span
@@ -693,7 +696,7 @@ function TaskDetails({
               {statusLabel(task.status, t)}
             </span>
           </div>
-          <p className="mt-1 text-xs text-stone-500">
+          <p className="mt-1 text-xs text-[var(--muted)]">
             {task.workspaceName} / {task.id}
           </p>
         </div>
@@ -820,23 +823,23 @@ function TaskDetails({
         </DetailBlock>
       </div>
 
-      <div className="border-t border-stone-200 px-4 py-4">
+      <div className="border-t border-[var(--border)] px-4 py-4">
         <div className="mb-3 flex items-center justify-between gap-3">
           <div>
-            <h4 className="text-sm font-semibold text-stone-950">{t("Prompt")}</h4>
-            <p className="mt-1 text-xs text-stone-500">{t("Agent prompt")}</p>
+            <h4 className="text-sm font-semibold text-[var(--foreground)]">{t("Prompt")}</h4>
+            <p className="mt-1 text-xs text-[var(--muted)]">{t("Agent prompt")}</p>
           </div>
         </div>
-        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg border border-stone-200 bg-stone-50 px-3 py-3 text-sm text-stone-700">
+        <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-sm text-[var(--muted)]">
           {actionSummary(task.action, t)}
         </pre>
       </div>
 
-      <div className="border-t border-stone-200 px-4 py-4">
+      <div className="border-t border-[var(--border)] px-4 py-4">
         <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h4 className="text-sm font-semibold text-stone-950">{t("Run history")}</h4>
-            <p className="mt-1 text-xs text-stone-500">
+            <h4 className="text-sm font-semibold text-[var(--foreground)]">{t("Run history")}</h4>
+            <p className="mt-1 text-xs text-[var(--muted)]">
               {t("runs {count}", { count: runsPage.totalCount })}
             </p>
           </div>
@@ -849,7 +852,7 @@ function TaskDetails({
         </div>
         <div className="panel-scroll overflow-x-auto">
           <table className="w-full min-w-[680px] text-left text-sm">
-            <thead className="border-y border-stone-200 bg-white text-xs font-semibold text-stone-500">
+            <thead className="border-y border-[var(--border)] bg-[var(--surface)] text-xs font-semibold text-[var(--muted)]">
               <tr>
                 <th className="px-3 py-2">{t("Scheduled time")}</th>
                 <th className="px-3 py-2">{t("Trigger")}</th>
@@ -859,14 +862,14 @@ function TaskDetails({
                 <th className="px-3 py-2 text-right">{t("Chat")}</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-stone-100">
+            <tbody className="divide-y divide-[var(--border)]">
               {runs.length ? (
                 runs.map((run) => (
                   <tr className="align-top" key={run.id}>
-                    <td className="whitespace-nowrap px-3 py-2 text-stone-700">
+                    <td className="whitespace-nowrap px-3 py-2 text-[var(--muted)]">
                       {formatTimestamp(run.scheduledAt, language, t)}
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-stone-700">
+                    <td className="whitespace-nowrap px-3 py-2 text-[var(--muted)]">
                       {triggerLabel(run.triggerReason, t)}
                     </td>
                     <td className="whitespace-nowrap px-3 py-2">
@@ -876,16 +879,16 @@ function TaskDetails({
                         {runStatusLabel(run.status, t)}
                       </span>
                     </td>
-                    <td className="whitespace-nowrap px-3 py-2 text-stone-700">
+                    <td className="whitespace-nowrap px-3 py-2 text-[var(--muted)]">
                       {formatTimestamp(run.completedAt, language, t)}
                     </td>
-                    <td className="max-w-64 px-3 py-2 text-stone-600">
+                    <td className="max-w-64 px-3 py-2 text-[var(--muted)]">
                       <span className="line-clamp-2">{run.errorMessage ?? ""}</span>
                     </td>
                     <td className="px-3 py-2 text-right">
                       {run.chatId ? (
                         <button
-                          className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-amber-200 hover:bg-amber-50 hover:text-amber-800"
+                          className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)]"
                           onClick={() => onOpenChat(run.workspaceId, run.chatId!)}
                           type="button"
                         >
@@ -893,15 +896,15 @@ function TaskDetails({
                           {t("Open chat")}
                         </button>
                       ) : (
-                        <span className="text-xs text-stone-400">{t("Not available")}</span>
+                        <span className="text-xs text-[var(--muted)]">{t("Not available")}</span>
                       )}
                     </td>
                   </tr>
                 ))
               ) : (
                 <tr>
-                  <td className="px-3 py-8 text-center text-sm text-stone-500" colSpan={6}>
-                    {isLoadingRuns ? t("Loading...") : t("No runs")}
+                  <td className="px-3 py-8 text-center text-sm text-[var(--muted)]" colSpan={6}>
+                    {isLoadingRuns ? t("Loading…") : t("No runs")}
                   </td>
                 </tr>
               )}
@@ -1095,7 +1098,7 @@ function ScheduledTaskDrawer({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-stone-950/30">
+    <div className="fixed inset-0 z-50 flex justify-end bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)]">
       <button
         aria-label={t("Close scheduled task editor backdrop")}
         className="absolute inset-0 cursor-default"
@@ -1105,19 +1108,19 @@ function ScheduledTaskDrawer({
       <form
         aria-label={t("Scheduled task editor")}
         aria-modal="true"
-        className="panel-scroll relative h-full w-full max-w-2xl overflow-y-auto bg-white shadow-2xl"
+        className="panel-scroll relative h-full w-full max-w-2xl overflow-y-auto bg-[var(--surface)] shadow-2xl"
         onSubmit={(event) => void saveTask(event)}
         role="dialog"
       >
-        <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-stone-200 bg-white px-5 py-4">
+        <div className="sticky top-0 z-10 flex items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-5 py-4">
           <div>
-            <h3 className="text-base font-semibold text-stone-950">
+            <h3 className="text-base font-semibold text-[var(--foreground)]">
               {mode.type === "edit" ? t("Edit scheduled task") : t("New scheduled task")}
             </h3>
           </div>
           <button
             aria-label={t("Close scheduled task editor")}
-            className="inline-flex size-9 items-center justify-center rounded-lg text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+            className="inline-flex size-9 items-center justify-center rounded-lg text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
             onClick={onClose}
             type="button"
           >
@@ -1126,7 +1129,7 @@ function ScheduledTaskDrawer({
         </div>
 
         {error ? (
-          <div className="mx-5 mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          <div className="mx-5 mt-4 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
             {error}
           </div>
         ) : null}
@@ -1354,13 +1357,13 @@ function ScheduledTaskDrawer({
                 ))}
               </SelectField>
             </div>
-            <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-              <span className="text-sm font-semibold text-stone-700">
+            <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+              <span className="text-sm font-semibold text-[var(--muted)]">
                 {t("Enable Team mode")}
               </span>
               <input
                 checked={form.collaborationToolsEnabled}
-                className="size-4 accent-amber-700"
+                className="size-4 accent-[var(--warning)]"
                 onChange={(event) =>
                   setForm((current) => ({
                     ...current,
@@ -1373,16 +1376,16 @@ function ScheduledTaskDrawer({
           </DetailBlock>
         </div>
 
-        <div className="sticky bottom-0 flex items-center justify-end gap-2 border-t border-stone-200 bg-white px-5 py-4">
+        <div className="sticky bottom-0 flex items-center justify-end gap-2 border-t border-[var(--border)] bg-[var(--surface)] px-5 py-4">
           <button
-            className="h-10 rounded-lg border border-stone-200 bg-white px-4 text-sm font-semibold text-stone-700 hover:bg-stone-50"
+            className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-semibold text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
             onClick={onClose}
             type="button"
           >
             {t("Cancel")}
           </button>
           <button
-            className="inline-flex h-10 items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 text-sm font-semibold text-amber-900 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+            className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-4 text-sm font-semibold text-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:opacity-60"
             disabled={isSaving}
             type="submit"
           >
@@ -1407,8 +1410,8 @@ function DetailBlock({
   title: string;
 }) {
   return (
-    <section className="rounded-lg border border-stone-200 bg-white px-3 py-3">
-      <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-stone-500">
+    <section className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-3">
+      <h4 className="mb-3 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
         {title}
       </h4>
       <div className="space-y-3">{children}</div>
@@ -1419,8 +1422,8 @@ function DetailBlock({
 function KeyValue({ label, value }: { label: string; value: string }) {
   return (
     <div className="grid gap-1 text-sm sm:grid-cols-[132px_minmax(0,1fr)]">
-      <dt className="text-xs font-semibold text-stone-500">{label}</dt>
-      <dd className="min-w-0 truncate text-stone-800" title={value}>
+      <dt className="text-xs font-semibold text-[var(--muted)]">{label}</dt>
+      <dd className="min-w-0 truncate text-[var(--foreground)]" title={value}>
         {value}
       </dd>
     </div>
@@ -1453,7 +1456,7 @@ function PaginationControls({
   const effectiveTotalPages = Math.max(totalPages, totalCount === 0 ? 0 : 1);
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 px-4 py-3 text-xs text-stone-500">
+    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] px-4 py-3 text-xs text-[var(--muted)]">
       <div>
         {t("Showing {start}-{end} of {total}", {
           start: formatNumber(start, language),
@@ -1465,7 +1468,7 @@ function PaginationControls({
         <label className="inline-flex items-center gap-2">
           <span>{t("Page size")}</span>
           <select
-            className="h-8 rounded-lg border border-stone-300 bg-white px-2 text-xs text-stone-900 outline-none focus:border-amber-700 focus:ring-2 focus:ring-amber-100"
+            className="h-8 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs text-[var(--foreground)] outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
             onChange={(event) => onPageSizeChange(Number(event.target.value))}
             value={pageSize}
           >
@@ -1484,7 +1487,7 @@ function PaginationControls({
         </span>
         <button
           aria-label={t("Previous page")}
-          className="inline-flex h-8 items-center rounded-lg border border-stone-200 bg-white px-2 font-semibold text-stone-700 hover:border-amber-200 hover:bg-amber-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          className="inline-flex h-8 items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={page <= 1}
           onClick={() => onPageChange(Math.max(1, page - 1))}
           type="button"
@@ -1493,7 +1496,7 @@ function PaginationControls({
         </button>
         <button
           aria-label={t("Next page")}
-          className="inline-flex h-8 items-center rounded-lg border border-stone-200 bg-white px-2 font-semibold text-stone-700 hover:border-amber-200 hover:bg-amber-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          className="inline-flex h-8 items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={totalPages === 0 || page >= totalPages}
           onClick={() => onPageChange(page + 1)}
           type="button"
@@ -1521,7 +1524,7 @@ function IconButton({
   return (
     <button
       aria-label={label}
-      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-amber-200 hover:bg-amber-50 hover:text-amber-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
       disabled={busy || disabled}
       onClick={onClick}
       title={label}
@@ -1553,11 +1556,11 @@ function TextField({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <input
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-amber-700 focus:ring-2 focus:ring-amber-100 disabled:bg-stone-100"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)] disabled:bg-[var(--surface-secondary)]"
         disabled={disabled}
         inputMode={inputMode}
         onChange={(event) => onChange(event.target.value)}
@@ -1581,11 +1584,11 @@ function TextArea({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <textarea
-        className="w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition focus:border-amber-700 focus:ring-2 focus:ring-amber-100"
+        className="w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
         onChange={(event) => onChange(event.target.value)}
         rows={rows}
         value={value}
@@ -1609,11 +1612,11 @@ function SelectField({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <select
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-amber-700 focus:ring-2 focus:ring-amber-100 disabled:bg-stone-100"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)] disabled:bg-[var(--surface-secondary)]"
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         value={value}
@@ -1638,22 +1641,22 @@ function RunPreview({
   t: Translate;
 }) {
   return (
-    <div className="border-t border-stone-200 pt-3">
-      <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+    <div className="border-t border-[var(--border)] pt-3">
+      <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
         {t("Next five runs")}
       </div>
       {isLoading ? (
-        <div className="mt-2 text-sm text-stone-500">{t("Loading...")}</div>
+        <div className="mt-2 text-sm text-[var(--muted)]">{t("Loading…")}</div>
       ) : error ? (
-        <div className="mt-2 text-sm text-rose-700">{error}</div>
+        <div className="mt-2 text-sm text-[var(--danger)]">{error}</div>
       ) : runs.length ? (
-        <ol className="mt-2 space-y-1 text-sm text-stone-700">
+        <ol className="mt-2 space-y-1 text-sm text-[var(--muted)]">
           {runs.map((runAt) => (
             <li key={runAt}>{formatTimestamp(runAt, language, t)}</li>
           ))}
         </ol>
       ) : (
-        <div className="mt-2 text-sm text-stone-500">{t("No upcoming runs")}</div>
+        <div className="mt-2 text-sm text-[var(--muted)]">{t("No upcoming runs")}</div>
       )}
     </div>
   );
@@ -1868,15 +1871,15 @@ function statusLabel(status: string, t: Translate) {
 function statusClass(status: string) {
   switch (status) {
     case "enabled":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-100";
+      return "bg-[var(--success-soft)] text-[var(--success-soft-foreground)] ring-[var(--success)]";
     case "paused":
-      return "bg-amber-50 text-amber-700 ring-amber-100";
+      return "bg-[var(--warning-soft)] text-[var(--warning)] ring-[var(--warning)]";
     case "completed":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-100";
+      return "bg-[var(--success-soft)] text-[var(--success-soft-foreground)] ring-[var(--success)]";
     case "archived":
-      return "bg-stone-100 text-stone-600 ring-stone-200";
+      return "bg-[var(--surface-secondary)] text-[var(--muted)] ring-[var(--border)]";
     default:
-      return "bg-stone-100 text-stone-700 ring-stone-200";
+      return "bg-[var(--surface-secondary)] text-[var(--muted)] ring-[var(--border)]";
   }
 }
 
@@ -1904,18 +1907,18 @@ function runStatusLabel(status: ScheduledTaskRunStatus | string, t: Translate) {
 function runStatusClass(status: string) {
   switch (status) {
     case "succeeded":
-      return "bg-emerald-50 text-emerald-700 ring-emerald-100";
+      return "bg-[var(--success-soft)] text-[var(--success-soft-foreground)] ring-[var(--success)]";
     case "failed":
-      return "bg-rose-50 text-rose-700 ring-rose-100";
+      return "bg-[var(--danger-soft)] text-[var(--danger)] ring-[var(--danger)]";
     case "running":
     case "queued":
     case "pending":
-      return "bg-amber-50 text-amber-700 ring-amber-100";
+      return "bg-[var(--warning-soft)] text-[var(--warning)] ring-[var(--warning)]";
     case "cancelled":
     case "skipped":
-      return "bg-stone-100 text-stone-600 ring-stone-200";
+      return "bg-[var(--surface-secondary)] text-[var(--muted)] ring-[var(--border)]";
     default:
-      return "bg-stone-100 text-stone-700 ring-stone-200";
+      return "bg-[var(--surface-secondary)] text-[var(--muted)] ring-[var(--border)]";
   }
 }
 

@@ -73,7 +73,7 @@ function TerminalCommandButton({
     return (
       <button
         aria-label={t("Run common command {name}", { name: command.name })}
-        className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-stone-800 hover:text-stone-100 disabled:cursor-not-allowed disabled:text-stone-600 disabled:hover:bg-transparent"
+        className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
         disabled={disabled}
         onClick={() => onRun(command)}
         title={t("Run common command {name}", { name: command.name })}
@@ -97,27 +97,27 @@ function TerminalCommandButton({
       <summary
         aria-disabled={disabled}
         aria-label={t("Run common command")}
-        className={`inline-flex size-6 cursor-pointer list-none items-center justify-center rounded-md text-stone-400 outline-none marker:hidden focus-visible:ring-2 focus-visible:ring-teal-500/60 [&::-webkit-details-marker]:hidden ${disabled
-            ? "pointer-events-none text-stone-600"
-            : "hover:bg-stone-800 hover:text-stone-100"
+        className={`inline-flex size-6 cursor-pointer list-none items-center justify-center rounded-md text-[var(--muted)] outline-none marker:hidden focus-visible:ring-2 focus-visible:ring-[var(--focus)] [&::-webkit-details-marker]:hidden ${disabled
+            ? "pointer-events-none text-[var(--muted)]"
+            : "hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
           }`}
         title={t("Run common command")}
       >
         <Play aria-hidden="true" className="size-3.5 fill-current" />
       </summary>
-      <div className="absolute right-0 top-full z-30 mt-2 w-56 overflow-hidden rounded-lg border border-stone-800 bg-stone-950 shadow-[0_18px_40px_rgba(0,0,0,0.28)]">
+      <div className="absolute right-0 top-full z-30 mt-2 w-56 overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
         <div className="panel-scroll max-h-56 overflow-y-auto py-1">
           {commands.map((command, index) => (
             <button
               aria-label={t("Run common command {name}", { name: command.name })}
-              className="flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-xs font-semibold text-stone-200 hover:bg-stone-800"
+              className="flex min-h-9 w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-xs font-semibold text-[var(--foreground)] hover:bg-[var(--surface-secondary)]"
               key={`${command.name}-${index}`}
               onClick={(event) => handleSelect(command, event)}
               type="button"
             >
               <Play
                 aria-hidden="true"
-                className="size-3.5 shrink-0 fill-current text-teal-400"
+                className="size-3.5 shrink-0 fill-current text-[var(--accent-soft-foreground)]"
               />
               <span className="min-w-0 flex-1 truncate">{command.name}</span>
             </button>
@@ -265,14 +265,14 @@ export function TerminalPanel({
   return (
     <section
       aria-hidden={!isVisible}
-      className="terminal-panel relative shrink-0 border-t border-stone-800 bg-[var(--background-inverse)]"
+      className="terminal-panel relative shrink-0 border-t border-[var(--border)] bg-[var(--background-inverse)]"
       hidden={!isVisible}
       style={{ "--terminal-panel-height": `${panelHeight}px` } as CSSProperties}
     >
       <div
         aria-label={t("Resize terminal panel")}
         aria-orientation="horizontal"
-        className="absolute left-0 right-0 top-0 z-10 h-1 cursor-row-resize bg-transparent hover:bg-teal-500/50"
+        className="absolute left-0 right-0 top-0 z-10 h-1 cursor-row-resize bg-transparent hover:bg-[color-mix(in_oklab,var(--accent)_50%,transparent)] focus-visible:bg-[var(--accent)]"
         onKeyDown={(event) => {
           if (event.key === "ArrowUp") {
             event.preventDefault();
@@ -293,7 +293,7 @@ export function TerminalPanel({
       />
       <div className="terminal-panel-body mx-auto flex h-[var(--terminal-panel-height)] w-full max-w-5xl min-w-0">
         <div className="flex min-w-0 flex-1 flex-col">
-          <div className="flex h-8 shrink-0 flex-nowrap items-center justify-between gap-2 overflow-hidden px-3 text-xs text-stone-400">
+          <div className="flex h-8 shrink-0 flex-nowrap items-center justify-between gap-2 overflow-hidden px-3 text-xs text-[var(--muted)]">
             <span className="inline-flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
               <Terminal aria-hidden="true" className="size-4 shrink-0" />
               <span
@@ -308,7 +308,7 @@ export function TerminalPanel({
             </span>
             <span className="flex min-w-0 shrink-0 items-center gap-2">
               {activeSession?.error ? (
-                <span className="min-w-0 max-w-[7rem] truncate text-rose-300 sm:max-w-[12rem]">
+                <span className="min-w-0 max-w-[7rem] truncate text-[var(--danger)] sm:max-w-[12rem]">
                   {activeSession.error}
                 </span>
               ) : null}
@@ -319,7 +319,7 @@ export function TerminalPanel({
               />
               <button
                 aria-label={t("New terminal")}
-                className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-stone-800 hover:text-stone-100"
+                className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                 onClick={createSession}
                 title={t("New terminal")}
                 type="button"
@@ -328,7 +328,7 @@ export function TerminalPanel({
               </button>
               <button
                 aria-label={t("Close terminal")}
-                className="inline-flex size-6 items-center justify-center rounded-md text-stone-400 hover:bg-rose-950/60 hover:text-rose-200"
+                className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                 onClick={onClose}
                 title={t("Close terminal")}
                 type="button"
@@ -355,13 +355,13 @@ export function TerminalPanel({
         {sessions.length > 1 ? (
           <aside
             aria-label={t("Terminal sessions")}
-            className="terminal-session-list panel-scroll w-44 shrink-0 overflow-y-auto border-l border-stone-800 bg-stone-950/35 px-2 py-2"
+            className="terminal-session-list panel-scroll w-44 shrink-0 overflow-y-auto border-l border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-2"
           >
             {sessions.map((session) => (
               <div
                 className={`flex w-full min-w-0 items-center gap-1 rounded-md text-xs ${session.clientId === activeSession?.clientId
-                    ? "bg-stone-800 text-stone-100"
-                    : "text-stone-400 hover:bg-stone-900 hover:text-stone-100"
+                    ? "bg-[var(--surface)] text-[var(--foreground)]"
+                    : "text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)]"
                   }`}
                 key={session.clientId}
               >
@@ -391,7 +391,7 @@ export function TerminalPanel({
                   aria-label={t("Close terminal {number}", {
                     number: session.number,
                   })}
-                  className="mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-stone-500 hover:bg-rose-950/60 hover:text-rose-200"
+                  className="mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                   onClick={() => closeSession(session.clientId)}
                   title={t("Close terminal {number}", { number: session.number })}
                   type="button"
@@ -774,18 +774,18 @@ function terminalStatusDotClass(
   const base = "size-2 shrink-0 rounded-full";
 
   if (status === "connected") {
-    return `${base} bg-emerald-400 shadow-[0_0_6px_2px_rgba(52,211,153,0.75)]`;
+    return `${base} bg-[var(--success)]`;
   }
 
   if (status === "connecting") {
-    return `${base} bg-amber-400 shadow-[0_0_6px_2px_rgba(251,191,36,0.7)]`;
+    return `${base} bg-[var(--warning)]`;
   }
 
   if (status === "error") {
-    return `${base} bg-rose-500 shadow-[0_0_6px_2px_rgba(244,63,94,0.75)]`;
+    return `${base} bg-[var(--danger)]`;
   }
 
-  return `${base} bg-stone-500`;
+  return `${base} bg-[var(--muted)]`;
 }
 
 function isTerminalServerEvent(value: unknown): value is TerminalServerEvent {

@@ -1129,7 +1129,7 @@ describe("app agents verification surfaces", () => {
     expect(
       within(transcriptPanel as HTMLElement).getByRole("button", { name: "Refresh" }),
     ).toBeEnabled();
-    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages…")).not.toBeInTheDocument();
 
     await act(async () => {
       snapshotRefreshGate.resolve();
@@ -1140,7 +1140,7 @@ describe("app agents verification surfaces", () => {
     expect(screen.getByText("Checking workspace state.")).toBeInTheDocument();
     expect(screen.getByText("Read")).toBeInTheDocument();
     expect(screen.getByText("1.2 s")).toBeInTheDocument();
-    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages…")).not.toBeInTheDocument();
 
     await act(async () => {
       transcriptRefreshGate.resolve();
@@ -1255,7 +1255,7 @@ describe("app agents verification surfaces", () => {
 
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
     assertGuidanceTimeline();
-    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages…")).not.toBeInTheDocument();
 
     const transcriptPanel = screen
       .getByText("Worker, inspect the current task.")
@@ -1272,7 +1272,7 @@ describe("app agents verification surfaces", () => {
 
     expect(screen.getByText("Worker, inspect the current task.")).toBeInTheDocument();
     assertGuidanceTimeline();
-    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages…")).not.toBeInTheDocument();
 
     await act(async () => {
       snapshotRefreshGate.resolve();
@@ -1376,7 +1376,7 @@ describe("app agents verification surfaces", () => {
 
     expect(await screen.findByText("Worker, inspect the current task.")).toBeInTheDocument();
     expect(screen.queryByText("Chat two worker message.")).not.toBeInTheDocument();
-    expect(screen.queryByText("Loading agent messages...")).not.toBeInTheDocument();
+    expect(screen.queryByText("Loading agent messages…")).not.toBeInTheDocument();
 
     await act(async () => {
       chat1ReloadGate.resolve();
@@ -2065,22 +2065,22 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
     });
-    expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
+    expect(screen.getByRole("button", { name: /Thinking/ })).toHaveTextContent("High");
 
-    await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
-    await userEvent.click(screen.getByLabelText("Thinking"));
-    await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
-    expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
-    expect(screen.getByLabelText("Thinking")).toHaveTextContent("Low");
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: /Thinking/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Low" }));
+    expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
+    expect(screen.getByRole("button", { name: /Thinking/ })).toHaveTextContent("Low");
 
     await userEvent.click(
       screen.getByRole("button", { name: "New chat in Default" }),
     );
-    expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
-    expect(screen.getByLabelText("Thinking")).toHaveTextContent("High");
+    expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
+    expect(screen.getByRole("button", { name: /Thinking/ })).toHaveTextContent("High");
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -2158,20 +2158,20 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
     });
 
     const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
     });
 
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "false");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
     });
   });
 
@@ -2232,20 +2232,20 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
     });
 
     const planModeToggle = await screen.findByRole("button", { name: "Plan mode" });
     await userEvent.click(planModeToggle);
     expect(planModeToggle).toHaveAttribute("aria-pressed", "true");
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
     });
 
-    await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
     });
 
     await userEvent.type(
@@ -2272,7 +2272,7 @@ describe("app agents verification surfaces", () => {
         "aria-pressed",
         "true",
       );
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
     });
   });
 
@@ -2282,12 +2282,12 @@ describe("app agents verification surfaces", () => {
     renderApp();
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
     });
-    await userEvent.click(screen.getByLabelText("Model"));
-    await userEvent.click(screen.getByRole("button", { name: "Model: GPT Test" }));
-    await userEvent.click(screen.getByLabelText("Thinking"));
-    await userEvent.click(screen.getByRole("button", { name: "Thinking: Low" }));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
+    await userEvent.click(screen.getByRole("button", { name: /Thinking/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Low" }));
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),

@@ -44,19 +44,19 @@ export function AgentsRuntimePanel({
     <section className="panel-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <Bot aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
+          <Bot aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
           <div className="min-w-0">
-            <h3 className="truncate text-sm font-semibold text-stone-950">
+            <h3 className="truncate text-sm font-semibold text-[var(--foreground)]">
               {t("Agents")}
             </h3>
-            <p className="truncate text-xs text-stone-500">
+            <p className="truncate text-xs text-[var(--muted)]">
               {t("Current chat agent instances")}
             </p>
           </div>
         </div>
         <button
           aria-label={t("Refresh")}
-          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-300"
+          className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           disabled={!activeChatId || isLoading}
           onClick={() => void onRefresh()}
           title={t("Refresh")}
@@ -71,7 +71,7 @@ export function AgentsRuntimePanel({
       </div>
 
       {error ? (
-        <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        <div className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
           {error}
         </div>
       ) : null}
@@ -84,7 +84,7 @@ export function AgentsRuntimePanel({
         <AgentEmptyState
           text={
             isLoading
-              ? t("Loading agent instances...")
+              ? t("Loading agent instances…")
               : t("No agent instances in this chat yet.")
           }
         />
@@ -149,8 +149,8 @@ function AgentInstanceCard({
       })}
       aria-pressed={isSelected}
       className={`w-full rounded-lg border px-3 py-3 text-left transition ${isSelected
-          ? "border-teal-300 bg-teal-50 text-stone-950 shadow-sm"
-          : "border-stone-200 bg-white hover:border-teal-200 hover:bg-teal-50"
+          ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--foreground)] shadow-sm"
+          : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
         }`}
       onClick={onSelect}
       type="button"
@@ -168,12 +168,12 @@ function AgentInstanceCard({
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-1.5">
-            <User aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
-            <div className="truncate text-sm font-semibold text-stone-950">
+            <User aria-hidden="true" className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]" />
+            <div className="truncate text-sm font-semibold text-[var(--foreground)]">
               {instance.definitionSnapshot.name}
             </div>
           </div>
-          <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-stone-500">
+          <div className="mt-1 flex flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-[var(--muted)]">
             <span>{instance.role}</span>
             <span className={status.textClassName}>{instance.status}</span>
             <span>{isIsolated ? t("isolated") : t("shared")}</span>
@@ -183,19 +183,19 @@ function AgentInstanceCard({
       </div>
 
       {isIsolated && instance.worktreeBranch ? (
-        <div className="mt-2 flex min-w-0 items-center gap-1.5 text-xs text-stone-500">
+        <div className="mt-2 flex min-w-0 items-center gap-1.5 text-xs text-[var(--muted)]">
           <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
           <span className="truncate">{instance.worktreeBranch}</span>
         </div>
       ) : null}
 
       {instance.executionRootPath ? (
-        <div className="mt-1 truncate font-mono text-[11px] text-stone-500">
+        <div className="mt-1 truncate font-mono text-[11px] text-[var(--muted)]">
           {instance.executionRootPath}
         </div>
       ) : null}
 
-      <dl className="mt-2 grid gap-1 text-xs text-stone-600">
+      <dl className="mt-2 grid gap-1 text-xs text-[var(--muted)]">
         <AgentKeyValue label={t("Instance ID")} value={instance.id} />
         <AgentKeyValue label={t("Definition")} value={instance.definitionId} />
         <AgentKeyValue label={t("Created")} value={formatAgentTimestamp(instance.createdAt)} />
@@ -207,7 +207,7 @@ function AgentInstanceCard({
 function AgentKeyValue({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
-      <dt className="inline font-semibold text-stone-800">{label}: </dt>
+      <dt className="inline font-semibold text-[var(--foreground)]">{label}: </dt>
       <dd className="inline break-all">{value}</dd>
     </div>
   );
@@ -215,7 +215,7 @@ function AgentKeyValue({ label, value }: { label: string; value: string }) {
 
 function AgentEmptyState({ text }: { text: string }) {
   return (
-    <div className="rounded-xl border border-dashed border-stone-200 bg-white px-3 py-6 text-center text-sm text-stone-500">
+    <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface)] px-3 py-6 text-center text-sm text-[var(--muted)]">
       {text}
     </div>
   );
@@ -231,59 +231,59 @@ function agentStatusPresentation(status: string): {
     case "running":
       return {
         animate: true,
-        className: "border-amber-200 bg-amber-100 text-amber-700",
+        className: "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]",
         icon: LoaderCircle,
-        textClassName: "text-amber-700",
+        textClassName: "text-[var(--warning)]",
       };
     case "waiting":
       return {
         animate: false,
-        className: "border-amber-200 bg-amber-100 text-amber-700",
+        className: "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]",
         icon: Hourglass,
-        textClassName: "text-amber-700",
+        textClassName: "text-[var(--warning)]",
       };
     case "paused":
       return {
         animate: false,
-        className: "border-stone-200 bg-stone-100 text-stone-600",
+        className: "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]",
         icon: CirclePause,
-        textClassName: "text-stone-600",
+        textClassName: "text-[var(--muted)]",
       };
     case "draining":
       return {
         animate: false,
-        className: "border-amber-200 bg-amber-100 text-amber-700",
+        className: "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]",
         icon: Activity,
-        textClassName: "text-amber-700",
+        textClassName: "text-[var(--warning)]",
       };
     case "stopped":
       return {
         animate: false,
-        className: "border-stone-200 bg-stone-100 text-stone-600",
+        className: "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]",
         icon: CircleStop,
-        textClassName: "text-stone-600",
+        textClassName: "text-[var(--muted)]",
       };
     case "failed":
       return {
         animate: false,
-        className: "border-rose-200 bg-rose-100 text-rose-700",
+        className: "border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]",
         icon: CircleAlert,
-        textClassName: "text-rose-700",
+        textClassName: "text-[var(--danger)]",
       };
     case "idle":
     case "active":
       return {
         animate: false,
-        className: "border-emerald-200 bg-emerald-100 text-emerald-700",
+        className: "border-[var(--success)] bg-[var(--success-soft)] text-[var(--success-soft-foreground)]",
         icon: CheckCircle2,
-        textClassName: "text-emerald-700",
+        textClassName: "text-[var(--success-soft-foreground)]",
       };
     default:
       return {
         animate: false,
-        className: "border-stone-200 bg-stone-100 text-stone-600",
+        className: "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]",
         icon: CircleDashed,
-        textClassName: "text-stone-600",
+        textClassName: "text-[var(--muted)]",
       };
   }
 }

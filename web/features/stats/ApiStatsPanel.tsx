@@ -258,7 +258,7 @@ export function ApiStatsPanel({
   const totalOutputTokens = summary.totalOutputTokens;
   const aiStatsColumns: AiStatsColumn[] = [
     {
-      cellClassName: "px-4 py-3 font-medium text-stone-900",
+      cellClassName: "px-4 py-3 font-medium text-[var(--foreground)]",
       id: "requestTime",
       label: t("Request time"),
       render: (request) => {
@@ -266,7 +266,7 @@ export function ApiStatsPanel({
         return parts ? (
           <div className="space-y-1">
             <div>{parts.date}</div>
-            <div className="text-xs text-stone-500">{parts.time}</div>
+            <div className="text-xs text-[var(--muted)]">{parts.time}</div>
           </div>
         ) : (
           request.requestStartedAt
@@ -274,23 +274,23 @@ export function ApiStatsPanel({
       },
     },
     {
-      cellClassName: "min-w-[14rem] px-4 py-3 text-stone-700",
+      cellClassName: "min-w-[14rem] px-4 py-3 text-[var(--muted)]",
       id: "session",
       label: t("Session"),
       render: (request) => (
         <div className="space-y-1">
-          <div className="flex min-w-0 items-center gap-2 font-medium text-stone-900">
-            <Bot aria-hidden="true" className="size-4 shrink-0 text-teal-700" />
+          <div className="flex min-w-0 items-center gap-2 font-medium text-[var(--foreground)]">
+            <Bot aria-hidden="true" className="size-4 shrink-0 text-[var(--accent-soft-foreground)]" />
             <span className="truncate">{request.workspaceName}</span>
           </div>
-          <div className="truncate text-xs text-stone-500">
+          <div className="truncate text-xs text-[var(--muted)]">
             {request.chatTitle ?? request.chatId ?? "n/a"}
           </div>
         </div>
       ),
     },
     {
-      cellClassName: "min-w-[13rem] px-4 py-3 font-mono text-xs text-stone-700",
+      cellClassName: "min-w-[13rem] px-4 py-3 font-mono text-xs text-[var(--muted)]",
       id: "providerModel",
       label: t("Provider / model"),
       render: (request) => {
@@ -303,15 +303,15 @@ export function ApiStatsPanel({
         return (
           <div className="space-y-1">
             <div
-              className="truncate font-medium text-stone-800"
+              className="truncate font-medium text-[var(--foreground)]"
               title={`${providerName}${transportSuffix}`}
             >
               <span>{providerName}</span>
-              <span className="font-normal text-stone-500">
+              <span className="font-normal text-[var(--muted)]">
                 {transportSuffix}
               </span>
             </div>
-            <div className="truncate text-stone-500">
+            <div className="truncate text-[var(--muted)]">
               {modelLabels.get(request.modelId) ?? request.modelId}
             </div>
           </div>
@@ -319,7 +319,7 @@ export function ApiStatsPanel({
       },
     },
     {
-      cellClassName: "px-4 py-3 text-stone-700",
+      cellClassName: "px-4 py-3 text-[var(--muted)]",
       id: "requestKind",
       label: t("Request type"),
       render: (request) => (
@@ -331,11 +331,11 @@ export function ApiStatsPanel({
       ),
     },
     {
-      cellClassName: "px-4 py-3 text-stone-700",
+      cellClassName: "px-4 py-3 text-[var(--muted)]",
       id: "thinkingLevel",
       label: t("Thinking level"),
       render: (request) => (
-        <span className="font-medium text-stone-800">
+        <span className="font-medium text-[var(--foreground)]">
           {thinkingLevelLabel(
             request.thinkingLevel,
             settings?.thinkingLevels ?? [],
@@ -351,11 +351,11 @@ export function ApiStatsPanel({
       label: t("Input"),
       render: (request) => (
         <div className="space-y-1">
-          <div className="text-stone-900">
+          <div className="text-[var(--foreground)]">
             {formatNullableCompactNumber(request.inputTokens, language)} (
             {formatNullableCompactNumber(request.cacheReadTokens, language)})
           </div>
-          <div className="text-xs text-stone-500">
+          <div className="text-xs text-[var(--muted)]">
             {formatPercent(request.cacheRatio, language)}
           </div>
         </div>
@@ -368,11 +368,11 @@ export function ApiStatsPanel({
       label: t("Output"),
       render: (request) => (
         <div className="space-y-1">
-          <div className="text-stone-900">
+          <div className="text-[var(--foreground)]">
             {formatNullableCompactNumber(request.outputTokens, language)} (
             {formatNullableCompactNumber(request.cacheWriteTokens, language)})
           </div>
-          <div className="text-xs text-stone-500">
+          <div className="text-xs text-[var(--muted)]">
             {t("Reasoning")}:{" "}
             {formatNullableCompactNumber(request.reasoningTokens, language)}
           </div>
@@ -386,13 +386,13 @@ export function ApiStatsPanel({
       label: t("Duration"),
       render: (request) => (
         <div className="space-y-1">
-          <div className="text-stone-900">
+          <div className="text-[var(--foreground)]">
             {formatNullableLatencySeconds(
               request.firstTokenLatencyMs,
               language,
             )}
           </div>
-          <div className="text-xs text-stone-500">
+          <div className="text-xs text-[var(--muted)]">
             {formatNullableLatencySeconds(request.totalLatencyMs, language)}
           </div>
         </div>
@@ -409,7 +409,7 @@ export function ApiStatsPanel({
               {auditStatusText(request.finalState, t)}
             </span>
           </div>
-          <div className="font-mono text-xs text-stone-500">
+          <div className="font-mono text-xs text-[var(--muted)]">
             {formatNullableNumber(request.statusCode, language)}
           </div>
         </div>
@@ -423,7 +423,7 @@ export function ApiStatsPanel({
       render: (request) => (
         <button
           aria-label={t("View request details")}
-          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onClick={() => void openRequestDetail(request)}
           title={t("View request details")}
           type="button"
@@ -501,17 +501,17 @@ export function ApiStatsPanel({
   return (
     <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
-        <section className="rounded-2xl border border-stone-200 bg-white/80 px-4 py-4 shadow-[var(--overlay-shadow)]">
+        <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex min-w-0 items-center gap-3">
-              <span className="inline-flex size-10 items-center justify-center rounded-xl bg-teal-50 text-teal-800">
+              <span className="inline-flex size-10 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
                 <BarChart3 aria-hidden="true" className="size-5" />
               </span>
               <div className="min-w-0">
-                <h2 className="truncate text-lg font-semibold text-stone-950">
+                <h2 className="truncate text-lg font-semibold text-[var(--foreground)]">
                   {t("API details")}
                 </h2>
-                <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                <p className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                   {filters.workspaceId
                     ? (selectedWorkspace?.name ?? filters.workspaceId)
                     : t("All workspaces")}
@@ -524,7 +524,7 @@ export function ApiStatsPanel({
                   ? t("Pause auto refresh")
                   : t("Resume auto refresh")
               }
-              className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+              className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
               onClick={() => {
                 if (autoRefreshEnabled) {
                   pauseAutoRefresh();
@@ -546,7 +546,7 @@ export function ApiStatsPanel({
               )}
             </button>
           </div>
-          <div className="mt-4 grid gap-3 border-t border-stone-200 pt-4 md:grid-cols-2 xl:grid-cols-8">
+          <div className="mt-4 grid gap-3 border-t border-[var(--border)] pt-4 md:grid-cols-2 xl:grid-cols-8">
             <FilterSelect
               label={t("Workspace")}
               onChange={(value) =>
@@ -598,11 +598,11 @@ export function ApiStatsPanel({
               value={filters.status}
             />
             <label className="block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                 {t("Started after")}
               </span>
               <input
-                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                 onChange={(event) =>
                   updateFilters({
                     startedAfter: event.target.value,
@@ -613,11 +613,11 @@ export function ApiStatsPanel({
               />
             </label>
             <label className="block">
-              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                 {t("Started before")}
               </span>
               <input
-                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                 onChange={(event) =>
                   updateFilters({
                     startedBefore: event.target.value,
@@ -631,7 +631,7 @@ export function ApiStatsPanel({
         </section>
 
         {error ? (
-          <div className="rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          <div className="rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
             {error}
           </div>
         ) : null}
@@ -663,8 +663,8 @@ export function ApiStatsPanel({
         </section>
 
         {summary.totalRequests === 0 ? (
-          <section className="rounded-2xl border border-dashed border-stone-300 bg-white/65 px-4 py-8 text-center text-sm font-medium text-stone-500">
-            {isLoading ? t("Loading...") : t("No statistics yet")}
+          <section className="rounded-2xl border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_65%,transparent)] px-4 py-8 text-center text-sm font-medium text-[var(--muted)]">
+            {isLoading ? t("Loading…") : t("No statistics yet")}
           </section>
         ) : (
           <Suspense fallback={<PanelLoadingFallback />}>
@@ -711,37 +711,37 @@ export function ApiStatsPanel({
           </Suspense>
         )}
 
-        <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+        <section className="min-w-0 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
             <div>
-              <h3 className="text-sm font-semibold text-stone-950">
+              <h3 className="text-sm font-semibold text-[var(--foreground)]">
                 {t("Request audit")}
               </h3>
-              <p className="mt-1 text-xs text-stone-500">
+              <p className="mt-1 text-xs text-[var(--muted)]">
                 {t("requests {count}", {
                   count: formatNumber(totalCount, language),
                 })}
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-3">
-              <div className="text-xs text-stone-500">
+              <div className="text-xs text-[var(--muted)]">
                 {t("Output tokens")}:{" "}
                 {formatCompactNumber(totalOutputTokens, language)}
               </div>
               <details className="relative">
-                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 [&::-webkit-details-marker]:hidden">
+                <summary className="inline-flex h-9 cursor-pointer list-none items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] [&::-webkit-details-marker]:hidden">
                   <SlidersHorizontal aria-hidden="true" className="size-4" />
                   {t("Columns")}
                 </summary>
-                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-stone-200 bg-white p-2 shadow-[var(--overlay-shadow)]">
+                <div className="absolute right-0 z-20 mt-2 w-56 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 shadow-[var(--overlay-shadow)]">
                   {aiStatsColumns.map((column) => (
                     <label
-                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                      className="flex min-h-9 cursor-pointer items-center gap-2 rounded-lg px-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                       key={column.id}
                     >
                       <input
                         checked={visibleColumnIds.has(column.id)}
-                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                        className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
                         disabled={
                           visibleColumnIds.has(column.id) &&
                           visibleColumnIds.size === 1
@@ -762,7 +762,7 @@ export function ApiStatsPanel({
             ref={auditTableScrollRef}
           >
             <table className="w-full min-w-max text-left text-sm">
-              <thead className="border-b border-stone-200 bg-white text-xs font-semibold text-stone-500">
+              <thead className="border-b border-[var(--border)] bg-[var(--surface)] text-xs font-semibold text-[var(--muted)]">
                 <tr>
                   {visibleColumns.map((column) => (
                     <th
@@ -776,12 +776,12 @@ export function ApiStatsPanel({
                   ))}
                 </tr>
               </thead>
-              <tbody className="divide-y divide-stone-100">
+              <tbody className="divide-y divide-[var(--border)]">
                 {requests.length ? (
                   requests.map((request) => (
                     <tr
                       key={request.id}
-                      className="align-top hover:bg-teal-50/40"
+                      className="align-top hover:bg-[var(--accent-soft)]"
                     >
                       {visibleColumns.map((column) => (
                         <td
@@ -796,18 +796,18 @@ export function ApiStatsPanel({
                 ) : (
                   <tr>
                     <td
-                      className="px-4 py-10 text-center text-sm text-stone-500"
+                      className="px-4 py-10 text-center text-sm text-[var(--muted)]"
                       colSpan={visibleColumns.length}
                     >
-                      {isLoading ? t("Loading...") : t("No recorded requests")}
+                      {isLoading ? t("Loading…") : t("No recorded requests")}
                     </td>
                   </tr>
                 )}
               </tbody>
             </table>
           </div>
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 px-4 py-3 text-sm">
-            <div className="text-stone-500">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] px-4 py-3 text-sm">
+            <div className="text-[var(--muted)]">
               {t("Showing {start}-{end} of {total}", {
                 end: formatNumber(pageEnd, language),
                 start: formatNumber(pageStart, language),
@@ -815,10 +815,10 @@ export function ApiStatsPanel({
               })}
             </div>
             <div className="flex flex-wrap items-center justify-end gap-3">
-              <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+              <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                 <span>{t("Page size")}</span>
                 <input
-                  className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                   max={500}
                   min={1}
                   onChange={(event) =>
@@ -834,7 +834,7 @@ export function ApiStatsPanel({
               >
                 <button
                   aria-label={t("Previous page")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                   disabled={isLoading || currentPage <= 1}
                   onClick={() => goToAuditPage(currentPage - 1)}
                   title={t("Previous page")}
@@ -846,7 +846,7 @@ export function ApiStatsPanel({
                   item === "ellipsis" ? (
                     <span
                       aria-hidden="true"
-                      className="inline-flex size-9 items-center justify-center text-stone-400"
+                      className="inline-flex size-9 items-center justify-center text-[var(--muted)]"
                       key={`ellipsis-${index}`}
                     >
                       ...
@@ -859,8 +859,8 @@ export function ApiStatsPanel({
                       })}
                       className={`inline-flex h-9 min-w-9 items-center justify-center rounded-lg border px-2 text-sm font-semibold shadow-sm ${
                         item === currentPage
-                          ? "border-teal-700 bg-teal-700 text-white"
-                          : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                          : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       }`}
                       disabled={isLoading}
                       key={item}
@@ -876,7 +876,7 @@ export function ApiStatsPanel({
                 )}
                 <button
                   aria-label={t("Next page")}
-                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                   disabled={
                     isLoading || totalPages === 0 || currentPage >= totalPages
                   }
@@ -920,11 +920,11 @@ function FilterSelect({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <select
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
         onChange={(event) => onChange(event.target.value)}
         value={value}
       >
@@ -962,7 +962,7 @@ function AiRequestDetailDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex min-h-0 items-center justify-center overflow-y-auto bg-stone-950/35 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 flex min-h-0 items-center justify-center overflow-y-auto bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] p-4 backdrop-blur-sm"
       onClick={(event) => {
         if (event.target === event.currentTarget) {
           onClose();
@@ -973,24 +973,24 @@ function AiRequestDetailDialog({
       <section
         aria-labelledby="ai-request-detail-title"
         aria-modal="true"
-        className="flex h-[min(90dvh,56rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        className="flex h-[min(90dvh,56rem)] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
         role="dialog"
       >
-        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+        <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
           <div className="min-w-0">
             <h2
-              className="truncate text-base font-semibold text-stone-950"
+              className="truncate text-base font-semibold text-[var(--foreground)]"
               id="ai-request-detail-title"
             >
               {t("Request details")}
             </h2>
-            <p className="mt-1 truncate text-xs font-medium text-stone-500">
-              {request ? request.id : t("Loading...")}
+            <p className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
+              {request ? request.id : t("Loading…")}
             </p>
           </div>
           <button
             aria-label={t("Close request details")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
             onClick={onClose}
             title={t("Close")}
             type="button"
@@ -1000,22 +1000,22 @@ function AiRequestDetailDialog({
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
           {error ? (
-            <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            <div className="mb-4 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
               {error}
             </div>
           ) : null}
           {isLoading ? (
-            <div className="flex items-center gap-2 py-8 text-sm text-stone-500">
+            <div className="flex items-center gap-2 py-8 text-sm text-[var(--muted)]">
               <LoaderCircle
                 aria-hidden="true"
                 className="size-4 animate-spin"
               />
-              {t("Loading...")}
+              {t("Loading…")}
             </div>
           ) : null}
           {request ? (
             <div className="grid gap-4">
-              <div className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3 md:grid-cols-2 xl:grid-cols-4">
+              <div className="grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 md:grid-cols-2 xl:grid-cols-4">
                 <AuditMeta
                   label={t("Workspace")}
                   value={request.workspaceName}
@@ -1238,7 +1238,7 @@ function ProviderResponseDetail({
           responseBody === null
             ? unavailable
               ? t("Final response detail is unavailable or was pruned.")
-              : t("Waiting for the final provider response...")
+              : t("Waiting for the final provider response…")
             : t("Stored response detail is malformed or unsupported.")
         }
         noticeTone={responseBody === null ? "neutral" : "warning"}
@@ -1482,13 +1482,13 @@ function AuditDetailCard({
 }) {
   const noticeClass =
     noticeTone === "error"
-      ? "border-rose-200 bg-rose-50 text-rose-700"
+      ? "border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]"
       : noticeTone === "warning"
-        ? "border-amber-200 bg-amber-50 text-amber-800"
-        : "border-stone-200 bg-stone-50 text-stone-600";
+        ? "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]"
+        : "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]";
   return (
-    <section className="grid min-w-0 content-start gap-3 rounded-xl border border-stone-200 bg-white p-3">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="grid min-w-0 content-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] p-3">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {notice ? (
         <div className={`rounded-lg border px-3 py-2 text-xs ${noticeClass}`}>
           {notice}
@@ -1541,9 +1541,9 @@ function parseProviderBody(body: string | undefined): JsonValue | null {
 function AuditMeta({ label, value }: { label: string; value: string }) {
   return (
     <div className="min-w-0">
-      <div className="text-xs font-semibold text-stone-500">{label}</div>
+      <div className="text-xs font-semibold text-[var(--muted)]">{label}</div>
       <div
-        className="mt-1 truncate text-sm font-medium text-stone-950"
+        className="mt-1 truncate text-sm font-medium text-[var(--foreground)]"
         title={value}
       >
         {value}
@@ -1694,12 +1694,12 @@ function StatsCard({
   value: string;
 }) {
   return (
-    <article className="rounded-2xl border border-stone-200/80 bg-white p-5 shadow-sm">
-      <div className="flex items-center gap-2 text-sm font-semibold text-stone-600">
+    <article className="rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-sm">
+      <div className="flex items-center gap-2 text-sm font-semibold text-[var(--muted)]">
         <Icon aria-hidden="true" className="size-4" />
         <span>{label}</span>
       </div>
-      <div className="mt-4 font-mono text-3xl font-semibold text-stone-950">
+      <div className="mt-4 font-mono text-3xl font-semibold text-[var(--foreground)]">
         {value}
       </div>
     </article>
@@ -1775,7 +1775,7 @@ function formatTrendBucket(bucket: string, language: AppLanguageId = "en") {
 
 function PanelLoadingFallback() {
   return (
-    <div className="grid min-h-40 w-full place-items-center p-8 text-stone-400">
+    <div className="grid min-h-40 w-full place-items-center p-8 text-[var(--muted)]">
       <LoaderCircle aria-hidden="true" className="size-6 animate-spin" />
     </div>
   );
@@ -1829,22 +1829,22 @@ function auditStatusClass(status: string) {
   const base = "inline-flex rounded-md px-2 py-1 text-xs font-semibold";
 
   if (status === "succeeded" || status === "completed") {
-    return `${base} bg-emerald-100 text-emerald-800`;
+    return `${base} bg-[var(--success-soft)] text-[var(--success-soft-foreground)]`;
   }
 
   if (status === "failed") {
-    return `${base} bg-rose-100 text-rose-700`;
+    return `${base} bg-[var(--danger-soft)] text-[var(--danger)]`;
   }
 
   if (status === "running") {
-    return `${base} bg-amber-100 text-amber-800`;
+    return `${base} bg-[var(--warning-soft)] text-[var(--warning)]`;
   }
 
   if (status === "cancelled") {
-    return `${base} bg-stone-100 text-stone-600`;
+    return `${base} bg-[var(--surface-secondary)] text-[var(--muted)]`;
   }
 
-  return `${base} bg-stone-100 text-stone-600`;
+  return `${base} bg-[var(--surface-secondary)] text-[var(--muted)]`;
 }
 
 function formatJsonValue(value: JsonValue) {
@@ -2140,7 +2140,7 @@ function jsonChildPath(path: string, segment: string | number) {
 }
 
 function jsonContainerSummary(kind: "array" | "object", count: number) {
-  return kind === "array" ? `... ${count} items ` : `... ${count} keys `;
+  return kind === "array" ? `… ${count} items ` : `… ${count} keys `;
 }
 
 function formatAuditDateParts(value: string, language: AppLanguageId = "en") {

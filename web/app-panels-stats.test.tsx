@@ -390,8 +390,8 @@ describe("app-panels-stats verification surfaces", () => {
     expect(appFileName.compareDocumentPosition(appDirectory)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );
-    expect(appFileName).toHaveClass("text-stone-900");
-    expect(appDirectory).toHaveClass("text-stone-400");
+    expect(appFileName).toHaveClass("text-[var(--foreground)]");
+    expect(appDirectory).toHaveClass("text-[var(--muted)]");
     expect(within(appRow).queryByText("web/App.tsx")).not.toBeInTheDocument();
   });
 
@@ -1288,7 +1288,7 @@ describe("app-panels-stats verification surfaces", () => {
       screen.getByRole("button", { name: "Retry phase options" }),
     );
     await user.click(
-      screen.getByRole("menuitem", { name: "Retry with another model..." }),
+      screen.getByRole("menuitem", { name: "Retry with another model…" }),
     );
 
     expect(
@@ -2735,24 +2735,24 @@ describe("app-panels-stats verification surfaces", () => {
     }
 
     expectPlanStatusTone("Merged implementation plan", "Implemented", [
-      "bg-emerald-100",
-      "text-emerald-800",
+      "bg-[var(--success-soft)]",
+      "text-[var(--success)]",
     ]);
     expectPlanStatusTone("Completed status colors", "Completed", [
-      "bg-emerald-100",
-      "text-emerald-800",
+      "bg-[var(--success-soft)]",
+      "text-[var(--success)]",
     ]);
     expectPlanStatusTone("Failed status colors", "Failed", [
-      "bg-rose-100",
-      "text-rose-700",
+      "bg-[var(--danger-soft)]",
+      "text-[var(--danger)]",
     ]);
     expectPlanStatusTone("Cancelled status colors", "Cancelled", [
-      "bg-stone-100",
-      "text-stone-600",
+      "bg-[var(--surface-secondary)]",
+      "text-[var(--muted)]",
     ]);
     expectPlanStatusTone("Ready status colors", "Ready", [
-      "bg-amber-100",
-      "text-amber-800",
+      "bg-[var(--warning-soft)]",
+      "text-[var(--warning)]",
     ]);
   });
 
@@ -3932,16 +3932,16 @@ describe("app-panels-stats verification surfaces", () => {
       within(todoPanel).getByText("Inspect workspace changes"),
     ).toBeInTheDocument();
     expect(within(todoPanel).getByText("running")).toHaveClass(
-      "bg-amber-100",
-      "text-amber-800",
+      "bg-[var(--warning-soft)]",
+      "text-[var(--warning)]",
     );
     expect(within(todoPanel).getByText("completed")).toHaveClass(
-      "bg-emerald-100",
-      "text-emerald-800",
+      "bg-[var(--success-soft)]",
+      "text-[var(--success)]",
     );
     expect(within(todoPanel).getByText("pending")).toHaveClass(
-      "bg-stone-100",
-      "text-stone-600",
+      "bg-[var(--surface-secondary)]",
+      "text-[var(--muted)]",
     );
     expect(within(todoPanel).queryByText("Git diff")).not.toBeInTheDocument();
 
@@ -4478,21 +4478,21 @@ describe("app-panels-stats verification surfaces", () => {
     );
     const table = await screen.findByRole("table");
 
-    expect(within(table).getByText("succeeded")).toHaveClass(
-      "bg-emerald-100",
-      "text-emerald-800",
+    expect(await within(table).findByText("succeeded")).toHaveClass(
+      "bg-[var(--success-soft)]",
+      "text-[var(--success-soft-foreground)]",
     );
     expect(within(table).getByText("failed")).toHaveClass(
-      "bg-rose-100",
-      "text-rose-700",
+      "bg-[var(--danger-soft)]",
+      "text-[var(--danger)]",
     );
     expect(within(table).getByText("running")).toHaveClass(
-      "bg-amber-100",
-      "text-amber-800",
+      "bg-[var(--warning-soft)]",
+      "text-[var(--warning)]",
     );
     expect(within(table).getByText("cancelled")).toHaveClass(
-      "bg-stone-100",
-      "text-stone-600",
+      "bg-[var(--surface-secondary)]",
+      "text-[var(--muted)]",
     );
   });
 

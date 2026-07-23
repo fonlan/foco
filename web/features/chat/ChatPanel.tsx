@@ -387,8 +387,8 @@ function ChatPanelComponent({
   );
   const workspaceName = activeWorkspaceName?.trim();
   const composerPlaceholder = workspaceName
-    ? t("Ask Foco anything about {name}...", { name: workspaceName })
-    : t("Ask Foco anything...");
+    ? t("Ask Foco anything about {name}…", { name: workspaceName })
+    : t("Ask Foco anything…");
   const modelOptions = useMemo(
     () =>
       [...availableModels]
@@ -1053,7 +1053,7 @@ function ChatPanelComponent({
               {hasMoreMessagesBefore || isLoadingMoreMessages ? (
                 <div className="flex justify-center">
                   <button
-                    className="chat-toolbar-button inline-flex items-center gap-2 rounded-lg border border-stone-200 bg-white/80 px-3 py-1.5 text-xs font-semibold text-stone-600"
+                    className="chat-toolbar-button inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] px-3 py-1.5 text-xs font-semibold text-[var(--muted)]"
                     disabled={isLoadingMoreMessages}
                     onClick={requestMoreMessages}
                     type="button"
@@ -1068,7 +1068,7 @@ function ChatPanelComponent({
                     )}
                     <span>
                       {isLoadingMoreMessages
-                        ? t("Loading...")
+                        ? t("Loading…")
                         : t("Load earlier messages")}
                     </span>
                   </button>
@@ -1112,15 +1112,15 @@ function ChatPanelComponent({
               ))}
             </>
           ) : isLoadingMessages ? (
-            <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-stone-500">
+            <div className="flex min-h-48 items-center justify-center gap-2 text-sm font-medium text-[var(--muted)]">
               <LoaderCircle
                 aria-hidden="true"
                 className="size-4 animate-spin"
               />
-              <span>{t("Loading...")}</span>
+              <span>{t("Loading…")}</span>
             </div>
           ) : readOnly ? (
-            <div className="flex min-h-48 items-center justify-center text-sm font-medium text-stone-500">
+            <div className="flex min-h-48 items-center justify-center text-sm font-medium text-[var(--muted)]">
               {t("No transcript records")}
             </div>
           ) : (
@@ -1157,14 +1157,14 @@ function ChatPanelComponent({
             tabIndex={0}
           />
 
-          <div className="composer-shell shrink-0 border-t border-stone-200/80 bg-transparent px-3 py-1.5 sm:px-5">
+          <div className="composer-shell shrink-0 border-t border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-transparent px-3 py-1.5 sm:px-5">
             <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
-              <div className="composer-surface relative rounded-xl border border-stone-300 bg-white">
+              <div className="composer-surface relative rounded-xl border border-[var(--border)] bg-[var(--surface)]">
                 {selectedSkills.length ? (
                   <div className="flex flex-wrap gap-1.5 px-3 pt-2">
                     {selectedSkills.map((skill) => (
                       <span
-                        className="inline-flex max-w-full items-center gap-1 rounded-full border border-teal-200 bg-teal-50 px-2 py-1 text-xs font-semibold text-teal-900"
+                        className="inline-flex max-w-full items-center gap-1 rounded-full border border-[var(--accent)] bg-[var(--accent-soft)] px-2 py-1 text-xs font-semibold text-[var(--accent-soft-foreground)]"
                         key={skill.key}
                       >
                         <span className="max-w-44 truncate">{skill.name}</span>
@@ -1172,7 +1172,7 @@ function ChatPanelComponent({
                           aria-label={t("Remove skill {name}", {
                             name: skill.name,
                           })}
-                          className="inline-flex size-4 items-center justify-center rounded-full text-teal-800 hover:bg-teal-100"
+                          className="inline-flex size-4 items-center justify-center rounded-full text-[var(--accent-soft-foreground)] hover:bg-[var(--accent-soft)]"
                           onClick={() => onRemoveSkill(skill.key)}
                           title={t("Remove skill")}
                           type="button"
@@ -1196,7 +1196,7 @@ function ChatPanelComponent({
                   </div>
                 ) : null}
                 <textarea
-                  className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-stone-900 outline-none placeholder:text-stone-400"
+                  className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-[var(--foreground)] outline-none placeholder:text-[var(--muted)]"
                   name="message"
                   onChange={(event) => onDraftMessageChange(event.target.value)}
                   onKeyDown={(
@@ -1226,14 +1226,14 @@ function ChatPanelComponent({
                   value={draftMessage}
                 />
                 {skillQuery !== null ? (
-                  <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-stone-200 bg-white shadow-[0_20px_46px_rgba(33,31,28,0.16)]">
+                  <div className="absolute bottom-full left-0 z-20 mb-2 w-full overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]">
                     <div className="panel-scroll max-h-64 overflow-y-auto py-1">
                       {skillCatalogStatus === "loading" && !skills.length ? (
-                        <div className="px-3 py-3 text-sm text-stone-500">
-                          {t("Loading skills...")}
+                        <div className="px-3 py-3 text-sm text-[var(--muted)]">
+                          {t("Loading skills…")}
                         </div>
                       ) : skillCatalogStatus === "error" ? (
-                        <div className="px-3 py-3 text-sm text-rose-600">
+                        <div className="px-3 py-3 text-sm text-[var(--danger)]">
                           {skillCatalogError
                             ? t("Failed to load skills: {error}", {
                                 error: skillCatalogError,
@@ -1243,7 +1243,7 @@ function ChatPanelComponent({
                       ) : visibleSkills.length ? (
                         <>
                           {skillCatalogRefreshError ? (
-                            <div className="border-b border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                            <div className="border-b border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-xs text-[var(--warning)]">
                               {t("Skill list refresh failed: {error}", {
                                 error: skillCatalogRefreshError,
                               })}
@@ -1254,7 +1254,7 @@ function ChatPanelComponent({
                             aria-label={t("Select skill {name}", {
                               name: skill.name,
                             })}
-                            className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-stone-50 disabled:cursor-not-allowed disabled:bg-stone-50 disabled:text-stone-400"
+                            className="grid w-full min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-3 px-3 py-2 text-left hover:bg-[var(--surface-secondary)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                             disabled={!skill.enabled}
                             key={skill.key}
                             onClick={() => handleSkillSelect(skill)}
@@ -1266,14 +1266,14 @@ function ChatPanelComponent({
                             type="button"
                           >
                             <span className="min-w-0">
-                              <span className="block truncate text-sm font-semibold text-stone-900">
+                              <span className="block truncate text-sm font-semibold text-[var(--foreground)]">
                                 {skill.name}
                               </span>
-                              <span className="mt-0.5 block truncate text-xs text-stone-500">
+                              <span className="mt-0.5 block truncate text-xs text-[var(--muted)]">
                                 {skill.description}
                               </span>
                             </span>
-                            <span className="self-center rounded-md border border-stone-200 px-1.5 py-0.5 text-[11px] font-semibold text-stone-500">
+                            <span className="self-center rounded-md border border-[var(--border)] px-1.5 py-0.5 text-[11px] font-semibold text-[var(--muted)]">
                               {skill.enabled
                                 ? skillScopeLabel(skill, t)
                                 : t("disabled")}
@@ -1282,7 +1282,7 @@ function ChatPanelComponent({
                           ))}
                         </>
                       ) : (
-                        <div className="px-3 py-3 text-sm text-stone-500">
+                        <div className="px-3 py-3 text-sm text-[var(--muted)]">
                           {skillCatalogRefreshError
                             ? t("Skill list refresh failed: {error}", {
                                 error: skillCatalogRefreshError,
@@ -1402,7 +1402,7 @@ function ChatPanelComponent({
                   {canRetryRun ? (
                     <button
                       aria-label={t("Retry last run")}
-                      className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={onRetryRun}
                       title={t("Retry last run")}
                       type="button"
@@ -1423,8 +1423,8 @@ function ChatPanelComponent({
                       aria-label={runningButtonLabel}
                       className={
                         runningButtonSendsMessage
-                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[var(--overlay-shadow)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
-                          : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
+                          : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                       }
                       disabled={
                         runningButtonSendsMessage &&
@@ -1457,7 +1457,7 @@ function ChatPanelComponent({
                             : undefined
                         }
                         aria-label={t("Send message")}
-                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[var(--overlay-shadow)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
                         disabled={
                           (!draftMessage.trim() && !draftAttachments.length) ||
                           !selectedModelId ||
@@ -1498,7 +1498,7 @@ function ChatPanelComponent({
                 </div>
               </div>
               {branchError ? (
-                <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                <div className="mt-2 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                   {branchError}
                 </div>
               ) : null}
@@ -1654,22 +1654,22 @@ const MessageRow = memo(function MessageRow({
           } ${isPendingUserMessage ? "message-bubble-pending" : ""}`}
           style={{
             backgroundColor: isPendingUserMessage
-              ? "var(--foco-panel-soft)"
+              ? "var(--surface-secondary)"
               : isUser
-                ? "var(--foco-user-surface)"
-                : "var(--foco-panel)",
+                ? "var(--accent-soft)"
+                : "var(--surface)",
             borderColor: isPendingUserMessage
-              ? "var(--foco-border)"
+              ? "var(--border)"
               : isUser
-                ? "var(--foco-user-border)"
-                : "var(--foco-border)",
+                ? "var(--accent)"
+                : "var(--border)",
           }}
         >
           <div
             className={`message-avatar mt-0.5 inline-flex size-8 shrink-0 items-center justify-center rounded-xl ${
               isUser
-                ? "bg-teal-950/45 text-white"
-                : "bg-stone-100 text-stone-700"
+                ? "bg-[color-mix(in_oklab,var(--accent)_45%,transparent)] text-white"
+                : "bg-[var(--surface-secondary)] text-[var(--muted)]"
             }`}
           >
             {isUser ? (
@@ -1797,7 +1797,7 @@ const MessageRow = memo(function MessageRow({
                       const skill = skills.find((item) => item.key === skillId);
                       return (
                         <button
-                          className="rounded-full border border-teal-800/20 bg-white/70 px-2 py-0.5 text-xs text-teal-950"
+                          className="rounded-full border border-[color-mix(in_oklab,var(--accent)_20%,transparent)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-2 py-0.5 text-xs text-[var(--accent-soft-foreground)]"
                           key={skillId}
                           onClick={() =>
                             onEditingSkillIdsChange(
@@ -1816,7 +1816,7 @@ const MessageRow = memo(function MessageRow({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <select
                     aria-label={t("Add skill")}
-                    className="rounded-lg border border-stone-300 bg-white/90 px-2 py-1 text-xs"
+                    className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-2 py-1 text-xs"
                     onChange={(event) => {
                       const skillId = event.target.value;
                       if (skillId && !editingSkillIds.includes(skillId)) {
@@ -1836,7 +1836,7 @@ const MessageRow = memo(function MessageRow({
                       ))}
                   </select>
                   <button
-                    className="rounded-lg border border-stone-300 bg-white/90 px-2 py-1 text-xs"
+                    className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-2 py-1 text-xs"
                     onClick={() =>
                       onSelectEditAttachments((attachments) =>
                         onEditingAttachmentsChange([
@@ -1854,7 +1854,7 @@ const MessageRow = memo(function MessageRow({
                   <div className="flex flex-wrap gap-1.5">
                     {editingAttachments.map((attachment) => (
                       <button
-                        className="rounded-full border border-stone-300 bg-white/70 px-2 py-0.5 text-xs"
+                        className="rounded-full border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-2 py-0.5 text-xs"
                         key={attachment.id}
                         onClick={() =>
                           onEditingAttachmentsChange(
@@ -1876,7 +1876,7 @@ const MessageRow = memo(function MessageRow({
                 <textarea
                   aria-label={t("Edit message")}
                   autoFocus
-                  className="min-h-24 w-full resize-y rounded-xl border border-stone-300 bg-white/90 px-3 py-2 text-sm text-stone-900 outline-none focus:border-teal-700"
+                  className="min-h-24 w-full resize-y rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-3 py-2 text-sm text-[var(--foreground)] outline-none focus:border-[var(--accent)]"
                   disabled={isSavingEdit}
                   onChange={(event) => onEditingTextChange(event.target.value)}
                   onKeyDown={(event) => {
@@ -2041,6 +2041,11 @@ function ComposerSelectMenu({
   options: ComposerSelectOption[];
   selectedValue: string;
 }) {
+  const selectedLabel =
+    options.find((option) => option.value === selectedValue)?.label ?? emptyLabel;
+  // Keep a stable "Label: value" accessible name for tests and screen readers.
+  const triggerAriaLabel = `${ariaLabel}: ${selectedLabel}`;
+
   return (
     <Select
       aria-label={ariaLabel}
@@ -2055,7 +2060,10 @@ function ComposerSelectMenu({
         onChange(String(key));
       }}
     >
-      <Select.Trigger className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium">
+      <Select.Trigger
+        aria-label={triggerAriaLabel}
+        className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium"
+      >
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
         <Select.Value className="composer-select-label min-w-0 flex-1 truncate" />
         <Select.Indicator />
@@ -2263,11 +2271,11 @@ function ReasoningBlock({
     : t("Expand thinking");
 
   return (
-    <div className="reasoning-block min-w-0 rounded-lg border border-stone-200 bg-stone-50/80 p-2 text-stone-600">
+    <div className="reasoning-block min-w-0 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] p-2 text-[var(--muted)]">
       <button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
-        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-stone-700 hover:text-stone-900"
+        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-[var(--muted)] hover:text-[var(--foreground)]"
         onClick={() => setIsExpanded((current) => !current)}
         title={toggleLabel}
         type="button"
@@ -2275,18 +2283,18 @@ function ReasoningBlock({
         {isExpanded ? (
           <ChevronDown
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-teal-700"
+            className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
           />
         ) : (
           <ChevronRight
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-teal-700"
+            className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
           />
         )}
         <span className="shrink-0 font-semibold">{t("Thinking")}</span>
         {isExpanded ? null : (
           <span
-            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
             title={preview}
           >
             {preview}
@@ -2294,7 +2302,7 @@ function ReasoningBlock({
         )}
         {durationLabel && durationTitle ? (
           <span
-            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-stone-500"
+            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--muted)]"
             title={durationTitle}
           >
             {durationLabel}
@@ -2302,7 +2310,7 @@ function ReasoningBlock({
         ) : null}
       </button>
       {isExpanded ? (
-        <div className="mt-2 border-l border-stone-200 pl-3 text-stone-700">
+        <div className="mt-2 border-l border-[var(--border)] pl-3 text-[var(--muted)]">
           <MarkdownContent
             content={reasoning}
             isUser={false}
@@ -2409,7 +2417,7 @@ export const MessagePartBlock = memo(MessagePartBlockComponent);
 
 function ErrorMessagePart({ text }: { text: string }) {
   return (
-    <div className="whitespace-pre-wrap break-words rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm leading-6 text-rose-700">
+    <div className="whitespace-pre-wrap break-words rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm leading-6 text-[var(--danger)]">
       {text}
     </div>
   );
@@ -2445,7 +2453,7 @@ function ComposerAttachmentChip({
       <span className="min-w-0 truncate">{attachment.name}</span>
       <button
         aria-label={t("Remove attachment {name}", { name: attachment.name })}
-        className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-stone-500 hover:bg-stone-200 hover:text-stone-900"
+        className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--default)] hover:text-[var(--foreground)]"
         onClick={onRemove}
         title={t("Remove attachment {name}", { name: attachment.name })}
         type="button"
@@ -2513,7 +2521,7 @@ function ChatReplyMetricsLine({
   ];
 
   return (
-    <div className="flex items-center justify-between gap-2 border-t border-stone-100 pt-2 text-[11px] leading-4 text-stone-400">
+    <div className="flex items-center justify-between gap-2 border-t border-[var(--border)] pt-2 text-[11px] leading-4 text-[var(--muted)]">
       <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
         {values.map((value) => (
           <span className="min-w-0 break-words" key={value}>
@@ -2524,7 +2532,7 @@ function ChatReplyMetricsLine({
       {onOpenApiRequests ? (
         <button
           aria-label={t("View API requests for this reply")}
-          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onClick={onOpenApiRequests}
           title={t("View API requests for this reply")}
           type="button"
@@ -2551,11 +2559,11 @@ function MemoriesUsedBlock({
   }
 
   return (
-    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
-      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
-        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+    <details className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-2 text-xs text-[var(--muted)]">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-[var(--muted)] marker:hidden">
+        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]" />
         <span>{t("Memories used")}</span>
-        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+        <span className="rounded-full bg-[var(--surface)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
           {memories.length}
         </span>
         <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
@@ -2563,16 +2571,16 @@ function MemoriesUsedBlock({
       <div className="mt-2 space-y-2">
         {memories.map((memory) => (
           <div
-            className="min-w-0 rounded-md border border-stone-100 bg-white px-2.5 py-2"
+            className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2"
             key={`${memory.scope}-${memory.id}`}
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-[var(--muted)]">
               <span>{memoryMetaLabel(memory.scope, t)}</span>
               <span>{memoryMetaLabel(memory.kind, t)}</span>
               <span>{memoryMetaLabel(memory.source, t)}</span>
               {memory.pinned ? <span>{t("Pinned")}</span> : null}
             </div>
-            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
+            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-[var(--muted)]">
               {memory.fact}
             </div>
           </div>
@@ -2593,11 +2601,11 @@ function ExtractedMemoriesBlock({
   }
 
   return (
-    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
-      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
-        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+    <details className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-2 text-xs text-[var(--muted)]">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-[var(--muted)] marker:hidden">
+        <Brain aria-hidden="true" className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]" />
         <span>{t("Memories saved")}</span>
-        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+        <span className="rounded-full bg-[var(--surface)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
           {memories.length}
         </span>
         <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
@@ -2605,15 +2613,15 @@ function ExtractedMemoriesBlock({
       <div className="mt-2 space-y-2">
         {memories.map((memory) => (
           <div
-            className="min-w-0 rounded-md border border-stone-100 bg-white px-2.5 py-2"
+            className="min-w-0 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2"
             key={`${memory.scope}-${memory.id}`}
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 text-[10px] font-semibold uppercase tracking-normal text-[var(--muted)]">
               <span>{memoryMetaLabel(memory.scope, t)}</span>
               <span>{memoryMetaLabel(memory.kind, t)}</span>
               <span>{memoryMetaLabel(memory.status, t)}</span>
             </div>
-            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-stone-700">
+            <div className="mt-1 line-clamp-2 break-words text-xs leading-5 text-[var(--muted)]">
               {memory.fact}
             </div>
           </div>
@@ -2635,14 +2643,14 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
   );
 
   return (
-    <details className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-2 text-xs text-stone-600">
-      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-stone-600 marker:hidden">
+    <details className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-2 text-xs text-[var(--muted)]">
+      <summary className="flex cursor-pointer list-none items-center gap-2 font-semibold text-[var(--muted)] marker:hidden">
         <FileText
           aria-hidden="true"
-          className="size-3.5 shrink-0 text-teal-700"
+          className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
         />
         <span>{t("Spec updated")}</span>
-        <span className="rounded-full bg-white px-1.5 py-0.5 text-[10px] text-stone-500">
+        <span className="rounded-full bg-[var(--surface)] px-1.5 py-0.5 text-[10px] text-[var(--muted)]">
           {lineCount}
         </span>
         <ChevronDown aria-hidden="true" className="ml-auto size-3.5 shrink-0" />
@@ -2650,10 +2658,10 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
       <div className="mt-2 space-y-2">
         {updates.map((update) => (
           <div
-            className="min-w-0 overflow-hidden rounded-md border border-stone-100 bg-white"
+            className="min-w-0 overflow-hidden rounded-md border border-[var(--border)] bg-[var(--surface)]"
             key={update.id}
           >
-            <div className="flex min-w-0 flex-wrap items-center gap-1.5 border-b border-stone-100 px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-normal text-stone-400">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 border-b border-[var(--border)] px-2.5 py-1.5 text-[10px] font-semibold uppercase tracking-normal text-[var(--muted)]">
               <span>
                 {t("Revision")} {update.baseRevision} -&gt; {update.revision}
               </span>
@@ -2664,8 +2672,8 @@ function SpecUpdatesBlock({ updates }: { updates: ChatSpecUpdateSummary[] }) {
                 <div
                   className={`whitespace-pre-wrap break-words px-2.5 ${
                     line.kind === "added"
-                      ? "bg-emerald-50 text-emerald-800"
-                      : "bg-rose-50 text-rose-800"
+                      ? "bg-[var(--success-soft)] text-[var(--success)]"
+                      : "bg-[var(--danger-soft)] text-[var(--danger)]"
                   }`}
                   key={`${update.id}-${index}`}
                 >
@@ -3136,20 +3144,20 @@ function managedCommandStatusLabel(
 
 function managedCommandStatusClass(presentation: ManagedCommandPresentation) {
   if (presentation.status === "running" && presentation.isBackgroundStart) {
-    return "border-emerald-200 bg-emerald-50 text-emerald-700";
+    return "border-[var(--success)] bg-[var(--success-soft)] text-[var(--success)]";
   }
   switch (presentation.status) {
     case "running":
-      return "border-amber-200 bg-amber-50 text-amber-800";
+      return "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]";
     case "exited":
-      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+      return "border-[var(--success)] bg-[var(--success-soft)] text-[var(--success)]";
     case "stopped":
     case "timed_out":
-      return "border-stone-200 bg-stone-100 text-stone-600";
+      return "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]";
     case "failed":
-      return "border-rose-200 bg-rose-50 text-rose-700";
+      return "border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]";
     default:
-      return "border-stone-200 bg-stone-50 text-stone-600";
+      return "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]";
   }
 }
 
@@ -3160,7 +3168,7 @@ function CommandChunkLog({ chunks }: { chunks: ManagedCommandChunk[] }) {
 
   return (
     <div
-      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}
+      className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-[var(--border)] pl-3 font-mono text-[11px] leading-5 text-[var(--muted)]`}
     >
       {chunks.map((chunk, index) => (
         <div
@@ -3169,7 +3177,7 @@ function CommandChunkLog({ chunks }: { chunks: ManagedCommandChunk[] }) {
         >
           <span
             className={
-              chunk.stream === "stderr" ? "text-rose-700" : "text-teal-700"
+              chunk.stream === "stderr" ? "text-[var(--danger)]" : "text-[var(--accent-soft-foreground)]"
             }
           >
             [{chunk.stream}
@@ -3223,43 +3231,43 @@ function ManagedCommandSummary({
         ) : null}
       </div>
       {presentation.command ? (
-        <div className="min-w-0 font-mono text-[11px] text-stone-600">
+        <div className="min-w-0 font-mono text-[11px] text-[var(--muted)]">
           {presentation.command}
           {presentation.cwd ? ` · cwd: ${presentation.cwd}` : ""}
         </div>
       ) : null}
       {toolName === "get_command_output" && cursorRange ? (
-        <div className="font-mono text-[11px] text-stone-500">
+        <div className="font-mono text-[11px] text-[var(--muted)]">
           cursor {cursorRange}
         </div>
       ) : null}
       {presentation.cursorExpired ? (
-        <div className="rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
+        <div className="rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-2 py-1.5 text-[11px] text-[var(--warning)]">
           {t("Earlier output was removed from the retained buffer.")}
         </div>
       ) : null}
       <CommandChunkLog chunks={presentation.chunks} />
       {!presentation.chunks.length && presentation.isBackgroundStart ? (
-        <div className="font-mono text-[11px] text-stone-500">
+        <div className="font-mono text-[11px] text-[var(--muted)]">
           {t("Background process started, no output yet")}
         </div>
       ) : null}
       {!presentation.chunks.length && toolName === "get_command_output" ? (
-        <div className="font-mono text-[11px] text-stone-500">
+        <div className="font-mono text-[11px] text-[var(--muted)]">
           {terminal
             ? t("Process ended, no more output")
             : t("Still running, no new output")}
         </div>
       ) : null}
       {presentation.hasMore ? (
-        <div className="font-mono text-[11px] text-amber-800">
+        <div className="font-mono text-[11px] text-[var(--warning)]">
           {t("More output is available; continue with nextCursor {cursor}.", {
             cursor: presentation.nextCursor ?? "-",
           })}
         </div>
       ) : null}
       {toolName === "stop_command" ? (
-        <div className="font-mono text-[11px] text-stone-500">
+        <div className="font-mono text-[11px] text-[var(--muted)]">
           {presentation.status === "stopped"
             ? t("Entire process tree terminated")
             : t("Process tree termination requested")}
@@ -3352,16 +3360,16 @@ function CompactReplacementDiffBlock({
 }) {
   return (
     <div className="min-w-0">
-      <div className="mb-1 font-semibold text-stone-500">Diff</div>
+      <div className="mb-1 font-semibold text-[var(--muted)]">Diff</div>
       <div
-        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto rounded-md border border-stone-200 font-mono text-[11px] leading-5`}
+        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto rounded-md border border-[var(--border)] font-mono text-[11px] leading-5`}
       >
         {diff.lines.map((line, index) => (
           <div
             className={`edit-file-diff-line grid grid-cols-[1.5rem_minmax(0,1fr)] whitespace-pre-wrap break-words px-2 ${
               line.kind === "added"
-                ? "bg-emerald-50 text-emerald-800"
-                : "bg-rose-50 text-rose-800"
+                ? "bg-[var(--success-soft)] text-[var(--success)]"
+                : "bg-[var(--danger-soft)] text-[var(--danger)]"
             }`}
             key={`${line.kind}-${index}`}
           >
@@ -3392,21 +3400,21 @@ function RawToolCallView({
   return (
     <>
       <div className="min-w-0">
-        <div className="mb-1 font-semibold text-stone-500">{t("Input")}</div>
+        <div className="mb-1 font-semibold text-[var(--muted)]">{t("Input")}</div>
         <pre
-          className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5`}
+          className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-[var(--border)] pl-3 font-mono text-[11px] leading-5`}
         >
           {formatJsonValue(input)}
         </pre>
       </div>
       {toolCall.output !== null ? (
         <div className="min-w-0">
-          <div className="mb-1 font-semibold text-stone-500">{t("Output")}</div>
+          <div className="mb-1 font-semibold text-[var(--muted)]">{t("Output")}</div>
           <pre
             className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
               toolCall.isError
-                ? "border-rose-200 text-rose-700"
-                : "border-stone-200"
+                ? "border-[var(--danger)] text-[var(--danger)]"
+                : "border-[var(--border)]"
             }`}
           >
             {formatJsonValue(toolCall.output)}
@@ -3414,11 +3422,11 @@ function RawToolCallView({
         </div>
       ) : liveOutputText ? (
         <div className="min-w-0">
-          <div className="mb-1 font-semibold text-stone-500">
+          <div className="mb-1 font-semibold text-[var(--muted)]">
             {t("Live output")}
           </div>
           <pre
-            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-stone-200 pl-3 font-mono text-[11px] leading-5 text-stone-700`}
+            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-[var(--border)] pl-3 font-mono text-[11px] leading-5 text-[var(--muted)]`}
           >
             {liveOutputText}
           </pre>
@@ -3464,7 +3472,7 @@ function CompactToolCallView({
   if (specMarkdown !== null) {
     return (
       <div
-        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-stone-200 pl-3`}
+        className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto border-l border-[var(--border)] pl-3`}
       >
         <MarkdownContent
           content={specMarkdown}
@@ -3485,8 +3493,8 @@ function CompactToolCallView({
     <pre
       className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l pl-3 font-mono text-[11px] leading-5 ${
         toolCall.isError
-          ? "border-rose-200 text-rose-700"
-          : "border-stone-200 text-stone-700"
+          ? "border-[var(--danger)] text-[var(--danger)]"
+          : "border-[var(--border)] text-[var(--muted)]"
       }`}
     >
       {text}
@@ -3575,18 +3583,18 @@ function ContextCompressionBlock({
       aria-busy={compression.status === "start" ? true : undefined}
       className="tool-call-block group min-w-0"
     >
-      <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden">
+      <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-[var(--muted)] marker:hidden">
         <Shrink
           aria-hidden="true"
-          className="size-3.5 shrink-0 text-teal-700"
+          className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
         />
         <span className="min-w-0 shrink-0 truncate">
           {t("Context compression")}
         </span>
-        <span className="shrink-0 text-stone-300">·</span>
-        <span className="shrink-0 text-stone-500">{kindLabel}</span>
+        <span className="shrink-0 text-[var(--muted)]">·</span>
+        <span className="shrink-0 text-[var(--muted)]">{kindLabel}</span>
         <span
-          className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+          className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
           title={`${savedLabel} · ${modelLabel}`}
         >
           {savedLabel} · {modelLabel}
@@ -3595,10 +3603,10 @@ function ContextCompressionBlock({
           aria-live={compression.status === "start" ? "polite" : undefined}
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${
             compression.status === "completed"
-              ? "bg-emerald-50 text-emerald-700"
+              ? "bg-[var(--success-soft)] text-[var(--success)]"
               : compression.status === "start"
-                ? "bg-amber-50 text-amber-800"
-                : "bg-stone-100 text-stone-600"
+                ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                : "bg-[var(--surface-secondary)] text-[var(--muted)]"
           }`}
         >
           {statusLabel}
@@ -3611,10 +3619,10 @@ function ContextCompressionBlock({
               : statusLabel}
         </span>
       </summary>
-      <div className="mt-2 grid gap-1.5 border-l border-stone-200 pl-3 text-[11px] text-stone-600">
+      <div className="mt-2 grid gap-1.5 border-l border-[var(--border)] pl-3 text-[11px] text-[var(--muted)]">
         {fields.map(([label, value]) => (
           <div className="flex min-w-0 gap-2" key={label}>
-            <span className="w-32 shrink-0 font-semibold text-stone-500">
+            <span className="w-32 shrink-0 font-semibold text-[var(--muted)]">
               {label}
             </span>
             <span className="min-w-0 flex-1 truncate font-mono" title={value}>
@@ -3666,12 +3674,12 @@ function ToolCallBlock({
       ? managedStatusLabel
       : toolStatusText(toolCall, t);
   const summaryStatusClass = toolCall.isError
-    ? "bg-rose-50 text-rose-700"
+    ? "bg-[var(--danger-soft)] text-[var(--danger)]"
     : managedCommand && managedStatusLabel
       ? managedCommandStatusClass(managedCommand)
       : toolCall.status === "completed"
-        ? "bg-emerald-50 text-emerald-700"
-        : "bg-stone-100 text-stone-600";
+        ? "bg-[var(--success-soft)] text-[var(--success)]"
+        : "bg-[var(--surface-secondary)] text-[var(--muted)]";
   const generatedImages = toolCall.isError
     ? []
     : generatedImageFiles(toolCall.name, toolCall.output);
@@ -3713,28 +3721,28 @@ function ToolCallBlock({
       <details className="tool-call-block group min-w-0">
         <summary
           aria-label={`${displayName} (${toolCall.name})`}
-          className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-stone-700 marker:hidden"
+          className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-[var(--muted)] marker:hidden"
           title={toolCall.name}
         >
           <ToolIcon
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-teal-700"
+            className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
           />
           <span className="min-w-0 shrink-0 truncate">{displayName}</span>
           {changeStats ? (
-            <span className="shrink-0 rounded bg-stone-100 px-1.5 py-0.5 font-mono text-[10px] leading-4 text-stone-600">
-              <span className="text-emerald-700">
+            <span className="shrink-0 rounded bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-[10px] leading-4 text-[var(--muted)]">
+              <span className="text-[var(--success)]">
                 +{changeStats.linesAdded}
               </span>{" "}
-              <span className="text-rose-700">-{changeStats.linesRemoved}</span>
+              <span className="text-[var(--danger)]">-{changeStats.linesRemoved}</span>
             </span>
           ) : null}
           {detailText ? (
-            <span className="shrink-0 text-stone-300">·</span>
+            <span className="shrink-0 text-[var(--muted)]">·</span>
           ) : null}
           {detailText ? (
             <span
-              className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-stone-500"
+              className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
               title={detailText}
             >
               {detailText}
@@ -3746,11 +3754,11 @@ function ToolCallBlock({
             {summaryStatusLabel}
           </span>
         </summary>
-        <div className="mt-2 grid gap-2 text-xs text-stone-600">
-          <div className="flex min-w-0 items-start justify-between gap-2 text-[11px] text-stone-500">
+        <div className="mt-2 grid gap-2 text-xs text-[var(--muted)]">
+          <div className="flex min-w-0 items-start justify-between gap-2 text-[11px] text-[var(--muted)]">
             <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
               <span>
-                <span className="font-semibold text-stone-500">
+                <span className="font-semibold text-[var(--muted)]">
                   {t("Started")}
                 </span>{" "}
                 <span>
@@ -3760,7 +3768,7 @@ function ToolCallBlock({
                 </span>
               </span>
               <span>
-                <span className="font-semibold text-stone-500">
+                <span className="font-semibold text-[var(--muted)]">
                   {t("Ended")}
                 </span>{" "}
                 <span>
@@ -3772,7 +3780,7 @@ function ToolCallBlock({
             </div>
             <button
               aria-label={toggleLabel}
-              className="shrink-0 rounded border border-stone-200 bg-white px-2 py-0.5 text-[11px] font-semibold text-stone-600 hover:border-stone-300 hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-teal-200"
+              className="shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[11px] font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
               onClick={() =>
                 setViewMode(viewMode === "compact" ? "raw" : "compact")
               }

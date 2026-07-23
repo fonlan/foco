@@ -403,19 +403,19 @@ describe("app-shell verification surfaces", () => {
     const assistantBubble = (await screen.findByLabelText("Edit (edit_file)"))
       .closest(".message-bubble") as HTMLElement | null;
     expect(userBubble).toHaveClass("message-bubble-user");
-    expect(userBubble).not.toHaveClass("bg-teal-800", "text-white");
+    expect(userBubble).not.toHaveClass("bg-[var(--accent)]", "text-white");
     expect(userBubble?.getAttribute("style")).toContain(
-      "background-color: var(--foco-user-surface)",
+      "background-color: var(--accent-soft)",
     );
     expect(userBubble?.getAttribute("style")).toContain(
-      "border-color: var(--foco-user-border)",
+      "border-color: var(--accent)",
     );
     expect(assistantBubble).toHaveClass("message-bubble-assistant");
     expect(assistantBubble?.getAttribute("style")).toContain(
-      "background-color: var(--foco-panel)",
+      "background-color: var(--surface)",
     );
     expect(assistantBubble?.getAttribute("style")).toContain(
-      "border-color: var(--foco-border)",
+      "border-color: var(--border)",
     );
     expect(userBubble?.querySelector("time")).toHaveAttribute(
       "dateTime",
@@ -474,8 +474,8 @@ describe("app-shell verification surfaces", () => {
     expect(screen.getByText("Need file context.")).toBeInTheDocument();
     expect(screen.getByText("Then answer.")).toBeInTheDocument();
     expect(within(assistantBubble).getByText("Edit")).toBeInTheDocument();
-    expect(screen.getByText("+1")).toHaveClass("text-emerald-700");
-    expect(screen.getByText("-1")).toHaveClass("text-rose-700");
+    expect(screen.getByText("+1")).toHaveClass("text-[var(--success)]");
+    expect(screen.getByText("-1")).toHaveClass("text-[var(--danger)]");
     expect(screen.getByText("README.md")).toBeInTheDocument();
     const diffLines = Array.from(
       assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"),
@@ -484,8 +484,8 @@ describe("app-shell verification surfaces", () => {
     const addedLine = diffLines.find((line) => line.textContent === "+hello world");
     expect(diffLines.some((line) => line.textContent === "-1hello")).toBe(false);
     expect(diffLines.some((line) => line.textContent === "+1hello world")).toBe(false);
-    expect(removedLine).toHaveClass("bg-rose-50", "text-rose-800");
-    expect(addedLine).toHaveClass("bg-emerald-50", "text-emerald-800");
+    expect(removedLine).toHaveClass("bg-[var(--danger-soft)]", "text-[var(--danger)]");
+    expect(addedLine).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
     expect(
@@ -1486,10 +1486,10 @@ describe("app-shell verification surfaces", () => {
       "-Legacy flag",
       "+Modern flag",
     ]);
-    expect(diffLines[0]).toHaveClass("bg-rose-50", "text-rose-800");
-    expect(diffLines[2]).toHaveClass("bg-emerald-50", "text-emerald-800");
-    expect(diffLines[4]).toHaveClass("bg-rose-50", "text-rose-800");
-    expect(diffLines[5]).toHaveClass("bg-emerald-50", "text-emerald-800");
+    expect(diffLines[0]).toHaveClass("bg-[var(--danger-soft)]", "text-[var(--danger)]");
+    expect(diffLines[2]).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
+    expect(diffLines[4]).toHaveClass("bg-[var(--danger-soft)]", "text-[var(--danger)]");
+    expect(diffLines[5]).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
     expect(within(assistantBubble).queryByRole("heading", { name: "Complete Patched Spec" })).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
@@ -1603,8 +1603,8 @@ describe("app-shell verification surfaces", () => {
     expect(
       diffLines.some((line) => /\*\*\*|@@|Move to/.test(line.textContent ?? "")),
     ).toBe(false);
-    expect(diffLines[0]).toHaveClass("bg-rose-50", "text-rose-800");
-    expect(diffLines[1]).toHaveClass("bg-emerald-50", "text-emerald-800");
+    expect(diffLines[0]).toHaveClass("bg-[var(--danger-soft)]", "text-[var(--danger)]");
+    expect(diffLines[1]).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
     expect(
@@ -1929,7 +1929,7 @@ describe("app-shell verification surfaces", () => {
     }
 
     const startStatus = within(startSummary).getByText("Backgrounded");
-    expect(startStatus).toHaveClass("bg-emerald-50", "text-emerald-700");
+    expect(startStatus).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
     expect(outputSummary).toHaveTextContent("Background running");
     expect(stopSummary).toHaveTextContent("Stopped");
 
@@ -2006,7 +2006,7 @@ describe("app-shell verification surfaces", () => {
     }
 
     const completedPill = within(assistantBubble).getByText("已完成");
-    expect(completedPill).toHaveClass("bg-emerald-50", "text-emerald-700");
+    expect(completedPill).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
     expect(within(assistantBubble).queryByText("completed")).not.toBeInTheDocument();
   });
 
@@ -2596,8 +2596,8 @@ describe("app-shell verification surfaces", () => {
     const user = userEvent.setup();
     renderApp();
 
-    const modelTrigger = await screen.findByLabelText("Model");
-    const thinkingTrigger = await screen.findByLabelText("Thinking");
+    const modelTrigger = await screen.findByRole("button", { name: /Model:/ });
+    const thinkingTrigger = await screen.findByRole("button", { name: /Thinking/ });
     const branchTrigger = await screen.findByLabelText("Git branch");
 
     await user.click(modelTrigger);
@@ -3164,7 +3164,7 @@ describe("app-shell verification surfaces", () => {
     );
     const messageList = document.querySelector(".message-list");
     expect(messageList).not.toBeNull();
-    expect(within(messageList as HTMLElement).getByText("Loading...")).toBeInTheDocument();
+    expect(within(messageList as HTMLElement).getByText("Loading…")).toBeInTheDocument();
 
     await userEvent.click(screen.getByText("Tool run"));
     expect(await screen.findByText("Please inspect README.")).toBeInTheDocument();

@@ -612,7 +612,7 @@ export function SkillStorePage({
               title={t("Could not load skills")}
             />
           ) : isLoadingList ? (
-            <LoadingBlock label={t("Loading skills...")} />
+            <LoadingBlock label={t("Loading skills…")} />
           ) : displayedSkills.length ? (
             <ol className="skill-store-list" onScroll={handleListScroll} ref={listRef}>
               {displayedSkills.map((skill, index) => (
@@ -656,7 +656,7 @@ export function SkillStorePage({
               {isLoadingMore ? (
                 <li className="skill-store-loading-more">
                   <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-                  {t("Loading more skills...")}
+                  {t("Loading more skills…")}
                 </li>
               ) : null}
             </ol>
@@ -675,7 +675,7 @@ export function SkillStorePage({
               title={t("No skill selected")}
             />
           ) : isLoadingDetail ? (
-            <LoadingBlock label={t("Loading skill details...")} />
+            <LoadingBlock label={t("Loading skill details…")} />
           ) : detailError ? (
             <StatusBlock
               actionLabel={t("Retry")}

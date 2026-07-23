@@ -83,28 +83,28 @@ export function planAutoRunEnabledStorageKey(workspaceId: string) {
 }
 export const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
 export const ANALYTICS_CHART_COLORS = [
-  "#0f766e",
-  "#2563eb",
-  "#7c3aed",
-  "#dc2626",
-  "#ca8a04",
-  "#16a34a",
-  "#475569",
-  "#db2777",
+  "var(--accent)",
+  "var(--link)",
+  "var(--success)",
+  "var(--danger)",
+  "var(--warning)",
+  "var(--default)",
+  "var(--muted)",
+  "var(--foreground)",
 ];
 export function chartColor(index: number) {
   return ANALYTICS_CHART_COLORS[index % ANALYTICS_CHART_COLORS.length];
 }
 export const chartTooltipStyle: CSSProperties = {
-  backgroundColor: "#ffffff",
-  border: "1px solid #e7e5e4",
+  backgroundColor: "var(--overlay)",
+  border: "1px solid var(--border)",
   borderRadius: "10px",
-  boxShadow: "0 12px 28px rgba(33, 31, 28, 0.14)",
-  color: "#1c1917",
+  boxShadow: "var(--overlay-shadow)",
+  color: "var(--overlay-foreground)",
   fontSize: "12px",
 };
 export const chartTooltipLabelStyle: CSSProperties = {
-  color: "#57534e",
+  color: "var(--muted)",
   fontWeight: 700,
   marginBottom: "4px",
 };

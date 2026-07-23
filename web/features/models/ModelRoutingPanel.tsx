@@ -382,14 +382,14 @@ export function ModelRoutingPanel({
         title={expanded ? t("Collapse model routing") : t("Expand model routing")}
         type="button"
       >
-        <Route aria-hidden="true" className="size-3.5 shrink-0 text-teal-700" />
+        <Route aria-hidden="true" className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]" />
         <span className="model-routing-header-label min-w-0 flex-1 truncate">
           {t("Model routing")}
         </span>
         {expanded ? (
-          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-stone-500" />
+          <ChevronDown aria-hidden="true" className="size-3.5 shrink-0 text-[var(--muted)]" />
         ) : (
-          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-stone-500" />
+          <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-[var(--muted)]" />
         )}
       </button>
 
@@ -479,14 +479,14 @@ export function ModelRoutingPanel({
                           <span className="block truncate font-medium">
                             {model.displayName}
                           </span>
-                          <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
+                          <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
                             {activeProviderLabel}
                           </span>
                         </span>
                         {isModelBusy ? (
                           <LoaderCircle
                             aria-hidden="true"
-                            className="size-3.5 shrink-0 animate-spin text-teal-700"
+                            className="size-3.5 shrink-0 animate-spin text-[var(--accent-soft-foreground)]"
                           />
                         ) : null}
                       </button>
@@ -551,7 +551,7 @@ export function ModelRoutingPanel({
                                 {isActive ? (
                                   <CheckCircle2
                                     aria-hidden="true"
-                                    className="size-3.5 shrink-0 text-teal-700"
+                                    className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
                                   />
                                 ) : null}
                                 {disabledReason ? (
@@ -562,7 +562,7 @@ export function ModelRoutingPanel({
                           );
                         })}
                         {!visibleProviderIds.length ? (
-                          <li className="model-routing-empty px-3 py-2 text-xs text-stone-500">
+                          <li className="model-routing-empty px-3 py-2 text-xs text-[var(--muted)]">
                             {t("No linked providers")}
                           </li>
                         ) : null}
@@ -573,7 +573,7 @@ export function ModelRoutingPanel({
               })}
             </ul>
           ) : (
-            <div className="model-routing-empty px-3 py-3 text-xs text-stone-500">
+            <div className="model-routing-empty px-3 py-3 text-xs text-[var(--muted)]">
               {t("No configured models")}
             </div>
           )}

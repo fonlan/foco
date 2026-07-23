@@ -50,18 +50,111 @@ const MERMAID_CONFIG: Record<string, unknown> = {
   securityLevel: "strict",
   startOnLoad: false,
   theme: "base",
-  themeVariables: {
+};
+
+const MERMAID_THEME_COLORS = {
+  lineColor: ["--border", "rgba(0, 0, 0, 0)"],
+  primaryBorderColor: ["--accent", "#3b82f6"],
+  primaryColor: ["--surface", "#ffffff"],
+  primaryTextColor: ["--foreground", "#343438"],
+  secondaryBorderColor: ["--border-secondary", "#e4e4e7"],
+  secondaryColor: ["--surface-secondary", "#f8f8f8"],
+  tertiaryColor: ["--accent-soft", "#e8f0ff"],
+} as const;
+
+export function mermaidThemeVariables() {
+  return {
     fontFamily:
       "Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif",
-    lineColor: "#78716c",
-    primaryBorderColor: "#0f766e",
-    primaryColor: "#f5f5f4",
-    primaryTextColor: "#1c1917",
-    secondaryBorderColor: "#a8a29e",
-    secondaryColor: "#fafaf9",
-    tertiaryColor: "#ccfbf1",
-  },
-};
+    ...Object.fromEntries(
+      Object.entries(MERMAID_THEME_COLORS).map(([key, [token, fallback]]) => [
+        key,
+        resolveMermaidColor(token, fallback),
+      ]),
+    ),
+  };
+}
+
+function resolveMermaidColor(token: string, fallback: string) {
+  if (typeof document === "undefined") {
+    return fallback;
+  }
+
+  const probe = document.createElement("span");
+  probe.style.color = `var(${token})`;
+  document.body.append(probe);
+  const resolved = getComputedStyle(probe).color;
+  probe.remove();
+
+  return mermaidCompatibleColor(resolved) ?? fallback;
+}
+
+export function mermaidCompatibleColor(value: string) {
+  const color = value.trim();
+  if (/^(?:#[0-9a-f]{3,8}|rgba?\()/i.test(color)) {
+    return color;
+  }
+
+  return oklchToRgba(color);
+}
+
+function oklchToRgba(value: string) {
+  const match = value.match(
+    /^oklch\(\s*([+-]?(?:\d*\.)?\d+%?)\s+([+-]?(?:\d*\.)?\d+)\s+([+-]?(?:\d*\.)?\d+)(?:deg)?(?:\s*\/\s*([+-]?(?:\d*\.)?\d+%?))?\s*\)$/i,
+  );
+  if (!match) {
+    return null;
+  }
+
+  const [lightnessValue, chromaValue, hueValue, alphaValue] = match.slice(1);
+  const lightness = parseCssNumber(lightnessValue, 1);
+  const chroma = Number(chromaValue);
+  const hue = Number(hueValue);
+  const alpha = alphaValue ? parseCssNumber(alphaValue, 1) : 1;
+  if (![lightness, chroma, hue, alpha].every(Number.isFinite)) {
+    return null;
+  }
+
+  const hueRadians = (hue * Math.PI) / 180;
+  const a = chroma * Math.cos(hueRadians);
+  const b = chroma * Math.sin(hueRadians);
+  const l = (lightness + 0.3963377774 * a + 0.2158037573 * b) ** 3;
+  const m = (lightness - 0.1055613458 * a - 0.0638541728 * b) ** 3;
+  const s = (lightness - 0.0894841775 * a - 1.291485548 * b) ** 3;
+  const red = linearToSrgb(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s);
+  const green = linearToSrgb(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s);
+  const blue = linearToSrgb(-0.0041960863 * l - 0.7034186147 * m + 1.707614701 * s);
+
+  const channels = [red, green, blue].map((channel) => Math.round(clamp(channel, 0, 1) * 255));
+  const normalizedAlpha = clamp(alpha, 0, 1);
+  return normalizedAlpha === 1
+    ? `rgb(${channels.join(", ")})`
+    : `rgba(${channels.join(", ")}, ${normalizedAlpha})`;
+}
+
+function parseCssNumber(value: string, percentageScale: number) {
+  return value.endsWith("%")
+    ? Number(value.slice(0, -1)) / 100 * percentageScale
+    : Number(value);
+}
+
+function linearToSrgb(value: number) {
+  return value <= 0.0031308
+    ? value * 12.92
+    : 1.055 * value ** (1 / 2.4) - 0.055;
+}
+
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(Math.max(value, minimum), maximum);
+}
+
+function mermaidConfig() {
+  return {
+    ...MERMAID_CONFIG,
+    themeVariables: mermaidThemeVariables(),
+  };
+}
+
 let mermaidRuntimePromise: Promise<MermaidRuntime> | null = null;
 
 const MARKDOWN_COMPONENTS: Components = {
@@ -222,6 +315,21 @@ function MermaidDiagram({ definition }: { definition: string }) {
   const renderCounterRef = useRef(0);
   const [error, setError] = useState<string | null>(null);
   const [svg, setSvg] = useState("");
+  const [themeRevision, setThemeRevision] = useState(0);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const observer = new MutationObserver(() => {
+      setThemeRevision((current) => current + 1);
+    });
+
+    observer.observe(root, {
+      attributeFilter: ["class", "data-theme"],
+      attributes: true,
+    });
+
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -259,7 +367,7 @@ function MermaidDiagram({ definition }: { definition: string }) {
     return () => {
       cancelled = true;
     };
-  }, [definition, baseRenderId]);
+  }, [definition, baseRenderId, themeRevision]);
 
   if (error !== null) {
     return (
@@ -287,12 +395,10 @@ function MermaidDiagram({ definition }: { definition: string }) {
 }
 
 async function loadMermaidRuntime() {
-  mermaidRuntimePromise ??= import("mermaid").then((module) => {
-    module.default.initialize(MERMAID_CONFIG);
-    return module.default;
-  });
-
-  return mermaidRuntimePromise;
+  mermaidRuntimePromise ??= import("mermaid").then((module) => module.default);
+  const runtime = await mermaidRuntimePromise;
+  runtime.initialize(mermaidConfig());
+  return runtime;
 }
 
 function markdownUrlTransform(imageUrlTransform?: MarkdownImageUrlTransform): UrlTransform {

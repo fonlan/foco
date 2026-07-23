@@ -460,21 +460,21 @@ function WorkspaceFilesTab({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
+      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-xl bg-sky-50 text-sky-800">
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-xl bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <Files aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{t("Files")}</h2>
-            <p className="truncate text-xs font-medium text-stone-500">
+            <p className="truncate text-xs font-medium text-[var(--muted)]">
               {t("Workspace file tree")}
             </p>
           </div>
         </div>
         <button
           aria-label={t("Refresh files")}
-          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:opacity-60"
           disabled={isLoading}
           onClick={onRefresh}
           title={t("Refresh files")}
@@ -489,7 +489,7 @@ function WorkspaceFilesTab({
       </div>
 
       {error ? (
-        <div className="mx-4 mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+        <div className="mx-4 mt-3 rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-xs font-medium text-[var(--danger)]">
           {error}
         </div>
       ) : null}
@@ -515,8 +515,8 @@ function WorkspaceFilesTab({
             />
           </div>
         ) : (
-          <div className="rounded-xl border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
-            {isLoading ? t("Loading files...") : t("No files")}
+          <div className="rounded-xl border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_60%,transparent)] px-3 py-4 text-sm text-[var(--muted)]">
+            {isLoading ? t("Loading files…") : t("No files")}
           </div>
         )}
       </div>
@@ -598,7 +598,7 @@ function WorkspaceFileTreeNodeRow({
         <span className="workspace-file-tree-name" title={node.path || node.name}>
           {node.name}
         </span>
-        {isBusy || isLoadingDirectory ? <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-stone-400" /> : null}
+        {isBusy || isLoadingDirectory ? <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin text-[var(--muted)]" /> : null}
         {!isDirectory ? (
           <span className="workspace-file-tree-size">{formatFileSize(node.sizeBytes)}</span>
         ) : null}
@@ -636,14 +636,14 @@ function TodoGraphPanel({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-4 py-3">
+      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-4 py-3">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-amber-50 text-amber-800">
+          <span className="inline-flex size-9 shrink-0 items-center justify-center rounded-xl bg-[var(--warning-soft)] text-[var(--warning)]">
             <ListChecks aria-hidden="true" className="size-5" />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{t("ToDo graph")}</h2>
-            <p className="truncate text-xs font-medium text-stone-500">
+            <p className="truncate text-xs font-medium text-[var(--muted)]">
               {todoGraph.updatedAt
                 ? t("Updated {time}", {
                   time: formatTodoGraphDate(todoGraph.updatedAt, language),
@@ -655,12 +655,12 @@ function TodoGraphPanel({
         {isLoading ? (
           <LoaderCircle
             aria-hidden="true"
-            className="size-4 shrink-0 animate-spin text-stone-500"
+            className="size-4 shrink-0 animate-spin text-[var(--muted)]"
           />
         ) : null}
       </div>
       {error ? (
-        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
           {error}
         </div>
       ) : null}
@@ -951,37 +951,37 @@ function ContextPlanTab({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-stone-200/80 px-3 py-2">
-        <label className="flex min-w-0 items-start gap-2 text-xs text-stone-700">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
+        <label className="flex min-w-0 items-start gap-2 text-xs text-[var(--muted)]">
           <input
             checked={autoRunEnabled}
-            className="mt-0.5 size-3.5 shrink-0 rounded border-stone-300 text-teal-700 focus:ring-teal-600 disabled:cursor-not-allowed disabled:opacity-60"
+            className="mt-0.5 size-3.5 shrink-0 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:opacity-60"
             disabled={autoRunToggleDisabled}
             onChange={(event) => onAutoRunToggle(event.currentTarget.checked)}
             type="checkbox"
           />
           <span className="min-w-0">
-            <span className="block truncate font-semibold text-stone-800">
+            <span className="block truncate font-semibold text-[var(--foreground)]">
               {t("Auto run plans")}
             </span>
-            <span className="block truncate text-stone-500">
+            <span className="block truncate text-[var(--muted)]">
               {t("Run every active plan in order")}
             </span>
           </span>
         </label>
         {showAutoRunBusy ? (
-          <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2 text-xs font-medium text-amber-700">
+          <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-[var(--warning)] bg-[var(--warning-soft)] px-2 text-xs font-medium text-[var(--warning)]">
             <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
             {t("Auto running")}
           </span>
         ) : autoRunEnabled && autoRunBlockedLabel ? (
-          <span className="inline-flex min-h-6 shrink-0 items-center rounded-full border border-stone-200 bg-stone-50 px-2 py-1 text-xs font-medium text-stone-600">
+          <span className="inline-flex min-h-6 shrink-0 items-center rounded-full border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">
             {autoRunBlockedLabel}
           </span>
         ) : null}
         <button
           aria-label={t("Audit plan worktrees")}
-          className="plan-worktree-audit-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          className="plan-worktree-audit-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={isLoadingWorktreeAudit}
           onClick={toggleWorktreeAudit}
           title={t("Audit plan worktrees")}
@@ -1012,7 +1012,7 @@ function ContextPlanTab({
           <div className="context-empty-state">
             <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
             <h2>{t("Plan")}</h2>
-            <p>{t("Loading plans...")}</p>
+            <p>{t("Loading plans…")}</p>
           </div>
         ) : null}
 
@@ -1033,7 +1033,7 @@ function ContextPlanTab({
         ) : null}
 
         {error && plans.length > 0 ? (
-          <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+          <div className="mb-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-xs font-medium text-[var(--danger)]">
             {error}
           </div>
         ) : null}
@@ -1090,7 +1090,7 @@ function ContextPlanTab({
                       ) : canRetryMerge ? (
                         <button
                           aria-label={t("Retry Merge")}
-                          className="context-memory-pin inline-flex items-center gap-1 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                           disabled={operationKey !== null}
                           onClick={() => onAction(plan.id, "retry_merge")}
                           title={t(planMergeRetryHint(plan))}
@@ -1109,7 +1109,7 @@ function ContextPlanTab({
                       {canReorderPlan ? (
                         <button
                           aria-label={t("Reorder plan")}
-                          className="inline-flex size-8 shrink-0 cursor-grab items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 active:cursor-grabbing disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          className="inline-flex size-8 shrink-0 cursor-grab items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] active:cursor-grabbing disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                           draggable
                           onDragEnd={handlePlanDragEnd}
                           onDragStart={(event) => handlePlanDragStart(event, plan)}
@@ -1122,7 +1122,7 @@ function ContextPlanTab({
                       {action ? (
                         <button
                           aria-label={t(planActionLabel(action))}
-                          className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                          className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                           disabled={operationKey !== null}
                           onClick={() => onAction(plan.id, action)}
                           title={t(planActionLabel(action))}
@@ -1138,7 +1138,7 @@ function ContextPlanTab({
                       ) : null}
                       <button
                         aria-label={t("Delete plan")}
-                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={operationKey !== null}
                         onClick={() => onDeletePlan(plan.id)}
                         title={t("Delete plan")}
@@ -1152,12 +1152,12 @@ function ContextPlanTab({
                       </button>
                     </div>
                   </div>
-                  <h3 className="break-words text-sm font-semibold text-stone-950">
+                  <h3 className="break-words text-sm font-semibold text-[var(--foreground)]">
                     {plan.title}
                   </h3>
                   <p>{plan.overview}</p>
                   {cancelledBarrierPhase ? (
-                    <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                    <div className="mt-2 rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-2 py-1.5 text-xs text-[var(--warning)]">
                       <span className="font-semibold">{cancelledBarrierPhase.title}</span>
                       {": "}
                       {t("Retry the cancelled phase to continue this plan.")}
@@ -1165,7 +1165,7 @@ function ContextPlanTab({
                   ) : null}
                   {plan.errorMessage ? (
                     <div
-                      className="mt-2 rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700"
+                      className="mt-2 rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1.5 text-xs text-[var(--danger)]"
                       title={canRetryMerge ? t(planMergeRetryHint(plan)) : undefined}
                     >
                       {plan.errorMessage}
@@ -1188,7 +1188,7 @@ function ContextPlanTab({
 
                       return (
                         <section
-                          className="rounded-lg border border-stone-200 bg-stone-50/80 px-2.5 py-2"
+                          className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] px-2.5 py-2"
                           key={phase.id}
                         >
                           <div className="flex min-w-0 items-start justify-between gap-2">
@@ -1210,16 +1210,16 @@ function ContextPlanTab({
                             >
                               <ChevronRight
                                 aria-hidden="true"
-                                className={`mt-0.5 size-3.5 shrink-0 text-stone-500 transition-transform ${
+                                className={`mt-0.5 size-3.5 shrink-0 text-[var(--muted)] transition-transform ${
                                   isExpanded ? "rotate-90" : ""
                                 }`}
                               />
                               <div className="min-w-0">
-                                <div className="truncate text-xs font-semibold text-stone-900">
+                                <div className="truncate text-xs font-semibold text-[var(--foreground)]">
                                   {phase.title}
                                 </div>
                                 {phase.summary ? (
-                                  <div className="mt-0.5 line-clamp-2 text-xs text-stone-500">
+                                  <div className="mt-0.5 line-clamp-2 text-xs text-[var(--muted)]">
                                     {phase.summary}
                                   </div>
                                 ) : null}
@@ -1232,7 +1232,7 @@ function ContextPlanTab({
                               {implementationChatId ? (
                                 <button
                                   aria-label={t("Open implementation chat")}
-                                  className="inline-flex size-7 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                  className="inline-flex size-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onClick={() => onOpenPhaseChat(implementationChatId)}
                                   title={t("Open implementation chat")}
                                   type="button"
@@ -1244,7 +1244,7 @@ function ContextPlanTab({
                                 <div className="relative inline-flex h-7 shrink-0 rounded-md shadow-sm">
                                   <button
                                     aria-label={t("Retry plan phase")}
-                                    className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={operationKey !== null}
                                     onClick={() => {
                                       setRetryMenuPhaseKey(null);
@@ -1254,7 +1254,7 @@ function ContextPlanTab({
                                         phase.implementationChatId,
                                       );
                                     }}
-                                    title={isRetrying ? t("Retrying phase...") : t("Retry plan phase")}
+                                    title={isRetrying ? t("Retrying phase…") : t("Retry plan phase")}
                                     type="button"
                                   >
                                     {isRetrying ? (
@@ -1263,14 +1263,14 @@ function ContextPlanTab({
                                       <RefreshCw aria-hidden="true" className="size-3.5 shrink-0" />
                                     )}
                                     <span className="truncate">
-                                      {isRetrying ? t("Retrying...") : t("Retry")}
+                                      {isRetrying ? t("Retrying…") : t("Retry")}
                                     </span>
                                   </button>
                                   <button
                                     aria-expanded={isRetryMenuOpen}
                                     aria-haspopup="menu"
                                     aria-label={t("Retry phase options")}
-                                    className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={operationKey !== null}
                                     onClick={() => {
                                       setRetryMenuPhaseKey((current) =>
@@ -1284,11 +1284,11 @@ function ContextPlanTab({
                                   </button>
                                   {isRetryMenuOpen ? (
                                     <div
-                                      className="absolute right-0 top-8 z-20 min-w-40 rounded-lg border border-stone-200 bg-white py-1 text-xs shadow-lg"
+                                      className="absolute right-0 top-8 z-20 min-w-40 rounded-lg border border-[var(--border)] bg-[var(--surface)] py-1 text-xs shadow-lg"
                                       role="menu"
                                     >
                                       <button
-                                        className="flex w-full items-center gap-2 px-3 py-2 text-left font-medium text-stone-700 hover:bg-stone-50"
+                                        className="flex w-full items-center gap-2 px-3 py-2 text-left font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                                         onClick={() => {
                                           setRetryMenuPhaseKey(null);
                                           setOverrideRetryPhase({ plan, phase });
@@ -1297,7 +1297,7 @@ function ContextPlanTab({
                                         type="button"
                                       >
                                         <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                                        <span className="truncate">{t("Retry with another model...")}</span>
+                                        <span className="truncate">{t("Retry with another model…")}</span>
                                       </button>
                                     </div>
                                   ) : null}
@@ -1308,12 +1308,12 @@ function ContextPlanTab({
                           {isExpanded ? (
                             <div className="mt-2 space-y-2 pl-5">
                               {phase.errorMessage ? (
-                                <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
+                                <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1.5 text-xs text-[var(--danger)]">
                                   {phase.errorMessage}
                                 </div>
                               ) : null}
                               {phase.implementationChatId ? (
-                                <div className="flex min-w-0 items-center gap-1.5 text-xs text-stone-500">
+                                <div className="flex min-w-0 items-center gap-1.5 text-xs text-[var(--muted)]">
                                   <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
                                   <span className="truncate">
                                     {t("Implementation chat")}: {phase.implementationChatId}
@@ -1448,7 +1448,7 @@ function PlanPhaseRetryDialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 grid place-items-center bg-stone-950/35 p-4 backdrop-blur-sm"
+      className="fixed inset-0 z-50 grid place-items-center bg-[color-mix(in_oklab,var(--foreground)_35%,transparent)] p-4 backdrop-blur-sm"
       onMouseDown={(event) => {
         if (event.target === event.currentTarget) {
           onClose();
@@ -1459,22 +1459,22 @@ function PlanPhaseRetryDialog({
       <section
         aria-labelledby="plan-phase-retry-dialog-title"
         aria-modal="true"
-        className="w-full max-w-md overflow-hidden rounded-2xl border border-stone-200 bg-white shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+        className="w-full max-w-md overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
         role="dialog"
       >
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+        <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
           <div className="min-w-0">
             <h2
-              className="truncate text-base font-semibold text-stone-950"
+              className="truncate text-base font-semibold text-[var(--foreground)]"
               id="plan-phase-retry-dialog-title"
             >
               {t("Retry with another model")}
             </h2>
-            <p className="truncate text-xs text-stone-500">{phase.title}</p>
+            <p className="truncate text-xs text-[var(--muted)]">{phase.title}</p>
           </div>
           <button
             aria-label={t("Close retry dialog")}
-            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
             onClick={onClose}
             title={t("Close")}
             type="button"
@@ -1517,24 +1517,24 @@ function PlanPhaseRetryDialog({
               ))}
             </PlanRetrySelect>
           ) : null}
-          <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
+          <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
             {t("Scope: this retry only")}
           </div>
           {formError ? (
-            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            <div className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
               {formError}
             </div>
           ) : null}
           <div className="flex flex-wrap justify-end gap-2">
             <button
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
               onClick={onClose}
               type="button"
             >
               {t("Cancel")}
             </button>
             <button
-              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-teal-700 bg-teal-700 px-3 text-xs font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:border-stone-300 disabled:bg-stone-200 disabled:text-stone-500"
+              className="inline-flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[var(--accent)] bg-[var(--accent)] px-3 text-xs font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--default)] disabled:text-[var(--muted)]"
               disabled={isSubmitting || !modelId || !resolvedProviderId}
               type="submit"
             >
@@ -1543,7 +1543,7 @@ function PlanPhaseRetryDialog({
               ) : (
                 <RefreshCw aria-hidden="true" className="size-3.5" />
               )}
-              {isSubmitting ? t("Retrying...") : t("Retry")}
+              {isSubmitting ? t("Retrying…") : t("Retry")}
             </button>
           </div>
         </form>
@@ -1569,12 +1569,12 @@ function PlanRetrySelect({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <select
         autoFocus={autoFocus}
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         value={value}
@@ -1618,19 +1618,19 @@ function PlanWorktreeAuditPanel({
   const { t } = useI18n();
 
   return (
-    <div className="panel-scroll flex min-h-0 flex-1 flex-col overflow-y-auto border-b border-stone-200 bg-stone-50/80 px-3 py-3">
+    <div className="panel-scroll flex min-h-0 flex-1 flex-col overflow-y-auto border-b border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] px-3 py-3">
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="min-w-0">
-          <h3 className="truncate text-xs font-semibold text-stone-900">
+          <h3 className="truncate text-xs font-semibold text-[var(--foreground)]">
             {t("Legacy worktrees")}
           </h3>
-          <p className="line-clamp-2 text-xs text-stone-500">
+          <p className="line-clamp-2 text-xs text-[var(--muted)]">
             {recoveryNote ?? t("Unmerged implemented plans need manual cherry-pick, merge, or rerun.")}
           </p>
         </div>
         <button
           aria-label={t("Refresh audit")}
-          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={isLoading}
           onClick={() => void onRefresh()}
           title={t("Refresh audit")}
@@ -1644,12 +1644,12 @@ function PlanWorktreeAuditPanel({
         </button>
       </div>
       {error ? (
-        <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1.5 text-xs text-rose-700">
+        <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1.5 text-xs text-[var(--danger)]">
           {error}
         </div>
       ) : null}
       {!error && !isLoading && items.length === 0 ? (
-        <div className="rounded-md border border-stone-200 bg-white px-2 py-1.5 text-xs text-stone-500">
+        <div className="rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs text-[var(--muted)]">
           {t("No legacy worktrees found")}
         </div>
       ) : null}
@@ -1660,7 +1660,7 @@ function PlanWorktreeAuditPanel({
             const isCleanupBusy = operationKey === cleanupKey;
             return (
               <div
-                className="rounded-lg border border-stone-200 bg-white px-2.5 py-2 text-xs text-stone-600 shadow-sm"
+                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 py-2 text-xs text-[var(--muted)] shadow-sm"
                 key={`${item.planId}:${item.phaseId}:${item.agentInstanceId}`}
               >
                 <div className="flex items-start justify-between gap-2">
@@ -1676,29 +1676,29 @@ function PlanWorktreeAuditPanel({
                         <span className="context-memory-kind">{item.headCommitShort}</span>
                       ) : null}
                     </div>
-                    <div className="break-all font-mono text-[11px] text-stone-700">
+                    <div className="break-all font-mono text-[11px] text-[var(--muted)]">
                       {item.planId} / {item.phaseId}
                     </div>
-                    <div className="break-all font-mono text-[11px] text-stone-500">
+                    <div className="break-all font-mono text-[11px] text-[var(--muted)]">
                       {item.worktreePath}
                     </div>
-                    <div className="break-all text-[11px] text-stone-500">
+                    <div className="break-all text-[11px] text-[var(--muted)]">
                       {t("Base")}: {item.baseRevision ?? t("unknown")} | {t("Ref")}: {item.refName ?? item.branch ?? t("unknown")}
                     </div>
                     {item.implementationChatId || item.agentTaskId ? (
-                      <div className="break-all text-[11px] text-stone-500">
+                      <div className="break-all text-[11px] text-[var(--muted)]">
                         {item.implementationChatId ?? t("No implementation chat")} · {item.agentTaskId ?? t("No agent task")}
                       </div>
                     ) : null}
                     {item.errorMessage ? (
-                      <div className="rounded-md border border-rose-200 bg-rose-50 px-2 py-1 text-[11px] text-rose-700">
+                      <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-2 py-1 text-[11px] text-[var(--danger)]">
                         {item.errorMessage}
                       </div>
                     ) : null}
                   </div>
                   <button
                     aria-label={t("Clean up worktree")}
-                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                     disabled={!item.cleanupAllowed || operationKey !== null}
                     onClick={() => void onCleanup(item)}
                     title={item.cleanupAllowed ? t("Clean up worktree") : t("Cleanup unavailable while plan or phase is running")}
@@ -1730,8 +1730,8 @@ function PlanStepRow({ step }: { step: PlanStep }) {
         aria-hidden="true"
         className={`mt-0.5 inline-flex size-4 items-center justify-center rounded border ${
           isComplete
-            ? "border-teal-700 bg-teal-700 text-white"
-            : "border-stone-300 bg-white text-transparent"
+            ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+            : "border-[var(--border)] bg-[var(--surface)] text-transparent"
         }`}
       >
         <CheckCircle2 className="size-3" />
@@ -1740,7 +1740,7 @@ function PlanStepRow({ step }: { step: PlanStep }) {
         <div className="flex min-w-0 items-center gap-2">
           <span
             className={`min-w-0 break-words font-medium ${
-              isComplete ? "text-stone-500 line-through" : "text-stone-800"
+              isComplete ? "text-[var(--muted)] line-through" : "text-[var(--foreground)]"
             }`}
           >
             {step.title}
@@ -1752,10 +1752,10 @@ function PlanStepRow({ step }: { step: PlanStep }) {
           ) : null}
         </div>
         {step.detail ? (
-          <div className="mt-0.5 whitespace-pre-wrap text-stone-500">{step.detail}</div>
+          <div className="mt-0.5 whitespace-pre-wrap text-[var(--muted)]">{step.detail}</div>
         ) : null}
         {step.acceptance.length ? (
-          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-stone-500">
+          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[var(--muted)]">
             {step.acceptance.map((acceptance) => (
               <li key={acceptance}>{acceptance}</li>
             ))}
@@ -1789,7 +1789,7 @@ function ContextMemoryTab({
         <div className="context-empty-state">
           <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
           <h2>{t("Memory")}</h2>
-          <p>{t("Loading...")}</p>
+          <p>{t("Loading…")}</p>
         </div>
       ) : error ? (
         <div className="context-empty-state">
@@ -1896,7 +1896,7 @@ function ContextMemoryGroup({
               >
                 <button
                   aria-label={t("Previous page")}
-                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                   disabled={meta.page <= 1}
                   onClick={() => onPageChange(meta.page - 1)}
                   title={t("Previous page")}
@@ -1908,7 +1908,7 @@ function ContextMemoryGroup({
                   item === "ellipsis" ? (
                     <span
                       aria-hidden="true"
-                      className="context-memory-pagination-control context-memory-pagination-ellipsis inline-flex items-center justify-center text-stone-400"
+                      className="context-memory-pagination-control context-memory-pagination-ellipsis inline-flex items-center justify-center text-[var(--muted)]"
                       key={`cm-ellipsis-${index}`}
                     >
                       ...
@@ -1923,8 +1923,8 @@ function ContextMemoryGroup({
                       })}
                       className={`context-memory-pagination-control inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${
                         item === meta.page
-                          ? "border-teal-700 bg-teal-700 text-white"
-                          : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                          : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                         }`}
                       key={item}
                       onClick={() => onPageChange(item)}
@@ -1939,7 +1939,7 @@ function ContextMemoryGroup({
                 )}
                 <button
                   aria-label={t("Next page")}
-                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                  className="context-memory-pagination-control inline-flex items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                   disabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
                   onClick={() => onPageChange(meta.page + 1)}
                   title={t("Next page")}
@@ -2005,21 +2005,21 @@ function ContextSpecTab({
       <div className="context-empty-state">
         <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
         <h2>{t("Project Spec")}</h2>
-        <p>{t("Loading...")}</p>
+        <p>{t("Loading…")}</p>
       </div>
     );
   }
 
   return (
-    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
+    <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--background-secondary)]">
+      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
         <div className="flex min-w-0 items-center gap-2">
-          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <ScrollText aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold">{t("Project Spec")}</h2>
-            <p className="truncate text-xs font-medium text-stone-500">
+            <p className="truncate text-xs font-medium text-[var(--muted)]">
               {spec
                 ? `${t("Revision")} ${formatNumber(spec.revision, language)}`
                 : t("Workspace spec")}
@@ -2028,7 +2028,7 @@ function ContextSpecTab({
         </div>
         <button
           aria-label={t("Reload spec")}
-          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--default)]/80 hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           disabled={isLoading}
           onClick={onReload}
           title={t("Reload spec")}
@@ -2044,14 +2044,14 @@ function ContextSpecTab({
 
       <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden px-3 py-3">
         {error ? (
-          <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-medium text-rose-700">
+          <div className="rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-xs font-medium text-[var(--danger)]">
             {error}
           </div>
         ) : null}
 
         <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_2.25rem_2.25rem_2.25rem] items-center gap-2">
           <button
-            className="inline-flex min-h-9 min-w-0 items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-teal-900/45 disabled:text-white/70"
+            className="inline-flex min-h-9 min-w-0 items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--accent)]/45 disabled:text-white/70"
             disabled={!enabled || isBusy || isLoading}
             onClick={onGenerate}
             title={generateLabel}
@@ -2066,7 +2066,7 @@ function ContextSpecTab({
           </button>
           <button
             aria-label={t("Save")}
-            className="inline-flex size-9 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+            className="inline-flex size-9 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
             disabled={!canEdit || !isDirty || isBusy || isLoading}
             onClick={onSave}
             title={t("Save")}
@@ -2082,8 +2082,8 @@ function ContextSpecTab({
             aria-label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
             aria-pressed={previewEnabled}
             className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm ${previewEnabled
-                ? "border-teal-300 bg-teal-700 text-white hover:bg-teal-800"
-                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                ? "border-[var(--accent)] bg-[var(--accent)] text-white hover:bg-[var(--accent)]"
+                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
               }`}
             onClick={() => onPreviewChange(!previewEnabled)}
             title={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
@@ -2098,9 +2098,9 @@ function ContextSpecTab({
           <button
             aria-label={t("Inject into new chats")}
             aria-pressed={injectEnabled}
-            className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400 ${injectEnabled
-                ? "border-teal-300 bg-teal-700 text-white hover:bg-teal-800"
-                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+            className={`inline-flex size-9 items-center justify-center rounded-md border shadow-sm disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)] ${injectEnabled
+                ? "border-[var(--accent)] bg-[var(--accent)] text-white hover:bg-[var(--accent)]"
+                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
               }`}
             disabled={!enabled || isBusy || isLoading}
             onClick={() => onSettingsChange(enabled, !injectEnabled)}
@@ -2116,10 +2116,10 @@ function ContextSpecTab({
         </div>
 
         {conflictMessage ? (
-          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+          <div className="rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-xs font-medium text-[var(--warning)]">
             <div>{conflictMessage}</div>
             <button
-              className="mt-2 inline-flex items-center gap-2 rounded-md border border-amber-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-amber-900 hover:bg-amber-100"
+              className="mt-2 inline-flex items-center gap-2 rounded-md border border-[var(--warning)] bg-[var(--surface)] px-2.5 py-1.5 text-xs font-semibold text-[var(--warning)] hover:bg-[var(--warning-soft)]"
               onClick={onReload}
               type="button"
             >
@@ -2135,7 +2135,7 @@ function ContextSpecTab({
 
         <div className="min-h-0 flex-1">
           {previewEnabled ? (
-            <div className="h-full min-h-0 overflow-y-auto rounded-md border border-stone-200 bg-white px-4 py-3">
+            <div className="h-full min-h-0 overflow-y-auto rounded-md border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
               {contentDraft.trim() ? (
                 <MarkdownContent
                   content={contentDraft}
@@ -2149,7 +2149,7 @@ function ContextSpecTab({
           ) : (
             <textarea
               aria-label={t("Project Spec Markdown")}
-              className="h-full min-h-0 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 font-mono text-[13px] leading-5 text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+              className="h-full min-h-0 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-[13px] leading-5 text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
               disabled={!canEdit || isLoading}
               onChange={(event) => onContentChange(event.target.value)}
               placeholder={t("Generate or paste a Project Spec Markdown document.")}
@@ -2158,7 +2158,7 @@ function ContextSpecTab({
           )}
         </div>
 
-        <div className="hidden rounded-md border border-stone-200 bg-white px-3 py-2 text-xs leading-5 text-stone-600 md:block">
+        <div className="hidden rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs leading-5 text-[var(--muted)] md:block">
           {spec ? (
             <>
               <div>
@@ -2172,7 +2172,7 @@ function ContextSpecTab({
                   : t("No spec jobs")}
               </div>
               {latestJob?.errorMessage ? (
-                <div className="break-words text-rose-700">{latestJob.errorMessage}</div>
+                <div className="break-words text-[var(--danger)]">{latestJob.errorMessage}</div>
               ) : null}
             </>
           ) : (
@@ -2204,7 +2204,7 @@ function ContextStatsTab({
       <div className="context-empty-state">
         <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
         <h2>{t("Stats")}</h2>
-        <p>{t("Loading...")}</p>
+        <p>{t("Loading…")}</p>
       </div>
     );
   }
@@ -2268,7 +2268,7 @@ function ContextStatsTab({
           </p>
         </div>
         {isLoading ? (
-          <LoaderCircle aria-label={t("Loading...")} className="size-4 animate-spin" />
+          <LoaderCircle aria-label={t("Loading…")} className="size-4 animate-spin" />
         ) : null}
       </div>
 
@@ -2642,30 +2642,30 @@ function TodoGraphTaskItem({
   return (
     <div>
       <div
-        className="rounded-lg border border-stone-200 bg-white shadow-sm transition hover:border-stone-300 hover:bg-stone-50"
+        className="rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-sm transition hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
         style={{ marginLeft: level ? Math.min(level * 14, 42) : 0 }}
       >
         <button
           aria-controls={bodyId}
           aria-expanded={isExpanded}
-          className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-stone-300"
+          className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-[var(--border)]"
           onClick={() => setIsExpanded((current) => !current)}
           type="button"
         >
           {isExpanded ? (
             <ChevronDown
               aria-hidden="true"
-              className="mt-0.5 size-3.5 shrink-0 text-stone-500"
+              className="mt-0.5 size-3.5 shrink-0 text-[var(--muted)]"
             />
           ) : (
             <ChevronRight
               aria-hidden="true"
-              className="mt-0.5 size-3.5 shrink-0 text-stone-500"
+              className="mt-0.5 size-3.5 shrink-0 text-[var(--muted)]"
             />
           )}
           <div className="min-w-0 flex-1">
             <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className="font-mono text-[11px] font-semibold text-stone-500">
+              <span className="font-mono text-[11px] font-semibold text-[var(--muted)]">
                 {task.id}
               </span>
               <span className={taskStatusClass(task.status)}>
@@ -2673,14 +2673,14 @@ function TodoGraphTaskItem({
               </span>
             </div>
             <h3
-              className={`mt-1 break-words text-sm font-semibold leading-snug text-stone-950 ${isExpanded ? "" : "line-clamp-2"
+              className={`mt-1 break-words text-sm font-semibold leading-snug text-[var(--foreground)] ${isExpanded ? "" : "line-clamp-2"
                 }`}
             >
               {task.title}
             </h3>
             {task.summary ? (
               <p
-                className={`mt-1 break-words text-xs leading-5 text-stone-600 ${isExpanded ? "" : "line-clamp-2"
+                className={`mt-1 break-words text-xs leading-5 text-[var(--muted)] ${isExpanded ? "" : "line-clamp-2"
                   }`}
               >
                 {task.summary}
@@ -2694,7 +2694,7 @@ function TodoGraphTaskItem({
               <div className="mt-1 flex flex-wrap gap-1.5">
                 {task.dependsOn.map((dependencyId) => (
                   <span
-                    className="rounded-md bg-stone-100 px-1.5 py-0.5 font-mono text-[11px] text-stone-600"
+                    className="rounded-md bg-[var(--surface-secondary)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--muted)]"
                     key={dependencyId}
                   >
                     {dependencyId}
@@ -2703,12 +2703,12 @@ function TodoGraphTaskItem({
               </div>
             ) : null}
             {task.acceptance.length ? (
-              <ul className="mt-2 space-y-1 text-xs leading-5 text-stone-600">
+              <ul className="mt-2 space-y-1 text-xs leading-5 text-[var(--muted)]">
                 {task.acceptance.map((item, index) => (
                   <li className="flex gap-2" key={`${task.id}-acceptance-${index}`}>
                     <CheckCircle2
                       aria-hidden="true"
-                      className="mt-0.5 size-3.5 shrink-0 text-teal-700"
+                      className="mt-0.5 size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
                     />
                     <span className="min-w-0 break-words">{item}</span>
                   </li>
@@ -2776,17 +2776,17 @@ function SourceControlPanel({
   const isCommitMessageInputDisabled = isCommitting || isGeneratingCommitMessage;
 
   return (
-    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--foco-canvas-raised)]">
-      <div className="flex items-center justify-between gap-3 border-b border-stone-200/80 px-3 py-2">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--background-secondary)]">
+      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
         <div className="flex min-w-0 flex-1 items-center gap-2">
-          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-teal-50 text-teal-800">
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <GitCompare aria-hidden="true" className="size-4" />
           </span>
           <div className="min-w-0 flex-1">
             <span className="foco-eyebrow">{t("Source Control")}</span>
             <select
               aria-label={t("Source Control target")}
-              className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-stone-300 bg-white px-2 py-1 text-xs font-medium text-stone-700 shadow-sm outline-none focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+              className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--muted)] shadow-sm outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
               disabled={sourceControlTargets.length <= 1 || isLoading}
               onChange={(event) => onTargetChange(event.target.value)}
               title={t("Source Control target")}
@@ -2802,7 +2802,7 @@ function SourceControlPanel({
         </div>
         <button
           aria-label={t("Refresh diff")}
-          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-stone-600 hover:bg-stone-200/80 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-400"
+          className="inline-flex size-8 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--default)]/80 hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           disabled={isLoading}
           onClick={onRefresh}
           title={t("Refresh diff")}
@@ -2817,7 +2817,7 @@ function SourceControlPanel({
       </div>
 
       {diffError ? (
-        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
           {diffError}
         </div>
       ) : null}
@@ -2826,7 +2826,7 @@ function SourceControlPanel({
         <form className="mb-3 space-y-2 px-1" onSubmit={onCommit}>
           <div className="relative">
             <textarea
-              className="min-h-20 w-full resize-none rounded-md border border-stone-300 bg-white px-3 py-2 pr-11 text-sm text-stone-900 shadow-inner outline-none placeholder:text-stone-400 focus:border-teal-500 focus:ring-2 focus:ring-teal-100"
+              className="min-h-20 w-full resize-none rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 pr-11 text-sm text-[var(--foreground)] shadow-inner outline-none placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
               disabled={isCommitMessageInputDisabled}
               onChange={(event) => onCommitMessageChange(event.target.value)}
               placeholder={t("Commit message")}
@@ -2834,7 +2834,7 @@ function SourceControlPanel({
             />
             <button
               aria-label={t("Generate commit message")}
-              className="absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-md text-teal-700 hover:bg-teal-50 hover:text-teal-900 disabled:cursor-not-allowed disabled:text-stone-300 disabled:hover:bg-transparent"
+              className="absolute right-2 top-2 inline-flex size-7 items-center justify-center rounded-md text-[var(--accent-soft-foreground)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
               disabled={isCommitMessageInputDisabled || stagedFiles.length === 0}
               onClick={onGenerateCommitMessage}
               title={t("Generate commit message")}
@@ -2848,7 +2848,7 @@ function SourceControlPanel({
             </button>
           </div>
           <button
-            className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-teal-700 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-teal-800 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:text-stone-500"
+            className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:text-[var(--muted)]"
             disabled={isCommitMessageInputDisabled || !gitCommitMessage.trim() || stagedFiles.length === 0}
             type="submit"
           >
@@ -2858,7 +2858,7 @@ function SourceControlPanel({
         </form>
 
         <section className="mb-3">
-          <div className="mb-1 flex items-center justify-between px-1 text-[11px] font-semibold uppercase tracking-wide text-stone-500">
+          <div className="mb-1 flex items-center justify-between px-1 text-[11px] font-semibold uppercase tracking-wide text-[var(--muted)]">
             <span>{t("Staged Changes")}</span>
             <span>{stagedFiles.length}</span>
           </div>
@@ -2879,7 +2879,7 @@ function SourceControlPanel({
                 />
               ))
             ) : (
-              <div className="rounded-md border border-dashed border-stone-300 bg-white/70 px-3 py-2 text-xs text-stone-500">
+              <div className="rounded-md border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-3 py-2 text-xs text-[var(--muted)]">
                 {t("No staged changes")}
               </div>
             )}
@@ -2895,7 +2895,7 @@ function SourceControlPanel({
             <span className="truncate text-[11px] font-semibold uppercase tracking-wide">
               {t("Changes")}
             </span>
-            <span className="text-xs text-stone-500">{files.length}</span>
+            <span className="text-xs text-[var(--muted)]">{files.length}</span>
           </button>
           <div className="mt-1 space-y-0.5">
             {files.length ? (
@@ -2914,7 +2914,7 @@ function SourceControlPanel({
                 />
               ))
             ) : (
-              <div className="rounded-md border border-dashed border-stone-300 bg-white/70 px-3 py-2 text-xs text-stone-500">
+              <div className="rounded-md border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_70%,transparent)] px-3 py-2 text-xs text-[var(--muted)]">
                 {t("No changes")}
               </div>
             )}
@@ -2970,11 +2970,11 @@ function GitFileRow({
             <ChevronRight aria-hidden="true" className="size-3.5 shrink-0" />
           )}
           <span className="flex min-w-0 flex-1 items-baseline gap-1.5 text-left">
-            <span className="min-w-0 truncate text-[13px] font-medium text-stone-900">
+            <span className="min-w-0 truncate text-[13px] font-medium text-[var(--foreground)]">
               {pathParts.name}
             </span>
             {pathParts.directory ? (
-              <span className="shrink truncate text-xs text-stone-400">
+              <span className="shrink truncate text-xs text-[var(--muted)]">
                 {pathParts.directory}
               </span>
             ) : null}
@@ -2983,7 +2983,7 @@ function GitFileRow({
         <span className={gitStatusBadgeClass(label)}>{label}</span>
         <button
           aria-label={t(action === "stage" ? "Stage file" : "Unstage file")}
-          className="inline-flex size-6 shrink-0 items-center justify-center rounded text-stone-500 hover:bg-stone-200 hover:text-stone-950 disabled:cursor-not-allowed disabled:text-stone-300"
+          className="inline-flex size-6 shrink-0 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--default)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           disabled={gitOperationKey !== null}
           onClick={(event) => {
             event.stopPropagation();
@@ -3003,7 +3003,7 @@ function GitFileRow({
         {showDiscard ? (
           <button
             aria-label={t("Discard file changes")}
-            className="inline-flex size-6 shrink-0 items-center justify-center rounded text-stone-500 hover:bg-rose-100 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
+            className="inline-flex size-6 shrink-0 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
             disabled={gitOperationKey !== null}
             onClick={(event) => {
               event.stopPropagation();
@@ -3046,9 +3046,9 @@ function InlineGitDiff({
 
   if (isLoading) {
     return (
-      <div className="ml-5 mt-1 flex items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 py-3 text-xs font-medium text-stone-500">
+      <div className="ml-5 mt-1 flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-3 text-xs font-medium text-[var(--muted)]">
         <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-        {t("Loading...")}
+        {t("Loading…")}
       </div>
     );
   }
@@ -3067,7 +3067,7 @@ function InlineGitDiff({
     <div className="ml-5 mt-1 space-y-2">
       {matchingSections.map((section) => (
         <div key={section.kind} className="space-y-2">
-          <div className="text-[11px] font-semibold uppercase text-stone-500">
+          <div className="text-[11px] font-semibold uppercase text-[var(--muted)]">
             {t(section.kind === "staged" ? "Staged" : "Unstaged")}
           </div>
           {section.files.map((file) =>
@@ -3077,7 +3077,7 @@ function InlineGitDiff({
               </InlineGitDiffNotice>
             ) : (
               <div
-                className="panel-scroll max-h-[min(30rem,52dvh)] overflow-auto rounded-lg border border-stone-200 bg-white py-2 font-mono text-[11px] leading-5 shadow-sm"
+                className="panel-scroll max-h-[min(30rem,52dvh)] overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] py-2 font-mono text-[11px] leading-5 shadow-sm"
                 key={`${section.kind}-${file.path}`}
               >
                 {file.lines.map((line, index) => (
@@ -3085,7 +3085,7 @@ function InlineGitDiff({
                     className={diffLineClass(line.kind)}
                     key={`${section.kind}-${file.path}-${index}`}
                   >
-                    <span className="select-none pr-2 text-stone-400">
+                    <span className="select-none pr-2 text-[var(--muted)]">
                       {line.prefix}
                     </span>
                     <span>{line.text || " "}</span>
@@ -3102,7 +3102,7 @@ function InlineGitDiff({
 
 function InlineGitDiffNotice({ children }: { children: ReactNode }) {
   return (
-    <div className="flex items-center gap-2 rounded-lg border border-stone-200 bg-stone-50 px-3 py-3 text-xs font-medium text-stone-500">
+    <div className="flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs font-medium text-[var(--muted)]">
       <FileText aria-hidden="true" className="size-3.5 shrink-0" />
       <span>{children}</span>
     </div>
@@ -3165,7 +3165,7 @@ export function ContextPanelSidebar({
   }, []);
 
   return (
-    <aside className="context-sidebar diff-sidebar min-w-0 border-stone-200/80 lg:border-l">
+    <aside className="context-sidebar diff-sidebar min-w-0 border-[color-mix(in_oklab,var(--border)_80%,transparent)] lg:border-l">
       <div className="relative flex h-full min-h-0 min-w-0 flex-col">
         <div
           aria-label={t("Resize context panel")}
@@ -3272,18 +3272,18 @@ function taskStatusClass(status: TaskStatus) {
   const base = "inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold";
 
   if (status === "completed") {
-    return `${base} bg-emerald-100 text-emerald-800`;
+    return `${base} bg-[var(--success-soft)] text-[var(--success-soft-foreground)]`;
   }
 
   if (status === "running" || status === "ready") {
-    return `${base} bg-amber-100 text-amber-800`;
+    return `${base} bg-[var(--warning-soft)] text-[var(--warning)]`;
   }
 
   if (status === "failed") {
-    return `${base} bg-rose-100 text-rose-700`;
+    return `${base} bg-[var(--danger-soft)] text-[var(--danger)]`;
   }
 
-  return `${base} bg-stone-100 text-stone-600`;
+  return `${base} bg-[var(--surface-secondary)] text-[var(--muted)]`;
 }
 
 function earliestIncompletePlanPhase(plan: Plan) {
@@ -3427,29 +3427,29 @@ function planPhaseStatusLabel(status: string) {
 function planStatusClass(status: PlanStatus) {
   const base = "inline-flex rounded-md px-2 py-0.5 text-[11px] font-semibold";
   if (status === "implemented" || status === "completed") {
-    return `${base} bg-emerald-100 text-emerald-800`;
+    return `${base} bg-[var(--success-soft)] text-[var(--success-soft-foreground)]`;
   }
   if (status === "ready" || status === "running" || status === "blocked") {
-    return `${base} bg-amber-100 text-amber-800`;
+    return `${base} bg-[var(--warning-soft)] text-[var(--warning)]`;
   }
   if (status === "failed") {
-    return `${base} bg-rose-100 text-rose-700`;
+    return `${base} bg-[var(--danger-soft)] text-[var(--danger)]`;
   }
-  return `${base} bg-stone-100 text-stone-600`;
+  return `${base} bg-[var(--surface-secondary)] text-[var(--muted)]`;
 }
 
 function planPhaseStatusClass(status: string) {
   const base = "inline-flex shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
   if (status === "completed" || status === "implemented") {
-    return `${base} bg-emerald-100 text-emerald-800`;
+    return `${base} bg-[var(--success-soft)] text-[var(--success-soft-foreground)]`;
   }
   if (status === "ready" || status === "running" || status === "blocked") {
-    return `${base} bg-amber-100 text-amber-800`;
+    return `${base} bg-[var(--warning-soft)] text-[var(--warning)]`;
   }
   if (status === "failed") {
-    return `${base} bg-rose-100 text-rose-700`;
+    return `${base} bg-[var(--danger-soft)] text-[var(--danger)]`;
   }
-  return `${base} bg-stone-100 text-stone-600`;
+  return `${base} bg-[var(--surface-secondary)] text-[var(--muted)]`;
 }
 
 function workspaceSpecJobStatusLabel(status: string) {
@@ -3551,8 +3551,8 @@ function contextSourceLabel(source: string, t: Translate) {
 
 function diffFileButtonClass(active: boolean) {
   return `diff-file-button flex min-h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg px-2 py-1.5 text-sm ${active
-      ? "diff-file-button-active bg-teal-50 text-teal-950 shadow-sm"
-      : "text-stone-700 hover:bg-stone-50 hover:text-stone-950"
+      ? "diff-file-button-active bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)] shadow-sm"
+      : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
     }`;
 }
 
@@ -3581,14 +3581,14 @@ function gitStatusBadgeClass(label: string) {
   const status = label[0] ?? ".";
   const colorClass =
     status === "M"
-      ? "bg-amber-100 text-amber-700 border-amber-200"
+      ? "bg-[var(--warning-soft)] text-[var(--warning)] border-[var(--warning)]"
       : status === "U" || status === "A"
-        ? "bg-emerald-100 text-emerald-700 border-emerald-200"
+        ? "bg-[var(--success-soft)] text-[var(--success-soft-foreground)] border-[var(--success)]"
         : status === "D"
-          ? "bg-rose-100 text-rose-700 border-rose-200"
+          ? "bg-[var(--danger-soft)] text-[var(--danger)] border-[var(--danger)]"
           : status === "R"
-            ? "bg-sky-100 text-sky-700 border-sky-200"
-            : "bg-stone-100 text-stone-600 border-stone-200";
+            ? "bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)] border-[var(--accent)]"
+            : "bg-[var(--surface-secondary)] text-[var(--muted)] border-[var(--border)]";
 
   return `shrink-0 rounded border px-1.5 py-0.5 font-mono text-[11px] font-semibold leading-none ${colorClass}`;
 }

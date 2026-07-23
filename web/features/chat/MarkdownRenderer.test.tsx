@@ -6,11 +6,26 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   handleMarkdownAnchorClick,
   MarkdownRenderer,
+  mermaidCompatibleColor,
+  mermaidThemeVariables,
 } from "./MarkdownRenderer";
 
 describe("MarkdownRenderer", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("converts OKLCH values before passing them to Mermaid", () => {
+    const resolved = mermaidCompatibleColor("oklch(0.9702 0 0)");
+
+    expect(resolved).toMatch(/^rgb\(\d+, \d+, \d+\)$/);
+    expect(mermaidCompatibleColor("var(--accent-soft)")).toBeNull();
+  });
+
+  it("never passes unresolved CSS variables to Mermaid theme configuration", () => {
+    const themeVariables = mermaidThemeVariables();
+
+    expect(Object.values(themeVariables).join(" ")).not.toContain("var(");
   });
 
   it("renders markdown links with a safe new-tab target", () => {

@@ -2692,20 +2692,20 @@ describe("app-settings verification surfaces", () => {
       return text.parentElement as HTMLElement;
     };
     expect(dreamStatusPill("Completed")).toHaveClass(
-      "bg-emerald-50",
-      "text-emerald-700",
+      "bg-[var(--success-soft)]",
+      "text-[var(--success-soft-foreground)]",
     );
     expect(dreamStatusPill("Failed")).toHaveClass(
-      "bg-rose-50",
-      "text-rose-700",
+      "bg-[var(--danger-soft)]",
+      "text-[var(--danger)]",
     );
     expect(dreamStatusPill("Running")).toHaveClass(
-      "bg-amber-50",
-      "text-amber-800",
+      "bg-[var(--warning-soft)]",
+      "text-[var(--warning)]",
     );
     expect(dreamStatusPill("Cancelled")).toHaveClass(
-      "bg-stone-50",
-      "text-stone-500",
+      "bg-[var(--surface-secondary)]",
+      "text-[var(--muted)]",
     );
     expect(screen.queryByText("Some remote Dream history is unavailable")).toBeNull();
   });

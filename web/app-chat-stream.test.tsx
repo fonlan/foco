@@ -144,6 +144,16 @@ function configureRemoteChat() {
   return { chatKey, remoteWorkspace };
 }
 
+
+function isDisabledControl(el: HTMLElement) {
+  return (
+    el.getAttribute("aria-disabled") === "true" ||
+    el.getAttribute("data-disabled") === "true" ||
+    el.hasAttribute("disabled") ||
+    (el as HTMLButtonElement).disabled === true
+  );
+}
+
 describe("app-chat-stream verification surfaces", () => {
   beforeEach(() => {
     resetAppTestEnvironment();
@@ -543,7 +553,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText(remoteWorkspace.name));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
       "/",
     );
 
@@ -587,7 +597,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     const composer = await screen.findByPlaceholderText(
-      "Ask Foco anything about Remote project...",
+      "Ask Foco anything about Remote project…",
     );
     await userEvent.type(composer, "/");
     await userEvent.click(
@@ -651,7 +661,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
       "/",
     );
 
@@ -713,7 +723,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const remoteComposer = await screen.findByPlaceholderText(
-      "Ask Foco anything about Remote project...",
+      "Ask Foco anything about Remote project…",
     );
     await userEvent.clear(remoteComposer);
     await userEvent.type(remoteComposer, "/");
@@ -722,7 +732,7 @@ describe("app-chat-stream verification surfaces", () => {
       screen.queryByRole("button", { name: "Select skill Current skill" }),
     ).not.toBeInTheDocument();
     expect(
-      await screen.findByText("Loading skills..."),
+      await screen.findByText("Loading skills…"),
     ).toBeInTheDocument();
 
     remoteGate.resolve(
@@ -817,7 +827,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     const remoteComposer = await screen.findByPlaceholderText(
-      "Ask Foco anything about Remote project...",
+      "Ask Foco anything about Remote project…",
     );
     await userEvent.clear(remoteComposer);
     await userEvent.type(remoteComposer, "Send before catalog ready");
@@ -922,10 +932,10 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
       "/",
     );
-    expect(await screen.findByText("Loading skills...")).toBeInTheDocument();
+    expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
     expect(
       screen.queryByRole("button", { name: "Select skill Late local skill" }),
     ).not.toBeInTheDocument();
@@ -1000,10 +1010,10 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
       "/",
     );
-    expect(await screen.findByText("Loading skills...")).toBeInTheDocument();
+    expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
 
     // Authoritative ready catalog without gitmemo prunes the selection.
     remoteGate.resolve(
@@ -1105,7 +1115,7 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project..."),
+      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
       "/",
     );
 
@@ -1160,16 +1170,16 @@ describe("app-chat-stream verification surfaces", () => {
 
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
 
     expect(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "OpenAI: GPT Test" }),
+      screen.queryByRole("option", { name: "OpenAI: GPT Test" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: "Anthropic: GPT Test" }),
+      screen.queryByRole("option", { name: "Anthropic: GPT Test" }),
     ).not.toBeInTheDocument();
   });
 
@@ -1214,9 +1224,9 @@ describe("app-chat-stream verification surfaces", () => {
       await screen.findByRole("button", { name: "Fast mode" }),
     ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByLabelText("Model"));
-    const modelOption = screen.getByRole("button", {
-      name: "Model: GPT Test",
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
+    const modelOption = screen.getByRole("option", {
+      name: "GPT Test",
     });
     expect(within(modelOption).queryByText("Fast")).not.toBeInTheDocument();
   });
@@ -1261,9 +1271,9 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Model: GPT Standard" }),
+      screen.getByRole("option", { name: "GPT Standard" }),
     );
     expect(
       screen.queryByText("Fast mode is not available for the selected model."),
@@ -1272,9 +1282,9 @@ describe("app-chat-stream verification surfaces", () => {
       screen.queryByRole("button", { name: "Fast mode" }),
     ).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     );
     const restoredFastToggle = await screen.findByRole("button", {
       name: "Fast mode",
@@ -1335,9 +1345,9 @@ describe("app-chat-stream verification surfaces", () => {
       ).getByRole("button", { name: "Enable Fast" }),
     );
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Model: Anthropic Standard" }),
+      screen.getByRole("option", { name: "Anthropic Standard" }),
     );
     expect(
       screen.queryByText("Fast mode is not available for the selected model."),
@@ -1579,7 +1589,7 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
-      `Ask Foco anything about Remote project...`,
+      `Ask Foco anything about Remote project…`,
     );
     expect(
       await screen.findByRole("status", { name: "Context usage 47%" }),
@@ -1627,7 +1637,7 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
-      `Ask Foco anything about Remote project...`,
+      `Ask Foco anything about Remote project…`,
     );
     await userEvent.type(composer, "first remote task");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
@@ -1733,7 +1743,7 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
-      `Ask Foco anything about Remote project...`,
+      `Ask Foco anything about Remote project…`,
     );
     expect(
       await screen.findByRole("status", { name: "Context usage 47%" }),
@@ -1769,7 +1779,7 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     const composer = await screen.findByPlaceholderText(
-      `Ask Foco anything about Remote project...`,
+      `Ask Foco anything about Remote project…`,
     );
     await userEvent.type(composer, "cancel remotely");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
@@ -4821,13 +4831,13 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "next task",
     );
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     );
-    await userEvent.click(screen.getByLabelText("Thinking"));
+    await userEvent.click(screen.getByRole("button", { name: /Thinking/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Thinking: High" }),
+      screen.getByRole("option", { name: "High" }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
@@ -5875,9 +5885,9 @@ describe("app-chat-stream verification surfaces", () => {
       workspaceId: "workspace-1",
     });
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     await userEvent.click(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     );
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -7288,7 +7298,7 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
 
     expect(
-      await screen.findByRole("tab", { name: /Second chat/ }),
+      await screen.findByRole("tab", { name: /Second chat/, hidden: true }),
     ).toHaveAttribute("aria-selected", "true");
     const dialog = await screen.findByRole("dialog", {
       name: "Foco needs your answer",
@@ -8345,27 +8355,22 @@ describe("app-chat-stream verification surfaces", () => {
 
     // Settings still pending: model catalog is empty, but selection must not
     // permanently clear to the empty-label state.
-    expect(screen.getByLabelText("Model")).toHaveAttribute(
-      "aria-disabled",
-      "true",
-    );
+    expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(true);
 
     await act(async () => {
       settingsGate.resolve(jsonResponse(settings));
     });
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
-      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
+      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
     });
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     expect(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {
@@ -8462,11 +8467,8 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
-      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
+      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
     });
 
     await act(async () => {
@@ -8513,11 +8515,8 @@ describe("app-chat-stream verification surfaces", () => {
     // Messages resolved after settings: model must stay restored, not cleared
     // by a stale empty-catalog applyComposerModelForPlanMode closure.
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Test");
-      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
+      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
     });
 
     await act(async () => {
@@ -8529,10 +8528,11 @@ describe("app-chat-stream verification surfaces", () => {
     });
     expect(await screen.findByText("Still running.")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     expect(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {
@@ -8676,20 +8676,18 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByLabelText("Model")).toHaveTextContent("GPT Alt");
-      expect(screen.getByLabelText("Model")).not.toHaveAttribute(
-        "aria-disabled",
-        "true",
-      );
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
+      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
     });
 
-    await userEvent.click(screen.getByLabelText("Model"));
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
     expect(
-      screen.getByRole("button", { name: "Model: GPT Alt" }),
+      screen.getByRole("option", { name: "GPT Alt" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Model: GPT Test" }),
+      screen.getByRole("option", { name: "GPT Test" }),
     ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream", {

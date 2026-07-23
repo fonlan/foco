@@ -114,7 +114,7 @@ export function WorkspaceFileEditorPanel({
   return (
     <section className="workspace-file-editor flex min-h-0 flex-1 flex-col">
       {editor?.error ? (
-        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
           {editor.error}
         </div>
       ) : null}
@@ -479,7 +479,7 @@ function MonacoFileEditor({
         ) : null}
       </div>
       {monacoError ? (
-        <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+        <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
           {monacoError}
         </div>
       ) : null}
@@ -513,21 +513,21 @@ function MonacoFileEditor({
             <p id={reloadConfirmDescriptionId}>{t("Save changes before reloading this file?")}</p>
             <div className="workspace-file-reload-dialog-actions">
               <button
-                className="rounded-lg bg-stone-900 px-3 py-2 text-sm font-semibold text-white hover:bg-stone-800"
+                className="rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white hover:bg-[var(--foreground)]"
                 onClick={() => void handleReloadConfirm("save")}
                 type="button"
               >
                 {t("Yes")}
               </button>
               <button
-                className="rounded-lg border border-stone-300 px-3 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                 onClick={() => void handleReloadConfirm("discard")}
                 type="button"
               >
                 {t("No")}
               </button>
               <button
-                className="rounded-lg border border-stone-300 px-3 py-2 text-sm font-medium text-stone-700 hover:bg-stone-50"
+                className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                 onClick={() => void handleReloadConfirm("cancel")}
                 type="button"
               >

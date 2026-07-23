@@ -36,7 +36,7 @@ describe("git diff parser", () => {
     expect(parseGitDiffLineStats({ additions: -1, deletions: 1 })).toBeNull();
     expect(hasGitDiffStats({ additions: 0, deletions: 0 })).toBe(false);
     expect(hasGitDiffStats({ additions: 1, deletions: 0 })).toBe(true);
-    expect(diffLineClass("add")).toContain("bg-emerald-50");
-    expect(diffLineClass("remove")).toContain("bg-rose-50");
+    expect(diffLineClass("add")).toContain("bg-[var(--success-soft)]");
+    expect(diffLineClass("remove")).toContain("bg-[var(--danger-soft)]");
   });
 });

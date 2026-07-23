@@ -236,17 +236,17 @@ export function AgentsSettingsPanel({
   }
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 p-4 shadow-[var(--overlay-shadow)]">
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] p-4 shadow-[var(--overlay-shadow)]">
       <div className="flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
-          <Bot aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
-          <h3 className="truncate text-sm font-semibold text-stone-950">
+          <Bot aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
+          <h3 className="truncate text-sm font-semibold text-[var(--foreground)]">
             {t("Agent definitions")}
           </h3>
         </div>
         <button
           aria-label={t("Add agent definition")}
-          className="inline-flex size-9 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] transition hover:bg-teal-900 active:translate-y-px disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+          className="inline-flex size-9 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] transition hover:bg-[var(--accent)] active:translate-y-px disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
           disabled={operationKey !== null}
           onClick={openCreateDialog}
           title={t("Add agent definition")}
@@ -256,13 +256,13 @@ export function AgentsSettingsPanel({
         </button>
       </div>
 
-      <label className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-        <span className="text-sm font-semibold text-stone-700">
+      <label className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] px-3 py-2">
+        <span className="text-sm font-semibold text-[var(--muted)]">
           {t("Default Team mode for new chats")}
         </span>
         <input
           checked={defaultTeamModeEnabled}
-          className="size-4 accent-teal-700"
+          className="size-4 accent-[var(--accent)]"
           disabled={isSavingDefaultTeamMode}
           onChange={(event) =>
             void onDefaultTeamModeEnabledChange(event.target.checked)
@@ -272,7 +272,7 @@ export function AgentsSettingsPanel({
       </label>
 
       {error ? (
-        <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        <div className="mt-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
           {error}
         </div>
       ) : null}
@@ -283,28 +283,28 @@ export function AgentsSettingsPanel({
 
           return (
             <article
-              className="group flex items-start gap-3 rounded-xl border border-stone-200 bg-stone-50/65 px-3 py-3 transition hover:border-teal-200 hover:bg-teal-50/45"
+              className="group flex items-start gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)]/65 px-3 py-3 transition hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]/45"
               key={definition.id}
             >
               <div className="min-w-0 flex-1">
                 <div className="flex min-w-0 flex-wrap items-baseline gap-x-3 gap-y-1">
-                  <h4 className="truncate text-sm font-semibold text-stone-950">
+                  <h4 className="truncate text-sm font-semibold text-[var(--foreground)]">
                     {definition.name}
                   </h4>
-                  <span className="truncate text-xs font-medium text-stone-500">
+                  <span className="truncate text-xs font-medium text-[var(--muted)]">
                     {modelNameById.get(definition.modelId) ?? definition.modelId}
                     <span aria-hidden="true"> · </span>
                     {t("Resolved by model routing")}
                   </span>
                 </div>
-                <p className="mt-1 text-sm leading-5 text-stone-600">
+                <p className="mt-1 text-sm leading-5 text-[var(--muted)]">
                   {definition.description}
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
                 <button
                   aria-label={t("Edit agent {name}", { name: definition.name })}
-                  className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-white hover:text-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
+                  className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--surface)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                   disabled={operationKey !== null}
                   onClick={() => openEditDialog(definition)}
                   title={t("Edit")}
@@ -315,7 +315,7 @@ export function AgentsSettingsPanel({
                 {!isBuiltin ? (
                   <button
                     aria-label={t("Delete agent {name}", { name: definition.name })}
-                    className="inline-flex size-8 items-center justify-center rounded-lg text-stone-500 transition hover:bg-rose-50 hover:text-rose-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500 disabled:cursor-not-allowed disabled:text-stone-300"
+                    className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                     disabled={operationKey !== null}
                     onClick={() => void deleteDefinition(definition)}
                     title={t("Delete")}
@@ -329,12 +329,12 @@ export function AgentsSettingsPanel({
           );
         })}
         {isLoading ? (
-          <div className="flex items-center justify-center gap-2 py-8 text-sm text-stone-500">
+          <div className="flex items-center justify-center gap-2 py-8 text-sm text-[var(--muted)]">
             <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
-            {t("Loading agent definitions...")}
+            {t("Loading agent definitions…")}
           </div>
         ) : definitions.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-stone-300 px-4 py-8 text-center text-sm text-stone-500">
+          <div className="rounded-xl border border-dashed border-[var(--border)] px-4 py-8 text-center text-sm text-[var(--muted)]">
             {t("No agent definitions")}
           </div>
         ) : null}
@@ -343,7 +343,7 @@ export function AgentsSettingsPanel({
       {dialogMode ? (
         <div
           aria-label={t("Close agent dialog backdrop")}
-          className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-stone-950/35 p-4 backdrop-blur-sm"
+          className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-[color-mix(in_oklab,var(--foreground)_35%,transparent)] p-4 backdrop-blur-sm"
           onMouseDown={(event) => {
             if (event.target === event.currentTarget) {
               closeDialog();
@@ -354,24 +354,24 @@ export function AgentsSettingsPanel({
           <form
             aria-label={dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
             aria-modal="true"
-            className="my-auto w-[min(94vw,52rem)] rounded-2xl border border-stone-200 bg-white p-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+            className="my-auto w-[min(94vw,52rem)] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--overlay-shadow)]"
             onSubmit={(event) => void submitDefinition(event)}
             role="dialog"
           >
             <div className="flex items-center justify-between gap-3">
               <div className="flex min-w-0 items-center gap-2">
                 {dialogMode === "edit" ? (
-                  <Pencil aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
+                  <Pencil aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
                 ) : (
-                  <Plus aria-hidden="true" className="size-5 shrink-0 text-teal-700" />
+                  <Plus aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
                 )}
-                <h3 className="truncate text-base font-semibold text-stone-950">
+                <h3 className="truncate text-base font-semibold text-[var(--foreground)]">
                   {dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
                 </h3>
               </div>
               <button
                 aria-label={t("Close agent dialog")}
-                className="inline-flex size-9 items-center justify-center rounded-lg text-stone-500 transition hover:bg-stone-100 hover:text-stone-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
+                className="inline-flex size-9 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 disabled={operationKey !== null}
                 onClick={closeDialog}
                 title={t("Close")}
@@ -382,7 +382,7 @@ export function AgentsSettingsPanel({
             </div>
 
             {error ? (
-              <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+              <div className="mt-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                 {error}
               </div>
             ) : null}
@@ -402,11 +402,11 @@ export function AgentsSettingsPanel({
                 value={draft.maxInstances}
               />
               <label className="block md:col-span-2">
-                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                   {t("Description")}
                 </span>
                 <input
-                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
                   onChange={(event) => updateDraft({ description: event.target.value })}
                   value={draft.description}
                 />
@@ -443,12 +443,12 @@ export function AgentsSettingsPanel({
               />
               <div className="block md:col-span-2">
                 <span className="mb-1.5 flex items-center justify-between gap-3">
-                  <span className="text-xs font-semibold text-stone-600">
+                  <span className="text-xs font-semibold text-[var(--muted)]">
                     {t("Agent role prompt")}
                   </span>
                   {defaultRolePrompt ? (
                     <button
-                      className="inline-flex h-8 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-600 transition hover:bg-stone-50 hover:text-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 disabled:cursor-not-allowed disabled:text-stone-300"
+                      className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                       disabled={operationKey !== null}
                       onClick={restoreDefaultRolePrompt}
                       type="button"
@@ -459,19 +459,19 @@ export function AgentsSettingsPanel({
                 </span>
                 <textarea
                   aria-label={t("Agent role prompt")}
-                  className="min-h-40 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                  className="min-h-40 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
                   onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
                   value={draft.systemPrompt}
                 />
               </div>
               <details className="group/tools relative md:col-span-2">
-                <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition marker:content-none focus-visible:border-teal-700 focus-visible:ring-2 focus-visible:ring-teal-100">
+                <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition marker:content-none focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]">
                   <span className="font-medium">{t("Allowed tools")}</span>
-                  <span className="text-xs text-stone-500">
+                  <span className="text-xs text-[var(--muted)]">
                     {t("{count} selected", { count: draft.allowedTools.length })}
                   </span>
                 </summary>
-                <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-stone-200 bg-white p-2 shadow-[var(--overlay-shadow)]">
+                <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 shadow-[var(--overlay-shadow)]">
                   {selectableTools.map((tool) => (
                     <AgentCheckbox
                       checked={draft.allowedTools.includes(tool)}
@@ -481,7 +481,7 @@ export function AgentsSettingsPanel({
                     />
                   ))}
                   {!selectableTools.length ? (
-                    <p className="px-2 py-3 text-sm text-stone-500">
+                    <p className="px-2 py-3 text-sm text-[var(--muted)]">
                       {t("No tools available")}
                     </p>
                   ) : null}
@@ -489,8 +489,8 @@ export function AgentsSettingsPanel({
               </details>
             </div>
 
-            <fieldset className="mt-4 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
-              <legend className="px-1 text-xs font-semibold text-stone-600">
+            <fieldset className="mt-4 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
+              <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                 {t("Workspace isolation mode")}
               </legend>
               <div className="grid gap-2">
@@ -515,8 +515,8 @@ export function AgentsSettingsPanel({
               </div>
             </fieldset>
 
-            <fieldset className="mt-4 rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
-              <legend className="px-1 text-xs font-semibold text-stone-600">
+            <fieldset className="mt-4 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
+              <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                 {t("Permissions")}
               </legend>
               <div className="grid gap-3 md:grid-cols-2">
@@ -547,7 +547,7 @@ export function AgentsSettingsPanel({
 
             <div className="mt-4 flex justify-end gap-2">
               <button
-                className="inline-flex h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-4 text-sm font-semibold text-stone-700 transition hover:bg-stone-50 active:translate-y-px disabled:cursor-not-allowed disabled:text-stone-300"
+                className="inline-flex h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] active:translate-y-px disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 disabled={operationKey !== null}
                 onClick={closeDialog}
                 type="button"
@@ -555,7 +555,7 @@ export function AgentsSettingsPanel({
                 {t("Cancel")}
               </button>
               <button
-                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-4 text-sm font-semibold text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] transition hover:bg-teal-900 active:translate-y-px disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 text-sm font-semibold text-white shadow-[var(--overlay-shadow)] transition hover:bg-[var(--accent)] active:translate-y-px disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
                 disabled={!canSubmit || operationKey !== null}
                 type="submit"
               >
@@ -593,10 +593,10 @@ function AgentTextField({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">{label}</span>
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{label}</span>
       <input
         autoFocus={autoFocus}
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
         inputMode={inputMode}
         min={type === "number" ? 1 : undefined}
         onChange={(event) => onChange(event.target.value)}
@@ -622,9 +622,9 @@ function AgentSelect({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">{label}</span>
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{label}</span>
       <select
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
         onChange={(event) => onChange(event.target.value)}
         value={value}
       >
@@ -646,18 +646,18 @@ function AgentCheckbox({
   onChange: (checked: boolean) => void;
 }) {
   return (
-    <label className="flex min-w-0 cursor-pointer items-start justify-between gap-3 rounded-lg px-3 py-2 text-sm text-stone-800 transition hover:bg-stone-50">
+    <label className="flex min-w-0 cursor-pointer items-start justify-between gap-3 rounded-lg px-3 py-2 text-sm text-[var(--foreground)] transition hover:bg-[var(--surface-secondary)]">
       <span className="min-w-0">
         <span className="block truncate font-medium">{label}</span>
         {description ? (
-          <span className="mt-1 block text-xs leading-5 text-stone-500">
+          <span className="mt-1 block text-xs leading-5 text-[var(--muted)]">
             {description}
           </span>
         ) : null}
       </span>
       <input
         checked={checked}
-        className="mt-0.5 size-4 shrink-0 accent-teal-700"
+        className="mt-0.5 size-4 shrink-0 accent-[var(--accent)]"
         onChange={(event) => onChange(event.target.checked)}
         type="checkbox"
       />

@@ -13349,7 +13349,7 @@ export function App() {
           disabled: isInstallingUpdate,
           icon: isInstallingUpdate ? LoaderCircle : Download,
           label: isInstallingUpdate
-            ? t("Installing update...")
+            ? t("Installing update…")
             : t("Install update"),
           onClick: () => void installUpdateFromNav(),
         }
@@ -13358,10 +13358,10 @@ export function App() {
   if (isCheckingAuth) {
     return (
       <I18nContext.Provider value={{ language, t }}>
-        <main className="app-root grid place-items-center bg-stone-100 text-stone-950">
+        <main className="app-root grid place-items-center bg-[var(--surface-secondary)] text-[var(--foreground)]">
           <LoaderCircle
             aria-hidden="true"
-            className="size-6 animate-spin text-teal-700"
+            className="size-6 animate-spin text-[var(--accent-soft-foreground)]"
           />
         </main>
       </I18nContext.Provider>
@@ -13558,7 +13558,7 @@ export function App() {
               updateButton={updateNavButton}
             />
             <aside
-              className={`workspace-sidebar relative border-stone-200/80 lg:border-r ${
+              className={`workspace-sidebar relative border-[color-mix(in_oklab,var(--border)_80%,transparent)] lg:border-r ${
                 isMobileWorkspaceOpen ? "workspace-sidebar-mobile-open" : ""
               }`}
               ref={workspaceSidebarRef}
@@ -13596,7 +13596,7 @@ export function App() {
                 tabIndex={0}
               />
               <div className="flex h-full min-h-0 flex-col">
-                <div className="workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
+                <div className="workspace-sidebar-header flex items-center justify-between gap-2 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-4 py-2">
                   <div className="min-w-0">
                     <span className="workspace-sidebar-title">
                       {t("Workspaces")}
@@ -13605,7 +13605,7 @@ export function App() {
                   <div className="flex shrink-0 items-center gap-1.5">
                     <button
                       aria-label={t("Refresh workspaces")}
-                      className="inline-flex size-8 items-center justify-center rounded-lg text-stone-600 transition hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400 disabled:hover:bg-transparent"
+                      className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
                       disabled={isLoading}
                       onClick={() => void refreshWorkspaces()}
                       title={t("Refresh workspaces")}
@@ -13619,7 +13619,7 @@ export function App() {
                     <button
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
-                      className="inline-flex size-8 items-center justify-center rounded-lg text-stone-600 transition hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={() =>
                         setWorkspaceChatSearchOpen((current) => !current)
                       }
@@ -13630,7 +13630,7 @@ export function App() {
                     </button>
                     <button
                       aria-label={t("Close")}
-                      className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white/90 text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                      className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                       onClick={() => setIsMobileWorkspaceOpen(false)}
                       title={t("Close")}
                       type="button"
@@ -13641,11 +13641,11 @@ export function App() {
                 </div>
 
                 {workspaceChatSearchOpen ? (
-                  <div className="border-b border-stone-200/80 px-3 py-2">
+                  <div className="border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
                     <div className="relative">
                       <input
                         aria-label={t("Search chats")}
-                        className="workspace-chat-search-input h-9 w-full rounded-lg border border-stone-300 bg-white px-3 pr-8 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="workspace-chat-search-input h-9 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 pr-8 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
                         onChange={(event) =>
                           setWorkspaceChatSearchQuery(event.target.value)
                         }
@@ -13656,7 +13656,7 @@ export function App() {
                       {workspaceChatSearchQuery.length ? (
                         <button
                           aria-label={t("Clear search")}
-                          className="absolute right-2 top-1/2 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-stone-400 hover:bg-stone-100 hover:text-stone-700"
+                          className="absolute right-2 top-1/2 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--muted)]"
                           onClick={() => setWorkspaceChatSearchQuery("")}
                           title={t("Clear search")}
                           type="button"
@@ -13761,7 +13761,7 @@ export function App() {
                                 <span className="block truncate">
                                   {workspace.name}
                                 </span>
-                                <span className="block truncate text-[10px] font-medium leading-3 text-stone-400">
+                                <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
                                   {workspace.displayPath}
                                 </span>
                               </span>
@@ -13770,7 +13770,7 @@ export function App() {
                               aria-label={t("New chat in {name}", {
                                 name: workspace.name,
                               })}
-                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-stone-500 hover:text-teal-800"
+                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-[var(--muted)] hover:text-[var(--accent-soft-foreground)]"
                               disabled={isRemoteWorkspace && !isRemoteReady}
                               onClick={() => {
                                 if (isRemoteWorkspace && !isRemoteReady) {
@@ -13794,14 +13794,14 @@ export function App() {
                             </button>
                           </div>
                           {isRemoteWorkspace && !isRemoteReady ? (
-                            <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-stone-500">
+                            <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-[var(--muted)]">
                               {workspace.lastRemoteError ? (
                                 <span className="min-w-0 flex-1 truncate">
                                   {workspace.lastRemoteError}
                                 </span>
                               ) : null}
                               <button
-                                className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-stone-200 bg-white px-2 font-semibold text-teal-800 hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                 disabled={
                                   retryingRemoteWorkspaceId === workspace.id
                                 }
@@ -13826,7 +13826,7 @@ export function App() {
                             </div>
                           ) : null}
                           {isExpanded ? (
-                            <div className="mt-1 space-y-1 border-l border-stone-200/80 pl-3 pr-1.5">
+                            <div className="mt-1 space-y-1 border-l border-[color-mix(in_oklab,var(--border)_80%,transparent)] pl-3 pr-1.5">
                               {visibleChats.length > 0 ? (
                                 <>
                                   {visibleChats.map((chat) => {
@@ -13906,7 +13906,7 @@ export function App() {
                                           <span className="block truncate">
                                             {chat.title}
                                           </span>
-                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-stone-400">
+                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
                                             <span className="min-w-0 truncate">
                                               {formatChatCreatedAt(
                                                 chat.createdAt,
@@ -13957,7 +13957,7 @@ export function App() {
                                           name: workspace.name,
                                         },
                                       )}
-                                      className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-stone-500 hover:border-stone-200 hover:bg-white/80 hover:text-stone-950"
+                                      className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
                                       disabled={paging?.isLoading}
                                       onClick={() =>
                                         void showMoreWorkspaceChats(
@@ -13976,7 +13976,7 @@ export function App() {
                                             count: nextVisibleChatCount,
                                           })}
                                         </span>
-                                        <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-stone-400">
+                                        <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
                                           {t("{count} hidden chats", {
                                             count: hiddenChatCount,
                                           })}
@@ -13986,7 +13986,7 @@ export function App() {
                                   ) : null}
                                 </>
                               ) : (
-                                <div className="rounded-lg px-2 py-1.5 text-xs text-stone-500">
+                                <div className="rounded-lg px-2 py-1.5 text-xs text-[var(--muted)]">
                                   {t("No chats")}
                                 </div>
                               )}
@@ -13996,13 +13996,13 @@ export function App() {
                       );
                     })
                   ) : (
-                    <div className="mx-2 rounded-lg border border-dashed border-stone-300 bg-white/60 px-3 py-4 text-sm text-stone-500">
+                    <div className="mx-2 rounded-lg border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_60%,transparent)] px-3 py-4 text-sm text-[var(--muted)]">
                       {isWorkspaceSearchActive
                         ? isSearchingWorkspaceChats
-                          ? t("Searching chats...")
+                          ? t("Searching chats…")
                           : (workspaceChatSearchError ?? t("No matching chats"))
                         : isLoading
-                          ? t("Loading workspaces...")
+                          ? t("Loading workspaces…")
                           : t("No workspaces")}
                     </div>
                   )}
@@ -14197,7 +14197,7 @@ export function App() {
             ) : null}
 
             <section className="app-main-panel flex min-w-0 flex-col">
-              <header className="app-toolbar shrink-0 border-b border-stone-200/80 bg-white/80 backdrop-blur">
+              <header className="app-toolbar shrink-0 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] backdrop-blur">
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <MainTabBar
                     activeTab={activeMainTab}
@@ -14757,7 +14757,7 @@ function RipgrepMissingDialog({
                   ) : (
                     <Download aria-hidden="true" className="size-4" />
                   )}
-                  {isPending ? t("Installing ripgrep...") : t("Download ripgrep")}
+                  {isPending ? t("Installing ripgrep…") : t("Download ripgrep")}
                 </>
               )}
             </Button>
@@ -15335,8 +15335,8 @@ function MainTabBar({
                 <div
                   className={`chat-tab-item group flex h-12 min-w-36 max-w-64 shrink-0 items-center rounded-lg border px-2 py-1.5 transition-colors ${
                     isActive
-                      ? "border-teal-200 bg-white text-stone-950 shadow-sm"
-                      : "border-stone-200 bg-stone-50/80 text-stone-600 hover:border-stone-300 hover:bg-white"
+                      ? "border-[var(--accent)] bg-[var(--surface)] text-[var(--foreground)] shadow-sm"
+                      : "border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface)]"
                   }`}
                   key={key}
                   onContextMenu={(event) => handleContextMenu(event, tab)}
@@ -15366,13 +15366,13 @@ function MainTabBar({
                       {tab.type === "htmlPreview" ? (
                         <AppWindow
                           aria-hidden="true"
-                          className="size-3.5 shrink-0 text-sky-600"
+                          className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
                         />
                       ) : null}
                       {tab.type === "agent" ? (
                         <Bot
                           aria-hidden="true"
-                          className="size-3.5 shrink-0 text-teal-700"
+                          className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
                         />
                       ) : null}
                       {isRunning ? (
@@ -15387,13 +15387,13 @@ function MainTabBar({
                         >
                           <LoaderCircle
                             aria-hidden="true"
-                            className="chat-tab-running-spinner size-3.5 animate-spin text-teal-700"
+                            className="chat-tab-running-spinner size-3.5 animate-spin text-[var(--accent-soft-foreground)]"
                           />
                         </span>
                       ) : null}
                       <span className="min-w-0 truncate">{title}</span>
                     </span>
-                    <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-stone-400">
+                    <span className="flex min-w-0 items-center gap-1 text-[11px] font-medium leading-4 text-[var(--muted)]">
                       <WorkspaceIcon
                         className="size-3 shrink-0 rounded-sm object-cover"
                         fallbackClassName="size-3 shrink-0"
@@ -15407,7 +15407,7 @@ function MainTabBar({
                   <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
                     <button
                       aria-label={t("Close chat tab {title}", { title })}
-                      className="inline-flex size-7 items-center justify-center rounded-md text-stone-400 opacity-0 hover:bg-rose-50 hover:text-rose-700 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
+                      className="inline-flex size-7 items-center justify-center rounded-md text-[var(--muted)] opacity-0 hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
                       onClick={() => onCloseTab(tab)}
                       title={t("Close")}
                       type="button"
@@ -15419,7 +15419,7 @@ function MainTabBar({
               );
             })
           ) : (
-            <div className="flex h-12 min-w-0 items-center rounded-lg border border-dashed border-stone-300 bg-white/55 px-3 text-sm font-medium text-stone-500">
+            <div className="flex h-12 min-w-0 items-center rounded-lg border border-dashed border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_55%,transparent)] px-3 text-sm font-medium text-[var(--muted)]">
               {t("No open chats")}
             </div>
           )}
@@ -15604,7 +15604,7 @@ function ApiOverviewPanel({
   return (
     <section className="api-overview-panel grid min-h-[18rem] w-full place-items-center px-4 py-10 text-center">
       <div className="flex max-w-full flex-col items-center gap-4">
-        <span className="inline-flex size-20 items-center justify-center overflow-hidden rounded-2xl text-teal-800">
+        <span className="inline-flex size-20 items-center justify-center overflow-hidden rounded-2xl text-[var(--accent-soft-foreground)]">
           <WorkspaceIcon
             className="size-20 rounded-2xl object-cover"
             fallbackClassName="size-10"
@@ -15614,7 +15614,7 @@ function ApiOverviewPanel({
         </span>
         <div className="min-w-0">
           <span className="foco-eyebrow">{t("Workspace")}</span>
-          <h2 className="foco-display mt-1 truncate text-3xl leading-tight text-stone-950">
+          <h2 className="foco-display mt-1 truncate text-3xl leading-tight text-[var(--foreground)]">
             {selectedWorkspace?.name ?? t("No workspace selected")}
           </h2>
         </div>
@@ -15626,27 +15626,27 @@ function ApiOverviewPanel({
 function workspaceConnectionDotClass(status: string) {
   const normalized = status.toLowerCase();
   if (normalized === "connected" || normalized === "ready") {
-    return "bg-emerald-500";
+    return "bg-[var(--success)]";
   }
   if (
     normalized === "checking" ||
     normalized === "connecting" ||
     normalized === "reconnecting"
   ) {
-    return "bg-amber-500";
+    return "bg-[var(--warning)]";
   }
   if (normalized === "failed" || normalized === "failedauth") {
-    return "bg-rose-500";
+    return "bg-[var(--danger)]";
   }
   if (normalized === "degraded") {
-    return "bg-yellow-500";
+    return "bg-[var(--warning)]";
   }
-  return "bg-stone-300";
+  return "bg-[var(--default)]";
 }
 
 function PanelLoadingFallback() {
   return (
-    <div className="grid h-full w-full place-items-center p-8 text-stone-400">
+    <div className="grid h-full w-full place-items-center p-8 text-[var(--muted)]">
       <LoaderCircle aria-hidden="true" className="size-6 animate-spin" />
     </div>
   );
@@ -15656,7 +15656,7 @@ function FocoLogoMark() {
   return (
     <span
       aria-hidden="true"
-      className="foco-logo-mark inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white shadow-[0_10px_24px_rgba(15,118,110,0.2)] ring-1 ring-stone-200/80"
+      className="foco-logo-mark inline-flex size-9 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-[var(--surface)] shadow-[var(--overlay-shadow)] ring-1 ring-[color-mix(in_oklab,var(--border)_80%,transparent)]"
       dangerouslySetInnerHTML={{ __html: focoLogoSvg }}
     />
   );
@@ -16060,41 +16060,41 @@ function LoginView({
   const { t } = useI18n();
 
   return (
-    <main className="app-root grid place-items-center bg-stone-100 px-4 text-stone-950">
+    <main className="app-root grid place-items-center bg-[var(--surface-secondary)] px-4 text-[var(--foreground)]">
       <form
         aria-label={t("Foco authentication")}
-        className="w-full max-w-sm rounded-2xl border border-stone-200 bg-white/90 px-4 py-5 shadow-[0_24px_70px_rgba(33,31,28,0.16)]"
+        className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] px-4 py-5 shadow-[var(--overlay-shadow)]"
         onSubmit={onLogin}
       >
         <div className="flex items-center gap-3">
           <FocoLogoMark />
           <div className="min-w-0">
-            <h1 className="foco-display text-2xl leading-none text-stone-950">
+            <h1 className="foco-display text-2xl leading-none text-[var(--foreground)]">
               Foco
             </h1>
             <p className="foco-eyebrow mt-1.5">{t("Password required")}</p>
           </div>
         </div>
         <label className="mt-5 block">
-          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
             {t("Password")}
           </span>
           <input
             autoComplete="current-password"
-            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
             onChange={(event) => onPasswordChange(event.target.value)}
             type="password"
             value={password}
           />
         </label>
         {error ? (
-          <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+          <div className="mt-4 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
             {error}
           </div>
         ) : null}
         <button
           aria-label={t("Log in")}
-          className="mt-4 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+          className="mt-4 inline-flex h-10 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
           disabled={isLoggingIn || !password.trim()}
           type="submit"
         >
@@ -17257,7 +17257,7 @@ function compactToolJson(value: JsonValue) {
 function compactToolText(value: string) {
   const normalized = value.replace(/\s+/g, " ").trim();
   return normalized.length > 240
-    ? `${normalized.slice(0, 237)}...`
+    ? `${normalized.slice(0, 237)}…`
     : normalized;
 }
 
@@ -17865,7 +17865,7 @@ function chatTitleForDraft(
   const normalized = content.trim().replace(/\s+/g, " ");
   if (normalized) {
     return normalized.length > 48
-      ? `${normalized.slice(0, 48)}...`
+      ? `${normalized.slice(0, 48)}…`
       : normalized;
   }
 

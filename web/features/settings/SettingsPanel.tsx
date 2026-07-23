@@ -5021,7 +5021,7 @@ export function SettingsPanel({
   async function testProvider(providerId: string) {
     setProviderTests((current) => ({
       ...current,
-      [providerId]: { message: t("Testing connection..."), status: "testing" },
+      [providerId]: { message: t("Testing connection…"), status: "testing" },
     }));
     setError(null);
 
@@ -5307,8 +5307,8 @@ export function SettingsPanel({
         </div>
       ) : null}
       <div className="settings-layout grid">
-        <aside className="settings-section-nav-card flex min-h-0 flex-col border-stone-200 p-2">
-          <div className="settings-sidebar-header workspace-sidebar-header flex items-center justify-between gap-2 border-b border-stone-200/80 px-4 py-2">
+        <aside className="settings-section-nav-card flex min-h-0 flex-col border-[var(--border)] p-2">
+          <div className="settings-sidebar-header workspace-sidebar-header flex items-center justify-between gap-2 border-b border-[var(--border)] px-4 py-2">
             <div className="min-w-0">
               <span className="workspace-sidebar-title">{t("Settings")}</span>
             </div>
@@ -5411,13 +5411,13 @@ export function SettingsPanel({
         </aside>
 
         <div className="min-w-0 flex flex-col gap-5">
-          <section className="rounded-2xl border border-stone-200 bg-white/75 px-4 py-4 shadow-[var(--overlay-shadow)]">
+          <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_75%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
-                <h2 className="text-lg font-semibold text-stone-950">
+                <h2 className="text-lg font-semibold text-[var(--foreground)]">
                   {settingsSectionTitle(activeSection, t)}
                 </h2>
-                <p className="mt-1 truncate text-xs font-medium text-stone-500">
+                <p className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                   {activeSection === "models"
                     ? metadata?.fetchedAt
                       ? t("Fetched {time} from {source}", {
@@ -5431,7 +5431,7 @@ export function SettingsPanel({
               {activeSection === "models" ? (
                 <button
                   aria-label={t("Refresh model metadata")}
-                  className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 disabled:shadow-none"
+                  className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
                   disabled={isRefreshing}
                   onClick={() => void refreshMetadata()}
                   title={t("Refresh model metadata")}
@@ -5448,7 +5448,7 @@ export function SettingsPanel({
           </section>
 
           {error && !isWorkspaceDialogOpen ? (
-            <div className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+            <div className="rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
               {error}
             </div>
           ) : null}
@@ -5456,12 +5456,12 @@ export function SettingsPanel({
           {activeSection === "general" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveGeneralSettings(event)}
               >
                 <div className="flex items-center gap-2">
-                  <Globe aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <Globe aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Web service")}
                   </h3>
                 </div>
@@ -5490,12 +5490,12 @@ export function SettingsPanel({
                     value={generalForm.listenPort}
                   />
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("LLM request retries")}
                     </span>
                     <input
                       autoComplete="off"
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       inputMode="numeric"
                       min={1}
                       onChange={(event) =>
@@ -5511,11 +5511,11 @@ export function SettingsPanel({
                     />
                   </label>
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Chat title generation model")}
                     </span>
                     <select
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         setGeneralForm((current) => ({
                           ...current,
@@ -5535,16 +5535,16 @@ export function SettingsPanel({
                         ))}
                     </select>
                   </label>
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Context management")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
                       <div className="min-w-0">
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Runtime tool-state compression")}
                         </p>
-                        <p className="mt-1 max-w-3xl text-xs leading-5 text-stone-500">
+                        <p className="mt-1 max-w-3xl text-xs leading-5 text-[var(--muted)]">
                           {t(
                             "At 80% context usage, replace older tool messages with compact snapshots. This breaks the provider's context cache.",
                           )}
@@ -5552,11 +5552,11 @@ export function SettingsPanel({
                       </div>
                       <label
                         aria-label={t("Runtime tool-state compression")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center self-end rounded-lg border border-stone-200 bg-white sm:self-auto"
+                        className="inline-flex size-10 shrink-0 items-center justify-center self-end rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:self-auto"
                       >
                         <input
                           checked={generalForm.runtimeToolStateCompressionEnabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setGeneralForm((current) => ({
                               ...current,
@@ -5569,12 +5569,12 @@ export function SettingsPanel({
                     </div>
                   </fieldset>
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("API request detail retention days")}
                     </span>
                     <input
                       autoComplete="off"
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       inputMode="numeric"
                       min={1}
                       onChange={(event) =>
@@ -5591,17 +5591,17 @@ export function SettingsPanel({
                       value={generalForm.apiRequestDetailRetentionDays}
                     />
                   </label>
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("API request details")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="flex min-w-0 items-center gap-2">
                         <Database
                           aria-hidden="true"
-                          className="size-4 shrink-0 text-teal-700"
+                          className="size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                         />
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Save request and response bodies")}
                         </p>
                       </div>
@@ -5616,11 +5616,11 @@ export function SettingsPanel({
                         />
                         <label
                           aria-label={t("Save request and response bodies")}
-                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                         >
                           <input
                             checked={generalForm.apiSaveRequestResponseDetails}
-                            className="size-4 accent-teal-700"
+                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setGeneralForm((current) => ({
                                 ...current,
@@ -5633,17 +5633,17 @@ export function SettingsPanel({
                       </div>
                     </div>
                   </fieldset>
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Startup")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="flex min-w-0 items-center gap-2">
                         <Play
                           aria-hidden="true"
-                          className="size-4 shrink-0 fill-current text-teal-700"
+                          className="size-4 shrink-0 fill-current text-[var(--accent-soft-foreground)]"
                         />
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Start Foco at startup")}
                         </p>
                       </div>
@@ -5656,11 +5656,11 @@ export function SettingsPanel({
                         />
                         <label
                           aria-label={t("Start Foco at startup")}
-                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                         >
                           <input
                             checked={generalForm.autoStartEnabled}
-                            className="size-4 accent-teal-700"
+                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setGeneralForm((current) => ({
                                 ...current,
@@ -5674,11 +5674,11 @@ export function SettingsPanel({
                     </div>
                   </fieldset>
                 </div>
-                <div className="mt-4 border-t border-stone-200 pt-4">
+                <div className="mt-4 border-t border-[var(--border)] pt-4">
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex items-center gap-2">
-                      <Lock aria-hidden="true" className="size-4 text-teal-700" />
-                      <h4 className="text-sm font-semibold text-stone-950">
+                      <Lock aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" />
+                      <h4 className="text-sm font-semibold text-[var(--foreground)]">
                         {t("Browser authentication")}
                       </h4>
                     </div>
@@ -5695,7 +5695,7 @@ export function SettingsPanel({
                     {canLogout ? (
                       <button
                         aria-label={t("Log out")}
-                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => void onLogout()}
                         title={t("Log out")}
                         type="button"
@@ -5706,7 +5706,7 @@ export function SettingsPanel({
                     ) : null}
                     <button
                       aria-label={t("Clear browser password")}
-                      className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
+                      className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
                         isClearingPassword ||
                         !settings?.general.webServer.passwordEnabled
@@ -5729,13 +5729,13 @@ export function SettingsPanel({
                   <div className="mt-3 grid gap-3">
                     <div className="grid gap-2">
                       <label className="block min-w-0">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Authentication password")}
                         </span>
                         <span className="relative block">
                           <input
                             autoComplete="new-password"
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 pr-10 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 pr-10 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setGeneralForm((current) => ({
                                 ...current,
@@ -5762,7 +5762,7 @@ export function SettingsPanel({
                                 ? t("Hide password")
                                 : t("Show password")
                             }
-                            className="absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                            className="absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                             disabled={!generalForm.password}
                             onClick={() =>
                               setIsGeneralPasswordVisible((current) => !current)
@@ -5782,7 +5782,7 @@ export function SettingsPanel({
                           </button>
                         </span>
                         {settings?.general.webServer.passwordEnabled ? (
-                          <span className="mt-1 block text-xs text-stone-500">
+                          <span className="mt-1 block text-xs text-[var(--muted)]">
                             {t(
                               "Saved password cannot be revealed; type a new password to preview it.",
                             )}
@@ -5793,11 +5793,11 @@ export function SettingsPanel({
                   </div>
                 </div>
                 <label className="mt-4 block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Language")}
                   </span>
                   <select
-                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     disabled={isSavingLanguage || isLoadingSettings}
                     onChange={(event) => void saveLanguageSetting(event.target.value)}
                     value={generalForm.language}
@@ -5808,16 +5808,16 @@ export function SettingsPanel({
                       </option>
                     ))}
                   </select>
-                  <span className="mt-1 block text-xs text-stone-500">
+                  <span className="mt-1 block text-xs text-[var(--muted)]">
                     {t("Language changes apply immediately after saving.")}
                   </span>
                 </label>
                 <label className="mt-4 block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Theme")}
                   </span>
                   <select
-                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     disabled={isSavingTheme || isLoadingSettings}
                     onChange={(event) =>
                       void saveThemeSetting(event.target.value as AppThemeId)
@@ -5830,14 +5830,14 @@ export function SettingsPanel({
                       </option>
                     ))}
                   </select>
-                  <span className="mt-1 block text-xs text-stone-500">
+                  <span className="mt-1 block text-xs text-[var(--muted)]">
                     {t("Theme changes apply immediately after saving.")}
                   </span>
                 </label>
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     aria-label={t("Save general settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={
                       isSavingGeneral ||
                       !generalForm.listenHost.trim() ||
@@ -5856,7 +5856,7 @@ export function SettingsPanel({
                   </button>
                   <button
                     aria-label={t("Reload general settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingSettings}
                     onClick={() => void loadSettings()}
                     title={t("Reload settings")}
@@ -5872,20 +5872,20 @@ export function SettingsPanel({
                 </div>
               </form>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center justify-between gap-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Saved bind")}
                   </h3>
                   <CapabilityPill label={t("restart required")} ok={false} />
                 </div>
-                <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                  <div className="break-all text-sm font-semibold text-stone-950">
+                <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                  <div className="break-all text-sm font-semibold text-[var(--foreground)]">
                     {settings
                       ? `${settings.general.webServer.listenHost}:${settings.general.webServer.listenPort}`
-                      : t("Loading...")}
+                      : t("Loading…")}
                   </div>
-                  <div className="mt-2 text-xs text-stone-500">
+                  <div className="mt-2 text-xs text-[var(--muted)]">
                     {t("Saved host and port are used the next time the backend starts.")}
                   </div>
                 </div>
@@ -5896,13 +5896,13 @@ export function SettingsPanel({
           {activeSection === "web-search" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveWebSearchSettings(event)}
               >
                 <div className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
-                    <Search aria-hidden="true" className="size-5 text-teal-700" />
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <Search aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Web search")}
                     </h3>
                   </div>
@@ -5912,16 +5912,16 @@ export function SettingsPanel({
                   />
                 </div>
                 <div className="mt-4 grid gap-4">
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Runtime tool")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0">
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Allow web search for chat runs")}
                         </p>
-                        <p className="mt-1 text-xs leading-5 text-stone-500">
+                        <p className="mt-1 text-xs leading-5 text-[var(--muted)]">
                           {t(
                             "Master switch for online search. Models with confirmed native search use the provider; others can fall back to Tavily/Brave when a key is configured.",
                           )}
@@ -5929,11 +5929,11 @@ export function SettingsPanel({
                       </div>
                       <label
                         aria-label={t("Allow web search for chat runs")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
                         <input
                           checked={webSearchForm.enabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setWebSearchForm((current) => ({
                               ...current,
@@ -5945,12 +5945,12 @@ export function SettingsPanel({
                       </label>
                     </div>
                   </fieldset>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs leading-5 text-stone-500">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs leading-5 text-[var(--muted)]">
                     {t(
                       "Tavily and Brave are function-path fallbacks for models without confirmed native search. Enabling the master switch does not require a search API key.",
                     )}
                     {settings?.webSearch ? (
-                      <span className="mt-1 block font-medium text-stone-600">
+                      <span className="mt-1 block font-medium text-[var(--muted)]">
                         {settings.webSearch.fallbackAvailable
                           ? t("Function fallback: available")
                           : t("Function fallback: no API key for active provider")}
@@ -5958,11 +5958,11 @@ export function SettingsPanel({
                     ) : null}
                   </div>
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Search API")}
                     </span>
                     <select
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         setWebSearchForm((current) => ({
                           ...current,
@@ -5978,26 +5978,26 @@ export function SettingsPanel({
                       ))}
                     </select>
                   </label>
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Web search proxy")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div className="min-w-0">
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Proxy search API requests")}
                         </p>
-                        <p className="mt-1 text-xs leading-5 text-stone-500">
+                        <p className="mt-1 text-xs leading-5 text-[var(--muted)]">
                           {t("Applies only to web_search requests sent to the configured search API.")}
                         </p>
                       </div>
                       <label
                         aria-label={t("Enable web search proxy")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
                         <input
                           checked={webSearchForm.apiProxyEnabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setWebSearchForm((current) => ({
                               ...current,
@@ -6010,11 +6010,11 @@ export function SettingsPanel({
                     </div>
                     <div className="mt-3 grid gap-3 lg:grid-cols-[180px_1fr]">
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Proxy type")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setWebSearchForm((current) => ({
                               ...current,
@@ -6061,11 +6061,11 @@ export function SettingsPanel({
 
                       return (
                         <div
-                          className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3"
+                          className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3"
                           key={provider.provider}
                         >
                           <div className="flex items-center justify-between gap-2">
-                            <span className="text-sm font-semibold text-stone-900">
+                            <span className="text-sm font-semibold text-[var(--foreground)]">
                               {provider.label}
                             </span>
                             <CapabilityPill
@@ -6074,12 +6074,12 @@ export function SettingsPanel({
                             />
                           </div>
                           <label className="mt-3 block">
-                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("API token")}
                             </span>
                             <input
                               autoComplete="off"
-                              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setWebSearchForm((current) => ({
                                   ...current,
@@ -6096,10 +6096,10 @@ export function SettingsPanel({
                             />
                           </label>
                           {provider.hasApiKey ? (
-                            <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-stone-600">
+                            <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                               <input
                                 checked={Boolean(webSearchForm[clearField])}
-                                className="size-4 accent-teal-700"
+                                className="size-4 accent-[var(--accent)]"
                                 onChange={(event) =>
                                   setWebSearchForm((current) => ({
                                     ...current,
@@ -6119,7 +6119,7 @@ export function SettingsPanel({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     aria-label={t("Save web search settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingWebSearch || !webSearchForm.activeProvider}
                     title={t("Save web search settings")}
                     type="submit"
@@ -6133,7 +6133,7 @@ export function SettingsPanel({
                   </button>
                   <button
                     aria-label={t("Reload web search settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingSettings}
                     onClick={() => void loadSettings()}
                     title={t("Reload settings")}
@@ -6173,16 +6173,16 @@ export function SettingsPanel({
           {activeSection === "prompts" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void savePromptSettings(event)}
               >
                 <label className="block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Extra prompt")}
                   </span>
                   <textarea
                     aria-label={t("Extra prompt")}
-                    className="min-h-36 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    className="min-h-36 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) =>
                       setPromptSettingsForm((current) => ({
                         ...current,
@@ -6194,20 +6194,20 @@ export function SettingsPanel({
                   />
                 </label>
 
-                <div className="mt-6 flex items-center justify-between gap-3 border-t border-stone-200 pt-4">
+                <div className="mt-6 flex items-center justify-between gap-3 border-t border-[var(--border)] pt-4">
                   <div className="flex items-center gap-2">
-                    <Bot aria-hidden="true" className="size-5 text-teal-700" />
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <Bot aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("System prompt")}
                     </h3>
                   </div>
-                  <span className="rounded-full border border-stone-200 bg-stone-50 px-2.5 py-1 text-xs font-semibold text-stone-600">
+                  <span className="rounded-full border border-[var(--border)] bg-[var(--surface-secondary)] px-2.5 py-1 text-xs font-semibold text-[var(--muted)]">
                     {activeSystemPrompt?.name ?? DEFAULT_SYSTEM_PROMPT_NAME}
                   </span>
                 </div>
                 <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(180px,240px)_minmax(0,1fr)]">
                   <div className="grid content-start gap-2">
-                    <div className="overflow-hidden rounded-xl border border-stone-200 bg-stone-50/80">
+                    <div className="overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)]">
                       {listSystemPrompts.map((prompt) => {
                         const isActive =
                           prompt.name === promptSettingsForm.activeSystemPromptName;
@@ -6218,8 +6218,8 @@ export function SettingsPanel({
                         return (
                           <div
                             className={`flex items-center gap-2 px-3 py-2 ${isActive
-                                ? "bg-teal-50"
-                                : "hover:bg-white"
+                                ? "bg-[var(--accent-soft)]"
+                                : "hover:bg-[var(--surface)]"
                               }`}
                             key={prompt.name}
                           >
@@ -6229,7 +6229,7 @@ export function SettingsPanel({
                                   aria-label={t("System prompt name")}
                                   autoComplete="off"
                                   autoFocus
-                                  className="h-8 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-2 text-sm font-semibold text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                  className="h-8 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm font-semibold text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                   onChange={(event) =>
                                     setPromptSettingsForm((current) => ({
                                       ...current,
@@ -6250,7 +6250,7 @@ export function SettingsPanel({
                                 />
                                 <button
                                   aria-label={t("Save system prompt name")}
-                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                   disabled={
                                     !promptSettingsForm.pendingSystemPromptRename.trim()
                                   }
@@ -6262,7 +6262,7 @@ export function SettingsPanel({
                                 </button>
                                 <button
                                   aria-label={t("Cancel system prompt rename")}
-                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                  className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onClick={cancelRenameSystemPrompt}
                                   title={t("Cancel system prompt rename")}
                                   type="button"
@@ -6274,8 +6274,8 @@ export function SettingsPanel({
                               <>
                                 <button
                                   className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${isActive
-                                      ? "text-teal-900"
-                                      : "text-stone-700"
+                                      ? "text-[var(--accent-soft-foreground)]"
+                                      : "text-[var(--muted)]"
                                     }`}
                                   onClick={() =>
                                     setPromptSettingsForm((current) => ({
@@ -6290,7 +6290,7 @@ export function SettingsPanel({
                                 {defaultSystemPromptContent(prompt.name) !== null ? (
                                   <button
                                     aria-label={t("Restore default system prompt")}
-                                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={isLoadingSettings || !settings}
                                     onClick={() => restoreSystemPromptDefault(prompt.name)}
                                     title={t("Restore default system prompt")}
@@ -6304,7 +6304,7 @@ export function SettingsPanel({
                                       aria-label={t("Rename system prompt {name}", {
                                         name: prompt.name,
                                       })}
-                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                       onClick={() => startRenameSystemPrompt(prompt.name)}
                                       title={t("Rename system prompt")}
                                       type="button"
@@ -6315,7 +6315,7 @@ export function SettingsPanel({
                                       aria-label={t("Remove system prompt {name}", {
                                         name: prompt.name,
                                       })}
-                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                                      className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                                       onClick={() => removeSystemPrompt(prompt.name)}
                                       title={t("Remove system prompt")}
                                       type="button"
@@ -6333,7 +6333,7 @@ export function SettingsPanel({
                     <div className="flex gap-2">
                       <input
                         autoComplete="off"
-                        className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
                           setPromptSettingsForm((current) => ({
                             ...current,
@@ -6345,7 +6345,7 @@ export function SettingsPanel({
                       />
                       <button
                         aria-label={t("Add system prompt")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={!promptSettingsForm.pendingSystemPromptName.trim()}
                         onClick={() =>
                           addSystemPrompt(promptSettingsForm.pendingSystemPromptName)
@@ -6358,12 +6358,12 @@ export function SettingsPanel({
                     </div>
                   </div>
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("System prompt")}
                     </span>
                     <textarea
                       aria-label={t("System prompt")}
-                      className="min-h-72 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="min-h-72 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         updateActiveSystemPromptContent(event.target.value)
                       }
@@ -6556,21 +6556,21 @@ export function SettingsPanel({
                   />
                 </div>
 
-                <div className="mt-6 flex items-center gap-2 border-t border-stone-200 pt-4">
-                  <ScrollText aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                <div className="mt-6 flex items-center gap-2 border-t border-[var(--border)] pt-4">
+                  <ScrollText aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Prompt files")}
                   </h3>
                 </div>
                 <div className="mt-4 grid gap-3">
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Prompt file path")}
                     </span>
                     <div className="flex gap-2">
                       <input
                         autoComplete="off"
-                        className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         name="prompt-file-path"
                         onChange={(event) =>
                           setPromptSettingsForm((current) => ({
@@ -6583,7 +6583,7 @@ export function SettingsPanel({
                       />
                       <button
                         aria-label={t("Add prompt file")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={!promptSettingsForm.pendingFile.trim()}
                         onClick={() => addPromptFilePath(promptSettingsForm.pendingFile)}
                         title={t("Add prompt file")}
@@ -6593,7 +6593,7 @@ export function SettingsPanel({
                       </button>
                       <button
                         aria-label={t("Choose prompt file")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={isSelectingPromptFile}
                         onClick={selectPromptFile}
                         title={t("Choose prompt file")}
@@ -6607,20 +6607,20 @@ export function SettingsPanel({
                       </button>
                     </div>
                   </label>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)]">
                     {promptSettingsForm.files.length ? (
-                      <div className="divide-y divide-stone-200">
+                      <div className="divide-y divide-[var(--border)]">
                         {promptSettingsForm.files.map((file) => (
                           <div
                             className="flex min-w-0 items-center justify-between gap-3 px-3 py-2"
                             key={file}
                           >
-                            <div className="min-w-0 break-all text-sm font-semibold text-stone-800">
+                            <div className="min-w-0 break-all text-sm font-semibold text-[var(--foreground)]">
                               {file}
                             </div>
                             <button
                               aria-label={t("Remove prompt file {path}", { path: file })}
-                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                               onClick={() => removePromptFilePath(file)}
                               title={t("Remove prompt file")}
                               type="button"
@@ -6631,7 +6631,7 @@ export function SettingsPanel({
                         ))}
                       </div>
                     ) : (
-                      <div className="px-3 py-6 text-center text-sm font-medium text-stone-500">
+                      <div className="px-3 py-6 text-center text-sm font-medium text-[var(--muted)]">
                         {t("No prompt files")}
                       </div>
                     )}
@@ -6641,7 +6641,7 @@ export function SettingsPanel({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <button
                     aria-label={t("Save prompt settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingPromptSettings}
                     title={t("Save prompt settings")}
                     type="submit"
@@ -6660,47 +6660,47 @@ export function SettingsPanel({
 
           {activeSection === "spec" ? (
             <section className="grid gap-4">
-              <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <div className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
-                    <FileText aria-hidden="true" className="size-5 text-teal-700" />
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <FileText aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Auto Spec")}
                     </h3>
                   </div>
                   {isSavingSpecSettings ? (
-                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-stone-500">
+                    <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-[var(--muted)]">
                       <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
-                      {t("Saving...")}
+                      {t("Saving…")}
                     </span>
                   ) : null}
                 </div>
                 {specSettingsSaveError ? (
-                  <div className="mt-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                  <div className="mt-3 rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                     {specSettingsSaveError}
                   </div>
                 ) : null}
                 <div className="mt-4 grid gap-3">
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Automation")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Enable Auto Spec")}
                         </p>
-                        <p className="mt-1 text-xs text-stone-500">
+                        <p className="mt-1 text-xs text-[var(--muted)]">
                           {t("Updates enabled workspace specs after successful chat turns.")}
                         </p>
                       </div>
                       <label
                         aria-label={t("Enable Auto Spec")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
                         <input
                           checked={specSettingsForm.autoEnabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             queueSpecSettingsSave({
                               ...specSettingsFormRef.current,
@@ -6713,12 +6713,12 @@ export function SettingsPanel({
                     </div>
                     <div className="mt-3">
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Spec generation model")}
                         </span>
                         <select
                           aria-label={t("Spec generation model")}
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             queueSpecSettingsSave({
                               ...specSettingsFormRef.current,
@@ -6747,13 +6747,13 @@ export function SettingsPanel({
                     </div>
                     <div className="mt-3">
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Spec LLM timeout ms")}
                         </span>
                         <input
                           aria-label={t("Spec LLM timeout ms")}
                           autoComplete="off"
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           inputMode="numeric"
                           name="spec-llm-timeout-ms"
                           onBlur={() => {
@@ -6798,21 +6798,21 @@ export function SettingsPanel({
                 </div>
               </div>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
                   <div className="min-w-0">
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Spec job history")}
                     </h3>
-                    <p className="mt-1 truncate text-xs text-stone-500">
+                    <p className="mt-1 truncate text-xs text-[var(--muted)]">
                       {t("All workspace Spec jobs")}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-3">
-                    <label className="inline-flex items-center gap-2 text-sm font-medium text-stone-700">
+                    <label className="inline-flex items-center gap-2 text-sm font-medium text-[var(--muted)]">
                       <input
                         checked={showRetryableSpecJobsOnly}
-                        className="size-4 accent-teal-700"
+                        className="size-4 accent-[var(--accent)]"
                         onChange={(event) =>
                           updateShowRetryableSpecJobsOnly(event.target.checked)
                         }
@@ -6822,7 +6822,7 @@ export function SettingsPanel({
                     </label>
                     <button
                       aria-label={t("Refresh Spec job history")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                       disabled={isLoadingSpecJobs}
                       onClick={() => void loadSpecJobs()}
                       title={t("Refresh Spec job history")}
@@ -6838,14 +6838,14 @@ export function SettingsPanel({
                 </div>
 
                 {specJobsError ? (
-                  <div className="border-b border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">
+                  <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-2 text-sm text-[var(--danger)]">
                     {specJobsError}
                   </div>
                 ) : null}
 
                 <div className="panel-scroll overflow-x-auto" onWheel={handleSettingsTableWheel}>
-                  <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
-                    <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
+                  <table className="min-w-full divide-y divide-[var(--border)] text-left text-sm">
+                    <thead className="bg-[var(--surface-secondary)] text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                       <tr>
                         <th className="px-3 py-2">{t("Time")}</th>
                         <th className="px-3 py-2">{t("Workspace")}</th>
@@ -6857,15 +6857,15 @@ export function SettingsPanel({
                         <th className="px-3 py-2 text-right">{t("Actions")}</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-stone-100">
+                    <tbody className="divide-y divide-[var(--border)]">
                       {specJobs.length === 0 ? (
                         <tr>
                           <td
-                            className="px-3 py-6 text-center text-sm font-medium text-stone-500"
+                            className="px-3 py-6 text-center text-sm font-medium text-[var(--muted)]"
                             colSpan={8}
                           >
                             {isLoadingSpecJobs
-                              ? t("Loading Spec job history...")
+                              ? t("Loading Spec job history…")
                               : t("No Spec jobs")}
                           </td>
                         </tr>
@@ -6879,18 +6879,18 @@ export function SettingsPanel({
                           const isDeleting = operationType === "delete";
                           const chatTitle = item.chatTitle?.trim() || null;
                           return (
-                            <tr className="bg-white hover:bg-stone-50" key={operationKey}>
+                            <tr className="bg-[var(--surface)] hover:bg-[var(--surface-secondary)]" key={operationKey}>
                               <td className="px-3 py-2 align-top">
-                                <span className="whitespace-nowrap text-xs font-semibold text-stone-700">
+                                <span className="whitespace-nowrap text-xs font-semibold text-[var(--muted)]">
                                   {formatAuditDate(specJobTime(job), language)}
                                 </span>
                               </td>
                               <td className="px-3 py-2 align-top">
                                 <div className="min-w-40">
-                                  <div className="font-semibold text-stone-900">
+                                  <div className="font-semibold text-[var(--foreground)]">
                                     {item.workspaceName}
                                   </div>
-                                  <div className="mt-1 max-w-56 truncate text-xs text-stone-500" title={item.workspacePath}>
+                                  <div className="mt-1 max-w-56 truncate text-xs text-[var(--muted)]" title={item.workspacePath}>
                                     {item.workspacePath}
                                   </div>
                                 </div>
@@ -6898,13 +6898,13 @@ export function SettingsPanel({
                               <td className="px-3 py-2 align-top">
                                 {chatTitle ? (
                                   <div
-                                    className="max-w-48 truncate text-sm font-medium text-stone-800"
+                                    className="max-w-48 truncate text-sm font-medium text-[var(--foreground)]"
                                     title={chatTitle}
                                   >
                                     {chatTitle}
                                   </div>
                                 ) : (
-                                  <span className="text-sm font-medium text-stone-400">
+                                  <span className="text-sm font-medium text-[var(--muted)]">
                                     {t("None")}
                                   </span>
                                 )}
@@ -6922,7 +6922,7 @@ export function SettingsPanel({
                               <td className="px-3 py-2 align-top">
                                 {job.modelId ?? t("Default")}
                               </td>
-                              <td className="max-w-72 px-3 py-2 align-top text-xs text-stone-600">
+                              <td className="max-w-72 px-3 py-2 align-top text-xs text-[var(--muted)]">
                                 {specJobResultLabel(job, t, language)}
                               </td>
                               <td className="px-3 py-2 align-top">
@@ -6930,7 +6930,7 @@ export function SettingsPanel({
                                   {job.status === "failed" && !job.hasRetry ? (
                                     <button
                                       aria-label={t("Retry Spec job")}
-                                      className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                      className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       disabled={isBusy}
                                       onClick={() => void retrySpecJob(item.workspaceId, job.id)}
                                       title={t("Retry Spec job")}
@@ -6947,7 +6947,7 @@ export function SettingsPanel({
                                   {job.status === "failed" ? (
                                     <button
                                       aria-label={t("Delete Spec job")}
-                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:border-stone-200 disabled:bg-stone-100 disabled:text-stone-400"
+                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       disabled={isBusy}
                                       onClick={() => void deleteSpecJob(item.workspaceId, job.id)}
                                       title={t("Delete Spec job")}
@@ -6970,8 +6970,8 @@ export function SettingsPanel({
                   </table>
                 </div>
 
-                <div className="flex flex-col gap-3 border-t border-stone-200 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-                  <div className="text-xs font-medium text-stone-500">
+                <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="text-xs font-medium text-[var(--muted)]">
                     {specJobsTotalCount
                       ? t("Showing {start}-{end} of {total}", {
                         end: formatNumber(specJobsPageEnd, language),
@@ -6981,10 +6981,10 @@ export function SettingsPanel({
                       : t("No Spec jobs")}
                   </div>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
-                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-stone-500 sm:w-auto">
+                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-[var(--muted)] sm:w-auto">
                       <span>{t("Page size")}</span>
                       <input
-                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         disabled={isLoadingSpecJobs}
                         inputMode="numeric"
                         onChange={(event) => updateSpecJobsPageSize(event.target.value)}
@@ -6997,7 +6997,7 @@ export function SettingsPanel({
                     >
                       <button
                         aria-label={t("Previous page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingSpecJobs || specJobsPage <= 1}
                         onClick={() => goToSpecJobsPage(specJobsPage - 1)}
                         title={t("Previous page")}
@@ -7009,7 +7009,7 @@ export function SettingsPanel({
                         item === "ellipsis" ? (
                           <span
                             aria-hidden="true"
-                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            className="inline-flex size-9 items-center justify-center text-[var(--muted)]"
                             key={`spec-jobs-ellipsis-${index}`}
                           >
                             ...
@@ -7021,8 +7021,8 @@ export function SettingsPanel({
                               page: formatNumber(item, language),
                             })}
                             className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === specJobsPage
-                                ? "border-teal-700 bg-teal-700 text-white"
-                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             disabled={isLoadingSpecJobs}
                             key={item}
@@ -7038,7 +7038,7 @@ export function SettingsPanel({
                       )}
                       <button
                         aria-label={t("Next page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           isLoadingSpecJobs ||
                           specJobsTotalPages === 0 ||
@@ -7060,22 +7060,22 @@ export function SettingsPanel({
           {activeSection === "plan" ? (
             <section className="grid gap-4">
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void savePlanSettings(event)}
               >
                 <div className="flex items-center gap-2">
-                  <ListChecks aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <ListChecks aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Plan automation")}
                   </h3>
                 </div>
                 <label className="mt-4 block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Merge automation")}
                   </span>
                   <select
                     aria-label={t("Merge automation")}
-                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) => setPlanMergeAutomationMode(event.target.value)}
                     value={planMergeAutomationMode}
                   >
@@ -7087,12 +7087,12 @@ export function SettingsPanel({
                   </select>
                 </label>
                 <label className="mt-4 block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Plan mode model")}
                   </span>
                   <select
                     aria-label={t("Plan mode model")}
-                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                    className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) => setPlanModeModelId(event.target.value)}
                     value={planModeModelId}
                   >
@@ -7106,7 +7106,7 @@ export function SettingsPanel({
                 </label>
                 <button
                   aria-label={t("Save plan settings")}
-                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingPlanSettings}
                   title={t("Save plan settings")}
                   type="submit"
@@ -7120,19 +7120,19 @@ export function SettingsPanel({
                 </button>
               </form>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
                   <div className="min-w-0">
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Plan history")}
                     </h3>
-                    <p className="mt-1 truncate text-xs text-stone-500">
+                    <p className="mt-1 truncate text-xs text-[var(--muted)]">
                       {planWorkspace?.name ?? t("No workspace selected")}
                     </p>
                   </div>
                   <button
                     aria-label={t("Refresh plan history")}
-                    className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingPlanHistory || !effectivePlanHistoryWorkspaceId}
                     onClick={() => void loadPlanHistory()}
                     title={t("Refresh plan history")}
@@ -7146,14 +7146,14 @@ export function SettingsPanel({
                   </button>
                 </div>
 
-                <div className="grid gap-3 border-b border-stone-200 px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+                <div className="grid gap-3 border-b border-[var(--border)] px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Workspace")}
                     </span>
                     <select
                       aria-label={t("Workspace")}
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
                         setPlanHistoryPage(1);
                         setPlanHistoryWorkspaceId(event.target.value);
@@ -7168,12 +7168,12 @@ export function SettingsPanel({
                     </select>
                   </label>
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Plan status")}
                     </span>
                     <select
                       aria-label={t("Plan status")}
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
                         setPlanHistoryPage(1);
                         setPlanHistoryStatus(event.target.value);
@@ -7200,14 +7200,14 @@ export function SettingsPanel({
                 </div>
 
                 {planHistoryError ? (
-                  <div className="border-b border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+                  <div className="border-b border-[var(--danger)] bg-[var(--danger-soft)] px-4 py-3 text-sm text-[var(--danger)]">
                     {planHistoryError}
                   </div>
                 ) : null}
 
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {!effectivePlanHistoryWorkspaceId ? (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No workspace selected")}
                     </div>
                   ) : planHistory.length ? (
@@ -7229,7 +7229,7 @@ export function SettingsPanel({
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                             <div className="min-w-0">
                               <div className="flex flex-wrap items-center gap-2">
-                                <span className="text-sm font-semibold text-stone-950">
+                                <span className="text-sm font-semibold text-[var(--foreground)]">
                                   {plan.title}
                                 </span>
                                 <CapabilityPill
@@ -7242,10 +7242,10 @@ export function SettingsPanel({
                                   ok={completedSteps === totalSteps && totalSteps > 0}
                                 />
                               </div>
-                              <p className="mt-1 line-clamp-2 text-xs leading-5 text-stone-500">
+                              <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--muted)]">
                                 {plan.overview}
                               </p>
-                              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-stone-500">
+                              <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[var(--muted)]">
                                 <span>{formatAuditDate(plan.updatedAt, language)}</span>
                                 {plan.completedByUserAt ? (
                                   <span>{t("Archived")}: {formatAuditDate(plan.completedByUserAt, language)}</span>
@@ -7255,7 +7255,7 @@ export function SettingsPanel({
                             {action ? (
                               <button
                                 aria-label={t(planActionLabel(action))}
-                                className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={planHistoryOperationKey !== null}
                                 onClick={() => void runPlanHistoryAction(plan.id, action)}
                                 title={t(planActionLabel(action))}
@@ -7274,14 +7274,14 @@ export function SettingsPanel({
                       );
                     })
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
-                      {isLoadingPlanHistory ? t("Loading plans...") : t("No plans")}
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
+                      {isLoadingPlanHistory ? t("Loading plans…") : t("No plans")}
                     </div>
                   )}
                 </div>
 
-                <div className="flex flex-col gap-3 border-t border-stone-200 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
-                  <div className="text-xs font-medium text-stone-500">
+                <div className="flex flex-col gap-3 border-t border-[var(--border)] px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="text-xs font-medium text-[var(--muted)]">
                     {planHistoryTotalCount
                       ? t("Showing {start}-{end} of {total}", {
                         end: formatNumber(planHistoryPageEnd, language),
@@ -7291,10 +7291,10 @@ export function SettingsPanel({
                       : t("No plans")}
                   </div>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
-                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-stone-500 sm:w-auto">
+                    <label className="flex w-full items-center gap-2 text-xs font-semibold text-[var(--muted)] sm:w-auto">
                       <span>{t("Page size")}</span>
                       <input
-                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         inputMode="numeric"
                         onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
                         value={planHistoryPageSize}
@@ -7306,7 +7306,7 @@ export function SettingsPanel({
                     >
                       <button
                         aria-label={t("Previous page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingPlanHistory || planHistoryPage <= 1}
                         onClick={() => goToPlanHistoryPage(planHistoryPage - 1)}
                         title={t("Previous page")}
@@ -7318,7 +7318,7 @@ export function SettingsPanel({
                         item === "ellipsis" ? (
                           <span
                             aria-hidden="true"
-                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            className="inline-flex size-9 items-center justify-center text-[var(--muted)]"
                             key={`plan-history-ellipsis-${index}`}
                           >
                             ...
@@ -7330,8 +7330,8 @@ export function SettingsPanel({
                               page: formatNumber(item, language),
                             })}
                             className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === planHistoryPage
-                                ? "border-teal-700 bg-teal-700 text-white"
-                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             disabled={isLoadingPlanHistory}
                             key={item}
@@ -7347,7 +7347,7 @@ export function SettingsPanel({
                       )}
                       <button
                         aria-label={t("Next page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           isLoadingPlanHistory ||
                           planHistoryTotalPages === 0 ||
@@ -7372,7 +7372,7 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close memory dialog backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={closeMemoryDialog}
                     type="button"
                   />
@@ -7382,7 +7382,7 @@ export function SettingsPanel({
                         ? t("Create memory")
                         : t("Edit memory")
                     }
-                    className={`fixed left-1/2 top-1/2 z-50 max-h-[88vh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)] ${memoryDialogMode === "edit" ? "w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)]"
+                    className={`fixed left-1/2 top-1/2 z-50 max-h-[88vh] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)] ${memoryDialogMode === "edit" ? "w-[min(94vw,72rem)]" : "w-[min(92vw,34rem)]"
                       }`}
                     onSubmit={(event) => void saveMemoryDialog(event)}
                     role="dialog"
@@ -7391,23 +7391,23 @@ export function SettingsPanel({
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           {memoryDialogMode === "create" ? (
-                            <Plus aria-hidden="true" className="size-5 text-teal-700" />
+                            <Plus aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
                           ) : (
-                            <Pencil aria-hidden="true" className="size-5 text-teal-700" />
+                            <Pencil aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
                           )}
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {memoryDialogMode === "create"
                               ? t("Create memory")
                               : t("Edit memory")}
                           </h3>
                         </div>
-                        <div className="mt-1 truncate text-xs text-stone-500">
+                        <div className="mt-1 truncate text-xs text-[var(--muted)]">
                           {memoryScopeLabel(manualMemoryForm.scope, t)}
                         </div>
                       </div>
                       <button
                         aria-label={t("Close memory dialog")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={closeMemoryDialog}
                         title={t("Close")}
                         type="button"
@@ -7426,11 +7426,11 @@ export function SettingsPanel({
                         {memoryDialogMode === "create" ? (
                           <>
                             <label className="block">
-                              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                 {t("Memory scope")}
                               </span>
                               <select
-                                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                 onChange={(event) =>
                                   setManualMemoryForm((current) => ({
                                     ...current,
@@ -7446,11 +7446,11 @@ export function SettingsPanel({
                             </label>
                             {manualMemoryForm.scope !== "global" ? (
                               <label className="block">
-                                <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                   {t("Workspace")}
                                 </span>
                                 <select
-                                  className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                  className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                   onChange={(event) =>
                                     setManualMemoryForm((current) => ({
                                       ...current,
@@ -7480,18 +7480,18 @@ export function SettingsPanel({
                                     chatId: value,
                                   }))
                                 }
-                                placeholder="chat-..."
+                                placeholder="chat-…"
                                 value={manualMemoryForm.chatId}
                               />
                             ) : null}
                           </>
                         ) : null}
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory kind")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
                                 ...current,
@@ -7520,13 +7520,13 @@ export function SettingsPanel({
                             placeholder="0.8"
                             value={manualMemoryForm.confidence}
                           />
-                          <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2 sm:mt-6">
-                            <span className="text-sm font-semibold text-stone-700">
+                          <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 sm:mt-6">
+                            <span className="text-sm font-semibold text-[var(--muted)]">
                               {t("Pinned memory")}
                             </span>
                             <input
                               checked={manualMemoryForm.pinned}
-                              className="size-4 accent-teal-700"
+                              className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
                                 setManualMemoryForm((current) => ({
                                   ...current,
@@ -7538,11 +7538,11 @@ export function SettingsPanel({
                           </label>
                         </div>
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory fact")}
                           </span>
                           <textarea
-                            className="min-h-32 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="min-h-32 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
                                 ...current,
@@ -7553,11 +7553,11 @@ export function SettingsPanel({
                           />
                         </label>
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory metadata")}
                           </span>
                           <textarea
-                            className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
                                 ...current,
@@ -7569,59 +7569,59 @@ export function SettingsPanel({
                           />
                         </label>
                         {memoryDialogMode === "edit" && selectedMemory ? (
-                          <div className="grid gap-2 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600">
-                            <div className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                          <div className="grid gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs text-[var(--muted)]">
+                            <div className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                               {t("Memory details")}
                             </div>
                             <div className="grid gap-2 sm:grid-cols-2">
                               <div className="break-all">
-                                <span className="font-semibold text-stone-700">ID: </span>
+                                <span className="font-semibold text-[var(--muted)]">ID: </span>
                                 {selectedMemory.id}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Memory status")}:{" "}
                                 </span>
                                 {memoryStatusLabel(selectedMemory.status, t)}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Enabled")}:{" "}
                                 </span>
                                 {selectedMemory.enabled ? t("Yes") : t("No")}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Memory scope")}:{" "}
                                 </span>
                                 {memoryScopeLabel(selectedMemory.scope, t)}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Chat ID")}:{" "}
                                 </span>
                                 {selectedMemory.chatId ?? "-"}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Latest")}:{" "}
                                 </span>
                                 {selectedMemory.isLatest ? t("Yes") : t("No")}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Expires at")}:{" "}
                                 </span>
                                 {selectedMemory.expiresAt ?? "-"}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Created")}:{" "}
                                 </span>
                                 {selectedMemory.createdAt}
                               </div>
                               <div>
-                                <span className="font-semibold text-stone-700">
+                                <span className="font-semibold text-[var(--muted)]">
                                   {t("Updated")}:{" "}
                                 </span>
                                 {selectedMemory.updatedAt}
@@ -7631,32 +7631,32 @@ export function SettingsPanel({
                         ) : null}
                       </div>
                       {memoryDialogMode === "edit" ? (
-                        <div className="grid min-w-0 gap-2 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-2">
+                        <div className="grid min-w-0 gap-2 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
                           <div className="flex items-center justify-between gap-2">
-                            <h4 className="text-xs font-semibold text-stone-600">
+                            <h4 className="text-xs font-semibold text-[var(--muted)]">
                               {t("Memory source details")}
                             </h4>
-                            <span className="font-mono text-[11px] font-semibold text-stone-400">
+                            <span className="font-mono text-[11px] font-semibold text-[var(--muted)]">
                               {memorySourceForms.length}
                             </span>
                           </div>
                           {memorySourceForms.length === 0 ? (
-                            <div className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-6 text-center text-sm font-medium text-stone-500">
+                            <div className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] px-3 py-6 text-center text-sm font-medium text-[var(--muted)]">
                               {t("No memory sources")}
                             </div>
                           ) : (
                             <div className="grid max-h-[58vh] gap-3 overflow-y-auto pr-1">
                               {memorySourceForms.map((source, index) => (
                                 <div
-                                  className="grid gap-3 rounded-xl border border-stone-200 bg-white px-3 py-3"
+                                  className="grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface)] px-3 py-3"
                                   key={source.id}
                                 >
                                   <div className="flex flex-wrap items-center justify-between gap-2">
                                     <div className="min-w-0">
-                                      <div className="text-xs font-semibold text-stone-500">
+                                      <div className="text-xs font-semibold text-[var(--muted)]">
                                         {t("Memory sources")} #{index + 1}
                                       </div>
-                                      <div className="mt-1 break-all font-mono text-[11px] text-stone-400">
+                                      <div className="mt-1 break-all font-mono text-[11px] text-[var(--muted)]">
                                         {source.id}
                                       </div>
                                     </div>
@@ -7674,7 +7674,7 @@ export function SettingsPanel({
                                     t={t}
                                   />
                                   <div className="grid gap-1.5">
-                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Source content")}
                                     </span>
                                     <SourceValueEditor
@@ -7691,7 +7691,7 @@ export function SettingsPanel({
                                     />
                                   </div>
                                   <div className="grid gap-1.5">
-                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Source metadata")}
                                     </span>
                                     <SourceValueEditor
@@ -7719,7 +7719,7 @@ export function SettingsPanel({
                             ? t("Create memory")
                             : t("Save memory")
                         }
-                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300 xl:col-span-2"
+                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] xl:col-span-2"
                         disabled={
                           isSavingMemory ||
                           !manualMemoryForm.fact.trim() ||
@@ -7750,26 +7750,26 @@ export function SettingsPanel({
               ) : null}
 
               <form
-                className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 onSubmit={(event) => void saveMemorySettings(event)}
               >
                 <div className="flex items-center gap-2">
-                  <Bot aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <Bot aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Memory controls")}
                   </h3>
                 </div>
                 <div className="mt-4 grid gap-3">
-                  <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("General memory control")}
                     </legend>
                     <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                       <div>
-                        <p className="text-sm font-semibold text-stone-800">
+                        <p className="text-sm font-semibold text-[var(--foreground)]">
                           {t("Enable memory")}
                         </p>
-                        <p className="mt-1 text-xs text-stone-500">
+                        <p className="mt-1 text-xs text-[var(--muted)]">
                           {t(
                             "Controls whether memory tools, retrieval, and extraction are available.",
                           )}
@@ -7777,11 +7777,11 @@ export function SettingsPanel({
                       </div>
                       <label
                         aria-label={t("Enable memory")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
                         <input
                           checked={memorySettingsForm.enabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setMemorySettingsForm((current) => ({
                               ...current,
@@ -7795,16 +7795,16 @@ export function SettingsPanel({
                   </fieldset>
 
                   <div className="grid gap-3 xl:grid-cols-2">
-                    <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
-                      <legend className="px-1 text-xs font-semibold text-stone-600">
+                    <fieldset className="rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_75%,transparent)] px-3 py-3">
+                      <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                         {t("Memory extraction")}
                       </legend>
                       <div className="mb-3 flex items-start gap-2">
                         <SlidersHorizontal
                           aria-hidden="true"
-                          className="mt-0.5 size-4 shrink-0 text-teal-700"
+                          className="mt-0.5 size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                         />
-                        <p className="text-xs text-stone-500">
+                        <p className="text-xs text-[var(--muted)]">
                           {t(
                             "Controls how new facts are extracted and how long they are retained.",
                           )}
@@ -7812,11 +7812,11 @@ export function SettingsPanel({
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Extraction mode")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
                                 ...current,
@@ -7833,11 +7833,11 @@ export function SettingsPanel({
                           </select>
                         </label>
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Extraction model")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
                                 ...current,
@@ -7885,26 +7885,26 @@ export function SettingsPanel({
                       </div>
                     </fieldset>
 
-                    <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
-                      <legend className="px-1 text-xs font-semibold text-stone-600">
+                    <fieldset className="rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_75%,transparent)] px-3 py-3">
+                      <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                         {t("Memory retrieval")}
                       </legend>
                       <div className="mb-3 flex items-start gap-2">
                         <Brain
                           aria-hidden="true"
-                          className="mt-0.5 size-4 shrink-0 text-teal-700"
+                          className="mt-0.5 size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                         />
-                        <p className="text-xs text-stone-500">
+                        <p className="text-xs text-[var(--muted)]">
                           {t("Controls how existing memory is matched into chat context.")}
                         </p>
                       </div>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory matching")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
                                 ...current,
@@ -7921,11 +7921,11 @@ export function SettingsPanel({
                           </select>
                         </label>
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Matching model")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
                                 ...current,
@@ -7969,7 +7969,7 @@ export function SettingsPanel({
                             placeholder="12"
                             value={memorySettingsForm.contextBudgetPercent}
                           />
-                          <p className="mt-1 text-xs text-stone-500">
+                          <p className="mt-1 text-xs text-[var(--muted)]">
                             {t(
                               "Percent of the model's available message tokens that matched memories may occupy. This is a token budget, not a fixed number of memories.",
                             )}
@@ -7979,34 +7979,34 @@ export function SettingsPanel({
                     </fieldset>
                   </div>
 
-                  <fieldset className="rounded-xl border border-stone-200 bg-white/75 px-3 py-3">
-                    <legend className="px-1 text-xs font-semibold text-stone-600">
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_75%,transparent)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                       {t("Dream")}
                     </legend>
                     <div className="mb-3 flex items-start gap-2">
                       <Sparkles
                         aria-hidden="true"
-                        className="mt-0.5 size-4 shrink-0 text-teal-700"
+                        className="mt-0.5 size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                       />
-                      <p className="text-xs text-stone-500">
+                      <p className="text-xs text-[var(--muted)]">
                         {t(
                           "Consolidates stale, duplicate, and pending memories without creating scheduled task rows.",
                         )}
                       </p>
                     </div>
                     <div className="grid gap-3 md:grid-cols-3">
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-stone-800">
+                          <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Enable Dream")}
                           </span>
                           <label
                             aria-label={t("Enable Dream")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
                             <input
                               checked={memorySettingsForm.dream.enabled}
-                              className="size-4 accent-teal-700"
+                              className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
                                 updateMemoryDreamForm({
                                   enabled: event.target.checked,
@@ -8017,18 +8017,18 @@ export function SettingsPanel({
                           </label>
                         </div>
                       </div>
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-stone-800">
+                          <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Enable Auto Dream")}
                           </span>
                           <label
                             aria-label={t("Enable Auto Dream")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
                             <input
                               checked={memorySettingsForm.dream.autoEnabled}
-                              className="size-4 accent-teal-700"
+                              className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
                                 updateMemoryDreamForm({
                                   autoEnabled: event.target.checked,
@@ -8039,18 +8039,18 @@ export function SettingsPanel({
                           </label>
                         </div>
                       </div>
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3">
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-stone-800">
+                          <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Create transcript chat")}
                           </span>
                           <label
                             aria-label={t("Create transcript chat")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white"
+                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
                             <input
                               checked={memorySettingsForm.dream.createTranscriptChat}
-                              className="size-4 accent-teal-700"
+                              className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
                                 updateMemoryDreamForm({
                                   createTranscriptChat: event.target.checked,
@@ -8064,12 +8064,12 @@ export function SettingsPanel({
                     </div>
                     <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Dream mode")}
                         </span>
                         <select
                           aria-label={t("Dream mode")}
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             updateMemoryDreamForm({
                               mode: event.target.value as MemoryDreamRunMode,
@@ -8084,12 +8084,12 @@ export function SettingsPanel({
                         </select>
                       </label>
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Dream model")}
                         </span>
                         <select
                           aria-label={t("Dream model")}
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             updateMemoryDreamForm({
                               modelId: event.target.value,
@@ -8176,7 +8176,7 @@ export function SettingsPanel({
                 </div>
                 <button
                   aria-label={t("Save memory settings")}
-                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingMemorySettings}
                   title={t("Save memory settings")}
                   type="submit"
@@ -8190,23 +8190,23 @@ export function SettingsPanel({
                 </button>
               </form>
 
-              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="min-w-0 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
                     <div className="flex items-center gap-2">
-                      <Sparkles aria-hidden="true" className="size-5 text-teal-700" />
-                      <h3 className="text-sm font-semibold text-stone-950">
+                      <Sparkles aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                      <h3 className="text-sm font-semibold text-[var(--foreground)]">
                         {t("Dream history")}
                       </h3>
                     </div>
-                    <p className="mt-1 truncate text-xs text-stone-500">
+                    <p className="mt-1 truncate text-xs text-[var(--muted)]">
                       {t("Memory maintenance jobs and applied changes")}
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-2">
                     <button
                       aria-label={t("Run workspace Dream now")}
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={
                         !isMemoryDreamRunnable ||
                         !memoryDreamWorkspaceId ||
@@ -8226,7 +8226,7 @@ export function SettingsPanel({
                     </button>
                     <button
                       aria-label={t("Run global Dream now")}
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
                         !isMemoryDreamRunnable ||
                         activeMemoryDreamJobKeys.has(globalDreamRunKey) ||
@@ -8245,7 +8245,7 @@ export function SettingsPanel({
                     </button>
                     <button
                       aria-label={t("Refresh Dream history")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={() => void loadMemoryDreamJobs()}
                       title={t("Refresh Dream history")}
                       type="button"
@@ -8260,11 +8260,11 @@ export function SettingsPanel({
                 </div>
 
                 <div className="mt-4 grid gap-3 md:grid-cols-4">
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="text-xs font-semibold text-stone-500">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <div className="text-xs font-semibold text-[var(--muted)]">
                       {t("Last successful run")}
                     </div>
-                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                    <div className="mt-1 text-sm font-semibold text-[var(--foreground)]">
                       {latestSuccessfulMemoryDreamJob
                         ? formatAuditDate(
                           latestSuccessfulMemoryDreamJob.completedAt ??
@@ -8274,11 +8274,11 @@ export function SettingsPanel({
                         : t("None")}
                     </div>
                   </div>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="text-xs font-semibold text-stone-500">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <div className="text-xs font-semibold text-[var(--muted)]">
                       {t("Last failed run")}
                     </div>
-                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                    <div className="mt-1 text-sm font-semibold text-[var(--foreground)]">
                       {latestFailedMemoryDreamJob
                         ? formatAuditDate(
                           latestFailedMemoryDreamJob.completedAt ??
@@ -8288,39 +8288,39 @@ export function SettingsPanel({
                         : t("None")}
                     </div>
                   </div>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="text-xs font-semibold text-stone-500">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <div className="text-xs font-semibold text-[var(--muted)]">
                       {t("Next automatic run")}
                     </div>
-                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                    <div className="mt-1 text-sm font-semibold text-[var(--foreground)]">
                       {memoryDreamNextRunEstimate}
                     </div>
                   </div>
-                  <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                    <div className="text-xs font-semibold text-stone-500">
+                  <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                    <div className="text-xs font-semibold text-[var(--muted)]">
                       {t("Latest applied changes")}
                     </div>
-                    <div className="mt-1 text-sm font-semibold text-stone-900">
+                    <div className="mt-1 text-sm font-semibold text-[var(--foreground)]">
                       {formatNumber(latestMemoryDreamChangeCount, language)}
                     </div>
                   </div>
                 </div>
 
                 {memoryDreamError ? (
-                  <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  <div className="mt-4 rounded-xl border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]">
                     {memoryDreamError}
                   </div>
                 ) : null}
 
                 {memoryDreamPartialUnavailable.length > 0 ? (
                   <div
-                    className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900"
+                    className="mt-4 rounded-xl border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]"
                     role="status"
                   >
                     <div className="font-semibold">
                       {t("Some remote Dream history is unavailable")}
                     </div>
-                    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-amber-800">
+                    <ul className="mt-1 list-disc space-y-0.5 pl-5 text-[var(--warning)]">
                       {memoryDreamPartialUnavailable.map((item) => {
                         const workspaceName =
                           workspaces.find((workspace) => workspace.id === item.workspaceId)
@@ -8336,11 +8336,11 @@ export function SettingsPanel({
                 ) : null}
 
                 <div
-                  className="settings-table-scroll panel-scroll mt-4 overflow-x-auto rounded-xl border border-stone-200 bg-white"
+                  className="settings-table-scroll panel-scroll mt-4 overflow-x-auto rounded-xl border border-[var(--border)] bg-[var(--surface)]"
                   onWheel={handleSettingsTableWheel}
                 >
-                  <table className="min-w-full divide-y divide-stone-200 text-left text-sm">
-                    <thead className="bg-stone-50 text-xs font-semibold uppercase tracking-wide text-stone-500">
+                  <table className="min-w-full divide-y divide-[var(--border)] text-left text-sm">
+                    <thead className="bg-[var(--surface-secondary)] text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                       <tr>
                         <th className="px-3 py-2">{t("Created")}</th>
                         <th className="px-3 py-2">{t("Scope")}</th>
@@ -8351,15 +8351,15 @@ export function SettingsPanel({
                         <th className="px-3 py-2 text-right">{t("Actions")}</th>
                       </tr>
                     </thead>
-                    <tbody className="divide-y divide-stone-100">
+                    <tbody className="divide-y divide-[var(--border)]">
                       {memoryDreamJobs.length === 0 ? (
                         <tr>
                           <td
-                            className="px-3 py-6 text-center text-sm font-medium text-stone-500"
+                            className="px-3 py-6 text-center text-sm font-medium text-[var(--muted)]"
                             colSpan={7}
                           >
                             {isLoadingMemoryDreamJobs
-                              ? t("Loading Dream history...")
+                              ? t("Loading Dream history…")
                               : t("No Dream jobs")}
                           </td>
                         </tr>
@@ -8376,11 +8376,11 @@ export function SettingsPanel({
                               : memoryDreamScopeLabel(job.scope, t);
                           return (
                             <tr
-                              className="bg-white hover:bg-stone-50"
+                              className="bg-[var(--surface)] hover:bg-[var(--surface-secondary)]"
                               key={job.id}
                             >
                               <td className="px-3 py-2 align-top">
-                                <span className="text-xs font-semibold text-stone-700">
+                                <span className="text-xs font-semibold text-[var(--muted)]">
                                   {formatAuditDate(job.createdAt, language)}
                                 </span>
                               </td>
@@ -8400,7 +8400,7 @@ export function SettingsPanel({
                                   tone={memoryDreamStatusTone(job.status)}
                                 />
                               </td>
-                              <td className="px-3 py-2 align-top text-xs text-stone-600">
+                              <td className="px-3 py-2 align-top text-xs text-[var(--muted)]">
                                 {t("added {count}", {
                                   count: job.changeCounts.added,
                                 })}
@@ -8425,7 +8425,7 @@ export function SettingsPanel({
                                 <div className="flex items-center justify-end gap-1">
                                   <button
                                     aria-label={t("View details")}
-                                    className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                    className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                     onClick={(event) => {
                                       event.stopPropagation();
                                       setMemoryDreamDetailJobSnapshot(job);
@@ -8439,7 +8439,7 @@ export function SettingsPanel({
                                   {job.transcriptChatId && transcriptWorkspaceId ? (
                                     <button
                                       aria-label={t("Open transcript")}
-                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                      className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                       onClick={(event) => {
                                         event.stopPropagation();
                                         onOpenChat(transcriptWorkspaceId, job.transcriptChatId!);
@@ -8450,7 +8450,7 @@ export function SettingsPanel({
                                       <ScrollText aria-hidden="true" className="size-4" />
                                     </button>
                                   ) : job.transcriptChatId ? (
-                                    <span className="text-xs text-stone-500">
+                                    <span className="text-xs text-[var(--muted)]">
                                       {job.transcriptChatId}
                                     </span>
                                   ) : null}
@@ -8464,8 +8464,8 @@ export function SettingsPanel({
                   </table>
                 </div>
 
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-3 text-sm">
-                  <div className="text-stone-500">
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] pt-3 text-sm">
+                  <div className="text-[var(--muted)]">
                     {t("Showing {start}-{end} of {total}", {
                       end: formatNumber(memoryDreamPageEnd, language),
                       start: formatNumber(memoryDreamPageStart, language),
@@ -8473,10 +8473,10 @@ export function SettingsPanel({
                     })}
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-3">
-                    <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                       <span>{t("Page size")}</span>
                       <input
-                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         max={MEMORY_DREAM_MAX_PAGE_SIZE}
                         min={1}
                         onChange={(event) => updateMemoryDreamPageSize(event.target.value)}
@@ -8490,7 +8490,7 @@ export function SettingsPanel({
                     >
                       <button
                         aria-label={t("Previous page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingMemoryDreamJobs || currentMemoryDreamPage <= 1}
                         onClick={() => goToMemoryDreamPage(currentMemoryDreamPage - 1)}
                         title={t("Previous page")}
@@ -8502,7 +8502,7 @@ export function SettingsPanel({
                         item === "ellipsis" ? (
                           <span
                             aria-hidden="true"
-                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            className="inline-flex size-9 items-center justify-center text-[var(--muted)]"
                             key={`memory-dream-ellipsis-${index}`}
                           >
                             ...
@@ -8516,8 +8516,8 @@ export function SettingsPanel({
                               page: formatNumber(item, language),
                             })}
                             className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === currentMemoryDreamPage
-                                ? "border-teal-700 bg-teal-700 text-white"
-                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             disabled={isLoadingMemoryDreamJobs}
                             key={item}
@@ -8533,7 +8533,7 @@ export function SettingsPanel({
                       )}
                       <button
                         aria-label={t("Next page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           isLoadingMemoryDreamJobs ||
                           memoryDreamTotalPages === 0 ||
@@ -8553,22 +8553,22 @@ export function SettingsPanel({
                   <>
                     <button
                       aria-label={t("Close Dream job details backdrop")}
-                      className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                      className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                       onClick={closeMemoryDreamDetailDialog}
                       type="button"
                     />
                     <div
                       aria-labelledby="memory-dream-detail-title"
                       aria-modal="true"
-                      className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(94vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                      className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(94vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                       role="dialog"
                     >
                       <div className="mb-4 flex items-start justify-between gap-3">
                         <div className="min-w-0">
                           <div className="flex flex-wrap items-center gap-2">
-                            <Sparkles aria-hidden="true" className="size-5 text-teal-700" />
+                            <Sparkles aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
                             <h4
-                              className="text-sm font-semibold text-stone-950"
+                              className="text-sm font-semibold text-[var(--foreground)]"
                               id="memory-dream-detail-title"
                             >
                               {t("Dream job details")}
@@ -8583,13 +8583,13 @@ export function SettingsPanel({
                               ok={memoryDreamDetailJob.scope === "workspace"}
                             />
                           </div>
-                          <div className="mt-1 text-xs text-stone-500">
+                          <div className="mt-1 text-xs text-[var(--muted)]">
                             {formatAuditDate(memoryDreamDetailJob.createdAt, language)}
                           </div>
                         </div>
                         <button
                           aria-label={t("Close Dream job details")}
-                          className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                          className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={closeMemoryDreamDetailDialog}
                           title={t("Close")}
                           type="button"
@@ -8597,28 +8597,28 @@ export function SettingsPanel({
                           <X aria-hidden="true" className="size-4" />
                         </button>
                       </div>
-                      <p className="text-sm text-stone-600">
+                      <p className="text-sm text-[var(--muted)]">
                         {memoryDreamDetailJob.summary ||
                           memoryDreamDetailJob.errorMessage ||
                           t("No summary")}
                       </p>
                       <div className="mt-3 grid gap-3">
                         {isLoadingMemoryDreamChanges ? (
-                          <div className="text-sm text-stone-500">
-                            {t("Loading Dream changes...")}
+                          <div className="text-sm text-[var(--muted)]">
+                            {t("Loading Dream changes…")}
                           </div>
                         ) : memoryDreamChangesByOperation.length === 0 ? (
-                          <div className="text-sm text-stone-500">
+                          <div className="text-sm text-[var(--muted)]">
                             {t("No Dream changes")}
                           </div>
                         ) : (
                           memoryDreamChangesByOperation.map((group) => (
                             <div
-                              className="rounded-lg border border-stone-200 bg-white px-3 py-3"
+                              className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-3"
                               key={group.operation}
                             >
                               <div className="mb-3 flex flex-wrap items-center gap-2">
-                                <h5 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                                <h5 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                                   {memoryDreamChangeOperationLabel(group.operation, t)}
                                 </h5>
                                 <CapabilityPill
@@ -8629,7 +8629,7 @@ export function SettingsPanel({
                               <div className="grid gap-3">
                                 {group.changes.map((change) => (
                                   <div
-                                    className="rounded-lg border border-stone-100 bg-stone-50/70 px-3 py-3"
+                                    className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3"
                                     key={change.id}
                                   >
                                     <div className="flex flex-wrap items-center gap-2">
@@ -8642,7 +8642,7 @@ export function SettingsPanel({
                                         ok={change.riskLevel === "low"}
                                       />
                                       {change.confidence !== null ? (
-                                        <span className="text-xs font-semibold text-stone-500">
+                                        <span className="text-xs font-semibold text-[var(--muted)]">
                                           {formatNumber(
                                             Math.round(change.confidence * 100),
                                             language,
@@ -8651,50 +8651,50 @@ export function SettingsPanel({
                                         </span>
                                       ) : null}
                                     </div>
-                                    <div className="mt-2 text-sm font-semibold text-stone-900">
+                                    <div className="mt-2 text-sm font-semibold text-[var(--foreground)]">
                                       {change.reason}
                                     </div>
                                     {change.targetFactIds.length ? (
-                                      <div className="mt-1 break-all text-xs text-stone-500">
+                                      <div className="mt-1 break-all text-xs text-[var(--muted)]">
                                         {change.targetFactIds.join(", ")}
                                       </div>
                                     ) : null}
                                     {change.errorMessage ? (
-                                      <div className="mt-2 text-sm text-rose-700">
+                                      <div className="mt-2 text-sm text-[var(--danger)]">
                                         {change.errorMessage}
                                       </div>
                                     ) : null}
                                     <div className="mt-3 grid gap-3 lg:grid-cols-3">
                                       <div>
-                                        <div className="text-xs font-semibold text-stone-700">
+                                        <div className="text-xs font-semibold text-[var(--muted)]">
                                           {t("Before JSON")}
                                         </div>
-                                        <p className="mt-1 text-xs text-stone-500">
+                                        <p className="mt-1 text-xs text-[var(--muted)]">
                                           {t("Memory state before this Dream change.")}
                                         </p>
-                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--muted)]">
                                           {memoryDreamJsonText(change.beforeJson)}
                                         </pre>
                                       </div>
                                       <div>
-                                        <div className="text-xs font-semibold text-stone-700">
+                                        <div className="text-xs font-semibold text-[var(--muted)]">
                                           {t("After JSON")}
                                         </div>
-                                        <p className="mt-1 text-xs text-stone-500">
+                                        <p className="mt-1 text-xs text-[var(--muted)]">
                                           {t("Memory state Dream wrote or proposed.")}
                                         </p>
-                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--muted)]">
                                           {memoryDreamJsonText(change.afterJson)}
                                         </pre>
                                       </div>
                                       <div>
-                                        <div className="text-xs font-semibold text-stone-700">
+                                        <div className="text-xs font-semibold text-[var(--muted)]">
                                           {t("Evidence JSON")}
                                         </div>
-                                        <p className="mt-1 text-xs text-stone-500">
+                                        <p className="mt-1 text-xs text-[var(--muted)]">
                                           {t("Sources Dream used to justify the change.")}
                                         </p>
-                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-stone-200 bg-white px-3 py-2 text-xs text-stone-700">
+                                        <pre className="panel-scroll mt-2 max-h-64 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs text-[var(--muted)]">
                                           {memoryDreamJsonText(change.evidence)}
                                         </pre>
                                       </div>
@@ -8711,13 +8711,13 @@ export function SettingsPanel({
                 ) : null}
               </section>
 
-              <section className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="min-w-0 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="min-w-0">
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Memory list")}
                     </h3>
-                    <p className="mt-1 truncate text-xs text-stone-500">
+                    <p className="mt-1 truncate text-xs text-[var(--muted)]">
                       {memoryScopeLabel(memoryFilter.scope, t)}
                     </p>
                   </div>
@@ -8725,7 +8725,7 @@ export function SettingsPanel({
                     {memoryFilter.scope !== "global" ? (
                       <button
                         aria-label={clearFilteredMemoryLabel}
-                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-sm font-semibold text-rose-700 hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--danger)] hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={!canClearFilteredMemories || isSavingMemory}
                         onClick={() => void clearFilteredMemories()}
                         title={clearFilteredMemoryLabel}
@@ -8737,7 +8737,7 @@ export function SettingsPanel({
                     ) : null}
                     <button
                       aria-label={t("Create memory")}
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-teal-800 px-3 text-sm font-semibold text-white hover:bg-teal-900"
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)]"
                       onClick={openCreateMemoryDialog}
                       title={t("Create memory")}
                       type="button"
@@ -8749,12 +8749,12 @@ export function SettingsPanel({
                 </div>
                 <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(8rem,0.7fr)_minmax(0,1.4fr)_auto]">
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Memory scope")}
                     </span>
                     <select
                       aria-label={t("Memory scope")}
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         updateMemoryFilter({
                           scope: event.target.value as MemoryFilterState["scope"],
@@ -8773,12 +8773,12 @@ export function SettingsPanel({
                   </label>
                   {memoryFilter.scope !== "global" ? (
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Workspace")}
                       </span>
                       <select
                         aria-label={t("Workspace")}
-                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
                           updateMemoryFilter({
                             workspaceId: event.target.value,
@@ -8802,17 +8802,17 @@ export function SettingsPanel({
                           chatId: value,
                         })
                       }
-                      placeholder="chat-..."
+                      placeholder="chat-…"
                       value={memoryFilter.chatId}
                     />
                   ) : null}
                   <label className="block">
-                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Memory kind")}
                     </span>
                     <select
                       aria-label={t("Memory kind")}
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         updateMemoryFilter({
                           kind: event.target.value,
@@ -8840,12 +8840,12 @@ export function SettingsPanel({
                   />
                   <div className="flex items-end gap-2">
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Memory status")}
                       </span>
                       <select
                         aria-label={t("Memory status")}
-                        className="h-10 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
                           updateMemoryFilter({
                             status: event.target.value as MemoryFilterState["status"],
@@ -8859,7 +8859,7 @@ export function SettingsPanel({
                     </label>
                     <button
                       aria-label={t("Refresh memories")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={() => void loadMemories()}
                       title={t("Refresh memories")}
                       type="button"
@@ -8874,7 +8874,7 @@ export function SettingsPanel({
                 </div>
                 <div className="mt-4 grid gap-3">
                   {memories.length === 0 ? (
-                    <div className="rounded-xl border border-dashed border-stone-300 bg-stone-50 px-3 py-6 text-center text-sm font-medium text-stone-500">
+                    <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-6 text-center text-sm font-medium text-[var(--muted)]">
                       {t("No memories")}
                     </div>
                   ) : (
@@ -8887,8 +8887,8 @@ export function SettingsPanel({
                       return (
                       <div
                         className={`grid gap-3 rounded-xl border px-3 py-3 sm:grid-cols-[minmax(0,1fr)_auto] ${selectedMemoryId === memory.id
-                            ? "border-teal-200 bg-teal-50/80"
-                            : "border-stone-200 bg-white hover:border-teal-100 hover:bg-stone-50"
+                            ? "border-[var(--accent)] bg-[var(--accent-soft)]"
+                            : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] hover:bg-[var(--surface-secondary)]"
                           }`}
                         key={memory.id}
                       >
@@ -8907,15 +8907,15 @@ export function SettingsPanel({
                               ok={memory.pinned}
                             />
                             {memory.scope === "chat" && memory.chatId ? (
-                              <span className="text-xs font-semibold text-stone-500">
+                              <span className="text-xs font-semibold text-[var(--muted)]">
                                 {memory.chatId}
                               </span>
                             ) : null}
                           </div>
-                          <div className="mt-2 break-words text-sm font-semibold text-stone-900">
+                          <div className="mt-2 break-words text-sm font-semibold text-[var(--foreground)]">
                             {memory.fact}
                           </div>
-                          <div className="mt-2 text-xs text-stone-500">
+                          <div className="mt-2 text-xs text-[var(--muted)]">
                             {memory.updatedAt}
                           </div>
                         </button>
@@ -8938,13 +8938,13 @@ export function SettingsPanel({
                               title={memoryEnabledToggleLabel}
                               type="checkbox"
                             />
-                            <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                            <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                           </label>
                           {memory.scope !== "global" ? (
                             <button
                               aria-label={t("Promote one level")}
-                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               onClick={() => promoteMemoryOneLevel(memory)}
                               title={
                                 memory.scope === "chat"
@@ -8958,7 +8958,7 @@ export function SettingsPanel({
                           ) : null}
                           <button
                             aria-label={t("Edit memory")}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={() => openEditMemoryDialog(memory)}
                             title={t("Edit memory")}
                             type="button"
@@ -8967,7 +8967,7 @@ export function SettingsPanel({
                           </button>
                           <button
                             aria-label={t("Delete memory")}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                             onClick={() => void forgetMemory(memory.id)}
                             title={t("Delete memory")}
                             type="button"
@@ -8980,8 +8980,8 @@ export function SettingsPanel({
                     })
                   )}
                 </div>
-                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-stone-200 pt-3 text-sm">
-                  <div className="text-stone-500">
+                <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-[var(--border)] pt-3 text-sm">
+                  <div className="text-[var(--muted)]">
                     {t("Showing {start}-{end} of {total}", {
                       end: formatNumber(memoryPageEnd, language),
                       start: formatNumber(memoryPageStart, language),
@@ -8989,10 +8989,10 @@ export function SettingsPanel({
                     })}
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-3">
-                    <label className="flex items-center gap-2 text-xs font-semibold text-stone-500">
+                    <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                       <span>{t("Page size")}</span>
                       <input
-                        className="h-9 w-20 rounded-lg border border-stone-300 bg-white px-2 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         max={200}
                         min={1}
                         onChange={(event) => updateMemoryPageSize(event.target.value)}
@@ -9006,7 +9006,7 @@ export function SettingsPanel({
                     >
                       <button
                         aria-label={t("Previous page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           !isMemoryFilterReady ||
                           isLoadingMemories ||
@@ -9022,7 +9022,7 @@ export function SettingsPanel({
                         item === "ellipsis" ? (
                           <span
                             aria-hidden="true"
-                            className="inline-flex size-9 items-center justify-center text-stone-400"
+                            className="inline-flex size-9 items-center justify-center text-[var(--muted)]"
                             key={`memory-ellipsis-${index}`}
                           >
                             ...
@@ -9036,8 +9036,8 @@ export function SettingsPanel({
                               page: formatNumber(item, language),
                             })}
                             className={`inline-flex size-9 items-center justify-center rounded-lg border text-sm font-semibold shadow-sm ${item === memoryListMeta.page
-                                ? "border-teal-700 bg-teal-700 text-white"
-                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white"
+                                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             disabled={!isMemoryFilterReady || isLoadingMemories}
                             key={item}
@@ -9053,7 +9053,7 @@ export function SettingsPanel({
                       )}
                       <button
                         aria-label={t("Next page")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           isLoadingMemories ||
                           !isMemoryFilterReady ||
@@ -9069,22 +9069,22 @@ export function SettingsPanel({
                     </nav>
                   </div>
                 </div>
-                <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                   <div className="flex items-center gap-2">
-                    <CircleAlert aria-hidden="true" className="size-4 text-rose-700" />
-                    <h4 className="text-xs font-semibold uppercase tracking-wide text-stone-500">
+                    <CircleAlert aria-hidden="true" className="size-4 text-[var(--danger)]" />
+                    <h4 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
                       {t("Extraction failures")}
                     </h4>
                   </div>
                   <div className="mt-2 grid gap-2">
                     {memoryExtractionJobs.length === 0 ? (
-                      <div className="text-sm text-stone-500">
+                      <div className="text-sm text-[var(--muted)]">
                         {t("No extraction failures")}
                       </div>
                     ) : (
                       memoryExtractionJobs.map((job) => (
                         <div
-                          className="rounded-lg border border-rose-100 bg-white px-3 py-2"
+                          className="rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 py-2"
                           key={job.id}
                         >
                           <div className="flex flex-wrap items-center gap-2">
@@ -9094,19 +9094,19 @@ export function SettingsPanel({
                               ok={false}
                             />
                             {job.chatId ? (
-                              <span className="text-xs font-semibold text-stone-500">
+                              <span className="text-xs font-semibold text-[var(--muted)]">
                                 {job.chatId}
                               </span>
                             ) : null}
                           </div>
                           <div className="mt-2 flex flex-wrap items-start justify-between gap-2">
-                            <div className="min-w-0 flex-1 text-sm font-semibold text-rose-700">
+                            <div className="min-w-0 flex-1 text-sm font-semibold text-[var(--danger)]">
                               {job.errorMessage ?? t("Memory extraction failed")}
                             </div>
                             <div className="flex shrink-0 items-center gap-2">
                               <button
                                 aria-label={t("Retry extraction")}
-                                className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={isSavingMemory}
                                 onClick={() =>
                                   void updateMemoryExtractionJob(job.id, "retry")
@@ -9118,7 +9118,7 @@ export function SettingsPanel({
                               </button>
                               <button
                                 aria-label={t("Skip extraction failure")}
-                                className="inline-flex size-8 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={isSavingMemory}
                                 onClick={() =>
                                   void updateMemoryExtractionJob(job.id, "skip")
@@ -9130,7 +9130,7 @@ export function SettingsPanel({
                               </button>
                             </div>
                           </div>
-                          <div className="mt-1 text-xs text-stone-500">
+                          <div className="mt-1 text-xs text-[var(--muted)]">
                             {job.completedAt ?? job.startedAt ?? job.createdAt}
                           </div>
                         </div>
@@ -9139,10 +9139,10 @@ export function SettingsPanel({
                   </div>
                 </div>
                 {selectedMemory?.status === "pending" ? (
-                  <div className="mt-4 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                  <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                     <div className="flex flex-wrap gap-2">
                       <button
-                        className="inline-flex h-9 items-center gap-2 rounded-lg bg-teal-800 px-3 text-xs font-semibold text-white hover:bg-teal-900"
+                        className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-xs font-semibold text-white hover:bg-[var(--accent)]"
                         onClick={() => void setMemoryStatus(selectedMemory.id, "active")}
                         type="button"
                       >
@@ -9150,7 +9150,7 @@ export function SettingsPanel({
                         {t("Approve memory")}
                       </button>
                       <button
-                        className="inline-flex h-9 items-center gap-2 rounded-lg border border-rose-200 bg-white px-3 text-xs font-semibold text-rose-700 hover:bg-rose-50"
+                        className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                         onClick={() => void setMemoryStatus(selectedMemory.id, "rejected")}
                         type="button"
                       >
@@ -9193,32 +9193,32 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close workspace configuration backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsWorkspaceDialogOpen(false)}
                     type="button"
                   />
                   <form
                     aria-label={t("Workspace configuration")}
-                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     onSubmit={(event) => void saveWorkspace(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <Folder aria-hidden="true" className="size-5 text-teal-700" />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <Folder aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Edit workspace")}
                           </h3>
                         </div>
                         {editingWorkspace ? (
-                          <div className="mt-1 truncate text-xs text-stone-500">
+                          <div className="mt-1 truncate text-xs text-[var(--muted)]">
                             {editingWorkspace.path}
                           </div>
                         ) : null}
                       </div>
                       <button
                         aria-label={t("Close workspace configuration")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsWorkspaceDialogOpen(false)}
                         title={t("Close")}
                         type="button"
@@ -9228,7 +9228,7 @@ export function SettingsPanel({
                     </div>
                     {error ? (
                       <div
-                        className="mb-3 rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                        className="mb-3 rounded-xl border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]"
                         role="alert"
                       >
                         {error}
@@ -9247,13 +9247,13 @@ export function SettingsPanel({
                         value={workspaceForm.name}
                       />
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Path")}
                         </span>
                         <div className="flex gap-2">
                           <input
                             autoComplete="off"
-                            className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             name="workspace-path"
                             onChange={(event) =>
                               setWorkspaceForm((current) => {
@@ -9270,7 +9270,7 @@ export function SettingsPanel({
                           />
                           <button
                             aria-label={t("Choose workspace path")}
-                            className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                            className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSelectingWorkspaceFormPath}
                             onClick={selectWorkspaceFormPath}
                             title={t("Choose workspace path")}
@@ -9287,19 +9287,19 @@ export function SettingsPanel({
                           </button>
                         </div>
                       </label>
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
                         <div className="mb-3 flex items-center justify-between gap-3">
                           <div className="flex min-w-0 items-center gap-2">
                             <WorkspaceIcon
-                              className="size-10 rounded-lg border border-stone-200 bg-white object-cover p-1"
-                              fallbackClassName="size-10 rounded-lg border border-stone-200 bg-white p-2 text-teal-700"
+                              className="size-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] object-cover p-1"
+                              fallbackClassName="size-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] p-2 text-[var(--accent-soft-foreground)]"
                               logoUrl={editingWorkspace?.logoUrl ?? null}
                             />
                             <div className="min-w-0">
-                              <span className="block text-sm font-semibold text-stone-800">
+                              <span className="block text-sm font-semibold text-[var(--foreground)]">
                                 {t("Workspace icon")}
                               </span>
-                              <span className="block truncate text-xs text-stone-500">
+                              <span className="block truncate text-xs text-[var(--muted)]">
                                 {editingWorkspace?.logoUrl
                                   ? t("Custom icon")
                                   : t("Folder icon")}
@@ -9308,7 +9308,7 @@ export function SettingsPanel({
                           </div>
                           <button
                             aria-label={t("Clear workspace icon")}
-                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-600 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:text-stone-300"
+                            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSavingWorkspaceLogo || !editingWorkspace?.logoUrl}
                             onClick={() => void clearWorkspaceLogo()}
                             title={t("Clear workspace icon")}
@@ -9334,7 +9334,7 @@ export function SettingsPanel({
                         />
                         <button
                           aria-label={t("Upload icon")}
-                          className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:text-stone-400"
+                          className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                           disabled={isSavingWorkspaceLogo}
                           onClick={() => workspaceLogoInputRef.current?.click()}
                           title={t("Upload icon")}
@@ -9345,11 +9345,11 @@ export function SettingsPanel({
                         </button>
                       </div>
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Terminal shell")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setWorkspaceForm((current) => ({
                               ...current,
@@ -9365,14 +9365,14 @@ export function SettingsPanel({
                           ))}
                         </select>
                       </label>
-                      <div className="rounded-lg border border-stone-200 bg-stone-50/80 p-3">
+                      <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
                         <div className="mb-3 flex items-center justify-between gap-3">
-                          <span className="text-sm font-semibold text-stone-700">
+                          <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Common commands")}
                           </span>
                           <button
                             aria-label={t("Add command")}
-                            className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addWorkspaceCommonCommand}
                             title={t("Add command")}
                             type="button"
@@ -9382,7 +9382,7 @@ export function SettingsPanel({
                         </div>
                         {workspaceForm.commonCommands.length ? (
                           <div className="space-y-2">
-                            <div className="grid gap-2 pr-10 text-xs font-semibold text-stone-500 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)]">
+                            <div className="grid gap-2 pr-10 text-xs font-semibold text-[var(--muted)] sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)]">
                               <span>{t("Command name")}</span>
                               <span>{t("Command")}</span>
                             </div>
@@ -9394,7 +9394,7 @@ export function SettingsPanel({
                                 <input
                                   aria-label={t("Command name")}
                                   autoComplete="off"
-                                  className="h-9 min-w-0 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                  className="h-9 min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                   onChange={(event) =>
                                     updateWorkspaceCommonCommand(
                                       index,
@@ -9408,7 +9408,7 @@ export function SettingsPanel({
                                 <input
                                   aria-label={t("Command")}
                                   autoComplete="off"
-                                  className="h-9 min-w-0 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                  className="h-9 min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                   onChange={(event) =>
                                     updateWorkspaceCommonCommand(
                                       index,
@@ -9423,7 +9423,7 @@ export function SettingsPanel({
                                   aria-label={t("Remove command {name}", {
                                     name: command.name || String(index + 1),
                                   })}
-                                  className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-500 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                                  className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                                   onClick={() => removeWorkspaceCommonCommand(index)}
                                   title={t("Remove command")}
                                   type="button"
@@ -9435,13 +9435,13 @@ export function SettingsPanel({
                           </div>
                         ) : null}
                       </div>
-                      <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                        <span className="text-sm font-semibold text-stone-700">
+                      <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                        <span className="text-sm font-semibold text-[var(--muted)]">
                           {t("Pinned workspace")}
                         </span>
                         <input
                           checked={workspaceForm.pinned}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setWorkspaceForm((current) => ({
                               ...current,
@@ -9451,17 +9451,17 @@ export function SettingsPanel({
                           type="checkbox"
                         />
                       </label>
-                      <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                        <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-700">
+                      <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                        <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-[var(--muted)]">
                           <ScrollText
                             aria-hidden="true"
-                            className="size-4 shrink-0 text-teal-700"
+                            className="size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                           />
                           <span className="truncate">{t("Enable Project Spec")}</span>
                         </span>
                         <input
                           checked={workspaceForm.specEnabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           disabled={
                             isLoadingWorkspaceSpecSettings ||
                             !isWorkspaceSpecSettingsLoaded
@@ -9480,7 +9480,7 @@ export function SettingsPanel({
                       </label>
                       <button
                         aria-label={t("Save workspace")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingWorkspace ||
                           isLoadingWorkspaceSpecSettings ||
@@ -9503,14 +9503,14 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Workspace list")}
                   </h3>
                   <button
                     aria-label={t("Add workspace")}
-                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                     onClick={onAddWorkspace}
                     title={t("Add workspace")}
                     type="button"
@@ -9518,13 +9518,13 @@ export function SettingsPanel({
                     <Plus aria-hidden="true" className="size-4" />
                   </button>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {orderedWorkspaces.length ? (
                     orderedWorkspaces.map((workspace) => (
                       <div
                         className={`grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-3 px-4 py-2.5 transition ${draggedWorkspaceId === workspace.id
-                            ? "bg-teal-50/70 opacity-80"
-                            : "bg-white/0"
+                            ? "bg-[var(--accent-soft)] opacity-80"
+                            : "bg-transparent"
                           }`}
                         key={workspace.id}
                         onDragOver={(event) =>
@@ -9537,9 +9537,9 @@ export function SettingsPanel({
                             aria-label={t("Reorder workspace {name}", {
                               name: workspace.name,
                             })}
-                            className={`inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-400 shadow-sm ${isSavingWorkspaceOrder
+                            className={`inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm ${isSavingWorkspaceOrder
                                 ? "cursor-not-allowed opacity-60"
-                                : "cursor-grab hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                : "cursor-grab hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             title={t("Reorder workspace {name}", {
                               name: workspace.name,
@@ -9562,8 +9562,8 @@ export function SettingsPanel({
                         </div>
                         <div className="flex min-w-0 items-center gap-3 select-text">
                           <WorkspaceIcon
-                            className="size-9 shrink-0 rounded-lg border border-stone-200 object-cover shadow-sm"
-                            fallbackClassName="size-9 shrink-0 rounded-lg border border-stone-200 bg-stone-50 p-2 text-stone-500 shadow-sm"
+                            className="size-9 shrink-0 rounded-lg border border-[var(--border)] object-cover shadow-sm"
+                            fallbackClassName="size-9 shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-2 text-[var(--muted)] shadow-sm"
                             logoUrl={workspace.logoUrl}
                           />
                           <div className="min-w-0">
@@ -9578,11 +9578,11 @@ export function SettingsPanel({
                                 <CapabilityPill label={t("pinned")} ok />
                               ) : null}
                             </div>
-                            <div className="mt-1 truncate text-xs text-stone-500">
+                            <div className="mt-1 truncate text-xs text-[var(--muted)]">
                               <span className="font-medium">
                                 {terminalShellLabel(terminalShells, workspace.terminalShell)}
                               </span>
-                              <span className="text-stone-300"> / </span>
+                              <span className="text-[var(--muted)]"> / </span>
                               <span>{workspace.path}</span>
                             </div>
                           </div>
@@ -9596,8 +9596,8 @@ export function SettingsPanel({
                               { name: workspace.name },
                             )}
                             className={`inline-flex size-9 items-center justify-center rounded-lg border shadow-sm ${workspace.pinned
-                                ? "border-teal-300 bg-teal-700 text-white shadow-[0_10px_22px_rgba(15,118,110,0.22)] hover:bg-teal-800"
-                                : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                ? "border-[var(--accent)] bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)]"
+                                : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               }`}
                             disabled={isSavingWorkspaceOrder || deletingWorkspaceId === workspace.id}
                             onClick={() =>
@@ -9612,7 +9612,7 @@ export function SettingsPanel({
                             aria-label={t("Delete workspace {name}", {
                               name: workspace.name,
                             })}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:opacity-50"
                             disabled={orderedWorkspaces.length <= 1 || deletingWorkspaceId === workspace.id}
                             onClick={() => setPendingDeleteWorkspace(workspace)}
                             title={t("Delete workspace")}
@@ -9628,7 +9628,7 @@ export function SettingsPanel({
                             aria-label={t("Edit workspace {name}", {
                               name: workspace.name,
                             })}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             disabled={deletingWorkspaceId === workspace.id}
                             onClick={() => void editConfiguredWorkspace(workspace)}
                             title={t("Edit workspace")}
@@ -9640,7 +9640,7 @@ export function SettingsPanel({
                       </div>
                     ))
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No workspaces")}
                     </div>
                   )}
@@ -9653,28 +9653,28 @@ export function SettingsPanel({
             <>
               <button
                 aria-label={t("Close workspace delete confirmation backdrop")}
-                className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                 onClick={() => setPendingDeleteWorkspace(null)}
                 type="button"
               />
               <section
                 aria-labelledby="delete-workspace-dialog-title"
                 aria-modal="true"
-                className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                 role="dialog"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="min-w-0">
                     <h3
-                      className="text-base font-semibold text-stone-950"
+                      className="text-base font-semibold text-[var(--foreground)]"
                       id="delete-workspace-dialog-title"
                     >
                       {t("Delete workspace?")}
                     </h3>
-                    <p className="mt-1 text-sm font-medium text-stone-950">
+                    <p className="mt-1 text-sm font-medium text-[var(--foreground)]">
                       {pendingDeleteWorkspace.name}
                     </p>
-                    <p className="mt-2 text-sm leading-6 text-stone-600">
+                    <p className="mt-2 text-sm leading-6 text-[var(--muted)]">
                       {t("Delete workspace confirmation", {
                         name: pendingDeleteWorkspace.name,
                       })}
@@ -9682,7 +9682,7 @@ export function SettingsPanel({
                   </div>
                   <button
                     aria-label={t("Cancel workspace deletion")}
-                    className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                    className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                     onClick={() => setPendingDeleteWorkspace(null)}
                     title={t("Close")}
                     type="button"
@@ -9692,7 +9692,7 @@ export function SettingsPanel({
                 </div>
                 <div className="flex justify-end gap-2">
                   <button
-                    className="inline-flex min-h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 hover:border-stone-300 hover:bg-stone-50"
+                    className="inline-flex min-h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
                     onClick={() => setPendingDeleteWorkspace(null)}
                     type="button"
                   >
@@ -9700,7 +9700,7 @@ export function SettingsPanel({
                   </button>
                   <button
                     aria-label={t("Confirm delete workspace")}
-                    className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-rose-700 px-3 py-2 text-sm font-semibold text-white shadow-[0_12px_28px_rgba(190,18,60,0.22)] hover:bg-rose-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                    className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--danger)] px-3 py-2 text-sm font-semibold text-white shadow-[0_12px_28px_rgba(190,18,60,0.22)] hover:bg-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={deletingWorkspaceId === pendingDeleteWorkspace.id}
                     onClick={() => void deleteConfiguredWorkspace(pendingDeleteWorkspace)}
                     type="button"
@@ -9723,30 +9723,30 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close hook run detail backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setHookRunDetail(null)}
                     type="button"
                   />
                   <div
                     aria-label={t("Hook run detail")}
-                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,46rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,46rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     role="dialog"
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <Webhook aria-hidden="true" className="size-5 text-teal-700" />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <Webhook aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {hookEventLabel(hookRunDetail.event, t)}
                           </h3>
                         </div>
-                        <div className="mt-1 truncate text-xs text-stone-500">
+                        <div className="mt-1 truncate text-xs text-[var(--muted)]">
                           {hookRunDetail.id}
                         </div>
                       </div>
                       <button
                         aria-label={t("Close hook run detail")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setHookRunDetail(null)}
                         title={t("Close")}
                         type="button"
@@ -9770,20 +9770,20 @@ export function SettingsPanel({
                         />
                       </div>
                       {hookRunDetail.stdoutPreview ? (
-                        <pre className="max-h-32 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                        <pre className="max-h-32 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
                           {hookRunDetail.stdoutPreview}
                         </pre>
                       ) : null}
                       {hookRunDetail.stderrPreview ? (
-                        <pre className="max-h-32 overflow-auto rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                        <pre className="max-h-32 overflow-auto rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-xs text-[var(--danger)]">
                           {hookRunDetail.stderrPreview}
                         </pre>
                       ) : null}
                       <div className="grid gap-3 lg:grid-cols-2">
-                        <pre className="max-h-80 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                        <pre className="max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
                           {JSON.stringify(hookRunDetail.input, null, 2)}
                         </pre>
-                        <pre className="max-h-80 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                        <pre className="max-h-80 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
                           {JSON.stringify(hookRunDetail.output, null, 2)}
                         </pre>
                       </div>
@@ -9796,32 +9796,32 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close hook configuration backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsHookDialogOpen(false)}
                     type="button"
                   />
                   <form
                     aria-label={t("Hook configuration")}
-                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,40rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(92vw,40rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     onSubmit={(event) => void submitHookForm(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <Webhook aria-hidden="true" className="size-5 text-teal-700" />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <Webhook aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {hookForm.handlerIndex === null
                               ? t("Add hook")
                               : t("Edit hook")}
                           </h3>
                         </div>
-                        <div className="mt-1 truncate text-xs text-stone-500">
+                        <div className="mt-1 truncate text-xs text-[var(--muted)]">
                           {hookScope === "global" ? t("Global hooks") : selectedHookWorkspace?.name}
                         </div>
                       </div>
                       <button
                         aria-label={t("Close hook configuration")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsHookDialogOpen(false)}
                         title={t("Close")}
                         type="button"
@@ -9833,11 +9833,11 @@ export function SettingsPanel({
                     <div className="grid gap-3">
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Event")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -9866,13 +9866,13 @@ export function SettingsPanel({
                           value={hookForm.matcher}
                         />
                       </div>
-                      <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                        <span className="text-sm font-semibold text-stone-700">
+                      <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                        <span className="text-sm font-semibold text-[var(--muted)]">
                           {t("Enable hook")}
                         </span>
                         <input
                           checked={hookForm.enabled}
-                          className="size-4 accent-teal-700"
+                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setHookForm((current) => ({
                               ...current,
@@ -9884,11 +9884,11 @@ export function SettingsPanel({
                       </label>
                       <div className="grid gap-3 sm:grid-cols-2">
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Handler type")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -9944,11 +9944,11 @@ export function SettingsPanel({
                             />
                           </div>
                           <label className="block">
-                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Args")}
                             </span>
                             <textarea
-                              className="min-h-20 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              className="min-h-20 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setHookForm((current) => ({
                                   ...current,
@@ -10007,11 +10007,11 @@ export function SettingsPanel({
 
                       {hookForm.type === "prompt" ? (
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Prompt")}
                           </span>
                           <textarea
-                            className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -10047,13 +10047,13 @@ export function SettingsPanel({
                         />
                       </div>
                       <div className="grid gap-2 sm:grid-cols-2">
-                        <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                          <span className="text-sm font-semibold text-stone-700">
+                        <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                          <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Async")}
                           </span>
                           <input
                             checked={hookForm.asyncHook}
-                            className="size-4 accent-teal-700"
+                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -10063,13 +10063,13 @@ export function SettingsPanel({
                             type="checkbox"
                           />
                         </label>
-                        <label className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                          <span className="text-sm font-semibold text-stone-700">
+                        <label className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                          <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Async re-wake")}
                           </span>
                           <input
                             checked={hookForm.asyncRewake}
-                            className="size-4 accent-teal-700"
+                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -10081,11 +10081,11 @@ export function SettingsPanel({
                         </label>
                       </div>
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Input override JSON")}
                         </span>
                         <textarea
-                          className="min-h-20 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="min-h-20 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setHookForm((current) => ({
                               ...current,
@@ -10098,7 +10098,7 @@ export function SettingsPanel({
                       </label>
                       <button
                         aria-label={t("Save hook")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isSavingHooks || !hookForm.event || !hookForm.type}
                         title={t("Save hook")}
                         type="submit"
@@ -10115,14 +10115,14 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
-                  <div className="inline-flex h-10 rounded-lg border border-stone-200 bg-stone-100 p-1">
+                  <div className="inline-flex h-10 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-1">
                     {(["global", "workspace"] as HookScope[]).map((scope) => (
                       <button
                         className={`rounded-md px-3 text-sm font-semibold ${hookScope === scope
-                            ? "bg-white text-teal-900 shadow-sm"
-                            : "text-stone-600 hover:text-stone-950"
+                            ? "bg-[var(--surface)] text-[var(--accent-soft-foreground)] shadow-sm"
+                            : "text-[var(--muted)] hover:text-[var(--foreground)]"
                           }`}
                         key={scope}
                         onClick={() => setHookScope(scope)}
@@ -10135,7 +10135,7 @@ export function SettingsPanel({
                   <label className="min-w-0">
                     <span className="sr-only">{t("Workspace")}</span>
                     <select
-                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
                         setHookWorkspaceId(event.target.value);
                         setHookRunDetail(null);
@@ -10152,7 +10152,7 @@ export function SettingsPanel({
                   <div className="flex gap-2">
                     <button
                       aria-label={t("Add hook")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)] hover:bg-teal-900 disabled:cursor-not-allowed disabled:bg-stone-300"
+                      className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={!hookSettings}
                       onClick={startAddingHookHandler}
                       title={t("Add hook")}
@@ -10162,7 +10162,7 @@ export function SettingsPanel({
                     </button>
                     <button
                       aria-label={t("Reload hooks")}
-                      className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                      className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                       disabled={isLoadingHooks || !selectedHookWorkspace}
                       onClick={() =>
                         selectedHookWorkspace
@@ -10180,16 +10180,16 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
-                <div className="mt-3 break-all rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-600">
-                  {activeHookPath ?? t("Loading...")}
+                <div className="mt-3 break-all rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
+                  {activeHookPath ?? t("Loading…")}
                 </div>
-                <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                  <span className="text-sm font-semibold text-stone-700">
+                <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-sm font-semibold text-[var(--muted)]">
                     {t("Disable all hooks")}
                   </span>
                   <input
                     checked={Boolean(activeHookConfig?.disableAllHooks)}
-                    className="size-4 accent-teal-700"
+                    className="size-4 accent-[var(--accent)]"
                     disabled={isSavingHooks || !activeHookConfig}
                     onChange={(event) =>
                       updateHookConfig({
@@ -10200,13 +10200,13 @@ export function SettingsPanel({
                     type="checkbox"
                   />
                 </label>
-                <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-2">
-                  <span className="text-sm font-semibold text-stone-700">
+                <label className="mt-3 flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2">
+                  <span className="text-sm font-semibold text-[var(--muted)]">
                     {t("Record hook run logs")}
                   </span>
                   <input
                     checked={generalForm.hookAuditEnabled}
-                    className="size-4 accent-teal-700"
+                    className="size-4 accent-[var(--accent)]"
                     disabled={isSavingGeneral || !settings}
                     onChange={(event) => void saveHookAuditEnabled(event.target.checked)}
                     type="checkbox"
@@ -10214,9 +10214,9 @@ export function SettingsPanel({
                 </label>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Hook rules")}
                   </h3>
                   <CapabilityPill
@@ -10224,14 +10224,14 @@ export function SettingsPanel({
                     ok={activeHookGroups.length > 0}
                   />
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {activeHookGroups.length ? (
                     activeHookGroups.map((entry) => (
                       <div className="px-4 py-3" key={`${entry.event}-${entry.groupIndex}`}>
                         <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-sm font-semibold text-stone-950">
+                              <span className="text-sm font-semibold text-[var(--foreground)]">
                                 {entry.event}
                               </span>
                               <CapabilityPill
@@ -10243,14 +10243,14 @@ export function SettingsPanel({
                                 ok={Boolean(entry.group.matcher)}
                               />
                             </div>
-                            <div className="mt-1 text-xs text-stone-500">
+                            <div className="mt-1 text-xs text-[var(--muted)]">
                               {t("handlers {count}", { count: entry.group.hooks.length })}
                             </div>
                           </div>
                           <div className="flex flex-wrap gap-2">
                             <button
                               aria-label={t("Move hook up")}
-                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={entry.groupIndex === 0 || isSavingHooks}
                               onClick={() => moveHookGroup(entry.event, entry.groupIndex, -1)}
                               title={t("Move hook up")}
@@ -10260,7 +10260,7 @@ export function SettingsPanel({
                             </button>
                             <button
                               aria-label={t("Move hook down")}
-                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={
                                 entry.groupIndex >=
                                 hookGroupsForEvent(activeHookConfig, entry.event).length - 1 ||
@@ -10287,20 +10287,20 @@ export function SettingsPanel({
                                 }
                                 type="checkbox"
                               />
-                              <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                              <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                              <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
+                              <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                             </label>
                           </div>
                         </div>
                         <div className="mt-3 space-y-2">
                           {entry.group.hooks.map((handler, handlerIndex) => (
                             <div
-                              className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
+                              className="grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 md:grid-cols-[minmax(0,1fr)_auto]"
                               key={`${entry.event}-${entry.groupIndex}-${handlerIndex}`}
                             >
                               <div className="min-w-0">
                                 <div className="flex flex-wrap items-center gap-2">
-                                  <span className="font-mono text-xs font-semibold text-stone-800">
+                                  <span className="font-mono text-xs font-semibold text-[var(--foreground)]">
                                     {handler.type}
                                   </span>
                                   <CapabilityPill
@@ -10314,14 +10314,14 @@ export function SettingsPanel({
                                     <CapabilityPill label={t("async")} ok />
                                   ) : null}
                                 </div>
-                                <div className="mt-1 truncate text-xs text-stone-500">
+                                <div className="mt-1 truncate text-xs text-[var(--muted)]">
                                   {hookHandlerSummary(handler)}
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-2">
                                 <button
                                   aria-label={t("Move handler up")}
-                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={handlerIndex === 0 || isSavingHooks}
                                   onClick={() =>
                                     moveHookHandler(
@@ -10338,7 +10338,7 @@ export function SettingsPanel({
                                 </button>
                                 <button
                                   aria-label={t("Move handler down")}
-                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={
                                     handlerIndex >= entry.group.hooks.length - 1 ||
                                     isSavingHooks
@@ -10358,7 +10358,7 @@ export function SettingsPanel({
                                 </button>
                                 <button
                                   aria-label={t("Edit hook")}
-                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onClick={() =>
                                     editHookHandler(
                                       entry.event,
@@ -10375,7 +10375,7 @@ export function SettingsPanel({
                                 </button>
                                 <button
                                   aria-label={t("Delete hook")}
-                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                  className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                   disabled={isSavingHooks}
                                   onClick={() =>
                                     deleteHookHandler(
@@ -10405,8 +10405,8 @@ export function SettingsPanel({
                                     }
                                     type="checkbox"
                                   />
-                                  <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                                  <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                                  <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
+                                  <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                                 </label>
                               </div>
                             </div>
@@ -10415,7 +10415,7 @@ export function SettingsPanel({
                       </div>
                     ))
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No hook rules")}
                     </div>
                   )}
@@ -10423,15 +10423,15 @@ export function SettingsPanel({
               </section>
 
               <div className="grid gap-4 xl:grid-cols-2">
-                <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+                <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                   <div className="flex items-center justify-between gap-3">
-                    <h3 className="text-sm font-semibold text-stone-950">
+                    <h3 className="text-sm font-semibold text-[var(--foreground)]">
                       {t("Import Claude hooks")}
                     </h3>
                     <div className="flex gap-2">
                       <button
                         aria-label={t("Import to global hooks")}
-                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                         disabled={isImportingHooks}
                         onClick={() => void importClaudeHooks("global")}
                         title={t("Import to global hooks")}
@@ -10446,7 +10446,7 @@ export function SettingsPanel({
                       </button>
                       <button
                         aria-label={t("Import to workspace hooks")}
-                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-sm font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                         disabled={isImportingHooks || !selectedHookWorkspace}
                         onClick={() => void importClaudeHooks("workspace")}
                         title={t("Import to workspace hooks")}
@@ -10457,14 +10457,14 @@ export function SettingsPanel({
                       </button>
                     </div>
                   </div>
-                  <p className="mt-2 text-xs text-stone-500">
+                  <p className="mt-2 text-xs text-[var(--muted)]">
                     {t("Global import reads user Claude settings; workspace import reads the selected workspace.")}
                   </p>
                   {hookImportResult ? (
                     <div
                       className={`mt-3 rounded-lg border px-3 py-2 text-sm ${hookImportResult.saved
-                          ? "border-teal-200 bg-teal-50 text-teal-800"
-                          : "border-amber-200 bg-amber-50 text-amber-800"
+                          ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]"
+                          : "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]"
                         }`}
                     >
                       <div className="font-semibold">
@@ -10494,20 +10494,20 @@ export function SettingsPanel({
                 </section>
 
                 <form
-                  className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]"
+                  className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                   onSubmit={(event) => void testHooks(event)}
                 >
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Test hook")}
                   </h3>
                   <div className="mt-3 grid gap-3">
                     <div className="grid gap-3 sm:grid-cols-2">
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Event")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) => setHookTestEvent(event.target.value)}
                           value={hookTestEvent}
                         >
@@ -10526,18 +10526,18 @@ export function SettingsPanel({
                       />
                     </div>
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Sample payload")}
                       </span>
                       <textarea
-                        className="min-h-28 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                        className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) => setHookTestPayload(event.target.value)}
                         value={hookTestPayload}
                       />
                     </label>
                     <button
                       aria-label={t("Run hook test")}
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 text-sm font-semibold text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={isTestingHooks || !selectedHookWorkspace}
                       title={t("Run hook test")}
                       type="submit"
@@ -10551,16 +10551,16 @@ export function SettingsPanel({
                     </button>
                   </div>
                   {hookTestResult ? (
-                    <pre className="mt-3 max-h-48 overflow-auto rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs text-stone-700">
+                    <pre className="mt-3 max-h-48 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
                       {JSON.stringify(hookTestResult, null, 2)}
                     </pre>
                   ) : null}
                 </form>
               </div>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Effective hooks")}
                   </h3>
                   <CapabilityPill
@@ -10568,7 +10568,7 @@ export function SettingsPanel({
                     ok={(hookSettings?.effective.length ?? 0) > 0}
                   />
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {hookSettings?.effective.length ? (
                     hookSettings.effective.map((hook, index) => {
                       const lastRun = latestHookRunForSummary(
@@ -10580,7 +10580,7 @@ export function SettingsPanel({
                         <div className="grid gap-3 px-4 py-3 md:grid-cols-[minmax(0,1fr)_auto]" key={`${hook.source}-${hook.event}-${index}`}>
                           <div className="min-w-0">
                             <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-sm font-semibold text-stone-950">
+                              <span className="text-sm font-semibold text-[var(--foreground)]">
                                 {hookEventLabel(hook.event, t)}
                               </span>
                               <CapabilityPill
@@ -10601,34 +10601,34 @@ export function SettingsPanel({
                                 />
                               ) : null}
                             </div>
-                            <div className="mt-1 truncate text-xs text-stone-500">
+                            <div className="mt-1 truncate text-xs text-[var(--muted)]">
                               {[hook.matcher || "*", hook.command, hook.url, hook.serverId, hook.toolName]
                                 .filter(Boolean)
                                 .join(" / ")}
                             </div>
                           </div>
-                          <div className="text-xs text-stone-500">
+                          <div className="text-xs text-[var(--muted)]">
                             {lastRun?.startedAt ?? hook.statusMessage ?? t("ready")}
                           </div>
                         </div>
                       );
                     })
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No effective hooks")}
                     </div>
                   )}
                 </div>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Recent hook runs")}
                   </h3>
                   <button
                     aria-label={t("Refresh hook runs")}
-                    className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                    className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isRefreshingHookRuns || !selectedHookWorkspace}
                     onClick={() => void refreshHookRuns()}
                     title={t("Refresh hook runs")}
@@ -10641,18 +10641,18 @@ export function SettingsPanel({
                     )}
                   </button>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {hookSettings?.recentRuns.length ? (
                     hookSettings.recentRuns.map((run) => (
                       <button
-                        className="grid w-full gap-3 px-4 py-3 text-left hover:bg-stone-50 md:grid-cols-[minmax(0,1fr)_auto]"
+                        className="grid w-full gap-3 px-4 py-3 text-left hover:bg-[var(--surface-secondary)] md:grid-cols-[minmax(0,1fr)_auto]"
                         key={run.id}
                         onClick={() => void openHookRunDetail(run.id)}
                         type="button"
                       >
                         <span className="min-w-0">
                           <span className="flex flex-wrap items-center gap-2">
-                            <span className="text-sm font-semibold text-stone-950">
+                            <span className="text-sm font-semibold text-[var(--foreground)]">
                               {hookEventLabel(run.event, t)}
                             </span>
                             <CapabilityPill
@@ -10664,15 +10664,15 @@ export function SettingsPanel({
                               ok
                             />
                           </span>
-                          <span className="mt-1 block truncate text-xs text-stone-500">
+                          <span className="mt-1 block truncate text-xs text-[var(--muted)]">
                             {run.id}
                           </span>
                         </span>
-                        <span className="text-xs text-stone-500">{run.startedAt}</span>
+                        <span className="text-xs text-[var(--muted)]">{run.startedAt}</span>
                       </button>
                     ))
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No hook runs")}
                     </div>
                   )}
@@ -10687,25 +10687,25 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close provider configuration backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={closeProviderDialog}
                     type="button"
                   />
                   <form
                     aria-label={t("Provider configuration")}
-                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="fixed left-1/2 top-1/2 z-50 max-h-[90vh] w-[min(96vw,72rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     onSubmit={(event) => void saveProvider(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <PlugZap aria-hidden="true" className="size-5 text-teal-700" />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <PlugZap aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {providerForm.id ? t("Edit provider") : t("Add provider")}
                           </h3>
                         </div>
                         {providerForm.id ? (
-                          <div className="mt-1 truncate text-xs text-stone-500">
+                          <div className="mt-1 truncate text-xs text-[var(--muted)]">
                             {providerForm.id}
                           </div>
                         ) : null}
@@ -10713,7 +10713,7 @@ export function SettingsPanel({
                       <div className="flex shrink-0 items-center gap-2">
                         <button
                           aria-label={t("Close provider configuration")}
-                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={closeProviderDialog}
                           title={t("Close")}
                           type="button"
@@ -10723,8 +10723,8 @@ export function SettingsPanel({
                       </div>
                     </div>
                     <div className="grid gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
-                      <div className="flex h-full min-h-0 flex-col rounded-xl border border-stone-200 bg-stone-50/70 p-2">
-                          <div className="px-2 pb-2 text-xs font-semibold text-stone-600">
+                      <div className="flex h-full min-h-0 flex-col rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] p-2">
+                          <div className="px-2 pb-2 text-xs font-semibold text-[var(--muted)]">
                             {t("Service provider")}
                           </div>
                           <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
@@ -10732,8 +10732,8 @@ export function SettingsPanel({
                               <button
                                 aria-pressed={selectedProviderServiceId === service.id}
                                 className={`flex min-h-9 w-full items-center justify-between gap-2 rounded-lg px-2 py-2 text-left text-sm font-semibold transition ${selectedProviderServiceId === service.id
-                                    ? "bg-teal-700 text-white"
-                                    : "text-stone-700 hover:bg-white hover:text-teal-800"
+                                    ? "bg-[var(--accent)] text-white"
+                                    : "text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--accent-soft-foreground)]"
                                   }`}
                                 key={service.id}
                                 onClick={() => applyProviderService(service.id)}
@@ -10742,8 +10742,8 @@ export function SettingsPanel({
                                 <span className="min-w-0 truncate">{service.label}</span>
                                 <span
                                   className={`rounded-md px-1.5 py-0.5 text-[11px] ${selectedProviderServiceId === service.id
-                                      ? "bg-white/15 text-white"
-                                      : "bg-stone-200 text-stone-600"
+                                      ? "bg-[color-mix(in_oklab,var(--surface)_15%,transparent)] text-white"
+                                      : "bg-[var(--default)] text-[var(--muted)]"
                                     }`}
                                 >
                                   {formatNumber(service.kindIds.length, language)}
@@ -10765,11 +10765,11 @@ export function SettingsPanel({
                         value={providerForm.name}
                       />
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Protocol")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             updateProviderProtocol(event.target.value)
                           }
@@ -10794,20 +10794,20 @@ export function SettingsPanel({
                         value={providerForm.baseUrl}
                       />
                       {providerUsesWebsocket ? (
-                        <p className="text-xs text-stone-600">
+                        <p className="text-xs text-[var(--muted)]">
                           {t(
                             "OpenAI Responses WebSocket reuses this HTTP Base URL only. Foco derives the WebSocket endpoint by converting the full Responses URL scheme (http→ws, https→wss). Prefer this protocol for long tool chains; API proxy is disabled in this release and there is no silent HTTP fallback.",
                           )}
                         </p>
                       ) : null}
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("API key")}
                         </span>
                         <span className="relative block">
                           <input
                             autoComplete="off"
-                            className={`h-10 w-full rounded-lg border border-stone-300 bg-white px-3 ${hasProviderKeyClearButton ? "pr-20" : "pr-11"} text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100`}
+                            className={`h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 ${hasProviderKeyClearButton ? "pr-20" : "pr-11"} text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]`}
                             name="api-key"
                             onChange={(event) =>
                               setProviderForm((current) => ({
@@ -10830,7 +10830,7 @@ export function SettingsPanel({
                                 ? t("Hide API key")
                                 : t("Show API key")
                             }
-                            className={`absolute ${hasProviderKeyClearButton ? "right-10" : "right-1"} top-1 inline-flex size-8 items-center justify-center rounded-md text-stone-500 hover:bg-stone-100 hover:text-stone-900 disabled:cursor-not-allowed disabled:text-stone-400`}
+                            className={`absolute ${hasProviderKeyClearButton ? "right-10" : "right-1"} top-1 inline-flex size-8 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]`}
                             disabled={isRevealingProviderApiKey}
                             onClick={() => void handleToggleProviderApiKeyVisibility()}
                             title={
@@ -10852,8 +10852,8 @@ export function SettingsPanel({
                             <button
                               aria-label={t("Clear saved API key")}
                               className={`absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md ${providerForm.clearApiKey
-                                  ? "bg-rose-50 text-rose-700"
-                                  : "text-stone-500 hover:bg-stone-100 hover:text-stone-900"
+                                  ? "bg-[var(--danger-soft)] text-[var(--danger)]"
+                                  : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
                                 }`}
                               onClick={() =>
                                 setProviderForm((current) => ({
@@ -10870,11 +10870,11 @@ export function SettingsPanel({
                           ) : null}
                         </span>
                       </label>
-                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
-                            <RefreshCw aria-hidden="true" className="size-4 text-teal-700" />
-                            <h4 className="text-sm font-semibold text-stone-950">
+                            <RefreshCw aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" />
+                            <h4 className="text-sm font-semibold text-[var(--foreground)]">
                               {t("Model sync")}
                             </h4>
                           </div>
@@ -10888,11 +10888,11 @@ export function SettingsPanel({
                           />
                         </div>
                         <div className="mt-3 grid gap-3">
-                          <label className="inline-flex items-center gap-2 text-sm font-semibold text-stone-700">
+                          <label className="inline-flex items-center gap-2 text-sm font-semibold text-[var(--muted)]">
                             <input
                               aria-label={t("Auto sync provider models")}
                               checked={providerForm.autoSyncModels}
-                              className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                              className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setProviderForm((current) => ({
                                   ...current,
@@ -10916,11 +10916,11 @@ export function SettingsPanel({
                           />
                         </div>
                       </div>
-                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
-                            <PlugZap aria-hidden="true" className="size-4 text-teal-700" />
-                            <h4 className="text-sm font-semibold text-stone-950">
+                            <PlugZap aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" />
+                            <h4 className="text-sm font-semibold text-[var(--foreground)]">
                               {t("AI API proxy")}
                             </h4>
                           </div>
@@ -10934,18 +10934,18 @@ export function SettingsPanel({
                           />
                         </div>
                         {providerUsesWebsocket ? (
-                          <p className="mt-3 text-xs text-stone-600">
+                          <p className="mt-3 text-xs text-[var(--muted)]">
                             {t(
                               "AI API proxy is not supported for the OpenAI Responses WebSocket protocol in this release.",
                             )}
                           </p>
                         ) : null}
                         <div className="mt-3 grid gap-3">
-                          <label className="inline-flex items-center gap-2 text-sm font-semibold text-stone-700">
+                          <label className="inline-flex items-center gap-2 text-sm font-semibold text-[var(--muted)]">
                             <input
                               aria-label={t("Enable AI API proxy")}
                               checked={providerForm.apiProxyEnabled}
-                              className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-200"
+                              className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
                               disabled={providerUsesWebsocket}
                               onChange={(event) =>
                                 setProviderForm((current) => ({
@@ -10959,11 +10959,11 @@ export function SettingsPanel({
                           </label>
                           <div className="grid gap-3 sm:grid-cols-[12rem_minmax(0,1fr)]">
                             <label className="block">
-                              <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                              <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                 {t("Proxy type")}
                               </span>
                               <select
-                                className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+                                className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={providerUsesWebsocket}
                                 onChange={(event) =>
                                   setProviderForm((current) => ({
@@ -10998,16 +10998,16 @@ export function SettingsPanel({
                           </div>
                         </div>
                       </div>
-                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
-                            <RefreshCw aria-hidden="true" className="size-4 text-teal-700" />
-                            <h4 className="text-sm font-semibold text-stone-950">
+                            <RefreshCw aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" />
+                            <h4 className="text-sm font-semibold text-[var(--foreground)]">
                               {t("Model redirects")}
                             </h4>
                           </div>
                           <button
-                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addProviderModelRedirect}
                             type="button"
                           >
@@ -11015,14 +11015,14 @@ export function SettingsPanel({
                             {t("Add redirect")}
                           </button>
                         </div>
-                        <p className="mt-2 text-xs leading-5 text-stone-500">
+                        <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
                           {t("Expose provider model IDs under local model IDs.")}
                         </p>
                         <div className="mt-3 space-y-3">
                           {providerForm.modelRedirects.length ? (
                             providerForm.modelRedirects.map((redirect, redirectIndex) => (
                               <div
-                                className="rounded-lg border border-stone-200 bg-white p-3"
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3"
                                 key={redirectIndex}
                               >
                                 <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.5rem]">
@@ -11044,7 +11044,7 @@ export function SettingsPanel({
                                   />
                                   <button
                                     aria-label={t("Delete redirect")}
-                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 hover:bg-rose-50"
+                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                                     onClick={() => deleteProviderModelRedirect(redirectIndex)}
                                     title={t("Delete redirect")}
                                     type="button"
@@ -11055,22 +11055,22 @@ export function SettingsPanel({
                               </div>
                             ))
                           ) : (
-                            <p className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-3 text-xs text-stone-500">
+                            <p className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] px-3 py-3 text-xs text-[var(--muted)]">
                               {t("No model redirects configured.")}
                             </p>
                           )}
                         </div>
                       </div>
-                      <div className="rounded-xl border border-stone-200 bg-stone-50/70 px-3 py-3">
+                      <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                         <div className="flex items-center justify-between gap-3">
                           <div className="flex items-center gap-2">
-                            <SlidersHorizontal aria-hidden="true" className="size-4 text-teal-700" />
-                            <h4 className="text-sm font-semibold text-stone-950">
+                            <SlidersHorizontal aria-hidden="true" className="size-4 text-[var(--accent-soft-foreground)]" />
+                            <h4 className="text-sm font-semibold text-[var(--foreground)]">
                               {t("Request overrides")}
                             </h4>
                           </div>
                           <button
-                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addProviderRequestOverride}
                             type="button"
                           >
@@ -11078,23 +11078,23 @@ export function SettingsPanel({
                             {t("Add override")}
                           </button>
                         </div>
-                        <p className="mt-2 text-xs leading-5 text-stone-500">
+                        <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
                           {t("Override request headers or body field paths for this provider.")}
                         </p>
                         <div className="mt-3 space-y-3">
                           {providerForm.requestOverrides.length ? (
                             providerForm.requestOverrides.map((overrideRule, overrideIndex) => (
                               <div
-                                className="rounded-lg border border-stone-200 bg-white p-3"
+                                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] p-3"
                                 key={overrideIndex}
                               >
                                 <div className="grid gap-3 lg:grid-cols-[7rem_minmax(0,1fr)_8rem_minmax(0,1fr)_2.5rem]">
                                   <label className="block">
-                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Target")}
                                     </span>
                                     <select
-                                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                       onChange={(event) =>
                                         updateProviderRequestOverride(overrideIndex, {
                                           target: event.target.value as ProviderRequestOverrideTarget,
@@ -11115,11 +11115,11 @@ export function SettingsPanel({
                                     value={overrideRule.name}
                                   />
                                   <label className="block">
-                                    <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Value type")}
                                     </span>
                                     <select
-                                      className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                       onChange={(event) =>
                                         updateProviderRequestOverride(overrideIndex, {
                                           valueType: event.target.value as ProviderRequestOverrideValueType,
@@ -11134,11 +11134,11 @@ export function SettingsPanel({
                                   </label>
                                   {overrideRule.valueType === "boolean" ? (
                                     <label className="block">
-                                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                                      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                         {t("Value")}
                                       </span>
                                       <select
-                                        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                                        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                         onChange={(event) =>
                                           updateProviderRequestOverride(overrideIndex, {
                                             value: event.target.value === "true",
@@ -11168,7 +11168,7 @@ export function SettingsPanel({
                                   )}
                                   <button
                                     aria-label={t("Delete override")}
-                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 hover:bg-rose-50"
+                                    className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                                     onClick={() => deleteProviderRequestOverride(overrideIndex)}
                                     title={t("Delete override")}
                                     type="button"
@@ -11179,7 +11179,7 @@ export function SettingsPanel({
                               </div>
                             ))
                           ) : (
-                            <p className="rounded-lg border border-dashed border-stone-300 bg-white px-3 py-3 text-xs text-stone-500">
+                            <p className="rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface)] px-3 py-3 text-xs text-[var(--muted)]">
                               {t("No request overrides configured.")}
                             </p>
                           )}
@@ -11187,7 +11187,7 @@ export function SettingsPanel({
                       </div>
                       <button
                         aria-label={t("Save provider")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingProvider ||
                           !providerForm.name.trim() ||
@@ -11223,15 +11223,15 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="order-1 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="order-1 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Configured providers")}
                   </h3>
                   <div className="flex gap-2">
                     <button
                       aria-label={t("Add provider")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingProvider}
                       title={t("Add provider")}
                       type="button"
@@ -11240,7 +11240,7 @@ export function SettingsPanel({
                     </button>
                     <button
                       aria-label={t("Refresh provider models")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       disabled={isLoadingSettings || isRefreshingProviderModels}
                       onClick={() => void refreshProviderModels()}
                       title={t("Refresh provider models")}
@@ -11257,7 +11257,7 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {providers.length ? (
                     providers.map((provider) => {
                       const test = providerTests[provider.id];
@@ -11285,7 +11285,7 @@ export function SettingsPanel({
                                     name: provider.name,
                                   })
                               }
-                              className="-mx-2 -my-1 flex min-w-0 items-start gap-2 rounded-lg px-2 py-1 text-left hover:bg-stone-50 focus:outline-none focus:ring-2 focus:ring-teal-100"
+                              className="-mx-2 -my-1 flex min-w-0 items-start gap-2 rounded-lg px-2 py-1 text-left hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
                               onClick={() => toggleProviderModels(provider.id)}
                               title={
                                 isExpanded
@@ -11296,7 +11296,7 @@ export function SettingsPanel({
                             >
                               <ChevronDown
                                 aria-hidden="true"
-                                className={`mt-0.5 size-4 shrink-0 text-stone-400 transition ${isExpanded ? "" : "-rotate-90"}`}
+                                className={`mt-0.5 size-4 shrink-0 text-[var(--muted)] transition ${isExpanded ? "" : "-rotate-90"}`}
                               />
                               <div className="min-w-0">
                                 <div className="flex flex-wrap items-center gap-2">
@@ -11326,25 +11326,25 @@ export function SettingsPanel({
                                     ok={provider.autoSyncModels}
                                   />
                                 </div>
-                                <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                                <div className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                                   {provider.id} / {provider.kindLabel}
                                 </div>
                                 {provider.modelSyncFilterRegex ? (
-                                  <div className="mt-1 truncate font-mono text-xs text-stone-500">
+                                  <div className="mt-1 truncate font-mono text-xs text-[var(--muted)]">
                                     {t("sync regex {pattern}", {
                                       pattern: provider.modelSyncFilterRegex,
                                     })}
                                   </div>
                                 ) : null}
                                 {provider.modelRedirects?.length ? (
-                                  <div className="mt-1 truncate font-mono text-xs text-stone-500">
+                                  <div className="mt-1 truncate font-mono text-xs text-[var(--muted)]">
                                     {provider.modelRedirects
                                       .map((redirect) => `${redirect.from} -> ${redirect.to}`)
                                       .join(", ")}
                                   </div>
                                 ) : null}
                                 {provider.baseUrl ? (
-                                  <div className="mt-1 truncate text-xs text-stone-500">
+                                  <div className="mt-1 truncate text-xs text-[var(--muted)]">
                                     {provider.baseUrl}
                                   </div>
                                 ) : null}
@@ -11369,14 +11369,14 @@ export function SettingsPanel({
                                   title={providerToggleLabel}
                                   type="checkbox"
                                 />
-                                <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                                <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                                <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                                <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                               </label>
                               <button
                                 aria-label={t("Edit provider {name}", {
                                   name: provider.name,
                                 })}
-                                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                                className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:opacity-60"
                                 disabled={isProviderOperationPending}
                                 onClick={() => editConfiguredProvider(provider)}
                                 title={t("Edit provider")}
@@ -11388,7 +11388,7 @@ export function SettingsPanel({
                                 aria-label={t("Test provider {name}", {
                                   name: provider.name,
                                 })}
-                                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100"
+                                className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                                 disabled={isProviderOperationPending || test?.status === "testing"}
                                 onClick={() => void testProvider(provider.id)}
                                 title={t("Test provider")}
@@ -11405,7 +11405,7 @@ export function SettingsPanel({
                               </button>
                               <button
                                 aria-label={providerDeleteLabel}
-                                className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                                className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                 disabled={isProviderOperationPending}
                                 onClick={() => void deleteProvider(provider.id)}
                                 title={providerDeleteLabel}
@@ -11423,12 +11423,12 @@ export function SettingsPanel({
                             </div>
                           </div>
                           {isExpanded ? (
-                            <div className="mt-3 rounded-lg border border-stone-200 bg-stone-50/70 px-3 py-3">
+                            <div className="mt-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                               <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-stone-900">
+                                <div className="flex min-w-0 items-center gap-2 text-sm font-semibold text-[var(--foreground)]">
                                   <ListChecks
                                     aria-hidden="true"
-                                    className="size-4 shrink-0 text-teal-700"
+                                    className="size-4 shrink-0 text-[var(--accent-soft-foreground)]"
                                   />
                                   <span>{t("Provider models")}</span>
                                 </div>
@@ -11442,15 +11442,15 @@ export function SettingsPanel({
                                 ) : null}
                               </div>
                               {modelList?.status === "error" ? (
-                                <div className="mt-3 rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                                <div className="mt-3 rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                                   {modelList.message}
                                 </div>
                               ) : modelList?.status === "ok" ? (
                                 modelList.models.length ? (
-                                  <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-stone-200 bg-white">
+                                  <div className="mt-3 max-h-56 overflow-y-auto rounded-md border border-[var(--border)] bg-[var(--surface)]">
                                     {modelList.models.map((modelId, modelIndex) => (
                                       <div
-                                        className="border-b border-stone-100 px-3 py-2 font-mono text-xs text-stone-700 last:border-b-0"
+                                        className="border-b border-[var(--border)] px-3 py-2 font-mono text-xs text-[var(--muted)] last:border-b-0"
                                         key={`${modelId}-${modelIndex}`}
                                       >
                                         {modelId}
@@ -11458,17 +11458,17 @@ export function SettingsPanel({
                                     ))}
                                   </div>
                                 ) : (
-                                  <div className="mt-3 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm text-stone-500">
+                                  <div className="mt-3 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--muted)]">
                                     {t("No provider models returned")}
                                   </div>
                                 )
                               ) : (
-                                <div className="mt-3 flex items-center gap-2 rounded-md border border-stone-200 bg-white px-3 py-2 text-sm text-stone-500">
+                                <div className="mt-3 flex items-center gap-2 rounded-md border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--muted)]">
                                   <LoaderCircle
                                     aria-hidden="true"
                                     className="size-4 animate-spin"
                                   />
-                                  {t("Loading provider models...")}
+                                  {t("Loading provider models…")}
                                 </div>
                               )}
                             </div>
@@ -11476,10 +11476,10 @@ export function SettingsPanel({
                           {test ? (
                             <div
                               className={`mt-3 rounded-lg border px-3 py-2 text-sm ${test.status === "ok"
-                                  ? "border-teal-200 bg-teal-50 text-teal-800"
+                                  ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]"
                                   : test.status === "testing"
-                                    ? "border-stone-200 bg-stone-50 text-stone-600"
-                                    : "border-rose-200 bg-rose-50 text-rose-700"
+                                    ? "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]"
+                                    : "border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]"
                                 }`}
                             >
                               {test.message}
@@ -11490,7 +11490,7 @@ export function SettingsPanel({
                       );
                     })
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No configured providers")}
                     </div>
                   )}
@@ -11505,25 +11505,25 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close MCP server configuration backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsMcpDialogOpen(false)}
                     type="button"
                   />
                   <form
                     aria-label={t("MCP server configuration")}
-                    className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="fixed left-1/2 top-1/2 z-50 w-[min(92vw,34rem)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     onSubmit={(event) => void saveMcpServer(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
-                          <Server aria-hidden="true" className="size-5 text-teal-700" />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <Server aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {mcpForm.id ? t("Edit MCP server") : t("Add MCP server")}
                           </h3>
                         </div>
                         {mcpForm.id ? (
-                          <div className="mt-1 truncate text-xs text-stone-500">
+                          <div className="mt-1 truncate text-xs text-[var(--muted)]">
                             {mcpForm.id}
                           </div>
                         ) : null}
@@ -11542,13 +11542,13 @@ export function SettingsPanel({
                             }
                             type="checkbox"
                           />
-                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                          <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
+                          <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                         </label>
                         {mcpForm.id ? (
                           <button
                             aria-label={t("Delete MCP server")}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSavingMcpServer}
                             onClick={() => void deleteMcpServer(mcpForm.id)}
                             title={t("Delete MCP server")}
@@ -11559,7 +11559,7 @@ export function SettingsPanel({
                         ) : null}
                         <button
                           aria-label={t("Close MCP server configuration")}
-                          className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                          className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={() => setIsMcpDialogOpen(false)}
                           title={t("Close")}
                           type="button"
@@ -11581,11 +11581,11 @@ export function SettingsPanel({
                         value={mcpForm.name}
                       />
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Transport")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setMcpForm((current) => ({
                               ...current,
@@ -11605,11 +11605,11 @@ export function SettingsPanel({
                         </select>
                       </label>
                       <label className="block">
-                        <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                        <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Execution host")}
                         </span>
                         <select
-                          className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setMcpForm((current) => ({
                               ...current,
@@ -11649,11 +11649,11 @@ export function SettingsPanel({
                             value={mcpForm.command}
                           />
                           <label className="block">
-                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Args")}
                             </span>
                             <textarea
-                              className="min-h-24 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              className="min-h-24 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setMcpForm((current) => ({
                                   ...current,
@@ -11668,7 +11668,7 @@ export function SettingsPanel({
                       )}
                       <button
                         aria-label={t("Save MCP server")}
-                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingMcpServer ||
                           !mcpForm.name.trim() ||
@@ -11696,15 +11696,15 @@ export function SettingsPanel({
                 </>
               ) : null}
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("MCP servers")}
                   </h3>
                   <div className="flex gap-2">
                     <button
                       aria-label={t("Add MCP server")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingMcpServer}
                       title={t("Add MCP server")}
                       type="button"
@@ -11713,7 +11713,7 @@ export function SettingsPanel({
                     </button>
                     <button
                       aria-label={t("Reload MCP settings")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       disabled={isLoadingSettings}
                       onClick={() => void loadSettings()}
                       title={t("Reload settings")}
@@ -11730,7 +11730,7 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {mcpServers.length ? (
                     mcpServers.map((server) => (
                       <div className="px-4 py-3" key={server.id}>
@@ -11755,10 +11755,10 @@ export function SettingsPanel({
                                 ok={server.toolCount > 0}
                               />
                             </div>
-                            <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                            <div className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                               {server.id} / {server.transportLabel}
                             </div>
-                            <div className="mt-1 truncate text-xs text-stone-500">
+                            <div className="mt-1 truncate text-xs text-[var(--muted)]">
                               {server.transport === "streamable-http"
                                 ? server.url
                                 : [server.command, ...server.args].filter(Boolean).join(" ")}
@@ -11769,7 +11769,7 @@ export function SettingsPanel({
                               aria-label={t("Edit MCP server {name}", {
                                 name: server.name,
                               })}
-                              className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               onClick={() => editConfiguredMcpServer(server)}
                               title={t("Edit MCP server")}
                               type="button"
@@ -11779,7 +11779,7 @@ export function SettingsPanel({
                           </div>
                         </div>
                         {server.error ? (
-                          <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                          <div className="mt-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                             {server.error}
                           </div>
                         ) : null}
@@ -11787,7 +11787,7 @@ export function SettingsPanel({
                       </div>
                     ))
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No configured MCP servers")}
                     </div>
                   )}
@@ -11798,14 +11798,14 @@ export function SettingsPanel({
 
           {activeSection === "skills" ? (
             <section className="grid gap-4">
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <label className="block">
-                  <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                  <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Skill translation model")}
                   </span>
                   <select
                     aria-label={t("Skill translation model")}
-                    className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                    className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                     disabled={isSavingSkills}
                     onChange={(event) => changeSkillTranslationModel(event.target.value)}
                     value={skills?.translationModelId ?? ""}
@@ -11820,16 +11820,16 @@ export function SettingsPanel({
                 </label>
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Detected skills")}
                   </h3>
                   <div className="flex items-center gap-2">
                     {updateableStoreSkills.length ? (
                       <button
                         aria-label={t("Update all store skills")}
-                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-stone-200 bg-white px-3 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                        className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
                           isUpdatingAllSkills ||
                           updatingSkillKey !== null ||
@@ -11845,7 +11845,7 @@ export function SettingsPanel({
                           <RefreshCw aria-hidden="true" className="size-4" />
                         )}
                         <span>
-                          {isUpdatingAllSkills ? t("Updating...") : t("Update all store skills")}
+                          {isUpdatingAllSkills ? t("Updating…") : t("Update all store skills")}
                         </span>
                       </button>
                     ) : null}
@@ -11857,7 +11857,7 @@ export function SettingsPanel({
                     />
                     <button
                       aria-label={t("Refresh skill discovery")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
                         isRefreshingSkills || isUpdatingAllSkills || updatingSkillKey !== null
                       }
@@ -11873,7 +11873,7 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {detectedSkillRows.length ? (
                     detectedSkillRows.map((row) => {
                       const { skill } = row;
@@ -11927,13 +11927,13 @@ export function SettingsPanel({
                                   />
                                 ) : null}
                               </div>
-                              <div className="mt-1 truncate text-xs font-medium text-stone-500">
+                              <div className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
                                 {skill.key}
                               </div>
-                              <div className="mt-1 break-words text-xs text-stone-500">
+                              <div className="mt-1 break-words text-xs text-[var(--muted)]">
                                 {skill.description}
                               </div>
-                              <div className="mt-1 break-all text-xs text-stone-400">
+                              <div className="mt-1 break-all text-xs text-[var(--muted)]">
                                 {skill.path}
                               </div>
                             </div>
@@ -11942,7 +11942,7 @@ export function SettingsPanel({
                                 {isStoreUpdateable ? (
                                   <button
                                     aria-label={t("Update skill {name}", { name: skill.name })}
-                                    className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                    className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={
                                       isSavingSkills ||
                                       isRefreshingSkills ||
@@ -11958,12 +11958,12 @@ export function SettingsPanel({
                                     ) : (
                                       <RefreshCw aria-hidden="true" className="size-4" />
                                     )}
-                                    <span>{isUpdatingSkill ? t("Updating...") : t("Update skill")}</span>
+                                    <span>{isUpdatingSkill ? t("Updating…") : t("Update skill")}</span>
                                   </button>
                                 ) : null}
                                 <button
                                   aria-label={t("Delete skill {name}", { name: skill.name })}
-                                  className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                                  className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={
                                     isSavingSkills ||
                                     isRefreshingSkills ||
@@ -11995,8 +11995,8 @@ export function SettingsPanel({
                                     }
                                     type="checkbox"
                                   />
-                                  <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                                  <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                                  <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
+                                  <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                                 </label>
                               </div>
                             ) : null}
@@ -12006,20 +12006,20 @@ export function SettingsPanel({
                       );
                     })
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No detected skills")}
                     </div>
                   )}
                 </div>
                 {remoteWorkspaceSkillCatalogs.some((catalog) => catalog.status === "loading") ? (
-                  <div className="border-t border-stone-100 px-4 py-3 text-sm text-stone-500">
-                    {t("Loading remote workspace skills...")}
+                  <div className="border-t border-[var(--border)] px-4 py-3 text-sm text-[var(--muted)]">
+                    {t("Loading remote workspace skills…")}
                   </div>
                 ) : null}
                 {remoteWorkspaceSkillCatalogs.some(
                   (catalog) => catalog.error || catalog.refreshError,
                 ) ? (
-                  <div className="space-y-2 border-t border-stone-100 px-4 py-3">
+                  <div className="space-y-2 border-t border-[var(--border)] px-4 py-3">
                     {remoteWorkspaceSkillCatalogs
                       .filter((catalog) => catalog.error || catalog.refreshError)
                       .map((catalog) => {
@@ -12029,7 +12029,7 @@ export function SettingsPanel({
 
                         return (
                           <div
-                            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]"
                             key={`remote-error:${catalog.workspace.id}`}
                             role="alert"
                           >
@@ -12038,7 +12038,7 @@ export function SettingsPanel({
                               {serverLabel ? ` · ${serverLabel}` : null}: {message}
                             </div>
                             <button
-                              className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-rose-200 bg-white px-2.5 text-xs font-semibold text-rose-700 shadow-sm hover:bg-rose-100"
+                              className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                               onClick={() => retryRemoteWorkspaceSkillCatalog(catalog.workspace.id)}
                               type="button"
                             >
@@ -12051,10 +12051,10 @@ export function SettingsPanel({
                 ) : null}
               </section>
 
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="flex items-center gap-2">
-                  <Wrench aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <Wrench aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Skill locations")}
                   </h3>
                 </div>
@@ -12062,7 +12062,7 @@ export function SettingsPanel({
                   {skillLocations.length ? (
                     skillLocations.map((location) => (
                       <div
-                        className="flex items-center justify-between gap-3 rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-xs font-medium text-stone-600"
+                        className="flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs font-medium text-[var(--muted)]"
                         key={location.id}
                       >
                         <span className="min-w-0 break-all">{location.path}</span>
@@ -12087,14 +12087,14 @@ export function SettingsPanel({
                             })}
                             type="checkbox"
                           />
-                          <span className="h-6 w-11 rounded-full bg-stone-300 transition peer-checked:bg-teal-700" />
-                          <span className="absolute left-1 size-4 rounded-full bg-white shadow transition peer-checked:translate-x-5" />
+                          <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
+                          <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                         </label>
                       </div>
                     ))
                   ) : (
-                    <div className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-500">
-                      {t("Loading...")}
+                    <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-sm text-[var(--muted)]">
+                      {t("Loading…")}
                     </div>
                   )}
                 </div>
@@ -12102,7 +12102,7 @@ export function SettingsPanel({
                   <div className="mt-4 space-y-2">
                     {skills.errors.map((skillError) => (
                       <div
-                        className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
+                        className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]"
                         key={`${skillError.path}-${skillError.message}`}
                       >
                         <div className="break-all font-medium">{skillError.path}</div>
@@ -12117,15 +12117,15 @@ export function SettingsPanel({
 
           {activeSection === "models" ? (
             <section className="grid gap-4">
-              <div className="min-w-0 rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-                <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-                  <h3 className="text-sm font-semibold text-stone-950">
+              <div className="min-w-0 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+                <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Models")}
                   </h3>
                   <div className="flex gap-2">
                     <button
                       aria-label={t("Add model")}
-                      className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                      className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingModel}
                       title={t("Add model")}
                       type="button"
@@ -12134,7 +12134,7 @@ export function SettingsPanel({
                     </button>
                   </div>
                 </div>
-                <div className="divide-y divide-stone-100">
+                <div className="divide-y divide-[var(--border)]">
                   {configuredModelsByName.length ? (
                     configuredModelsByName.map((model) => (
                       <div
@@ -12151,12 +12151,12 @@ export function SettingsPanel({
                             </span>
                             <span
                               aria-hidden="true"
-                              className="shrink-0 text-xs text-stone-300"
+                              className="shrink-0 text-xs text-[var(--muted)]"
                             >
                               /
                             </span>
                             <span
-                              className="min-w-0 truncate text-xs font-medium text-stone-500"
+                              className="min-w-0 truncate text-xs font-medium text-[var(--muted)]"
                               title={model.id}
                             >
                               {model.id}
@@ -12231,14 +12231,14 @@ export function SettingsPanel({
                               }
                               type="checkbox"
                             />
-                            <span className="absolute inset-0 rounded-full bg-stone-200 transition peer-checked:bg-teal-700 peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-white shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
+                            <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
+                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                           </label>
                           <button
                             aria-label={t("Test model {name}", {
                               name: model.displayName,
                             })}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800 disabled:cursor-not-allowed disabled:opacity-60"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:opacity-60"
                             disabled={modelTests[model.id]?.testing === true}
                             onClick={() => void testModel(model)}
                             title={t("Test model")}
@@ -12254,7 +12254,7 @@ export function SettingsPanel({
                             aria-label={t("Edit model {name}", {
                               name: model.displayName,
                             })}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={() => editConfiguredModel(model)}
                             title={t("Edit model")}
                             type="button"
@@ -12265,7 +12265,7 @@ export function SettingsPanel({
                             aria-label={t("Delete model {name}", {
                               name: model.displayName,
                             })}
-                            className="inline-flex size-9 items-center justify-center rounded-lg border border-rose-200 bg-white text-rose-700 shadow-sm hover:bg-rose-50 disabled:cursor-not-allowed disabled:text-stone-400"
+                            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSaving}
                             onClick={() => void deleteModel(model.id)}
                             title={t("Delete model")}
@@ -12277,7 +12277,7 @@ export function SettingsPanel({
                       </div>
                     ))
                   ) : (
-                    <div className="px-4 py-6 text-sm text-stone-500">
+                    <div className="px-4 py-6 text-sm text-[var(--muted)]">
                       {t("No configured models")}
                     </div>
                   )}
@@ -12288,13 +12288,13 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close model configuration backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsModelDialogOpen(false)}
                     type="button"
                   />
                   <form
                     aria-label={t("Model configuration")}
-                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(96vw,70rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88dvh] w-[min(96vw,70rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     onSubmit={(event) => void saveModel(event)}
                   >
                     <div className="mb-4 flex items-center justify-between gap-3">
@@ -12302,21 +12302,21 @@ export function SettingsPanel({
                         <div className="flex items-center gap-2">
                           <SlidersHorizontal
                             aria-hidden="true"
-                            className="size-5 text-teal-700"
+                            className="size-5 text-[var(--accent-soft-foreground)]"
                           />
-                          <h3 className="text-sm font-semibold text-stone-950">
+                          <h3 className="text-sm font-semibold text-[var(--foreground)]">
                             {editingModel ? t("Edit model") : t("Add model")}
                           </h3>
                         </div>
                         {selectedMetadata ? (
-                          <div className="mt-1 truncate text-xs text-stone-500">
+                          <div className="mt-1 truncate text-xs text-[var(--muted)]">
                             {selectedMetadata.key}
                           </div>
                         ) : null}
                       </div>
                       <button
                         aria-label={t("Close model configuration")}
-                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsModelDialogOpen(false)}
                         title={t("Close")}
                         type="button"
@@ -12329,11 +12329,11 @@ export function SettingsPanel({
                       <div className="space-y-3">
                         <div className="grid gap-3 sm:grid-cols-2">
                           <label className="block">
-                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Model developer")}
                             </span>
                             <select
-                              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                              className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) => selectModelDeveloper(event.target.value)}
                               value={selectedModelDeveloper}
                             >
@@ -12346,11 +12346,11 @@ export function SettingsPanel({
                             </select>
                           </label>
                           <label className="block">
-                            <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                            <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Model id")}
                             </span>
                             <select
-                              className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                              className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={!modelIdOptions.length && !editingModel}
                               onChange={(event) => updateModelId(event.target.value)}
                               value={form.modelId}
@@ -12373,7 +12373,7 @@ export function SettingsPanel({
                         </div>
 
                         {selectedModelDeveloper && !developerModels.length ? (
-                          <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                          <div className="rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]">
                             {t("No cached models for developer")}
                           </div>
                         ) : null}
@@ -12418,20 +12418,20 @@ export function SettingsPanel({
                         </div>
 
                         <div className="grid gap-3 sm:grid-cols-2">
-                          <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                            <legend className="px-1 text-xs font-semibold text-stone-600">
+                          <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                            <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                               {t("Input types")}
                             </legend>
                             <div className="grid gap-2">
                               {inputModalityOptions.map((modality) => (
                                 <label
-                                  className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-[var(--surface)] px-3 py-2 text-sm font-medium text-[var(--muted)]"
                                   key={modality}
                                 >
                                   <span>{t(modality)}</span>
                                   <input
                                     checked={form.inputModalities.includes(modality)}
-                                    className="size-4 accent-teal-700"
+                                    className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
                                       toggleModelModality(
                                         "inputModalities",
@@ -12445,20 +12445,20 @@ export function SettingsPanel({
                               ))}
                             </div>
                           </fieldset>
-                          <fieldset className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
-                            <legend className="px-1 text-xs font-semibold text-stone-600">
+                          <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
+                            <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
                               {t("Output types")}
                             </legend>
                             <div className="grid gap-2">
                               {outputModalityOptions.map((modality) => (
                                 <label
-                                  className="flex items-center justify-between gap-3 rounded-lg bg-white px-3 py-2 text-sm font-medium text-stone-700"
+                                  className="flex items-center justify-between gap-3 rounded-lg bg-[var(--surface)] px-3 py-2 text-sm font-medium text-[var(--muted)]"
                                   key={modality}
                                 >
                                   <span>{t(modality)}</span>
                                   <input
                                     checked={form.outputModalities.includes(modality)}
-                                    className="size-4 accent-teal-700"
+                                    className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
                                       toggleModelModality(
                                         "outputModalities",
@@ -12475,8 +12475,8 @@ export function SettingsPanel({
                         </div>
 
                         {selectedMetadata ? (
-                          <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600">
-                            <div className="truncate font-semibold text-stone-800">
+                          <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs text-[var(--muted)]">
+                            <div className="truncate font-semibold text-[var(--foreground)]">
                               {t("Model metadata")}: {selectedMetadata.key}
                             </div>
                             <div className="mt-3 grid gap-2 sm:grid-cols-2">
@@ -12491,14 +12491,14 @@ export function SettingsPanel({
                       </div>
 
                       <div className="space-y-3">
-                        <div className="rounded-xl border border-stone-200 px-3 py-3">
+                        <div className="rounded-xl border border-[var(--border)] px-3 py-3">
                           <div className="mb-2 flex items-center justify-between gap-2">
-                            <div className="text-xs font-semibold text-stone-600">
+                            <div className="text-xs font-semibold text-[var(--muted)]">
                               {t("Providers")}
                             </div>
                             <button
                               aria-label={t("Add provider")}
-                              className="inline-flex size-8 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                              className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               onClick={startAddingProviderFromModel}
                               title={t("Add provider")}
                               type="button"
@@ -12514,14 +12514,14 @@ export function SettingsPanel({
 
                                 return (
                                   <label
-                                    className={`flex items-center justify-between gap-3 rounded-lg bg-stone-50/80 px-3 py-2 ${providerSupportsCurrentModel ? "" : "opacity-60"}`}
+                                    className={`flex items-center justify-between gap-3 rounded-lg bg-[var(--surface-secondary)] px-3 py-2 ${providerSupportsCurrentModel ? "" : "opacity-60"}`}
                                     key={provider.id}
                                   >
                                     <span className="min-w-0">
-                                      <span className="block truncate text-sm font-semibold text-stone-700">
+                                      <span className="block truncate text-sm font-semibold text-[var(--muted)]">
                                         {provider.name}
                                       </span>
-                                      <span className="block truncate text-xs text-stone-500">
+                                      <span className="block truncate text-xs text-[var(--muted)]">
                                         {providerSupportsCurrentModel
                                           ? provider.kindLabel
                                           : t("Model not supported")}
@@ -12530,7 +12530,7 @@ export function SettingsPanel({
                                     <input
                                       aria-label={provider.name}
                                       checked={selectedProviderIds.has(provider.id)}
-                                      className="size-4 accent-teal-700 disabled:cursor-not-allowed"
+                                      className="size-4 accent-[var(--accent)] disabled:cursor-not-allowed"
                                       disabled={!providerSupportsCurrentModel}
                                       onChange={(event) =>
                                         toggleModelProvider(
@@ -12545,7 +12545,7 @@ export function SettingsPanel({
                               })
                             ) : (
                               <button
-                                className="flex w-full items-center justify-between rounded-lg border border-dashed border-stone-300 bg-stone-50 px-3 py-3 text-left text-sm text-stone-500 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                                className="flex w-full items-center justify-between rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-left text-sm text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                 onClick={startAddingProviderFromModel}
                                 type="button"
                               >
@@ -12557,11 +12557,11 @@ export function SettingsPanel({
                         </div>
 
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Active provider")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                             disabled={!modelProviderIds.length}
                             onChange={(event) =>
                               setForm((current) => ({
@@ -12587,11 +12587,11 @@ export function SettingsPanel({
                         </label>
 
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Thinking level")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-400"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                             disabled={!modelThinkingEnabled}
                             onChange={(event) =>
                               setForm((current) => ({
@@ -12623,11 +12623,11 @@ export function SettingsPanel({
                         </label>
 
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Web search mode")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setForm((current) => ({
                                 ...current,
@@ -12642,13 +12642,13 @@ export function SettingsPanel({
                             <option value="function">{t("Function fallback only")}</option>
                             <option value="disabled">{t("Disabled for this model")}</option>
                           </select>
-                          <p className="mt-1.5 text-xs leading-5 text-stone-500">
+                          <p className="mt-1.5 text-xs leading-5 text-[var(--muted)]">
                             {t(
                               "Auto prefers confirmed provider-native search; unknown capability falls back to Tavily/Brave when available.",
                             )}
                           </p>
                           {settings?.webSearch && form.webSearchMode !== "disabled" ? (
-                            <p className="mt-1 text-xs leading-5 text-stone-500">
+                            <p className="mt-1 text-xs leading-5 text-[var(--muted)]">
                               {settings.webSearch.enabled
                                 ? settings.webSearch.fallbackAvailable
                                   ? t(
@@ -12663,11 +12663,11 @@ export function SettingsPanel({
                         </label>
 
                         <label className="block">
-                          <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                          <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("System prompt")}
                           </span>
                           <select
-                            className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                            className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setForm((current) => ({
                                 ...current,
@@ -12685,7 +12685,7 @@ export function SettingsPanel({
                         </label>
 
                         {enabledNeedsLimits ? (
-                          <div className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                          <div className="flex items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]">
                             <CircleAlert
                               aria-hidden="true"
                               className="size-4 shrink-0"
@@ -12696,7 +12696,7 @@ export function SettingsPanel({
 
                         <button
                           aria-label={t("Save model")}
-                          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={
                             isSaving ||
                             enabledNeedsLimits ||
@@ -12726,25 +12726,25 @@ export function SettingsPanel({
           ) : null}
           {activeSection === "about" ? (
             <>
-              <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
+              <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
                 <div className="grid gap-5 md:grid-cols-[minmax(0,1fr)_minmax(16rem,0.8fr)] md:items-start">
                   <div className="min-w-0 space-y-4">
                     <div className="flex items-center gap-3">
                       <div
                         aria-hidden="true"
-                        className="size-12 shrink-0 overflow-hidden rounded-xl shadow-[0_12px_28px_rgba(15,118,110,0.22)] [&>svg]:block [&>svg]:size-full"
+                        className="size-12 shrink-0 overflow-hidden rounded-xl shadow-[var(--overlay-shadow)] [&>svg]:block [&>svg]:size-full"
                         dangerouslySetInnerHTML={{ __html: focoLogoSvg }}
                       />
                       <div className="min-w-0">
-                        <h3 className="text-xl font-semibold text-stone-950">Foco</h3>
-                        <p className="mt-1 text-sm font-medium text-stone-500">
+                        <h3 className="text-xl font-semibold text-[var(--foreground)]">Foco</h3>
+                        <p className="mt-1 text-sm font-medium text-[var(--muted)]">
                           {t("Local-first AI coding workspace")}
                         </p>
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <button
-                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isCheckingUpdate}
                         onClick={() => void checkForUpdate()}
                         type="button"
@@ -12758,7 +12758,7 @@ export function SettingsPanel({
                       </button>
                       {settings?.update.updateAvailable ? (
                         <button
-                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-800 hover:border-teal-300 hover:bg-teal-100 disabled:cursor-not-allowed disabled:opacity-60"
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:opacity-60"
                           disabled={isInstallingUpdate}
                           onClick={() => void installUpdate()}
                           type="button"
@@ -12768,14 +12768,14 @@ export function SettingsPanel({
                           ) : (
                             <Download aria-hidden="true" className="size-4" />
                           )}
-                          <span>{isInstallingUpdate ? t("Installing update...") : t("Install update")}</span>
+                          <span>{isInstallingUpdate ? t("Installing update…") : t("Install update")}</span>
                         </button>
                       ) : null}
                     </div>
-                    <label className="inline-flex items-center gap-2 text-sm font-medium text-stone-700">
+                    <label className="inline-flex items-center gap-2 text-sm font-medium text-[var(--muted)]">
                       <input
                         checked={Boolean(settings?.update.autoCheckEnabled)}
-                        className="size-4 rounded border-stone-300 text-teal-700 focus:ring-teal-600"
+                        className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
                         disabled={isSavingUpdateSettings}
                         onChange={(event) => void saveAutoUpdateCheck(event.target.checked)}
                         type="checkbox"
@@ -12783,33 +12783,33 @@ export function SettingsPanel({
                       <span>{t("Automatically check for updates")}</span>
                     </label>
                     {settings?.update.error ? (
-                      <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                      <div className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
                         {settings.update.error}
                       </div>
                     ) : null}
                   </div>
-                  <dl className="grid gap-3 rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+                  <dl className="grid gap-3 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                     <div className="flex items-center justify-between gap-3">
-                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                      <dt className="text-xs font-semibold uppercase text-[var(--muted)]">
                         {t("Current version")}
                       </dt>
-                      <dd className="text-sm font-semibold text-stone-800">
+                      <dd className="text-sm font-semibold text-[var(--foreground)]">
                         {settings?.update.currentVersion ?? settings?.appVersion ?? ""}
                       </dd>
                     </div>
                     <div className="flex items-center justify-between gap-3">
-                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                      <dt className="text-xs font-semibold uppercase text-[var(--muted)]">
                         {t("Latest version")}
                       </dt>
-                      <dd className="text-sm font-semibold text-stone-800">
+                      <dd className="text-sm font-semibold text-[var(--foreground)]">
                         {settings?.update.targetVersion ?? t("Up to date")}
                       </dd>
                     </div>
                     <div className="flex items-center justify-between gap-3">
-                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                      <dt className="text-xs font-semibold uppercase text-[var(--muted)]">
                         {t("Last checked")}
                       </dt>
-                      <dd className="text-right text-sm font-semibold text-stone-800">
+                      <dd className="text-right text-sm font-semibold text-[var(--foreground)]">
                         {settings?.update.lastCheckedAt
                           ? formatAuditDate(settings.update.lastCheckedAt, language)
                           : t("Never")}
@@ -12817,12 +12817,12 @@ export function SettingsPanel({
                     </div>
                     {settings?.update.releaseUrl ? (
                       <div className="flex items-center justify-between gap-3">
-                        <dt className="text-xs font-semibold uppercase text-stone-400">
+                        <dt className="text-xs font-semibold uppercase text-[var(--muted)]">
                           {t("Release")}
                         </dt>
                         <dd className="min-w-0 text-right text-sm font-semibold">
                           <a
-                            className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
+                            className="break-all text-[var(--accent-soft-foreground)] underline-offset-2 hover:text-[var(--accent-soft-foreground)] hover:underline"
                             href={settings.update.releaseUrl}
                             rel="noreferrer"
                             target="_blank"
@@ -12833,13 +12833,13 @@ export function SettingsPanel({
                       </div>
                     ) : null}
                     <div className="flex items-center justify-between gap-3">
-                      <dt className="text-xs font-semibold uppercase text-stone-400">
+                      <dt className="text-xs font-semibold uppercase text-[var(--muted)]">
                         {t("GitHub repository")}
                       </dt>
                       <dd className="min-w-0 text-right text-sm font-semibold">
                         <a
                           aria-label={t("Open GitHub repository")}
-                          className="break-all text-teal-700 underline-offset-2 hover:text-teal-900 hover:underline"
+                          className="break-all text-[var(--accent-soft-foreground)] underline-offset-2 hover:text-[var(--accent-soft-foreground)] hover:underline"
                           href="https://github.com/fonlan/foco"
                           rel="noreferrer"
                           target="_blank"
@@ -12855,23 +12855,23 @@ export function SettingsPanel({
                 <>
                   <button
                     aria-label={t("Close update dialog backdrop")}
-                    className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+                    className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setUpdateConfirm(null)}
                     type="button"
                   />
                   <section
                     aria-modal="true"
-                    className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+                    className="fixed left-1/2 top-1/2 z-50 grid w-[min(92vw,28rem)] -translate-x-1/2 -translate-y-1/2 gap-4 rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
                     role="dialog"
                   >
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0">
-                        <h3 className="text-base font-semibold text-stone-950">
+                        <h3 className="text-base font-semibold text-[var(--foreground)]">
                           {updateConfirm.source === "install"
                             ? t("Update is installing")
                             : t("Update available")}
                         </h3>
-                        <p className="mt-1 text-sm text-stone-600">
+                        <p className="mt-1 text-sm text-[var(--muted)]">
                           {updateConfirm.source === "install"
                             ? t("Foco will restart shortly.")
                             : t("Version {version} is available", {
@@ -12881,7 +12881,7 @@ export function SettingsPanel({
                       </div>
                       <button
                         aria-label={t("Close")}
-                        className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                        className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setUpdateConfirm(null)}
                         title={t("Close")}
                         type="button"
@@ -12892,14 +12892,14 @@ export function SettingsPanel({
                     {updateConfirm.source === "check" ? (
                       <div className="flex justify-end gap-2">
                         <button
-                          className="inline-flex min-h-10 items-center justify-center rounded-lg border border-stone-200 bg-white px-3 py-2 text-sm font-semibold text-stone-700 hover:border-stone-300 hover:bg-stone-50"
+                          className="inline-flex min-h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
                           onClick={() => setUpdateConfirm(null)}
                           type="button"
                         >
                           {t("Not now")}
                         </button>
                         <button
-                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-stone-950 px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={isInstallingUpdate}
                           onClick={() => void installUpdate()}
                           type="button"
@@ -13077,30 +13077,30 @@ function RemoteServersSettingsSection({
         <>
           <button
             aria-label={t("Close remote server configuration backdrop")}
-            className="fixed inset-0 z-40 bg-stone-950/35 backdrop-blur-sm"
+            className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
             onClick={onCloseDialog}
             type="button"
           />
           <form
             aria-label={t("Remote server configuration")}
-            className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-stone-200 bg-white px-4 py-4 shadow-[0_30px_80px_rgba(33,31,28,0.28)]"
+            className="panel-scroll fixed left-1/2 top-1/2 z-50 max-h-[88vh] w-[min(92vw,38rem)] -translate-x-1/2 -translate-y-1/2 overflow-y-auto rounded-2xl border border-[var(--border)] bg-[var(--surface)] px-4 py-4 shadow-[var(--overlay-shadow)]"
             onSubmit={onSave}
           >
             <div className="mb-4 flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <Server aria-hidden="true" className="size-5 text-teal-700" />
-                  <h3 className="text-sm font-semibold text-stone-950">
+                  <Server aria-hidden="true" className="size-5 text-[var(--accent-soft-foreground)]" />
+                  <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {form.id ? t("Edit remote server") : t("Add remote server")}
                   </h3>
                 </div>
-                <div className="mt-1 truncate text-xs text-stone-500">
+                <div className="mt-1 truncate text-xs text-[var(--muted)]">
                   {form.hostAlias || t("SSH hostname / IP")}
                 </div>
               </div>
               <button
                 aria-label={t("Close remote server configuration")}
-                className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                 onClick={onCloseDialog}
                 title={t("Close")}
                 type="button"
@@ -13135,12 +13135,12 @@ function RemoteServersSettingsSection({
                 value={form.port}
               />
               <div className="sm:col-span-2">
-                <div className="mb-1.5 text-xs font-semibold text-stone-600">
+                <div className="mb-1.5 text-xs font-semibold text-[var(--muted)]">
                   {t("Authentication")}
                 </div>
                 <div
                   aria-label={t("Authentication")}
-                  className="mb-3 inline-flex rounded-lg border border-stone-200 bg-stone-50 p-0.5"
+                  className="mb-3 inline-flex rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-0.5"
                   role="tablist"
                 >
                   <button
@@ -13148,8 +13148,8 @@ function RemoteServersSettingsSection({
                     aria-selected={form.authMethod === "key"}
                     className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
                       form.authMethod === "key"
-                        ? "bg-white text-stone-950 shadow-sm"
-                        : "text-stone-500 hover:text-stone-800"
+                        ? "bg-[var(--surface)] text-[var(--foreground)] shadow-sm"
+                        : "text-[var(--muted)] hover:text-[var(--foreground)]"
                     }`}
                     id={keyTabId}
                     onClick={() =>
@@ -13169,8 +13169,8 @@ function RemoteServersSettingsSection({
                     aria-selected={form.authMethod === "password"}
                     className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
                       form.authMethod === "password"
-                        ? "bg-white text-stone-950 shadow-sm"
-                        : "text-stone-500 hover:text-stone-800"
+                        ? "bg-[var(--surface)] text-[var(--foreground)] shadow-sm"
+                        : "text-[var(--muted)] hover:text-[var(--foreground)]"
                     }`}
                     id={passwordTabId}
                     onClick={() =>
@@ -13210,13 +13210,13 @@ function RemoteServersSettingsSection({
                 ) : (
                   <div aria-labelledby={keyTabId} id={keyPanelId} role="tabpanel">
                     <label className="block">
-                      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+                      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Identity file")}
                       </span>
                       <div className="flex gap-2">
                         <input
                           autoComplete="off"
-                          className="h-10 min-w-0 flex-1 rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+                          className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           name="identity-file"
                           onChange={(event) =>
                             onFormChange((current) => ({
@@ -13230,7 +13230,7 @@ function RemoteServersSettingsSection({
                         />
                         <button
                           aria-label={t("Browse for private key")}
-                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                           onClick={onSelectIdentityFile}
                           title={t("Browse for private key")}
                           type="button"
@@ -13269,7 +13269,7 @@ function RemoteServersSettingsSection({
               />
             </div>
             {references.length ? (
-              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+              <div className="mt-4 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-xs text-[var(--warning)]">
                 <div className="font-semibold">{t("Server is used by workspaces")}</div>
                 <div className="mt-1 flex flex-wrap gap-1.5">
                   {references.map((reference) => (
@@ -13286,7 +13286,7 @@ function RemoteServersSettingsSection({
             <div className="mt-4 flex justify-end gap-2">
               <button
                 aria-label={t("Cancel remote server configuration")}
-                className="inline-flex size-10 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
+                className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                 onClick={onCloseDialog}
                 title={t("Cancel")}
                 type="button"
@@ -13295,7 +13295,7 @@ function RemoteServersSettingsSection({
               </button>
               <button
                 aria-label={t("Save remote server")}
-                className="inline-flex size-10 items-center justify-center rounded-lg bg-stone-950 text-white hover:bg-stone-800 disabled:cursor-not-allowed disabled:bg-stone-300"
+                className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                 disabled={
                   isSaving ||
                   !form.name.trim() ||
@@ -13318,14 +13318,14 @@ function RemoteServersSettingsSection({
         </>
       ) : null}
 
-      <section className="rounded-2xl border border-stone-200 bg-white/85 shadow-[var(--overlay-shadow)]">
-        <div className="flex items-center justify-between gap-3 border-b border-stone-200 px-4 py-3">
-          <h3 className="text-sm font-semibold text-stone-950">
+      <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
+        <div className="flex items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
+          <h3 className="text-sm font-semibold text-[var(--foreground)]">
             {t("Remote server list")}
           </h3>
           <button
             aria-label={t("Add remote server")}
-            className="inline-flex size-9 items-center justify-center rounded-lg border border-stone-200 bg-white text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+            className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
             onClick={onStartAdding}
             title={t("Add remote server")}
             type="button"
@@ -13335,8 +13335,8 @@ function RemoteServersSettingsSection({
         </div>
         {servers.length ? (
           <div className="overflow-x-auto">
-            <table className="min-w-full divide-y divide-stone-100 text-left text-sm">
-              <thead className="bg-stone-50/80 text-xs font-semibold uppercase text-stone-500">
+            <table className="min-w-full divide-y divide-[var(--border)] text-left text-sm">
+              <thead className="bg-[var(--surface-secondary)] text-xs font-semibold uppercase text-[var(--muted)]">
                 <tr>
                   <th className="px-4 py-2">{t("Server")}</th>
                   <th className="px-4 py-2">{t("Status")}</th>
@@ -13347,7 +13347,7 @@ function RemoteServersSettingsSection({
                   <th className="px-4 py-2 text-right">{t("Actions")}</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-stone-100">
+              <tbody className="divide-y divide-[var(--border)]">
                 {servers.map((server) => {
                   const diagnostic = diagnostics[server.id];
                   const isBusy = Boolean(activeOperationKey?.endsWith(`:${server.id}`));
@@ -13357,15 +13357,15 @@ function RemoteServersSettingsSection({
                     <tr key={server.id} className="align-top">
                       <td className="px-4 py-3">
                         <div className="flex min-w-0 items-center gap-2">
-                          <span className="relative inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-stone-200 bg-stone-50 text-teal-700">
+                          <span className="relative inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--accent-soft-foreground)]">
                             <Server aria-hidden="true" className="size-4" />
                             <span className={`absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full border-2 border-white ${remoteStatusDotClass(server.status)}`} />
                           </span>
                           <div className="min-w-0">
-                            <div className="truncate font-semibold text-stone-900">{server.name}</div>
-                            <div className="truncate text-xs text-stone-500">{remoteServerDisplayTarget(server)}</div>
+                            <div className="truncate font-semibold text-[var(--foreground)]">{server.name}</div>
+                            <div className="truncate text-xs text-[var(--muted)]">{remoteServerDisplayTarget(server)}</div>
                             {server.lastError ? (
-                              <div className="mt-1 line-clamp-2 text-xs text-rose-700">{server.lastError}</div>
+                              <div className="mt-1 line-clamp-2 text-xs text-[var(--danger)]">{server.lastError}</div>
                             ) : null}
                           </div>
                         </div>
@@ -13377,22 +13377,22 @@ function RemoteServersSettingsSection({
                           tone={remoteStatusTone(server.status)}
                         />
                       </td>
-                      <td className="px-4 py-3 text-xs text-stone-600">
+                      <td className="px-4 py-3 text-xs text-[var(--muted)]">
                         {server.lastKnownTarget ?? "-"}
                       </td>
-                      <td className="px-4 py-3 text-xs text-stone-600">
+                      <td className="px-4 py-3 text-xs text-[var(--muted)]">
                         <div>{server.sidecarVersion ?? "-"}</div>
-                        <div className="mt-1 text-stone-400">
+                        <div className="mt-1 text-[var(--muted)]">
                           {t("Cached diagnostic; refreshed after a verified workspace connection")}
                         </div>
-                        <div className="mt-1 text-stone-400">
+                        <div className="mt-1 text-[var(--muted)]">
                           {remoteSidecarInstallStateLabel(server.sidecarInstallState, t)}
                         </div>
                       </td>
-                      <td className="px-4 py-3 text-xs font-semibold text-stone-700">
+                      <td className="px-4 py-3 text-xs font-semibold text-[var(--muted)]">
                         {server.workspaceCount}
                       </td>
-                      <td className="px-4 py-3 text-xs text-stone-600">
+                      <td className="px-4 py-3 text-xs text-[var(--muted)]">
                         {server.lastCheckedAt ?? "-"}
                         {diagnostic ? (
                           <div className="mt-2 grid gap-1">
@@ -13446,7 +13446,7 @@ function RemoteServersSettingsSection({
             </table>
           </div>
         ) : (
-          <div className="px-4 py-6 text-sm text-stone-500">
+          <div className="px-4 py-6 text-sm text-[var(--muted)]">
             {t("No remote servers")}
           </div>
         )}
@@ -13477,9 +13477,9 @@ function IconActionButton({
   return (
     <button
       aria-label={label}
-      className={`inline-flex size-8 items-center justify-center rounded-lg border shadow-sm disabled:cursor-not-allowed disabled:text-stone-300 ${tone === "danger"
-          ? "border-stone-200 bg-white text-stone-600 hover:border-rose-200 hover:bg-rose-50 hover:text-rose-700"
-          : "border-stone-200 bg-white text-stone-700 hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+      className={`inline-flex size-8 items-center justify-center rounded-lg border shadow-sm disabled:cursor-not-allowed disabled:text-[var(--muted)] ${tone === "danger"
+          ? "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
+          : "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
         }`}
       disabled={disabled}
       onClick={onClick}
@@ -13555,27 +13555,27 @@ function remoteStatusTone(status: string): CapabilityPillTone {
 function remoteStatusDotClass(status: string) {
   switch (remoteStatusTone(status)) {
     case "success":
-      return "bg-emerald-500";
+      return "bg-[var(--success)]";
     case "active":
-      return "bg-amber-500";
+      return "bg-[var(--warning-soft)]";
     case "danger":
-      return "bg-rose-500";
+      return "bg-[var(--danger-soft)]";
     default:
-      return "bg-stone-300";
+      return "bg-[var(--default)]";
   }
 }
 
 function remoteStageDotClass(status: string) {
   if (status === "success") {
-    return "bg-emerald-500";
+    return "bg-[var(--success)]";
   }
   if (status === "failed") {
-    return "bg-rose-500";
+    return "bg-[var(--danger-soft)]";
   }
   if (status === "skipped") {
-    return "bg-stone-300";
+    return "bg-[var(--default)]";
   }
-  return "bg-amber-500";
+  return "bg-[var(--warning-soft)]";
 }
 
 function remoteSidecarInstallStateLabel(state: string, t: Translate) {
@@ -13747,8 +13747,8 @@ function SettingsNavButton({
       aria-label={label}
       aria-current={active ? "page" : undefined}
       className={`inline-flex h-10 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-sm font-semibold ${active
-          ? "bg-teal-800 text-white shadow-[0_12px_28px_rgba(15,118,110,0.22)]"
-          : "text-stone-600 hover:bg-stone-100 hover:text-stone-950"
+          ? "bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)]"
+          : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
         }`}
       onClick={onClick}
       title={label}
@@ -13781,12 +13781,12 @@ function TextField({
 }) {
   return (
     <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-stone-600">
+      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
       <input
         autoComplete={autoComplete}
-        className="h-10 w-full rounded-lg border border-stone-300 bg-white px-3 text-sm text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100 disabled:cursor-not-allowed disabled:bg-stone-100 disabled:text-stone-500"
+        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
         disabled={disabled}
         inputMode={inputMode}
         name={label.toLowerCase().replace(/\s+/g, "-")}
@@ -13824,7 +13824,7 @@ function SourceValueEditor({
     return (
       <textarea
         aria-label={title}
-        className={`${minHeightClass} w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-xs text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100`}
+        className={`${minHeightClass} w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]`}
         onChange={(event) => onChange(event.target.value)}
         spellCheck={false}
         value={value}
@@ -13833,31 +13833,31 @@ function SourceValueEditor({
   }
 
   return (
-    <div className="rounded-lg border border-stone-200 bg-stone-950 text-stone-100">
+    <div className="rounded-lg border border-[var(--border)] bg-[var(--foreground)] text-[var(--muted)]">
       <button
         aria-label={`${isExpanded ? t("Collapse JSON") : t("Expand JSON")} ${title}`}
-        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-xs font-semibold text-stone-200"
+        className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-xs font-semibold text-[var(--muted)]"
         onClick={() => onToggle(id)}
         type="button"
       >
         <span className="inline-flex min-w-0 items-center gap-2">
-          <Code2 aria-hidden="true" className="size-3.5 shrink-0 text-teal-300" />
+          <Code2 aria-hidden="true" className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]" />
           <span className="truncate">{title}</span>
         </span>
-        <span className="shrink-0 text-stone-400">
+        <span className="shrink-0 text-[var(--muted)]">
           {isExpanded ? t("Collapse JSON") : t("Expand JSON")}
         </span>
       </button>
       {isExpanded ? (
         <textarea
           aria-label={title}
-          className={`${minHeightClass} w-full resize-y border-0 border-t border-stone-800 bg-stone-950 px-3 py-3 font-mono text-xs leading-relaxed text-stone-100 outline-none focus:ring-2 focus:ring-inset focus:ring-teal-500/40`}
+          className={`${minHeightClass} w-full resize-y border-0 border-t border-[var(--border)] bg-[var(--foreground)] px-3 py-3 font-mono text-xs leading-relaxed text-[var(--muted)] outline-none focus:ring-2 focus:ring-inset focus:ring-[var(--accent)]`}
           onChange={(event) => onChange(event.target.value)}
           spellCheck={false}
           value={parsed.pretty}
         />
       ) : (
-        <div className="border-t border-stone-800 px-3 py-2 font-mono text-xs text-stone-400">
+        <div className="border-t border-[var(--border)] px-3 py-2 font-mono text-xs text-[var(--muted)]">
           <code>{jsonSyntaxNodes(compactToolText(parsed.pretty))}</code>
         </div>
       )}
@@ -13867,11 +13867,11 @@ function SourceValueEditor({
 
 function KeyValue({ label, value }: { label: string; value: string }) {
   return (
-    <div className="min-w-0 rounded-lg bg-white px-3 py-2">
-      <div className="truncate text-[11px] font-semibold uppercase text-stone-400">
+    <div className="min-w-0 rounded-lg bg-[var(--surface)] px-3 py-2">
+      <div className="truncate text-[11px] font-semibold uppercase text-[var(--muted)]">
         {label}
       </div>
-      <div className="mt-0.5 truncate text-sm font-semibold text-stone-800">
+      <div className="mt-0.5 truncate text-sm font-semibold text-[var(--foreground)]">
         {value}
       </div>
     </div>
@@ -13890,29 +13890,29 @@ function MemorySourceReadonlyDetails({
   }
 
   return (
-    <div className="grid gap-2 rounded-lg border border-stone-200 bg-stone-50/80 px-3 py-3 text-xs text-stone-600 sm:grid-cols-2">
+    <div className="grid gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs text-[var(--muted)] sm:grid-cols-2">
       <div>
-        <span className="font-semibold text-stone-700">{t("Memory scope")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Memory scope")}: </span>
         {memoryScopeLabel(source.scope, t)}
       </div>
       <div>
-        <span className="font-semibold text-stone-700">{t("Chat ID")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Chat ID")}: </span>
         {source.chatId ?? "-"}
       </div>
       <div>
-        <span className="font-semibold text-stone-700">{t("Source type")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Source type")}: </span>
         {source.sourceType}
       </div>
       <div>
-        <span className="font-semibold text-stone-700">{t("Source ID")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Source ID")}: </span>
         {source.sourceId ?? "-"}
       </div>
       <div>
-        <span className="font-semibold text-stone-700">{t("Created")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Created")}: </span>
         {source.createdAt}
       </div>
       <div>
-        <span className="font-semibold text-stone-700">{t("Updated")}: </span>
+        <span className="font-semibold text-[var(--muted)]">{t("Updated")}: </span>
         {source.updatedAt}
       </div>
     </div>
@@ -14009,16 +14009,16 @@ type CapabilityPillTone = "ok" | "success" | "danger" | "active" | "muted";
 function capabilityPillToneClass(tone: CapabilityPillTone) {
   switch (tone) {
     case "success":
-      return "border-emerald-200 bg-emerald-50 text-emerald-700";
+      return "border-[var(--success)] bg-[var(--success-soft)] text-[var(--success-soft-foreground)]";
     case "danger":
-      return "border-rose-200 bg-rose-50 text-rose-700";
+      return "border-[var(--danger)] bg-[var(--danger-soft)] text-[var(--danger)]";
     case "active":
-      return "border-amber-200 bg-amber-50 text-amber-800";
+      return "border-[var(--warning)] bg-[var(--warning-soft)] text-[var(--warning)]";
     case "muted":
-      return "border-stone-200 bg-stone-50 text-stone-500";
+      return "border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]";
     case "ok":
     default:
-      return "border-teal-200 bg-teal-50 text-teal-800";
+      return "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]";
   }
 }
 
@@ -14085,7 +14085,7 @@ function Warnings({ warnings }: { warnings: string[] }) {
     <div className="mt-3 space-y-1">
       {warnings.map((warning) => (
         <div
-          className="flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+          className="flex items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 py-2 text-sm text-[var(--warning)]"
           key={warning}
         >
           <CircleAlert aria-hidden="true" className="size-4 shrink-0" />
@@ -14347,17 +14347,17 @@ function PromptOverrideEditor({
   value: string;
 }) {
   return (
-    <div className="rounded-xl border border-stone-200 bg-stone-50/80 px-3 py-3">
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
       <div className="flex flex-wrap items-start justify-between gap-2">
         <div className="min-w-0">
-          <p className="text-xs font-semibold text-stone-600">{title}</p>
+          <p className="text-xs font-semibold text-[var(--muted)]">{title}</p>
           {description ? (
-            <p className="mt-1 text-xs text-stone-500">{description}</p>
+            <p className="mt-1 text-xs text-[var(--muted)]">{description}</p>
           ) : null}
         </div>
         <button
           aria-label={restoreAriaLabel}
-          className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-stone-200 bg-white px-2.5 text-xs font-semibold text-stone-700 shadow-sm hover:border-teal-200 hover:bg-teal-50 hover:text-teal-800"
+          className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onClick={onRestore}
           title={t("Restore default")}
           type="button"
@@ -14370,7 +14370,7 @@ function PromptOverrideEditor({
         <span className="sr-only">{title}</span>
         <textarea
           aria-label={title}
-          className="min-h-44 w-full resize-y rounded-lg border border-stone-300 bg-white px-3 py-2 font-mono text-sm leading-6 text-stone-900 outline-none transition placeholder:text-stone-400 focus:border-teal-700 focus:ring-2 focus:ring-teal-100"
+          className="min-h-44 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
           data-testid={testId}
           onChange={(event) => onChange(event.target.value)}
           value={value}
@@ -14978,15 +14978,15 @@ function jsonSyntaxNodes(value: string) {
 
 function jsonTokenClass(token: string) {
   if (token.startsWith('"')) {
-    return token.endsWith('":') ? "text-sky-300" : "text-emerald-300";
+    return token.endsWith('":') ? "text-[var(--accent-soft-foreground)]" : "text-[var(--success-soft-foreground)]";
   }
   if (token === "true" || token === "false") {
-    return "text-amber-300";
+    return "text-[var(--warning)]";
   }
   if (token === "null") {
-    return "text-stone-500";
+    return "text-[var(--muted)]";
   }
-  return "text-violet-300";
+  return "text-[var(--accent-soft-foreground)]";
 }
 
 function memorySourceRecordsToForm(sources: MemorySourceRecord[]): MemorySourceFormState[] {
@@ -15547,7 +15547,7 @@ function optionalNumber(value: string, label: string) {
 
 function compactToolText(value: string) {
   const normalized = value.replace(/\s+/g, " ").trim();
-  return normalized.length > 240 ? `${normalized.slice(0, 237)}...` : normalized;
+  return normalized.length > 240 ? `${normalized.slice(0, 237)}…` : normalized;
 }
 
 function formatJsonValue(value: JsonValue) {

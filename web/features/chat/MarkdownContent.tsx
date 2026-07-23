@@ -56,7 +56,7 @@ export const MarkdownContent = memo(function MarkdownContent({
       className={`markdown-content min-w-0 break-words text-sm leading-6 ${
         isUser ? "markdown-content-user" : "markdown-content-assistant"
       } ${variant === "reasoning" ? "markdown-content-reasoning" : ""} ${
-        isError ? "text-rose-700" : ""
+        isError ? "text-[var(--danger)]" : ""
       }`}
     >
       {skillPrefix ? (

@@ -216,8 +216,8 @@ export function WorkspaceHtmlPreviewPanel({
 
       {isLoading && !session ? (
         <div className="workspace-html-preview-status" role="status">
-          <LoaderCircle aria-hidden="true" className="size-5 animate-spin text-teal-700" />
-          <span>{t("Loading HTML preview...")}</span>
+          <LoaderCircle aria-hidden="true" className="size-5 animate-spin text-[var(--accent-soft-foreground)]" />
+          <span>{t("Loading HTML preview…")}</span>
         </div>
       ) : null}
 
@@ -235,7 +235,7 @@ export function WorkspaceHtmlPreviewPanel({
 
       {!isLoading && !session && !error ? (
         <div className="workspace-html-preview-status">
-          <AppWindow aria-hidden="true" className="size-5 text-stone-400" />
+          <AppWindow aria-hidden="true" className="size-5 text-[var(--muted)]" />
           <span>{t("HTML preview is unavailable.")}</span>
         </div>
       ) : null}

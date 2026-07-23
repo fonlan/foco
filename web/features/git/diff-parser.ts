@@ -64,22 +64,22 @@ export function diffLineClass(kind: GitDiffLine["kind"]) {
   const base = "flex min-w-max px-3";
 
   if (kind === "add") {
-    return `${base} bg-emerald-50 text-emerald-950`;
+    return `${base} bg-[var(--success-soft)] text-[var(--success)]`;
   }
 
   if (kind === "remove") {
-    return `${base} bg-rose-50 text-rose-950`;
+    return `${base} bg-[var(--danger-soft)] text-[var(--danger)]`;
   }
 
   if (kind === "hunk") {
-    return `${base} bg-sky-50 text-sky-900`;
+    return `${base} bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]`;
   }
 
   if (kind === "meta") {
-    return `${base} text-stone-500`;
+    return `${base} text-[var(--muted)]`;
   }
 
-  return `${base} text-stone-700`;
+  return `${base} text-[var(--muted)]`;
 }
 
 // Private helpers

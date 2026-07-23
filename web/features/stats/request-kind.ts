@@ -51,10 +51,10 @@ export function requestKindBadgeClass(requestKind: string) {
 
   switch (requestKind) {
     case CHAT_COMPLETION_REQUEST_KIND:
-      return `${base} border-teal-200 bg-teal-50 text-teal-800`;
+      return `${base} border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]`;
     case CONTEXT_COMPRESSION_REQUEST_KIND:
-      return `${base} border-violet-200 bg-violet-50 text-violet-800`;
+      return `${base} border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]`;
     default:
-      return `${base} border-stone-200 bg-stone-100 text-stone-700`;
+      return `${base} border-[var(--border)] bg-[var(--surface-secondary)] text-[var(--muted)]`;
   }
 }

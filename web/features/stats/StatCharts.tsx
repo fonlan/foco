@@ -113,7 +113,7 @@ function compactChartTick(value: unknown) {
 
 function compactChartLabel(value: unknown) {
   const label = String(value);
-  return label.length > 16 ? `${label.slice(0, 15)}...` : label;
+  return label.length > 16 ? `${label.slice(0, 15)}…` : label;
 }
 
 export function LineChartCard({
@@ -129,8 +129,8 @@ export function LineChartCard({
   const chartData = data.slice(-12);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {chartData.length ? (
         <div className="mt-3 h-52 w-full">
           <ResponsiveContainer
@@ -142,39 +142,39 @@ export function LineChartCard({
               data={chartData}
               margin={{ bottom: 4, left: 0, right: 12, top: 10 }}
             >
-              <CartesianGrid stroke="#f5f5f4" vertical={false} />
+              <CartesianGrid stroke="var(--border)" vertical={false} />
               <XAxis
                 axisLine={false}
                 dataKey="label"
                 minTickGap={18}
-                tick={{ fill: "#78716c", fontSize: 12 }}
+                tick={{ fill: "var(--muted)", fontSize: 12 }}
                 tickLine={false}
               />
               <YAxis
                 axisLine={false}
-                tick={{ fill: "#78716c", fontSize: 12 }}
+                tick={{ fill: "var(--muted)", fontSize: 12 }}
                 tickFormatter={compactChartTick}
                 tickLine={false}
                 width={46}
               />
               <Tooltip
                 contentStyle={chartTooltipStyle}
-                cursor={{ stroke: "#99f6e4", strokeWidth: 1 }}
+                cursor={{ stroke: "color-mix(in oklab, var(--accent) 35%, transparent)", strokeWidth: 1 }}
                 formatter={(value) => [valueFormatter(Number(value)), title]}
                 labelStyle={chartTooltipLabelStyle}
               />
               <Line
-                activeDot={{ r: 6, stroke: "#0f766e", strokeWidth: 2 }}
+                activeDot={{ r: 6, stroke: "var(--accent)", strokeWidth: 2 }}
                 dataKey="value"
                 dot={{
-                  fill: "#ffffff",
+                  fill: "var(--surface)",
                   r: 3,
-                  stroke: "#0f766e",
+                  stroke: "var(--accent)",
                   strokeWidth: 2,
                 }}
                 isAnimationActive
                 name={title}
-                stroke="#0f766e"
+                stroke="var(--accent)"
                 strokeWidth={2.5}
                 type="monotone"
               />
@@ -207,8 +207,8 @@ export function DualLineChartCard({
   const chartData = data.slice(-12);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {chartData.length ? (
         <>
           <div className="mt-3 h-52 w-full">
@@ -221,17 +221,17 @@ export function DualLineChartCard({
                 data={chartData}
                 margin={{ bottom: 4, left: 0, right: 8, top: 10 }}
               >
-                <CartesianGrid stroke="#f5f5f4" vertical={false} />
+                <CartesianGrid stroke="var(--border)" vertical={false} />
                 <XAxis
                   axisLine={false}
                   dataKey="label"
                   minTickGap={18}
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickLine={false}
                 />
                 <YAxis
                   axisLine={false}
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickFormatter={compactChartTick}
                   tickLine={false}
                   width={46}
@@ -240,7 +240,7 @@ export function DualLineChartCard({
                 <YAxis
                   axisLine={false}
                   orientation="right"
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickFormatter={compactChartTick}
                   tickLine={false}
                   width={48}
@@ -248,7 +248,7 @@ export function DualLineChartCard({
                 />
                 <Tooltip
                   contentStyle={chartTooltipStyle}
-                  cursor={{ stroke: "#99f6e4", strokeWidth: 1 }}
+                  cursor={{ stroke: "color-mix(in oklab, var(--accent) 35%, transparent)", strokeWidth: 1 }}
                   formatter={(value, name) => {
                     const isSecondary = String(name) === secondaryLabel;
                     return [
@@ -261,23 +261,23 @@ export function DualLineChartCard({
                   labelStyle={chartTooltipLabelStyle}
                 />
                 <Line
-                  activeDot={{ r: 6, stroke: "#0f766e", strokeWidth: 2 }}
+                  activeDot={{ r: 6, stroke: "var(--accent)", strokeWidth: 2 }}
                   dataKey="primaryValue"
-                  dot={{ fill: "#ffffff", r: 3, stroke: "#0f766e", strokeWidth: 2 }}
+                  dot={{ fill: "var(--surface)", r: 3, stroke: "var(--accent)", strokeWidth: 2 }}
                   isAnimationActive
                   name={primaryLabel}
-                  stroke="#0f766e"
+                  stroke="var(--accent)"
                   strokeWidth={2.5}
                   type="monotone"
                   yAxisId="requests"
                 />
                 <Line
-                  activeDot={{ r: 6, stroke: "#b45309", strokeWidth: 2 }}
+                  activeDot={{ r: 6, stroke: "var(--warning)", strokeWidth: 2 }}
                   dataKey="secondaryValue"
-                  dot={{ fill: "#ffffff", r: 3, stroke: "#b45309", strokeWidth: 2 }}
+                  dot={{ fill: "var(--surface)", r: 3, stroke: "var(--warning)", strokeWidth: 2 }}
                   isAnimationActive
                   name={secondaryLabel}
-                  stroke="#b45309"
+                  stroke="var(--warning)"
                   strokeWidth={2.5}
                   type="monotone"
                   yAxisId="tokens"
@@ -287,8 +287,8 @@ export function DualLineChartCard({
           </div>
           <SeriesLegend
             items={[
-              { color: "#0f766e", label: primaryLabel },
-              { color: "#b45309", label: secondaryLabel },
+              { color: "var(--accent)", label: primaryLabel },
+              { color: "var(--warning)", label: secondaryLabel },
             ]}
           />
         </>
@@ -313,8 +313,8 @@ export function DonutChartCard({
   const total = chartData.reduce((sum, item) => sum + item.value, 0);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {total > 0 ? (
         <div className="mt-4 grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center">
           <div className="relative h-48 w-full min-w-0">
@@ -348,7 +348,7 @@ export function DonutChartCard({
               </PieChart>
             </ResponsiveContainer>
             <div className="pointer-events-none absolute inset-0 grid place-items-center">
-              <div className="rounded-full bg-white/80 px-2 py-1 text-center font-mono text-sm font-semibold text-stone-950 shadow-sm">
+              <div className="rounded-full bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] px-2 py-1 text-center font-mono text-sm font-semibold text-[var(--foreground)] shadow-sm">
                 {valueFormatter(total)}
               </div>
             </div>
@@ -396,8 +396,8 @@ export function DoubleDonutChartCard({
   const colorForItem = (item: ChartDatum) => chartColor(colorIds.indexOf(item.id));
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {outerTotal > 0 || innerTotal > 0 ? (
         <div className="mt-4 grid gap-4 sm:grid-cols-[12rem_1fr] sm:items-center">
           <div className="relative h-48 w-full min-w-0">
@@ -451,11 +451,11 @@ export function DoubleDonutChartCard({
               </ResponsiveContainer>
             </div>
             <div className="pointer-events-none absolute inset-0 z-0 grid place-items-center text-center">
-              <div className="rounded-full bg-white/85 px-2 py-1 shadow-sm">
-                <div className="font-mono text-xs font-semibold text-stone-950">
+              <div className="rounded-full bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-2 py-1 shadow-sm">
+                <div className="font-mono text-xs font-semibold text-[var(--foreground)]">
                   {outerFormatter(outerTotal)}
                 </div>
-                <div className="font-mono text-[11px] font-semibold text-stone-500">
+                <div className="font-mono text-[11px] font-semibold text-[var(--muted)]">
                   {innerFormatter(innerTotal)}
                 </div>
               </div>
@@ -493,8 +493,8 @@ export function BarChartCard({
   const chartMax = Math.max(maxValue ?? 0, ...chartData.map((item) => item.value), 1);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {chartData.length ? (
         <>
           <div className="mt-4 h-64 w-full">
@@ -508,12 +508,12 @@ export function BarChartCard({
                 layout="vertical"
                 margin={{ bottom: 4, left: 6, right: 18, top: 4 }}
               >
-                <CartesianGrid horizontal={false} stroke="#f5f5f4" />
+                <CartesianGrid horizontal={false} stroke="var(--border)" />
                 <XAxis domain={[0, chartMax]} hide type="number" />
                 <YAxis
                   axisLine={false}
                   dataKey="label"
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickFormatter={compactChartLabel}
                   tickLine={false}
                   type="category"
@@ -521,7 +521,7 @@ export function BarChartCard({
                 />
                 <Tooltip
                   contentStyle={chartTooltipStyle}
-                  cursor={{ fill: "#f0fdfa" }}
+                  cursor={{ fill: "var(--accent-soft)" }}
                   formatter={(value, _name, item) => [
                     chartPayloadDisplayValue(
                       item.payload,
@@ -576,8 +576,8 @@ export function ScatterChartCard({
   const xMax = Math.max(...chartData.map((item) => item.x), 1);
 
   return (
-    <section className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-4 shadow-[var(--overlay-shadow)]">
-      <h3 className="text-sm font-semibold text-stone-950">{title}</h3>
+    <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
+      <h3 className="text-sm font-semibold text-[var(--foreground)]">{title}</h3>
       {chartData.length ? (
         <>
           <div className="mt-4 h-64 w-full">
@@ -587,13 +587,13 @@ export function ScatterChartCard({
               width="100%"
             >
               <ScatterChart margin={{ bottom: 8, left: 0, right: 16, top: 8 }}>
-                <CartesianGrid stroke="#f5f5f4" />
+                <CartesianGrid stroke="var(--border)" />
                 <XAxis
                   axisLine={false}
                   dataKey="x"
                   domain={[0, xMax]}
                   name={xLabel}
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickFormatter={(value) => xFormatter(Number(value))}
                   tickLine={false}
                   type="number"
@@ -603,7 +603,7 @@ export function ScatterChartCard({
                   dataKey="y"
                   domain={[0, 1]}
                   name={yLabel}
-                  tick={{ fill: "#78716c", fontSize: 12 }}
+                  tick={{ fill: "var(--muted)", fontSize: 12 }}
                   tickFormatter={(value) => yFormatter(Number(value))}
                   tickLine={false}
                   type="number"
@@ -611,7 +611,7 @@ export function ScatterChartCard({
                 />
                 <Tooltip
                   contentStyle={chartTooltipStyle}
-                  cursor={{ stroke: "#99f6e4", strokeWidth: 1 }}
+                  cursor={{ stroke: "color-mix(in oklab, var(--accent) 35%, transparent)", strokeWidth: 1 }}
                   formatter={(value, name, item) => {
                     const isXValue = String(name) === xLabel;
                     return [
@@ -629,7 +629,7 @@ export function ScatterChartCard({
                   }
                   labelStyle={chartTooltipLabelStyle}
                 />
-                <Scatter data={chartData} fill="#0f766e" name={title}>
+                <Scatter data={chartData} fill="var(--accent)" name={title}>
                   {chartData.map((item, index) => (
                     <Cell fill={chartColor(index)} key={item.id} />
                   ))}
@@ -658,7 +658,7 @@ function SeriesLegend({
   items: Array<{ color: string; label: string }>;
 }) {
   return (
-    <div className="mt-3 flex flex-wrap gap-3 text-xs font-medium text-stone-600">
+    <div className="mt-3 flex flex-wrap gap-3 text-xs font-medium text-[var(--muted)]">
       {items.map((item) => (
         <span className="inline-flex items-center gap-1.5" key={item.label}>
           <span
@@ -689,10 +689,10 @@ function ChartLegend({
             className="size-2.5 shrink-0 rounded-full"
             style={{ backgroundColor: chartColor(index) }}
           />
-          <span className="min-w-0 flex-1 truncate font-medium text-stone-600">
+          <span className="min-w-0 flex-1 truncate font-medium text-[var(--muted)]">
             {item.label}
           </span>
-          <span className="shrink-0 font-mono text-stone-950">
+          <span className="shrink-0 font-mono text-[var(--foreground)]">
             {item.displayValue ?? valueFormatter(item.value)}
           </span>
         </div>
@@ -722,7 +722,7 @@ function DualChartLegend({
 
   return (
     <div className="grid gap-2">
-      <div className="grid grid-cols-[1fr_auto_auto] gap-3 text-[11px] font-semibold uppercase text-stone-400">
+      <div className="grid grid-cols-[1fr_auto_auto] gap-3 text-[11px] font-semibold uppercase text-[var(--muted)]">
         <span />
         <span>{outerLabel}</span>
         <span>{innerLabel}</span>
@@ -741,14 +741,14 @@ function DualChartLegend({
                 className="size-2.5 shrink-0 rounded-full"
                 style={{ backgroundColor: chartColor(index) }}
               />
-              <span className="min-w-0 truncate font-medium text-stone-600">
+              <span className="min-w-0 truncate font-medium text-[var(--muted)]">
                 {item.label}
               </span>
             </span>
-            <span className="font-mono text-stone-950">
+            <span className="font-mono text-[var(--foreground)]">
               {outerItem ? outerFormatter(outerItem.value) : "n/a"}
             </span>
-            <span className="font-mono text-stone-950">
+            <span className="font-mono text-[var(--foreground)]">
               {innerItem ? innerFormatter(innerItem.value) : "n/a"}
             </span>
           </div>
@@ -773,7 +773,7 @@ function ScatterLegend({
 }) {
   return (
     <div className="mt-2 grid gap-2">
-      <div className="grid grid-cols-[1fr_auto_auto] gap-3 text-[11px] font-semibold uppercase text-stone-400">
+      <div className="grid grid-cols-[1fr_auto_auto] gap-3 text-[11px] font-semibold uppercase text-[var(--muted)]">
         <span />
         <span>{xLabel}</span>
         <span>{yLabel}</span>
@@ -789,14 +789,14 @@ function ScatterLegend({
               className="size-2.5 shrink-0 rounded-full"
               style={{ backgroundColor: chartColor(index) }}
             />
-            <span className="min-w-0 truncate font-medium text-stone-600">
+            <span className="min-w-0 truncate font-medium text-[var(--muted)]">
               {item.label}
             </span>
           </span>
-          <span className="font-mono text-stone-950">
+          <span className="font-mono text-[var(--foreground)]">
             {item.displayXValue ?? xFormatter(item.x)}
           </span>
-          <span className="font-mono text-stone-950">
+          <span className="font-mono text-[var(--foreground)]">
             {item.displayYValue ?? yFormatter(item.y)}
           </span>
         </div>
@@ -807,7 +807,7 @@ function ScatterLegend({
 
 function ChartEmptyState({ label }: { label: string }) {
   return (
-    <div className="mt-4 grid h-44 place-items-center rounded-xl border border-dashed border-stone-300 bg-stone-50/70 text-sm font-medium text-stone-500">
+    <div className="mt-4 grid h-44 place-items-center rounded-xl border border-dashed border-[var(--border)] bg-[var(--surface-secondary)] text-sm font-medium text-[var(--muted)]">
       {label}
     </div>
   );
