@@ -32,6 +32,8 @@
   --accent-foreground: #ffffff;
   --accent-soft: #e8e8e8;
   --accent-soft-foreground: #303030;
+  /* Data visualization remains chromatic even when the workbench is neutral. */
+  --chart-primary: #6366f1;
   --border: #d1d1d1;
   --border-secondary: #e0e0e0;
   --background-inverse: #202020;
@@ -72,6 +74,7 @@
   --accent-foreground: #ffffff;
   --accent-soft: #333333;
   --accent-soft-foreground: #f2f2f2;
+  --chart-primary: #818cf8;
   --border: #454545;
   --border-secondary: #373737;
   --background-inverse: #101010;

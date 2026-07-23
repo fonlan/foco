@@ -82,7 +82,7 @@ export function planAutoRunEnabledStorageKey(workspaceId: string) {
 }
 export const DEFAULT_AI_STATS_COLUMN_IDS: AiStatsColumnId[] = [...AI_STATS_COLUMN_IDS];
 export const ANALYTICS_CHART_COLORS = [
-  "var(--accent)",
+  "var(--chart-primary)",
   "var(--link)",
   "var(--success)",
   "var(--danger)",
