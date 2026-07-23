@@ -2040,7 +2040,11 @@ function ComposerSelectMenu({
         className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium"
       >
         <Icon aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
-        <Select.Value className="composer-select-label min-w-0 flex-1 truncate" />
+        <Select.Value className="composer-select-label min-w-0 flex-1 truncate">
+          {({ defaultChildren, isPlaceholder }) =>
+            isPlaceholder ? defaultChildren : selectedLabel
+          }
+        </Select.Value>
         <Select.Indicator />
       </Select.Trigger>
       <Select.Popover className="composer-select-popover w-64 max-w-[min(16rem,calc(100vw-1rem))]" placement="top start">
@@ -2051,7 +2055,9 @@ function ComposerSelectMenu({
               key={option.value}
               textValue={option.label}
             >
-              <Label className="min-w-0 flex-1 truncate">{option.label}</Label>
+              <Label className="composer-select-option-label min-w-0 flex-1 truncate">
+                {option.label}
+              </Label>
               {option.badge ? (
                 <Chip className="ms-auto" size="sm" variant="soft">
                   {option.badge}

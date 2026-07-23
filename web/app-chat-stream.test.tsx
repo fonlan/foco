@@ -1206,6 +1206,32 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("uses text-only trigger values and micro labels in composer pickers", async () => {
+    const stylesCss = readFileSync("styles.css", "utf8");
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const modelTrigger = screen.getByRole("button", { name: /Model:/ });
+    const selectValue = modelTrigger.querySelector(
+      '[data-slot="select-value"]',
+    );
+    expect(selectValue).toHaveTextContent("GPT Test");
+    expect(
+      selectValue?.querySelector('[data-slot="label"]'),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(modelTrigger);
+    const modelOption = await screen.findByRole("option", { name: "GPT Test" });
+    expect(
+      within(modelOption).getByText("GPT Test"),
+    ).toHaveClass("composer-select-option-label");
+
+    expect(stylesCss).toMatch(
+      /\.composer-select-label,\s*\.composer-select-popover \.composer-select-option-label\s*\{\s*font-size:\s*var\(--foco-font-micro\)/,
+    );
+  });
+
   it("compacts the Fast toggle to a 2rem icon button under the phone breakpoint", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
     const chatPanelSource = readFileSync("features/chat/ChatPanel.tsx", "utf8");
