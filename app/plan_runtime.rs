@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use foco_agent::{
@@ -588,12 +589,7 @@ async fn sync_plan_merge_task(
                     true,
                 )?;
             }
-            delete_plan_worktrees(
-                &state.background_command_registry,
-                workspace,
-                &plan,
-                true,
-            )?;
+            delete_plan_worktrees(&state.background_command_registry, workspace, &plan, true)?;
             continue_plan_if_ready(state, workspace, plan).await?;
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
@@ -936,12 +932,7 @@ async fn finalize_plan_worktree(
             drop(database);
             confirm_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id)?;
             release_confirmed_plan_derived_effects(state, workspace)?;
-            delete_plan_worktrees(
-                &state.background_command_registry,
-                workspace,
-                plan,
-                true,
-            )
+            delete_plan_worktrees(&state.background_command_registry, workspace, plan, true)
         }
         Err(error) => {
             if is_shared_workspace_dirty_merge_error(&error) {
@@ -1319,7 +1310,8 @@ fn delete_instance_worktree(
     Ok(())
 }
 
-/// Stops managed background commands owned by one isolated worktree root.
+/// Stops managed background commands owned by one isolated worktree root and waits until
+/// those process trees reach a terminal status before the directory is deleted.
 ///
 /// Failures are logged and ignored so worktree/database cleanup can still finish.
 /// Matching is exact on the worktree path (after registry canonicalize), so shared
@@ -1328,7 +1320,11 @@ fn stop_managed_commands_for_worktree(
     background_commands: &BackgroundCommandRegistry,
     worktree_root: &Path,
 ) {
-    match background_commands.stop_for_workspace(worktree_root) {
+    // Grace period for SIGTERM + force kill is 500ms in the registry monitor; allow extra
+    // headroom for pipe drain and slow CI hosts before deleting the worktree directory.
+    const WORKTREE_COMMAND_STOP_WAIT: Duration = Duration::from_secs(3);
+    match background_commands.stop_and_wait_for_workspace(worktree_root, WORKTREE_COMMAND_STOP_WAIT)
+    {
         Ok(stopped) => {
             if stopped > 0 {
                 tracing::info!(

@@ -528,12 +528,49 @@ impl BackgroundCommandRegistry {
     }
 
     /// Requests termination for every command owned by a workspace.
+    ///
+    /// The returned count is how many running commands newly received a stop request.
+    /// Snapshots may still report `Running` briefly while the monitor drains pipes.
     pub fn stop_for_workspace(
         &self,
         workspace_path: &Path,
     ) -> Result<usize, BackgroundCommandError> {
         let workspace_path = workspace_owner_path(workspace_path)?;
         Ok(self.stop_matching(|entry| entry.workspace_path == workspace_path))
+    }
+
+    /// Stops every command owned by a workspace and waits until each reaches a terminal status.
+    ///
+    /// Use this before deleting an execution workspace directory so managed process trees are
+    /// not still writing into a path that is about to be removed. After the wait budget elapses,
+    /// remaining processes are force-killed and given a short additional window to finish.
+    pub fn stop_and_wait_for_workspace(
+        &self,
+        workspace_path: &Path,
+        wait: Duration,
+    ) -> Result<usize, BackgroundCommandError> {
+        let workspace_path = workspace_owner_path(workspace_path)?;
+        let entries = {
+            let state = lock_recover(&self.inner.state);
+            state
+                .entries
+                .values()
+                .filter(|entry| entry.workspace_path == workspace_path)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut requested = 0usize;
+        for entry in &entries {
+            if entry.request_termination(BackgroundCommandTermination::ExplicitStop) {
+                requested += 1;
+            }
+        }
+
+        let deadline = Instant::now() + wait;
+        for entry in &entries {
+            wait_entry_terminal_or_force(entry, deadline);
+        }
+        Ok(requested)
     }
 
     /// Backwards-compatible alias for [`Self::stop_for_workspace`].
@@ -908,6 +945,25 @@ where
                 entry.append_output(stream, &buffer[..read])?;
             }
         })
+}
+
+/// Waits until `entry` is terminal. If `deadline` elapses first, force-kills the process tree
+/// and waits a short additional window for the monitor to record the terminal status.
+fn wait_entry_terminal_or_force(entry: &BackgroundCommandEntry, deadline: Instant) {
+    loop {
+        if entry.snapshot().status.is_terminal() {
+            return;
+        }
+        if Instant::now() >= deadline {
+            entry.force_terminate();
+            let force_deadline = Instant::now() + Duration::from_secs(2);
+            while !entry.snapshot().status.is_terminal() && Instant::now() < force_deadline {
+                thread::sleep(MONITOR_POLL_INTERVAL);
+            }
+            return;
+        }
+        thread::sleep(MONITOR_POLL_INTERVAL);
+    }
 }
 
 fn monitor_background_command(
@@ -1371,6 +1427,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn registry_stop_and_wait_for_workspace_reaches_terminal_before_return() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let other = tempfile::tempdir().expect("other workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let target = registry
+            .start(background_request(workspace.path(), "sleep 30"))
+            .expect("start target command");
+        let other_command = registry
+            .start(background_request(other.path(), "sleep 30"))
+            .expect("start other command");
+        let target_pid = target.pid;
+        assert!(process_is_alive(target_pid));
+
+        let stopped = registry
+            .stop_and_wait_for_workspace(workspace.path(), Duration::from_secs(3))
+            .expect("stop and wait");
+        let target_snapshot = registry
+            .command(&target.command_id)
+            .expect("target command");
+        let other_snapshot = registry
+            .command(&other_command.command_id)
+            .expect("other command");
+
+        assert_eq!(stopped, 1);
+        assert!(
+            target_snapshot.status.is_terminal(),
+            "stop_and_wait must not return while the workspace command is still running"
+        );
+        assert_eq!(target_snapshot.status, BackgroundCommandStatus::Stopped);
+        assert!(
+            !process_is_alive(target_pid),
+            "process tree must exit before stop_and_wait returns"
+        );
+        assert_eq!(other_snapshot.status, BackgroundCommandStatus::Running);
+        assert!(process_is_alive(other_command.pid));
+
+        registry.shutdown_all();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn registry_prunes_terminal_records_after_the_configured_retention() {
         let workspace = tempfile::tempdir().expect("workspace");
         let registry = BackgroundCommandRegistry::with_limits(BackgroundCommandLimits {
@@ -1445,5 +1542,15 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }

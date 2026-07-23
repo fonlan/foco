@@ -1050,12 +1050,17 @@ pub(crate) fn run_command_with_timeout(
         }
 
         if exit_status.is_none() {
-            exit_status = child
-                .try_wait()
-                .map_err(|source| ToolRuntimeError::Command {
-                    command: command_label.clone(),
-                    source,
-                })?;
+            match child.try_wait() {
+                Ok(status) => exit_status = status,
+                Err(source) => {
+                    // try_wait failure is rare, but the process tree may still be running.
+                    terminate_command_process_tree(&mut child);
+                    return Err(ToolRuntimeError::Command {
+                        command: command_label,
+                        source,
+                    });
+                }
+            }
         }
 
         if let Some(status) = exit_status {
@@ -7122,6 +7127,11 @@ mod tests {
             }),
         );
 
+        // Register cleanup as soon as the pid is known so assertion failures cannot leave
+        // a 30s sleep process behind.
+        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
+        let _cleanup = ForceKillOnDrop(grandchild_pid);
+
         assert!(result.is_error);
         assert!(
             result.output["error"]
@@ -7129,14 +7139,11 @@ mod tests {
                 .expect("timeout error")
                 .contains("timed out")
         );
-        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
         wait_until_process_exits(grandchild_pid, Duration::from_secs(2));
         assert!(
             !process_is_alive(grandchild_pid),
             "grandchild process should be killed with its process group on timeout"
         );
-        // Ensure no leftover sleep if the assertion path somehow races.
-        force_kill_process(grandchild_pid);
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
@@ -7173,6 +7180,9 @@ mod tests {
         );
         trigger.join().expect("join cancellation trigger");
 
+        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
+        let _cleanup = ForceKillOnDrop(grandchild_pid);
+
         assert!(result.is_error);
         assert!(
             result.output["error"]
@@ -7180,13 +7190,11 @@ mod tests {
                 .expect("cancellation error")
                 .contains("cancelled")
         );
-        let grandchild_pid = wait_for_pid_file(&pid_path, Duration::from_secs(2));
         wait_until_process_exits(grandchild_pid, Duration::from_secs(2));
         assert!(
             !process_is_alive(grandchild_pid),
             "grandchild process should be killed with its process group on cancellation"
         );
-        force_kill_process(grandchild_pid);
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
@@ -7327,6 +7335,17 @@ mod tests {
             .args(["-9", &pid.to_string()])
             .stderr(Stdio::null())
             .status();
+    }
+
+    /// Ensures a test-spawned process is force-killed even if assertions panic.
+    #[cfg(unix)]
+    struct ForceKillOnDrop(u32);
+
+    #[cfg(unix)]
+    impl Drop for ForceKillOnDrop {
+        fn drop(&mut self) {
+            force_kill_process(self.0);
+        }
     }
 
     fn run_test_command(workspace_path: &Path, command: &str, args: &[&str]) {
