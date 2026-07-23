@@ -64,6 +64,14 @@ impl CodeGraphInitGate {
             active = next;
         }
     }
+
+    #[cfg(test)]
+    fn active_count(&self) -> usize {
+        *self
+            .active
+            .lock()
+            .expect("code graph init gate lock poisoned")
+    }
 }
 
 struct CodeGraphInitPermit {
@@ -787,6 +795,7 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
     execution_root: PathBuf,
     label: impl Into<String>,
 ) {
+    let triggered_at = Instant::now();
     let label = label.into();
     let claim = match indexes.lock() {
         Ok(mut guard) => match guard.claim(&execution_root) {
@@ -830,12 +839,14 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
                 init_control.mark_finished();
                 return;
             }
+            let gate_queued_at = Instant::now();
             let Some(_permit) =
                 code_graph_init_gate().acquire_unless_cancelled(&init_control.cancel)
             else {
                 init_control.mark_finished();
                 return;
             };
+            let queue_wait_ms = gate_queued_at.elapsed().as_millis() as u64;
             if init_control.is_cancelled() {
                 init_control.mark_finished();
                 return;
@@ -844,6 +855,7 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
             tracing::info!(
                 execution_root = %worker_root.display(),
                 label = %worker_label,
+                queue_wait_ms,
                 "code graph execution-root initialization started"
             );
             match initialize_code_graph_execution_root(&worker_root) {
@@ -855,6 +867,7 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
                             execution_root = %worker_root.display(),
                             label = %worker_label,
                             elapsed_ms = started_at.elapsed().as_millis() as u64,
+                            prewarm_to_ready_ms = triggered_at.elapsed().as_millis() as u64,
                             "code graph execution-root initialization cancelled after index"
                         );
                         return;
@@ -867,6 +880,7 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
                         execution_root = %worker_root.display(),
                         label = %worker_label,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        prewarm_to_ready_ms = triggered_at.elapsed().as_millis() as u64,
                         "code graph execution-root initialization completed"
                     );
                 }
@@ -882,6 +896,7 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
                         label = %worker_label,
                         error = %error,
                         elapsed_ms = started_at.elapsed().as_millis() as u64,
+                        prewarm_to_ready_ms = triggered_at.elapsed().as_millis() as u64,
                         "failed to initialize code graph for execution root"
                     );
                 }
@@ -1008,6 +1023,9 @@ fn initialize_code_graph_execution_root(execution_root: &Path) -> AppResult<Code
         deleted_files = report.deleted_files,
         parse_errors = report.parse_errors,
         elapsed_ms = index_started_at.elapsed().as_millis() as u64,
+        file_prepare_duration_us = report.file_prepare_duration_us,
+        sqlite_persistence_duration_us = report.sqlite_persistence_duration_us,
+        resolver_duration_us = report.resolver_duration_us,
         "initialized code graph index"
     );
     let watcher_started_at = Instant::now();
@@ -1176,6 +1194,95 @@ mod tests {
         )
         .expect_err("should cancel before long deadline");
         assert!(matches!(error, CodeGraphReadinessError::Cancelled));
+    }
+
+    #[test]
+    fn init_gate_never_grants_more_than_configured_permits() {
+        static TEST_GATE: OnceLock<CodeGraphInitGate> = OnceLock::new();
+        let gate = TEST_GATE.get_or_init(CodeGraphInitGate::new);
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let mut workers = Vec::new();
+
+        for _ in 0..(MAX_CONCURRENT_CODE_GRAPH_INITS + 2) {
+            let release = Arc::clone(&release);
+            let started_tx = started_tx.clone();
+            workers.push(std::thread::spawn(move || {
+                let cancel = AtomicBool::new(false);
+                let permit = gate
+                    .acquire_unless_cancelled(&cancel)
+                    .expect("test worker should acquire a permit");
+                started_tx.send(()).expect("report acquired permit");
+
+                let (released, notify) = &*release;
+                let mut released = released.lock().expect("release lock");
+                while !*released {
+                    released = notify.wait(released).expect("release wait");
+                }
+                drop(permit);
+            }));
+        }
+        drop(started_tx);
+
+        for _ in 0..MAX_CONCURRENT_CODE_GRAPH_INITS {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("configured number of workers should start");
+        }
+        assert_eq!(gate.active_count(), MAX_CONCURRENT_CODE_GRAPH_INITS);
+        assert!(
+            started_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "additional workers must remain queued while every permit is held"
+        );
+
+        let (released, notify) = &*release;
+        *released.lock().expect("release lock") = true;
+        notify.notify_all();
+        for worker in workers {
+            worker.join().expect("init gate worker");
+        }
+        assert_eq!(gate.active_count(), 0);
+    }
+
+    #[test]
+    #[ignore = "run with --release to measure execution-root prewarm through watcher Ready"]
+    fn release_execution_root_prewarm_reports_trigger_to_ready() {
+        let execution_root = tempfile::tempdir().expect("execution root");
+        let source_dir = execution_root.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source directory");
+        for module_index in 0..32 {
+            let source = (0..100)
+                .map(|step_index| {
+                    format!(
+                        "pub fn module_{module_index}_step_{step_index}(value: usize) -> usize {{ value + {step_index} }}\n"
+                    )
+                })
+                .collect::<String>();
+            std::fs::write(source_dir.join(format!("module_{module_index}.rs")), source)
+                .expect("benchmark source");
+        }
+
+        let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
+        let triggered_at = Instant::now();
+        spawn_code_graph_execution_root_initialization_if_needed(
+            Arc::clone(&indexes),
+            execution_root.path().to_path_buf(),
+            "release-prewarm-benchmark",
+        );
+        wait_for_code_graph_ready(
+            &indexes,
+            execution_root.path(),
+            Some(Instant::now() + Duration::from_secs(30)),
+            None,
+        )
+        .expect("execution root must reach watcher Ready");
+        eprintln!(
+            "code_graph_execution_root_release_benchmark files=32 functions=3200 prewarm_to_ready_ms={}",
+            triggered_at.elapsed().as_millis()
+        );
+
+        release_code_graph_execution_root(&indexes, execution_root.path());
+        assert_eq!(indexes.lock().expect("lock").entry_count(), 0);
     }
 
     #[test]

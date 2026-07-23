@@ -1078,30 +1078,38 @@ fn legacy_extraction_does_not_allocate_unpersistable_unresolved_edges() {
 }
 
 #[test]
-#[ignore = "run with --release to compare the fixed semantic graph performance fixture"]
-fn semantic_fixture_performance_baseline_indexes_fixed_workspace() {
-    let workspace = semantic_fixture_workspace("performance_rust_workspace");
-    let workspace_bytes = fixture_file_bytes(workspace.path());
+#[ignore = "run with --release to measure medium and large execution-root graph indexing"]
+fn semantic_fixture_release_performance_reports_medium_and_large_execution_roots() {
+    let medium_workspace = semantic_fixture_workspace("performance_rust_workspace");
+    run_execution_root_performance_sample("medium", medium_workspace.path());
+
+    let large_workspace = semantic_fixture_workspace("performance_rust_workspace");
+    add_large_execution_root_sources(large_workspace.path());
+    run_execution_root_performance_sample("large", large_workspace.path());
+}
+
+fn run_execution_root_performance_sample(name: &str, workspace: &Path) {
+    let workspace_bytes = fixture_file_bytes(workspace);
     let full_started_at = std::time::Instant::now();
 
-    let full_report = index_workspace(workspace.path()).expect("index performance fixture");
+    let full_report = index_workspace(workspace).expect("index performance fixture");
 
     assert!(
         full_report.indexed_files > 0,
         "performance fixture must be indexed"
     );
-    let incremental_path = workspace.path().join("src/consumer.rs");
+    let incremental_path = workspace.join("src/consumer.rs");
     fs::write(
         &incremental_path,
         "use crate::generated::{step_00, step_20, step_40};\n\npub fn render_batch(value: usize) -> usize {\n    step_40(step_20(step_00(value)))\n}\n\n// benchmark mutation\n",
     )
     .expect("mutate performance fixture");
     let incremental_started_at = std::time::Instant::now();
-    let incremental_report = index_workspace(workspace.path()).expect("incremental index");
+    let incremental_report = index_workspace(workspace).expect("incremental index");
     let resolver_started_at = std::time::Instant::now();
-    crate::resolver::resolve_workspace_imports(workspace.path()).expect("resolver-only pass");
+    crate::resolver::resolve_workspace_imports(workspace).expect("resolver-only pass");
 
-    let connection = graph_connection(workspace.path());
+    let connection = graph_connection(workspace);
     let caller_query_started_at = std::time::Instant::now();
     let caller_count = query_count(
         &connection,
@@ -1122,7 +1130,8 @@ fn semantic_fixture_performance_baseline_indexes_fixed_workspace() {
     let callee_query_duration = callee_query_started_at.elapsed();
 
     eprintln!(
-        "semantic graph benchmark files={} bytes={} full_ms={} full_file_prepare_us={} full_sqlite_persistence_us={} full_resolver_us={} incremental_ms={} incremental_indexed={} incremental_file_prepare_us={} incremental_sqlite_persistence_us={} incremental_resolver_us={} resolver_only_ms={} callers={} caller_query_ms={} callees={} callee_query_ms={}",
+        "code_graph_release_benchmark scenario={} execution_root=temp-isolated files={} bytes={} cold_index_ms={} cold_file_prepare_us={} cold_sqlite_persistence_us={} cold_resolver_us={} incremental_ms={} incremental_indexed={} incremental_file_prepare_us={} incremental_sqlite_persistence_us={} incremental_resolver_us={} resolver_only_ms={} callers={} caller_query_ms={} callees={} callee_query_ms={}",
+        name,
         full_report.scanned_files,
         workspace_bytes,
         full_started_at.elapsed().as_millis(),
@@ -1140,6 +1149,21 @@ fn semantic_fixture_performance_baseline_indexes_fixed_workspace() {
         callee_count,
         callee_query_duration.as_millis(),
     );
+}
+
+fn add_large_execution_root_sources(workspace: &Path) {
+    let generated = fs::read_to_string(workspace.join("src/generated.rs"))
+        .expect("read medium fixture generated source");
+    for module_index in 0..32 {
+        let renamed = generated.replace("step_", &format!("module_{module_index}_step_"));
+        fs::write(
+            workspace
+                .join("src")
+                .join(format!("large_module_{module_index}.rs")),
+            renamed,
+        )
+        .expect("write large execution-root source");
+    }
 }
 
 #[test]
