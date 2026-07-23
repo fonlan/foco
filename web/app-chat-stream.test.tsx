@@ -144,7 +144,6 @@ function configureRemoteChat() {
   return { chatKey, remoteWorkspace };
 }
 
-
 function isDisabledControl(el: HTMLElement) {
   return (
     el.getAttribute("aria-disabled") === "true" ||
@@ -553,12 +552,16 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText(remoteWorkspace.name));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
+      await screen.findByPlaceholderText(
+        "Ask Foco anything about Remote project…",
+      ),
       "/",
     );
 
     expect(
-      await screen.findByRole("button", { name: "Select skill Remote workspace skill" }),
+      await screen.findByRole("button", {
+        name: "Select skill Remote workspace skill",
+      }),
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Select skill Remote global skill" }),
@@ -642,7 +645,8 @@ describe("app-chat-stream verification surfaces", () => {
           ...appTestState.settingsResponse.skills.detected,
           {
             canEnable: true,
-            description: "Local host copy that must not appear via settings fallback.",
+            description:
+              "Local host copy that must not appear via settings fallback.",
             enabled: true,
             id: "gitmemo",
             key: "global:gitmemo",
@@ -661,7 +665,9 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
+      await screen.findByPlaceholderText(
+        "Ask Foco anything about Remote project…",
+      ),
       "/",
     );
 
@@ -691,7 +697,9 @@ describe("app-chat-stream verification surfaces", () => {
     appTestState.workspaceSkillsResponsesByWorkspaceId = {
       [workspace.id]: {
         skills: [
-          ...settings.skills.detected.filter((skill) => skill.scope === "global"),
+          ...settings.skills.detected.filter(
+            (skill) => skill.scope === "global",
+          ),
           localWorkspaceSkill,
         ],
       },
@@ -731,9 +739,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       screen.queryByRole("button", { name: "Select skill Current skill" }),
     ).not.toBeInTheDocument();
-    expect(
-      await screen.findByText("Loading skills…"),
-    ).toBeInTheDocument();
+    expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
 
     remoteGate.resolve(
       jsonResponse({
@@ -843,7 +849,9 @@ describe("app-chat-stream verification surfaces", () => {
       ).toBe(true);
     });
 
-    const streamCall = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.find(
+    const streamCall = (
+      globalThis.fetch as ReturnType<typeof vi.fn>
+    ).mock.calls.find(
       ([url]) =>
         typeof url === "string" &&
         url === `/api/workspaces/${remoteWorkspaceId}/chat/stream`,
@@ -932,7 +940,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
+      await screen.findByPlaceholderText(
+        "Ask Foco anything about Remote project…",
+      ),
       "/",
     );
     expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
@@ -1010,7 +1020,9 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
+      await screen.findByPlaceholderText(
+        "Ask Foco anything about Remote project…",
+      ),
       "/",
     );
     expect(await screen.findByText("Loading skills…")).toBeInTheDocument();
@@ -1038,7 +1050,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
 
     expect(
-      await screen.findByRole("button", { name: "Select skill Remote only skill" }),
+      await screen.findByRole("button", {
+        name: "Select skill Remote only skill",
+      }),
     ).toBeInTheDocument();
     await waitFor(() => {
       expect(
@@ -1107,7 +1121,10 @@ describe("app-chat-stream verification surfaces", () => {
     configureRemoteChat();
     appTestState.workspaceSkillsResponsesByWorkspaceId = {
       [remoteWorkspaceId]: [
-        jsonResponse({ error: "sidecar skill discovery failed" }, { status: 502 }),
+        jsonResponse(
+          { error: "sidecar skill discovery failed" },
+          { status: 502 },
+        ),
       ],
     };
 
@@ -1115,7 +1132,9 @@ describe("app-chat-stream verification surfaces", () => {
     await userEvent.click(await screen.findByText("Remote project"));
     await userEvent.click(await screen.findByText(remoteChatTitle));
     await userEvent.type(
-      await screen.findByPlaceholderText("Ask Foco anything about Remote project…"),
+      await screen.findByPlaceholderText(
+        "Ask Foco anything about Remote project…",
+      ),
       "/",
     );
 
@@ -1144,8 +1163,12 @@ describe("app-chat-stream verification surfaces", () => {
     ).length;
 
     await userEvent.click(screen.getByRole("button", { name: "Settings" }));
-    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
-    await userEvent.click(within(settingsNav).getByRole("button", { name: "Skills" }));
+    const settingsNav = await screen.findByRole("navigation", {
+      name: "Settings",
+    });
+    await userEvent.click(
+      within(settingsNav).getByRole("button", { name: "Skills" }),
+    );
     await userEvent.click(
       await screen.findByRole("button", { name: "Refresh skill discovery" }),
     );
@@ -1190,9 +1213,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(chatPanelSource).toMatch(
       /className=["']composer-fast-toggle-label["']/,
     );
-    expect(chatPanelSource).toMatch(
-      /aria-label=\{t\(["']Fast mode["']\)\}/,
-    );
+    expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Fast mode["']\)\}/);
 
     expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*2rem[\s\S]*?min-width:\s*2rem[\s\S]*?max-width:\s*2rem[\s\S]*?height:\s*2rem[\s\S]*?flex:\s*0 0 2rem/,
@@ -1272,9 +1293,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(fastToggle).toHaveAttribute("aria-pressed", "true");
 
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "GPT Standard" }),
-    );
+    await userEvent.click(screen.getByRole("option", { name: "GPT Standard" }));
     expect(
       screen.queryByText("Fast mode is not available for the selected model."),
     ).not.toBeInTheDocument();
@@ -1283,9 +1302,7 @@ describe("app-chat-stream verification surfaces", () => {
     ).not.toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "GPT Test" }),
-    );
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     const restoredFastToggle = await screen.findByRole("button", {
       name: "Fast mode",
     });
@@ -4100,121 +4117,158 @@ describe("app-chat-stream verification surfaces", () => {
     }
   });
 
-  it("keeps live compression after a delayed GET active-run messages snapshot resolves", async () => {
-    const delayedMessages = deferred<Response>();
-    let messagesRequestCount = 0;
-    const assistantMessageId = "message-assistant-stream";
-    const messagesPayload = {
-      messages: [
-        chatMessages.messages[0],
-        {
-          ...chatMessages.messages[1],
-          content: "",
-          id: assistantMessageId,
-          metrics: null,
-          parts: [],
-          reasoning: null,
-          status: "streaming",
-          toolCalls: [],
+  it.each([
+    ["start", "request-stream", "Compressing", true],
+    ["completed", "request-stream", "Compressed", true],
+    ["start then completed", "request-stream", "Compressed", true],
+    ["completed from a replacement run", "request-replacement", null, false],
+  ] as const)(
+    "keeps only the applicable live compression after a delayed GET active-run messages snapshot resolves (%s)",
+    async (lifecycle, delayedSnapshotRunId, expectedStatus, shouldPreserve) => {
+      const delayedMessages = deferred<Response>();
+      let messagesRequestCount = 0;
+      const assistantMessageId = "message-assistant-stream";
+      const messagesPayload = {
+        messages: [
+          chatMessages.messages[0],
+          {
+            ...chatMessages.messages[1],
+            content: "",
+            id: assistantMessageId,
+            metrics: null,
+            parts: [],
+            reasoning: null,
+            status: "streaming",
+            toolCalls: [],
+          },
+        ],
+        activeRun: {
+          assistantMessageId,
+          chatId: "chat-1",
+          lastSequence: 0,
+          runId: "request-stream",
+          workspaceId: "workspace-1",
         },
-      ],
-      activeRun: {
-        assistantMessageId,
-        chatId: "chat-1",
-        lastSequence: 0,
-        runId: "request-stream",
-        workspaceId: "workspace-1",
-      },
-    };
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const url = typeof input === "string" ? input : input.toString();
-        const path = url.startsWith("http://127.0.0.1")
-          ? new URL(url).pathname
-          : url.split("?")[0];
-        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
-          messagesRequestCount += 1;
-          return messagesRequestCount === 1
-            ? jsonResponse(messagesPayload)
-            : delayedMessages.promise;
+      };
+      const fetchMock = vi.fn(
+        async (input: RequestInfo | URL, init?: RequestInit) => {
+          const url = typeof input === "string" ? input : input.toString();
+          const path = url.startsWith("http://127.0.0.1")
+            ? new URL(url).pathname
+            : url.split("?")[0];
+          if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+            messagesRequestCount += 1;
+            return messagesRequestCount === 1
+              ? jsonResponse(messagesPayload)
+              : delayedMessages.promise;
+          }
+          return mockFetch(input, init);
+        },
+      );
+      vi.stubGlobal("fetch", fetchMock);
+      window.history.replaceState(null, "", "/workspace-1/chat-1");
+      renderApp();
+
+      await waitFor(() =>
+        expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+          true,
+        ),
+      );
+
+      // An identity correction starts a refresh, but the server response is held
+      // to model the pre-SSE `/messages` snapshot that caused the regression.
+      await act(async () => {
+        enqueueChatStreamEventForRun("request-stream", {
+          assistantMessageId: "stale-alias",
+          delta: "trigger refresh",
+          type: "textDelta",
+        });
+      });
+      await waitFor(() => expect(messagesRequestCount).toBe(2));
+
+      await act(async () => {
+        if (lifecycle !== "completed") {
+          enqueueChatStreamEventForRun("request-stream", {
+            assistantMessageId,
+            kind: "llm",
+            status: "start",
+            type: "contextCompression",
+            detail: {
+              compressionId: "compression-race-1",
+              kind: "llm",
+              originalTokenCount: 9000,
+              providerId: "openai",
+              modelId: "gpt-test",
+              startedAt: "2026-07-23T10:00:00Z",
+              status: "start",
+            },
+          });
         }
-        return mockFetch(input, init);
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    window.history.replaceState(null, "", "/workspace-1/chat-1");
-    renderApp();
-
-    await waitFor(() =>
-      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
-        true,
-      ),
-    );
-
-    // An identity correction starts a refresh, but the server response is held
-    // to model the pre-SSE `/messages` snapshot that caused the regression.
-    await act(async () => {
-      enqueueChatStreamEventForRun("request-stream", {
-        assistantMessageId: "stale-alias",
-        delta: "trigger refresh",
-        type: "textDelta",
+        if (lifecycle !== "start") {
+          enqueueChatStreamEventForRun("request-stream", {
+            assistantMessageId,
+            compressionId: "compression-race-1",
+            kind: "llm",
+            snapshotId: "snapshot-race-1",
+            status: "completed",
+            type: "contextCompression",
+            detail: {
+              completedAt: "2026-07-23T10:00:02Z",
+              compressionId: "compression-race-1",
+              kind: "llm",
+              modelId: "gpt-test",
+              originalTokenCount: 9000,
+              providerId: "openai",
+              snapshotId: "snapshot-race-1",
+              startedAt: "2026-07-23T10:00:00Z",
+              status: "completed",
+              summaryTokenCount: 1200,
+            },
+          });
+        }
       });
-    });
-    await waitFor(() => expect(messagesRequestCount).toBe(2));
+      expect(
+        screen.getByText(expectedStatus ?? "Compressed"),
+      ).toBeInTheDocument();
 
-    await act(async () => {
-      enqueueChatStreamEventForRun("request-stream", {
-        assistantMessageId,
-        kind: "llm",
-        status: "start",
-        type: "contextCompression",
-        detail: {
-          compressionId: "compression-race-1",
-          kind: "llm",
-          originalTokenCount: 9000,
-          providerId: "openai",
-          modelId: "gpt-test",
-          startedAt: "2026-07-23T10:00:00Z",
-          status: "start",
-        },
+      await act(async () => {
+        delayedMessages.resolve(
+          jsonResponse({
+            ...messagesPayload,
+            activeRun: {
+              ...messagesPayload.activeRun,
+              runId: delayedSnapshotRunId,
+            },
+          }),
+        );
       });
-      enqueueChatStreamEventForRun("request-stream", {
-        assistantMessageId,
-        compressionId: "compression-race-1",
-        kind: "llm",
-        snapshotId: "snapshot-race-1",
-        status: "completed",
-        type: "contextCompression",
-        detail: {
-          completedAt: "2026-07-23T10:00:02Z",
-          compressionId: "compression-race-1",
-          kind: "llm",
-          modelId: "gpt-test",
-          originalTokenCount: 9000,
-          providerId: "openai",
-          snapshotId: "snapshot-race-1",
-          startedAt: "2026-07-23T10:00:00Z",
-          status: "completed",
-          summaryTokenCount: 1200,
-        },
+
+      await waitFor(() => {
+        if (shouldPreserve) {
+          expect(
+            screen.getByText(expectedStatus ?? "Compressed"),
+          ).toBeInTheDocument();
+          expect(screen.getAllByText("Context compression")).toHaveLength(1);
+        } else {
+          expect(
+            screen.queryByText("Context compression"),
+          ).not.toBeInTheDocument();
+        }
       });
-    });
-    expect(screen.getByText("Compressed")).toBeInTheDocument();
+      if (shouldPreserve && lifecycle !== "start") {
+        await userEvent.click(screen.getByText("Context compression"));
+        expect(screen.getByText("snapshot-race-1")).toBeInTheDocument();
+        expect(
+          screen.getByText(/Saved 7,800 tokens|Saved 7800 tokens/),
+        ).toBeInTheDocument();
+      }
+      await act(async () => {
+        appTestState.chatStreamControllers.get("request-stream")?.close();
+      });
+    },
+  );
 
-    await act(async () => {
-      delayedMessages.resolve(jsonResponse(messagesPayload));
-    });
-
-    await waitFor(() => {
-      expect(screen.getByText("Compressed")).toBeInTheDocument();
-      expect(screen.getAllByText("Context compression")).toHaveLength(1);
-    });
-    await act(async () => {
-      appTestState.chatStreamControllers.get("request-stream")?.close();
-    });
-  });
-
-  it("keeps background chat bubble events out of the active tab until switched", async () => {
+  it("keeps a background compression lifecycle cached until its tab is restored", async () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
@@ -4266,6 +4320,26 @@ describe("app-chat-stream verification surfaces", () => {
           status: "start",
         },
       });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        compressionId: "compression-background",
+        kind: "llm",
+        snapshotId: "snapshot-background",
+        status: "completed",
+        type: "contextCompression",
+        detail: {
+          completedAt: "2026-07-19T14:00:02Z",
+          compressionId: "compression-background",
+          kind: "llm",
+          modelId: "gpt-test",
+          originalTokenCount: 2000,
+          providerId: "openai",
+          snapshotId: "snapshot-background",
+          startedAt: "2026-07-19T14:00:00Z",
+          status: "completed",
+          summaryTokenCount: 400,
+        },
+      });
     });
 
     // Background stream updates cache only — active tab stays on Second chat.
@@ -4284,9 +4358,15 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(backgroundAssistantRow as HTMLElement).getByText("completed"),
     ).toBeInTheDocument();
-    expect(screen.getByText("Context compression")).toBeInTheDocument();
+    expect(screen.getByText("Compressed")).toBeInTheDocument();
+    expect(screen.queryByText("Compressing")).not.toBeInTheDocument();
     expect(screen.getAllByText("Read")).toHaveLength(1);
     expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    await userEvent.click(screen.getByText("Context compression"));
+    expect(screen.getByText("snapshot-background")).toBeInTheDocument();
+    expect(
+      screen.getByText(/Saved 1,600 tokens|Saved 1600 tokens/),
+    ).toBeInTheDocument();
     expect(screen.queryByText("Second answer.")).not.toBeInTheDocument();
 
     await act(async () => {
@@ -4946,13 +5026,9 @@ describe("app-chat-stream verification surfaces", () => {
       "next task",
     );
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "GPT Test" }),
-    );
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     await userEvent.click(screen.getByRole("button", { name: /Thinking/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "High" }),
-    );
+    await userEvent.click(screen.getByRole("option", { name: "High" }));
     fireEvent.click(screen.getByRole("button", { name: "Send guidance" }), {
       ctrlKey: true,
     });
@@ -6000,9 +6076,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "GPT Test" }),
-    );
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
       "Review it",
@@ -6392,7 +6466,9 @@ describe("app-chat-stream verification surfaces", () => {
       name: "Stream-ended summary",
     });
     const completedBubble = heading.closest(".message-bubble") as HTMLElement;
-    expect(completedBubble.querySelector(".markdown-content-assistant")).not.toBeNull();
+    expect(
+      completedBubble.querySelector(".markdown-content-assistant"),
+    ).not.toBeNull();
     expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
     expect(
       within(completedBubble).getByText("Rendered terminal item").tagName,
@@ -6458,9 +6534,13 @@ describe("app-chat-stream verification surfaces", () => {
       enqueueChatStreamEventForRun("request-stream", { type: "streamEnd" });
     });
 
-    const heading = await screen.findByRole("heading", { name: "Plan summary" });
+    const heading = await screen.findByRole("heading", {
+      name: "Plan summary",
+    });
     const completedBubble = heading.closest(".message-bubble") as HTMLElement;
-    expect(completedBubble.querySelector(".markdown-content-assistant")).not.toBeNull();
+    expect(
+      completedBubble.querySelector(".markdown-content-assistant"),
+    ).not.toBeNull();
     expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
     expect(
       within(completedBubble).getByText("Rendered after reconnect").tagName,
@@ -6740,7 +6820,9 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByRole("button", { name: "Retry last run" }),
     ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Retry last run" }));
+    await userEvent.click(
+      screen.getByRole("button", { name: "Retry last run" }),
+    );
     await waitFor(() =>
       expect(appTestState.activeChatStreamController).not.toBeNull(),
     );
@@ -8201,9 +8283,7 @@ describe("app-chat-stream verification surfaces", () => {
       controller: ReadableStreamDefaultController<Uint8Array>,
       event: Record<string, unknown>,
     ) => {
-      controller.enqueue(
-        encoder.encode(`data: ${JSON.stringify(event)}\n\n`),
-      );
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify(event)}\n\n`));
     };
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -8312,10 +8392,13 @@ describe("app-chat-stream verification surfaces", () => {
           },
         );
       });
-      expect(await screen.findByText("Replacement owner text.")).toBeInTheDocument();
+      expect(
+        await screen.findByText("Replacement owner text."),
+      ).toBeInTheDocument();
 
       await act(async () => {
-        const controller = oldController as ReadableStreamDefaultController<Uint8Array>;
+        const controller =
+          oldController as ReadableStreamDefaultController<Uint8Array>;
         emit(controller, {
           assistantMessageId: "old-assistant",
           delta: "Late old text.",
@@ -8363,8 +8446,12 @@ describe("app-chat-stream verification surfaces", () => {
       expect(screen.queryByText("Late old text.")).not.toBeInTheDocument();
       expect(screen.queryByText("Late old reasoning.")).not.toBeInTheDocument();
       expect(screen.queryByText("late_old_tool")).not.toBeInTheDocument();
-      expect(screen.queryByText("Late old completion.")).not.toBeInTheDocument();
-      expect(screen.getByRole("button", { name: "Cancel run" })).toBeInTheDocument();
+      expect(
+        screen.queryByText("Late old completion."),
+      ).not.toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: "Cancel run" }),
+      ).toBeInTheDocument();
       expect(document.querySelectorAll(".message-row")).toHaveLength(2);
     } finally {
       await act(async () => {
@@ -8590,15 +8677,21 @@ describe("app-chat-stream verification surfaces", () => {
 
     // Settings still pending: model catalog is empty, but selection must not
     // permanently clear to the empty-label state.
-    expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(true);
+    expect(
+      isDisabledControl(screen.getByRole("button", { name: /Model:/ })),
+    ).toBe(true);
 
     await act(async () => {
       settingsGate.resolve(jsonResponse(settings));
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
-      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent(
+        "GPT Test",
+      );
+      expect(
+        isDisabledControl(screen.getByRole("button", { name: /Model:/ })),
+      ).toBe(false);
     });
 
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
@@ -8702,8 +8795,12 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
-      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent(
+        "GPT Test",
+      );
+      expect(
+        isDisabledControl(screen.getByRole("button", { name: /Model:/ })),
+      ).toBe(false);
     });
 
     await act(async () => {
@@ -8750,8 +8847,12 @@ describe("app-chat-stream verification surfaces", () => {
     // Messages resolved after settings: model must stay restored, not cleared
     // by a stale empty-catalog applyComposerModelForPlanMode closure.
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Test");
-      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent(
+        "GPT Test",
+      );
+      expect(
+        isDisabledControl(screen.getByRole("button", { name: /Model:/ })),
+      ).toBe(false);
     });
 
     await act(async () => {
@@ -8911,14 +9012,16 @@ describe("app-chat-stream verification surfaces", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent("GPT Alt");
-      expect(isDisabledControl(screen.getByRole("button", { name: /Model:/ }))).toBe(false);
+      expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent(
+        "GPT Alt",
+      );
+      expect(
+        isDisabledControl(screen.getByRole("button", { name: /Model:/ })),
+      ).toBe(false);
     });
 
     await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    expect(
-      screen.getByRole("option", { name: "GPT Alt" }),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "GPT Alt" })).toBeInTheDocument();
     expect(
       screen.getByRole("option", { name: "GPT Test" }),
     ).toBeInTheDocument();

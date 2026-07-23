@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 describe("remote start run identity", () => {
@@ -432,6 +432,256 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     );
 
     expect(result.messages[0]?.parts).toEqual(loadedAssistant.parts);
+  });
+
+  it.each([
+    ["start after an older response", "start", null, null],
+    [
+      "completed after an older response",
+      "completed",
+      "snapshot-live",
+      900,
+    ],
+  ] as const)(
+    "keeps exactly one live compression lifecycle for %s",
+    (_label, status, snapshotId, summaryTokenCount) => {
+      const loadedAssistant = {
+        ...message("assistant-live"),
+        parts: [{ text: "Older server text", type: "text" as const }],
+      };
+      const liveAssistant = {
+        ...loadedAssistant,
+        parts: [
+          ...loadedAssistant.parts,
+          {
+            detail: {
+              compressionId: "compression-live",
+              kind: "llm" as const,
+              modelId: "gpt-test",
+              originalTokenCount: 5000,
+              providerId: "openai",
+              snapshotId,
+              startedAt: "2026-07-23T10:00:00Z",
+              status,
+              summaryTokenCount,
+            },
+            id: "compression-live",
+            kind: "llm" as const,
+            status,
+            type: "contextCompression" as const,
+          },
+        ],
+      };
+
+      const result = overlayStaleLoadedContextCompressionParts(
+        [loadedAssistant],
+        [liveAssistant],
+      );
+      const compressionParts = result[0]?.parts.filter(
+        (part) => part.type === "contextCompression",
+      );
+
+      expect(compressionParts).toHaveLength(1);
+      expect(compressionParts?.[0]).toMatchObject({
+        detail: {
+          compressionId: "compression-live",
+          originalTokenCount: 5000,
+          snapshotId,
+          summaryTokenCount,
+        },
+        status,
+      });
+      expect(result[0]?.parts).toHaveLength(2);
+    },
+  );
+
+  it("uses a persisted completed server part to upgrade a local start", () => {
+    const loadedAssistant = {
+      ...message("assistant-live"),
+      parts: [
+        {
+          detail: {
+            completedAt: "2026-07-23T10:00:02Z",
+            compressionId: "compression-upgrade",
+            kind: "llm" as const,
+            originalTokenCount: 5000,
+            snapshotId: "snapshot-server",
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "completed" as const,
+            summaryTokenCount: 900,
+          },
+          id: "compression-upgrade",
+          kind: "llm" as const,
+          status: "completed" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+    const localStart = {
+      ...loadedAssistant,
+      parts: [
+        {
+          detail: {
+            compressionId: "compression-upgrade",
+            kind: "llm" as const,
+            originalTokenCount: 5000,
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "start" as const,
+          },
+          id: "compression-upgrade",
+          kind: "llm" as const,
+          status: "start" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+
+    const result = overlayStaleLoadedContextCompressionParts(
+      [loadedAssistant],
+      [localStart],
+    );
+    const compressionParts = result[0]?.parts.filter(
+      (part) => part.type === "contextCompression",
+    );
+
+    expect(compressionParts).toHaveLength(1);
+    expect(compressionParts?.[0]).toMatchObject({
+      detail: { snapshotId: "snapshot-server", summaryTokenCount: 900 },
+      status: "completed",
+    });
+  });
+
+  it("does not let an older server start downgrade a local completed part", () => {
+    const serverStart = {
+      ...message("assistant-live"),
+      parts: [
+        {
+          detail: {
+            compressionId: "compression-no-downgrade",
+            kind: "llm" as const,
+            originalTokenCount: 5000,
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "start" as const,
+          },
+          id: "compression-no-downgrade",
+          kind: "llm" as const,
+          status: "start" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+    const localCompleted = {
+      ...serverStart,
+      parts: [
+        {
+          detail: {
+            completedAt: "2026-07-23T10:00:02Z",
+            compressionId: "compression-no-downgrade",
+            kind: "llm" as const,
+            originalTokenCount: 5000,
+            snapshotId: "snapshot-local",
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "completed" as const,
+            summaryTokenCount: 900,
+          },
+          id: "compression-no-downgrade",
+          kind: "llm" as const,
+          status: "completed" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+
+    const result = overlayStaleLoadedContextCompressionParts(
+      [serverStart],
+      [localCompleted],
+    );
+    const compressionParts = result[0]?.parts.filter(
+      (part) => part.type === "contextCompression",
+    );
+
+    expect(compressionParts).toHaveLength(1);
+    expect(compressionParts?.[0]).toMatchObject({
+      detail: { snapshotId: "snapshot-local", summaryTokenCount: 900 },
+      status: "completed",
+    });
+  });
+
+  it("keeps same-second compression lifecycles distinct by compression ID", () => {
+    const liveAssistant = {
+      ...message("assistant-live"),
+      parts: ["compression-a", "compression-b"].map((compressionId) => ({
+        detail: {
+          completedAt: "2026-07-23T10:00:02Z",
+          compressionId,
+          kind: "llm" as const,
+          originalTokenCount: 5000,
+          snapshotId: `snapshot-${compressionId}`,
+          startedAt: "2026-07-23T10:00:00Z",
+          status: "completed" as const,
+          summaryTokenCount: 900,
+        },
+        id: compressionId,
+        kind: "llm" as const,
+        status: "completed" as const,
+        type: "contextCompression" as const,
+      })),
+    };
+
+    const result = overlayStaleLoadedContextCompressionParts(
+      [{ ...message("assistant-live"), parts: [] }],
+      [liveAssistant],
+    );
+    const compressionParts = result[0]?.parts.filter(
+      (part) => part.type === "contextCompression",
+    );
+
+    expect(compressionParts).toHaveLength(2);
+    expect(compressionParts?.map((part) => part.detail.compressionId)).toEqual([
+      "compression-a",
+      "compression-b",
+    ]);
+  });
+
+  it("does not resurrect a deleted compression part from a zero-overlap cache", () => {
+    const staleCache = [
+      {
+        ...message("assistant-deleted"),
+        parts: [
+          {
+            detail: {
+              compressionId: "compression-deleted",
+              kind: "llm" as const,
+              startedAt: "2026-07-23T10:00:00Z",
+              status: "completed" as const,
+            },
+            id: "compression-deleted",
+            kind: "llm" as const,
+            status: "completed" as const,
+            type: "contextCompression" as const,
+          },
+        ],
+      },
+    ];
+    const serverRewrite = [
+      {
+        ...message("assistant-rewritten"),
+        content: "Authoritative rewrite.",
+        parts: [{ text: "Authoritative rewrite.", type: "text" as const }],
+      },
+    ];
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      serverRewrite,
+      staleCache,
+      { preserveLiveContextCompressionParts: true },
+    );
+
+    expect(result.preservedCachePrefix).toBe(false);
+    expect(result.messages).toEqual(serverRewrite);
+    expect(result.messages[0]?.parts).not.toContainEqual(
+      expect.objectContaining({ type: "contextCompression" }),
+    );
   });
 
   it("drops cached streaming placeholders when preserveStreaming is false", () => {
