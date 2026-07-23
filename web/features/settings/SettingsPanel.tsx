@@ -171,7 +171,16 @@ import {
 import { findVerticalScrollAncestor } from "../../shared/scroll-forwarding";
 import { AgentsSettingsPanel } from "../agents/AgentsSettingsPanel";
 import { FilePickerDialog, type FilePickerSelection } from "../file-picker/FilePickerDialog";
-import { Button, Modal, Spinner } from "../../shared/ui";
+import {
+  Button,
+  Modal,
+  SettingsButton,
+  SettingsInput,
+  SettingsSelect,
+  SettingsTextArea,
+  SettingsTextField,
+  Spinner,
+} from "../../shared/ui";
 import { useRemoteWorkspaceSkillCatalog } from "./use-remote-workspace-skill-catalog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
 import {
@@ -5338,7 +5347,7 @@ export function SettingsPanel({
             <CircleAlert aria-hidden="true" className="app-error-toast-icon" />
           )}
           <div className="app-error-toast-message">{modelTestToast.message}</div>
-          <button
+          <SettingsButton
             aria-label={t("Dismiss model test result")}
             className={
               modelTestToast.kind === "success"
@@ -5350,7 +5359,7 @@ export function SettingsPanel({
             type="button"
           >
             <X aria-hidden="true" className="size-4" />
-          </button>
+          </SettingsButton>
         </div>
       ) : null}
       <div className="settings-layout grid">
@@ -5476,7 +5485,7 @@ export function SettingsPanel({
                 </p>
               </div>
               {activeSection === "models" ? (
-                <button
+                <SettingsButton
                   aria-label={t("Refresh model metadata")}
                   className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
                   disabled={isRefreshing}
@@ -5489,7 +5498,7 @@ export function SettingsPanel({
                   ) : (
                     <RefreshCw aria-hidden="true" className="size-4" />
                   )}
-                </button>
+                </SettingsButton>
               ) : null}
             </div>
           </section>
@@ -5513,7 +5522,7 @@ export function SettingsPanel({
                   </h3>
                 </div>
                 <div className="mt-4 grid gap-3">
-                  <TextField
+                  <SettingsTextField
                     label={t("Listen address")}
                     onChange={(value) =>
                       setGeneralForm((current) => ({
@@ -5524,7 +5533,7 @@ export function SettingsPanel({
                     placeholder="127.0.0.1"
                     value={generalForm.listenHost}
                   />
-                  <TextField
+                  <SettingsTextField
                     inputMode="numeric"
                     label={t("Listen port")}
                     onChange={(value) =>
@@ -5540,7 +5549,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("LLM request retries")}
                     </span>
-                    <input
+                    <SettingsInput
                       autoComplete="off"
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       inputMode="numeric"
@@ -5561,7 +5570,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Chat title generation model")}
                     </span>
-                    <select
+                    <SettingsSelect
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         setGeneralForm((current) => ({
@@ -5580,7 +5589,7 @@ export function SettingsPanel({
                             {model.displayName || model.id}
                           </option>
                         ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
                   <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                     <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
@@ -5601,7 +5610,7 @@ export function SettingsPanel({
                         aria-label={t("Runtime tool-state compression")}
                         className="inline-flex size-10 shrink-0 items-center justify-center self-end rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:self-auto"
                       >
-                        <input
+                        <SettingsInput
                           checked={generalForm.runtimeToolStateCompressionEnabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -5619,7 +5628,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("API request detail retention days")}
                     </span>
-                    <input
+                    <SettingsInput
                       autoComplete="off"
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       inputMode="numeric"
@@ -5665,7 +5674,7 @@ export function SettingsPanel({
                           aria-label={t("Save request and response bodies")}
                           className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                         >
-                          <input
+                          <SettingsInput
                             checked={generalForm.apiSaveRequestResponseDetails}
                             className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
@@ -5705,7 +5714,7 @@ export function SettingsPanel({
                           aria-label={t("Start Foco at startup")}
                           className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                         >
-                          <input
+                          <SettingsInput
                             checked={generalForm.autoStartEnabled}
                             className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
@@ -5740,7 +5749,7 @@ export function SettingsPanel({
                   </div>
                   <div className="mt-3 flex flex-wrap gap-2">
                     {canLogout ? (
-                      <button
+                      <SettingsButton
                         aria-label={t("Log out")}
                         className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => void onLogout()}
@@ -5749,9 +5758,9 @@ export function SettingsPanel({
                       >
                         <Lock aria-hidden="true" className="size-4" />
                         {t("Log out")}
-                      </button>
+                      </SettingsButton>
                     ) : null}
-                    <button
+                    <SettingsButton
                       aria-label={t("Clear browser password")}
                       className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
@@ -5771,7 +5780,7 @@ export function SettingsPanel({
                         <X aria-hidden="true" className="size-4" />
                       )}
                       {t("Clear browser password")}
-                    </button>
+                    </SettingsButton>
                   </div>
                   <div className="mt-3 grid gap-3">
                     <div className="grid gap-2">
@@ -5780,7 +5789,7 @@ export function SettingsPanel({
                           {t("Authentication password")}
                         </span>
                         <span className="relative block">
-                          <input
+                          <SettingsInput
                             autoComplete="new-password"
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 pr-10 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
@@ -5803,7 +5812,7 @@ export function SettingsPanel({
                             type={isGeneralPasswordVisible ? "text" : "password"}
                             value={passwordInputValue}
                           />
-                          <button
+                          <SettingsButton
                             aria-label={
                               isGeneralPasswordVisible
                                 ? t("Hide password")
@@ -5826,7 +5835,7 @@ export function SettingsPanel({
                             ) : (
                               <Eye aria-hidden="true" className="size-4" />
                             )}
-                          </button>
+                          </SettingsButton>
                         </span>
                         {settings?.general.webServer.passwordEnabled ? (
                           <span className="mt-1 block text-xs text-[var(--muted)]">
@@ -5843,7 +5852,7 @@ export function SettingsPanel({
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Language")}
                   </span>
-                  <select
+                  <SettingsSelect
                     className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     disabled={isSavingLanguage || isLoadingSettings}
                     onChange={(event) => void saveLanguageSetting(event.target.value)}
@@ -5854,7 +5863,7 @@ export function SettingsPanel({
                         {language.name}
                       </option>
                     ))}
-                  </select>
+                  </SettingsSelect>
                   <span className="mt-1 block text-xs text-[var(--muted)]">
                     {t("Language changes apply immediately after saving.")}
                   </span>
@@ -5863,7 +5872,7 @@ export function SettingsPanel({
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Theme")}
                   </span>
-                  <select
+                  <SettingsSelect
                     className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     disabled={isSavingTheme || isLoadingSettings}
                     onChange={(event) =>
@@ -5876,13 +5885,13 @@ export function SettingsPanel({
                         {t(theme.name)}
                       </option>
                     ))}
-                  </select>
+                  </SettingsSelect>
                   <span className="mt-1 block text-xs text-[var(--muted)]">
                     {t("Theme changes apply immediately after saving.")}
                   </span>
                 </label>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <button
+                  <SettingsButton
                     aria-label={t("Save general settings")}
                     className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={
@@ -5900,8 +5909,8 @@ export function SettingsPanel({
                       <CheckCircle2 aria-hidden="true" className="size-4" />
                     )}
                     {t("Save")}
-                  </button>
-                  <button
+                  </SettingsButton>
+                  <SettingsButton
                     aria-label={t("Reload general settings")}
                     className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingSettings}
@@ -5915,7 +5924,7 @@ export function SettingsPanel({
                       <RefreshCw aria-hidden="true" className="size-4" />
                     )}
                     {t("Reload")}
-                  </button>
+                  </SettingsButton>
                 </div>
               </form>
 
@@ -5978,7 +5987,7 @@ export function SettingsPanel({
                         aria-label={t("Allow web search for chat runs")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
-                        <input
+                        <SettingsInput
                           checked={webSearchForm.enabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -6008,7 +6017,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Search API")}
                     </span>
-                    <select
+                    <SettingsSelect
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
                         setWebSearchForm((current) => ({
@@ -6023,7 +6032,7 @@ export function SettingsPanel({
                           {provider.label}
                         </option>
                       ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
                   <fieldset className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                     <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
@@ -6042,7 +6051,7 @@ export function SettingsPanel({
                         aria-label={t("Enable web search proxy")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
-                        <input
+                        <SettingsInput
                           checked={webSearchForm.apiProxyEnabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -6060,7 +6069,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Proxy type")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setWebSearchForm((current) => ({
@@ -6080,9 +6089,9 @@ export function SettingsPanel({
                               </option>
                             ),
                           )}
-                        </select>
+                        </SettingsSelect>
                       </label>
-                      <TextField
+                      <SettingsTextField
                         label={t("Proxy server")}
                         onChange={(value) =>
                           setWebSearchForm((current) => ({
@@ -6124,7 +6133,7 @@ export function SettingsPanel({
                             <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("API token")}
                             </span>
-                            <input
+                            <SettingsInput
                               autoComplete="off"
                               className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
@@ -6144,7 +6153,7 @@ export function SettingsPanel({
                           </label>
                           {provider.hasApiKey ? (
                             <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
-                              <input
+                              <SettingsInput
                                 checked={Boolean(webSearchForm[clearField])}
                                 className="size-4 accent-[var(--accent)]"
                                 onChange={(event) =>
@@ -6164,7 +6173,7 @@ export function SettingsPanel({
                   </div>
                 </div>
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <button
+                  <SettingsButton
                     aria-label={t("Save web search settings")}
                     className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingWebSearch || !webSearchForm.activeProvider}
@@ -6177,8 +6186,8 @@ export function SettingsPanel({
                       <CheckCircle2 aria-hidden="true" className="size-4" />
                     )}
                     {t("Save")}
-                  </button>
-                  <button
+                  </SettingsButton>
+                  <SettingsButton
                     aria-label={t("Reload web search settings")}
                     className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingSettings}
@@ -6192,7 +6201,7 @@ export function SettingsPanel({
                       <RefreshCw aria-hidden="true" className="size-4" />
                     )}
                     {t("Reload")}
-                  </button>
+                  </SettingsButton>
                 </div>
               </form>
             </section>
@@ -6227,7 +6236,7 @@ export function SettingsPanel({
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Extra prompt")}
                   </span>
-                  <textarea
+                  <SettingsTextArea
                     aria-label={t("Extra prompt")}
                     className="min-h-36 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) =>
@@ -6272,7 +6281,7 @@ export function SettingsPanel({
                           >
                             {isRenaming ? (
                               <>
-                                <input
+                                <SettingsInput
                                   aria-label={t("System prompt name")}
                                   autoComplete="off"
                                   autoFocus
@@ -6295,7 +6304,7 @@ export function SettingsPanel({
                                   }}
                                   value={promptSettingsForm.pendingSystemPromptRename}
                                 />
-                                <button
+                                <SettingsButton
                                   aria-label={t("Save system prompt name")}
                                   className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                   disabled={
@@ -6306,8 +6315,8 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <CheckCircle2 aria-hidden="true" className="size-4" />
-                                </button>
-                                <button
+                                </SettingsButton>
+                                <SettingsButton
                                   aria-label={t("Cancel system prompt rename")}
                                   className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onClick={cancelRenameSystemPrompt}
@@ -6315,11 +6324,11 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <X aria-hidden="true" className="size-4" />
-                                </button>
+                                </SettingsButton>
                               </>
                             ) : (
                               <>
-                                <button
+                                <SettingsButton
                                   className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${isActive
                                       ? "text-[var(--accent-soft-foreground)]"
                                       : "text-[var(--muted)]"
@@ -6333,9 +6342,9 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   {prompt.name}
-                                </button>
+                                </SettingsButton>
                                 {defaultSystemPromptContent(prompt.name) !== null ? (
-                                  <button
+                                  <SettingsButton
                                     aria-label={t("Restore default system prompt")}
                                     className="inline-flex size-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={isLoadingSettings || !settings}
@@ -6344,10 +6353,10 @@ export function SettingsPanel({
                                     type="button"
                                   >
                                     <RefreshCw aria-hidden="true" className="size-4" />
-                                  </button>
+                                  </SettingsButton>
                                 ) : isFixed ? null : (
                                   <>
-                                    <button
+                                    <SettingsButton
                                       aria-label={t("Rename system prompt {name}", {
                                         name: prompt.name,
                                       })}
@@ -6357,8 +6366,8 @@ export function SettingsPanel({
                                       type="button"
                                     >
                                       <Pencil aria-hidden="true" className="size-4" />
-                                    </button>
-                                    <button
+                                    </SettingsButton>
+                                    <SettingsButton
                                       aria-label={t("Remove system prompt {name}", {
                                         name: prompt.name,
                                       })}
@@ -6368,7 +6377,7 @@ export function SettingsPanel({
                                       type="button"
                                     >
                                       <Trash2 aria-hidden="true" className="size-4" />
-                                    </button>
+                                    </SettingsButton>
                                   </>
                                 )}
                               </>
@@ -6378,7 +6387,7 @@ export function SettingsPanel({
                       })}
                     </div>
                     <div className="flex gap-2">
-                      <input
+                      <SettingsInput
                         autoComplete="off"
                         className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
@@ -6390,7 +6399,7 @@ export function SettingsPanel({
                         placeholder={t("Prompt name")}
                         value={promptSettingsForm.pendingSystemPromptName}
                       />
-                      <button
+                      <SettingsButton
                         aria-label={t("Add system prompt")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={!promptSettingsForm.pendingSystemPromptName.trim()}
@@ -6401,14 +6410,14 @@ export function SettingsPanel({
                         type="button"
                       >
                         <Plus aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
                   </div>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("System prompt")}
                     </span>
-                    <textarea
+                    <SettingsTextArea
                       aria-label={t("System prompt")}
                       className="min-h-72 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
@@ -6615,7 +6624,7 @@ export function SettingsPanel({
                       {t("Prompt file path")}
                     </span>
                     <div className="flex gap-2">
-                      <input
+                      <SettingsInput
                         autoComplete="off"
                         className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         name="prompt-file-path"
@@ -6628,7 +6637,7 @@ export function SettingsPanel({
                         placeholder="C:/Users/name/.codex/AGENTS.md"
                         value={promptSettingsForm.pendingFile}
                       />
-                      <button
+                      <SettingsButton
                         aria-label={t("Add prompt file")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={!promptSettingsForm.pendingFile.trim()}
@@ -6637,8 +6646,8 @@ export function SettingsPanel({
                         type="button"
                       >
                         <Plus aria-hidden="true" className="size-4" />
-                      </button>
-                      <button
+                      </SettingsButton>
+                      <SettingsButton
                         aria-label={t("Choose prompt file")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                         disabled={isSelectingPromptFile}
@@ -6651,7 +6660,7 @@ export function SettingsPanel({
                         ) : (
                           <FolderSearch aria-hidden="true" className="size-4" />
                         )}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </label>
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)]">
@@ -6665,7 +6674,7 @@ export function SettingsPanel({
                             <div className="min-w-0 break-all text-sm font-semibold text-[var(--foreground)]">
                               {file}
                             </div>
-                            <button
+                            <SettingsButton
                               aria-label={t("Remove prompt file {path}", { path: file })}
                               className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                               onClick={() => removePromptFilePath(file)}
@@ -6673,7 +6682,7 @@ export function SettingsPanel({
                               type="button"
                             >
                               <Trash2 aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                           </div>
                         ))}
                       </div>
@@ -6686,7 +6695,7 @@ export function SettingsPanel({
                 </div>
 
                 <div className="mt-4 flex flex-wrap gap-2">
-                  <button
+                  <SettingsButton
                     aria-label={t("Save prompt settings")}
                     className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingPromptSettings}
@@ -6699,7 +6708,7 @@ export function SettingsPanel({
                       <CheckCircle2 aria-hidden="true" className="size-4" />
                     )}
                     {t("Save")}
-                  </button>
+                  </SettingsButton>
                 </div>
               </form>
             </section>
@@ -6745,7 +6754,7 @@ export function SettingsPanel({
                         aria-label={t("Enable Auto Spec")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
-                        <input
+                        <SettingsInput
                           checked={specSettingsForm.autoEnabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -6763,7 +6772,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Spec generation model")}
                         </span>
-                        <select
+                        <SettingsSelect
                           aria-label={t("Spec generation model")}
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
@@ -6789,7 +6798,7 @@ export function SettingsPanel({
                               })}
                             </option>
                           ) : null}
-                        </select>
+                        </SettingsSelect>
                       </label>
                     </div>
                     <div className="mt-3">
@@ -6797,7 +6806,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Spec LLM timeout ms")}
                         </span>
-                        <input
+                        <SettingsInput
                           aria-label={t("Spec LLM timeout ms")}
                           autoComplete="off"
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
@@ -6857,7 +6866,7 @@ export function SettingsPanel({
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-3">
                     <label className="inline-flex items-center gap-2 text-sm font-medium text-[var(--muted)]">
-                      <input
+                      <SettingsInput
                         checked={showRetryableSpecJobsOnly}
                         className="size-4 accent-[var(--accent)]"
                         onChange={(event) =>
@@ -6867,7 +6876,7 @@ export function SettingsPanel({
                       />
                       <span>{t("Only retryable Spec jobs")}</span>
                     </label>
-                    <button
+                    <SettingsButton
                       aria-label={t("Refresh Spec job history")}
                       className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                       disabled={isLoadingSpecJobs}
@@ -6880,7 +6889,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
 
@@ -6975,7 +6984,7 @@ export function SettingsPanel({
                               <td className="px-3 py-2 align-top">
                                 <div className="flex items-center justify-end gap-1.5">
                                   {job.status === "failed" && !job.hasRetry ? (
-                                    <button
+                                    <SettingsButton
                                       aria-label={t("Retry Spec job")}
                                       className="inline-flex h-8 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       disabled={isBusy}
@@ -6989,10 +6998,10 @@ export function SettingsPanel({
                                         <Redo2 aria-hidden="true" className="size-3.5" />
                                       )}
                                       {t("Retry")}
-                                    </button>
+                                    </SettingsButton>
                                   ) : null}
                                   {job.status === "failed" ? (
-                                    <button
+                                    <SettingsButton
                                       aria-label={t("Delete Spec job")}
                                       className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:border-[var(--border)] disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       disabled={isBusy}
@@ -7005,7 +7014,7 @@ export function SettingsPanel({
                                       ) : (
                                         <Trash2 aria-hidden="true" className="size-3.5" />
                                       )}
-                                    </button>
+                                    </SettingsButton>
                                   ) : null}
                                 </div>
                               </td>
@@ -7030,7 +7039,7 @@ export function SettingsPanel({
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
                     <label className="flex w-full items-center gap-2 text-xs font-semibold text-[var(--muted)] sm:w-auto">
                       <span>{t("Page size")}</span>
-                      <input
+                      <SettingsInput
                         className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         disabled={isLoadingSpecJobs}
                         inputMode="numeric"
@@ -7042,7 +7051,7 @@ export function SettingsPanel({
                       aria-label={t("Spec job history pagination")}
                       className="flex flex-wrap items-center gap-1.5"
                     >
-                      <button
+                      <SettingsButton
                         aria-label={t("Previous page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingSpecJobs || specJobsPage <= 1}
@@ -7051,7 +7060,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronLeft aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                       {specJobsPaginationItems.map((item, index) =>
                         item === "ellipsis" ? (
                           <span
@@ -7062,7 +7071,7 @@ export function SettingsPanel({
                             ...
                           </span>
                         ) : (
-                          <button
+                          <SettingsButton
                             aria-current={item === specJobsPage ? "page" : undefined}
                             aria-label={t("Go to page {page}", {
                               page: formatNumber(item, language),
@@ -7080,10 +7089,10 @@ export function SettingsPanel({
                             type="button"
                           >
                             {formatNumber(item, language)}
-                          </button>
+                          </SettingsButton>
                         ),
                       )}
-                      <button
+                      <SettingsButton
                         aria-label={t("Next page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -7096,7 +7105,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronRight aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </nav>
                   </div>
                 </div>
@@ -7120,7 +7129,7 @@ export function SettingsPanel({
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Merge automation")}
                   </span>
-                  <select
+                  <SettingsSelect
                     aria-label={t("Merge automation")}
                     className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) => setPlanMergeAutomationMode(event.target.value)}
@@ -7131,13 +7140,13 @@ export function SettingsPanel({
                         {t(mode.label)}
                       </option>
                     ))}
-                  </select>
+                  </SettingsSelect>
                 </label>
                 <label className="mt-4 block">
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Plan mode model")}
                   </span>
-                  <select
+                  <SettingsSelect
                     aria-label={t("Plan mode model")}
                     className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                     onChange={(event) => setPlanModeModelId(event.target.value)}
@@ -7149,9 +7158,9 @@ export function SettingsPanel({
                         {model.displayName || model.id}
                       </option>
                     ))}
-                  </select>
+                  </SettingsSelect>
                 </label>
-                <button
+                <SettingsButton
                   aria-label={t("Save plan settings")}
                   className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingPlanSettings}
@@ -7164,7 +7173,7 @@ export function SettingsPanel({
                     <CheckCircle2 aria-hidden="true" className="size-4" />
                   )}
                   {t("Save")}
-                </button>
+                </SettingsButton>
               </form>
 
               <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] shadow-[var(--overlay-shadow)]">
@@ -7177,7 +7186,7 @@ export function SettingsPanel({
                       {planWorkspace?.name ?? t("No workspace selected")}
                     </p>
                   </div>
-                  <button
+                  <SettingsButton
                     aria-label={t("Refresh plan history")}
                     className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isLoadingPlanHistory || !effectivePlanHistoryWorkspaceId}
@@ -7190,7 +7199,7 @@ export function SettingsPanel({
                     ) : (
                       <RefreshCw aria-hidden="true" className="size-4" />
                     )}
-                  </button>
+                  </SettingsButton>
                 </div>
 
                 <div className="grid gap-3 border-b border-[var(--border)] px-4 py-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
@@ -7198,7 +7207,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Workspace")}
                     </span>
-                    <select
+                    <SettingsSelect
                       aria-label={t("Workspace")}
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
@@ -7212,13 +7221,13 @@ export function SettingsPanel({
                           {workspace.name}
                         </option>
                       ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
                   <label className="block">
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Plan status")}
                     </span>
-                    <select
+                    <SettingsSelect
                       aria-label={t("Plan status")}
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
@@ -7242,7 +7251,7 @@ export function SettingsPanel({
                           {t(planStatusLabel(status))}
                         </option>
                       ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
                 </div>
 
@@ -7300,7 +7309,7 @@ export function SettingsPanel({
                               </div>
                             </div>
                             {action ? (
-                              <button
+                              <SettingsButton
                                 aria-label={t(planActionLabel(action))}
                                 className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={planHistoryOperationKey !== null}
@@ -7314,7 +7323,7 @@ export function SettingsPanel({
                                   <CheckCircle2 aria-hidden="true" className="size-4" />
                                 )}
                                 {t(planActionLabel(action))}
-                              </button>
+                              </SettingsButton>
                             ) : null}
                           </div>
                         </article>
@@ -7340,7 +7349,7 @@ export function SettingsPanel({
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between lg:justify-end">
                     <label className="flex w-full items-center gap-2 text-xs font-semibold text-[var(--muted)] sm:w-auto">
                       <span>{t("Page size")}</span>
-                      <input
+                      <SettingsInput
                         className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         inputMode="numeric"
                         onChange={(event) => updatePlanHistoryPageSize(event.target.value)}
@@ -7351,7 +7360,7 @@ export function SettingsPanel({
                       aria-label={t("Plan history pagination")}
                       className="flex flex-wrap items-center gap-1.5"
                     >
-                      <button
+                      <SettingsButton
                         aria-label={t("Previous page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingPlanHistory || planHistoryPage <= 1}
@@ -7360,7 +7369,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronLeft aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                       {planHistoryPaginationItems.map((item, index) =>
                         item === "ellipsis" ? (
                           <span
@@ -7371,7 +7380,7 @@ export function SettingsPanel({
                             ...
                           </span>
                         ) : (
-                          <button
+                          <SettingsButton
                             aria-current={item === planHistoryPage ? "page" : undefined}
                             aria-label={t("Go to page {page}", {
                               page: formatNumber(item, language),
@@ -7389,10 +7398,10 @@ export function SettingsPanel({
                             type="button"
                           >
                             {formatNumber(item, language)}
-                          </button>
+                          </SettingsButton>
                         ),
                       )}
-                      <button
+                      <SettingsButton
                         aria-label={t("Next page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -7405,7 +7414,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronRight aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </nav>
                   </div>
                 </div>
@@ -7417,7 +7426,7 @@ export function SettingsPanel({
             <section className="grid gap-4">
               {isMemoryDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close memory dialog backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={closeMemoryDialog}
@@ -7452,7 +7461,7 @@ export function SettingsPanel({
                           {memoryScopeLabel(manualMemoryForm.scope, t)}
                         </div>
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close memory dialog")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={closeMemoryDialog}
@@ -7460,7 +7469,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
                     <div
                       className={
@@ -7476,7 +7485,7 @@ export function SettingsPanel({
                               <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                 {t("Memory scope")}
                               </span>
-                              <select
+                              <SettingsSelect
                                 className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                 onChange={(event) =>
                                   setManualMemoryForm((current) => ({
@@ -7489,14 +7498,14 @@ export function SettingsPanel({
                                 <option value="global">{t("Global memory")}</option>
                                 <option value="workspace">{t("Workspace memory")}</option>
                                 <option value="chat">{t("Chat memory")}</option>
-                              </select>
+                              </SettingsSelect>
                             </label>
                             {manualMemoryForm.scope !== "global" ? (
                               <label className="block">
                                 <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                   {t("Workspace")}
                                 </span>
-                                <select
+                                <SettingsSelect
                                   className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                   onChange={(event) =>
                                     setManualMemoryForm((current) => ({
@@ -7515,11 +7524,11 @@ export function SettingsPanel({
                                       {workspace.name}
                                     </option>
                                   ))}
-                                </select>
+                                </SettingsSelect>
                               </label>
                             ) : null}
                             {manualMemoryForm.scope === "chat" ? (
-                              <TextField
+                              <SettingsTextField
                                 label={t("Chat ID")}
                                 onChange={(value) =>
                                   setManualMemoryForm((current) => ({
@@ -7537,7 +7546,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory kind")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
@@ -7552,10 +7561,10 @@ export function SettingsPanel({
                                 {memoryKindLabel(kind, t)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
                         <div className="grid gap-3 sm:grid-cols-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Confidence")}
                             onChange={(value) =>
@@ -7571,7 +7580,7 @@ export function SettingsPanel({
                             <span className="text-sm font-semibold text-[var(--muted)]">
                               {t("Pinned memory")}
                             </span>
-                            <input
+                            <SettingsInput
                               checked={manualMemoryForm.pinned}
                               className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
@@ -7588,7 +7597,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory fact")}
                           </span>
-                          <textarea
+                          <SettingsTextArea
                             className="min-h-32 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
@@ -7603,7 +7612,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory metadata")}
                           </span>
-                          <textarea
+                          <SettingsTextArea
                             className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setManualMemoryForm((current) => ({
@@ -7708,7 +7717,7 @@ export function SettingsPanel({
                                       </div>
                                     </div>
                                   </div>
-                                  <TextField
+                                  <SettingsTextField
                                     label={t("Source title")}
                                     onChange={(value) =>
                                       updateMemorySourceForm(source.id, "title", value)
@@ -7760,7 +7769,7 @@ export function SettingsPanel({
                           )}
                         </div>
                       ) : null}
-                      <button
+                      <SettingsButton
                         aria-label={
                           memoryDialogMode === "create"
                             ? t("Create memory")
@@ -7790,7 +7799,7 @@ export function SettingsPanel({
                         {memoryDialogMode === "create"
                           ? t("Create memory")
                           : t("Save memory")}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </form>
                 </>
@@ -7826,7 +7835,7 @@ export function SettingsPanel({
                         aria-label={t("Enable memory")}
                         className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                       >
-                        <input
+                        <SettingsInput
                           checked={memorySettingsForm.enabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -7862,7 +7871,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Extraction mode")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
@@ -7877,13 +7886,13 @@ export function SettingsPanel({
                                 {t(mode.label)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
                         <label className="block">
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Extraction model")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
@@ -7899,10 +7908,10 @@ export function SettingsPanel({
                                 {model.displayName}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
                         <div className="sm:col-span-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Retention days")}
                             onChange={(value) =>
@@ -7916,7 +7925,7 @@ export function SettingsPanel({
                           />
                         </div>
                         <div className="sm:col-span-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Extraction LLM timeout ms")}
                             onChange={(value) =>
@@ -7950,7 +7959,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Memory matching")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
@@ -7965,13 +7974,13 @@ export function SettingsPanel({
                                 {t(mode.label)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
                         <label className="block">
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Matching model")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setMemorySettingsForm((current) => ({
@@ -7987,10 +7996,10 @@ export function SettingsPanel({
                                 {model.displayName}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
                         <div className="sm:col-span-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Retrieval LLM timeout ms")}
                             onChange={(value) =>
@@ -8004,7 +8013,7 @@ export function SettingsPanel({
                           />
                         </div>
                         <div className="sm:col-span-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Memory context budget %")}
                             onChange={(value) =>
@@ -8051,7 +8060,7 @@ export function SettingsPanel({
                             aria-label={t("Enable Dream")}
                             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
-                            <input
+                            <SettingsInput
                               checked={memorySettingsForm.dream.enabled}
                               className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
@@ -8073,7 +8082,7 @@ export function SettingsPanel({
                             aria-label={t("Enable Auto Dream")}
                             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
-                            <input
+                            <SettingsInput
                               checked={memorySettingsForm.dream.autoEnabled}
                               className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
@@ -8095,7 +8104,7 @@ export function SettingsPanel({
                             aria-label={t("Create transcript chat")}
                             className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
                           >
-                            <input
+                            <SettingsInput
                               checked={memorySettingsForm.dream.createTranscriptChat}
                               className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
@@ -8114,7 +8123,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Dream mode")}
                         </span>
-                        <select
+                        <SettingsSelect
                           aria-label={t("Dream mode")}
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
@@ -8128,13 +8137,13 @@ export function SettingsPanel({
                             {t("Deterministic only")}
                           </option>
                           <option value="llm">{t("LLM")}</option>
-                        </select>
+                        </SettingsSelect>
                       </label>
                       <label className="block">
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Dream model")}
                         </span>
-                        <select
+                        <SettingsSelect
                           aria-label={t("Dream model")}
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
@@ -8150,9 +8159,9 @@ export function SettingsPanel({
                               {model.displayName}
                             </option>
                           ))}
-                        </select>
+                        </SettingsSelect>
                       </label>
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Workspace interval days")}
                         onChange={(value) =>
@@ -8163,7 +8172,7 @@ export function SettingsPanel({
                         placeholder="7"
                         value={memorySettingsForm.dream.workspaceIntervalDays}
                       />
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Global interval days")}
                         onChange={(value) =>
@@ -8174,7 +8183,7 @@ export function SettingsPanel({
                         placeholder="30"
                         value={memorySettingsForm.dream.globalIntervalDays}
                       />
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Max facts per run")}
                         onChange={(value) =>
@@ -8185,7 +8194,7 @@ export function SettingsPanel({
                         placeholder="200"
                         value={memorySettingsForm.dream.maxFactsPerRun}
                       />
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Max changes per run")}
                         onChange={(value) =>
@@ -8196,7 +8205,7 @@ export function SettingsPanel({
                         placeholder="50"
                         value={memorySettingsForm.dream.maxChangesPerRun}
                       />
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Scheduler scan minutes")}
                         onChange={(value) =>
@@ -8207,7 +8216,7 @@ export function SettingsPanel({
                         placeholder="60"
                         value={memorySettingsForm.dream.schedulerScanMinutes}
                       />
-                      <TextField
+                      <SettingsTextField
                         inputMode="numeric"
                         label={t("Dream LLM timeout ms")}
                         onChange={(value) =>
@@ -8221,7 +8230,7 @@ export function SettingsPanel({
                     </div>
                   </fieldset>
                 </div>
-                <button
+                <SettingsButton
                   aria-label={t("Save memory settings")}
                   className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingMemorySettings}
@@ -8234,7 +8243,7 @@ export function SettingsPanel({
                     <CheckCircle2 aria-hidden="true" className="size-4" />
                   )}
                   {t("Save")}
-                </button>
+                </SettingsButton>
               </form>
 
               <section className="min-w-0 rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
@@ -8251,7 +8260,7 @@ export function SettingsPanel({
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-2">
-                    <button
+                    <SettingsButton
                       aria-label={t("Run workspace Dream now")}
                       className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={
@@ -8270,8 +8279,8 @@ export function SettingsPanel({
                         <Play aria-hidden="true" className="size-4" />
                       )}
                       {t("Run workspace Dream now")}
-                    </button>
-                    <button
+                    </SettingsButton>
+                    <SettingsButton
                       aria-label={t("Run global Dream now")}
                       className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
@@ -8289,8 +8298,8 @@ export function SettingsPanel({
                         <Globe aria-hidden="true" className="size-4" />
                       )}
                       {t("Run global Dream now")}
-                    </button>
-                    <button
+                    </SettingsButton>
+                    <SettingsButton
                       aria-label={t("Refresh Dream history")}
                       className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={() => void loadMemoryDreamJobs()}
@@ -8302,7 +8311,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
 
@@ -8470,7 +8479,7 @@ export function SettingsPanel({
                               </td>
                               <td className="px-3 py-2 align-top">
                                 <div className="flex items-center justify-end gap-1">
-                                  <button
+                                  <SettingsButton
                                     aria-label={t("View details")}
                                     className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                     onClick={(event) => {
@@ -8482,9 +8491,9 @@ export function SettingsPanel({
                                     type="button"
                                   >
                                     <Eye aria-hidden="true" className="size-4" />
-                                  </button>
+                                  </SettingsButton>
                                   {job.transcriptChatId && transcriptWorkspaceId ? (
-                                    <button
+                                    <SettingsButton
                                       aria-label={t("Open transcript")}
                                       className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                       onClick={(event) => {
@@ -8495,7 +8504,7 @@ export function SettingsPanel({
                                       type="button"
                                     >
                                       <ScrollText aria-hidden="true" className="size-4" />
-                                    </button>
+                                    </SettingsButton>
                                   ) : job.transcriptChatId ? (
                                     <span className="text-xs text-[var(--muted)]">
                                       {job.transcriptChatId}
@@ -8522,7 +8531,7 @@ export function SettingsPanel({
                   <div className="flex flex-wrap items-center justify-end gap-3">
                     <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                       <span>{t("Page size")}</span>
-                      <input
+                      <SettingsInput
                         className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         max={MEMORY_DREAM_MAX_PAGE_SIZE}
                         min={1}
@@ -8535,7 +8544,7 @@ export function SettingsPanel({
                       aria-label={t("Dream history pagination")}
                       className="flex items-center gap-1"
                     >
-                      <button
+                      <SettingsButton
                         aria-label={t("Previous page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={isLoadingMemoryDreamJobs || currentMemoryDreamPage <= 1}
@@ -8544,7 +8553,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronLeft aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                       {memoryDreamPaginationItems.map((item, index) =>
                         item === "ellipsis" ? (
                           <span
@@ -8555,7 +8564,7 @@ export function SettingsPanel({
                             ...
                           </span>
                         ) : (
-                          <button
+                          <SettingsButton
                             aria-current={
                               item === currentMemoryDreamPage ? "page" : undefined
                             }
@@ -8575,10 +8584,10 @@ export function SettingsPanel({
                             type="button"
                           >
                             {formatNumber(item, language)}
-                          </button>
+                          </SettingsButton>
                         ),
                       )}
-                      <button
+                      <SettingsButton
                         aria-label={t("Next page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -8591,14 +8600,14 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronRight aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </nav>
                   </div>
                 </div>
 
                 {memoryDreamDetailJob ? (
                   <>
-                    <button
+                    <SettingsButton
                       aria-label={t("Close Dream job details backdrop")}
                       className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                       onClick={closeMemoryDreamDetailDialog}
@@ -8634,7 +8643,7 @@ export function SettingsPanel({
                             {formatAuditDate(memoryDreamDetailJob.createdAt, language)}
                           </div>
                         </div>
-                        <button
+                        <SettingsButton
                           aria-label={t("Close Dream job details")}
                           className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={closeMemoryDreamDetailDialog}
@@ -8642,7 +8651,7 @@ export function SettingsPanel({
                           type="button"
                         >
                           <X aria-hidden="true" className="size-4" />
-                        </button>
+                        </SettingsButton>
                       </div>
                       <p className="text-sm text-[var(--muted)]">
                         {memoryDreamDetailJob.summary ||
@@ -8770,7 +8779,7 @@ export function SettingsPanel({
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-2">
                     {memoryFilter.scope !== "global" ? (
-                      <button
+                      <SettingsButton
                         aria-label={clearFilteredMemoryLabel}
                         className="inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--danger)] hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={!canClearFilteredMemories || isSavingMemory}
@@ -8780,9 +8789,9 @@ export function SettingsPanel({
                       >
                         <Trash2 aria-hidden="true" className="size-4" />
                         {clearFilteredMemoryLabel}
-                      </button>
+                      </SettingsButton>
                     ) : null}
-                    <button
+                    <SettingsButton
                       aria-label={t("Create memory")}
                       className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-sm font-semibold text-white hover:bg-[var(--accent)]"
                       onClick={openCreateMemoryDialog}
@@ -8791,7 +8800,7 @@ export function SettingsPanel({
                     >
                       <Plus aria-hidden="true" className="size-4" />
                       {t("Create memory")}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(9rem,0.8fr)_minmax(9rem,0.8fr)_minmax(8rem,0.7fr)_minmax(0,1.4fr)_auto]">
@@ -8799,7 +8808,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Memory scope")}
                     </span>
-                    <select
+                    <SettingsSelect
                       aria-label={t("Memory scope")}
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
@@ -8816,14 +8825,14 @@ export function SettingsPanel({
                       <option value="global">{t("Global memory")}</option>
                       <option value="workspace">{t("Workspace memory")}</option>
                       <option value="chat">{t("Chat memory")}</option>
-                    </select>
+                    </SettingsSelect>
                   </label>
                   {memoryFilter.scope !== "global" ? (
                     <label className="block">
                       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Workspace")}
                       </span>
-                      <select
+                      <SettingsSelect
                         aria-label={t("Workspace")}
                         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
@@ -8838,11 +8847,11 @@ export function SettingsPanel({
                             {workspace.name}
                           </option>
                         ))}
-                      </select>
+                      </SettingsSelect>
                     </label>
                   ) : null}
                   {memoryFilter.scope === "chat" ? (
-                    <TextField
+                    <SettingsTextField
                       label={t("Chat ID")}
                       onChange={(value) =>
                         updateMemoryFilter({
@@ -8857,7 +8866,7 @@ export function SettingsPanel({
                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                       {t("Memory kind")}
                     </span>
-                    <select
+                    <SettingsSelect
                       aria-label={t("Memory kind")}
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) =>
@@ -8873,9 +8882,9 @@ export function SettingsPanel({
                           {memoryKindLabel(kind, t)}
                         </option>
                       ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
-                  <TextField
+                  <SettingsTextField
                     label={t("Search memories")}
                     onChange={(value) =>
                       updateMemoryFilter({
@@ -8890,7 +8899,7 @@ export function SettingsPanel({
                       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Memory status")}
                       </span>
-                      <select
+                      <SettingsSelect
                         aria-label={t("Memory status")}
                         className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) =>
@@ -8902,9 +8911,9 @@ export function SettingsPanel({
                       >
                         <option value="active">{t("Active")}</option>
                         <option value="pending">{t("Pending review")}</option>
-                      </select>
+                      </SettingsSelect>
                     </label>
-                    <button
+                    <SettingsButton
                       aria-label={t("Refresh memories")}
                       className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={() => void loadMemories()}
@@ -8916,7 +8925,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="mt-4 grid gap-3">
@@ -8939,7 +8948,7 @@ export function SettingsPanel({
                           }`}
                         key={memory.id}
                       >
-                        <button
+                        <SettingsButton
                           className="min-w-0 text-left"
                           onClick={() => setSelectedMemoryId(memory.id)}
                           type="button"
@@ -8965,13 +8974,13 @@ export function SettingsPanel({
                           <div className="mt-2 text-xs text-[var(--muted)]">
                             {memory.updatedAt}
                           </div>
-                        </button>
+                        </SettingsButton>
                         <div className="flex items-start justify-end gap-2">
                           <label
                             className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
                             title={memoryEnabledToggleLabel}
                           >
-                            <input
+                            <SettingsInput
                               aria-label={memoryEnabledToggleLabel}
                               checked={memory.enabled}
                               className="peer sr-only"
@@ -8989,7 +8998,7 @@ export function SettingsPanel({
                             <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                           </label>
                           {memory.scope !== "global" ? (
-                            <button
+                            <SettingsButton
                               aria-label={t("Promote one level")}
                               className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               onClick={() => promoteMemoryOneLevel(memory)}
@@ -9001,9 +9010,9 @@ export function SettingsPanel({
                               type="button"
                             >
                               <ArrowUp aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                           ) : null}
-                          <button
+                          <SettingsButton
                             aria-label={t("Edit memory")}
                             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={() => openEditMemoryDialog(memory)}
@@ -9011,8 +9020,8 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Pencil aria-hidden="true" className="size-4" />
-                          </button>
-                          <button
+                          </SettingsButton>
+                          <SettingsButton
                             aria-label={t("Delete memory")}
                             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                             onClick={() => void forgetMemory(memory.id)}
@@ -9020,7 +9029,7 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Trash2 aria-hidden="true" className="size-4" />
-                          </button>
+                          </SettingsButton>
                         </div>
                       </div>
                       );
@@ -9038,7 +9047,7 @@ export function SettingsPanel({
                   <div className="flex flex-wrap items-center justify-end gap-3">
                     <label className="flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                       <span>{t("Page size")}</span>
-                      <input
+                      <SettingsInput
                         className="h-9 w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         max={200}
                         min={1}
@@ -9051,7 +9060,7 @@ export function SettingsPanel({
                       aria-label={t("Memory pagination")}
                       className="flex items-center gap-1"
                     >
-                      <button
+                      <SettingsButton
                         aria-label={t("Previous page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -9064,7 +9073,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronLeft aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                       {memoryPaginationItems.map((item, index) =>
                         item === "ellipsis" ? (
                           <span
@@ -9075,7 +9084,7 @@ export function SettingsPanel({
                             ...
                           </span>
                         ) : (
-                          <button
+                          <SettingsButton
                             aria-current={
                               item === memoryListMeta.page ? "page" : undefined
                             }
@@ -9095,10 +9104,10 @@ export function SettingsPanel({
                             type="button"
                           >
                             {formatNumber(item, language)}
-                          </button>
+                          </SettingsButton>
                         ),
                       )}
-                      <button
+                      <SettingsButton
                         aria-label={t("Next page")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -9112,7 +9121,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <ChevronRight aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </nav>
                   </div>
                 </div>
@@ -9151,7 +9160,7 @@ export function SettingsPanel({
                               {job.errorMessage ?? t("Memory extraction failed")}
                             </div>
                             <div className="flex shrink-0 items-center gap-2">
-                              <button
+                              <SettingsButton
                                 aria-label={t("Retry extraction")}
                                 className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={isSavingMemory}
@@ -9162,8 +9171,8 @@ export function SettingsPanel({
                                 type="button"
                               >
                                 <Redo2 aria-hidden="true" className="size-3.5" />
-                              </button>
-                              <button
+                              </SettingsButton>
+                              <SettingsButton
                                 aria-label={t("Skip extraction failure")}
                                 className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={isSavingMemory}
@@ -9174,7 +9183,7 @@ export function SettingsPanel({
                                 type="button"
                               >
                                 <X aria-hidden="true" className="size-3.5" />
-                              </button>
+                              </SettingsButton>
                             </div>
                           </div>
                           <div className="mt-1 text-xs text-[var(--muted)]">
@@ -9188,22 +9197,22 @@ export function SettingsPanel({
                 {selectedMemory?.status === "pending" ? (
                   <div className="mt-4 rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
                     <div className="flex flex-wrap gap-2">
-                      <button
+                      <SettingsButton
                         className="inline-flex h-9 items-center gap-2 rounded-lg bg-[var(--accent)] px-3 text-xs font-semibold text-white hover:bg-[var(--accent)]"
                         onClick={() => void setMemoryStatus(selectedMemory.id, "active")}
                         type="button"
                       >
                         <CheckCircle2 aria-hidden="true" className="size-3.5" />
                         {t("Approve memory")}
-                      </button>
-                      <button
+                      </SettingsButton>
+                      <SettingsButton
                         className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                         onClick={() => void setMemoryStatus(selectedMemory.id, "rejected")}
                         type="button"
                       >
                         <X aria-hidden="true" className="size-3.5" />
                         {t("Reject memory")}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </div>
                 ) : null}
@@ -9238,7 +9247,7 @@ export function SettingsPanel({
             <section className="grid gap-4">
               {isWorkspaceDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close workspace configuration backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsWorkspaceDialogOpen(false)}
@@ -9263,7 +9272,7 @@ export function SettingsPanel({
                           </div>
                         ) : null}
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close workspace configuration")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsWorkspaceDialogOpen(false)}
@@ -9271,7 +9280,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
                     {error ? (
                       <div
@@ -9282,7 +9291,7 @@ export function SettingsPanel({
                       </div>
                     ) : null}
                     <div className="space-y-3">
-                      <TextField
+                      <SettingsTextField
                         label={t("Workspace name")}
                         onChange={(value) =>
                           setWorkspaceForm((current) => ({
@@ -9298,7 +9307,7 @@ export function SettingsPanel({
                           {t("Path")}
                         </span>
                         <div className="flex gap-2">
-                          <input
+                          <SettingsInput
                             autoComplete="off"
                             className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             name="workspace-path"
@@ -9315,7 +9324,7 @@ export function SettingsPanel({
                             placeholder="C:/Users/name/workspace"
                             value={workspaceForm.path}
                           />
-                          <button
+                          <SettingsButton
                             aria-label={t("Choose workspace path")}
                             className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSelectingWorkspaceFormPath}
@@ -9331,7 +9340,7 @@ export function SettingsPanel({
                             ) : (
                               <FolderSearch aria-hidden="true" className="size-4" />
                             )}
-                          </button>
+                          </SettingsButton>
                         </div>
                       </label>
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
@@ -9353,7 +9362,7 @@ export function SettingsPanel({
                               </span>
                             </div>
                           </div>
-                          <button
+                          <SettingsButton
                             aria-label={t("Clear workspace icon")}
                             className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSavingWorkspaceLogo || !editingWorkspace?.logoUrl}
@@ -9369,9 +9378,9 @@ export function SettingsPanel({
                             ) : (
                               <Trash2 aria-hidden="true" className="size-4" />
                             )}
-                          </button>
+                          </SettingsButton>
                         </div>
-                        <input
+                        <SettingsInput
                           aria-label={t("Workspace icon file")}
                           accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
                           className="sr-only"
@@ -9379,7 +9388,7 @@ export function SettingsPanel({
                           ref={workspaceLogoInputRef}
                           type="file"
                         />
-                        <button
+                        <SettingsButton
                           aria-label={t("Upload icon")}
                           className="mt-2 inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                           disabled={isSavingWorkspaceLogo}
@@ -9389,13 +9398,13 @@ export function SettingsPanel({
                         >
                           <Upload aria-hidden="true" className="size-3.5" />
                           {t("Upload icon")}
-                        </button>
+                        </SettingsButton>
                       </div>
                       <label className="block">
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Terminal shell")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setWorkspaceForm((current) => ({
@@ -9410,14 +9419,14 @@ export function SettingsPanel({
                               {shell.label}
                             </option>
                           ))}
-                        </select>
+                        </SettingsSelect>
                       </label>
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-3">
                         <div className="mb-3 flex items-center justify-between gap-3">
                           <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Common commands")}
                           </span>
-                          <button
+                          <SettingsButton
                             aria-label={t("Add command")}
                             className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addWorkspaceCommonCommand}
@@ -9425,7 +9434,7 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Plus aria-hidden="true" className="size-4" />
-                          </button>
+                          </SettingsButton>
                         </div>
                         {workspaceForm.commonCommands.length ? (
                           <div className="space-y-2">
@@ -9438,7 +9447,7 @@ export function SettingsPanel({
                                 className="grid items-center gap-2 sm:grid-cols-[minmax(0,0.8fr)_minmax(0,1.4fr)_2.25rem]"
                                 key={index}
                               >
-                                <input
+                                <SettingsInput
                                   aria-label={t("Command name")}
                                   autoComplete="off"
                                   className="h-9 min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
@@ -9452,7 +9461,7 @@ export function SettingsPanel({
                                   placeholder={t("Command name")}
                                   value={command.name}
                                 />
-                                <input
+                                <SettingsInput
                                   aria-label={t("Command")}
                                   autoComplete="off"
                                   className="h-9 min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
@@ -9466,7 +9475,7 @@ export function SettingsPanel({
                                   placeholder="npm run dev"
                                   value={command.command}
                                 />
-                                <button
+                                <SettingsButton
                                   aria-label={t("Remove command {name}", {
                                     name: command.name || String(index + 1),
                                   })}
@@ -9476,7 +9485,7 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <Trash2 aria-hidden="true" className="size-4" />
-                                </button>
+                                </SettingsButton>
                               </div>
                             ))}
                           </div>
@@ -9486,7 +9495,7 @@ export function SettingsPanel({
                         <span className="text-sm font-semibold text-[var(--muted)]">
                           {t("Pinned workspace")}
                         </span>
-                        <input
+                        <SettingsInput
                           checked={workspaceForm.pinned}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -9506,7 +9515,7 @@ export function SettingsPanel({
                           />
                           <span className="truncate">{t("Enable Project Spec")}</span>
                         </span>
-                        <input
+                        <SettingsInput
                           checked={workspaceForm.specEnabled}
                           className="size-4 accent-[var(--accent)]"
                           disabled={
@@ -9525,7 +9534,7 @@ export function SettingsPanel({
                           type="checkbox"
                         />
                       </label>
-                      <button
+                      <SettingsButton
                         aria-label={t("Save workspace")}
                         className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
@@ -9544,7 +9553,7 @@ export function SettingsPanel({
                           <CheckCircle2 aria-hidden="true" className="size-4" />
                         )}
                         {t("Save")}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </form>
                 </>
@@ -9555,7 +9564,7 @@ export function SettingsPanel({
                   <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Workspace list")}
                   </h3>
-                  <button
+                  <SettingsButton
                     aria-label={t("Add workspace")}
                     className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                     onClick={onAddWorkspace}
@@ -9563,7 +9572,7 @@ export function SettingsPanel({
                     type="button"
                   >
                     <Plus aria-hidden="true" className="size-4" />
-                  </button>
+                  </SettingsButton>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
                   {orderedWorkspaces.length ? (
@@ -9635,7 +9644,7 @@ export function SettingsPanel({
                           </div>
                         </div>
                         <div className="flex gap-2 justify-end">
-                          <button
+                          <SettingsButton
                             aria-label={t(
                               workspace.pinned
                                 ? "Unpin workspace {name}"
@@ -9654,8 +9663,8 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Lock aria-hidden="true" className="size-4" />
-                          </button>
-                          <button
+                          </SettingsButton>
+                          <SettingsButton
                             aria-label={t("Delete workspace {name}", {
                               name: workspace.name,
                             })}
@@ -9670,8 +9679,8 @@ export function SettingsPanel({
                             ) : (
                               <Trash2 aria-hidden="true" className="size-4" />
                             )}
-                          </button>
-                          <button
+                          </SettingsButton>
+                          <SettingsButton
                             aria-label={t("Edit workspace {name}", {
                               name: workspace.name,
                             })}
@@ -9682,7 +9691,7 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Pencil aria-hidden="true" className="size-4" />
-                          </button>
+                          </SettingsButton>
                         </div>
                       </div>
                     ))
@@ -9698,7 +9707,7 @@ export function SettingsPanel({
 
           {activeSection === "workspaces" && pendingDeleteWorkspace ? (
             <>
-              <button
+              <SettingsButton
                 aria-label={t("Close workspace delete confirmation backdrop")}
                 className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                 onClick={() => setPendingDeleteWorkspace(null)}
@@ -9727,7 +9736,7 @@ export function SettingsPanel({
                       })}
                     </p>
                   </div>
-                  <button
+                  <SettingsButton
                     aria-label={t("Cancel workspace deletion")}
                     className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                     onClick={() => setPendingDeleteWorkspace(null)}
@@ -9735,17 +9744,17 @@ export function SettingsPanel({
                     type="button"
                   >
                     <X aria-hidden="true" className="size-4" />
-                  </button>
+                  </SettingsButton>
                 </div>
                 <div className="flex justify-end gap-2">
-                  <button
+                  <SettingsButton
                     className="inline-flex min-h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
                     onClick={() => setPendingDeleteWorkspace(null)}
                     type="button"
                   >
                     {t("Cancel")}
-                  </button>
-                  <button
+                  </SettingsButton>
+                  <SettingsButton
                     aria-label={t("Confirm delete workspace")}
                     className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--danger)] px-3 py-2 text-sm font-semibold text-white shadow-[0_12px_28px_rgba(190,18,60,0.22)] hover:bg-[var(--danger)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={deletingWorkspaceId === pendingDeleteWorkspace.id}
@@ -9758,7 +9767,7 @@ export function SettingsPanel({
                       <Trash2 aria-hidden="true" className="size-4" />
                     )}
                     <span>{t("Delete workspace")}</span>
-                  </button>
+                  </SettingsButton>
                 </div>
               </section>
             </>
@@ -9768,7 +9777,7 @@ export function SettingsPanel({
             <section className="grid gap-4">
               {hookRunDetail ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close hook run detail backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setHookRunDetail(null)}
@@ -9791,7 +9800,7 @@ export function SettingsPanel({
                           {hookRunDetail.id}
                         </div>
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close hook run detail")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setHookRunDetail(null)}
@@ -9799,7 +9808,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
                     <div className="grid gap-3">
                       <div className="grid gap-2 sm:grid-cols-3">
@@ -9841,7 +9850,7 @@ export function SettingsPanel({
 
               {isHookDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close hook configuration backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsHookDialogOpen(false)}
@@ -9866,7 +9875,7 @@ export function SettingsPanel({
                           {hookScope === "global" ? t("Global hooks") : selectedHookWorkspace?.name}
                         </div>
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close hook configuration")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsHookDialogOpen(false)}
@@ -9874,7 +9883,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
 
                     <div className="grid gap-3">
@@ -9883,7 +9892,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Event")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
@@ -9902,9 +9911,9 @@ export function SettingsPanel({
                                 {hookEventLabel(eventName, t)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
-                        <TextField
+                        <SettingsTextField
                           label={t("Matcher")}
                           onChange={(value) =>
                             setHookForm((current) => ({ ...current, matcher: value }))
@@ -9917,7 +9926,7 @@ export function SettingsPanel({
                         <span className="text-sm font-semibold text-[var(--muted)]">
                           {t("Enable hook")}
                         </span>
-                        <input
+                        <SettingsInput
                           checked={hookForm.enabled}
                           className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
@@ -9934,7 +9943,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Handler type")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
@@ -9949,9 +9958,9 @@ export function SettingsPanel({
                                 {hookHandlerTypeLabel(type, t)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
-                        <TextField
+                        <SettingsTextField
                           label={t("If filter")}
                           onChange={(value) =>
                             setHookForm((current) => ({ ...current, ifFilter: value }))
@@ -9963,7 +9972,7 @@ export function SettingsPanel({
 
                       {hookForm.type === "command" ? (
                         <>
-                          <TextField
+                          <SettingsTextField
                             label={t("Command")}
                             onChange={(value) =>
                               setHookForm((current) => ({ ...current, command: value }))
@@ -9972,7 +9981,7 @@ export function SettingsPanel({
                             value={hookForm.command}
                           />
                           <div className="grid gap-3 sm:grid-cols-2">
-                            <TextField
+                            <SettingsTextField
                               label={t("Shell")}
                               onChange={(value) =>
                                 setHookForm((current) => ({ ...current, shell: value }))
@@ -9980,7 +9989,7 @@ export function SettingsPanel({
                               placeholder="powershell"
                               value={hookForm.shell}
                             />
-                            <TextField
+                            <SettingsTextField
                               inputMode="numeric"
                               label={t("Timeout ms")}
                               onChange={(value) =>
@@ -9994,7 +10003,7 @@ export function SettingsPanel({
                             <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Args")}
                             </span>
-                            <textarea
+                            <SettingsTextArea
                               className="min-h-20 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setHookForm((current) => ({
@@ -10011,7 +10020,7 @@ export function SettingsPanel({
 
                       {hookForm.type === "http" ? (
                         <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem]">
-                          <TextField
+                          <SettingsTextField
                             label={t("URL")}
                             onChange={(value) =>
                               setHookForm((current) => ({ ...current, url: value }))
@@ -10019,7 +10028,7 @@ export function SettingsPanel({
                             placeholder="http://127.0.0.1:8787/hook"
                             value={hookForm.url}
                           />
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Timeout ms")}
                             onChange={(value) =>
@@ -10033,7 +10042,7 @@ export function SettingsPanel({
 
                       {hookForm.type === "mcp_tool" ? (
                         <div className="grid gap-3 sm:grid-cols-2">
-                          <TextField
+                          <SettingsTextField
                             label={t("MCP server id")}
                             onChange={(value) =>
                               setHookForm((current) => ({ ...current, serverId: value }))
@@ -10041,7 +10050,7 @@ export function SettingsPanel({
                             placeholder="server"
                             value={hookForm.serverId}
                           />
-                          <TextField
+                          <SettingsTextField
                             label={t("MCP tool name")}
                             onChange={(value) =>
                               setHookForm((current) => ({ ...current, toolName: value }))
@@ -10057,7 +10066,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Prompt")}
                           </span>
-                          <textarea
+                          <SettingsTextArea
                             className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
@@ -10072,7 +10081,7 @@ export function SettingsPanel({
                       ) : null}
 
                       <div className="grid gap-3 sm:grid-cols-2">
-                        <TextField
+                        <SettingsTextField
                           label={t("Status message")}
                           onChange={(value) =>
                             setHookForm((current) => ({
@@ -10083,7 +10092,7 @@ export function SettingsPanel({
                           placeholder={t("Running hook")}
                           value={hookForm.statusMessage}
                         />
-                        <TextField
+                        <SettingsTextField
                           inputMode="numeric"
                           label={t("Timeout ms")}
                           onChange={(value) =>
@@ -10098,7 +10107,7 @@ export function SettingsPanel({
                           <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Async")}
                           </span>
-                          <input
+                          <SettingsInput
                             checked={hookForm.asyncHook}
                             className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
@@ -10114,7 +10123,7 @@ export function SettingsPanel({
                           <span className="text-sm font-semibold text-[var(--muted)]">
                             {t("Async re-wake")}
                           </span>
-                          <input
+                          <SettingsInput
                             checked={hookForm.asyncRewake}
                             className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
@@ -10131,7 +10140,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Input override JSON")}
                         </span>
-                        <textarea
+                        <SettingsTextArea
                           className="min-h-20 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setHookForm((current) => ({
@@ -10143,7 +10152,7 @@ export function SettingsPanel({
                           value={hookForm.inputText}
                         />
                       </label>
-                      <button
+                      <SettingsButton
                         aria-label={t("Save hook")}
                         className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isSavingHooks || !hookForm.event || !hookForm.type}
@@ -10156,7 +10165,7 @@ export function SettingsPanel({
                           <CheckCircle2 aria-hidden="true" className="size-4" />
                         )}
                         {t("Save")}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </form>
                 </>
@@ -10166,7 +10175,7 @@ export function SettingsPanel({
                 <div className="grid gap-3 lg:grid-cols-[auto_minmax(0,1fr)_auto]">
                   <div className="inline-flex h-10 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-1">
                     {(["global", "workspace"] as HookScope[]).map((scope) => (
-                      <button
+                      <SettingsButton
                         className={`rounded-md px-3 text-sm font-semibold ${hookScope === scope
                             ? "bg-[var(--surface)] text-[var(--accent-soft-foreground)] shadow-sm"
                             : "text-[var(--muted)] hover:text-[var(--foreground)]"
@@ -10176,12 +10185,12 @@ export function SettingsPanel({
                         type="button"
                       >
                         {scope === "global" ? t("Global") : t("Workspace")}
-                      </button>
+                      </SettingsButton>
                     ))}
                   </div>
                   <label className="min-w-0">
                     <span className="sr-only">{t("Workspace")}</span>
-                    <select
+                    <SettingsSelect
                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                       onChange={(event) => {
                         setHookWorkspaceId(event.target.value);
@@ -10194,10 +10203,10 @@ export function SettingsPanel({
                           {workspace.name}
                         </option>
                       ))}
-                    </select>
+                    </SettingsSelect>
                   </label>
                   <div className="flex gap-2">
-                    <button
+                    <SettingsButton
                       aria-label={t("Add hook")}
                       className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={!hookSettings}
@@ -10206,8 +10215,8 @@ export function SettingsPanel({
                       type="button"
                     >
                       <Plus aria-hidden="true" className="size-4" />
-                    </button>
-                    <button
+                    </SettingsButton>
+                    <SettingsButton
                       aria-label={t("Reload hooks")}
                       className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                       disabled={isLoadingHooks || !selectedHookWorkspace}
@@ -10224,7 +10233,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="mt-3 break-all rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
@@ -10234,7 +10243,7 @@ export function SettingsPanel({
                   <span className="text-sm font-semibold text-[var(--muted)]">
                     {t("Disable all hooks")}
                   </span>
-                  <input
+                  <SettingsInput
                     checked={Boolean(activeHookConfig?.disableAllHooks)}
                     className="size-4 accent-[var(--accent)]"
                     disabled={isSavingHooks || !activeHookConfig}
@@ -10251,7 +10260,7 @@ export function SettingsPanel({
                   <span className="text-sm font-semibold text-[var(--muted)]">
                     {t("Record hook run logs")}
                   </span>
-                  <input
+                  <SettingsInput
                     checked={generalForm.hookAuditEnabled}
                     className="size-4 accent-[var(--accent)]"
                     disabled={isSavingGeneral || !settings}
@@ -10295,7 +10304,7 @@ export function SettingsPanel({
                             </div>
                           </div>
                           <div className="flex flex-wrap gap-2">
-                            <button
+                            <SettingsButton
                               aria-label={t("Move hook up")}
                               className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={entry.groupIndex === 0 || isSavingHooks}
@@ -10304,8 +10313,8 @@ export function SettingsPanel({
                               type="button"
                             >
                               <ArrowUp aria-hidden="true" className="size-4" />
-                            </button>
-                            <button
+                            </SettingsButton>
+                            <SettingsButton
                               aria-label={t("Move hook down")}
                               className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={
@@ -10318,9 +10327,9 @@ export function SettingsPanel({
                               type="button"
                             >
                               <ArrowDown aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                             <label className="relative inline-flex cursor-pointer items-center">
-                              <input
+                              <SettingsInput
                                 aria-label={t("Enable hook group")}
                                 checked={entry.group.enabled !== false}
                                 className="peer sr-only"
@@ -10366,7 +10375,7 @@ export function SettingsPanel({
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-2">
-                                <button
+                                <SettingsButton
                                   aria-label={t("Move handler up")}
                                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={handlerIndex === 0 || isSavingHooks}
@@ -10382,8 +10391,8 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <ArrowUp aria-hidden="true" className="size-4" />
-                                </button>
-                                <button
+                                </SettingsButton>
+                                <SettingsButton
                                   aria-label={t("Move handler down")}
                                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={
@@ -10402,8 +10411,8 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <ArrowDown aria-hidden="true" className="size-4" />
-                                </button>
-                                <button
+                                </SettingsButton>
+                                <SettingsButton
                                   aria-label={t("Edit hook")}
                                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onClick={() =>
@@ -10419,8 +10428,8 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <Pencil aria-hidden="true" className="size-4" />
-                                </button>
-                                <button
+                                </SettingsButton>
+                                <SettingsButton
                                   aria-label={t("Delete hook")}
                                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                   disabled={isSavingHooks}
@@ -10435,9 +10444,9 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <Trash2 aria-hidden="true" className="size-4" />
-                                </button>
+                                </SettingsButton>
                                 <label className="relative inline-flex cursor-pointer items-center">
-                                  <input
+                                  <SettingsInput
                                     aria-label={t("Enable hook")}
                                     checked={handler.enabled !== false}
                                     className="peer sr-only"
@@ -10476,7 +10485,7 @@ export function SettingsPanel({
                       {t("Import Claude hooks")}
                     </h3>
                     <div className="flex gap-2">
-                      <button
+                      <SettingsButton
                         aria-label={t("Import to global hooks")}
                         className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                         disabled={isImportingHooks}
@@ -10490,8 +10499,8 @@ export function SettingsPanel({
                           <Globe aria-hidden="true" className="size-4" />
                         )}
                         {t("Global")}
-                      </button>
-                      <button
+                      </SettingsButton>
+                      <SettingsButton
                         aria-label={t("Import to workspace hooks")}
                         className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                         disabled={isImportingHooks || !selectedHookWorkspace}
@@ -10501,7 +10510,7 @@ export function SettingsPanel({
                       >
                         <Folder aria-hidden="true" className="size-4" />
                         {t("Workspace")}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </div>
                   <p className="mt-2 text-xs text-[var(--muted)]">
@@ -10553,7 +10562,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Event")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) => setHookTestEvent(event.target.value)}
                           value={hookTestEvent}
@@ -10563,9 +10572,9 @@ export function SettingsPanel({
                               {hookEventLabel(eventName, t)}
                             </option>
                           ))}
-                        </select>
+                        </SettingsSelect>
                       </label>
-                      <TextField
+                      <SettingsTextField
                         label={t("Match value")}
                         onChange={setHookTestMatcher}
                         placeholder="run_command"
@@ -10576,13 +10585,13 @@ export function SettingsPanel({
                       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                         {t("Sample payload")}
                       </span>
-                      <textarea
+                      <SettingsTextArea
                         className="min-h-28 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                         onChange={(event) => setHookTestPayload(event.target.value)}
                         value={hookTestPayload}
                       />
                     </label>
-                    <button
+                    <SettingsButton
                       aria-label={t("Run hook test")}
                       className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={isTestingHooks || !selectedHookWorkspace}
@@ -10595,7 +10604,7 @@ export function SettingsPanel({
                         <CheckCircle2 aria-hidden="true" className="size-4" />
                       )}
                       {t("Run")}
-                    </button>
+                    </SettingsButton>
                   </div>
                   {hookTestResult ? (
                     <pre className="mt-3 max-h-48 overflow-auto rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-2 text-xs text-[var(--muted)]">
@@ -10673,7 +10682,7 @@ export function SettingsPanel({
                   <h3 className="text-sm font-semibold text-[var(--foreground)]">
                     {t("Recent hook runs")}
                   </h3>
-                  <button
+                  <SettingsButton
                     aria-label={t("Refresh hook runs")}
                     className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                     disabled={isRefreshingHookRuns || !selectedHookWorkspace}
@@ -10686,12 +10695,12 @@ export function SettingsPanel({
                     ) : (
                       <RefreshCw aria-hidden="true" className="size-4" />
                     )}
-                  </button>
+                  </SettingsButton>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
                   {hookSettings?.recentRuns.length ? (
                     hookSettings.recentRuns.map((run) => (
-                      <button
+                      <SettingsButton
                         className="grid w-full gap-3 px-4 py-3 text-left hover:bg-[var(--surface-secondary)] md:grid-cols-[minmax(0,1fr)_auto]"
                         key={run.id}
                         onClick={() => void openHookRunDetail(run.id)}
@@ -10716,7 +10725,7 @@ export function SettingsPanel({
                           </span>
                         </span>
                         <span className="text-xs text-[var(--muted)]">{run.startedAt}</span>
-                      </button>
+                      </SettingsButton>
                     ))
                   ) : (
                     <div className="px-4 py-6 text-sm text-[var(--muted)]">
@@ -10732,7 +10741,7 @@ export function SettingsPanel({
             <section className="grid gap-4">
               {isProviderDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close provider configuration backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={closeProviderDialog}
@@ -10758,7 +10767,7 @@ export function SettingsPanel({
                         ) : null}
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        <button
+                        <SettingsButton
                           aria-label={t("Close provider configuration")}
                           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={closeProviderDialog}
@@ -10766,7 +10775,7 @@ export function SettingsPanel({
                           type="button"
                         >
                           <X aria-hidden="true" className="size-4" />
-                        </button>
+                        </SettingsButton>
                       </div>
                     </div>
                     <div className="grid gap-4 lg:grid-cols-[13rem_minmax(0,1fr)]">
@@ -10776,7 +10785,7 @@ export function SettingsPanel({
                           </div>
                           <div className="min-h-0 flex-1 space-y-1 overflow-y-auto pr-1">
                             {providerServices.map((service) => (
-                              <button
+                              <SettingsButton
                                 aria-pressed={selectedProviderServiceId === service.id}
                                 className={`flex min-h-9 w-full items-center justify-between gap-2 rounded-lg px-2 py-2 text-left text-sm font-semibold transition ${selectedProviderServiceId === service.id
                                     ? "bg-[var(--accent)] text-white"
@@ -10795,12 +10804,12 @@ export function SettingsPanel({
                                 >
                                   {formatNumber(service.kindIds.length, language)}
                                 </span>
-                              </button>
+                              </SettingsButton>
                             ))}
                           </div>
                         </div>
                       <div className="space-y-3">
-                      <TextField
+                      <SettingsTextField
                         label={t("Name")}
                         onChange={(value) =>
                           setProviderForm((current) => ({
@@ -10815,7 +10824,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Protocol")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             updateProviderProtocol(event.target.value)
@@ -10827,9 +10836,9 @@ export function SettingsPanel({
                               {kind.label}
                             </option>
                           ))}
-                        </select>
+                        </SettingsSelect>
                       </label>
-                      <TextField
+                      <SettingsTextField
                         label={t("Base URL")}
                         onChange={(value) =>
                           setProviderForm((current) => ({
@@ -10852,7 +10861,7 @@ export function SettingsPanel({
                           {t("API key")}
                         </span>
                         <span className="relative block">
-                          <input
+                          <SettingsInput
                             autoComplete="off"
                             className={`h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 ${hasProviderKeyClearButton ? "pr-20" : "pr-11"} text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]`}
                             name="api-key"
@@ -10871,7 +10880,7 @@ export function SettingsPanel({
                             type={isProviderApiKeyVisible ? "text" : "password"}
                             value={providerForm.apiKey}
                           />
-                          <button
+                          <SettingsButton
                             aria-label={
                               isProviderApiKeyVisible
                                 ? t("Hide API key")
@@ -10894,9 +10903,9 @@ export function SettingsPanel({
                             ) : (
                               <Eye aria-hidden="true" className="size-4" />
                             )}
-                          </button>
+                          </SettingsButton>
                           {hasProviderKeyClearButton ? (
-                            <button
+                            <SettingsButton
                               aria-label={t("Clear saved API key")}
                               className={`absolute right-1 top-1 inline-flex size-8 items-center justify-center rounded-md ${providerForm.clearApiKey
                                   ? "bg-[var(--danger-soft)] text-[var(--danger)]"
@@ -10913,7 +10922,7 @@ export function SettingsPanel({
                               type="button"
                             >
                               <X aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                           ) : null}
                         </span>
                       </label>
@@ -10936,7 +10945,7 @@ export function SettingsPanel({
                         </div>
                         <div className="mt-3 grid gap-3">
                           <label className="inline-flex items-center gap-2 text-sm font-semibold text-[var(--muted)]">
-                            <input
+                            <SettingsInput
                               aria-label={t("Auto sync provider models")}
                               checked={providerForm.autoSyncModels}
                               className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
@@ -10950,7 +10959,7 @@ export function SettingsPanel({
                             />
                             {t("Auto sync provider models")}
                           </label>
-                          <TextField
+                          <SettingsTextField
                             label={t("Model sync filter regex")}
                             onChange={(value) =>
                               setProviderForm((current) => ({
@@ -10989,7 +10998,7 @@ export function SettingsPanel({
                         ) : null}
                         <div className="mt-3 grid gap-3">
                           <label className="inline-flex items-center gap-2 text-sm font-semibold text-[var(--muted)]">
-                            <input
+                            <SettingsInput
                               aria-label={t("Enable AI API proxy")}
                               checked={providerForm.apiProxyEnabled}
                               className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
@@ -11009,7 +11018,7 @@ export function SettingsPanel({
                               <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                 {t("Proxy type")}
                               </span>
-                              <select
+                              <SettingsSelect
                                 className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                 disabled={providerUsesWebsocket}
                                 onChange={(event) =>
@@ -11028,9 +11037,9 @@ export function SettingsPanel({
                                     {proxyType.label}
                                   </option>
                                 ))}
-                              </select>
+                              </SettingsSelect>
                             </label>
-                            <TextField
+                            <SettingsTextField
                               disabled={providerUsesWebsocket}
                               label={t("Proxy server")}
                               onChange={(value) =>
@@ -11053,14 +11062,14 @@ export function SettingsPanel({
                               {t("Model redirects")}
                             </h4>
                           </div>
-                          <button
+                          <SettingsButton
                             className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addProviderModelRedirect}
                             type="button"
                           >
                             <Plus aria-hidden="true" className="size-3.5" />
                             {t("Add redirect")}
-                          </button>
+                          </SettingsButton>
                         </div>
                         <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
                           {t("Expose provider model IDs under local model IDs.")}
@@ -11073,7 +11082,7 @@ export function SettingsPanel({
                                 key={redirectIndex}
                               >
                                 <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_2.5rem]">
-                                  <TextField
+                                  <SettingsTextField
                                     label={t("Upstream model")}
                                     onChange={(value) =>
                                       updateProviderModelRedirect(redirectIndex, { from: value })
@@ -11081,7 +11090,7 @@ export function SettingsPanel({
                                     placeholder="qwen/qwen3.6-35b-a3b"
                                     value={redirect.from}
                                   />
-                                  <TextField
+                                  <SettingsTextField
                                     label={t("Local model")}
                                     onChange={(value) =>
                                       updateProviderModelRedirect(redirectIndex, { to: value })
@@ -11089,7 +11098,7 @@ export function SettingsPanel({
                                     placeholder="qwen3.6-35b-a3b"
                                     value={redirect.to}
                                   />
-                                  <button
+                                  <SettingsButton
                                     aria-label={t("Delete redirect")}
                                     className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                                     onClick={() => deleteProviderModelRedirect(redirectIndex)}
@@ -11097,7 +11106,7 @@ export function SettingsPanel({
                                     type="button"
                                   >
                                     <Trash2 aria-hidden="true" className="size-4" />
-                                  </button>
+                                  </SettingsButton>
                                 </div>
                               </div>
                             ))
@@ -11116,14 +11125,14 @@ export function SettingsPanel({
                               {t("Request overrides")}
                             </h4>
                           </div>
-                          <button
+                          <SettingsButton
                             className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                             onClick={addProviderRequestOverride}
                             type="button"
                           >
                             <Plus aria-hidden="true" className="size-3.5" />
                             {t("Add override")}
-                          </button>
+                          </SettingsButton>
                         </div>
                         <p className="mt-2 text-xs leading-5 text-[var(--muted)]">
                           {t("Override request headers or body field paths for this provider.")}
@@ -11140,7 +11149,7 @@ export function SettingsPanel({
                                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Target")}
                                     </span>
-                                    <select
+                                    <SettingsSelect
                                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                       onChange={(event) =>
                                         updateProviderRequestOverride(overrideIndex, {
@@ -11151,9 +11160,9 @@ export function SettingsPanel({
                                     >
                                       <option value="header">{t("Header")}</option>
                                       <option value="body">{t("Body")}</option>
-                                    </select>
+                                    </SettingsSelect>
                                   </label>
-                                  <TextField
+                                  <SettingsTextField
                                     label={t("Field")}
                                     onChange={(value) =>
                                       updateProviderRequestOverride(overrideIndex, { name: value })
@@ -11165,7 +11174,7 @@ export function SettingsPanel({
                                     <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                       {t("Value type")}
                                     </span>
-                                    <select
+                                    <SettingsSelect
                                       className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                       onChange={(event) =>
                                         updateProviderRequestOverride(overrideIndex, {
@@ -11177,14 +11186,14 @@ export function SettingsPanel({
                                       <option value="string">{t("String")}</option>
                                       <option value="number">{t("Number")}</option>
                                       <option value="boolean">{t("Boolean")}</option>
-                                    </select>
+                                    </SettingsSelect>
                                   </label>
                                   {overrideRule.valueType === "boolean" ? (
                                     <label className="block">
                                       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                                         {t("Value")}
                                       </span>
-                                      <select
+                                      <SettingsSelect
                                         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                                         onChange={(event) =>
                                           updateProviderRequestOverride(overrideIndex, {
@@ -11195,10 +11204,10 @@ export function SettingsPanel({
                                       >
                                         <option value="true">true</option>
                                         <option value="false">false</option>
-                                      </select>
+                                      </SettingsSelect>
                                     </label>
                                   ) : (
-                                    <TextField
+                                    <SettingsTextField
                                       label={t("Value")}
                                       onChange={(value) =>
                                         updateProviderRequestOverride(overrideIndex, { value })
@@ -11213,7 +11222,7 @@ export function SettingsPanel({
                                       value={String(overrideRule.value)}
                                     />
                                   )}
-                                  <button
+                                  <SettingsButton
                                     aria-label={t("Delete override")}
                                     className="mt-6 inline-flex size-10 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] hover:bg-[var(--danger-soft)]"
                                     onClick={() => deleteProviderRequestOverride(overrideIndex)}
@@ -11221,7 +11230,7 @@ export function SettingsPanel({
                                     type="button"
                                   >
                                     <Trash2 aria-hidden="true" className="size-4" />
-                                  </button>
+                                  </SettingsButton>
                                 </div>
                               </div>
                             ))
@@ -11232,7 +11241,7 @@ export function SettingsPanel({
                           )}
                         </div>
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Save provider")}
                         className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
@@ -11263,7 +11272,7 @@ export function SettingsPanel({
                           <KeyRound aria-hidden="true" className="size-4" />
                         )}
                         <span>{t("Save provider")}</span>
-                      </button>
+                      </SettingsButton>
                     </div>
                     </div>
                   </form>
@@ -11276,7 +11285,7 @@ export function SettingsPanel({
                     {t("Configured providers")}
                   </h3>
                   <div className="flex gap-2">
-                    <button
+                    <SettingsButton
                       aria-label={t("Add provider")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingProvider}
@@ -11284,8 +11293,8 @@ export function SettingsPanel({
                       type="button"
                     >
                       <Plus aria-hidden="true" className="size-4" />
-                    </button>
-                    <button
+                    </SettingsButton>
+                    <SettingsButton
                       aria-label={t("Refresh provider models")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       disabled={isLoadingSettings || isRefreshingProviderModels}
@@ -11301,7 +11310,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
@@ -11321,7 +11330,7 @@ export function SettingsPanel({
                       return (
                         <div className="px-4 py-3" key={provider.id}>
                           <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
-                            <button
+                            <SettingsButton
                               aria-expanded={isExpanded}
                               aria-label={
                                 isExpanded
@@ -11396,13 +11405,13 @@ export function SettingsPanel({
                                   </div>
                                 ) : null}
                               </div>
-                            </button>
+                            </SettingsButton>
                             <div className="flex flex-wrap items-center justify-end gap-2 md:self-start">
                               <label
                                 className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
                                 title={providerToggleLabel}
                               >
-                                <input
+                                <SettingsInput
                                   aria-label={providerToggleLabel}
                                   checked={provider.enabled}
                                   className="peer sr-only"
@@ -11419,7 +11428,7 @@ export function SettingsPanel({
                                 <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
                                 <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                               </label>
-                              <button
+                              <SettingsButton
                                 aria-label={t("Edit provider {name}", {
                                   name: provider.name,
                                 })}
@@ -11430,8 +11439,8 @@ export function SettingsPanel({
                                 type="button"
                               >
                                 <SlidersHorizontal aria-hidden="true" className="size-4" />
-                              </button>
-                              <button
+                              </SettingsButton>
+                              <SettingsButton
                                 aria-label={t("Test provider {name}", {
                                   name: provider.name,
                                 })}
@@ -11449,8 +11458,8 @@ export function SettingsPanel({
                                 ) : (
                                   <PlugZap aria-hidden="true" className="size-4" />
                                 )}
-                              </button>
-                              <button
+                              </SettingsButton>
+                              <SettingsButton
                                 aria-label={providerDeleteLabel}
                                 className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                                 disabled={isProviderOperationPending}
@@ -11466,7 +11475,7 @@ export function SettingsPanel({
                                 ) : (
                                   <Trash2 aria-hidden="true" className="size-4" />
                                 )}
-                              </button>
+                              </SettingsButton>
                             </div>
                           </div>
                           {isExpanded ? (
@@ -11550,7 +11559,7 @@ export function SettingsPanel({
             <section className="grid gap-4">
               {isMcpDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close MCP server configuration backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsMcpDialogOpen(false)}
@@ -11577,7 +11586,7 @@ export function SettingsPanel({
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         <label className="relative inline-flex cursor-pointer items-center">
-                          <input
+                          <SettingsInput
                             aria-label={t("Enable MCP server")}
                             checked={mcpForm.enabled}
                             className="peer sr-only"
@@ -11593,7 +11602,7 @@ export function SettingsPanel({
                           <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
                         </label>
                         {mcpForm.id ? (
-                          <button
+                          <SettingsButton
                             aria-label={t("Delete MCP server")}
                             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                             disabled={isSavingMcpServer}
@@ -11602,9 +11611,9 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Trash2 aria-hidden="true" className="size-4" />
-                          </button>
+                          </SettingsButton>
                         ) : null}
-                        <button
+                        <SettingsButton
                           aria-label={t("Close MCP server configuration")}
                           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                           onClick={() => setIsMcpDialogOpen(false)}
@@ -11612,11 +11621,11 @@ export function SettingsPanel({
                           type="button"
                         >
                           <X aria-hidden="true" className="size-4" />
-                        </button>
+                        </SettingsButton>
                       </div>
                     </div>
                     <div className="space-y-3">
-                      <TextField
+                      <SettingsTextField
                         label={t("Name")}
                         onChange={(value) =>
                           setMcpForm((current) => ({
@@ -11631,7 +11640,7 @@ export function SettingsPanel({
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Transport")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setMcpForm((current) => ({
@@ -11649,13 +11658,13 @@ export function SettingsPanel({
                               {t(transport.label)}
                             </option>
                           ))}
-                        </select>
+                        </SettingsSelect>
                       </label>
                       <label className="block">
                         <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                           {t("Execution host")}
                         </span>
-                        <select
+                        <SettingsSelect
                           className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           onChange={(event) =>
                             setMcpForm((current) => ({
@@ -11668,10 +11677,10 @@ export function SettingsPanel({
                           <option value="auto">{t("Auto")}</option>
                           <option value="local">{t("Local")}</option>
                           <option value="workspace">{t("Workspace")}</option>
-                        </select>
+                        </SettingsSelect>
                       </label>
                       {mcpForm.transport === "streamable-http" ? (
-                        <TextField
+                        <SettingsTextField
                           label={t("URL")}
                           onChange={(value) =>
                             setMcpForm((current) => ({
@@ -11684,7 +11693,7 @@ export function SettingsPanel({
                         />
                       ) : (
                         <>
-                          <TextField
+                          <SettingsTextField
                             label={t("Command")}
                             onChange={(value) =>
                               setMcpForm((current) => ({
@@ -11699,7 +11708,7 @@ export function SettingsPanel({
                             <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Args")}
                             </span>
-                            <textarea
+                            <SettingsTextArea
                               className="min-h-24 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) =>
                                 setMcpForm((current) => ({
@@ -11713,7 +11722,7 @@ export function SettingsPanel({
                           </label>
                         </>
                       )}
-                      <button
+                      <SettingsButton
                         aria-label={t("Save MCP server")}
                         className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
@@ -11737,7 +11746,7 @@ export function SettingsPanel({
                         ) : (
                           <Terminal aria-hidden="true" className="size-4" />
                         )}
-                      </button>
+                      </SettingsButton>
                     </div>
                   </form>
                 </>
@@ -11749,7 +11758,7 @@ export function SettingsPanel({
                     {t("MCP servers")}
                   </h3>
                   <div className="flex gap-2">
-                    <button
+                    <SettingsButton
                       aria-label={t("Add MCP server")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingMcpServer}
@@ -11757,8 +11766,8 @@ export function SettingsPanel({
                       type="button"
                     >
                       <Plus aria-hidden="true" className="size-4" />
-                    </button>
-                    <button
+                    </SettingsButton>
+                    <SettingsButton
                       aria-label={t("Reload MCP settings")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       disabled={isLoadingSettings}
@@ -11774,7 +11783,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
@@ -11812,7 +11821,7 @@ export function SettingsPanel({
                             </div>
                           </div>
                           <div className="flex flex-wrap gap-2">
-                            <button
+                            <SettingsButton
                               aria-label={t("Edit MCP server {name}", {
                                 name: server.name,
                               })}
@@ -11822,7 +11831,7 @@ export function SettingsPanel({
                               type="button"
                             >
                               <SlidersHorizontal aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                           </div>
                         </div>
                         {server.error ? (
@@ -11850,7 +11859,7 @@ export function SettingsPanel({
                   <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                     {t("Skill translation model")}
                   </span>
-                  <select
+                  <SettingsSelect
                     aria-label={t("Skill translation model")}
                     className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                     disabled={isSavingSkills}
@@ -11863,7 +11872,7 @@ export function SettingsPanel({
                         {model.displayName}
                       </option>
                     ))}
-                  </select>
+                  </SettingsSelect>
                 </label>
               </section>
 
@@ -11874,7 +11883,7 @@ export function SettingsPanel({
                   </h3>
                   <div className="flex items-center gap-2">
                     {updateableStoreSkills.length ? (
-                      <button
+                      <SettingsButton
                         aria-label={t("Update all store skills")}
                         className="inline-flex h-9 items-center justify-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                         disabled={
@@ -11894,7 +11903,7 @@ export function SettingsPanel({
                         <span>
                           {isUpdatingAllSkills ? t("Updating…") : t("Update all store skills")}
                         </span>
-                      </button>
+                      </SettingsButton>
                     ) : null}
                     <CapabilityPill
                       label={t("skills {count}", {
@@ -11902,7 +11911,7 @@ export function SettingsPanel({
                       })}
                       ok={detectedSkillRows.length > 0}
                     />
-                    <button
+                    <SettingsButton
                       aria-label={t("Refresh skill discovery")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                       disabled={
@@ -11917,7 +11926,7 @@ export function SettingsPanel({
                       ) : (
                         <RefreshCw aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
@@ -11967,7 +11976,7 @@ export function SettingsPanel({
                             </div>
                             <div className="flex items-center gap-2 justify-self-start md:justify-self-end">
                               {!isRemoteSkill && isStoreUpdateable ? (
-                                <button
+                                <SettingsButton
                                     aria-label={t("Update skill {name}", { name: skill.name })}
                                     className="inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     disabled={
@@ -11986,9 +11995,9 @@ export function SettingsPanel({
                                       <RefreshCw aria-hidden="true" className="size-4" />
                                     )}
                                     <span>{isUpdatingSkill ? t("Updating…") : t("Update skill")}</span>
-                                </button>
+                                </SettingsButton>
                               ) : null}
-                                <button
+                                <SettingsButton
                                   aria-label={t("Delete skill {name}", { name: skill.name })}
                                   className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                   disabled={
@@ -12008,9 +12017,9 @@ export function SettingsPanel({
                                   type="button"
                                 >
                                   <Trash2 aria-hidden="true" className="size-4" />
-                                </button>
+                                </SettingsButton>
                                 <label className="relative inline-flex cursor-pointer items-center">
-                                  <input
+                                  <SettingsInput
                                     aria-label={t("Enable skill {name}", {
                                       name: skill.name,
                                     })}
@@ -12077,13 +12086,13 @@ export function SettingsPanel({
                               <span className="font-medium">{catalog.workspace.name}</span>
                               {serverLabel ? ` · ${serverLabel}` : null}: {message}
                             </div>
-                            <button
+                            <SettingsButton
                               className="inline-flex h-8 shrink-0 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
                               onClick={() => retryRemoteWorkspaceSkillCatalog(catalog.workspace.id)}
                               type="button"
                             >
                               {t("Retry")}
-                            </button>
+                            </SettingsButton>
                           </div>
                         );
                       })}
@@ -12107,7 +12116,7 @@ export function SettingsPanel({
                       >
                         <span className="min-w-0 break-all">{location.path}</span>
                         <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                          <input
+                          <SettingsInput
                             aria-label={t("Enable skill location {path}", {
                               path: location.path,
                             })}
@@ -12163,7 +12172,7 @@ export function SettingsPanel({
                     {t("Models")}
                   </h3>
                   <div className="flex gap-2">
-                    <button
+                    <SettingsButton
                       aria-label={t("Add model")}
                       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                       onClick={startAddingModel}
@@ -12171,7 +12180,7 @@ export function SettingsPanel({
                       type="button"
                     >
                       <Plus aria-hidden="true" className="size-4" />
-                    </button>
+                    </SettingsButton>
                   </div>
                 </div>
                 <div className="divide-y divide-[var(--border)]">
@@ -12250,7 +12259,7 @@ export function SettingsPanel({
                                   })
                             }
                           >
-                            <input
+                            <SettingsInput
                               aria-label={
                                 model.enabled
                                   ? t("Disable model {name}", {
@@ -12274,7 +12283,7 @@ export function SettingsPanel({
                             <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
                             <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
                           </label>
-                          <button
+                          <SettingsButton
                             aria-label={t("Test model {name}", {
                               name: model.displayName,
                             })}
@@ -12289,8 +12298,8 @@ export function SettingsPanel({
                             ) : (
                               <RadioTower aria-hidden="true" className="size-4" />
                             )}
-                          </button>
-                          <button
+                          </SettingsButton>
+                          <SettingsButton
                             aria-label={t("Edit model {name}", {
                               name: model.displayName,
                             })}
@@ -12300,8 +12309,8 @@ export function SettingsPanel({
                             type="button"
                           >
                             <SlidersHorizontal aria-hidden="true" className="size-4" />
-                          </button>
-                          <button
+                          </SettingsButton>
+                          <SettingsButton
                             aria-label={t("Delete model {name}", {
                               name: model.displayName,
                             })}
@@ -12312,7 +12321,7 @@ export function SettingsPanel({
                             type="button"
                           >
                             <Trash2 aria-hidden="true" className="size-4" />
-                          </button>
+                          </SettingsButton>
                         </div>
                       </div>
                     ))
@@ -12326,7 +12335,7 @@ export function SettingsPanel({
 
               {isModelDialogOpen ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close model configuration backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setIsModelDialogOpen(false)}
@@ -12354,7 +12363,7 @@ export function SettingsPanel({
                           </div>
                         ) : null}
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close model configuration")}
                         className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setIsModelDialogOpen(false)}
@@ -12362,7 +12371,7 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
 
                     <div className="grid gap-4 lg:grid-cols-[minmax(0,1.05fr)_minmax(20rem,0.95fr)]">
@@ -12372,7 +12381,7 @@ export function SettingsPanel({
                             <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Model developer")}
                             </span>
-                            <select
+                            <SettingsSelect
                               className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                               onChange={(event) => selectModelDeveloper(event.target.value)}
                               value={selectedModelDeveloper}
@@ -12383,13 +12392,13 @@ export function SettingsPanel({
                                   {developer}
                                 </option>
                               ))}
-                            </select>
+                            </SettingsSelect>
                           </label>
                           <label className="block">
                             <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                               {t("Model id")}
                             </span>
-                            <select
+                            <SettingsSelect
                               className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                               disabled={!modelIdOptions.length && !editingModel}
                               onChange={(event) => updateModelId(event.target.value)}
@@ -12408,7 +12417,7 @@ export function SettingsPanel({
                                 ) ? (
                                 <option value={form.modelId}>{form.modelId}</option>
                               ) : null}
-                            </select>
+                            </SettingsSelect>
                           </label>
                         </div>
 
@@ -12418,7 +12427,7 @@ export function SettingsPanel({
                           </div>
                         ) : null}
 
-                        <TextField
+                        <SettingsTextField
                           label={t("Display name")}
                           onChange={(value) =>
                             setForm((current) => ({
@@ -12431,7 +12440,7 @@ export function SettingsPanel({
                         />
 
                         <div className="grid gap-3 sm:grid-cols-2">
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Context window")}
                             onChange={(value) =>
@@ -12443,7 +12452,7 @@ export function SettingsPanel({
                             placeholder="128000"
                             value={form.contextWindow}
                           />
-                          <TextField
+                          <SettingsTextField
                             inputMode="numeric"
                             label={t("Max output tokens")}
                             onChange={(value) =>
@@ -12469,7 +12478,7 @@ export function SettingsPanel({
                                   key={modality}
                                 >
                                   <span>{t(modality)}</span>
-                                  <input
+                                  <SettingsInput
                                     checked={form.inputModalities.includes(modality)}
                                     className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
@@ -12496,7 +12505,7 @@ export function SettingsPanel({
                                   key={modality}
                                 >
                                   <span>{t(modality)}</span>
-                                  <input
+                                  <SettingsInput
                                     checked={form.outputModalities.includes(modality)}
                                     className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
@@ -12536,7 +12545,7 @@ export function SettingsPanel({
                             <div className="text-xs font-semibold text-[var(--muted)]">
                               {t("Providers")}
                             </div>
-                            <button
+                            <SettingsButton
                               aria-label={t("Add provider")}
                               className="inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                               onClick={startAddingProviderFromModel}
@@ -12544,7 +12553,7 @@ export function SettingsPanel({
                               type="button"
                             >
                               <Plus aria-hidden="true" className="size-4" />
-                            </button>
+                            </SettingsButton>
                           </div>
                           <div className="panel-scroll max-h-56 space-y-2 overflow-y-auto pr-1">
                             {providers.length ? (
@@ -12567,7 +12576,7 @@ export function SettingsPanel({
                                           : t("Model not supported")}
                                       </span>
                                     </span>
-                                    <input
+                                    <SettingsInput
                                       aria-label={provider.name}
                                       checked={selectedProviderIds.has(provider.id)}
                                       className="size-4 accent-[var(--accent)] disabled:cursor-not-allowed"
@@ -12584,14 +12593,14 @@ export function SettingsPanel({
                                 );
                               })
                             ) : (
-                              <button
+                              <SettingsButton
                                 className="flex w-full items-center justify-between rounded-lg border border-dashed border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-left text-sm text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                 onClick={startAddingProviderFromModel}
                                 type="button"
                               >
                                 <span>{t("No providers")}</span>
                                 <Plus aria-hidden="true" className="size-4" />
-                              </button>
+                              </SettingsButton>
                             )}
                           </div>
                         </div>
@@ -12600,7 +12609,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Active provider")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                             disabled={!modelProviderIds.length}
                             onChange={(event) =>
@@ -12623,14 +12632,14 @@ export function SettingsPanel({
                                 </option>
                               );
                             })}
-                          </select>
+                          </SettingsSelect>
                         </label>
 
                         <label className="block">
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Thinking level")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                             disabled={!modelThinkingEnabled}
                             onChange={(event) =>
@@ -12659,14 +12668,14 @@ export function SettingsPanel({
                                 {t(level.label)}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
 
                         <label className="block">
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("Web search mode")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setForm((current) => ({
@@ -12681,7 +12690,7 @@ export function SettingsPanel({
                             <option value="native">{t("Native only")}</option>
                             <option value="function">{t("Function fallback only")}</option>
                             <option value="disabled">{t("Disabled for this model")}</option>
-                          </select>
+                          </SettingsSelect>
                           <p className="mt-1.5 text-xs leading-5 text-[var(--muted)]">
                             {t(
                               "Auto prefers confirmed provider-native search; unknown capability falls back to Tavily/Brave when available.",
@@ -12706,7 +12715,7 @@ export function SettingsPanel({
                           <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                             {t("System prompt")}
                           </span>
-                          <select
+                          <SettingsSelect
                             className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                             onChange={(event) =>
                               setForm((current) => ({
@@ -12721,7 +12730,7 @@ export function SettingsPanel({
                                 {prompt.name}
                               </option>
                             ))}
-                          </select>
+                          </SettingsSelect>
                         </label>
 
                         {enabledNeedsLimits ? (
@@ -12734,7 +12743,7 @@ export function SettingsPanel({
                           </div>
                         ) : null}
 
-                        <button
+                        <SettingsButton
                           aria-label={t("Save model")}
                           className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={
@@ -12755,7 +12764,7 @@ export function SettingsPanel({
                             <CheckCircle2 aria-hidden="true" className="size-4" />
                           )}
                           <span>{t("Save model")}</span>
-                        </button>
+                        </SettingsButton>
                       </div>
                     </div>
                   </form>
@@ -12783,7 +12792,7 @@ export function SettingsPanel({
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <button
+                      <SettingsButton
                         className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isCheckingUpdate}
                         onClick={() => void checkForUpdate()}
@@ -12795,9 +12804,9 @@ export function SettingsPanel({
                           <RefreshCw aria-hidden="true" className="size-4" />
                         )}
                         <span>{t("Check for updates")}</span>
-                      </button>
+                      </SettingsButton>
                       {settings?.update.updateAvailable ? (
-                        <button
+                        <SettingsButton
                           className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-[var(--accent)] bg-[var(--accent-soft)] px-3 py-2 text-sm font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:opacity-60"
                           disabled={isInstallingUpdate}
                           onClick={() => void installUpdate()}
@@ -12809,11 +12818,11 @@ export function SettingsPanel({
                             <Download aria-hidden="true" className="size-4" />
                           )}
                           <span>{isInstallingUpdate ? t("Installing update…") : t("Install update")}</span>
-                        </button>
+                        </SettingsButton>
                       ) : null}
                     </div>
                     <label className="inline-flex items-center gap-2 text-sm font-medium text-[var(--muted)]">
-                      <input
+                      <SettingsInput
                         checked={Boolean(settings?.update.autoCheckEnabled)}
                         className="size-4 rounded border-[var(--border)] text-[var(--accent-soft-foreground)] focus:ring-[var(--accent)]"
                         disabled={isSavingUpdateSettings}
@@ -12893,7 +12902,7 @@ export function SettingsPanel({
               </section>
               {updateConfirm ? (
                 <>
-                  <button
+                  <SettingsButton
                     aria-label={t("Close update dialog backdrop")}
                     className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
                     onClick={() => setUpdateConfirm(null)}
@@ -12919,7 +12928,7 @@ export function SettingsPanel({
                               })}
                         </p>
                       </div>
-                      <button
+                      <SettingsButton
                         aria-label={t("Close")}
                         className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                         onClick={() => setUpdateConfirm(null)}
@@ -12927,18 +12936,18 @@ export function SettingsPanel({
                         type="button"
                       >
                         <X aria-hidden="true" className="size-4" />
-                      </button>
+                      </SettingsButton>
                     </div>
                     {updateConfirm.source === "check" ? (
                       <div className="flex justify-end gap-2">
-                        <button
+                        <SettingsButton
                           className="inline-flex min-h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
                           onClick={() => setUpdateConfirm(null)}
                           type="button"
                         >
                           {t("Not now")}
-                        </button>
-                        <button
+                        </SettingsButton>
+                        <SettingsButton
                           className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={isInstallingUpdate}
                           onClick={() => void installUpdate()}
@@ -12950,7 +12959,7 @@ export function SettingsPanel({
                             <Download aria-hidden="true" className="size-4" />
                           )}
                           <span>{t("Install update")}</span>
-                        </button>
+                        </SettingsButton>
                       </div>
                     ) : null}
                   </section>
@@ -13115,7 +13124,7 @@ function RemoteServersSettingsSection({
 
       {isDialogOpen ? (
         <>
-          <button
+          <SettingsButton
             aria-label={t("Close remote server configuration backdrop")}
             className="fixed inset-0 z-40 bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)] backdrop-blur-sm"
             onClick={onCloseDialog}
@@ -13138,7 +13147,7 @@ function RemoteServersSettingsSection({
                   {form.hostAlias || t("SSH hostname / IP")}
                 </div>
               </div>
-              <button
+              <SettingsButton
                 aria-label={t("Close remote server configuration")}
                 className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                 onClick={onCloseDialog}
@@ -13146,28 +13155,28 @@ function RemoteServersSettingsSection({
                 type="button"
               >
                 <X aria-hidden="true" className="size-4" />
-              </button>
+              </SettingsButton>
             </div>
             <div className="grid gap-3 sm:grid-cols-2">
-              <TextField
+              <SettingsTextField
                 label={t("Server name")}
                 onChange={(value) => onFormChange((current) => ({ ...current, name: value }))}
                 placeholder={t("Server name")}
                 value={form.name}
               />
-              <TextField
+              <SettingsTextField
                 label={t("SSH hostname / IP")}
                 onChange={(value) => onFormChange((current) => ({ ...current, hostAlias: value }))}
                 placeholder="192.168.1.10"
                 value={form.hostAlias}
               />
-              <TextField
+              <SettingsTextField
                 label={t("SSH user")}
                 onChange={(value) => onFormChange((current) => ({ ...current, user: value }))}
                 placeholder="root"
                 value={form.user}
               />
-              <TextField
+              <SettingsTextField
                 inputMode="numeric"
                 label={t("SSH port")}
                 onChange={(value) => onFormChange((current) => ({ ...current, port: value }))}
@@ -13183,7 +13192,7 @@ function RemoteServersSettingsSection({
                   className="mb-3 inline-flex rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-0.5"
                   role="tablist"
                 >
-                  <button
+                  <SettingsButton
                     aria-controls={keyPanelId}
                     aria-selected={form.authMethod === "key"}
                     className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
@@ -13203,8 +13212,8 @@ function RemoteServersSettingsSection({
                     type="button"
                   >
                     {t("Key")}
-                  </button>
-                  <button
+                  </SettingsButton>
+                  <SettingsButton
                     aria-controls={passwordPanelId}
                     aria-selected={form.authMethod === "password"}
                     className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
@@ -13224,7 +13233,7 @@ function RemoteServersSettingsSection({
                     type="button"
                   >
                     {t("Password")}
-                  </button>
+                  </SettingsButton>
                 </div>
                 {form.authMethod === "password" ? (
                   <div
@@ -13232,7 +13241,7 @@ function RemoteServersSettingsSection({
                     id={passwordPanelId}
                     role="tabpanel"
                   >
-                    <TextField
+                    <SettingsTextField
                       autoComplete="current-password"
                       label={t("SSH password")}
                       onChange={(value) =>
@@ -13254,7 +13263,7 @@ function RemoteServersSettingsSection({
                         {t("Identity file")}
                       </span>
                       <div className="flex gap-2">
-                        <input
+                        <SettingsInput
                           autoComplete="off"
                           className="h-10 min-w-0 flex-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
                           name="identity-file"
@@ -13268,7 +13277,7 @@ function RemoteServersSettingsSection({
                           type="text"
                           value={form.identityFile}
                         />
-                        <button
+                        <SettingsButton
                           aria-label={t("Browse for private key")}
                           className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                           onClick={onSelectIdentityFile}
@@ -13276,31 +13285,31 @@ function RemoteServersSettingsSection({
                           type="button"
                         >
                           <FolderSearch aria-hidden="true" className="size-4" />
-                        </button>
+                        </SettingsButton>
                       </div>
                     </label>
                   </div>
                 )}
               </div>
-              <TextField
+              <SettingsTextField
                 label={t("Default remote root")}
                 onChange={(value) => onFormChange((current) => ({ ...current, defaultRemoteRoot: value }))}
                 placeholder="~/workspaces"
                 value={form.defaultRemoteRoot}
               />
-              <TextField
+              <SettingsTextField
                 label={t("Terminal shell override")}
                 onChange={(value) => onFormChange((current) => ({ ...current, terminalShell: value }))}
                 placeholder="/bin/bash"
                 value={form.terminalShell}
               />
-              <TextField
+              <SettingsTextField
                 label={t("Foco command")}
                 onChange={(value) => onFormChange((current) => ({ ...current, focoCommand: value }))}
                 placeholder="foco"
                 value={form.focoCommand}
               />
-              <TextField
+              <SettingsTextField
                 inputMode="numeric"
                 label={t("Connect timeout ms")}
                 onChange={(value) => onFormChange((current) => ({ ...current, connectTimeoutMs: value }))}
@@ -13324,7 +13333,7 @@ function RemoteServersSettingsSection({
               </div>
             ) : null}
             <div className="mt-4 flex justify-end gap-2">
-              <button
+              <SettingsButton
                 aria-label={t("Cancel remote server configuration")}
                 className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                 onClick={onCloseDialog}
@@ -13332,8 +13341,8 @@ function RemoteServersSettingsSection({
                 type="button"
               >
                 <X aria-hidden="true" className="size-4" />
-              </button>
-              <button
+              </SettingsButton>
+              <SettingsButton
                 aria-label={t("Save remote server")}
                 className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                 disabled={
@@ -13352,7 +13361,7 @@ function RemoteServersSettingsSection({
                 ) : (
                   <CheckCircle2 aria-hidden="true" className="size-4" />
                 )}
-              </button>
+              </SettingsButton>
             </div>
           </form>
         </>
@@ -13363,7 +13372,7 @@ function RemoteServersSettingsSection({
           <h3 className="text-sm font-semibold text-[var(--foreground)]">
             {t("Remote server list")}
           </h3>
-          <button
+          <SettingsButton
             aria-label={t("Add remote server")}
             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
             onClick={onStartAdding}
@@ -13371,7 +13380,7 @@ function RemoteServersSettingsSection({
             type="button"
           >
             <Plus aria-hidden="true" className="size-4" />
-          </button>
+          </SettingsButton>
         </div>
         {servers.length ? (
           <div className="overflow-x-auto">
@@ -13515,7 +13524,7 @@ function IconActionButton({
   tone?: "danger" | "default";
 }) {
   return (
-    <button
+    <SettingsButton
       aria-label={label}
       className={`inline-flex size-8 items-center justify-center rounded-lg border shadow-sm disabled:cursor-not-allowed disabled:text-[var(--muted)] ${tone === "danger"
           ? "border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
@@ -13531,7 +13540,7 @@ function IconActionButton({
       ) : (
         <Icon aria-hidden="true" className="size-3.5" />
       )}
-    </button>
+    </SettingsButton>
   );
 }
 
@@ -13783,7 +13792,7 @@ function SettingsNavButton({
   onClick: () => void;
 }) {
   return (
-    <button
+    <SettingsButton
       aria-label={label}
       aria-current={active ? "page" : undefined}
       className={`inline-flex h-10 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-sm font-semibold ${active
@@ -13796,46 +13805,7 @@ function SettingsNavButton({
     >
       <Icon aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0 truncate">{label}</span>
-    </button>
-  );
-}
-
-function TextField({
-  autoComplete = "off",
-  disabled = false,
-  inputMode,
-  label,
-  onChange,
-  placeholder,
-  type = "text",
-  value,
-}: {
-  autoComplete?: string;
-  disabled?: boolean;
-  inputMode?: "numeric";
-  label: string;
-  onChange: (value: string) => void;
-  placeholder: string;
-  type?: "password" | "text";
-  value: string;
-}) {
-  return (
-    <label className="block">
-      <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-        {label}
-      </span>
-      <input
-        autoComplete={autoComplete}
-        className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-        disabled={disabled}
-        inputMode={inputMode}
-        name={label.toLowerCase().replace(/\s+/g, "-")}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={placeholder}
-        type={type}
-        value={value}
-      />
-    </label>
+    </SettingsButton>
   );
 }
 
@@ -13862,7 +13832,7 @@ function SourceValueEditor({
 
   if (!parsed) {
     return (
-      <textarea
+      <SettingsTextArea
         aria-label={title}
         className={`${minHeightClass} w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-xs text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]`}
         onChange={(event) => onChange(event.target.value)}
@@ -13874,7 +13844,7 @@ function SourceValueEditor({
 
   return (
     <div className="rounded-lg border border-[var(--border)] bg-[var(--foreground)] text-[var(--muted)]">
-      <button
+      <SettingsButton
         aria-label={`${isExpanded ? t("Collapse JSON") : t("Expand JSON")} ${title}`}
         className="flex w-full items-center justify-between gap-3 px-3 py-2 text-left text-xs font-semibold text-[var(--muted)]"
         onClick={() => onToggle(id)}
@@ -13887,9 +13857,9 @@ function SourceValueEditor({
         <span className="shrink-0 text-[var(--muted)]">
           {isExpanded ? t("Collapse JSON") : t("Expand JSON")}
         </span>
-      </button>
+      </SettingsButton>
       {isExpanded ? (
-        <textarea
+        <SettingsTextArea
           aria-label={title}
           className={`${minHeightClass} w-full resize-y border-0 border-t border-[var(--border)] bg-[var(--foreground)] px-3 py-3 font-mono text-xs leading-relaxed text-[var(--muted)] outline-none focus:ring-2 focus:ring-inset focus:ring-[var(--accent)]`}
           onChange={(event) => onChange(event.target.value)}
@@ -14395,7 +14365,7 @@ function PromptOverrideEditor({
             <p className="mt-1 text-xs text-[var(--muted)]">{description}</p>
           ) : null}
         </div>
-        <button
+        <SettingsButton
           aria-label={restoreAriaLabel}
           className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onClick={onRestore}
@@ -14404,11 +14374,11 @@ function PromptOverrideEditor({
         >
           <RefreshCw aria-hidden="true" className="size-3.5" />
           {t("Restore default")}
-        </button>
+        </SettingsButton>
       </div>
       <label className="mt-3 block">
         <span className="sr-only">{title}</span>
-        <textarea
+        <SettingsTextArea
           aria-label={title}
           className="min-h-44 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
           data-testid={testId}

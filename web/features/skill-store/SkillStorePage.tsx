@@ -20,6 +20,11 @@ import type {
 } from "../../api/types";
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
+import {
+  SettingsButton,
+  SettingsInput,
+  SettingsSelect,
+} from "../../shared/ui";
 import { MarkdownRenderer } from "../chat/MarkdownRenderer";
 import "./skill-store.css";
 
@@ -508,7 +513,7 @@ export function SkillStorePage({
           <h1>{t("Skill Store")}</h1>
           <p>{t("Browse registry skills by total installs")}</p>
         </div>
-        <button
+        <SettingsButton
           aria-label={t("Refresh skills")}
           className="skill-store-icon-button"
           disabled={isLoadingList || isLoadingMore}
@@ -520,7 +525,7 @@ export function SkillStorePage({
             aria-hidden="true"
             className={`size-4 ${isLoadingList ? "animate-spin" : ""}`}
           />
-        </button>
+        </SettingsButton>
       </header>
 
       <div className="skill-store-layout">
@@ -528,7 +533,7 @@ export function SkillStorePage({
           <div className="skill-store-controls">
             <label className="skill-store-search" htmlFor="skill-store-search">
               <Search aria-hidden="true" className="size-4" />
-              <input
+              <SettingsInput
                 id="skill-store-search"
                 aria-label={t("Search skills")}
                 onChange={(event) => setQuery(event.target.value)}
@@ -538,7 +543,7 @@ export function SkillStorePage({
               />
             </label>
             <label className="skill-store-sort" htmlFor="skill-store-sort">
-              <select
+              <SettingsSelect
                 id="skill-store-sort"
                 aria-label={t("Sort skills")}
                 onChange={(event) =>
@@ -551,7 +556,7 @@ export function SkillStorePage({
                     {t(option.label)}
                   </option>
                 ))}
-              </select>
+              </SettingsSelect>
             </label>
           </div>
           <form
@@ -563,7 +568,7 @@ export function SkillStorePage({
           >
             <label htmlFor="skill-store-import-input">
               <Link2 aria-hidden="true" className="size-4" />
-              <input
+              <SettingsInput
                 id="skill-store-import-input"
                 aria-label={t("Import skill URL")}
                 onChange={(event) => setImportInput(event.target.value)}
@@ -572,7 +577,7 @@ export function SkillStorePage({
                 value={importInput}
               />
             </label>
-            <button
+            <SettingsButton
               className="skill-store-secondary-button"
               disabled={isImporting}
               type="submit"
@@ -583,7 +588,7 @@ export function SkillStorePage({
                 <Link2 aria-hidden="true" className="size-4" />
               )}
               {t("Import")}
-            </button>
+            </SettingsButton>
           </form>
           {importError ? (
             <p className="skill-store-error skill-store-import-error" role="alert">
@@ -600,7 +605,7 @@ export function SkillStorePage({
           {listError && displayedSkills.length ? (
             <p className="skill-store-error skill-store-list-error" role="alert">
               {listError}
-              <button type="button" onClick={() => void loadSkills("append")}>{t("Retry")}</button>
+              <SettingsButton type="button" onClick={() => void loadSkills("append")}>{t("Retry")}</SettingsButton>
             </p>
           ) : null}
 
@@ -617,7 +622,7 @@ export function SkillStorePage({
             <ol className="skill-store-list" onScroll={handleListScroll} ref={listRef}>
               {displayedSkills.map((skill, index) => (
                 <li key={`${skill.source ?? "skills"}/${skill.id}`}>
-                  <button
+                  <SettingsButton
                     className={
                       selectedSkillKey === skillSelectionKey(skill)
                         ? "skill-store-row skill-store-row-active"
@@ -650,7 +655,7 @@ export function SkillStorePage({
                         {formatChange(skill.change)}
                       </span>
                     </span>
-                  </button>
+                  </SettingsButton>
                 </li>
               ))}
               {isLoadingMore ? (
@@ -704,7 +709,7 @@ export function SkillStorePage({
 
               <div className="skill-store-install-panel">
                 <div className="skill-store-install-targets">
-                  <button
+                  <SettingsButton
                     className="skill-store-primary-button skill-store-install-button"
                     disabled={!canInstall}
                     onClick={() => void installSelectedSkill()}
@@ -716,10 +721,10 @@ export function SkillStorePage({
                       <Download aria-hidden="true" className="size-4" />
                     )}
                     {t("Install")}
-                  </button>
+                  </SettingsButton>
                   <label>
                     <span>{t("Install target")}</span>
-                    <select
+                    <SettingsSelect
                       value={installTarget}
                       onChange={(event) =>
                         setInstallTarget(event.target.value as InstallTarget)
@@ -727,12 +732,12 @@ export function SkillStorePage({
                     >
                       <option value="global">{t("Global")}</option>
                       <option value="workspace">{t("Workspace")}</option>
-                    </select>
+                    </SettingsSelect>
                   </label>
                   {installTarget === "workspace" ? (
                     <label>
                       <span>{t("Workspace")}</span>
-                      <select
+                      <SettingsSelect
                         value={workspaceId}
                         onChange={(event) => setWorkspaceId(event.target.value)}
                       >
@@ -741,13 +746,13 @@ export function SkillStorePage({
                             {workspace.name}
                           </option>
                         ))}
-                      </select>
+                      </SettingsSelect>
                     </label>
                   ) : null}
                 </div>
                 {showOverwriteOption ? (
                   <label className="skill-store-overwrite">
-                    <input
+                    <SettingsInput
                       checked={overwrite}
                       onChange={(event) => setOverwrite(event.target.checked)}
                       type="checkbox"
@@ -774,7 +779,7 @@ export function SkillStorePage({
                 <div className="skill-store-section-heading">
                   <h3>{t("Summary")}</h3>
                   {canTranslateSummary ? (
-                    <button
+                    <SettingsButton
                       aria-label={
                         isTranslating
                           ? t("Translating")
@@ -801,7 +806,7 @@ export function SkillStorePage({
                       ) : (
                         <Languages aria-hidden="true" className="size-4" />
                       )}
-                    </button>
+                    </SettingsButton>
                   ) : null}
                 </div>
                 {translationError ? (
@@ -938,9 +943,9 @@ function StatusBlock({
       <strong>{title}</strong>
       <span>{message}</span>
       {actionLabel && onAction ? (
-        <button onClick={onAction} type="button">
+        <SettingsButton onClick={onAction} type="button">
           {actionLabel}
-        </button>
+        </SettingsButton>
       ) : null}
     </div>
   );

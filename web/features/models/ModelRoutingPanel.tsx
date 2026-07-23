@@ -28,6 +28,7 @@ import type {
   ConfiguredProviderSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
+import { SettingsButton } from "../../shared/ui";
 import {
   clampModelRoutingPanelHeight,
   modelRoutingPanelHeightBounds,
@@ -374,7 +375,7 @@ export function ModelRoutingPanel({
         />
       ) : null}
 
-      <button
+      <SettingsButton
         aria-controls="model-routing-tree"
         aria-expanded={expanded}
         className="model-routing-header"
@@ -391,7 +392,7 @@ export function ModelRoutingPanel({
         ) : (
           <ChevronRight aria-hidden="true" className="size-3.5 shrink-0 text-[var(--muted)]" />
         )}
-      </button>
+      </SettingsButton>
 
       {expanded ? (
         <div
@@ -433,7 +434,7 @@ export function ModelRoutingPanel({
                     aria-expanded={isModelExpanded}
                   >
                     <div className="model-routing-model-row">
-                      <button
+                      <SettingsButton
                         aria-expanded={isModelExpanded}
                         aria-label={t("Toggle providers for {name}", {
                           name: model.displayName,
@@ -454,8 +455,8 @@ export function ModelRoutingPanel({
                             className="size-3.5 shrink-0"
                           />
                         )}
-                      </button>
-                      <button
+                      </SettingsButton>
+                      <SettingsButton
                         className="model-routing-model-button"
                         disabled={isModelBusy}
                         onClick={() => toggleModel(model.id)}
@@ -489,7 +490,7 @@ export function ModelRoutingPanel({
                             className="size-3.5 shrink-0 animate-spin text-[var(--accent-soft-foreground)]"
                           />
                         ) : null}
-                      </button>
+                      </SettingsButton>
                     </div>
 
                     {isModelExpanded ? (
@@ -513,7 +514,7 @@ export function ModelRoutingPanel({
 
                           return (
                             <li key={providerId} role="none">
-                              <button
+                              <SettingsButton
                                 aria-current={isActive ? "true" : undefined}
                                 aria-disabled={providerDisabled || isModelBusy}
                                 className={`model-routing-provider-button ${
@@ -557,7 +558,7 @@ export function ModelRoutingPanel({
                                 {disabledReason ? (
                                   <span className="sr-only">{disabledReason}</span>
                                 ) : null}
-                              </button>
+                              </SettingsButton>
                             </li>
                           );
                         })}

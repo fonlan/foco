@@ -78,3 +78,10 @@ export {
 } from "./variants";
 export { ContextMenu } from "./ContextMenu";
 export type { ContextMenuItem, ContextMenuProps } from "./ContextMenu";
+export {
+  SettingsButton,
+  SettingsInput,
+  SettingsSelect,
+  SettingsTextArea,
+  SettingsTextField,
+} from "./settings-controls";

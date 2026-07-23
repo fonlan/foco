@@ -44,6 +44,12 @@ import type {
 import { errorMessage, requestJson } from "../../shared/api-client";
 import { useI18n } from "../../shared/i18n";
 import {
+  SettingsButton,
+  SettingsInput,
+  SettingsSelect,
+  SettingsTextArea,
+} from "../../shared/ui";
+import {
   defaultThinkingLevelForModel,
   isModelThinkingLevelSupported,
   thinkingLevelOptionsForModel,
@@ -409,15 +415,15 @@ export function ScheduledTasksPage({
               </div>
             </div>
             <div className="flex items-center gap-2">
-              <button
+              <SettingsButton
                 className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-3 text-sm font-semibold text-[var(--warning)] shadow-sm hover:bg-[var(--warning-soft)]"
                 onClick={() => setFormMode({ type: "create" })}
                 type="button"
               >
                 <Plus aria-hidden="true" className="size-4" />
                 {t("New task")}
-              </button>
-              <button
+              </SettingsButton>
+              <SettingsButton
                 aria-label={t("Refresh scheduled tasks")}
                 className="inline-flex size-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)]"
                 disabled={isLoading}
@@ -430,14 +436,14 @@ export function ScheduledTasksPage({
                 ) : (
                   <RefreshCw aria-hidden="true" className="size-4" />
                 )}
-              </button>
+              </SettingsButton>
             </div>
           </div>
         </section>
 
         <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {TASK_STATUSES.map((status) => (
-            <button
+            <SettingsButton
               className={`rounded-lg border px-4 py-3 text-left shadow-sm transition ${statusFilter === status
                   ? "border-[var(--warning)] bg-[var(--warning-soft)]"
                   : "border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)]"
@@ -452,7 +458,7 @@ export function ScheduledTasksPage({
               <div className="mt-2 text-2xl font-semibold text-[var(--foreground)]">
                 {formatNumber(statusCounts[status] ?? 0, language)}
               </div>
-            </button>
+            </SettingsButton>
           ))}
         </section>
 
@@ -483,7 +489,7 @@ export function ScheduledTasksPage({
                   aria-hidden="true"
                   className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[var(--muted)]"
                 />
-                <input
+                <SettingsInput
                   aria-label={t("Search scheduled tasks")}
                   className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] pl-9 pr-3 text-sm outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
                   onChange={(event) => setSearchQuery(event.target.value)}
@@ -491,7 +497,7 @@ export function ScheduledTasksPage({
                   value={searchQuery}
                 />
               </label>
-              <select
+              <SettingsSelect
                 aria-label={t("Filter scheduled tasks by workspace")}
                 className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
                 onChange={(event) => setWorkspaceFilter(event.target.value)}
@@ -503,13 +509,13 @@ export function ScheduledTasksPage({
                     {workspace.name}
                   </option>
                 ))}
-              </select>
+              </SettingsSelect>
             </div>
             <div className="panel-scroll max-h-[640px] min-w-0 overflow-y-auto">
               {tasks.length ? (
                 <div className="divide-y divide-[var(--border)]">
                   {tasks.map((task) => (
-                    <button
+                    <SettingsButton
                       className={`grid w-full grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-3 text-left transition ${selectedTask?.id === task.id ? "bg-[var(--warning-soft)]" : "hover:bg-[var(--warning-soft)]"
                         }`}
                       key={task.id}
@@ -542,7 +548,7 @@ export function ScheduledTasksPage({
                           {formatTimestamp(task.nextRunAt, language, t)}
                         </span>
                       </span>
-                    </button>
+                    </SettingsButton>
                   ))}
                 </div>
               ) : (
@@ -887,14 +893,14 @@ function TaskDetails({
                     </td>
                     <td className="px-3 py-2 text-right">
                       {run.chatId ? (
-                        <button
+                        <SettingsButton
                           className="inline-flex h-8 items-center gap-1 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)]"
                           onClick={() => onOpenChat(run.workspaceId, run.chatId!)}
                           type="button"
                         >
                           <ExternalLink aria-hidden="true" className="size-3.5" />
                           {t("Open chat")}
-                        </button>
+                        </SettingsButton>
                       ) : (
                         <span className="text-xs text-[var(--muted)]">{t("Not available")}</span>
                       )}
@@ -1099,7 +1105,7 @@ function ScheduledTaskDrawer({
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-[color-mix(in_oklab,var(--foreground)_30%,transparent)]">
-      <button
+      <SettingsButton
         aria-label={t("Close scheduled task editor backdrop")}
         className="absolute inset-0 cursor-default"
         onClick={onClose}
@@ -1118,14 +1124,14 @@ function ScheduledTaskDrawer({
               {mode.type === "edit" ? t("Edit scheduled task") : t("New scheduled task")}
             </h3>
           </div>
-          <button
+          <SettingsButton
             aria-label={t("Close scheduled task editor")}
             className="inline-flex size-9 items-center justify-center rounded-lg text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
             onClick={onClose}
             type="button"
           >
             <X aria-hidden="true" className="size-4" />
-          </button>
+          </SettingsButton>
         </div>
 
         {error ? (
@@ -1361,7 +1367,7 @@ function ScheduledTaskDrawer({
               <span className="text-sm font-semibold text-[var(--muted)]">
                 {t("Enable Team mode")}
               </span>
-              <input
+              <SettingsInput
                 checked={form.collaborationToolsEnabled}
                 className="size-4 accent-[var(--warning)]"
                 onChange={(event) =>
@@ -1377,14 +1383,14 @@ function ScheduledTaskDrawer({
         </div>
 
         <div className="sticky bottom-0 flex items-center justify-end gap-2 border-t border-[var(--border)] bg-[var(--surface)] px-5 py-4">
-          <button
+          <SettingsButton
             className="h-10 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-semibold text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
             onClick={onClose}
             type="button"
           >
             {t("Cancel")}
-          </button>
-          <button
+          </SettingsButton>
+          <SettingsButton
             className="inline-flex h-10 items-center gap-2 rounded-lg border border-[var(--warning)] bg-[var(--warning-soft)] px-4 text-sm font-semibold text-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:opacity-60"
             disabled={isSaving}
             type="submit"
@@ -1395,7 +1401,7 @@ function ScheduledTaskDrawer({
               <Clock3 aria-hidden="true" className="size-4" />
             )}
             {t("Save task")}
-          </button>
+          </SettingsButton>
         </div>
       </form>
     </div>
@@ -1467,7 +1473,7 @@ function PaginationControls({
       <div className="flex flex-wrap items-center gap-2">
         <label className="inline-flex items-center gap-2">
           <span>{t("Page size")}</span>
-          <select
+          <SettingsSelect
             className="h-8 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs text-[var(--foreground)] outline-none focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
             onChange={(event) => onPageSizeChange(Number(event.target.value))}
             value={pageSize}
@@ -1477,7 +1483,7 @@ function PaginationControls({
                 {option}
               </option>
             ))}
-          </select>
+          </SettingsSelect>
         </label>
         <span>
           {t("Page {page} of {totalPages}", {
@@ -1485,7 +1491,7 @@ function PaginationControls({
             totalPages: formatNumber(effectiveTotalPages, language),
           })}
         </span>
-        <button
+        <SettingsButton
           aria-label={t("Previous page")}
           className="inline-flex h-8 items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={page <= 1}
@@ -1493,8 +1499,8 @@ function PaginationControls({
           type="button"
         >
           {t("Previous page")}
-        </button>
-        <button
+        </SettingsButton>
+        <SettingsButton
           aria-label={t("Next page")}
           className="inline-flex h-8 items-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--muted)] hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
           disabled={totalPages === 0 || page >= totalPages}
@@ -1502,7 +1508,7 @@ function PaginationControls({
           type="button"
         >
           {t("Next page")}
-        </button>
+        </SettingsButton>
       </div>
     </div>
   );
@@ -1522,7 +1528,7 @@ function IconButton({
   onClick: () => void;
 }) {
   return (
-    <button
+    <SettingsButton
       aria-label={label}
       className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--warning)] hover:bg-[var(--warning-soft)] hover:text-[var(--warning)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
       disabled={busy || disabled}
@@ -1535,7 +1541,7 @@ function IconButton({
       ) : (
         <Icon aria-hidden="true" className="size-4" />
       )}
-    </button>
+    </SettingsButton>
   );
 }
 
@@ -1559,7 +1565,7 @@ function TextField({
       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
-      <input
+      <SettingsInput
         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)] disabled:bg-[var(--surface-secondary)]"
         disabled={disabled}
         inputMode={inputMode}
@@ -1587,7 +1593,7 @@ function TextArea({
       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
-      <textarea
+      <SettingsTextArea
         className="w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)]"
         onChange={(event) => onChange(event.target.value)}
         rows={rows}
@@ -1615,14 +1621,14 @@ function SelectField({
       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
         {label}
       </span>
-      <select
+      <SettingsSelect
         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--warning)] focus:ring-2 focus:ring-[var(--warning)] disabled:bg-[var(--surface-secondary)]"
         disabled={disabled}
         onChange={(event) => onChange(event.target.value)}
         value={value}
       >
         {children}
-      </select>
+      </SettingsSelect>
     </label>
   );
 }

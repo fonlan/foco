@@ -18,6 +18,12 @@ import type {
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
 import {
+  SettingsButton,
+  SettingsInput,
+  SettingsSelect,
+  SettingsTextArea,
+} from "../../shared/ui";
+import {
   defaultThinkingLevelForModel,
   isModelThinkingLevelSupported,
   thinkingLevelOptionsForModel,
@@ -244,7 +250,7 @@ export function AgentsSettingsPanel({
             {t("Agent definitions")}
           </h3>
         </div>
-        <button
+        <SettingsButton
           aria-label={t("Add agent definition")}
           className="inline-flex size-9 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] transition hover:bg-[var(--accent)] active:translate-y-px disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
           disabled={operationKey !== null}
@@ -253,14 +259,14 @@ export function AgentsSettingsPanel({
           type="button"
         >
           <Plus aria-hidden="true" className="size-4" />
-        </button>
+        </SettingsButton>
       </div>
 
       <label className="mt-4 flex items-center justify-between gap-3 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] px-3 py-2">
         <span className="text-sm font-semibold text-[var(--muted)]">
           {t("Default Team mode for new chats")}
         </span>
-        <input
+        <SettingsInput
           checked={defaultTeamModeEnabled}
           className="size-4 accent-[var(--accent)]"
           disabled={isSavingDefaultTeamMode}
@@ -302,7 +308,7 @@ export function AgentsSettingsPanel({
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                <button
+                <SettingsButton
                   aria-label={t("Edit agent {name}", { name: definition.name })}
                   className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--surface)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                   disabled={operationKey !== null}
@@ -311,9 +317,9 @@ export function AgentsSettingsPanel({
                   type="button"
                 >
                   <Pencil aria-hidden="true" className="size-4" />
-                </button>
+                </SettingsButton>
                 {!isBuiltin ? (
-                  <button
+                  <SettingsButton
                     aria-label={t("Delete agent {name}", { name: definition.name })}
                     className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--danger)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                     disabled={operationKey !== null}
@@ -322,7 +328,7 @@ export function AgentsSettingsPanel({
                     type="button"
                   >
                     <Trash2 aria-hidden="true" className="size-4" />
-                  </button>
+                  </SettingsButton>
                 ) : null}
               </div>
             </article>
@@ -369,7 +375,7 @@ export function AgentsSettingsPanel({
                   {dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
                 </h3>
               </div>
-              <button
+              <SettingsButton
                 aria-label={t("Close agent dialog")}
                 className="inline-flex size-9 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 disabled={operationKey !== null}
@@ -378,7 +384,7 @@ export function AgentsSettingsPanel({
                 type="button"
               >
                 <X aria-hidden="true" className="size-4" />
-              </button>
+              </SettingsButton>
             </div>
 
             {error ? (
@@ -405,7 +411,7 @@ export function AgentsSettingsPanel({
                 <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
                   {t("Description")}
                 </span>
-                <input
+                <SettingsInput
                   className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
                   onChange={(event) => updateDraft({ description: event.target.value })}
                   value={draft.description}
@@ -447,17 +453,17 @@ export function AgentsSettingsPanel({
                     {t("Agent role prompt")}
                   </span>
                   {defaultRolePrompt ? (
-                    <button
+                    <SettingsButton
                       className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                       disabled={operationKey !== null}
                       onClick={restoreDefaultRolePrompt}
                       type="button"
                     >
                       {t("Restore default Agent role prompt")}
-                    </button>
+                    </SettingsButton>
                   ) : null}
                 </span>
-                <textarea
+                <SettingsTextArea
                   aria-label={t("Agent role prompt")}
                   className="min-h-40 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
                   onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
@@ -546,15 +552,15 @@ export function AgentsSettingsPanel({
             </fieldset>
 
             <div className="mt-4 flex justify-end gap-2">
-              <button
+              <SettingsButton
                 className="inline-flex h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] active:translate-y-px disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 disabled={operationKey !== null}
                 onClick={closeDialog}
                 type="button"
               >
                 {t("Cancel")}
-              </button>
-              <button
+              </SettingsButton>
+              <SettingsButton
                 className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--accent)] px-4 text-sm font-semibold text-white shadow-[var(--overlay-shadow)] transition hover:bg-[var(--accent)] active:translate-y-px disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
                 disabled={!canSubmit || operationKey !== null}
                 type="submit"
@@ -565,7 +571,7 @@ export function AgentsSettingsPanel({
                   <CheckCircle2 aria-hidden="true" className="size-4" />
                 )}
                 <span>{dialogMode === "edit" ? t("Save") : t("Create")}</span>
-              </button>
+              </SettingsButton>
             </div>
           </form>
         </div>
@@ -594,7 +600,7 @@ function AgentTextField({
   return (
     <label className="block">
       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{label}</span>
-      <input
+      <SettingsInput
         autoFocus={autoFocus}
         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
         inputMode={inputMode}
@@ -623,13 +629,13 @@ function AgentSelect({
   return (
     <label className="block">
       <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">{label}</span>
-      <select
+      <SettingsSelect
         className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
         onChange={(event) => onChange(event.target.value)}
         value={value}
       >
         {children}
-      </select>
+      </SettingsSelect>
     </label>
   );
 }
@@ -655,7 +661,7 @@ function AgentCheckbox({
           </span>
         ) : null}
       </span>
-      <input
+      <SettingsInput
         checked={checked}
         className="mt-0.5 size-4 shrink-0 accent-[var(--accent)]"
         onChange={(event) => onChange(event.target.checked)}

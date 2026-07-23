@@ -643,17 +643,13 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    const select = await screen.findByLabelText("Chat title generation model");
-    const options = Array.from((select as HTMLSelectElement).options).map((option) => ({
-      label: option.textContent,
-      value: option.value,
-    }));
+    const trigger = await screen.findByRole("button", { name: /Chat title generation model/ });
+    await userEvent.keyboard("{Tab}");
+    expect(trigger).toHaveFocus();
+    await userEvent.keyboard("{Enter}");
+    const options = (await screen.findAllByRole("option")).map((option) => option.textContent);
 
-    expect(options).toEqual([
-      { label: "Disabled", value: "disabled" },
-      { label: "Current chat model", value: "current_chat_model" },
-      { label: "GPT Test", value: "gpt-test" },
-    ]);
+    expect(options).toEqual(["Disabled", "Current chat model", "GPT Test"]);
   });
 
   it("saves plan mode model from plan settings", async () => {
@@ -664,17 +660,13 @@ describe("app-settings verification surfaces", () => {
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Plan settings" }));
 
-    const select = await screen.findByLabelText("Plan mode model");
-    const options = Array.from((select as HTMLSelectElement).options).map((option) => ({
-      label: option.textContent,
-      value: option.value,
-    }));
-    expect(options).toEqual([
-      { label: "Default agent model", value: "" },
-      { label: "GPT Test", value: "gpt-test" },
+    const trigger = await screen.findByRole("button", { name: /Plan mode model/ });
+    await userEvent.click(trigger);
+    expect((await screen.findAllByRole("option")).map((option) => option.textContent)).toEqual([
+      "Default agent model",
+      "GPT Test",
     ]);
-
-    await userEvent.selectOptions(select, "gpt-test");
+    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
     await userEvent.click(screen.getByRole("button", { name: "Save plan settings" }));
 
     await waitFor(() => {
@@ -685,7 +677,7 @@ describe("app-settings verification surfaces", () => {
         modeModelId: "gpt-test",
       });
     });
-    expect(select).toHaveValue("gpt-test");
+    expect(trigger).toHaveAccessibleName("GPT Test Plan mode model");
   });
 
   it("toggles a skill location with a location-only request", async () => {
