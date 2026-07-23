@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex},
+    sync::{
+        Arc, Condvar, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -14,6 +17,127 @@ use foco_store::{
 use foco_tools::ToolCancellationToken;
 
 use crate::{AppResult, AppState};
+
+/// Process-wide cap on concurrent full code-graph index+watcher startups.
+///
+/// Queuing happens outside workspace DB permits so ordinary chat/tool DB work is
+/// not blocked while large worktrees wait their turn.
+const MAX_CONCURRENT_CODE_GRAPH_INITS: usize = 2;
+
+/// How long cleanup waits for an in-flight init worker after cancel is requested.
+///
+/// Indexing itself is not interruptible mid-batch; this bound avoids hanging
+/// Plan/worktree teardown forever if a worker is stuck on I/O.
+const CODE_GRAPH_INIT_RELEASE_WAIT: Duration = Duration::from_secs(30);
+
+struct CodeGraphInitGate {
+    active: Mutex<usize>,
+    notify: Condvar,
+}
+
+impl CodeGraphInitGate {
+    fn new() -> Self {
+        Self {
+            active: Mutex::new(0),
+            notify: Condvar::new(),
+        }
+    }
+
+    /// Acquires a permit, or returns `None` if `cancel` is set while waiting.
+    fn acquire_unless_cancelled(&'static self, cancel: &AtomicBool) -> Option<CodeGraphInitPermit> {
+        let mut active = self
+            .active
+            .lock()
+            .expect("code graph init gate lock poisoned");
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            if *active < MAX_CONCURRENT_CODE_GRAPH_INITS {
+                *active += 1;
+                return Some(CodeGraphInitPermit { gate: self });
+            }
+            let (next, _) = self
+                .notify
+                .wait_timeout(active, Duration::from_millis(50))
+                .expect("code graph init gate wait poisoned");
+            active = next;
+        }
+    }
+}
+
+struct CodeGraphInitPermit {
+    gate: &'static CodeGraphInitGate,
+}
+
+impl Drop for CodeGraphInitPermit {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.gate.active.lock() {
+            *active = active.saturating_sub(1);
+            self.gate.notify.notify_one();
+        }
+    }
+}
+
+fn code_graph_init_gate() -> &'static CodeGraphInitGate {
+    static GATE: OnceLock<CodeGraphInitGate> = OnceLock::new();
+    GATE.get_or_init(CodeGraphInitGate::new)
+}
+
+/// Coordinates cancel + completion for one background init worker.
+pub(crate) struct CodeGraphInitControl {
+    cancel: AtomicBool,
+    finished: Mutex<bool>,
+    finished_notify: Condvar,
+}
+
+impl CodeGraphInitControl {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancel: AtomicBool::new(false),
+            finished: Mutex::new(false),
+            finished_notify: Condvar::new(),
+        })
+    }
+
+    fn request_cancel(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::SeqCst)
+    }
+
+    fn mark_finished(&self) {
+        if let Ok(mut finished) = self.finished.lock() {
+            *finished = true;
+            self.finished_notify.notify_all();
+        }
+    }
+
+    /// Waits until the worker marks finished or `timeout` elapses.
+    fn wait_finished(&self, timeout: Duration) -> bool {
+        let Ok(mut finished) = self.finished.lock() else {
+            return false;
+        };
+        let deadline = Instant::now() + timeout;
+        while !*finished {
+            let remaining = match deadline.checked_duration_since(Instant::now()) {
+                Some(remaining) if !remaining.is_zero() => remaining,
+                _ => return false,
+            };
+            let (next, wait_result) = match self.finished_notify.wait_timeout(finished, remaining) {
+                Ok(pair) => pair,
+                Err(_) => return false,
+            };
+            finished = next;
+            if wait_result.timed_out() && !*finished {
+                return false;
+            }
+        }
+        true
+    }
+}
 
 /// Lifecycle phase for one canonical execution-root code graph index.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,6 +175,8 @@ struct CodeGraphEntry {
     /// Monotonic claim generation for this path; stale workers must not publish.
     generation: u64,
     state: CodeGraphEntryState,
+    /// Present while a background init worker owns this claim (cancel + join).
+    init_control: Option<Arc<CodeGraphInitControl>>,
 }
 
 /// Token returned by a successful [`CodeGraphIndexState::claim`].
@@ -126,14 +252,14 @@ impl CodeGraphIndexState {
 
     /// Claims exclusive initialization for `execution_root`.
     ///
-    /// Returns `Some(token)` when this caller should run indexing. Concurrent
-    /// claims for the same canonical path return `None`. A previous `Failed`
-    /// entry may be reclaimed for an explicit retry. Pass the token to
+    /// Returns `Some((token, init_control))` when this caller should run indexing.
+    /// Concurrent claims for the same canonical path return `None`. A previous
+    /// `Failed` entry may be reclaimed for an explicit retry. Pass the token to
     /// `complete` / `fail` so a released or superseded claim cannot publish.
     pub(crate) fn claim(
         &mut self,
         execution_root: &Path,
-    ) -> Result<Option<CodeGraphClaimToken>, String> {
+    ) -> Result<Option<(CodeGraphClaimToken, Arc<CodeGraphInitControl>)>, String> {
         let key = Self::canonicalize_key(execution_root)?;
         match self.entries.get(&key) {
             Some(CodeGraphEntry {
@@ -147,15 +273,17 @@ impl CodeGraphIndexState {
             | None => {
                 self.next_generation = self.next_generation.wrapping_add(1);
                 let generation = self.next_generation;
+                let init_control = CodeGraphInitControl::new();
                 self.entries.insert(
                     key,
                     CodeGraphEntry {
                         generation,
                         state: CodeGraphEntryState::Initializing,
+                        init_control: Some(Arc::clone(&init_control)),
                     },
                 );
                 self.notify.notify_all();
-                Ok(Some(CodeGraphClaimToken { generation }))
+                Ok(Some((CodeGraphClaimToken { generation }, init_control)))
             }
         }
     }
@@ -192,6 +320,7 @@ impl CodeGraphIndexState {
             return;
         }
         entry.state = CodeGraphEntryState::Ready { watcher };
+        entry.init_control = None;
         self.notify.notify_all();
     }
 
@@ -236,14 +365,39 @@ impl CodeGraphIndexState {
             stage: stage.to_string(),
             error,
         };
+        entry.init_control = None;
         self.notify.notify_all();
     }
 
-    /// Drops the entry and stops its watcher (if any). Safe when absent.
-    pub(crate) fn release(&mut self, execution_root: &Path) -> Result<(), String> {
+    /// Drops the entry and stops its watcher (if any). Cancels and waits for any
+    /// in-flight init worker so SQLite/file handles are released before the
+    /// worktree directory is deleted. Safe when absent.
+    ///
+    /// Prefer [`release_code_graph_execution_root`] from call sites that hold
+    /// `Arc<Mutex<...>>`; this method only removes the map entry and returns
+    /// the init control so the caller can wait outside the lock.
+    pub(crate) fn take_init_control_and_remove(
+        &mut self,
+        execution_root: &Path,
+    ) -> Result<Option<Arc<CodeGraphInitControl>>, String> {
         let key = Self::canonicalize_key(execution_root)?;
-        self.entries.remove(&key);
+        let init_control = self
+            .entries
+            .remove(&key)
+            .and_then(|entry| entry.init_control);
         self.notify.notify_all();
+        Ok(init_control)
+    }
+
+    /// Convenience for unit tests that already hold `&mut self` without a mutex.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn release_for_test(&mut self, execution_root: &Path) -> Result<(), String> {
+        let control = self.take_init_control_and_remove(execution_root)?;
+        if let Some(control) = control {
+            control.request_cancel();
+            let _ = control.wait_finished(CODE_GRAPH_INIT_RELEASE_WAIT);
+        }
         Ok(())
     }
 
@@ -437,7 +591,7 @@ fn initialize_code_graph_workspace_if_needed(
     workspace: WorkspaceConfig,
     indexes: Arc<Mutex<CodeGraphIndexState>>,
 ) {
-    let claim_token = match indexes.lock() {
+    let claim = match indexes.lock() {
         Ok(mut guard) => match guard.claim(&workspace.path) {
             Ok(token) => token,
             Err(error) => {
@@ -459,7 +613,7 @@ fn initialize_code_graph_workspace_if_needed(
             return;
         }
     };
-    let Some(claim_token) = claim_token else {
+    let Some((claim_token, init_control)) = claim else {
         return;
     };
 
@@ -469,11 +623,21 @@ fn initialize_code_graph_workspace_if_needed(
         workspace_path = %workspace.path.display(),
         "background code graph workspace initialization started"
     );
+    if init_control.is_cancelled() {
+        init_control.mark_finished();
+        return;
+    }
     match initialize_code_graph_workspace(&workspace) {
         Ok(watcher) => {
+            if init_control.is_cancelled() {
+                drop(watcher);
+                init_control.mark_finished();
+                return;
+            }
             if let Ok(mut guard) = indexes.lock() {
                 guard.complete(&workspace.path, claim_token, watcher);
             }
+            init_control.mark_finished();
             tracing::info!(
                 workspace_id = %workspace.id,
                 workspace_path = %workspace.path.display(),
@@ -482,7 +646,9 @@ fn initialize_code_graph_workspace_if_needed(
             );
         }
         Err(error) => {
-            if let Ok(mut guard) = indexes.lock() {
+            if !init_control.is_cancelled()
+                && let Ok(mut guard) = indexes.lock()
+            {
                 guard.fail(
                     &workspace.path,
                     claim_token,
@@ -490,6 +656,7 @@ fn initialize_code_graph_workspace_if_needed(
                     error.to_string(),
                 );
             }
+            init_control.mark_finished();
             tracing::error!(
                 workspace_id = %workspace.id,
                 workspace_path = %workspace.path.display(),
@@ -509,7 +676,7 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
         // ponytail: local main never watches remote paths; sidecar owns remote graph index and watcher lifecycle.
         return;
     }
-    let claim_token = match state.code_graph_indexes.lock() {
+    let claim = match state.code_graph_indexes.lock() {
         Ok(mut guard) => match guard.claim(&workspace.path) {
             Ok(token) => token,
             Err(error) => {
@@ -531,28 +698,40 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
             return;
         }
     };
-    let Some(claim_token) = claim_token else {
+    let Some((claim_token, init_control)) = claim else {
         return;
     };
 
     let workspace = workspace.clone();
     let worker_workspace = workspace.clone();
     let indexes = state.code_graph_indexes.clone();
+    let worker_control = Arc::clone(&init_control);
     if let Err(error) = std::thread::Builder::new()
         .name(format!("foco-code-graph-{}", workspace.id))
         .spawn(move || {
             let workspace = worker_workspace;
+            let init_control = worker_control;
             let started_at = Instant::now();
             tracing::info!(
                 workspace_id = %workspace.id,
                 workspace_path = %workspace.path.display(),
                 "lazy code graph workspace initialization started"
             );
+            if init_control.is_cancelled() {
+                init_control.mark_finished();
+                return;
+            }
             match initialize_code_graph_workspace(&workspace) {
                 Ok(watcher) => {
+                    if init_control.is_cancelled() {
+                        drop(watcher);
+                        init_control.mark_finished();
+                        return;
+                    }
                     if let Ok(mut guard) = indexes.lock() {
                         guard.complete(&workspace.path, claim_token, watcher);
                     }
+                    init_control.mark_finished();
                     tracing::info!(
                         workspace_id = %workspace.id,
                         workspace_path = %workspace.path.display(),
@@ -561,7 +740,9 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
                     );
                 }
                 Err(error) => {
-                    if let Ok(mut guard) = indexes.lock() {
+                    if !init_control.is_cancelled()
+                        && let Ok(mut guard) = indexes.lock()
+                    {
                         guard.fail(
                             &workspace.path,
                             claim_token,
@@ -569,6 +750,7 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
                             error.to_string(),
                         );
                     }
+                    init_control.mark_finished();
                     tracing::error!(
                         workspace_id = %workspace.id,
                         workspace_path = %workspace.path.display(),
@@ -583,6 +765,7 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
         if let Ok(mut guard) = state.code_graph_indexes.lock() {
             guard.fail(&workspace.path, claim_token, "spawn", error.to_string());
         }
+        init_control.mark_finished();
         tracing::error!(
             workspace_id = %workspace.id,
             workspace_path = %workspace.path.display(),
@@ -596,16 +779,16 @@ pub(crate) fn spawn_code_graph_workspace_initialization_if_needed(
 /// (shared workspace or isolated worktree). Concurrent calls for the same
 /// canonical path only start one worker.
 ///
-/// Wired by later plan phases for worktree prewarm; kept here so the registry
-/// claim/complete/fail path is shared with main-workspace initialization.
-#[allow(dead_code)]
+/// Heavy index work is process-gated so multiple large worktrees do not all
+/// reindex at once. Claim/complete still run without holding a workspace DB
+/// permit; graph crate batches keep SQLite writes short.
 pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
     indexes: Arc<Mutex<CodeGraphIndexState>>,
     execution_root: PathBuf,
     label: impl Into<String>,
 ) {
     let label = label.into();
-    let claim_token = match indexes.lock() {
+    let claim = match indexes.lock() {
         Ok(mut guard) => match guard.claim(&execution_root) {
             Ok(token) => token,
             Err(error) => {
@@ -627,16 +810,36 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
             return;
         }
     };
-    let Some(claim_token) = claim_token else {
+    let Some((claim_token, init_control)) = claim else {
         return;
     };
 
     let worker_root = execution_root.clone();
     let worker_label = label.clone();
     let worker_indexes = indexes.clone();
+    let worker_control = Arc::clone(&init_control);
     if let Err(error) = std::thread::Builder::new()
         .name(format!("foco-code-graph-{}", sanitize_thread_label(&label)))
         .spawn(move || {
+            let init_control = worker_control;
+            // Acquire after claim so concurrent same-path callers still single-flight,
+            // while distinct roots queue without holding the registry lock.
+            // Check cancel before and after the gate so queued worktrees can exit
+            // without starting a full index once cleanup has released them.
+            if init_control.is_cancelled() {
+                init_control.mark_finished();
+                return;
+            }
+            let Some(_permit) =
+                code_graph_init_gate().acquire_unless_cancelled(&init_control.cancel)
+            else {
+                init_control.mark_finished();
+                return;
+            };
+            if init_control.is_cancelled() {
+                init_control.mark_finished();
+                return;
+            }
             let started_at = Instant::now();
             tracing::info!(
                 execution_root = %worker_root.display(),
@@ -645,9 +848,21 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
             );
             match initialize_code_graph_execution_root(&worker_root) {
                 Ok(watcher) => {
+                    if init_control.is_cancelled() {
+                        drop(watcher);
+                        init_control.mark_finished();
+                        tracing::info!(
+                            execution_root = %worker_root.display(),
+                            label = %worker_label,
+                            elapsed_ms = started_at.elapsed().as_millis() as u64,
+                            "code graph execution-root initialization cancelled after index"
+                        );
+                        return;
+                    }
                     if let Ok(mut guard) = worker_indexes.lock() {
                         guard.complete(&worker_root, claim_token, watcher);
                     }
+                    init_control.mark_finished();
                     tracing::info!(
                         execution_root = %worker_root.display(),
                         label = %worker_label,
@@ -656,9 +871,12 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
                     );
                 }
                 Err(error) => {
-                    if let Ok(mut guard) = worker_indexes.lock() {
+                    if !init_control.is_cancelled()
+                        && let Ok(mut guard) = worker_indexes.lock()
+                    {
                         guard.fail(&worker_root, claim_token, "initialize", error.to_string());
                     }
+                    init_control.mark_finished();
                     tracing::error!(
                         execution_root = %worker_root.display(),
                         label = %worker_label,
@@ -673,12 +891,90 @@ pub(crate) fn spawn_code_graph_execution_root_initialization_if_needed(
         if let Ok(mut guard) = indexes.lock() {
             guard.fail(&execution_root, claim_token, "spawn", error.to_string());
         }
+        init_control.mark_finished();
         tracing::error!(
             execution_root = %execution_root.display(),
             label = %label,
             error = %error,
             "failed to spawn code graph execution-root initialization"
         );
+    }
+}
+
+/// Drops the registry entry (and watcher) for `execution_root` before the
+/// directory is deleted. Cancels any in-flight init worker and waits briefly
+/// for it to release file handles. Missing or uncanonicalizable paths are ignored.
+pub(crate) fn release_code_graph_execution_root(
+    indexes: &Arc<Mutex<CodeGraphIndexState>>,
+    execution_root: &Path,
+) {
+    let init_control = {
+        let Ok(mut guard) = indexes.lock() else {
+            tracing::error!(
+                execution_root = %execution_root.display(),
+                "code graph index lock poisoned while releasing execution root"
+            );
+            return;
+        };
+        match guard.take_init_control_and_remove(execution_root) {
+            Ok(control) => {
+                tracing::debug!(
+                    execution_root = %execution_root.display(),
+                    "released code graph index entry for execution root"
+                );
+                control
+            }
+            Err(error) => {
+                // Path may already be gone or never registered; cleanup must continue.
+                tracing::debug!(
+                    execution_root = %execution_root.display(),
+                    error = %error,
+                    "skipped code graph release for unresolvable execution root"
+                );
+                None
+            }
+        }
+    };
+
+    if let Some(control) = init_control {
+        control.request_cancel();
+        if !control.wait_finished(CODE_GRAPH_INIT_RELEASE_WAIT) {
+            tracing::warn!(
+                execution_root = %execution_root.display(),
+                wait_ms = CODE_GRAPH_INIT_RELEASE_WAIT.as_millis() as u64,
+                "code graph init worker did not finish before release wait deadline"
+            );
+        }
+    }
+}
+
+/// Releases the code-graph registry entry, runs worktree deletion, and re-prewarms
+/// the path when delete fails while the directory still exists.
+///
+/// Prevents a failed delete from leaving a live worktree without a registry entry
+/// (which would look "unregistered = ready" and skip watcher updates).
+pub(crate) fn release_code_graph_then_delete_worktree<E>(
+    indexes: &Arc<Mutex<CodeGraphIndexState>>,
+    worktree_path: &Path,
+    delete: impl FnOnce() -> Result<(), E>,
+) -> Result<(), E> {
+    release_code_graph_execution_root(indexes, worktree_path);
+    match delete() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if worktree_path.exists() {
+                tracing::warn!(
+                    execution_root = %worktree_path.display(),
+                    "worktree delete failed while path still exists; restoring code graph prewarm"
+                );
+                spawn_code_graph_execution_root_initialization_if_needed(
+                    indexes.clone(),
+                    worktree_path.to_path_buf(),
+                    "restore-after-failed-worktree-delete",
+                );
+            }
+            Err(error)
+        }
     }
 }
 
@@ -736,9 +1032,10 @@ mod tests {
         let path = dir.path();
         let mut state = CodeGraphIndexState::default();
 
-        let token = state.claim(path).expect("claim").expect("first claim");
+        let (token, control) = state.claim(path).expect("claim").expect("first claim");
         assert!(state.claim(path).expect("second claim").is_none());
         state.fail(path, token, "index", "boom");
+        control.mark_finished();
         assert!(state.claim(path).expect("retry after fail").is_some());
         assert_eq!(
             state.status(path).expect("status").map(|s| s.phase),
@@ -751,9 +1048,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
         let mut state = CodeGraphIndexState::default();
-        let stale = state.claim(path).expect("claim").expect("token");
-        state.release(path).expect("release");
-        assert_eq!(state.entry_count(), 0);
+        let (stale, control) = state.claim(path).expect("claim").expect("token");
+        // Release removes the entry without waiting on a live worker in this unit test.
+        let _ = state.take_init_control_and_remove(path).expect("release");
+        control.mark_finished();
         // complete requires a real watcher; fail is enough to prove generation gating.
         state.fail(path, stale, "index", "should not reinsert");
         assert_eq!(state.entry_count(), 0);
@@ -765,9 +1063,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
         let mut state = CodeGraphIndexState::default();
-        let stale = state.claim(path).expect("claim").expect("token");
-        state.release(path).expect("release");
-        let live = state.claim(path).expect("reclaim").expect("new token");
+        let (stale, stale_control) = state.claim(path).expect("claim").expect("token");
+        // Release via take so we can reclaim without waiting on a live worker.
+        let _ = state.take_init_control_and_remove(path).expect("release");
+        stale_control.mark_finished();
+        let (live, live_control) = state.claim(path).expect("reclaim").expect("new token");
         assert_ne!(stale, live);
         state.fail(path, stale, "index", "stale worker");
         assert_eq!(
@@ -776,6 +1076,7 @@ mod tests {
             "stale fail must not overwrite the live claim"
         );
         state.fail(path, live, "index", "live failure");
+        live_control.mark_finished();
         assert_eq!(
             state.status(path).expect("status").map(|s| s.phase),
             Some(CodeGraphIndexPhase::Failed)
@@ -795,7 +1096,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().to_path_buf();
         let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
-        let token = {
+        let (token, control) = {
             let mut guard = indexes.lock().expect("lock");
             guard.claim(&path).expect("claim").expect("token")
         };
@@ -812,6 +1113,7 @@ mod tests {
                 .lock()
                 .expect("lock")
                 .fail(&path_worker, token, "index", "test failure");
+            control.mark_finished();
         });
 
         barrier.wait();
@@ -880,10 +1182,91 @@ mod tests {
     fn release_removes_entry() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path();
-        let mut state = CodeGraphIndexState::default();
-        assert!(state.claim(path).expect("claim").is_some());
-        assert_eq!(state.entry_count(), 1);
-        state.release(path).expect("release");
-        assert_eq!(state.entry_count(), 0);
+        let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
+        {
+            let mut guard = indexes.lock().expect("lock");
+            let (_token, control) = guard.claim(path).expect("claim").expect("token");
+            // No live worker; mark finished so release wait returns immediately.
+            control.mark_finished();
+        }
+        assert_eq!(indexes.lock().expect("lock").entry_count(), 1);
+        release_code_graph_execution_root(&indexes, path);
+        assert_eq!(indexes.lock().expect("lock").entry_count(), 0);
+    }
+
+    #[test]
+    fn release_cancels_initializing_worker_before_returning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
+        let (token, control) = {
+            let mut guard = indexes.lock().expect("lock");
+            guard.claim(&path).expect("claim").expect("token")
+        };
+
+        let barrier = Arc::new(Barrier::new(2));
+        let control_worker = Arc::clone(&control);
+        let barrier_worker = Arc::clone(&barrier);
+        let indexes_worker = indexes.clone();
+        let path_worker = path.clone();
+        let handle = std::thread::spawn(move || {
+            barrier_worker.wait();
+            // Simulate a worker blocked before heavy work; observe cancel.
+            while !control_worker.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Stale complete/fail must not reinsert after release.
+            indexes_worker
+                .lock()
+                .expect("lock")
+                .fail(&path_worker, token, "index", "cancelled");
+            control_worker.mark_finished();
+        });
+
+        barrier.wait();
+        let started = Instant::now();
+        release_code_graph_execution_root(&indexes, &path);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "release should return once the worker observes cancel"
+        );
+        assert_eq!(indexes.lock().expect("lock").entry_count(), 0);
+        handle.join().expect("worker");
+    }
+
+    #[test]
+    fn restore_after_failed_delete_reclaims_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_path_buf();
+        // Create a tiny source file so a real re-prewarm can complete if needed.
+        std::fs::write(path.join("lib.rs"), "pub fn restore_symbol() {}\n").expect("source");
+        let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
+        {
+            let mut guard = indexes.lock().expect("lock");
+            let (_token, control) = guard.claim(&path).expect("claim").expect("token");
+            control.mark_finished();
+        }
+
+        let result: Result<(), String> =
+            release_code_graph_then_delete_worktree(&indexes, &path, || {
+                Err("simulated delete failure".to_string())
+            });
+        assert!(result.is_err());
+        // Path still exists, so restore should claim Initializing (or Ready after prewarm).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = indexes.lock().expect("lock").status(&path).expect("status");
+            match status.map(|s| s.phase) {
+                Some(CodeGraphIndexPhase::Initializing | CodeGraphIndexPhase::Ready) => break,
+                Some(CodeGraphIndexPhase::Failed) => {
+                    panic!("restore prewarm should not leave Failed without retry");
+                }
+                None if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                None => panic!("failed delete must re-register the surviving worktree path"),
+            }
+        }
+        release_code_graph_execution_root(&indexes, &path);
     }
 }

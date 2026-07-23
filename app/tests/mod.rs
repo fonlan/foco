@@ -2378,6 +2378,450 @@ fn lazy_code_graph_initialization_indexes_workspace_once() {
 }
 
 #[test]
+fn worktree_code_graph_prewarm_indexes_execution_root_not_shared_workspace() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worktree-graph-shared"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-worktree-graph-profile"));
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::write(
+        workspace_dir.join("lib.rs"),
+        "pub fn shared_only_symbol() -> i32 { 1 }\n",
+    )
+    .expect("shared source");
+
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+
+    let repo = gix::init(&workspace_dir).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_dir.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("git config");
+    crate::git_backend::stage_git_file(&workspace_dir, "lib.rs").expect("stage");
+    crate::git_backend::commit_staged_changes(&workspace_dir, "initial".to_string())
+        .expect("commit");
+
+    let worktree =
+        crate::git_backend::create_agent_worktree(&workspace_dir, "agent-instance-graph-prewarm")
+            .expect("create worktree");
+    fs::write(
+        worktree.root_path.join("lib.rs"),
+        "pub fn worktree_only_symbol() -> i32 { 2 }\n",
+    )
+    .expect("worktree source");
+
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        worktree.root_path.clone(),
+        "test-worktree-prewarm",
+    );
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
+
+    let worktree_db =
+        WorkspaceDatabase::open_or_create(&worktree.root_path).expect("worktree database");
+    let symbols = worktree_db
+        .find_code_graph_symbols("worktree_only_symbol", None, None, 10)
+        .expect("worktree symbols");
+    assert_eq!(
+        symbols.len(),
+        1,
+        "worktree graph should index worktree source"
+    );
+    assert!(
+        symbols.iter().any(|symbol| {
+            symbol.name.contains("worktree_only_symbol")
+                || symbol
+                    .qualified_name
+                    .as_deref()
+                    .is_some_and(|name| name.contains("worktree_only_symbol"))
+        }),
+        "unexpected symbols: {symbols:?}"
+    );
+    let shared_pollution = worktree_db
+        .find_code_graph_symbols("shared_only_symbol", None, None, 10)
+        .expect("shared name query on worktree db");
+    assert!(
+        shared_pollution.is_empty(),
+        "worktree graph must not contain shared-only symbols"
+    );
+    drop(worktree_db);
+
+    let shared_db = WorkspaceDatabase::open_or_create(&workspace_dir).expect("shared database");
+    let shared_context = shared_db.code_graph_context().expect("shared context");
+    assert_eq!(
+        shared_context.indexed_files, 0,
+        "shared workspace graph must stay cold when only the worktree was prewarmed"
+    );
+    drop(shared_db);
+
+    crate::runtime::release_code_graph_execution_root(
+        &state.code_graph_indexes,
+        &worktree.root_path,
+    );
+    assert_eq!(
+        state
+            .code_graph_indexes
+            .lock()
+            .expect("code graph index lock")
+            .entry_count(),
+        0,
+        "release must drop the worktree registry entry"
+    );
+    crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree.root_path, true)
+        .expect("delete worktree");
+    assert!(!worktree.root_path.exists());
+
+    let worktree2 =
+        crate::git_backend::create_agent_worktree(&workspace_dir, "agent-instance-graph-prewarm")
+            .expect("recreate worktree");
+    fs::write(
+        worktree2.root_path.join("lib.rs"),
+        "pub fn reclaimed_symbol() -> i32 { 3 }\n",
+    )
+    .expect("reclaimed source");
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        worktree2.root_path.clone(),
+        "test-worktree-reclaim",
+    );
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
+    let reclaimed_db =
+        WorkspaceDatabase::open_or_create(&worktree2.root_path).expect("reclaimed db");
+    let reclaimed = reclaimed_db
+        .find_code_graph_symbols("reclaimed_symbol", None, None, 10)
+        .expect("reclaimed symbols");
+    assert_eq!(reclaimed.len(), 1);
+    drop(reclaimed_db);
+
+    crate::runtime::release_code_graph_execution_root(
+        &state.code_graph_indexes,
+        &worktree2.root_path,
+    );
+    crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree2.root_path, true)
+        .expect("delete reclaimed worktree");
+    state
+        .code_graph_indexes
+        .lock()
+        .expect("code graph index lock")
+        .clear_watchers();
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn worktree_code_graph_readiness_blocks_while_initializing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().to_path_buf();
+    let indexes = Arc::new(Mutex::new(CodeGraphIndexState::default()));
+    {
+        let mut guard = indexes.lock().expect("lock");
+        assert!(guard.claim(&path).expect("claim").is_some());
+    }
+    let error = wait_for_code_graph_ready(
+        &indexes,
+        &path,
+        Some(Instant::now() + Duration::from_millis(40)),
+        None,
+    )
+    .expect_err("initializing path must not look ready");
+    assert!(
+        matches!(error, CodeGraphReadinessError::TimedOut { .. }),
+        "expected timeout while initializing, got {error}"
+    );
+}
+
+#[test]
+fn worktree_code_graph_watcher_reflects_local_edits_only() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worktree-graph-watch"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-worktree-graph-watch-profile"));
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::write(
+        workspace_dir.join("lib.rs"),
+        "pub fn shared_watch_symbol() -> i32 { 1 }\n",
+    )
+    .expect("shared source");
+
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+    let repo = gix::init(&workspace_dir).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_dir.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("git config");
+    crate::git_backend::stage_git_file(&workspace_dir, "lib.rs").expect("stage");
+    crate::git_backend::commit_staged_changes(&workspace_dir, "initial".to_string())
+        .expect("commit");
+
+    let worktree =
+        crate::git_backend::create_agent_worktree(&workspace_dir, "agent-instance-graph-watch")
+            .expect("create worktree");
+    fs::write(
+        worktree.root_path.join("lib.rs"),
+        "pub fn worktree_watch_base() -> i32 { 1 }\n",
+    )
+    .expect("worktree base");
+
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        worktree.root_path.clone(),
+        "test-worktree-watch",
+    );
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
+
+    fs::write(
+        worktree.root_path.join("lib.rs"),
+        "pub fn worktree_watch_base() -> i32 { 1 }\n\npub fn worktree_watch_added() -> i32 { 2 }\n",
+    )
+    .expect("worktree edit");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut saw_added = false;
+    while Instant::now() < deadline {
+        let db = WorkspaceDatabase::open_or_create(&worktree.root_path).expect("worktree db");
+        let symbols = db
+            .find_code_graph_symbols("worktree_watch_added", None, None, 10)
+            .expect("query");
+        if !symbols.is_empty() {
+            saw_added = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw_added,
+        "watcher should index worktree edit after debounce"
+    );
+
+    fs::write(
+        workspace_dir.join("lib.rs"),
+        "pub fn shared_watch_symbol() -> i32 { 1 }\n\npub fn shared_watch_added() -> i32 { 9 }\n",
+    )
+    .expect("shared edit");
+    std::thread::sleep(Duration::from_millis(900));
+    let worktree_db = WorkspaceDatabase::open_or_create(&worktree.root_path).expect("worktree db");
+    let leaked = worktree_db
+        .find_code_graph_symbols("shared_watch_added", None, None, 10)
+        .expect("leak query");
+    assert!(
+        leaked.is_empty(),
+        "shared workspace edits must not pollute worktree graph"
+    );
+    drop(worktree_db);
+
+    crate::runtime::release_code_graph_execution_root(
+        &state.code_graph_indexes,
+        &worktree.root_path,
+    );
+    crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree.root_path, true)
+        .expect("delete worktree");
+    state
+        .code_graph_indexes
+        .lock()
+        .expect("code graph index lock")
+        .clear_watchers();
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn worktree_code_graph_release_cancels_initializing_before_delete() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worktree-graph-cancel"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-worktree-graph-cancel-profile"));
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::write(
+        workspace_dir.join("lib.rs"),
+        "pub fn cancel_base_symbol() -> i32 { 1 }\n",
+    )
+    .expect("shared source");
+
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+    let repo = gix::init(&workspace_dir).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_dir.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("git config");
+    crate::git_backend::stage_git_file(&workspace_dir, "lib.rs").expect("stage");
+    crate::git_backend::commit_staged_changes(&workspace_dir, "initial".to_string())
+        .expect("commit");
+
+    let worktree =
+        crate::git_backend::create_agent_worktree(&workspace_dir, "agent-instance-graph-cancel")
+            .expect("create worktree");
+    fs::write(
+        worktree.root_path.join("lib.rs"),
+        "pub fn cancel_worktree_symbol() -> i32 { 2 }\n",
+    )
+    .expect("worktree source");
+
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        worktree.root_path.clone(),
+        "test-worktree-cancel-init",
+    );
+    // Do not wait for Ready: release must cancel/wait while Initializing or Ready.
+    let release_started = Instant::now();
+    crate::runtime::release_code_graph_execution_root(
+        &state.code_graph_indexes,
+        &worktree.root_path,
+    );
+    assert!(
+        release_started.elapsed() < Duration::from_secs(30),
+        "release must not hang waiting for init forever"
+    );
+    assert_eq!(
+        state
+            .code_graph_indexes
+            .lock()
+            .expect("code graph index lock")
+            .entry_count(),
+        0,
+        "release must remove the registry entry"
+    );
+    crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree.root_path, true)
+        .expect("delete after cancel release");
+    assert!(!worktree.root_path.exists());
+
+    state
+        .code_graph_indexes
+        .lock()
+        .expect("code graph index lock")
+        .clear_watchers();
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
+fn worktree_code_graph_failed_delete_restores_registry_entry() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-worktree-graph-restore"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-worktree-graph-restore-profile"));
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    fs::write(
+        workspace_dir.join("lib.rs"),
+        "pub fn restore_base_symbol() -> i32 { 1 }\n",
+    )
+    .expect("shared source");
+
+    let config = GlobalConfig::first_run(workspace_dir.clone());
+    let state = test_app_state(config, profile_dir.clone());
+    let repo = gix::init(&workspace_dir).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_dir.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("git config");
+    crate::git_backend::stage_git_file(&workspace_dir, "lib.rs").expect("stage");
+    crate::git_backend::commit_staged_changes(&workspace_dir, "initial".to_string())
+        .expect("commit");
+
+    let worktree =
+        crate::git_backend::create_agent_worktree(&workspace_dir, "agent-instance-graph-restore")
+            .expect("create worktree");
+    fs::write(
+        worktree.root_path.join("lib.rs"),
+        "pub fn restore_worktree_symbol() -> i32 { 2 }\n",
+    )
+    .expect("worktree source");
+
+    crate::runtime::spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        worktree.root_path.clone(),
+        "test-worktree-restore-prewarm",
+    );
+    wait_for_code_graph_watchers(&state.code_graph_indexes, 1);
+
+    // Dirty worktree + allow_changes=false fails delete; path must stay registered.
+    fs::write(
+        worktree.root_path.join("extra.rs"),
+        "pub fn dirty_extra() {}\n",
+    )
+    .expect("dirty worktree");
+    let delete_error = crate::runtime::release_code_graph_then_delete_worktree(
+        &state.code_graph_indexes,
+        &worktree.root_path,
+        || crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree.root_path, false),
+    )
+    .expect_err("dirty worktree delete must fail");
+    let _ = delete_error;
+    assert!(
+        worktree.root_path.exists(),
+        "failed delete must leave the worktree directory"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut restored = false;
+    while Instant::now() < deadline {
+        let status = state
+            .code_graph_indexes
+            .lock()
+            .expect("code graph index lock")
+            .status(&worktree.root_path)
+            .expect("status");
+        if status.is_some() {
+            restored = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        restored,
+        "failed delete must re-prewarm the surviving worktree path"
+    );
+
+    crate::runtime::release_code_graph_execution_root(
+        &state.code_graph_indexes,
+        &worktree.root_path,
+    );
+    crate::git_backend::delete_agent_worktree(&workspace_dir, &worktree.root_path, true)
+        .expect("force delete dirty worktree");
+    state
+        .code_graph_indexes
+        .lock()
+        .expect("code graph index lock")
+        .clear_watchers();
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[test]
 fn repeated_tool_call_detector_rejects_third_identical_batch() {
     let mut detector = RepeatedToolCallDetector::default();
 

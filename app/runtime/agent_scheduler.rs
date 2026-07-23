@@ -34,7 +34,10 @@ use tokio::{
     time,
 };
 
-use super::{ActiveAgentRunIdentity, ActiveChatRunRegistrationResult};
+use super::{
+    ActiveAgentRunIdentity, ActiveChatRunRegistrationResult,
+    spawn_code_graph_execution_root_initialization_if_needed,
+};
 use crate::git_backend::{
     agent_instance_worktree_path, agent_worktree_diff_id, git_diff_response,
     resolve_agent_worktree_path,
@@ -850,6 +853,15 @@ async fn run_coordinator_task_inner(
             agent_instance_execution_root(&workspace.path, &instance)
         }
     };
+    // Prewarm the execution-root graph as soon as the tool root is known so the
+    // first Graph tool call does not wait on a cold full index. Shared main-root
+    // sessions already claim via prepare_prompt_context; this is a no-op when
+    // the path is already Initializing/Ready.
+    spawn_code_graph_execution_root_initialization_if_needed(
+        state.code_graph_indexes.clone(),
+        chat_context.tool_workspace_path.clone(),
+        format!("agent-task:{}", task.id),
+    );
     let allowed_tools = instance
         .definition_snapshot
         .allowed_tools

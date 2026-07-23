@@ -28,7 +28,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::git_backend::{
     AgentWorktreeInfo, agent_worktree_relative_path, create_agent_worktree, delete_agent_worktree,
 };
-use crate::runtime::ActiveChatRunRegistrationResult;
+use crate::runtime::{ActiveChatRunRegistrationResult, release_code_graph_then_delete_worktree};
 use crate::*;
 
 type BoxedChatEventStream =
@@ -1002,10 +1002,11 @@ pub(crate) async fn queue_chat_message_internal(
             })
             .map_err(|error| {
                 if let Some(worktree) = &coordinator_worktree {
-                    let _ = delete_agent_worktree(
-                        &workspace.path,
-                        Path::new(&worktree.root_path),
-                        true,
+                    let worktree_path = Path::new(&worktree.root_path);
+                    let _ = release_code_graph_then_delete_worktree(
+                        &state.code_graph_indexes,
+                        worktree_path,
+                        || delete_agent_worktree(&workspace.path, worktree_path, true),
                     );
                 }
                 ApiError::from_workspace_error(error)

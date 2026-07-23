@@ -38,8 +38,8 @@ use crate::git_backend::{
     merge_agent_worktree, resolve_agent_worktree_path,
 };
 use crate::runtime::{
-    AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
-    ToolResourceLockOwnerSnapshot,
+    AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM, CodeGraphIndexState,
+    ToolResourceLockOwnerSnapshot, release_code_graph_then_delete_worktree,
 };
 use crate::*;
 
@@ -604,8 +604,12 @@ pub(crate) async fn create_agent_instances(
         Ok(created) => created,
         Err(error) => {
             for worktree in &worktrees {
-                let _ =
-                    delete_agent_worktree(&workspace.path, Path::new(&worktree.root_path), true);
+                let worktree_path = Path::new(&worktree.root_path);
+                let _ = release_code_graph_then_delete_worktree(
+                    &state.code_graph_indexes,
+                    worktree_path,
+                    || delete_agent_worktree(&workspace.path, worktree_path, true),
+                );
             }
             return Err(ApiError::from_workspace_error(error));
         }
@@ -724,6 +728,7 @@ pub(crate) async fn agent_runtime_action(
                     | AgentRuntimeAction::WorktreeMerge
             ) {
                 worktree_action = Some(execute_agent_worktree_action(
+                    &state.code_graph_indexes,
                     &workspace.path,
                     &mut database,
                     &team.id,
@@ -798,6 +803,7 @@ pub(crate) async fn agent_runtime_action(
 }
 
 fn execute_agent_worktree_action(
+    code_graph_indexes: &std::sync::Arc<std::sync::Mutex<CodeGraphIndexState>>,
     workspace_path: &Path,
     database: &mut WorkspaceDatabase,
     team_id: &AgentTeamId,
@@ -856,7 +862,9 @@ fn execute_agent_worktree_action(
             })
         }
         AgentRuntimeAction::WorktreeDelete => {
-            delete_agent_worktree(workspace_path, &worktree_path, false)?;
+            release_code_graph_then_delete_worktree(code_graph_indexes, &worktree_path, || {
+                delete_agent_worktree(workspace_path, &worktree_path, false)
+            })?;
             let updated = database
                 .update_agent_instance_worktree_status(&instance.id, "deleted")
                 .map_err(ApiError::from_workspace_error)?;

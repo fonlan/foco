@@ -13,6 +13,7 @@ use std::path::Path;
 
 use crate::{
     git_backend::{agent_worktree_head_commit, delete_agent_worktree, resolve_agent_worktree_path},
+    runtime::release_code_graph_then_delete_worktree,
     *,
 };
 
@@ -560,7 +561,9 @@ pub(crate) async fn cleanup_plan_worktree(
     }
     let root_path = resolve_agent_worktree_path(&workspace.path, &record.worktree_path);
 
-    delete_agent_worktree(&workspace.path, &root_path, true)?;
+    release_code_graph_then_delete_worktree(&state.code_graph_indexes, &root_path, || {
+        delete_agent_worktree(&workspace.path, &root_path, true)
+    })?;
     database
         .switch_agent_instance_to_shared_workspace(&record.agent_instance_id)
         .map_err(ApiError::from_workspace_error)?;

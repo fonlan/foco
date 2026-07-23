@@ -1,6 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -35,6 +36,7 @@ use crate::{
         PlanMergeFailureKind, classify_plan_merge_failure, plan_merge_prompt,
         plan_phase_source_diff,
     },
+    runtime::{CodeGraphIndexState, release_code_graph_then_delete_worktree},
     *,
 };
 const PLAN_MERGE_CORRELATION_PREFIX: &str = "plan_merge:";
@@ -542,6 +544,7 @@ async fn sync_plan_merge_task(
                     {
                         delete_instance_worktree(
                             &state.background_command_registry,
+                            &state.code_graph_indexes,
                             workspace,
                             instance,
                             true,
@@ -584,12 +587,19 @@ async fn sync_plan_merge_task(
             if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree {
                 delete_instance_worktree(
                     &state.background_command_registry,
+                    &state.code_graph_indexes,
                     workspace,
                     instance,
                     true,
                 )?;
             }
-            delete_plan_worktrees(&state.background_command_registry, workspace, &plan, true)?;
+            delete_plan_worktrees(
+                &state.background_command_registry,
+                &state.code_graph_indexes,
+                workspace,
+                &plan,
+                true,
+            )?;
             continue_plan_if_ready(state, workspace, plan).await?;
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
@@ -932,7 +942,13 @@ async fn finalize_plan_worktree(
             drop(database);
             confirm_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id)?;
             release_confirmed_plan_derived_effects(state, workspace)?;
-            delete_plan_worktrees(&state.background_command_registry, workspace, plan, true)
+            delete_plan_worktrees(
+                &state.background_command_registry,
+                &state.code_graph_indexes,
+                workspace,
+                plan,
+                true,
+            )
         }
         Err(error) => {
             if is_shared_workspace_dirty_merge_error(&error) {
@@ -1274,6 +1290,7 @@ fn plan_instance_worktree_path(
 
 fn delete_plan_worktrees(
     background_commands: &BackgroundCommandRegistry,
+    code_graph_indexes: &Arc<Mutex<CodeGraphIndexState>>,
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
     allow_changes: bool,
@@ -1286,7 +1303,9 @@ fn delete_plan_worktrees(
         let root_key = root_path.display().to_string();
         if deleted_roots.insert(root_key) {
             stop_managed_commands_for_worktree(background_commands, &root_path);
-            delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
+            release_code_graph_then_delete_worktree(code_graph_indexes, &root_path, || {
+                delete_agent_worktree(&workspace.path, &root_path, allow_changes)
+            })?;
         }
         database
             .switch_agent_instance_to_shared_workspace(&instance.id)
@@ -1297,13 +1316,16 @@ fn delete_plan_worktrees(
 
 fn delete_instance_worktree(
     background_commands: &BackgroundCommandRegistry,
+    code_graph_indexes: &Arc<Mutex<CodeGraphIndexState>>,
     workspace: &WorkspaceConfig,
     instance: &AgentInstanceRecord,
     allow_changes: bool,
 ) -> Result<(), ApiError> {
     let root_path = plan_instance_worktree_path(workspace, instance);
     stop_managed_commands_for_worktree(background_commands, &root_path);
-    delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
+    release_code_graph_then_delete_worktree(code_graph_indexes, &root_path, || {
+        delete_agent_worktree(&workspace.path, &root_path, allow_changes)
+    })?;
     let mut database = open_workspace_database(&workspace.path)?;
     database
         .switch_agent_instance_to_shared_workspace(&instance.id)
