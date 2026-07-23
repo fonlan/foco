@@ -20,6 +20,8 @@ use foco_store::{
 };
 use serde_json::Value;
 
+use foco_tools::BackgroundCommandRegistry;
+
 use crate::{
     git_backend::{
         AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AgentWorktreeInfo, agent_instance_worktree_path,
@@ -537,7 +539,12 @@ async fn sync_plan_merge_task(
                     if instance.execution_workspace_mode
                         == AgentExecutionWorkspaceMode::IsolatedWorktree
                     {
-                        delete_instance_worktree(workspace, instance, true)?;
+                        delete_instance_worktree(
+                            &state.background_command_registry,
+                            workspace,
+                            instance,
+                            true,
+                        )?;
                     }
                     // Merge commit/apply failure: keep implementation phase completed
                     // and return the plan to implemented + merge error for Retry Merge.
@@ -574,9 +581,19 @@ async fn sync_plan_merge_task(
             confirm_plan_derived_effects_for_phase(workspace, &target.plan_id, &target.phase_id)?;
             release_confirmed_plan_derived_effects(state, workspace)?;
             if instance.execution_workspace_mode == AgentExecutionWorkspaceMode::IsolatedWorktree {
-                delete_instance_worktree(workspace, instance, true)?;
+                delete_instance_worktree(
+                    &state.background_command_registry,
+                    workspace,
+                    instance,
+                    true,
+                )?;
             }
-            delete_plan_worktrees(workspace, &plan, true)?;
+            delete_plan_worktrees(
+                &state.background_command_registry,
+                workspace,
+                &plan,
+                true,
+            )?;
             continue_plan_if_ready(state, workspace, plan).await?;
         }
         AgentTaskStatus::Failed | AgentTaskStatus::Cancelled | AgentTaskStatus::Interrupted => {
@@ -919,7 +936,12 @@ async fn finalize_plan_worktree(
             drop(database);
             confirm_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id)?;
             release_confirmed_plan_derived_effects(state, workspace)?;
-            delete_plan_worktrees(workspace, plan, true)
+            delete_plan_worktrees(
+                &state.background_command_registry,
+                workspace,
+                plan,
+                true,
+            )
         }
         Err(error) => {
             if is_shared_workspace_dirty_merge_error(&error) {
@@ -1259,6 +1281,7 @@ fn plan_instance_worktree_path(
 }
 
 fn delete_plan_worktrees(
+    background_commands: &BackgroundCommandRegistry,
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
     allow_changes: bool,
@@ -1270,6 +1293,7 @@ fn delete_plan_worktrees(
         let root_path = plan_instance_worktree_path(workspace, &instance);
         let root_key = root_path.display().to_string();
         if deleted_roots.insert(root_key) {
+            stop_managed_commands_for_worktree(background_commands, &root_path);
             delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
         }
         database
@@ -1280,17 +1304,48 @@ fn delete_plan_worktrees(
 }
 
 fn delete_instance_worktree(
+    background_commands: &BackgroundCommandRegistry,
     workspace: &WorkspaceConfig,
     instance: &AgentInstanceRecord,
     allow_changes: bool,
 ) -> Result<(), ApiError> {
     let root_path = plan_instance_worktree_path(workspace, instance);
+    stop_managed_commands_for_worktree(background_commands, &root_path);
     delete_agent_worktree(&workspace.path, &root_path, allow_changes)?;
     let mut database = open_workspace_database(&workspace.path)?;
     database
         .switch_agent_instance_to_shared_workspace(&instance.id)
         .map_err(ApiError::from_workspace_error)?;
     Ok(())
+}
+
+/// Stops managed background commands owned by one isolated worktree root.
+///
+/// Failures are logged and ignored so worktree/database cleanup can still finish.
+/// Matching is exact on the worktree path (after registry canonicalize), so shared
+/// workspace commands and other worktrees are not stopped.
+fn stop_managed_commands_for_worktree(
+    background_commands: &BackgroundCommandRegistry,
+    worktree_root: &Path,
+) {
+    match background_commands.stop_for_workspace(worktree_root) {
+        Ok(stopped) => {
+            if stopped > 0 {
+                tracing::info!(
+                    worktree = %worktree_root.display(),
+                    stopped,
+                    "stopped managed background commands before deleting plan worktree"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                worktree = %worktree_root.display(),
+                error = %error,
+                "failed to stop managed background commands before deleting plan worktree"
+            );
+        }
+    }
 }
 
 fn plan_runner_model_selection(

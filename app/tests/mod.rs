@@ -52,8 +52,9 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
-    ToolCancellationToken, WEB_FETCH_TOOL, WEB_SEARCH_TOOL,
+    BackgroundCommandRequest, BackgroundCommandStatus, GRAPH_EXPLORE_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL, ToolCancellationToken, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL,
 };
 use futures_util::StreamExt;
 use rusqlite::{Connection, params};
@@ -14047,6 +14048,150 @@ async fn retry_merge_after_dirty_block_cleans_ff_and_records_shared_merge_commit
         foco_agent::AgentExecutionWorkspaceMode::Shared
     );
     assert!(source_instance.worktree_status.is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn plan_worktree_cleanup_stops_managed_background_commands_for_that_worktree_only() {
+    let fixture = blocked_plan_worktree_fixture("bg-cmd-cleanup").await;
+    fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
+
+    let worktree_command = fixture
+        .state
+        .background_command_registry
+        .start(BackgroundCommandRequest {
+            workspace_path: fixture.source_root.clone(),
+            cwd: fixture.source_root.clone(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            owner_chat_id: Some("chat-plan-worktree".to_string()),
+            owner_run_id: None,
+            timeout: None,
+        })
+        .expect("start worktree background command");
+    let shared_command = fixture
+        .state
+        .background_command_registry
+        .start(BackgroundCommandRequest {
+            workspace_path: fixture.workspace.path.clone(),
+            cwd: fixture.workspace.path.clone(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30".to_string()],
+            owner_chat_id: Some("chat-shared-workspace".to_string()),
+            owner_run_id: None,
+            timeout: None,
+        })
+        .expect("start shared workspace background command");
+
+    let worktree_pid = wait_for_background_command_pid(
+        &fixture.state.background_command_registry,
+        &worktree_command.command_id,
+    );
+    let shared_pid = wait_for_background_command_pid(
+        &fixture.state.background_command_registry,
+        &shared_command.command_id,
+    );
+    assert!(
+        unix_process_is_alive(worktree_pid),
+        "worktree command should be running before cleanup"
+    );
+    assert!(
+        unix_process_is_alive(shared_pid),
+        "shared workspace command should be running before cleanup"
+    );
+
+    let retried = crate::plan_runtime::transition_plan_action(
+        &fixture.state,
+        &fixture.workspace.id,
+        &fixture.plan_id,
+        "retry_merge",
+    )
+    .await
+    .expect("retry merge");
+
+    assert_eq!(retried.status, "implemented");
+    assert!(retried.error_message.is_none());
+    assert!(!fixture.source_root.exists());
+    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 0);
+
+    let worktree_terminal = wait_for_background_command_terminal(
+        &fixture.state.background_command_registry,
+        &worktree_command.command_id,
+    );
+    assert_eq!(worktree_terminal.status, BackgroundCommandStatus::Stopped);
+    assert!(
+        !unix_process_is_alive(worktree_pid),
+        "worktree managed command process should exit after plan worktree cleanup"
+    );
+
+    let shared_snapshot = fixture
+        .state
+        .background_command_registry
+        .command(&shared_command.command_id)
+        .expect("shared command still registered");
+    assert_eq!(shared_snapshot.status, BackgroundCommandStatus::Running);
+    assert!(
+        unix_process_is_alive(shared_pid),
+        "shared workspace managed command must keep running"
+    );
+
+    fixture
+        .state
+        .background_command_registry
+        .stop(&shared_command.command_id)
+        .expect("stop shared command");
+    let shared_terminal = wait_for_background_command_terminal(
+        &fixture.state.background_command_registry,
+        &shared_command.command_id,
+    );
+    assert_eq!(shared_terminal.status, BackgroundCommandStatus::Stopped);
+}
+
+#[cfg(unix)]
+fn wait_for_background_command_pid(
+    registry: &foco_tools::BackgroundCommandRegistry,
+    command_id: &str,
+) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let snapshot = registry.command(command_id).expect("command status");
+        if snapshot.pid != 0 {
+            return snapshot.pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed command did not report a pid"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_background_command_terminal(
+    registry: &foco_tools::BackgroundCommandRegistry,
+    command_id: &str,
+) -> foco_tools::BackgroundCommandSnapshot {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = registry.command(command_id).expect("command status");
+        if snapshot.status.is_terminal() {
+            return snapshot;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "managed command did not reach a terminal status"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+fn unix_process_is_alive(pid: u32) -> bool {
+    let status = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .expect("kill -0");
+    status.success()
 }
 
 #[tokio::test]
