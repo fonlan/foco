@@ -1,4 +1,6 @@
 @import "tailwindcss";
+/* HeroUI v3 styles must follow Tailwind (see heroui-react skill). */
+@import "@heroui/styles";
 @import "katex/dist/katex.min.css";
 @import "@fontsource/big-shoulders-display/latin-700.css";
 @import "@fontsource/big-shoulders-display/latin-500.css";
@@ -14,8 +16,8 @@
 }
 
 :root {
-  color: var(--foco-text, #14110b);
-  background: var(--foco-canvas, #f5f1ea);
+  color: var(--foreground);
+  background: var(--background);
   font-family:
     Aptos,
     "Segoe UI Variable",
@@ -28,7 +30,6 @@
   font-synthesis: none;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
-  color-scheme: light;
 }
 
 * {
@@ -42,20 +43,8 @@ html {
 body {
   margin: 0;
   min-width: 320px;
-  background:
-    linear-gradient(
-      180deg,
-      rgba(252, 250, 245, 0.7),
-      rgba(245, 241, 234, 0.92)
-    ),
-    repeating-linear-gradient(
-      0deg,
-      rgba(20, 17, 11, 0.018) 0,
-      rgba(20, 17, 11, 0.018) 1px,
-      transparent 1px,
-      transparent 6px
-    ),
-    var(--foco-canvas, #f5f1ea);
+  background: var(--background);
+  color: var(--foreground);
 }
 
 #root {
@@ -148,7 +137,7 @@ summary:focus-visible {
 .app-root {
   height: 100dvh;
   overflow: hidden;
-  background: var(--foco-canvas, #f5f1ea);
+  background: var(--foco-canvas);
 }
 
 .app-shell {
@@ -1256,44 +1245,11 @@ summary:focus-visible {
   }
 }
 
-/* Foco WebUI — "Optical Instrument" design system.
-   Warm paper canvas, deep ink, a single signal-amber accent used as
-   restraint, and a self-hosted display face for personality. */
+/* Foco layout/typography tokens + transitional --foco-* color aliases.
+   Color aliases map only to HeroUI default semantic tokens and must be
+   deleted as call sites migrate (see web/shared/ui/FOCO_TOKEN_MIGRATION.md). */
 :root {
-  --foco-canvas: #f5f1ea;
-  --foco-canvas-raised: #f8f4ed;
-  --foco-rail: #1a1814;
-  --foco-rail-soft: #23201b;
-  --foco-sidebar: #f8f4ed;
-  --foco-panel: #fcfaf5;
-  --foco-panel-soft: #f6f1e7;
-  --foco-panel-muted: #ede5d6;
-  --foco-panel-selected: #fbf1e3;
-  --foco-border: #e0d7c5;
-  --foco-border-strong: #c9bca0;
-  --foco-border-active: #d99a52;
-  --foco-text: #14110b;
-  --foco-text-muted: #6b6457;
-  --foco-text-faint: #9a9082;
-  --foco-text-subtle: #b4aa9a;
-  --foco-primary: #14110b;
-  --foco-primary-hover: #2a241a;
-  --foco-accent: #c8651b;
-  --foco-accent-hover: #ad5414;
-  --foco-accent-strong: #9a4912;
-  --foco-accent-soft: #f8e9d8;
-  --foco-accent-muted: #f0d4b6;
-  --foco-accent-line: #d99a52;
-  --foco-user-surface: #fbf1e3;
-  --foco-user-border: #d99a52;
-  --foco-user-avatar: #9a4912;
-  --foco-success: #4f7a3a;
-  --foco-success-soft: #e7efdf;
-  --foco-warning: #b07a1e;
-  --foco-warning-soft: #f7ecd2;
-  --foco-error: #a83a2a;
-  --foco-error-soft: #f5dfd9;
-  --foco-danger: #a83a2a;
+  /* Layout / typography (not color system) */
   --foco-header-height: 2.75rem;
   --foco-font-ui: 0.8125rem;
   --foco-font-body: 0.84375rem;
@@ -1303,144 +1259,81 @@ summary:focus-visible {
     "Big Shoulders Display", "Segoe UI Variable", "Segoe UI", ui-sans-serif,
     system-ui, sans-serif;
   --foco-line-body: 1.55;
-  --foco-shadow-subtle: 0 1px 2px rgba(20, 17, 11, 0.07);
-  --foco-shadow-soft: 0 10px 28px rgba(20, 17, 11, 0.08);
-  --foco-shadow-raised: 0 18px 46px rgba(20, 17, 11, 0.13);
-  --foco-shadow-accent: 0 14px 32px rgba(200, 101, 27, 0.18);
-  --foco-focus-ring: 0 0 0 3px rgba(200, 101, 27, 0.2);
-  --foco-sidebar-gradient: linear-gradient(
-    180deg,
-    rgba(252, 250, 245, 0.92),
-    rgba(245, 241, 234, 0.98)
-  );
-  --foco-header-surface: rgba(252, 250, 245, 0.92);
-  --foco-row-hover: rgba(255, 252, 245, 0.7);
-  --foco-chat-row-hover: rgba(255, 252, 245, 0.74);
-  --foco-active-surface-gradient: linear-gradient(
-    180deg,
-    #fcfaf5,
-    var(--foco-panel-selected)
-  );
-  --foco-active-inset-shadow: inset 0 1px 0 rgba(255, 252, 245, 0.82);
-  --foco-toolbar-surface: rgba(252, 250, 245, 0.92);
-  --foco-main-panel-gradient: linear-gradient(
-    180deg,
-    rgba(252, 250, 245, 0.5),
-    rgba(245, 241, 234, 0.72)
-  );
-  --foco-row-border: rgba(224, 215, 197, 0.72);
-  --foco-empty-surface: rgba(252, 250, 245, 0.86);
-  --foco-composer-shell-gradient: linear-gradient(
-    180deg,
-    rgba(245, 241, 234, 0),
-    var(--foco-canvas)
-  );
-  --foco-composer-top-shadow: 0 1px 0 rgba(255, 252, 245, 0.85);
-  --foco-context-tabs-surface: rgba(252, 250, 245, 0.72);
-  --foco-graph-line: rgba(201, 188, 160, 0.6);
-  --foco-settings-main-gradient: linear-gradient(
-    180deg,
-    rgba(252, 250, 245, 0.46),
-    rgba(245, 241, 234, 0.62)
-  );
-  --foco-settings-card-surface: rgba(252, 250, 245, 0.9);
-  --foco-json-surface: #fcfaf5;
-  --foco-json-header: #f6f1e7;
-  --foco-json-border: #e0d7c5;
-  --foco-json-text: #14110b;
-  --foco-json-key: #9a4912;
-  --foco-json-string: #8a4b05;
-  --foco-json-number: #3c5a8a;
-  --foco-json-literal: #a83a2a;
-  --foco-json-punctuation: #6b6457;
+
+  /* Transitional color aliases → HeroUI semantic tokens */
+  --foco-canvas: var(--background);
+  --foco-canvas-raised: var(--background-secondary);
+  --foco-rail: var(--background-inverse);
+  --foco-rail-soft: var(--surface-tertiary);
+  --foco-sidebar: var(--surface);
+  --foco-panel: var(--surface);
+  --foco-panel-soft: var(--surface-secondary);
+  --foco-panel-muted: var(--default);
+  --foco-panel-selected: var(--accent-soft);
+  --foco-border: var(--border);
+  --foco-border-strong: var(--border-secondary);
+  --foco-border-active: var(--accent);
+  --foco-text: var(--foreground);
+  --foco-text-muted: var(--muted);
+  --foco-text-faint: var(--muted);
+  --foco-text-subtle: var(--muted);
+  --foco-foreground: var(--foreground);
+  --foco-muted: var(--muted);
+  --foco-muted-foreground: var(--muted);
+  --foco-primary: var(--foreground);
+  --foco-primary-hover: var(--accent);
+  --foco-accent: var(--accent);
+  --foco-accent-hover: var(--accent-hover);
+  --foco-accent-strong: var(--accent-soft-foreground);
+  --foco-accent-soft: var(--accent-soft);
+  --foco-accent-muted: var(--accent-soft-hover);
+  --foco-accent-line: var(--accent);
+  --foco-user-surface: var(--accent-soft);
+  --foco-user-border: var(--accent);
+  --foco-user-avatar: var(--accent);
+  --foco-success: var(--success);
+  --foco-success-soft: var(--success-soft);
+  --foco-warning: var(--warning);
+  --foco-warning-soft: var(--warning-soft);
+  --foco-error: var(--danger);
+  --foco-error-soft: var(--danger-soft);
+  --foco-danger: var(--danger);
+  --foco-shadow-subtle: var(--surface-shadow);
+  --foco-shadow-soft: var(--overlay-shadow);
+  --foco-shadow-raised: var(--overlay-shadow);
+  --foco-shadow-accent: var(--overlay-shadow);
+  --foco-focus-ring: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
+  --foco-sidebar-gradient: var(--surface);
+  --foco-header-surface: var(--surface);
+  --foco-row-hover: var(--surface-hover);
+  --foco-chat-row-hover: var(--surface-hover);
+  --foco-active-surface-gradient: var(--accent-soft);
+  --foco-active-inset-shadow: none;
+  --foco-toolbar-surface: var(--surface);
+  --foco-main-panel-gradient: var(--background);
+  --foco-row-border: var(--border);
+  --foco-empty-surface: var(--surface-secondary);
+  --foco-composer-shell-gradient: var(--background);
+  --foco-composer-top-shadow: none;
+  --foco-context-tabs-surface: var(--surface);
+  --foco-graph-line: var(--border-secondary);
+  --foco-settings-main-gradient: var(--background);
+  --foco-settings-card-surface: var(--surface);
+  --foco-json-surface: var(--surface);
+  --foco-json-header: var(--surface-secondary);
+  --foco-json-border: var(--border);
+  --foco-json-text: var(--foreground);
+  --foco-json-key: var(--accent-soft-foreground);
+  --foco-json-string: var(--warning);
+  --foco-json-number: var(--success);
+  --foco-json-literal: var(--danger);
+  --foco-json-punctuation: var(--muted);
 }
 
+/* Dark theme is driven by HeroUI `.dark` / `[data-theme="dark"]`.
+   Keep a no-op selector only if legacy tests still set data-foco-theme. */
 html[data-foco-theme="dark"] {
-  color-scheme: dark;
-  --foco-canvas: #1a1814;
-  --foco-canvas-raised: #211e19;
-  --foco-rail: #0e0d0b;
-  --foco-rail-soft: #16140f;
-  --foco-sidebar: #201d18;
-  --foco-panel: #25221c;
-  --foco-panel-soft: #1d1a15;
-  --foco-panel-muted: #2e2a23;
-  --foco-panel-selected: #332619;
-  --foco-border: #332e25;
-  --foco-border-strong: #463f31;
-  --foco-border-active: #8a5a28;
-  --foco-text: #ece6db;
-  --foco-text-muted: #a89e8c;
-  --foco-text-faint: #7a7160;
-  --foco-text-subtle: #5d5546;
-  --foco-primary: #ece6db;
-  --foco-primary-hover: #ffffff;
-  --foco-accent: #e8923c;
-  --foco-accent-hover: #f4a659;
-  --foco-accent-strong: #f4a659;
-  --foco-accent-soft: rgba(232, 146, 60, 0.16);
-  --foco-accent-muted: rgba(232, 146, 60, 0.26);
-  --foco-accent-line: #8a5a28;
-  --foco-user-surface: #332619;
-  --foco-user-border: #8a5a28;
-  --foco-user-avatar: #e8923c;
-  --foco-success: #8fb96a;
-  --foco-success-soft: rgba(143, 185, 106, 0.16);
-  --foco-warning: #e0b25a;
-  --foco-warning-soft: rgba(224, 178, 90, 0.16);
-  --foco-error: #e07a6a;
-  --foco-error-soft: rgba(224, 122, 106, 0.16);
-  --foco-danger: #e07a6a;
-  --foco-shadow-subtle: 0 1px 2px rgba(0, 0, 0, 0.3);
-  --foco-shadow-soft: 0 12px 30px rgba(0, 0, 0, 0.36);
-  --foco-shadow-raised: 0 20px 54px rgba(0, 0, 0, 0.48);
-  --foco-shadow-accent: 0 14px 34px rgba(232, 146, 60, 0.28);
-  --foco-focus-ring: 0 0 0 3px rgba(232, 146, 60, 0.3);
-  --foco-sidebar-gradient: linear-gradient(
-    180deg,
-    rgba(32, 29, 24, 0.96),
-    rgba(26, 24, 20, 0.98)
-  );
-  --foco-header-surface: rgba(37, 34, 28, 0.92);
-  --foco-row-hover: rgba(255, 250, 240, 0.055);
-  --foco-chat-row-hover: rgba(255, 250, 240, 0.05);
-  --foco-active-surface-gradient: linear-gradient(
-    180deg,
-    rgba(51, 38, 25, 0.95),
-    var(--foco-panel-selected)
-  );
-  --foco-active-inset-shadow: inset 0 1px 0 rgba(255, 250, 240, 0.06);
-  --foco-toolbar-surface: rgba(37, 34, 28, 0.94);
-  --foco-main-panel-gradient: linear-gradient(
-    180deg,
-    rgba(33, 30, 25, 0.72),
-    rgba(26, 24, 20, 0.9)
-  );
-  --foco-row-border: rgba(51, 46, 37, 0.72);
-  --foco-empty-surface: rgba(33, 30, 25, 0.86);
-  --foco-composer-shell-gradient: linear-gradient(
-    180deg,
-    rgba(26, 24, 20, 0),
-    var(--foco-canvas)
-  );
-  --foco-composer-top-shadow: 0 1px 0 rgba(255, 250, 240, 0.05);
-  --foco-context-tabs-surface: rgba(33, 30, 25, 0.78);
-  --foco-graph-line: rgba(70, 63, 49, 0.5);
-  --foco-settings-main-gradient: linear-gradient(
-    180deg,
-    rgba(33, 30, 25, 0.66),
-    rgba(26, 24, 20, 0.84)
-  );
-  --foco-settings-card-surface: rgba(33, 30, 25, 0.9);
-  --foco-json-surface: #1d1a15;
-  --foco-json-header: #25221c;
-  --foco-json-border: #332e25;
-  --foco-json-text: #ece6db;
-  --foco-json-key: #f4a659;
-  --foco-json-string: #e0b25a;
-  --foco-json-number: #8fb96a;
-  --foco-json-literal: #e07a6a;
-  --foco-json-punctuation: #a89e8c;
+  /* Prefer HeroUI contract; this only mirrors class for transitional tests. */
 }
 
 body,
@@ -1832,10 +1725,8 @@ body,
 
 .workspace-menu-active {
   border-color: var(--foco-accent-line);
-  background: linear-gradient(180deg, #fdf6ec, var(--foco-accent-soft));
-  box-shadow:
-    inset 0 0 0 1px rgba(200, 101, 27, 0.06),
-    0 8px 18px rgba(20, 17, 11, 0.06);
+  background: var(--foco-accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--accent) 12%, transparent);
 }
 
 .workspace-item {

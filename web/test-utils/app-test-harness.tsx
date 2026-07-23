@@ -2939,7 +2939,10 @@ export function resetAppTestEnvironment() {
   appTestState.workspaceSkillsDefaultErrors = [];
   window.history.replaceState(null, "", "/");
   window.localStorage.clear();
+  document.documentElement.classList.remove("light", "dark");
+  document.documentElement.removeAttribute("data-theme");
   document.documentElement.removeAttribute("data-foco-theme");
+  document.documentElement.style.colorScheme = "";
   mermaidMock.initialize.mockClear();
   mermaidMock.render.mockClear();
   Object.defineProperty(navigator, "clipboard", {

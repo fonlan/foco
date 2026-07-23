@@ -1758,7 +1758,8 @@ describe("app-settings verification surfaces", () => {
       );
     });
     await waitFor(() => {
-      expect(document.documentElement.dataset.focoTheme).toBe("dark");
+      expect(document.documentElement.dataset.theme).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
     });
   });
 
@@ -1767,10 +1768,14 @@ describe("app-settings verification surfaces", () => {
     renderApp();
 
     await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
-    await userEvent.selectOptions(
-      await screen.findByRole("combobox", { name: /Theme/ }),
-      "dark",
-    );
+    const themeSelect = await screen.findByRole("combobox", { name: /Theme/ });
+    await waitFor(() => {
+      expect(themeSelect).not.toBeDisabled();
+      expect(
+        within(themeSelect).getByRole("option", { name: "Dark" }),
+      ).toBeInTheDocument();
+    });
+    await userEvent.selectOptions(themeSelect, "dark");
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -1782,7 +1787,8 @@ describe("app-settings verification surfaces", () => {
       );
     });
     await waitFor(() => {
-      expect(document.documentElement.dataset.focoTheme).toBe("dark");
+      expect(document.documentElement.dataset.theme).toBe("dark");
+      expect(document.documentElement.classList.contains("dark")).toBe(true);
     });
   });
 

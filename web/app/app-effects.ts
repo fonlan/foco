@@ -9,9 +9,27 @@ export function useDocumentLanguage(language: string) {
   }, [language]);
 }
 
+const THEME_COLOR_LIGHT = "#f7f7f7";
+const THEME_COLOR_DARK = "#1c1b1f";
+
+/** Sync HeroUI v3 theme contract: class + data-theme + color-scheme. */
 export function useDocumentTheme(theme: string) {
   useEffect(() => {
-    document.documentElement.dataset.focoTheme = theme;
+    const root = document.documentElement;
+    const next = theme === "dark" ? "dark" : "light";
+
+    root.classList.remove("light", "dark");
+    root.classList.add(next);
+    root.dataset.theme = next;
+    root.style.colorScheme = next;
+
+    const themeColor = document.querySelector('meta[name="theme-color"]');
+    if (themeColor) {
+      themeColor.setAttribute(
+        "content",
+        next === "dark" ? THEME_COLOR_DARK : THEME_COLOR_LIGHT,
+      );
+    }
   }, [theme]);
 }
 
