@@ -12528,6 +12528,19 @@ fn insert_claimed_agent_task(
     foco_agent::AgentTaskId,
     foco_agent::AgentAttemptId,
 ) {
+    insert_claimed_agent_task_with_input(workspace_dir, suffix, "{}")
+}
+
+fn insert_claimed_agent_task_with_input(
+    workspace_dir: &Path,
+    suffix: &str,
+    input_json: &str,
+) -> (
+    foco_agent::AgentTeamId,
+    foco_agent::AgentInstanceId,
+    foco_agent::AgentTaskId,
+    foco_agent::AgentAttemptId,
+) {
     let chat_id = format!("chat-{suffix}");
     let team_id = foco_agent::AgentTeamId::new(format!("agent-team-{suffix}")).expect("team id");
     let instance_id =
@@ -12574,7 +12587,7 @@ fn insert_claimed_agent_task(
             owner_instance_id: &instance_id,
             origin_instance_id: None,
             parent_task_id: None,
-            input_json: "{}",
+            input_json,
         })
         .expect("enqueue");
     database
@@ -12582,6 +12595,105 @@ fn insert_claimed_agent_task(
         .expect("claim")
         .expect("claimed");
     (team_id, instance_id, task_id, attempt_id)
+}
+
+#[test]
+fn startup_reconciliation_closes_owned_implementation_chat_before_failing_task() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let input = json!({
+        "queuedUserMessageId": "user-restart-owner",
+        "visibleAssistantMessageId": "assistant-restart-owner",
+        "visibleAssistantSequence": 1,
+        "message": "Implement the phase",
+    })
+    .to_string();
+    let (team_id, _, task_id, _attempt_id) =
+        insert_claimed_agent_task_with_input(workspace.path(), "restart-owner", &input);
+    let chat_id = "chat-restart-owner";
+    {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .insert_message(NewMessage {
+                id: "user-restart-owner",
+                chat_id,
+                role: "user",
+                content: "Implement the phase",
+                sequence: 0,
+                metadata_json: Some(r#"{"queuedRun":{"status":"queued"}}"#),
+            })
+            .expect("user message");
+        database
+            .insert_message(NewMessage {
+                id: "assistant-restart-owner",
+                chat_id,
+                role: "assistant",
+                content: "partial text",
+                sequence: 1,
+                metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+            })
+            .expect("streaming assistant");
+        database
+            .mark_chat_queued_run_started(
+                chat_id,
+                "user-restart-owner",
+                "assistant-restart-owner",
+                1,
+            )
+            .expect("mark queued run");
+        database
+            .claim_agent_chat_queued_run(
+                chat_id,
+                "user-restart-owner",
+                "assistant-restart-owner",
+                1,
+                task_id.as_str(),
+                "run-restart-owner",
+            )
+            .expect("claim queued run");
+    }
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Failed
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&task_id)
+            .expect("attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Failed
+    );
+    let chat = database.chat(chat_id).expect("chat").expect("chat");
+    let chat_metadata = parse_json_value(&chat.metadata_json, "chat metadata").expect("metadata");
+    assert!(chat_metadata.get("queuedRun").is_none());
+    let user = database
+        .message("user-restart-owner")
+        .expect("user")
+        .expect("user");
+    let user_metadata = parse_json_value(&user.metadata_json, "user metadata").expect("metadata");
+    assert!(user_metadata.get("queuedRun").is_none());
+    let assistant = database
+        .message("assistant-restart-owner")
+        .expect("assistant")
+        .expect("assistant");
+    let assistant_metadata =
+        parse_json_value(&assistant.metadata_json, "assistant metadata").expect("metadata");
+    assert_eq!(assistant_metadata["streamingState"], json!("failed"));
+    assert!(assistant.content.contains("backend restarted"));
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    assert!(events.iter().any(|event| event.event_type == "task_failed"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -16470,6 +16582,7 @@ fn queued_user_message_metadata_writes_top_level_session_mode() {
         &[],
         Some("plan"),
         false,
+        None,
         None,
     )
     .expect("queued user metadata json");

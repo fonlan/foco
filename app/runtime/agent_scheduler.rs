@@ -19,7 +19,7 @@ use foco_providers::{NeutralChatMessage, NeutralChatRole, NeutralToolCall, Neutr
 use foco_store::{
     config::{AGENT_DEFINITION_SYSTEM_PROMPT_MAX_CHARS, AgentDefinitionSettings},
     workspace::{
-        AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
+        AgentAttemptRecord, AgentContextEntryRecord, AgentInstanceRecord, AgentMessageRecord,
         AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate, AgentTeamRecord,
         NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, PreStreamChatFailureClosure,
         PreStreamChatFailureClosureResult, WorkspaceDatabase,
@@ -379,6 +379,20 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
                 )?;
                     continue;
                 }
+                if close_restarted_coordinator_chat_run(
+                    &mut database,
+                    &record.task,
+                    &record.attempt,
+                )? {
+                    database
+                        .fail_plan_phase_run(&record.task.id, RESTART_INTERRUPTION_REASON)
+                        .map_err(ApiError::from_workspace_error)?;
+                    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                        &mut database,
+                        &record.task.id,
+                    )?;
+                    continue;
+                }
                 database
                     .update_agent_task_state(AgentTaskStateUpdate {
                         team_id: &record.task.team_id,
@@ -478,6 +492,93 @@ pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> 
         tracing::warn!(error = %error.message, "failed to reconcile integrated plan derived effects");
     }
     Ok(())
+}
+
+/// Close a Coordinator-owned implementation chat during startup recovery.
+///
+/// The task, attempt, streaming assistant, and queuedRun must transition in
+/// one transaction so a runner left over from the previous process cannot
+/// continue writing after its Plan phase has become terminal.
+fn close_restarted_coordinator_chat_run(
+    database: &mut WorkspaceDatabase,
+    task: &AgentTaskRecord,
+    attempt: &AgentAttemptRecord,
+) -> Result<bool, ApiError> {
+    let Ok(input) = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json) else {
+        return Ok(false);
+    };
+    let (Some(assistant_message_id), Some(assistant_sequence)) = (
+        input.visible_assistant_message_id.as_deref(),
+        input.visible_assistant_sequence,
+    ) else {
+        return Ok(false);
+    };
+    let Some(team) = database
+        .agent_team(&task.team_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(instance) = database
+        .agent_instance(&task.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    if instance.role != AgentRole::Coordinator {
+        return Ok(false);
+    }
+
+    let error_json = json!({
+        "message": RESTART_INTERRUPTION_REASON,
+        "code": "backend_restart_interrupted",
+        "stage": "startup_reconciliation",
+        "retryable": false,
+    })
+    .to_string();
+    let assistant_metadata_json = json!({
+        "streamingState": "failed",
+        "runFailure": {
+            "code": "backend_restart_interrupted",
+            "stage": "startup_reconciliation",
+            "retryable": false,
+            "taskId": task.id.as_str(),
+            "attemptId": attempt.id.as_str(),
+            "message": RESTART_INTERRUPTION_REASON,
+        },
+        "parts": [StoredChatMessagePart::Error {
+            text: RESTART_INTERRUPTION_REASON.to_string(),
+        }],
+        "partsVersion": STORED_CHAT_PARTS_VERSION,
+        "partsSource": "startup_reconciliation",
+    })
+    .to_string();
+    let result = database
+        .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+            task_id: &task.id,
+            attempt_id: &attempt.id,
+            chat_id: &team.chat_id,
+            user_message_id: &input.queued_user_message_id,
+            assistant_message_id,
+            assistant_sequence,
+            error_json: &error_json,
+            assistant_content: RESTART_INTERRUPTION_REASON,
+            assistant_metadata_json: &assistant_metadata_json,
+            materialize_assistant: true,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    match result {
+        PreStreamChatFailureClosureResult::Applied => Ok(true),
+        PreStreamChatFailureClosureResult::Skipped { reason } => {
+            tracing::info!(
+                task_id = %task.id,
+                attempt_id = %attempt.id,
+                reason = %reason,
+                "startup Coordinator chat closure skipped because the durable owner changed"
+            );
+            Ok(false)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -897,9 +998,32 @@ async fn run_coordinator_task_inner(
         attempt_id: Some(attempt_id.clone()),
     };
     let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
-    let next_run_event_sequence = open_workspace_database_critical(&workspace.path)?
+    let mut database = open_workspace_database_critical(&workspace.path)?;
+    if chat_context.agent_primary_chat_output {
+        let queued_user_message_id =
+            chat_context
+                .queued_user_message_id
+                .as_deref()
+                .ok_or_else(|| {
+                    ApiError::internal(
+                        "Coordinator primary chat run is missing its queued user message",
+                    )
+                })?;
+        database
+            .claim_agent_chat_queued_run(
+                &chat_context.chat_id,
+                queued_user_message_id,
+                &chat_context.assistant_message_id,
+                chat_context.assistant_sequence,
+                task.id.as_str(),
+                &chat_context.llm_request_id,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    let next_run_event_sequence = database
         .next_run_event_sequence(task.id.as_str())
         .map_err(ApiError::from_workspace_error)?;
+    drop(database);
     // Register before snapshotting unread Agent messages. Messages sent after the snapshot are
     // buffered as live guidance instead of being stranded until a later attempt.
     let registration = state

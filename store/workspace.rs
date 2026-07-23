@@ -60,8 +60,8 @@ pub use workspace_records::{
     LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRecord,
     LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
     NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
-    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewCodeGraphEdge,
-    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
+    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot,
+    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
     NewCodeGraphImportResolutionCandidate, NewCodeGraphReference, NewCodeGraphResolvedCall,
     NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
     NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
@@ -71,7 +71,7 @@ pub use workspace_records::{
     PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
     PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
     PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-    PreStreamFailureMaterialization, PromptContextInjectionRecord,
+    PreStreamFailureMaterialization, PromptContextInjectionRecord, QueueCoordinatorChatMessage,
     RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
     STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
@@ -588,6 +588,145 @@ pub enum RemoteQueuedRunClaimOutcome {
 pub enum RemoteQueuedRunClearOutcome {
     Cleared,
     NotOwned,
+}
+
+/// Result of claiming a Coordinator-owned primary chat run.
+///
+/// Unlike the remote-only owner, a Coordinator claim also binds the durable
+/// Agent task that created the visible assistant placeholder. This lets a
+/// legacy queued run be upgraded only when its still-live task proves the
+/// exact chat/message identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentQueuedRunClaimOutcome {
+    Claimed,
+    AlreadyOwned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentQueuedRunClearOutcome {
+    Cleared,
+    NotOwned,
+}
+
+fn queued_run_matches_agent_identity(
+    queued_run: &serde_json::Map<String, Value>,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    assistant_sequence: i64,
+    allow_missing_user_message_id: bool,
+) -> bool {
+    let queued_user_message_id = queued_run
+        .get("userMessageId")
+        .or_else(|| queued_run.get("user_message_id"))
+        .and_then(Value::as_str);
+    (allow_missing_user_message_id && queued_user_message_id.is_none()
+        || queued_user_message_id == Some(user_message_id))
+        && queued_run
+            .get("assistantMessageId")
+            .or_else(|| queued_run.get("assistant_message_id"))
+            .and_then(Value::as_str)
+            == Some(assistant_message_id)
+        && queued_run
+            .get("assistantSequence")
+            .or_else(|| queued_run.get("assistant_sequence"))
+            .and_then(Value::as_i64)
+            .is_none_or(|sequence| sequence == assistant_sequence)
+}
+
+fn active_agent_task_matches_queued_run(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    chat_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    assistant_sequence: i64,
+    agent_task_id: &str,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let task = transaction
+        .query_row(
+            "SELECT tasks.input_json, tasks.status, teams.chat_id
+             FROM agent_tasks AS tasks
+             JOIN agent_teams AS teams ON teams.id = tasks.team_id
+             WHERE tasks.id = ?1",
+            params![agent_task_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|source| sqlite_error(database_path, source))?;
+    let Some((input_json, status, task_chat_id)) = task else {
+        return Ok(false);
+    };
+    if task_chat_id != chat_id || !matches!(status.as_str(), "queued" | "running" | "waiting") {
+        return Ok(false);
+    }
+    let input = serde_json::from_str::<Value>(&input_json).map_err(|source| {
+        WorkspaceDatabaseError::InvalidMessageMetadata {
+            message: format!("Coordinator task input is invalid JSON: {source}"),
+        }
+    })?;
+    Ok(
+        input.get("queuedUserMessageId").and_then(Value::as_str) == Some(user_message_id)
+            && input
+                .get("visibleAssistantMessageId")
+                .and_then(Value::as_str)
+                == Some(assistant_message_id)
+            && input
+                .get("visibleAssistantSequence")
+                .and_then(Value::as_i64)
+                == Some(assistant_sequence),
+    )
+}
+
+fn agent_chat_run_is_owned_in_transaction(
+    transaction: &Transaction<'_>,
+    database_path: &Path,
+    chat_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    assistant_sequence: i64,
+    agent_task_id: &str,
+    run_id: &str,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let Some(chat) = chat_from_transaction(transaction, database_path, chat_id)? else {
+        return Ok(false);
+    };
+    let Some(user) = message_from_transaction(transaction, database_path, user_message_id)? else {
+        return Ok(false);
+    };
+    if user.chat_id != chat_id || user.role != "user" {
+        return Ok(false);
+    }
+    let chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+    let user_metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+    let Some(chat_run) = chat_metadata
+        .get(QUEUED_CHAT_METADATA_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Ok(false);
+    };
+    let Some(user_run) = user_metadata
+        .get(QUEUED_MESSAGE_METADATA_KEY)
+        .and_then(Value::as_object)
+    else {
+        return Ok(false);
+    };
+    Ok([chat_run, user_run].into_iter().all(|queued_run| {
+        queued_run_matches_agent_identity(
+            queued_run,
+            user_message_id,
+            assistant_message_id,
+            assistant_sequence,
+            queued_run.get("userMessageId").is_none(),
+        ) && queued_run.get("status").and_then(Value::as_str) == Some("running")
+            && queued_run.get("agentTaskId").and_then(Value::as_str) == Some(agent_task_id)
+            && queued_run.get("runId").and_then(Value::as_str) == Some(run_id)
+    }))
 }
 
 /// Result of atomically persisting a remote pre-stream assistant failure and
@@ -6235,6 +6374,362 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))
     }
 
+    /// Atomically publishes a primary chat message and the Coordinator task
+    /// that owns its queued run. This is intentionally the only point at which
+    /// a newly-created chat exposes `queuedRun` to concurrent readers.
+    pub fn queue_coordinator_chat_message(
+        &mut self,
+        queued: QueueCoordinatorChatMessage<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let has_new_chat = queued.new_chat_title.is_some();
+        if has_new_chat != queued.new_chat_metadata_json.is_some() {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "new chat title and metadata must be supplied together".to_string(),
+            });
+        }
+        if queued.user_message.chat_id != queued.chat_id || queued.user_message.role != "user" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "queued Coordinator message must be a user message for its chat"
+                    .to_string(),
+            });
+        }
+        if queued.max_team_queued <= 0
+            || queued.max_instance_queued <= 0
+            || queued.max_chat_queued <= 0
+        {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent queued task limits must be greater than 0".to_string(),
+            });
+        }
+        validate_agent_json(queued.task.input_json, "input_json")?;
+        validate_agent_json(queued.task_queued_payload_json, "payload_json")?;
+        let queued_run =
+            serde_json::from_str::<Value>(queued.chat_queued_run_json).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat queued run is invalid JSON: {source}"),
+                }
+            })?;
+        if !queued_run.is_object() {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "chat queued run must be an object".to_string(),
+            });
+        }
+        if let Some(metadata_json) = queued.new_chat_metadata_json {
+            validate_json_metadata(metadata_json, "chat metadata")?;
+        }
+        if let Some(snapshot) = queued.chat_spec_snapshot.as_ref() {
+            WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.validate_markdown_size(snapshot.content_markdown)?;
+            workspace_spec_revision_to_i64(snapshot.revision, "spec_revision")?;
+        }
+
+        let new_team_snapshot = queued
+            .new_team
+            .as_ref()
+            .map(|team| {
+                if team.max_concurrent_runs <= 0 {
+                    return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: "max_concurrent_runs must be greater than 0".to_string(),
+                    });
+                }
+                match team.coordinator_execution_workspace_mode {
+                    AgentExecutionWorkspaceMode::Shared
+                        if team.coordinator_execution_root_path.is_some()
+                            || team.coordinator_worktree_base_revision.is_some()
+                            || team.coordinator_worktree_branch.is_some()
+                            || team.coordinator_worktree_status.is_some() =>
+                    {
+                        return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                            message: "shared Coordinator must not include Agent worktree metadata"
+                                .to_string(),
+                        });
+                    }
+                    AgentExecutionWorkspaceMode::IsolatedWorktree
+                        if team.coordinator_execution_root_path.is_none()
+                            || team.coordinator_worktree_base_revision.is_none()
+                            || team.coordinator_worktree_branch.is_none()
+                            || team.coordinator_worktree_status.is_none() =>
+                    {
+                        return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                            message: "isolated Coordinator requires Agent worktree metadata"
+                                .to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+                let snapshot_json =
+                    serde_json::to_string(team.coordinator_definition).map_err(|source| {
+                        WorkspaceDatabaseError::AgentRuntimeJson {
+                            field: "definition_snapshot_json",
+                            source,
+                        }
+                    })?;
+                validate_agent_definition_snapshot(&snapshot_json)?;
+                Ok(snapshot_json)
+            })
+            .transpose()?;
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        if let (Some(title), Some(metadata_json)) =
+            (queued.new_chat_title, queued.new_chat_metadata_json)
+        {
+            transaction
+                .execute(
+                    "INSERT INTO chats (id, title, created_at, updated_at, metadata_json)
+                     VALUES (?1, ?2, ?3, ?3, ?4)",
+                    params![queued.chat_id, title, now, metadata_json],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        if let (Some(team), Some(snapshot_json)) =
+            (queued.new_team.as_ref(), new_team_snapshot.as_deref())
+        {
+            if team.chat_id != queued.chat_id
+                || team.id != queued.task.team_id
+                || team.coordinator_instance_id != queued.task.owner_instance_id
+            {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: "new Coordinator team does not match the queued chat and task"
+                        .to_string(),
+                });
+            }
+            let definition_revision =
+                i64::try_from(team.coordinator_definition.revision).map_err(|_| {
+                    WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: "agent definition revision exceeds SQLite integer range"
+                            .to_string(),
+                    }
+                })?;
+            transaction
+                .execute(
+                    "INSERT INTO agent_teams
+                        (id, chat_id, coordinator_instance_id, status, max_concurrent_runs,
+                         next_event_sequence, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 'active', ?4, 0, ?5, ?5)",
+                    params![
+                        team.id.as_str(),
+                        team.chat_id,
+                        team.coordinator_instance_id.as_str(),
+                        team.max_concurrent_runs,
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            transaction
+                .execute(
+                    "INSERT INTO agent_instances
+                        (id, team_id, definition_id, definition_revision,
+                         definition_snapshot_json, role, status, next_task_sequence,
+                         next_message_sequence, context_generation, execution_workspace_mode,
+                         execution_root_path, worktree_base_revision, worktree_branch,
+                         worktree_status, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, 'coordinator', 'idle', 0, 0, 0, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                    params![
+                        team.coordinator_instance_id.as_str(),
+                        team.id.as_str(),
+                        team.coordinator_definition.id.as_str(),
+                        definition_revision,
+                        snapshot_json,
+                        team.coordinator_execution_workspace_mode.as_str(),
+                        team.coordinator_execution_root_path,
+                        team.coordinator_worktree_base_revision,
+                        team.coordinator_worktree_branch,
+                        team.coordinator_worktree_status,
+                        now
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let payload_json = serde_json::to_string(&json!({
+                "coordinatorDefinitionId": team.coordinator_definition.id,
+                "defaultAgent": true,
+            }))
+            .map_err(|source| WorkspaceDatabaseError::AgentRuntimeJson {
+                field: "payload_json",
+                source,
+            })?;
+            append_agent_event_in_transaction(
+                &transaction,
+                NewAgentEvent {
+                    team_id: team.id,
+                    event_type: "team_created",
+                    instance_id: Some(team.coordinator_instance_id),
+                    task_id: None,
+                    attempt_id: None,
+                    message_id: None,
+                    payload_json: &payload_json,
+                },
+                &database_path,
+            )?;
+        }
+
+        let (team_status, instance_status): (String, String) = transaction
+            .query_row(
+                "SELECT team.status, instance.status
+                 FROM agent_teams AS team
+                 JOIN agent_instances AS instance ON instance.team_id = team.id
+                 WHERE team.id = ?1 AND instance.id = ?2",
+                params![
+                    queued.task.team_id.as_str(),
+                    queued.task.owner_instance_id.as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if team_status != AgentTeamStatus::Active.as_str()
+            || !matches!(instance_status.as_str(), "idle" | "running")
+        {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Coordinator does not accept a queued task in its current state"
+                    .to_string(),
+            });
+        }
+        let team_queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks WHERE team_id = ?1 AND status = 'queued'",
+                params![queued.task.team_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let instance_queued: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM agent_tasks WHERE owner_instance_id = ?1 AND status = 'queued'",
+                params![queued.task.owner_instance_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if team_queued >= queued.max_team_queued || team_queued >= queued.max_chat_queued {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task queue is full for team/chat '{}'",
+                    queued.task.team_id
+                ),
+            });
+        }
+        if instance_queued >= queued.max_instance_queued {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!(
+                    "Agent task queue is full for instance '{}'",
+                    queued.task.owner_instance_id
+                ),
+            });
+        }
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT next_task_sequence FROM agent_instances WHERE id = ?1 AND team_id = ?2",
+                params![
+                    queued.task.owner_instance_id.as_str(),
+                    queued.task.team_id.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET next_task_sequence = next_task_sequence + 1, updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![
+                    queued.task.owner_instance_id.as_str(),
+                    queued.task.team_id.as_str(),
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO agent_tasks
+                    (id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                     sequence, status, input_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?8)",
+                params![
+                    queued.task.id.as_str(),
+                    queued.task.team_id.as_str(),
+                    queued.task.owner_instance_id.as_str(),
+                    queued.task.origin_instance_id.map(AgentInstanceId::as_str),
+                    queued.task.parent_task_id.map(AgentTaskId::as_str),
+                    sequence,
+                    queued.task.input_json,
+                    now
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        append_agent_event_in_transaction(
+            &transaction,
+            NewAgentEvent {
+                team_id: queued.task.team_id,
+                event_type: "task_queued",
+                instance_id: Some(queued.task.owner_instance_id),
+                task_id: Some(queued.task.id),
+                attempt_id: None,
+                message_id: None,
+                payload_json: queued.task_queued_payload_json,
+            },
+            &database_path,
+        )?;
+        transaction
+            .execute(
+                "INSERT INTO messages
+                    (id, chat_id, role, content, sequence, created_at, metadata_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    queued.user_message.id,
+                    queued.user_message.chat_id,
+                    queued.user_message.role,
+                    queued.user_message.content,
+                    queued.user_message.sequence,
+                    now,
+                    queued.user_message.metadata_json.unwrap_or("{}")
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if let Some(snapshot) = queued.chat_spec_snapshot.as_ref() {
+            let revision = workspace_spec_revision_to_i64(snapshot.revision, "spec_revision")?;
+            transaction
+                .execute(
+                    "INSERT INTO chat_spec_snapshots
+                        (chat_id, spec_revision, content_markdown, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![queued.chat_id, revision, snapshot.content_markdown, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        for injection in &queued.prompt_context_injections {
+            insert_prompt_context_injection_in_transaction(
+                &transaction,
+                injection,
+                &database_path,
+                &now,
+            )?;
+        }
+        let chat = chat_from_transaction(&transaction, &database_path, queued.chat_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat was not found: {}", queued.chat_id),
+            })?;
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        chat_metadata.insert(QUEUED_CHAT_METADATA_KEY.to_string(), queued_run);
+        let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("chat metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE chats SET metadata_json = ?1, updated_at = ?2 WHERE id = ?3",
+                params![chat_metadata_json, now, queued.chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(())
+    }
+
     pub fn insert_message(
         &mut self,
         message: NewMessage<'_>,
@@ -6800,6 +7295,291 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
+    }
+
+    /// Atomically claim the durable queued run owned by a Coordinator task.
+    ///
+    /// Both the chat and queued user message carry the identity. Keeping them
+    /// in one transaction prevents an old scheduler wake-up from claiming a
+    /// replacement turn between a read and its first provider request.
+    pub fn claim_agent_chat_queued_run(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        assistant_sequence: i64,
+        agent_task_id: &str,
+        run_id: &str,
+    ) -> Result<AgentQueuedRunClaimOutcome, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let chat =
+            chat_from_transaction(&transaction, &database_path, chat_id)?.ok_or_else(|| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat was not found: {chat_id}"),
+                }
+            })?;
+        let user = message_from_transaction(&transaction, &database_path, user_message_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("queued user message was not found: {user_message_id}"),
+            })?;
+        if user.chat_id != chat_id || user.role != "user" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "queued user message does not belong to its Coordinator chat".to_string(),
+            });
+        }
+        let assistant =
+            message_from_transaction(&transaction, &database_path, assistant_message_id)?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!(
+                        "queued assistant message was not found: {assistant_message_id}"
+                    ),
+                })?;
+        if assistant.chat_id != chat_id
+            || assistant.role != "assistant"
+            || assistant.sequence != assistant_sequence
+        {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "queued assistant identity was replaced before Coordinator claim"
+                    .to_string(),
+            });
+        }
+
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        let mut user_metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let chat_run = chat_metadata
+            .get_mut(QUEUED_CHAT_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "chat metadata.queuedRun must be an object".to_string(),
+            })?;
+        let user_run = user_metadata
+            .get_mut(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "user message metadata.queuedRun must be an object".to_string(),
+            })?;
+
+        if !queued_run_matches_agent_identity(
+            chat_run,
+            user_message_id,
+            assistant_message_id,
+            assistant_sequence,
+            false,
+        ) || !queued_run_matches_agent_identity(
+            user_run,
+            user_message_id,
+            assistant_message_id,
+            assistant_sequence,
+            true,
+        ) {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "Coordinator queuedRun identity was replaced before claim".to_string(),
+            });
+        }
+
+        let chat_owner = chat_run.get("agentTaskId").and_then(Value::as_str);
+        let user_owner = user_run.get("agentTaskId").and_then(Value::as_str);
+        let owner_matches = chat_owner == Some(agent_task_id) && user_owner == Some(agent_task_id);
+        let legacy_owner = chat_owner.is_none() && user_owner.is_none();
+        if !owner_matches
+            && !(legacy_owner
+                && active_agent_task_matches_queued_run(
+                    &transaction,
+                    &database_path,
+                    chat_id,
+                    user_message_id,
+                    assistant_message_id,
+                    assistant_sequence,
+                    agent_task_id,
+                )?)
+        {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "Coordinator queuedRun owner was replaced before claim".to_string(),
+            });
+        }
+
+        let chat_status = chat_run.get("status").and_then(Value::as_str);
+        let user_status = user_run.get("status").and_then(Value::as_str);
+        let outcome = match (chat_status, user_status) {
+            (Some("queued"), Some("queued")) => AgentQueuedRunClaimOutcome::Claimed,
+            (Some("running"), Some("running"))
+                if chat_run.get("runId").and_then(Value::as_str) == Some(run_id)
+                    && user_run.get("runId").and_then(Value::as_str) == Some(run_id) =>
+            {
+                AgentQueuedRunClaimOutcome::AlreadyOwned
+            }
+            (Some("running"), Some("running"))
+                if owner_matches
+                    && chat_run.get("runId").is_none()
+                    && user_run.get("runId").is_none() =>
+            {
+                AgentQueuedRunClaimOutcome::Claimed
+            }
+            (Some("running"), Some("running")) if legacy_owner => {
+                AgentQueuedRunClaimOutcome::Claimed
+            }
+            _ => {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "Coordinator queuedRun is no longer claimable".to_string(),
+                });
+            }
+        };
+        if outcome == AgentQueuedRunClaimOutcome::Claimed {
+            for queued_run in [&mut *chat_run, &mut *user_run] {
+                queued_run.insert("status".to_string(), Value::String("running".to_string()));
+                queued_run.insert(
+                    "userMessageId".to_string(),
+                    Value::String(user_message_id.to_string()),
+                );
+                queued_run.insert(
+                    "assistantMessageId".to_string(),
+                    Value::String(assistant_message_id.to_string()),
+                );
+                queued_run.insert(
+                    "assistantSequence".to_string(),
+                    Value::Number(assistant_sequence.into()),
+                );
+                queued_run.insert(
+                    "agentTaskId".to_string(),
+                    Value::String(agent_task_id.to_string()),
+                );
+                queued_run.insert("runId".to_string(), Value::String(run_id.to_string()));
+            }
+            let chat_metadata_json = serde_json::to_string(&chat_metadata).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("chat metadata is invalid JSON: {source}"),
+                }
+            })?;
+            let user_metadata_json = serde_json::to_string(&user_metadata).map_err(|source| {
+                WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: format!("user message metadata is invalid JSON: {source}"),
+                }
+            })?;
+            transaction
+                .execute(
+                    "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
+                    params![chat_metadata_json, chat_id],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            transaction
+                .execute(
+                    "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                    params![user_metadata_json, user_message_id, chat_id],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(outcome)
+    }
+
+    /// Clear only the queued run still owned by this exact Coordinator task/run.
+    pub fn clear_agent_chat_queued_run_if_owned(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        assistant_sequence: i64,
+        agent_task_id: &str,
+        run_id: &str,
+    ) -> Result<AgentQueuedRunClearOutcome, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(chat) = chat_from_transaction(&transaction, &database_path, chat_id)? else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(AgentQueuedRunClearOutcome::NotOwned);
+        };
+        let Some(user) = message_from_transaction(&transaction, &database_path, user_message_id)?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(AgentQueuedRunClearOutcome::NotOwned);
+        };
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        let mut user_metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let matches_owner = [
+            chat_metadata
+                .get(QUEUED_CHAT_METADATA_KEY)
+                .and_then(Value::as_object),
+            user_metadata
+                .get(QUEUED_MESSAGE_METADATA_KEY)
+                .and_then(Value::as_object),
+        ]
+        .into_iter()
+        .flatten()
+        .count()
+            == 2
+            && [
+                chat_metadata
+                    .get(QUEUED_CHAT_METADATA_KEY)
+                    .and_then(Value::as_object),
+                user_metadata
+                    .get(QUEUED_MESSAGE_METADATA_KEY)
+                    .and_then(Value::as_object),
+            ]
+            .into_iter()
+            .flatten()
+            .all(|queued_run| {
+                queued_run_matches_agent_identity(
+                    queued_run,
+                    user_message_id,
+                    assistant_message_id,
+                    assistant_sequence,
+                    queued_run.get("userMessageId").is_none(),
+                ) && queued_run.get("agentTaskId").and_then(Value::as_str) == Some(agent_task_id)
+                    && queued_run.get("runId").and_then(Value::as_str) == Some(run_id)
+                    && queued_run.get("status").and_then(Value::as_str) == Some("running")
+            });
+        if !matches_owner {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(AgentQueuedRunClearOutcome::NotOwned);
+        }
+        chat_metadata.remove(QUEUED_CHAT_METADATA_KEY);
+        user_metadata.remove(QUEUED_MESSAGE_METADATA_KEY);
+        transaction
+            .execute(
+                "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
+                params![
+                    serde_json::to_string(&chat_metadata).map_err(|source| {
+                        WorkspaceDatabaseError::InvalidMessageMetadata {
+                            message: format!("chat metadata is invalid JSON: {source}"),
+                        }
+                    })?,
+                    chat_id
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![
+                    serde_json::to_string(&user_metadata).map_err(|source| {
+                        WorkspaceDatabaseError::InvalidMessageMetadata {
+                            message: format!("user message metadata is invalid JSON: {source}"),
+                        }
+                    })?,
+                    user_message_id,
+                    chat_id
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(AgentQueuedRunClearOutcome::Cleared)
     }
 
     /// Atomic pre-stream coordinator failure: fail running task/attempt, write
@@ -9813,6 +10593,99 @@ impl WorkspaceDatabase {
             .map_err(|source| sqlite_error(&database_path, source))?;
 
         Ok(())
+    }
+
+    /// Insert a running audit only while the exact Coordinator-owned chat run
+    /// is current. The ownership check and insert share one SQLite transaction
+    /// so a replacement cannot slip between them.
+    pub fn insert_llm_request_if_agent_chat_run_owned(
+        &mut self,
+        request: NewLlmRequest<'_>,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        assistant_sequence: i64,
+        agent_task_id: &str,
+        run_id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        validate_llm_request_tokens(&request)?;
+        validate_llm_agent_references(&self.connection, &self.database_path, &request)?;
+        let cache_ratio = calculate_cache_ratio(request.input_tokens, request.cache_read_tokens)?;
+        let thinking_level = normalized_optional_text(request.thinking_level);
+        let request_body_json =
+            normalize_audit_detail_for_write(request.request_body_json, "request_body_json")?;
+        let response_body_json =
+            normalize_audit_detail_for_write(request.response_body_json, "response_body_json")?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if !agent_chat_run_is_owned_in_transaction(
+            &transaction,
+            &database_path,
+            chat_id,
+            user_message_id,
+            assistant_message_id,
+            assistant_sequence,
+            agent_task_id,
+            run_id,
+        )? {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+        transaction
+            .execute(
+                "INSERT INTO llm_requests
+                    (
+                        id, workspace_id, chat_id, request_kind, agent_team_id, agent_instance_id,
+                        agent_task_id, agent_attempt_id, provider_id, model_id, thinking_level,
+                        request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
+                        first_token_latency_ms, total_latency_ms, status_code, final_state,
+                        request_body_json, response_body_json
+                    ) VALUES
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                params![
+                    request.id, request.workspace_id, request.chat_id, request.request_kind,
+                    request.agent_team_id.map(AgentTeamId::as_str),
+                    request.agent_instance_id.map(AgentInstanceId::as_str),
+                    request.agent_task_id.map(AgentTaskId::as_str),
+                    request.agent_attempt_id.map(AgentAttemptId::as_str),
+                    request.provider_id, request.model_id, thinking_level, request.request_started_at,
+                    request.first_token_at, request.completed_at, request.input_tokens,
+                    request.output_tokens, request.cache_read_tokens, request.cache_write_tokens,
+                    request.reasoning_tokens, cache_ratio, request.first_token_latency_ms,
+                    request.total_latency_ms, request.status_code, request.final_state,
+                    request_body_json, response_body_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        apply_llm_request_usage_rollup_delta(
+            &transaction,
+            &database_path,
+            llm_request_usage_rollup_delta(
+                LlmRequestUsageRollupSource {
+                    workspace_id: Some(request.workspace_id),
+                    provider_id: request.provider_id,
+                    model_id: request.model_id,
+                    request_started_at: request.request_started_at,
+                    final_state: request.final_state,
+                    input_tokens: request.input_tokens,
+                    output_tokens: request.output_tokens,
+                    cache_read_tokens: request.cache_read_tokens,
+                    cache_write_tokens: request.cache_write_tokens,
+                    total_latency_ms: request.total_latency_ms,
+                },
+                1,
+            ),
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     pub fn update_llm_request_body(
@@ -16947,6 +17820,57 @@ fn task_waiting_requested_event_exists(
         }
     }
     Ok(false)
+}
+
+fn insert_prompt_context_injection_in_transaction(
+    transaction: &Transaction<'_>,
+    injection: &NewPromptContextInjection<'_>,
+    database_path: &Path,
+    created_at: &str,
+) -> Result<(), WorkspaceDatabaseError> {
+    let query = match injection.kind {
+        "stable" => {
+            "INSERT INTO prompt_context_injections
+                (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(chat_id) WHERE kind = 'stable' DO UPDATE SET
+                messages_json = excluded.messages_json,
+                memory_keys_json = excluded.memory_keys_json,
+                memory_summaries_json = excluded.memory_summaries_json,
+                created_at = excluded.created_at"
+        }
+        "turn_memory" => {
+            "INSERT INTO prompt_context_injections
+                (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(chat_id, sequence) WHERE kind = 'turn_memory' DO UPDATE SET
+                messages_json = excluded.messages_json,
+                memory_keys_json = excluded.memory_keys_json,
+                memory_summaries_json = excluded.memory_summaries_json,
+                created_at = excluded.created_at"
+        }
+        _ => {
+            "INSERT INTO prompt_context_injections
+                (id, chat_id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        }
+    };
+    transaction
+        .execute(
+            query,
+            params![
+                injection.id,
+                injection.chat_id,
+                injection.kind,
+                injection.sequence,
+                injection.messages_json,
+                injection.memory_keys_json,
+                injection.memory_summaries_json,
+                created_at,
+            ],
+        )
+        .map_err(|source| sqlite_error(database_path, source))?;
+    Ok(())
 }
 
 fn append_agent_event_in_transaction(

@@ -25,18 +25,19 @@ use foco_store::{
     },
     wait_for_ordinary_gate_queued_waiters,
     workspace::{
-        AgentTaskStateUpdate, AgentTaskWaitRegistrationOutcome, LlmRequestAuditFilters,
-        LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRollupFilters,
-        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
-        NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry, NewAgentContextSnapshot,
-        NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask, NewAgentTaskDependency,
-        NewAgentTeam, NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport,
-        NewCodeGraphReference, NewCodeGraphSymbol, NewContextCompressionSnapshot, NewLlmRequest,
-        NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
-        NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
-        PlanListOrder, PlanPatch, PlanPhaseAttemptTrigger, PlanStepPatch,
-        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult, RUNNABLE_AGENT_TASKS_SQL,
+        AgentQueuedRunClaimOutcome, AgentQueuedRunClearOutcome, AgentTaskStateUpdate,
+        AgentTaskWaitRegistrationOutcome, LlmRequestAuditFilters, LlmRequestRecord,
+        LlmRequestTransport, LlmRequestUsageRollupFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS,
+        MessageMetadataMutation, NEXT_ENABLED_SCHEDULED_TASK_SQL, NewAgentContextEntry,
+        NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+        NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot, NewCodeGraphEdge,
+        NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
+        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
+        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
+        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
+        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
+        PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL,
         RegisterAgentTaskWaitDependencies, RemotePreStreamFailureClosureOutcome,
         RemoteQueuedRunClaimOutcome, RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage,
         ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
@@ -594,7 +595,6 @@ fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
             metadata_json: Some(r#"{"streamingState":"streaming"}"#),
         })
         .expect("assistant insert");
-
     assert_eq!(
         database
             .claim_remote_queued_run(
@@ -650,6 +650,108 @@ fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
             )
             .expect("owner clear"),
         RemoteQueuedRunClearOutcome::Cleared
+    );
+}
+
+#[test]
+fn agent_queued_run_claim_and_clear_require_the_full_durable_owner() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    let queued = json!({
+        "status": "queued",
+        "userMessageId": "user-agent-claim",
+        "assistantMessageId": "assistant-agent-claim",
+        "assistantSequence": 1,
+        "agentTaskId": "agent-task-owner",
+    });
+    database
+        .insert_chat_with_metadata(
+            "chat-agent-claim",
+            "Agent claim",
+            &json!({ "queuedRun": queued }).to_string(),
+        )
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-agent-claim",
+            chat_id: "chat-agent-claim",
+            role: "user",
+            content: "hello",
+            sequence: 0,
+            metadata_json: Some(&json!({ "queuedRun": queued }).to_string()),
+        })
+        .expect("user insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-agent-claim",
+            chat_id: "chat-agent-claim",
+            role: "assistant",
+            content: "",
+            sequence: 1,
+            metadata_json: Some("{}"),
+        })
+        .expect("assistant insert");
+    database
+        .mark_chat_queued_run_started(
+            "chat-agent-claim",
+            "user-agent-claim",
+            "assistant-agent-claim",
+            1,
+        )
+        .expect("pre-claim running marker");
+
+    assert_eq!(
+        database
+            .claim_agent_chat_queued_run(
+                "chat-agent-claim",
+                "user-agent-claim",
+                "assistant-agent-claim",
+                1,
+                "agent-task-owner",
+                "agent-task-owner",
+            )
+            .expect("owner claim"),
+        AgentQueuedRunClaimOutcome::Claimed
+    );
+    assert_eq!(
+        database
+            .claim_agent_chat_queued_run(
+                "chat-agent-claim",
+                "user-agent-claim",
+                "assistant-agent-claim",
+                1,
+                "agent-task-owner",
+                "agent-task-owner",
+            )
+            .expect("owner replay"),
+        AgentQueuedRunClaimOutcome::AlreadyOwned
+    );
+    assert_eq!(
+        database
+            .clear_agent_chat_queued_run_if_owned(
+                "chat-agent-claim",
+                "user-agent-claim",
+                "assistant-agent-claim",
+                1,
+                "agent-task-late",
+                "agent-task-late",
+            )
+            .expect("late clear"),
+        AgentQueuedRunClearOutcome::NotOwned
+    );
+    assert_eq!(
+        database
+            .clear_agent_chat_queued_run_if_owned(
+                "chat-agent-claim",
+                "user-agent-claim",
+                "assistant-agent-claim",
+                1,
+                "agent-task-owner",
+                "agent-task-owner",
+            )
+            .expect("owner clear"),
+        AgentQueuedRunClearOutcome::Cleared
     );
 }
 
@@ -19773,6 +19875,180 @@ fn create_test_agent_team(
         })
         .expect("agent team create");
     (team_id, instance_id)
+}
+
+#[test]
+fn queue_coordinator_chat_message_rolls_back_chat_and_team_when_task_owner_is_invalid() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    let team_id = AgentTeamId::new("agent-team-atomic-queue".to_string()).expect("team id");
+    let coordinator_id =
+        AgentInstanceId::new("agent-instance-atomic-queue".to_string()).expect("instance id");
+    let wrong_owner_id =
+        AgentInstanceId::new("agent-instance-atomic-wrong".to_string()).expect("owner id");
+    let task_id = AgentTaskId::new("agent-task-atomic-queue".to_string()).expect("task id");
+    let definition = phase8_agent_definition("atomic-queue", 1, 1);
+
+    let error = database
+        .queue_coordinator_chat_message(QueueCoordinatorChatMessage {
+            chat_id: "chat-atomic-queue",
+            new_chat_title: Some("Atomic queue"),
+            new_chat_metadata_json: Some(r#"{"queuedRun":{"status":"queued"}}"#),
+            user_message: NewMessage {
+                id: "msg-user-atomic-queue",
+                chat_id: "chat-atomic-queue",
+                role: "user",
+                content: "queue this",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            chat_queued_run_json: r#"{"status":"queued","userMessageId":"msg-user-atomic-queue"}"#,
+            chat_spec_snapshot: None,
+            prompt_context_injections: Vec::new(),
+            new_team: Some(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-atomic-queue",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            }),
+            task: NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &wrong_owner_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            },
+            max_team_queued: 1,
+            max_instance_queued: 1,
+            max_chat_queued: 1,
+            task_queued_payload_json: r#"{"userMessageId":"msg-user-atomic-queue"}"#,
+        })
+        .expect_err("mismatched owner must fail atomically");
+
+    assert!(error.to_string().contains("does not match"));
+    assert!(
+        database
+            .chat("chat-atomic-queue")
+            .expect("chat lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .agent_team(&team_id)
+            .expect("team lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .is_none()
+    );
+}
+
+#[test]
+fn queue_coordinator_chat_message_publishes_task_and_context_together() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    let team_id = AgentTeamId::new("agent-team-atomic-publish".to_string()).expect("team id");
+    let coordinator_id =
+        AgentInstanceId::new("agent-instance-atomic-publish".to_string()).expect("instance id");
+    let task_id = AgentTaskId::new("agent-task-atomic-publish".to_string()).expect("task id");
+    let definition = phase8_agent_definition("atomic-publish", 1, 1);
+    let messages_json = r#"[{"role":"system","content":"remember this"}]"#;
+
+    database
+        .queue_coordinator_chat_message(QueueCoordinatorChatMessage {
+            chat_id: "chat-atomic-publish",
+            new_chat_title: Some("Atomic publish"),
+            new_chat_metadata_json: Some(r#"{"queuedRun":{"status":"queued"}}"#),
+            user_message: NewMessage {
+                id: "msg-user-atomic-publish",
+                chat_id: "chat-atomic-publish",
+                role: "user",
+                content: "queue this",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            chat_queued_run_json: r#"{"status":"queued","userMessageId":"msg-user-atomic-publish"}"#,
+            chat_spec_snapshot: Some(NewChatSpecSnapshot {
+                revision: 7,
+                content_markdown: "# Snapshot",
+            }),
+            prompt_context_injections: vec![NewPromptContextInjection {
+                id: "ctx-inj-atomic-publish",
+                chat_id: "chat-atomic-publish",
+                kind: "stable",
+                sequence: None,
+                messages_json,
+                memory_keys_json: "[]",
+                memory_summaries_json: "[]",
+            }],
+            new_team: Some(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-atomic-publish",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            }),
+            task: NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &coordinator_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            },
+            max_team_queued: 1,
+            max_instance_queued: 1,
+            max_chat_queued: 1,
+            task_queued_payload_json: r#"{"userMessageId":"msg-user-atomic-publish"}"#,
+        })
+        .expect("queue Coordinator chat message");
+
+    assert!(
+        database
+            .chat("chat-atomic-publish")
+            .expect("chat lookup")
+            .expect("chat created")
+            .metadata_json
+            .contains("msg-user-atomic-publish")
+    );
+    assert!(
+        database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .is_some()
+    );
+    assert_eq!(
+        database
+            .chat_spec_snapshot("chat-atomic-publish")
+            .expect("snapshot lookup")
+            .expect("snapshot created")
+            .spec_revision,
+        7
+    );
+    assert_eq!(
+        database
+            .prompt_context_injections_for_chat("chat-atomic-publish")
+            .expect("prompt context lookup")
+            .len(),
+        1
+    );
 }
 
 fn complete_test_agent_task(

@@ -642,6 +642,7 @@ pub(crate) async fn edit_chat_user_message(
         session_mode.as_deref(),
         team_mode_enabled,
         None,
+        None,
     )?;
     let queued_run_json = json!({
         "status": "queued",
@@ -774,7 +775,7 @@ pub(crate) async fn queue_chat_message_internal(
         correlation_id,
         origin,
     } = input;
-    let mut team = if let Some(chat_id) = chat_id.as_deref() {
+    let team = if let Some(chat_id) = chat_id.as_deref() {
         let database = open_workspace_database(&workspace.path)?;
         database
             .agent_team_for_chat(chat_id)
@@ -860,6 +861,10 @@ pub(crate) async fn queue_chat_message_internal(
     let user_message_id = unique_id("msg-user");
     let assistant_message_id = unique_id("msg-assistant");
     let assistant_sequence = prompt_context.next_message_sequence + 1;
+    // The task id is generated before either queuedRun metadata document so
+    // both durable copies identify the Coordinator that may claim this turn.
+    let task_id = foco_agent::AgentTaskId::new(unique_id("agent-task"))
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     let user_metadata_json = queued_user_message_metadata_json(
         &prompt_context.attachments,
         &assistant_message_id,
@@ -871,6 +876,7 @@ pub(crate) async fn queue_chat_message_internal(
         &requested_skill_ids,
         requested_session_mode.as_deref(),
         team_mode_enabled,
+        Some(task_id.as_str()),
         origin_metadata.as_ref(),
     )?;
     let chat_queued_run_json = json!({
@@ -885,10 +891,11 @@ pub(crate) async fn queue_chat_message_internal(
         "skillIds": requested_skill_ids,
         "sessionMode": requested_session_mode,
         "content": message,
+        "agentTaskId": task_id,
     })
     .to_string();
 
-    let (chat_id, chat_title) = if prompt_context.is_new_chat {
+    let (chat_id, chat_title, new_chat_metadata_json) = if prompt_context.is_new_chat {
         let chat_id = prompt_context
             .chat_id
             .clone()
@@ -910,12 +917,10 @@ pub(crate) async fn queue_chat_message_internal(
             &requested_skill_ids,
             message,
             requested_session_mode.as_deref(),
+            Some(task_id.as_str()),
             origin_metadata.as_ref(),
         )?;
-        database
-            .insert_chat_with_metadata(&chat_id, &title, &chat_metadata_json)
-            .map_err(ApiError::from_workspace_error)?;
-        (chat_id, title)
+        (chat_id, title, Some(chat_metadata_json))
     } else {
         let chat_id = prompt_context
             .chat_id
@@ -925,31 +930,16 @@ pub(crate) async fn queue_chat_message_internal(
             .chat(&chat_id)
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| ApiError::bad_request(format!("chat was not found: {chat_id}")))?;
-        (chat_id, chat.title)
+        (chat_id, chat.title, None)
     };
-    persist_pending_chat_spec_snapshot(
-        &mut database,
-        &chat_id,
-        prompt_context.pending_spec_snapshot.as_ref(),
-    )?;
-    if prompt_context.is_new_chat {
-        let fallback_pending_context_injections;
-        let pending_context_injections = if prompt_context.pending_context_injections.is_empty() {
-            fallback_pending_context_injections =
-                pending_stable_prompt_context_injection_from_prompt_context(&prompt_context)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-            fallback_pending_context_injections.as_slice()
-        } else {
-            prompt_context.pending_context_injections.as_slice()
-        };
-        persist_pending_prompt_context_injections(
-            &mut database,
-            &chat_id,
-            pending_context_injections,
-        )?;
+    if let (Some(team), Some(coordinator)) = (&team, &mut coordinator) {
+        resume_chat_coordinator_for_new_message(&mut database, team, coordinator)?;
     }
 
+    let mut new_team_id = None;
+    let mut new_coordinator_id = None;
+    let mut new_definition = None;
+    let mut new_worktree = None;
     if team.is_none() {
         let definition = match agent_definition_id.as_deref() {
             Some(id) => configured_agent_definition(&config, id)?,
@@ -979,121 +969,176 @@ pub(crate) async fn queue_chat_message_internal(
                 )?),
             },
         };
-        let coordinator_worktree_root = coordinator_worktree
-            .as_ref()
-            .map(|worktree| agent_worktree_relative_path(&workspace.path, &worktree.root_path))
-            .transpose()?;
-        let (created_team, created_coordinator) = database
-            .create_agent_team(foco_store::workspace::NewAgentTeam {
-                id: &team_id,
+        new_team_id = Some(team_id);
+        new_coordinator_id = Some(instance_id);
+        new_definition = Some(definition);
+        new_worktree = coordinator_worktree;
+    }
+    let coordinator_worktree_root = new_worktree
+        .as_ref()
+        .map(|worktree| agent_worktree_relative_path(&workspace.path, &worktree.root_path))
+        .transpose()?;
+
+    let team_id = team
+        .as_ref()
+        .map(|team| team.id.clone())
+        .or_else(|| new_team_id.clone())
+        .ok_or_else(|| ApiError::internal("Coordinator team was not prepared"))?;
+    let coordinator_id = coordinator
+        .as_ref()
+        .map(|coordinator| coordinator.id.clone())
+        .or_else(|| new_coordinator_id.clone())
+        .ok_or_else(|| ApiError::internal("Coordinator instance was not prepared"))?;
+    let input_json = serde_json::to_string(&CoordinatorTaskInput {
+        queued_user_message_id: user_message_id.clone(),
+        visible_assistant_message_id: Some(assistant_message_id.clone()),
+        visible_assistant_sequence: Some(assistant_sequence),
+        message: message.to_string(),
+        attachments: task_attachments,
+        skill_ids: Vec::new(),
+        session_mode: requested_session_mode.clone(),
+        latency_mode: requested_latency_mode,
+        collaboration_tools_enabled: team_mode_enabled,
+        defer_until_workspace_idle: defer_start,
+        delegated_input: None,
+        correlation_id,
+    })
+    .map_err(|source| {
+        ApiError::internal(format!("failed to serialize Coordinator task: {source}"))
+    })?;
+    let task_queued_payload_json = serde_json::to_string(&json!({
+        "userMessageId": user_message_id,
+    }))
+    .map_err(|source| ApiError::internal(format!("failed to serialize task event: {source}")))?;
+    let fallback_pending_context_injections;
+    let pending_context_injections = if prompt_context.is_new_chat {
+        if prompt_context.pending_context_injections.is_empty() {
+            fallback_pending_context_injections =
+                pending_stable_prompt_context_injection_from_prompt_context(&prompt_context)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            fallback_pending_context_injections.as_slice()
+        } else {
+            prompt_context.pending_context_injections.as_slice()
+        }
+    } else {
+        &[]
+    };
+    let prepared_prompt_context_injections = pending_context_injections
+        .iter()
+        .filter(|injection| !injection.messages.is_empty())
+        .map(|injection| {
+            Ok::<_, ApiError>((
+                unique_id("ctx-inj"),
+                injection.kind,
+                injection.sequence,
+                serde_json::to_string(&injection.messages).map_err(|source| {
+                    ApiError::internal(format!(
+                        "failed to serialize prompt context injection: {source}"
+                    ))
+                })?,
+                serde_json::to_string(&injection.memory_keys).map_err(|source| {
+                    ApiError::internal(format!(
+                        "failed to serialize prompt context injection memory keys: {source}"
+                    ))
+                })?,
+                serde_json::to_string(&injection.memory_summaries).map_err(|source| {
+                    ApiError::internal(format!(
+                        "failed to serialize prompt context injection memory summaries: {source}"
+                    ))
+                })?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let queued_prompt_context_injections = prepared_prompt_context_injections
+        .iter()
+        .map(
+            |(id, kind, sequence, messages_json, memory_keys_json, memory_summaries_json)| {
+                foco_store::workspace::NewPromptContextInjection {
+                    id,
+                    chat_id: &chat_id,
+                    kind,
+                    sequence: *sequence,
+                    messages_json,
+                    memory_keys_json,
+                    memory_summaries_json,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    let new_team = match (&new_team_id, &new_coordinator_id, &new_definition) {
+        (Some(team_id), Some(instance_id), Some(definition)) => {
+            Some(foco_store::workspace::NewAgentTeam {
+                id: team_id,
                 chat_id: &chat_id,
-                coordinator_instance_id: &instance_id,
-                coordinator_definition: &definition,
+                coordinator_instance_id: instance_id,
+                coordinator_definition: definition,
                 coordinator_execution_workspace_mode,
                 coordinator_execution_root_path: coordinator_worktree_root.as_deref(),
-                coordinator_worktree_base_revision: coordinator_worktree
+                coordinator_worktree_base_revision: new_worktree
                     .as_ref()
                     .map(|worktree| worktree.base_revision.as_str()),
-                coordinator_worktree_branch: coordinator_worktree
+                coordinator_worktree_branch: new_worktree
                     .as_ref()
                     .map(|worktree| worktree.branch.as_str()),
-                coordinator_worktree_status: coordinator_worktree.as_ref().map(|_| "active"),
+                coordinator_worktree_status: new_worktree.as_ref().map(|_| "active"),
                 max_concurrent_runs: DEFAULT_AGENT_TEAM_MAX_CONCURRENT_RUNS,
             })
-            .map_err(|error| {
-                if let Some(worktree) = &coordinator_worktree {
-                    let worktree_path = Path::new(&worktree.root_path);
-                    let _ = release_code_graph_then_delete_worktree(
-                        &state.code_graph_indexes,
-                        worktree_path,
-                        || delete_agent_worktree(&workspace.path, worktree_path, true),
-                    );
-                }
-                ApiError::from_workspace_error(error)
-            })?;
-        insert_agent_event(
-            &mut database,
-            &team_id,
-            "team_created",
-            Some(&instance_id),
-            None,
-            None,
-            serde_json::json!({ "coordinatorDefinitionId": definition.id, "defaultAgent": true }),
-        )?;
-        team = Some(created_team);
-        coordinator = Some(created_coordinator);
-    }
-
-    if let (Some(team), Some(coordinator)) = (&team, &mut coordinator) {
-        resume_chat_coordinator_for_new_message(&mut database, team, coordinator)?;
-    }
-
-    let agent_task_id = if let (Some(team), Some(coordinator)) = (&team, &coordinator) {
-        let task_id = foco_agent::AgentTaskId::new(unique_id("agent-task"))
-            .map_err(|error| ApiError::internal(error.to_string()))?;
-        let input_json = serde_json::to_string(&CoordinatorTaskInput {
-            queued_user_message_id: user_message_id.clone(),
-            visible_assistant_message_id: Some(assistant_message_id.clone()),
-            visible_assistant_sequence: Some(assistant_sequence),
-            message: message.to_string(),
-            attachments: task_attachments,
-            skill_ids: Vec::new(),
-            session_mode: requested_session_mode.clone(),
-            latency_mode: requested_latency_mode,
-            collaboration_tools_enabled: team_mode_enabled,
-            defer_until_workspace_idle: defer_start,
-            delegated_input: None,
-            correlation_id,
-        })
-        .map_err(|source| {
-            ApiError::internal(format!("failed to serialize Coordinator task: {source}"))
-        })?;
-        database
-            .enqueue_agent_task_with_limits(
-                foco_store::workspace::NewAgentTask {
-                    id: &task_id,
-                    team_id: &team.id,
-                    owner_instance_id: &coordinator.id,
-                    origin_instance_id: None,
-                    parent_task_id: None,
-                    input_json: &input_json,
-                },
-                AGENT_MAX_QUEUED_TASKS_PER_TEAM,
-                AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
-                AGENT_MAX_QUEUED_TASKS_PER_CHAT,
-            )
-            .map_err(ApiError::from_workspace_error)?;
-        insert_agent_event(
-            &mut database,
-            &team.id,
-            "task_queued",
-            Some(&coordinator.id),
-            Some(&task_id),
-            None,
-            serde_json::json!({ "userMessageId": user_message_id }),
-        )?;
-        Some(task_id)
-    } else {
-        None
+        }
+        (None, None, None) => None,
+        _ => return Err(ApiError::internal("incomplete new Coordinator state")),
     };
-    let agent_team_id = team.as_ref().map(|team| team.id.clone());
-
-    database
-        .insert_message(NewMessage {
-            id: &user_message_id,
+    let queued_result = database.queue_coordinator_chat_message(
+        foco_store::workspace::QueueCoordinatorChatMessage {
             chat_id: &chat_id,
-            role: "user",
-            content: message,
-            sequence: prompt_context.next_message_sequence,
-            metadata_json: Some(&user_metadata_json),
-        })
-        .map_err(ApiError::from_workspace_error)?;
-    if !prompt_context.is_new_chat {
-        database
-            .set_chat_queued_run(&chat_id, &chat_queued_run_json)
-            .map_err(ApiError::from_workspace_error)?;
+            new_chat_title: prompt_context.is_new_chat.then_some(chat_title.as_str()),
+            new_chat_metadata_json: new_chat_metadata_json.as_deref(),
+            user_message: NewMessage {
+                id: &user_message_id,
+                chat_id: &chat_id,
+                role: "user",
+                content: message,
+                sequence: prompt_context.next_message_sequence,
+                metadata_json: Some(&user_metadata_json),
+            },
+            chat_queued_run_json: &chat_queued_run_json,
+            chat_spec_snapshot: prompt_context
+                .pending_spec_snapshot
+                .as_ref()
+                .map(|pending| foco_store::workspace::NewChatSpecSnapshot {
+                    revision: pending.revision,
+                    content_markdown: &pending.content_markdown,
+                }),
+            prompt_context_injections: queued_prompt_context_injections,
+            new_team,
+            task: foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &coordinator_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: &input_json,
+            },
+            max_team_queued: AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+            max_instance_queued: AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+            max_chat_queued: AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+            task_queued_payload_json: &task_queued_payload_json,
+        },
+    );
+    if let Err(error) = queued_result {
+        if let Some(worktree) = &new_worktree {
+            let worktree_path = Path::new(&worktree.root_path);
+            let _ = release_code_graph_then_delete_worktree(
+                &state.code_graph_indexes,
+                worktree_path,
+                || delete_agent_worktree(&workspace.path, worktree_path, true),
+            );
+        }
+        return Err(ApiError::from_workspace_error(error));
     }
-    if agent_task_id.is_some() && !defer_start {
+    let agent_team_id = Some(team_id);
+    let agent_task_id = Some(task_id);
+    if !defer_start {
         state.agent_scheduler.wake()?;
     }
     if should_generate_chat_title {

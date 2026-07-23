@@ -2976,9 +2976,22 @@ pub(crate) fn persist_chat_result(
     if context.agent_primary_chat_output
         && let Some(queued_user_message_id) = &context.queued_user_message_id
     {
-        database
-            .clear_chat_queued_run(&context.chat_id, queued_user_message_id)
-            .map_err(ApiError::from_workspace_error)?;
+        if let Some(agent_task_id) = context.agent_associations.task_id.as_ref() {
+            let _ = database
+                .clear_agent_chat_queued_run_if_owned(
+                    &context.chat_id,
+                    queued_user_message_id,
+                    &context.assistant_message_id,
+                    context.assistant_sequence,
+                    agent_task_id.as_str(),
+                    &context.llm_request_id,
+                )
+                .map_err(ApiError::from_workspace_error)?;
+        } else {
+            database
+                .clear_chat_queued_run(&context.chat_id, queued_user_message_id)
+                .map_err(ApiError::from_workspace_error)?;
+        }
     }
 
     let queue_external_derived_effects = context.agent_primary_chat_output
@@ -3103,49 +3116,74 @@ fn persist_running_llm_request_for_kind(
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
     let save_details = api_audit_save_details(&context.global_config);
-    if context.agent_primary_chat_output
-        && let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
-        && !queued_chat_run_matches_context(&database, context, queued_user_message_id)?
-    {
-        return Err(ApiError::conflict(
-            "chat run is no longer current because its queued run was replaced",
-        ));
-    }
     let chat_id = database
         .chat(&context.chat_id)
         .map_err(ApiError::from_workspace_error)?
         .is_some()
         .then_some(context.chat_id.as_str());
-    database
-        .insert_llm_request(NewLlmRequest {
-            id: request_id,
-            workspace_id: &context.workspace_id,
-            chat_id,
-            request_kind,
-            agent_team_id: context.agent_associations.team_id.as_ref(),
-            agent_instance_id: context.agent_associations.instance_id.as_ref(),
-            agent_task_id: context.agent_associations.task_id.as_ref(),
-            agent_attempt_id: context.agent_associations.attempt_id.as_ref(),
-            provider_id: &context.provider_id,
-            model_id: &context.model_id,
-            thinking_level: context.provider_request.thinking_level.as_deref(),
-            request_started_at,
-            first_token_at: None,
-            completed_at: None,
-            input_tokens: None,
-            output_tokens: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            reasoning_tokens: None,
-            first_token_latency_ms: None,
-            total_latency_ms: None,
-            status_code: None,
-            final_state: "running",
-            request_body_json: request_body_json
-                .and_then(|value| api_audit_detail_json(value, save_details)),
-            response_body_json: None,
-        })
-        .map_err(ApiError::from_workspace_error)?;
+    let request = NewLlmRequest {
+        id: request_id,
+        workspace_id: &context.workspace_id,
+        chat_id,
+        request_kind,
+        agent_team_id: context.agent_associations.team_id.as_ref(),
+        agent_instance_id: context.agent_associations.instance_id.as_ref(),
+        agent_task_id: context.agent_associations.task_id.as_ref(),
+        agent_attempt_id: context.agent_associations.attempt_id.as_ref(),
+        provider_id: &context.provider_id,
+        model_id: &context.model_id,
+        thinking_level: context.provider_request.thinking_level.as_deref(),
+        request_started_at,
+        first_token_at: None,
+        completed_at: None,
+        input_tokens: None,
+        output_tokens: None,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+        reasoning_tokens: None,
+        first_token_latency_ms: None,
+        total_latency_ms: None,
+        status_code: None,
+        final_state: "running",
+        request_body_json: request_body_json
+            .and_then(|value| api_audit_detail_json(value, save_details)),
+        response_body_json: None,
+    };
+    if context.agent_primary_chat_output
+        && let (Some(queued_user_message_id), Some(agent_task_id)) = (
+            context.queued_user_message_id.as_deref(),
+            context.agent_associations.task_id.as_ref(),
+        )
+    {
+        let inserted = database
+            .insert_llm_request_if_agent_chat_run_owned(
+                request,
+                &context.chat_id,
+                queued_user_message_id,
+                &context.assistant_message_id,
+                context.assistant_sequence,
+                agent_task_id.as_str(),
+                &context.llm_request_id,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        if !inserted {
+            return Err(ApiError::conflict(
+                "chat run is no longer current (queued run missing, replaced, or owned by another task)",
+            ));
+        }
+    } else {
+        if context.agent_primary_chat_output
+            && let Some(queued_user_message_id) = context.queued_user_message_id.as_deref()
+            && !queued_chat_run_matches_context(&database, context, queued_user_message_id)?
+        {
+            return Err(ApiError::conflict(
+                "chat run is no longer current because its queued run was replaced",
+            ));
+        }
+        database
+            .insert_llm_request(request)
+            .map_err(ApiError::from_workspace_error)?;
+    }
     persist_llm_request_events(&mut database, request_id, events, 0, save_details)
 }
 

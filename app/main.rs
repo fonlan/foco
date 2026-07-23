@@ -10744,6 +10744,7 @@ fn queued_chat_metadata_json(
     skill_ids: &[String],
     content: &str,
     session_mode: Option<&str>,
+    agent_task_id: Option<&str>,
     origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = json!({
@@ -10759,6 +10760,7 @@ fn queued_chat_metadata_json(
             "skillIds": skill_ids,
             "sessionMode": session_mode,
             "content": content,
+            "agentTaskId": agent_task_id,
         }
     });
     merge_queued_origin_metadata(&mut metadata, origin_metadata, "queued chat metadata")?;
@@ -10780,6 +10782,7 @@ fn queued_user_message_metadata_json(
     skill_ids: &[String],
     session_mode: Option<&str>,
     team_mode_enabled: bool,
+    agent_task_id: Option<&str>,
     origin_metadata: Option<&Value>,
 ) -> Result<String, ApiError> {
     let mut metadata = serde_json::from_str::<Value>(&user_message_metadata_json(attachments)?)
@@ -10810,6 +10813,7 @@ fn queued_user_message_metadata_json(
             "latencyMode": latency_mode,
             "skillIds": skill_ids,
             "sessionMode": session_mode,
+            "agentTaskId": agent_task_id,
         }),
     );
     merge_queued_origin_metadata(&mut metadata, origin_metadata, "queued user metadata")?;
@@ -12849,73 +12853,23 @@ fn chat_message_parts(
 }
 
 fn queued_run_summary_for_chat(
-    database: &mut WorkspaceDatabase,
-    chat_id: &str,
+    _database: &WorkspaceDatabase,
+    _chat_id: &str,
     metadata_json: &str,
 ) -> Result<Option<QueuedRunSummary>, ApiError> {
-    let queued_run = queued_run_summary_from_chat_metadata(metadata_json)?;
-    let Some(summary) = queued_run.as_ref() else {
-        return Ok(None);
-    };
-    if summary.status != "queued" && summary.status != "running" {
-        return Ok(queued_run);
-    }
-    if queued_run_has_resumable_task(database, chat_id, &summary.user_message_id)? {
-        return Ok(queued_run);
-    }
-
-    database
-        .clear_chat_queued_run(chat_id, &summary.user_message_id)
-        .map_err(ApiError::from_workspace_error)?;
-    Ok(None)
+    // A queued run is lifecycle-owned state. In particular, a newly queued Plan
+    // Coordinator can be committed concurrently with list/message reads; a read
+    // must never turn a transient observation into a destructive invalidation.
+    queued_run_summary_from_chat_metadata(metadata_json)
 }
 
 fn queued_run_summary_for_message(
-    database: &mut WorkspaceDatabase,
-    chat_id: &str,
-    user_message_id: &str,
+    _database: &WorkspaceDatabase,
+    _chat_id: &str,
+    _user_message_id: &str,
     metadata_json: &str,
 ) -> Result<Option<QueuedMessageRunSummary>, ApiError> {
-    let queued_run = queued_run_summary_from_message_metadata(metadata_json)?;
-    let Some(summary) = queued_run.as_ref() else {
-        return Ok(None);
-    };
-    if summary.status != "queued" && summary.status != "running" {
-        return Ok(queued_run);
-    }
-    if queued_run_has_resumable_task(database, chat_id, user_message_id)? {
-        return Ok(queued_run);
-    }
-
-    database
-        .clear_chat_queued_run(chat_id, user_message_id)
-        .map_err(ApiError::from_workspace_error)?;
-    Ok(None)
-}
-
-fn queued_run_has_resumable_task(
-    database: &WorkspaceDatabase,
-    chat_id: &str,
-    user_message_id: &str,
-) -> Result<bool, ApiError> {
-    let Some(team) = database
-        .agent_team_for_chat(chat_id)
-        .map_err(ApiError::from_workspace_error)?
-    else {
-        return Ok(false);
-    };
-
-    Ok(database
-        .agent_task_for_queued_user_message(&team.id, user_message_id)
-        .map_err(ApiError::from_workspace_error)?
-        .is_some_and(|task| {
-            matches!(
-                task.status,
-                foco_agent::AgentTaskStatus::Queued
-                    | foco_agent::AgentTaskStatus::Running
-                    | foco_agent::AgentTaskStatus::Waiting
-            )
-        }))
+    queued_run_summary_from_message_metadata(metadata_json)
 }
 
 fn queued_run_summary_from_chat_metadata(

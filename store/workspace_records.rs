@@ -123,6 +123,33 @@ pub struct NewAgentTask<'a> {
     pub input_json: &'a str,
 }
 
+#[derive(Clone, Debug)]
+pub struct NewChatSpecSnapshot<'a> {
+    pub revision: u64,
+    pub content_markdown: &'a str,
+}
+
+/// The durable state that makes a primary chat run observable to readers.
+///
+/// A coordinator task is deliberately part of the same insertion: readers may
+/// observe `queuedRun` only after the user message and its owning task exist.
+#[derive(Clone, Debug)]
+pub struct QueueCoordinatorChatMessage<'a> {
+    pub chat_id: &'a str,
+    pub new_chat_title: Option<&'a str>,
+    pub new_chat_metadata_json: Option<&'a str>,
+    pub user_message: NewMessage<'a>,
+    pub chat_queued_run_json: &'a str,
+    pub chat_spec_snapshot: Option<NewChatSpecSnapshot<'a>>,
+    pub prompt_context_injections: Vec<NewPromptContextInjection<'a>>,
+    pub new_team: Option<NewAgentTeam<'a>>,
+    pub task: NewAgentTask<'a>,
+    pub max_team_queued: i64,
+    pub max_instance_queued: i64,
+    pub max_chat_queued: i64,
+    pub task_queued_payload_json: &'a str,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentTaskRecord {
     pub id: AgentTaskId,
