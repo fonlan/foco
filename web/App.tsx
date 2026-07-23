@@ -17186,7 +17186,12 @@ type ToolCallChangeStats = {
 function toolCallChangeStats(
   toolCall: ChatToolCallSummary,
 ): ToolCallChangeStats | null {
-  if (toolCall.name !== "edit_file" && toolCall.name !== "write_file") {
+  if (
+    toolCall.isError ||
+    (toolCall.name !== "edit_file" &&
+      toolCall.name !== "write_file" &&
+      toolCall.name !== "apply_patch")
+  ) {
     return null;
   }
   if (toolCall.output === null || !isObjectRecord(toolCall.output)) {
@@ -17316,7 +17321,9 @@ function numericField(
   snakeName?: string,
 ) {
   const field = fieldValue(value, camelName, snakeName);
-  return typeof field === "number" && Number.isFinite(field) ? field : null;
+  return typeof field === "number" && Number.isSafeInteger(field) && field >= 0
+    ? field
+    : null;
 }
 
 function stringArrayField(

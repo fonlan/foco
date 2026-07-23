@@ -1193,7 +1193,11 @@ describe("app-shell verification surfaces", () => {
       },
       isError: true,
       name: "apply_patch",
-      output: { error: "patch did not apply" },
+      output: {
+        error: "patch did not apply",
+        linesAdded: 99,
+        linesRemoved: 88,
+      },
     };
     assistantMessage.toolCalls = [failedToolCall];
     assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
@@ -1223,6 +1227,8 @@ describe("app-shell verification surfaces", () => {
     }
 
     expect(within(assistantBubble).getByText("patch did not apply")).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("+99")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("-88")).not.toBeInTheDocument();
     expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
     expect(within(assistantBubble).queryByText("Input")).not.toBeInTheDocument();
     expect(within(assistantBubble).queryByText("Output")).not.toBeInTheDocument();
@@ -1265,6 +1271,49 @@ describe("app-shell verification surfaces", () => {
     }
 
     expect(within(assistantBubble).getByText("Patch summary")).toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("+1")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("-1")).not.toBeInTheDocument();
+    expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
+  });
+
+  it("does not show change stats for legacy apply_patch object output", async () => {
+    const legacyPatchChatMessages = JSON.parse(JSON.stringify(chatMessages));
+    const assistantMessage = legacyPatchChatMessages.messages[1];
+    const legacyToolCall = {
+      ...assistantMessage.toolCalls[0],
+      input: { patch: "not a patch\n+unexpected" },
+      name: "apply_patch",
+      output: { patchedFiles: 4 },
+    };
+    assistantMessage.toolCalls = [legacyToolCall];
+    assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
+      part.type === "toolCall" ? { ...part, toolCall: legacyToolCall } : part,
+    );
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      const path = url.startsWith("http://127.0.0.1")
+        ? new URL(url).pathname
+        : url.split("?")[0];
+
+      if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+        return jsonResponse({ ...legacyPatchChatMessages, activeRun: null });
+      }
+
+      return mockFetch(input, init);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const assistantBubble = (await screen.findByLabelText("Patch (apply_patch)"))
+      .closest(".message-bubble") as HTMLElement | null;
+    if (!assistantBubble) {
+      throw new Error("Expected assistant message bubble");
+    }
+
+    expect(within(assistantBubble).queryByText("+4")).not.toBeInTheDocument();
+    expect(within(assistantBubble).queryByText("-4")).not.toBeInTheDocument();
     expect(assistantBubble.querySelector(".edit-file-diff-line")).toBeNull();
   });
 
@@ -1559,7 +1608,7 @@ describe("app-shell verification surfaces", () => {
         ].join("\n"),
       },
       name: "apply_patch",
-      output: { patchedFiles: 4 },
+      output: { linesAdded: 4, lines_removed: 5, patchedFiles: 4 },
     };
     assistantMessage.toolCalls = [applyPatchToolCall];
     assistantMessage.parts = assistantMessage.parts.map((part: { type: string }) =>
@@ -1598,6 +1647,12 @@ describe("app-shell verification surfaces", () => {
     ];
     const diffLines = Array.from(
       assistantBubble.querySelectorAll<HTMLElement>(".edit-file-diff-line"),
+    );
+    expect(within(assistantBubble).getByText("+4")).toHaveClass(
+      "text-[var(--success)]",
+    );
+    expect(within(assistantBubble).getByText("-5")).toHaveClass(
+      "text-[var(--danger)]",
     );
     expect(diffLines.map((line) => line.textContent)).toEqual(expectedDiffLines);
     expect(
