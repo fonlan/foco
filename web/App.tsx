@@ -11414,6 +11414,7 @@ export function App() {
           if (streamEvent.type === "streamEnd") {
             finishLiveReasoningDuration();
             stopLiveReasoningDuration();
+            finishStreamingAssistantMessage(currentAssistantMessageId);
             finishChatRun(
               chatKey,
               activeRun.runId,
@@ -12726,6 +12727,7 @@ export function App() {
         if (streamEvent.type === "streamEnd") {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
+          finishStreamingAssistantMessage(currentAssistantMessageId);
           finishChatRun(
             currentRunningChatKey,
             activeRunId,

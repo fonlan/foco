@@ -6203,6 +6203,25 @@ describe("app-chat-stream verification surfaces", () => {
     await act(async () => {
       enqueueChatStreamEvent({
         assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-markdown",
+          input: { path: "docs.md" },
+          isError: false,
+          name: "read_file",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        isError: false,
+        output: "# docs",
+        toolCallId: "call-markdown",
+        type: "toolResult",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
         chatId: "chat-1",
         memoriesUsed: [],
         metrics: {
@@ -6218,6 +6237,7 @@ describe("app-chat-stream verification surfaces", () => {
         type: "complete",
         usage: null,
       });
+      enqueueChatStreamEvent({ type: "streamEnd" });
     });
 
     const link = await screen.findByRole("link", { name: "docs" });
@@ -6226,10 +6246,111 @@ describe("app-chat-stream verification surfaces", () => {
     expect(completeBubble.querySelector("pre code")).not.toBeNull();
     expect(completeBubble.querySelector("table")).not.toBeNull();
     expect(completeBubble.querySelector(".katex")).not.toBeNull();
+    expect(within(completeBubble).getByText("Read")).toBeInTheDocument();
+    expect(
+      within(completeBubble).getByText("Model: model-1"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders POST stream markdown after streamEnd without a complete event", async () => {
+    renderApp();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "markdown stream end",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+
+    const markdown = "# Stream-ended summary\n\n- **Rendered terminal item**";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: markdown,
+        type: "textDelta",
+      });
+    });
 
     await act(async () => {
-      appTestState.activeChatStreamController?.close();
+      enqueueChatStreamEvent({ type: "streamEnd" });
     });
+
+    const heading = await screen.findByRole("heading", {
+      name: "Stream-ended summary",
+    });
+    const completedBubble = heading.closest(".message-bubble") as HTMLElement;
+    expect(completedBubble.querySelector(".markdown-content-assistant")).not.toBeNull();
+    expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
+    expect(
+      within(completedBubble).getByText("Rendered terminal item").tagName,
+    ).toBe("STRONG");
+  });
+
+  it("renders reattached active-run markdown after streamEnd without a complete event", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [],
+                reasoning: null,
+                status: "streaming",
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              assistantMessageId: "message-assistant-stream",
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+
+    const markdown = "# Plan summary\n\n- **Rendered after reconnect**";
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        delta: markdown,
+        type: "textDelta",
+      });
+    });
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", { type: "streamEnd" });
+    });
+
+    const heading = await screen.findByRole("heading", { name: "Plan summary" });
+    const completedBubble = heading.closest(".message-bubble") as HTMLElement;
+    expect(completedBubble.querySelector(".markdown-content-assistant")).not.toBeNull();
+    expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
+    expect(
+      within(completedBubble).getByText("Rendered after reconnect").tagName,
+    ).toBe("STRONG");
   });
 
   it("shows retrieved memories as soon as the chat stream starts", async () => {
