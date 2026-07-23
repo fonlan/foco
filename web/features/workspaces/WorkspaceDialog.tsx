@@ -103,7 +103,7 @@ export function WorkspaceDialog({
     <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && onClose()}>
       <Modal.Container placement="center" scroll="inside" size="lg">
         <Modal.Dialog aria-label={title}>
-          <Modal.CloseTrigger />
+          <Modal.CloseTrigger aria-label={t("Close workspace dialog")} />
           <Modal.Header>
             <Modal.Heading>{title}</Modal.Heading>
             <p className="text-sm text-muted">
@@ -346,9 +346,12 @@ export function WorkspaceDialog({
                     aria-hidden="true"
                     className="size-4 shrink-0 text-accent"
                   />
-                  <span className="truncate">{t("Enable Project Spec")}</span>
+                  <span className="truncate" id="workspace-dialog-spec-label">
+                    {t("Enable Project Spec")}
+                  </span>
                 </span>
                 <Switch
+                  aria-labelledby="workspace-dialog-spec-label"
                   isDisabled={isSaving}
                   isSelected={specEnabled}
                   onChange={onSpecEnabledChange}

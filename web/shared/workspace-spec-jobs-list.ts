@@ -74,3 +74,8 @@ export function fetchWorkspaceSpecJobsList(
   });
   return promise;
 }
+
+/** Test-only: drop module-level flights so fake timers cannot reuse wall-clock storm windows. */
+export function resetWorkspaceSpecJobsListFlightsForTests() {
+  workspaceSpecJobsListFlights.clear();
+}

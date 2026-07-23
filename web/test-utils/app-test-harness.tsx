@@ -17,6 +17,7 @@ import type {
   WorkspaceSpecJobSummary,
   WorkspaceSpecResponse,
 } from "../api/types";
+import { resetWorkspaceSpecJobsListFlightsForTests } from "../shared/workspace-spec-jobs-list";
 
 export const mermaidMock = {
   initialize: vi.fn(),
@@ -2880,6 +2881,7 @@ export function resetAppTestEnvironment() {
   // Unmount previous App trees so intervals/effects from prior tests cannot
   // keep driving fetch/setState after the next test starts.
   cleanup();
+  resetWorkspaceSpecJobsListFlightsForTests();
   appTestState.activeChatStreamController = null;
   appTestState.chatStreamControllers = new Map();
   appTestState.chatMessagesResponsesByChatKey = {};

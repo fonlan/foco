@@ -308,6 +308,13 @@ const WORKSPACE_SPEC_JOB_POLL_DELAYS_MS = [
 ] as const;
 const WORKSPACE_SPEC_JOB_STEADY_POLL_MS = 60000;
 
+function workspaceSpecJobPollDelayMs(pollIndex: number) {
+  return (
+    WORKSPACE_SPEC_JOB_POLL_DELAYS_MS[pollIndex] ??
+    WORKSPACE_SPEC_JOB_STEADY_POLL_MS
+  );
+}
+
 type SingleFlightEntry<T> = {
   promise: Promise<T>;
   queued?: boolean;
@@ -1525,6 +1532,7 @@ export function App() {
     useState<WorkspaceChatContextMenuState | null>(null);
   const [workspaceFileContextMenu, setWorkspaceFileContextMenu] =
     useState<WorkspaceFileContextMenuState | null>(null);
+  const workspaceFileContextMenuRef = useRef<HTMLElement | null>(null);
   // ponytail: keep inactive chat cache ref-only so hot streaming paths don't
   // rerender App; ceiling is App still owns too much chat state, upgrade path is
   // moving this cache into a dedicated hook/store.
@@ -2698,6 +2706,91 @@ export function App() {
       ? selectedThinkingLevel
       : "";
   }, [selectedModel, selectedThinkingLevel]);
+
+  useEffect(() => {
+    if (!workspaceFileContextMenu) {
+      return;
+    }
+
+    function closeWorkspaceFileContextMenuForScroll(event: Event) {
+      const target = event.target;
+      if (
+        target === document ||
+        target === document.documentElement ||
+        target === document.body ||
+        target === window
+      ) {
+        setWorkspaceFileContextMenu(null);
+        return;
+      }
+      if (target instanceof Element && target.closest(".context-panel")) {
+        setWorkspaceFileContextMenu(null);
+      }
+    }
+
+    function closeWorkspaceFileContextMenu() {
+      setWorkspaceFileContextMenu(null);
+    }
+
+    window.addEventListener("resize", closeWorkspaceFileContextMenu);
+    window.addEventListener(
+      "scroll",
+      closeWorkspaceFileContextMenuForScroll,
+      true,
+    );
+
+    return () => {
+      window.removeEventListener("resize", closeWorkspaceFileContextMenu);
+      window.removeEventListener(
+        "scroll",
+        closeWorkspaceFileContextMenuForScroll,
+        true,
+      );
+    };
+  }, [workspaceFileContextMenu]);
+
+  useLayoutEffect(() => {
+    if (!workspaceFileContextMenu || workspaceFileContextMenu.positioned) {
+      return;
+    }
+
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const element =
+      workspaceFileContextMenuRef.current ??
+      (document.querySelector(
+        ".workspace-file-context-menu",
+      ) as HTMLElement | null);
+    if (!element) {
+      return;
+    }
+    workspaceFileContextMenuRef.current = element;
+
+    const margin = 8;
+    const rect = element.getBoundingClientRect();
+    const nextLeft = Math.max(
+      margin,
+      Math.min(
+        workspaceFileContextMenu.left,
+        window.innerWidth - rect.width - margin,
+      ),
+    );
+    const nextTop = Math.max(
+      margin,
+      Math.min(
+        workspaceFileContextMenu.top,
+        window.innerHeight - rect.height - margin,
+      ),
+    );
+    setWorkspaceFileContextMenu({
+      ...workspaceFileContextMenu,
+      left: nextLeft,
+      positioned: true,
+      top: nextTop,
+    });
+  }, [workspaceFileContextMenu]);
 
   useEffect(
     () => () => {
@@ -4015,9 +4108,7 @@ export function App() {
         let pollIndex = 0;
         try {
           while (!observer.cancelled) {
-            const delayMs =
-              WORKSPACE_SPEC_JOB_POLL_DELAYS_MS[pollIndex] ??
-              WORKSPACE_SPEC_JOB_STEADY_POLL_MS;
+            const delayMs = workspaceSpecJobPollDelayMs(pollIndex);
             pollIndex += 1;
             await new Promise<void>((resolve) => {
               window.setTimeout(resolve, delayMs);
@@ -14051,6 +14142,7 @@ export function App() {
             {workspaceFileContextMenu ? (
               <ContextMenu
                 aria-label={workspaceFileContextMenu.node.name}
+                className="workspace-file-context-menu"
                 isOpen
                 items={[
                   {
@@ -14119,6 +14211,7 @@ export function App() {
                   },
                 ]}
                 left={workspaceFileContextMenu.left}
+                positioned={workspaceFileContextMenu.positioned}
                 top={workspaceFileContextMenu.top}
                 onAction={(key) => {
                   const { node, workspacePath } = workspaceFileContextMenu;

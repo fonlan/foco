@@ -1025,7 +1025,7 @@ describe("app-workspaces verification surfaces", () => {
     });
 
     await userEvent.click(
-      within(dialog).getByRole("checkbox", { name: "Enable Project Spec" }),
+      within(dialog).getByRole("switch", { name: "Enable Project Spec" }),
     );
     await userEvent.click(within(dialog).getByRole("button", { name: "Add workspace" }));
 
@@ -1150,8 +1150,14 @@ describe("app-workspaces verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", { name: "Add workspace" });
     await userEvent.click(within(dialog).getByRole("button", { name: "SSH" }));
 
-    const serverSelect = within(dialog).getByRole("combobox");
-    await userEvent.selectOptions(serverSelect, remoteServer.id);
+    const serverSelect = within(dialog).getByRole("button", {
+      name: /Remote Server|Select remote server|dev-box/,
+    });
+    await userEvent.click(serverSelect);
+    const serverOption = await screen.findByRole("option", {
+      name: /dev-box/,
+    });
+    await userEvent.click(serverOption);
 
     const nameInput = within(dialog).getByPlaceholderText("Workspace name");
     const pathInput = within(dialog).getByPlaceholderText("/home/name/workspace");
@@ -1327,7 +1333,12 @@ describe("app-workspaces verification surfaces", () => {
 
     expect(within(dialog).getByText("注册 SSH 工作区。")).toBeInTheDocument();
     expect(within(dialog).getByText("远程服务器")).toBeInTheDocument();
-    expect(within(dialog).getByText("选择远程服务器")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", {
+        name: (_accessibleName, element) =>
+          element.getAttribute("aria-haspopup") === "listbox",
+      }),
+    ).toBeInTheDocument();
     expect(within(dialog).getByPlaceholderText("服务器名称")).toBeInTheDocument();
     expect(within(dialog).getByPlaceholderText("SSH 主机名/IP")).toBeInTheDocument();
     expect(

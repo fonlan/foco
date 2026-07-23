@@ -48,7 +48,11 @@ import {
 } from "./test-utils/app-test-harness";
 
 describe("app-panels-stats verification surfaces", () => {
-  beforeEach(resetAppTestEnvironment);
+  beforeEach(() => {
+    // Prior tests may install fake timers; always restore real timers first.
+    vi.useRealTimers();
+    resetAppTestEnvironment();
+  });
 
   function aiStatisticsCallUrls() {
     const fetchMock = vi.mocked(fetch);
@@ -2736,11 +2740,11 @@ describe("app-panels-stats verification surfaces", () => {
 
     expectPlanStatusTone("Merged implementation plan", "Implemented", [
       "bg-[var(--success-soft)]",
-      "text-[var(--success)]",
+      "text-[var(--success-soft-foreground)]",
     ]);
     expectPlanStatusTone("Completed status colors", "Completed", [
       "bg-[var(--success-soft)]",
-      "text-[var(--success)]",
+      "text-[var(--success-soft-foreground)]",
     ]);
     expectPlanStatusTone("Failed status colors", "Failed", [
       "bg-[var(--danger-soft)]",
@@ -3070,11 +3074,19 @@ describe("app-panels-stats verification surfaces", () => {
     appTestState.workspaceSpecJobPollsBeforeCompletion = 8;
     await openSpecPanel();
 
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    // Fake only timeout APIs so long backoff can be advanced without waiting
+    // real wall-clock time. Prefer fireEvent over userEvent under fake timers.
+    // Also fake Date so module-level request storm dedupe (400ms wall clock)
+    // advances with the same timer stream as poll delays.
+    vi.useFakeTimers({
+      toFake: ["setTimeout", "clearTimeout", "Date"],
+    });
     try {
       fireEvent.click(screen.getByRole("button", { name: "Regenerate spec" }));
       await act(async () => {
         await Promise.resolve();
+        // Sum of WORKSPACE_SPEC_JOB_POLL_DELAYS_MS for 9 polls exceeds the old
+        // hard ceiling; advance past the full schedule plus steady interval.
         await vi.advanceTimersByTimeAsync(225_000);
       });
 
@@ -3937,7 +3949,7 @@ describe("app-panels-stats verification surfaces", () => {
     );
     expect(within(todoPanel).getByText("completed")).toHaveClass(
       "bg-[var(--success-soft)]",
-      "text-[var(--success)]",
+      "text-[var(--success-soft-foreground)]",
     );
     expect(within(todoPanel).getByText("pending")).toHaveClass(
       "bg-[var(--surface-secondary)]",
@@ -5205,7 +5217,7 @@ describe("app-panels-stats verification surfaces", () => {
     const dialog = await screen.findByRole("dialog", { name: "请求详情" });
     expect(within(dialog).getByText("状态")).toBeInTheDocument();
     expect(within(dialog).getByText("运行中")).toBeInTheDocument();
-    expect(within(dialog).getByText("正在等待供应商最终响应……")).toBeInTheDocument();
+    expect(within(dialog).getByText("正在等待供应商最终响应…")).toBeInTheDocument();
     await waitFor(
       () => {
         expect(detailCalls).toBeGreaterThanOrEqual(2);
