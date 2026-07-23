@@ -134,7 +134,7 @@ use crate::{
     },
     provider_retry::{
         is_retryable_provider_status, is_retryable_provider_stream_error,
-        should_retry_remote_broker_failure,
+        provider_429_retry_backoff_i64, should_retry_remote_broker_failure,
     },
     runtime::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
@@ -2811,6 +2811,9 @@ struct RemoteActiveRunStream {
     cancel_requested: Arc<AtomicBool>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
+    /// Normal terminal completion is distinct from cancellation, but retry waits
+    /// must observe either condition immediately.
+    finished_tx: watch::Sender<bool>,
     /// Shared with in-flight `execute_tool` so cancel can preempt long local tools.
     tool_token: foco_tools::ToolCancellationToken,
     /// Ensures finish/cancel/guard cleanup removes the active run and cancels
@@ -2822,6 +2825,7 @@ impl RemoteActiveRunStream {
     fn new(chat_id: String) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(512);
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (finished_tx, _) = watch::channel(false);
         Self {
             chat_id,
             broker_request_id: Arc::new(Mutex::new(None)),
@@ -2832,6 +2836,7 @@ impl RemoteActiveRunStream {
             cancel_requested: Arc::new(AtomicBool::new(false)),
             cancel_tx,
             cancel_rx,
+            finished_tx,
             tool_token: foco_tools::ToolCancellationToken::default(),
             cleanup_committed: Arc::new(AtomicBool::new(false)),
         }
@@ -2901,6 +2906,7 @@ impl RemoteActiveRunStream {
 
     fn mark_finished(&self) {
         self.finished.store(true, Ordering::Release);
+        self.finished_tx.send_replace(true);
     }
 
     fn is_finished(&self) -> bool {
@@ -2921,6 +2927,10 @@ impl RemoteActiveRunStream {
         self.cancel_tx.subscribe()
     }
 
+    fn subscribe_finished(&self) -> watch::Receiver<bool> {
+        self.finished_tx.subscribe()
+    }
+
     fn tool_token(&self) -> foco_tools::ToolCancellationToken {
         self.tool_token.clone()
     }
@@ -2928,6 +2938,41 @@ impl RemoteActiveRunStream {
     /// First terminal cleanup path claims ownership. Returns true only once.
     fn try_commit_cleanup(&self) -> bool {
         !self.cleanup_committed.swap(true, Ordering::AcqRel)
+    }
+}
+
+/// Wait for the shared 429 retry staircase without keeping a remote run alive after cancel.
+/// Returns `true` when cancel or stream completion interrupted the wait.
+async fn remote_sidecar_wait_provider_retry_backoff_cancellable(
+    run_stream: &RemoteActiveRunStream,
+    status_code: Option<i64>,
+    retry_ordinal: u32,
+) -> bool {
+    let Some(delay) = provider_429_retry_backoff_i64(status_code, retry_ordinal) else {
+        return false;
+    };
+    if run_stream.is_cancel_requested() || run_stream.is_finished() {
+        return true;
+    }
+
+    let mut cancel_rx = run_stream.subscribe_cancel();
+    let mut finished_rx = run_stream.subscribe_finished();
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            _ = &mut sleep => return false,
+            changed = cancel_rx.changed() => {
+                if changed.is_err() || run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    return true;
+                }
+            }
+            changed = finished_rx.changed() => {
+                if changed.is_err() || run_stream.is_finished() || run_stream.is_cancel_requested() {
+                    return true;
+                }
+            }
+        }
     }
 }
 
@@ -14454,6 +14499,8 @@ enum RemoteSidecarBrokerLlmTurnOutcome {
     },
     Retry {
         message: String,
+        /// Broker provider errors retain their original status so only real 429s back off.
+        status_code: Option<i64>,
     },
     ReasoningLoopInterrupted {
         message: String,
@@ -14520,7 +14567,10 @@ async fn remote_sidecar_run_broker_llm_turn(
                 "failed",
                 json!({ "error": { "message": message } }),
             );
-            return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message });
+            return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                message,
+                status_code: None,
+            });
         }
     };
     run_metrics.record_llm_request_id(broker_request_id);
@@ -14583,6 +14633,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
                 return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
                     message: message.to_string(),
+                    status_code: None,
                 });
             }
             Err(_) => {
@@ -14611,6 +14662,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 );
                 return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
                     message: message.to_string(),
+                    status_code: None,
                 });
             }
         };
@@ -15012,6 +15064,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     0,
                     1,
                 );
+                let status_code = envelope.payload.get("statusCode").and_then(Value::as_i64);
                 let error_provider_id =
                     remote_broker_resolved_provider_id(&envelope.payload, &resolved_provider_id);
                 let audit_outcome =
@@ -15035,6 +15088,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     state.broker_pending.lock().await.remove(broker_request_id);
                     return Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
                         message: message.to_string(),
+                        status_code,
                     });
                 }
                 let _ = with_sidecar_workspace_database(state, |database| {
@@ -16711,6 +16765,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut reasoning_loop_recovery_count = 0usize;
     let max_provider_retries = remote_sidecar_llm_request_retry_count(&stream_state);
     let mut provider_retry_count = 0u32;
+    let mut rate_limit_retry_count = 0u32;
     remote_sidecar_record_durable_run_event(
         &stream_state,
         &run_stream,
@@ -16977,10 +17032,17 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         let turn_text = remote_sidecar_current_turn_output(&text, turn_text_start);
         let turn_reasoning = remote_sidecar_current_turn_output(&reasoning, turn_reasoning_start);
         match llm_turn {
-            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message })
-                if provider_retry_count < max_provider_retries =>
-            {
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                message,
+                status_code,
+            }) if provider_retry_count < max_provider_retries => {
                 provider_retry_count = provider_retry_count.saturating_add(1);
+                let retry_ordinal = if status_code == Some(429) {
+                    rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                    rate_limit_retry_count
+                } else {
+                    0
+                };
                 text.truncate(turn_text_start);
                 reasoning.truncate(turn_reasoning_start);
                 run_metrics = attempt_run_metrics;
@@ -16997,9 +17059,18 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         "toolCalls": [],
                     }),
                 );
+                if remote_sidecar_wait_provider_retry_backoff_cancellable(
+                    &run_stream,
+                    status_code,
+                    retry_ordinal,
+                )
+                .await
+                {
+                    continue;
+                }
                 continue;
             }
-            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message }) => {
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { message, .. }) => {
                 let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
                 let remaining_reasoning = reasoning
                     .get(flushed_reasoning_len..)
@@ -17103,6 +17174,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 turn_input_tokens,
             }) => {
                 provider_id = resolved_provider_id;
+                rate_limit_retry_count = 0;
                 record_chat_completion_input_tokens(
                     &mut runtime_tool_state.last_chat_completion_input_tokens,
                     turn_input_tokens,
@@ -17466,6 +17538,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 turn_llm_request_id,
             }) => {
                 provider_id = resolved_provider_id;
+                rate_limit_retry_count = 0;
                 if reasoning_loop_recovery_count < MAX_REASONING_LOOP_RECOVERIES_PER_RUN {
                     reasoning_loop_recovery_count = reasoning_loop_recovery_count.saturating_add(1);
                     remote_sidecar_flush_open_content_parts(
@@ -30911,6 +30984,147 @@ mod tests {
         drop(reconnect);
         assert_eq!(state.active_run_count.load(Ordering::Relaxed), 1);
         remote_sidecar_cancel_active_run(&state, &run_id, false, true);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_retry_outcome_preserves_provider_status_code() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-1".to_string(),
+            "chat-1".to_string(),
+        );
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "code": "provider_error",
+                        "message": "rate limited",
+                        "retryable": true,
+                        "statusCode": 429,
+                    }),
+                    timestamp: None,
+                })
+                .expect("send rate-limit broker error");
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
+        let outcome = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-1",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-1",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &mut latency_mode,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+            &[],
+            &[],
+            0,
+            0,
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        assert!(matches!(
+            outcome,
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                message,
+                status_code: Some(429),
+            }) if message == "rate limited"
+        ));
+        let audit = database
+            .llm_request("broker-request-1")
+            .expect("sidecar audit lookup")
+            .expect("sidecar audit exists");
+        assert_eq!(audit.final_state, "failed");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_429_backoff_waits_until_cancel_but_skips_non_429_errors() {
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        assert!(
+            !remote_sidecar_wait_provider_retry_backoff_cancellable(&run_stream, Some(503), 1,)
+                .await
+        );
+
+        let waiting_stream = run_stream.clone();
+        let wait = tokio::spawn(async move {
+            remote_sidecar_wait_provider_retry_backoff_cancellable(&waiting_stream, Some(429), 1)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "a 429 retry must not immediately start the next broker request"
+        );
+
+        run_stream.request_cancel();
+        let interrupted = timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("cancel should interrupt a pending 429 backoff")
+            .expect("backoff task should not panic");
+        assert!(interrupted);
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_429_backoff_is_interrupted_when_stream_finishes() {
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        let waiting_stream = run_stream.clone();
+        let wait = tokio::spawn(async move {
+            remote_sidecar_wait_provider_retry_backoff_cancellable(&waiting_stream, Some(429), 1)
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !wait.is_finished(),
+            "a 429 retry must remain pending until its delay or terminal stream state"
+        );
+
+        run_stream.mark_finished();
+        let interrupted = timeout(Duration::from_secs(1), wait)
+            .await
+            .expect("stream completion should interrupt a pending 429 backoff")
+            .expect("backoff task should not panic");
+        assert!(interrupted);
     }
 
     #[tokio::test]
