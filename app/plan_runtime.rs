@@ -1110,6 +1110,7 @@ fn commit_workspace_changes(
         .chain(diff.staged_files.iter())
         .map(|file| file.path.trim())
         .filter(|path| !path.is_empty())
+        .filter(|path| !crate::git_backend::is_foco_reserved_repo_path(path))
         .map(str::to_string)
         .collect::<BTreeSet<_>>();
     if changed_paths.is_empty() {

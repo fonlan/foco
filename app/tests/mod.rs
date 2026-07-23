@@ -1363,6 +1363,7 @@ fn test_prepared_chat_context(
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
+        code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -15548,6 +15549,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
+        code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -17482,6 +17484,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
+        code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,
@@ -17903,6 +17906,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         question_registry: QuestionRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         builtin_tool_runtime: foco_tools::BuiltinToolRuntime::default(),
+        code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
         app_shutdown_rx,
         context_budget: foco_agent::ContextBudget {
             context_window: 1_000,

@@ -42,10 +42,11 @@ use super::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AGENT_MESSAGE_GUIDANCE_SOURCE, ActiveChatRunRegistry,
-    AgentMessageGuidanceDelivery, AgentScheduler, AskQuestionInput, QuestionAnswer, QuestionItem,
-    QuestionItemAnswer, QuestionOption, QuestionRegistry, QuestionRequest, ToolOutputDeltaSink,
-    ToolResourceLease, ToolResourceLockOwner, ToolResourceLockRegistry, execute_image_tool,
-    execute_web_tool, image_tool_timeout_ms, is_image_tool_name, is_web_tool_name,
+    AgentMessageGuidanceDelivery, AgentScheduler, AskQuestionInput, CodeGraphIndexState,
+    CodeGraphReadinessError, QuestionAnswer, QuestionItem, QuestionItemAnswer, QuestionOption,
+    QuestionRegistry, QuestionRequest, ToolOutputDeltaSink, ToolResourceLease,
+    ToolResourceLockOwner, ToolResourceLockRegistry, execute_image_tool, execute_web_tool,
+    image_tool_timeout_ms, is_image_tool_name, is_web_tool_name, wait_for_code_graph_ready,
     web_tool_timeout_ms,
 };
 use crate::*;
@@ -54,7 +55,8 @@ use foco_providers::NeutralToolCall;
 use foco_tools::{
     CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
     GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
-    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
+    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_CHILDREN_TOOL, GRAPH_FIND_IMPORTERS_TOOL,
+    GRAPH_FIND_IMPORTS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
     GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, READ_SPEC_TOOL, SEARCH_TEXT_TOOL,
     UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_SPEC_TOOL, UPDATE_TODO_GRAPH_TOOL,
     WRITE_FILE_TOOL,
@@ -192,15 +194,25 @@ fn is_read_only_tool(tool_name: &str) -> bool {
         READ_FILE_TOOL
             | FIND_FILES_TOOL
             | SEARCH_TEXT_TOOL
-            | GRAPH_FIND_SYMBOLS_TOOL
-            | GRAPH_FIND_CALLERS_TOOL
-            | GRAPH_FIND_CALLEES_TOOL
-            | GRAPH_FIND_REFERENCES_TOOL
-            | GRAPH_RELATED_FILES_TOOL
-            | GRAPH_EXPLORE_TOOL
             | GET_TODO_GRAPH_TOOL
             | READ_SPEC_TOOL
             | MEMORY_SEARCH_TOOL_NAME
+    ) || is_code_graph_tool_name(tool_name)
+}
+
+/// Central list of built-in Code Graph tools that query the execution-root index.
+pub(crate) fn is_code_graph_tool_name(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        GRAPH_FIND_SYMBOLS_TOOL
+            | GRAPH_FIND_CALLERS_TOOL
+            | GRAPH_FIND_CALLEES_TOOL
+            | GRAPH_FIND_CHILDREN_TOOL
+            | GRAPH_FIND_REFERENCES_TOOL
+            | GRAPH_FIND_IMPORTS_TOOL
+            | GRAPH_FIND_IMPORTERS_TOOL
+            | GRAPH_RELATED_FILES_TOOL
+            | GRAPH_EXPLORE_TOOL
     )
 }
 
@@ -273,6 +285,7 @@ pub(crate) async fn execute_tool_calls_parallel(
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
     builtin_tool_runtime: BuiltinToolRuntime,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
 ) -> Result<Vec<ToolHookOutcome>, ApiError> {
     let mut executed_by_index = (0..tool_calls.len())
         .map(|_| None)
@@ -303,6 +316,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                         cancellation_token.clone(),
                         tool_output_delta_tx.clone(),
                         builtin_tool_runtime.clone(),
+                        code_graph_indexes.clone(),
                         assistant_message_id,
                         workspace_id,
                         workspace_path,
@@ -348,6 +362,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                     let cancellation_token = cancellation_token.clone();
                     let tool_output_delta_tx = tool_output_delta_tx.clone();
                     let builtin_tool_runtime = builtin_tool_runtime.clone();
+                    let code_graph_indexes = code_graph_indexes.clone();
                     let tool_call = tool_calls.get(tool_index).cloned();
 
                     tokio::spawn(async move {
@@ -376,6 +391,7 @@ pub(crate) async fn execute_tool_calls_parallel(
                                 cancellation_token,
                                 tool_output_delta_tx,
                                 builtin_tool_runtime,
+                                code_graph_indexes,
                                 &assistant_message_id,
                                 &workspace_id,
                                 &workspace_path,
@@ -432,6 +448,7 @@ async fn execute_tool_call(
     cancellation_token: ToolCancellationToken,
     tool_output_delta_tx: mpsc::UnboundedSender<ToolOutputDeltaEvent>,
     builtin_tool_runtime: BuiltinToolRuntime,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     assistant_message_id: &str,
     workspace_id: &str,
     workspace_path: &Path,
@@ -477,6 +494,7 @@ async fn execute_tool_call(
         &tool_call.name,
         tool_call.arguments.clone(),
         builtin_tool_runtime,
+        code_graph_indexes,
     )
     .await;
     let completed_at_text = utc_timestamp();
@@ -697,6 +715,7 @@ pub(crate) async fn execute_tool(
         tool_name,
         arguments,
         BuiltinToolRuntime::default(),
+        Arc::new(Mutex::new(CodeGraphIndexState::default())),
     )
     .await
 }
@@ -733,6 +752,7 @@ pub(crate) async fn execute_tool_with_runtime(
     tool_name: &str,
     arguments: Value,
     builtin_tool_runtime: BuiltinToolRuntime,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
 ) -> ToolExecutionWithHooks {
     let mut result = execute_tool_unbudgeted(
         mcp_registry,
@@ -765,6 +785,7 @@ pub(crate) async fn execute_tool_with_runtime(
         tool_name,
         arguments,
         builtin_tool_runtime,
+        code_graph_indexes,
     )
     .await;
     let budgeted = budget_tool_execution(tool_name, result.execution);
@@ -816,6 +837,7 @@ async fn execute_tool_unbudgeted(
     tool_name: &str,
     mut arguments: Value,
     builtin_tool_runtime: BuiltinToolRuntime,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
 ) -> ToolExecutionWithHooks {
     if cancellation_token.is_cancelled() {
         return cancelled_tool_execution();
@@ -1324,6 +1346,47 @@ async fn execute_tool_unbudgeted(
         } else {
             tool_workspace_path
         };
+        if is_code_graph_tool_name(&tool_name) {
+            let indexes = code_graph_indexes.clone();
+            let execution_root = builtin_workspace_path.to_path_buf();
+            let wait_cancellation = cancellation_token.clone();
+            let wait_deadline = tool_deadline;
+            let readiness = tokio::task::spawn_blocking(move || {
+                wait_for_code_graph_ready(
+                    &indexes,
+                    &execution_root,
+                    wait_deadline,
+                    Some(&wait_cancellation),
+                )
+            })
+            .await;
+            match readiness {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return ToolExecutionWithHooks {
+                        execution: code_graph_readiness_tool_execution(error),
+                        hook_summary,
+                    };
+                }
+                Err(join_error) => {
+                    return ToolExecutionWithHooks {
+                        execution: ToolExecution {
+                            output: json!({
+                                "error": format!(
+                                    "code graph readiness wait failed: {join_error}"
+                                ),
+                                "retryable": true,
+                            }),
+                            is_error: true,
+                        },
+                        hook_summary,
+                    };
+                }
+            }
+            if cancellation_token.is_cancelled() {
+                return cancelled_tool_execution_with_hooks(hook_summary);
+            }
+        }
         let worker = tokio::task::spawn_blocking({
             let workspace_path = builtin_workspace_path.to_path_buf();
             let chat_id = chat_id.to_string();
@@ -2909,6 +2972,57 @@ fn resource_lock_timeout_error(
 
 fn remaining_duration_until(deadline: Instant) -> Option<Duration> {
     deadline.checked_duration_since(Instant::now())
+}
+
+fn code_graph_readiness_tool_execution(error: CodeGraphReadinessError) -> ToolExecution {
+    match error {
+        CodeGraphReadinessError::Cancelled => ToolExecution {
+            output: json!({
+                "error": "tool execution cancelled",
+                "cancelled": true,
+            }),
+            is_error: true,
+        },
+        CodeGraphReadinessError::TimedOut { execution_root } => ToolExecution {
+            output: json!({
+                "error": format!(
+                    "code graph index is still initializing for execution root '{}'; retry after indexing completes",
+                    execution_root.display()
+                ),
+                "retryable": true,
+                "codeGraphPhase": "initializing",
+                "executionRoot": execution_root.display().to_string(),
+            }),
+            is_error: true,
+        },
+        CodeGraphReadinessError::Failed {
+            execution_root,
+            stage,
+            error,
+        } => ToolExecution {
+            output: json!({
+                "error": format!(
+                    "code graph index failed for execution root '{}' during {stage}: {error}",
+                    execution_root.display()
+                ),
+                "retryable": true,
+                "codeGraphPhase": "failed",
+                "executionRoot": execution_root.display().to_string(),
+                "failedStage": stage,
+            }),
+            is_error: true,
+        },
+        CodeGraphReadinessError::InvalidPath { path, error } => ToolExecution {
+            output: json!({
+                "error": format!(
+                    "failed to resolve code graph execution root '{}': {error}",
+                    path.display()
+                ),
+                "retryable": false,
+            }),
+            is_error: true,
+        },
+    }
 }
 
 fn set_tool_timeout_ms(arguments: &mut Value, timeout: Duration) {

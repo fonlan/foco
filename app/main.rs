@@ -2289,6 +2289,7 @@ struct PreparedChatContext {
     question_registry: QuestionRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
     builtin_tool_runtime: BuiltinToolRuntime,
+    code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
     app_shutdown_rx: watch::Receiver<bool>,
     context_budget: foco_agent::ContextBudget,
     /// Live global config used to resolve the active provider immediately before every
@@ -4663,6 +4664,7 @@ impl PreparedChatContext {
                                     tool_cancellation_token.clone(),
                                     tool_output_delta_tx,
                                     self.builtin_tool_runtime.clone(),
+                                    self.code_graph_indexes.clone(),
                                 );
                                 tokio::pin!(tool_results);
                                 let mut question_events_open = true;
@@ -5401,6 +5403,7 @@ async fn prepare_chat_context_for_output(
         question_registry: state.question_registry.clone(),
         tool_resource_locks: state.tool_resource_locks.clone(),
         builtin_tool_runtime: BuiltinToolRuntime::new(state.background_command_registry.clone()),
+        code_graph_indexes: state.code_graph_indexes.clone(),
         app_shutdown_rx: state.app_shutdown_rx.clone(),
         context_budget: prompt_context.context_budget,
         live_config: Some(state.config.clone()),

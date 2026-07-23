@@ -37,8 +37,9 @@ pub(crate) use broker_artifacts::BrokeredTransferFile;
 pub(crate) use chat_run::agent_run_event_kind;
 pub(crate) use chat_run::run_chat_context_in_background;
 pub(crate) use code_graph::{
-    CodeGraphIndexState, recently_active_code_graph_workspaces,
+    CodeGraphIndexState, CodeGraphReadinessError, recently_active_code_graph_workspaces,
     spawn_code_graph_index_initialization, spawn_code_graph_workspace_initialization_if_needed,
+    wait_for_code_graph_ready,
 };
 pub(crate) use foco_store::workspace::AGENT_MESSAGE_GUIDANCE_SOURCE;
 pub(crate) use image_tools::{

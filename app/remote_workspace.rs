@@ -140,15 +140,15 @@ use crate::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
         AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, BrokeredTransferFile,
-        MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionRegistry,
-        REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
-        ReasoningLoopDetector, SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent,
-        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
-        execute_tool_with_runtime, execute_web_tool, image_tool_timeout_ms,
-        materialize_brokered_image_result, materialize_brokered_web_result,
-        open_workspace_database_ordinary_with_pre_stream_retry, package_brokered_web_result_files,
-        pre_stream_failure_user_message, reasoning_loop_guard_message, run_post_tool_hooks,
-        web_tool_timeout_ms,
+        CodeGraphIndexState, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
+        QuestionRegistry, REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT,
+        ReadOnlyToolProgressAction, ReasoningLoopDetector, SidecarRuntimeConfigBundle,
+        ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
+        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
+        materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
+        package_brokered_web_result_files, pre_stream_failure_user_message,
+        reasoning_loop_guard_message, run_post_tool_hooks, web_tool_timeout_ms,
     },
     save_config,
     skills::{
@@ -14293,6 +14293,7 @@ async fn remote_sidecar_execute_tool_call(
         &tool_call.name,
         tool_call.arguments.clone(),
         foco_tools::BuiltinToolRuntime::new(state.background_command_registry.clone()),
+        Arc::new(Mutex::new(CodeGraphIndexState::default())),
     )
     .await;
 

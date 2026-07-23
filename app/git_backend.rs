@@ -25,6 +25,16 @@ pub(super) const AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE: &str =
     "does not match Agent worktree base revision";
 pub(super) const AGENT_WORKTREE_SHARED_DIRTY_MESSAGE: &str =
     "cannot merge Agent worktree while shared workspace has uncommitted changes";
+pub(super) const AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE: &str =
+    "Agent worktree commits must not include Foco runtime path '.foco'";
+
+/// Returns true when `repo_path` is the reserved Foco runtime directory or a path under it.
+///
+/// Repo paths use forward slashes. This is independent of `.gitignore`.
+pub(crate) fn is_foco_reserved_repo_path(repo_path: &str) -> bool {
+    let normalized = repo_path.trim().trim_start_matches("./").replace('\\', "/");
+    normalized == ".foco" || normalized.starts_with(".foco/")
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct AgentWorktreeInfo {
@@ -711,6 +721,12 @@ pub(super) fn merge_agent_worktree(
     let entries = status_entries_for_repo(&worktree_path, &worktree_repo)?;
     let diff = git_diff_response(&worktree_path, None)?;
     for entry in &entries {
+        if is_foco_reserved_repo_path(&entry.repo_path) {
+            return Err(ApiError::bad_request(format!(
+                "{AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE}: {}",
+                entry.repo_path
+            )));
+        }
         let Some(target_path) = shared_repo.workdir_path(entry.repo_path.as_bytes().as_bstr())
         else {
             return Err(ApiError::bad_request(
@@ -754,6 +770,21 @@ pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
     let worktree_path = validate_agent_worktree_path(workspace_path, worktree_path)?;
     let shared_repo = open_repo(workspace_path)?;
     let worktree_repo = open_repo(&worktree_path)?;
+    let worktree_head = worktree_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
+        })?
+        .detach();
+    // Reject committed `.foco` runtime paths before shared HEAD / dirty checks so
+    // SharedHeadMismatch cannot route into automatic merge with a poisoned diff.
+    if worktree_head.to_string() != base_revision {
+        reject_committed_foco_runtime_paths(
+            &worktree_repo,
+            base_revision,
+            &worktree_head.to_string(),
+        )?;
+    }
     let shared_head = shared_repo
         .head_id()
         .map_err(|source| {
@@ -774,12 +805,6 @@ pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
         ));
     }
 
-    let worktree_head = worktree_repo
-        .head_id()
-        .map_err(|source| {
-            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
-        })?
-        .detach();
     if worktree_head.to_string() == base_revision {
         return Ok(None);
     }
@@ -842,6 +867,7 @@ pub(super) fn agent_worktree_committed_diff(
             ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
         })?
         .detach();
+    reject_committed_foco_runtime_paths(&worktree_repo, base_revision, &head_id.to_string())?;
     let head_commit = worktree_repo.find_commit(head_id).map_err(|source| {
         ApiError::bad_request(format!(
             "failed to read Agent worktree HEAD commit: {source}"
@@ -1000,6 +1026,9 @@ fn status_entries_for_repo(
         match item {
             gix::status::Item::TreeIndex(change) => {
                 let repo_path = bstr_to_path_string(change.location());
+                if is_foco_reserved_repo_path(&repo_path) {
+                    continue;
+                }
                 if let Some(workspace_path_string) =
                     workspace_relative_path(&workspace_root, &worktree_root, &repo_path)
                 {
@@ -1014,6 +1043,9 @@ fn status_entries_for_repo(
             }
             gix::status::Item::IndexWorktree(item) => {
                 let repo_path = bstr_to_path_string(item.rela_path());
+                if is_foco_reserved_repo_path(&repo_path) {
+                    continue;
+                }
                 if let Some(workspace_path_string) =
                     workspace_relative_path(&workspace_root, &worktree_root, &repo_path)
                 {
@@ -1133,6 +1165,97 @@ fn index_paths(index: &gix::index::File) -> BTreeSet<String> {
         .iter()
         .map(|entry| entry.path(index).to_str_lossy().into_owned())
         .collect()
+}
+
+/// Rejects base..HEAD tree changes that introduce or modify reserved `.foco` runtime paths.
+fn reject_committed_foco_runtime_paths(
+    repo: &gix::Repository,
+    base_revision: &str,
+    head_revision: &str,
+) -> Result<(), ApiError> {
+    let base_id = gix::ObjectId::from_hex(base_revision.as_bytes()).map_err(|source| {
+        ApiError::bad_request(format!("invalid Agent worktree base revision: {source}"))
+    })?;
+    let head_id = gix::ObjectId::from_hex(head_revision.as_bytes()).map_err(|source| {
+        ApiError::bad_request(format!("invalid Agent worktree HEAD revision: {source}"))
+    })?;
+    let base_commit = repo.find_commit(base_id).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree base commit: {source}"
+        ))
+    })?;
+    let head_commit = repo.find_commit(head_id).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree HEAD commit: {source}"
+        ))
+    })?;
+    let base_tree_id = base_commit.tree_id().map_err(|source| {
+        ApiError::internal(format!("failed to read Agent worktree base tree: {source}"))
+    })?;
+    let head_tree_id = head_commit.tree_id().map_err(|source| {
+        ApiError::internal(format!("failed to read Agent worktree HEAD tree: {source}"))
+    })?;
+    let base_index = repo
+        .index_from_tree(&base_tree_id.detach())
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to build git index from base tree: {source}"
+            ))
+        })?;
+    let head_index = repo
+        .index_from_tree(&head_tree_id.detach())
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to build git index from HEAD tree: {source}"
+            ))
+        })?;
+    let base_paths = index_paths(&base_index);
+    let head_paths = index_paths(&head_index);
+    let mut offending = BTreeSet::new();
+    for path in base_paths.iter().chain(head_paths.iter()) {
+        if !is_foco_reserved_repo_path(path) {
+            continue;
+        }
+        let in_base = base_paths.contains(path);
+        let in_head = head_paths.contains(path);
+        if in_base != in_head {
+            offending.insert(path.clone());
+            continue;
+        }
+        if in_base && in_head {
+            let base_blob = blob_from_index_file(repo, &base_index, path)?;
+            let head_blob = blob_from_index_file(repo, &head_index, path)?;
+            if base_blob != head_blob {
+                offending.insert(path.clone());
+            }
+        }
+    }
+    if let Some(path) = offending.into_iter().next() {
+        return Err(ApiError::bad_request(format!(
+            "{AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE}: {path}"
+        )));
+    }
+    Ok(())
+}
+
+fn blob_from_index_file(
+    repo: &gix::Repository,
+    index: &gix::index::File,
+    repo_path: &str,
+) -> Result<Option<Vec<u8>>, ApiError> {
+    let Some(entry) = index.entry_by_path(repo_path.as_bytes().as_bstr()) else {
+        return Ok(None);
+    };
+    let Some(mode) = entry.mode.to_tree_entry_mode() else {
+        return Ok(None);
+    };
+    if !mode.is_blob() {
+        return Ok(None);
+    }
+    let blob = repo
+        .find_blob(entry.id)
+        .map_err(|source| ApiError::internal(format!("failed to read git index blob: {source}")))?;
+    Ok(Some(blob.data.clone()))
 }
 
 fn append_file_diff(
@@ -1691,6 +1814,254 @@ fn plan_worktree_fast_forward_merges_committed_phase_history() {
     delete_agent_worktree(workspace_path, &worktree.root_path, false).expect("delete worktree");
     assert!(!worktree.root_path.exists());
 }
+
+#[cfg(test)]
+#[test]
+fn is_foco_reserved_repo_path_matches_runtime_tree() {
+    assert!(is_foco_reserved_repo_path(".foco"));
+    assert!(is_foco_reserved_repo_path(".foco/foco.sqlite"));
+    assert!(is_foco_reserved_repo_path(".foco/foco.sqlite-wal"));
+    assert!(is_foco_reserved_repo_path("./.foco/agent-worktrees/x"));
+    assert!(!is_foco_reserved_repo_path("src/foco.rs"));
+    assert!(!is_foco_reserved_repo_path("foco/config.toml"));
+}
+
+#[cfg(test)]
+#[test]
+fn untracked_foco_runtime_does_not_block_worktree_status_or_delete() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    // Intentionally no .gitignore for .foco — protection must not depend on it.
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    stage_git_file(workspace_path, "README.md").expect("stage base file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-foco-runtime").expect("worktree");
+    fs::create_dir_all(worktree.root_path.join(".foco")).expect("runtime dir");
+    fs::write(
+        worktree.root_path.join(".foco").join("foco.sqlite"),
+        "runtime-db",
+    )
+    .expect("runtime db");
+    fs::write(
+        worktree.root_path.join(".foco").join("foco.sqlite-wal"),
+        "wal",
+    )
+    .expect("runtime wal");
+
+    let status = git_status_response(&worktree.root_path).expect("status");
+    assert!(
+        status.files.is_empty(),
+        "untracked .foco runtime must not appear in status: {:?}",
+        status.files
+    );
+    delete_agent_worktree(workspace_path, &worktree.root_path, false)
+        .expect("delete must ignore untracked .foco runtime");
+    assert!(!worktree.root_path.exists());
+}
+
+#[cfg(test)]
+#[test]
+fn fast_forward_rejects_committed_foco_runtime_paths() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    stage_git_file(workspace_path, "README.md").expect("stage base file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+    let shared_head_before = shared_workspace_head_commit_id(workspace_path).expect("shared head");
+
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-foco-commit").expect("worktree");
+    fs::create_dir_all(worktree.root_path.join(".foco")).expect("runtime dir");
+    fs::write(
+        worktree.root_path.join(".foco").join("foco.sqlite"),
+        "should-not-merge",
+    )
+    .expect("runtime db");
+    // Force-commit reserved path the way a misbehaving agent shell command might
+    // (`git add -f` / raw git). Foco stage/commit APIs intentionally hide `.foco`.
+    let force_add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree.root_path)
+        .args(["add", "-f", ".foco/foco.sqlite"])
+        .output()
+        .expect("force-add reserved path");
+    assert!(
+        force_add.status.success(),
+        "force-add failed: {}",
+        String::from_utf8_lossy(&force_add.stderr)
+    );
+    let force_commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree.root_path)
+        .args([
+            "-c",
+            "user.name=Foco Test",
+            "-c",
+            "user.email=foco@example.invalid",
+            "commit",
+            "-m",
+            "bad runtime commit",
+        ])
+        .output()
+        .expect("force-commit reserved path");
+    assert!(
+        force_commit.status.success(),
+        "force-commit failed: {}",
+        String::from_utf8_lossy(&force_commit.stderr)
+    );
+
+    let error = fast_forward_shared_workspace_to_agent_worktree(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect_err("fast-forward must reject committed .foco");
+    assert!(
+        error
+            .message
+            .contains(AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE),
+        "unexpected error: {}",
+        error.message
+    );
+    assert_eq!(
+        shared_workspace_head_commit_id(workspace_path).expect("shared head after reject"),
+        shared_head_before,
+        "shared HEAD must remain unchanged"
+    );
+    assert!(
+        !workspace_path.join(".foco").join("foco.sqlite").exists(),
+        "shared workspace must not receive worktree .foco runtime files"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn committed_foco_is_rejected_before_shared_head_mismatch() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join("README.md"), "base\n").expect("base file");
+    stage_git_file(workspace_path, "README.md").expect("stage base file");
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+
+    let worktree = create_agent_worktree(workspace_path, "agent-instance-foco-before-mismatch")
+        .expect("worktree");
+    fs::create_dir_all(worktree.root_path.join(".foco")).expect("runtime dir");
+    fs::write(
+        worktree.root_path.join(".foco").join("foco.sqlite"),
+        "should-not-merge",
+    )
+    .expect("runtime db");
+    let force_add = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree.root_path)
+        .args(["add", "-f", ".foco/foco.sqlite"])
+        .output()
+        .expect("force-add reserved path");
+    assert!(
+        force_add.status.success(),
+        "force-add failed: {}",
+        String::from_utf8_lossy(&force_add.stderr)
+    );
+    let force_commit = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree.root_path)
+        .args([
+            "-c",
+            "user.name=Foco Test",
+            "-c",
+            "user.email=foco@example.invalid",
+            "commit",
+            "-m",
+            "bad runtime commit",
+        ])
+        .output()
+        .expect("force-commit reserved path");
+    assert!(
+        force_commit.status.success(),
+        "force-commit failed: {}",
+        String::from_utf8_lossy(&force_commit.stderr)
+    );
+
+    // Advance shared HEAD so a late foco check would be skipped by SharedHeadMismatch.
+    fs::write(workspace_path.join("README.md"), "shared moved\n").expect("shared edit");
+    stage_git_file(workspace_path, "README.md").expect("stage shared edit");
+    commit_staged_changes(workspace_path, "shared advance".to_string()).expect("shared commit");
+    let shared_head_before = shared_workspace_head_commit_id(workspace_path).expect("shared head");
+
+    let ff_error = fast_forward_shared_workspace_to_agent_worktree(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect_err("must reject committed .foco before head mismatch");
+    assert!(
+        ff_error
+            .message
+            .contains(AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE),
+        "expected foco rejection, got: {}",
+        ff_error.message
+    );
+    assert!(
+        !ff_error
+            .message
+            .contains("does not match Agent worktree base"),
+        "must not surface SharedHeadMismatch when .foco is committed: {}",
+        ff_error.message
+    );
+
+    let diff_error =
+        agent_worktree_committed_diff(workspace_path, &worktree.root_path, &worktree.base_revision)
+            .expect_err("committed diff must reject .foco");
+    assert!(
+        diff_error
+            .message
+            .contains(AGENT_WORKTREE_FOCO_RUNTIME_COMMITTED_MESSAGE),
+        "unexpected committed-diff error: {}",
+        diff_error.message
+    );
+
+    assert_eq!(
+        shared_workspace_head_commit_id(workspace_path).expect("shared head after reject"),
+        shared_head_before,
+        "shared HEAD must remain unchanged"
+    );
+}
+
 fn remove_tracked_files_missing_from_target(
     repo: &gix::Repository,
     target_index: &gix::index::File,
