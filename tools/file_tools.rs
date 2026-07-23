@@ -1645,12 +1645,13 @@ pub(crate) fn ripgrep_command() -> String {
         .unwrap_or_else(|| "rg".to_string())
 }
 
-struct TextChangeStats {
-    lines_added: usize,
-    lines_removed: usize,
+#[derive(Default)]
+pub(crate) struct TextChangeStats {
+    pub(crate) lines_added: usize,
+    pub(crate) lines_removed: usize,
 }
 
-fn text_change_stats(old: &str, new: &str) -> Result<TextChangeStats, ToolRuntimeError> {
+pub(crate) fn text_change_stats(old: &str, new: &str) -> Result<TextChangeStats, ToolRuntimeError> {
     let input = gix::diff::blob::InternedInput::new(old.as_bytes(), new.as_bytes());
     let diff =
         gix::diff::blob::diff_with_slider_heuristics(gix::diff::blob::Algorithm::Histogram, &input);
@@ -1670,9 +1671,6 @@ fn text_change_stats(old: &str, new: &str) -> Result<TextChangeStats, ToolRuntim
     };
 
     for line in String::from_utf8_lossy(&hunks).lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
-            continue;
-        }
         if line.starts_with('+') {
             stats.lines_added += 1;
         } else if line.starts_with('-') {

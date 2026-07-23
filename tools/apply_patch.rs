@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::errors::tool_timeout_ms;
+use crate::file_tools::text_change_stats;
 use crate::{
     DEFAULT_APPLY_PATCH_TIMEOUT_MS, ToolCancellationToken, ToolRuntimeError, decode_text_file,
     encode_text_file, parse_arguments,
@@ -318,6 +319,8 @@ pub(crate) fn apply_patch_with_cancellation(
         "added": affected.added,
         "modified": affected.modified,
         "deleted": affected.deleted,
+        "linesAdded": affected.lines_added,
+        "linesRemoved": affected.lines_removed,
         "timeoutMs": timeout_ms,
     }))
 }
@@ -423,6 +426,8 @@ struct AffectedPaths {
     added: Vec<String>,
     modified: Vec<String>,
     deleted: Vec<String>,
+    lines_added: usize,
+    lines_removed: usize,
 }
 
 impl AffectedPaths {
@@ -445,6 +450,12 @@ impl AffectedPaths {
         }
         output
     }
+
+    fn record_text_change(&mut self, old: &str, new: &str) {
+        let stats = text_change_stats(old, new).unwrap_or_default();
+        self.lines_added += stats.lines_added;
+        self.lines_removed += stats.lines_removed;
+    }
 }
 
 fn apply_hunk(
@@ -461,14 +472,23 @@ fn apply_hunk(
                 source,
             })?;
             affected.added.push(display_patch_path(path));
+            affected.record_text_change("", contents);
         }
         PatchHunk::DeleteFile { path } => {
             let target = resolve_existing_patch_file(workspace, path)?;
+            let original = fs::read(&target).ok().and_then(|bytes| {
+                decode_text_file(&target, &bytes)
+                    .ok()
+                    .map(|(content, _)| content)
+            });
             fs::remove_file(&target).map_err(|source| ToolRuntimeError::Io {
                 path: target,
                 source,
             })?;
             affected.deleted.push(display_patch_path(path));
+            if let Some(original) = original {
+                affected.record_text_change(&original, "");
+            }
         }
         PatchHunk::UpdateFile {
             path,
@@ -502,12 +522,14 @@ fn apply_hunk(
                     source: source_error,
                 })?;
                 affected.modified.push(display_patch_path(move_path));
+                affected.record_text_change(&original, &updated);
             } else {
                 fs::write(&source, encoded).map_err(|source_error| ToolRuntimeError::Io {
                     path: source,
                     source: source_error,
                 })?;
                 affected.modified.push(display_patch_path(path));
+                affected.record_text_change(&original, &updated);
             }
         }
     }
@@ -1041,6 +1063,8 @@ mod tests {
             result["summary"],
             "Success. Updated the following files:\nM unicode.txt\n"
         );
+        assert_eq!(result["linesAdded"], 2);
+        assert_eq!(result["linesRemoved"], 2);
     }
 
     #[test]
@@ -1071,6 +1095,31 @@ mod tests {
             result["summary"],
             "Success. Updated the following files:\nA nested/add.txt\nM nested/moved.txt\nD delete.txt\n"
         );
+        assert_eq!(result["linesAdded"], 2);
+        assert_eq!(result["linesRemoved"], 2);
+    }
+
+    #[test]
+    fn apply_patch_counts_content_that_looks_like_diff_file_headers() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(directory.path().join("deleted.txt"), "--\n--value\n")
+            .expect("seed delete source");
+
+        let result = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Add File: added.txt\n+++\n+++value\n*** Delete File: deleted.txt"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect("patch should apply");
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("added.txt")).expect("added file"),
+            "++\n++value\n"
+        );
+        assert_eq!(result["linesAdded"], 2);
+        assert_eq!(result["linesRemoved"], 2);
     }
 
     #[test]
@@ -1282,6 +1331,30 @@ mod tests {
             result["summary"],
             "Success. Updated the following files:\nM destination.txt\n"
         );
+        assert_eq!(result["linesAdded"], 1);
+        assert_eq!(result["linesRemoved"], 1);
+    }
+
+    #[test]
+    fn apply_patch_does_not_count_pure_moves_as_line_changes() {
+        let directory = tempdir().expect("temp directory");
+        fs::write(directory.path().join("source.txt"), "unchanged\n").expect("seed source");
+
+        let result = apply_patch(
+            directory.path(),
+            json!({
+                "patch": patch("*** Update File: source.txt\n*** Move to: destination.txt\n@@\n unchanged"),
+                "timeoutMs": null,
+            }),
+        )
+        .expect("move should apply");
+
+        assert_eq!(
+            fs::read_to_string(directory.path().join("destination.txt")).expect("moved file"),
+            "unchanged\n"
+        );
+        assert_eq!(result["linesAdded"], 0);
+        assert_eq!(result["linesRemoved"], 0);
     }
 
     #[cfg(windows)]
