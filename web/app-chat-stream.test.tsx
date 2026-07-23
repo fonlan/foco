@@ -4100,6 +4100,120 @@ describe("app-chat-stream verification surfaces", () => {
     }
   });
 
+  it("keeps live compression after a delayed GET active-run messages snapshot resolves", async () => {
+    const delayedMessages = deferred<Response>();
+    let messagesRequestCount = 0;
+    const assistantMessageId = "message-assistant-stream";
+    const messagesPayload = {
+      messages: [
+        chatMessages.messages[0],
+        {
+          ...chatMessages.messages[1],
+          content: "",
+          id: assistantMessageId,
+          metrics: null,
+          parts: [],
+          reasoning: null,
+          status: "streaming",
+          toolCalls: [],
+        },
+      ],
+      activeRun: {
+        assistantMessageId,
+        chatId: "chat-1",
+        lastSequence: 0,
+        runId: "request-stream",
+        workspaceId: "workspace-1",
+      },
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          messagesRequestCount += 1;
+          return messagesRequestCount === 1
+            ? jsonResponse(messagesPayload)
+            : delayedMessages.promise;
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+
+    // An identity correction starts a refresh, but the server response is held
+    // to model the pre-SSE `/messages` snapshot that caused the regression.
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "stale-alias",
+        delta: "trigger refresh",
+        type: "textDelta",
+      });
+    });
+    await waitFor(() => expect(messagesRequestCount).toBe(2));
+
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          compressionId: "compression-race-1",
+          kind: "llm",
+          originalTokenCount: 9000,
+          providerId: "openai",
+          modelId: "gpt-test",
+          startedAt: "2026-07-23T10:00:00Z",
+          status: "start",
+        },
+      });
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId,
+        compressionId: "compression-race-1",
+        kind: "llm",
+        snapshotId: "snapshot-race-1",
+        status: "completed",
+        type: "contextCompression",
+        detail: {
+          completedAt: "2026-07-23T10:00:02Z",
+          compressionId: "compression-race-1",
+          kind: "llm",
+          modelId: "gpt-test",
+          originalTokenCount: 9000,
+          providerId: "openai",
+          snapshotId: "snapshot-race-1",
+          startedAt: "2026-07-23T10:00:00Z",
+          status: "completed",
+          summaryTokenCount: 1200,
+        },
+      });
+    });
+    expect(screen.getByText("Compressed")).toBeInTheDocument();
+
+    await act(async () => {
+      delayedMessages.resolve(jsonResponse(messagesPayload));
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText("Compressed")).toBeInTheDocument();
+      expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    });
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+  });
+
   it("keeps background chat bubble events out of the active tab until switched", async () => {
     renderApp();
 

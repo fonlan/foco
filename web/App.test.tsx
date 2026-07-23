@@ -365,6 +365,75 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     expect(result.preservedCachePrefix).toBe(false);
   });
 
+  it("keeps a live completed compression lifecycle when a stale same-run assistant snapshot arrives", () => {
+    const loadedUser = { ...message("user-1"), role: "user" as const };
+    const staleAssistant = {
+      ...message("assistant-live"),
+      parts: [{ text: "Server text", type: "text" as const }],
+      status: "streaming" as const,
+    };
+    const liveAssistant = {
+      ...staleAssistant,
+      parts: [
+        ...staleAssistant.parts,
+        {
+          detail: {
+            completedAt: "2026-07-23T10:00:02Z",
+            compressionId: "compression-1",
+            kind: "llm" as const,
+            snapshotId: "snapshot-1",
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "completed" as const,
+          },
+          id: "compression-1",
+          kind: "llm" as const,
+          status: "completed" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedUser, staleAssistant],
+      [loadedUser, liveAssistant],
+      { preserveLiveContextCompressionParts: true },
+    );
+
+    expect(result.messages[1]?.parts).toEqual(liveAssistant.parts);
+  });
+
+  it("does not overlay compression parts for an ordinary authoritative reload", () => {
+    const loadedAssistant = {
+      ...message("assistant-live"),
+      parts: [{ text: "Server replacement", type: "text" as const }],
+    };
+    const cachedAssistant = {
+      ...loadedAssistant,
+      parts: [
+        ...loadedAssistant.parts,
+        {
+          detail: {
+            compressionId: "compression-1",
+            kind: "llm" as const,
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "start" as const,
+          },
+          id: "compression-1",
+          kind: "llm" as const,
+          status: "start" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+
+    const result = mergeLoadedMessagesWithStreamingPlaceholders(
+      [loadedAssistant],
+      [cachedAssistant],
+    );
+
+    expect(result.messages[0]?.parts).toEqual(loadedAssistant.parts);
+  });
+
   it("drops cached streaming placeholders when preserveStreaming is false", () => {
     const loadedUser = { ...message("user-1"), role: "user" as const };
     const placeholder = { ...message("assistant-stream"), status: "streaming" as const };

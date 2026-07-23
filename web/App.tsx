@@ -462,6 +462,12 @@ export type MergeLoadedMessagesResult = {
 export type MergeLoadedMessagesOptions = {
   preserveStreamingPlaceholders?: boolean;
   preserveDisjointActiveRunCache?: boolean;
+  /**
+   * The messages request began before this chat received newer live events.
+   * Keep only context-compression parts that the stale server snapshot cannot
+   * know about; this is deliberately narrower than general message merging.
+   */
+  preserveLiveContextCompressionParts?: boolean;
 };
 
 export type ContinuousActiveRunMatchInput = {
@@ -521,6 +527,7 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
   const {
     preserveStreamingPlaceholders = false,
     preserveDisjointActiveRunCache = false,
+    preserveLiveContextCompressionParts = false,
   } =
     typeof options === "boolean"
       ? {
@@ -568,6 +575,13 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
       preservedCachePrefix || cacheOverlapStart === 0
         ? [...preservedPrefix, ...loadedMessages]
         : [...loadedMessages];
+  }
+
+  if (preserveLiveContextCompressionParts) {
+    nextMessages = overlayStaleLoadedContextCompressionParts(
+      nextMessages,
+      cachedMessages,
+    );
   }
 
   // No id continuity with cache: do not resurrect orphan streaming from a
@@ -620,6 +634,73 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
   }
 
   return { messages: nextMessages, preservedCachePrefix };
+}
+
+/**
+ * Overlay live compression lifecycle parts onto a same-thread assistant from
+ * an older `/messages` response. This never restores messages the server did
+ * not return: callers must first prove the response predates live revisions
+ * and belongs to the same continuous active run.
+ */
+export function overlayStaleLoadedContextCompressionParts(
+  loadedMessages: ShellMessage[],
+  cachedMessages: ShellMessage[],
+): ShellMessage[] {
+  const cachedAssistantsById = new Map(
+    cachedMessages
+      .filter((message) => message.role === "assistant")
+      .map((message) => [message.id, message]),
+  );
+
+  return loadedMessages.map((loadedMessage) => {
+    if (loadedMessage.role !== "assistant") {
+      return loadedMessage;
+    }
+    const cachedMessage = cachedAssistantsById.get(loadedMessage.id);
+    if (!cachedMessage) {
+      return loadedMessage;
+    }
+
+    const liveCompressionParts = cachedMessage.parts.filter(
+      (part): part is ChatContextCompressionPart =>
+        part.type === "contextCompression",
+    );
+    if (!liveCompressionParts.length) {
+      return loadedMessage;
+    }
+
+    let parts = [...loadedMessage.parts];
+    let changed = false;
+    for (const livePart of liveCompressionParts) {
+      const serverIndex = parts.findIndex(
+        (part) =>
+          part.type === "contextCompression" &&
+          contextCompressionPartsMatch(part, livePart),
+      );
+      if (serverIndex < 0) {
+        parts.push(livePart);
+        changed = true;
+        continue;
+      }
+
+      const serverPart = parts[serverIndex];
+      if (serverPart?.type !== "contextCompression") {
+        continue;
+      }
+      // A persisted completed part is newer than a local start. Conversely,
+      // never let an old server start downgrade a locally completed lifecycle.
+      const merged =
+        serverPart.status === "completed" || livePart.status !== "completed"
+          ? mergeContextCompressionPart(livePart, serverPart)
+          : mergeContextCompressionPart(serverPart, livePart);
+      if (merged !== serverPart) {
+        parts[serverIndex] = merged;
+        changed = true;
+      }
+    }
+
+    return changed ? { ...loadedMessage, parts } : loadedMessage;
+  });
 }
 
 export function preserveCachedReasoningDurations(
@@ -1534,6 +1615,16 @@ export function App() {
   // rerender App; ceiling is App still owns too much chat state, upgrade path is
   // moving this cache into a dedicated hook/store.
   const chatMessagesByKeyRef = useRef<Record<string, ShellMessage[]>>({});
+  // A per-chat monotonic boundary between a `/messages` request and live SSE
+  // mutations. It is intentionally ref-only: cache protection is ordering
+  // metadata, not render state.
+  const liveMessageRevisionByChatKeyRef = useRef<Map<string, number>>(
+    new Map(),
+  );
+  function advanceLiveMessageRevision(chatKey: string) {
+    const revisions = liveMessageRevisionByChatKeyRef.current;
+    revisions.set(chatKey, (revisions.get(chatKey) ?? 0) + 1);
+  }
   const cachedChatAccessOrderRef = useRef<string[]>([]);
   const trimmedChatCacheKeysRef = useRef<Set<string>>(new Set());
   function rememberChatCacheAccess(chatKey: string) {
@@ -6924,6 +7015,8 @@ export function App() {
     // already wrote cache (same-chat abort → reload race).
     const hadCachedMessagesBeforeLoad =
       chatMessagesByKeyRef.current[chatKey] !== undefined;
+    const liveRevisionBeforeLoad =
+      liveMessageRevisionByChatKeyRef.current.get(chatKey) ?? 0;
     loadingChatKeysRef.current.add(chatKey);
     const controller = new AbortController();
     loadingChatControllersRef.current.set(chatKey, controller);
@@ -6986,11 +7079,18 @@ export function App() {
       // path only re-inserts placeholders; zero-overlap still drops orphans).
       const preserveStreamingPlaceholders =
         sameContinuousLocalRun || (!hasLocalActiveRun && Boolean(activeRun));
+      const staleAfterLiveMessageRevision =
+        (liveMessageRevisionByChatKeyRef.current.get(chatKey) ?? 0) >
+        liveRevisionBeforeLoad;
       const mergeResult = mergeLoadedMessagesWithStreamingPlaceholders(
         normalizedMessages,
         cachedMessages,
         {
           preserveDisjointActiveRunCache,
+          // An old response may not remove live compression lifecycle parts,
+          // but only while the active run proves this is still the same thread.
+          preserveLiveContextCompressionParts:
+            staleAfterLiveMessageRevision && sameContinuousLocalRun,
           preserveStreamingPlaceholders,
         },
       );
@@ -10940,6 +11040,7 @@ export function App() {
           }
 
           if (streamEvent.type === "contextCompression") {
+            advanceLiveMessageRevision(chatKey);
             setMessagesForChatKey(chatKey, (current) =>
               current.map((message) =>
                 isCurrentAssistantMessage(
@@ -12255,6 +12356,7 @@ export function App() {
         }
 
         if (streamEvent.type === "contextCompression") {
+          advanceLiveMessageRevision(runMessagesKey);
           setMessagesForChatKey(runMessagesKey, (current) =>
             current.map((message) =>
               isCurrentAssistantMessage(message, streamEvent.assistantMessageId)
@@ -16228,18 +16330,16 @@ function contextCompressionPartsMatch(
 ) {
   const currentCompressionId = current.detail.compressionId;
   const nextCompressionId = next.detail.compressionId;
-  if (currentCompressionId || nextCompressionId) {
-    return Boolean(
-      currentCompressionId &&
-      nextCompressionId &&
-      currentCompressionId === nextCompressionId,
-    );
+  if (currentCompressionId && nextCompressionId) {
+    return currentCompressionId === nextCompressionId;
+  }
+  const currentSnapshotId = current.detail.snapshotId;
+  const nextSnapshotId = next.detail.snapshotId;
+  if (currentSnapshotId && nextSnapshotId) {
+    return currentSnapshotId === nextSnapshotId;
   }
   return (
     current.kind === next.kind &&
-    current.status === "start" &&
-    next.status === "completed" &&
-    !current.detail.snapshotId &&
     Boolean(current.detail.startedAt) &&
     current.detail.startedAt === next.detail.startedAt
   );
