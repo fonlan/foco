@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "audit:heroui": "node ../scripts/audit-heroui-component-coverage.mjs",
     "dev": "vite --host 127.0.0.1",
     "build": "tsc -b tsconfig.build.json && vite build",
     "test": "vitest run --pool=forks",

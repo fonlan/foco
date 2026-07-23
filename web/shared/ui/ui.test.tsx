@@ -6,16 +6,24 @@ import { describe, expect, it, vi } from "vitest";
 import { DeleteChatDialog } from "../../features/chat/DeleteChatDialog";
 import {
   Button,
+  Checkbox,
   ContextMenu,
   Description,
   FieldError,
   Input,
   Label,
+  ListBox,
   Modal,
+  Select,
   Spinner,
   Switch,
+  TextArea,
   TextField,
+  formField,
   iconButton,
+  overlayPanel,
+  surfacePanel,
+  toolbarButton,
 } from "./index";
 
 describe("shared/ui HeroUI barrel", () => {
@@ -129,6 +137,105 @@ describe("shared/ui HeroUI barrel", () => {
     expect(toggle).toBeChecked();
   });
 
+  it("keeps checkbox labels attached to their controls", async () => {
+    const user = userEvent.setup();
+
+    function ControlledCheckbox() {
+      const [selected, setSelected] = useState(false);
+      return (
+        <Checkbox isSelected={selected} onChange={setSelected}>
+          <Checkbox.Content>
+            <Checkbox.Control>
+              <Checkbox.Indicator />
+            </Checkbox.Control>
+            Share diagnostics
+          </Checkbox.Content>
+        </Checkbox>
+      );
+    }
+
+    render(<ControlledCheckbox />);
+    const checkbox = screen.getByRole("checkbox", { name: "Share diagnostics" });
+    expect(checkbox).not.toBeChecked();
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
+  });
+
+  it("uses the Select and ListBox keyboard contract", async () => {
+    const user = userEvent.setup();
+    const onChange = vi.fn();
+
+    function ControlledSelect() {
+      const [selected, setSelected] = useState("chat");
+      return (
+        <Select
+          aria-label="Work lane"
+          selectedKey={selected}
+          onSelectionChange={(key) => {
+            setSelected(String(key));
+            onChange(String(key));
+          }}
+        >
+          <Select.Trigger aria-label="Work lane">
+            <Select.Value />
+            <Select.Indicator />
+          </Select.Trigger>
+          <Select.Popover>
+            <ListBox>
+              <ListBox.Item id="chat" textValue="Chat">Chat</ListBox.Item>
+              <ListBox.Item id="plan" textValue="Plan">Plan</ListBox.Item>
+            </ListBox>
+          </Select.Popover>
+        </Select>
+      );
+    }
+
+    render(<ControlledSelect />);
+    const trigger = screen.getByRole("button", { name: /Work lane$/ });
+    await user.click(trigger);
+    await screen.findByRole("listbox");
+    await user.keyboard("{ArrowDown}{Enter}");
+
+    await waitFor(() => expect(onChange).toHaveBeenCalledWith("plan"));
+  });
+
+  it("keeps compact workbench recipes semantic and composable", () => {
+    expect(iconButton()).toContain("focus-visible:ring-focus");
+    expect(toolbarButton({ emphasis: "active" })).toContain("bg-surface-secondary");
+    expect(formField()).toContain("[data-slot=input]");
+    expect(formField()).toContain("[data-slot=textarea]");
+    expect(formField()).toContain("[data-slot=select-trigger]");
+    expect(formField()).not.toContain("[data-slot=control]");
+    expect(overlayPanel({ width: "wide" })).toContain("w-[min(42rem");
+    expect(surfacePanel({ level: "active" })).toContain("border-focus");
+  });
+
+  it("uses documented HeroUI form slots in the workbench fixture", () => {
+    render(
+      <div>
+        <TextField aria-label="Fixture input" className={formField()}>
+          <Input />
+        </TextField>
+        <TextField aria-label="Fixture notes" className={formField()}>
+          <TextArea />
+        </TextField>
+        <Select aria-label="Fixture select" className={formField()}>
+          <Select.Trigger>
+            <Select.Value />
+            <Select.Indicator />
+          </Select.Trigger>
+          <Select.Popover>
+            <ListBox><ListBox.Item id="fixture">Fixture</ListBox.Item></ListBox>
+          </Select.Popover>
+        </Select>
+      </div>,
+    );
+
+    expect(screen.getByRole("textbox", { name: "Fixture input" })).toHaveAttribute("data-slot", "input");
+    expect(screen.getByRole("textbox", { name: "Fixture notes" })).toHaveAttribute("data-slot", "textarea");
+    expect(screen.getByRole("button", { name: /Fixture select/ })).toHaveAttribute("data-slot", "select-trigger");
+  });
+
   it("Modal provides dialog role, Escape dismissal, and footer actions", async () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
@@ -188,6 +295,37 @@ describe("shared/ui HeroUI barrel", () => {
 
     await user.keyboard("{Escape}");
     await waitFor(() => expect(onClose).toHaveBeenCalled());
+  });
+
+  it("returns focus to the Modal trigger after Escape dismissal", async () => {
+    const user = userEvent.setup();
+
+    function TriggeredModal() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <Button onPress={() => setOpen(true)}>Open work lane</Button>
+          <Modal.Backdrop isDismissable isOpen={open} onOpenChange={setOpen}>
+            <Modal.Container>
+              <Modal.Dialog aria-label="Work lane details">
+                <Modal.Header><Modal.Heading>Work lane details</Modal.Heading></Modal.Header>
+                <Modal.Body>Current activity is isolated here.</Modal.Body>
+                <Modal.Footer><Button onPress={() => setOpen(false)}>Close</Button></Modal.Footer>
+              </Modal.Dialog>
+            </Modal.Container>
+          </Modal.Backdrop>
+        </>
+      );
+    }
+
+    render(<TriggeredModal />);
+    const trigger = screen.getByRole("button", { name: "Open work lane" });
+    await user.click(trigger);
+    expect(screen.getByRole("dialog", { name: "Work lane details" })).toBeInTheDocument();
+
+    await user.keyboard("{Escape}");
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
   });
 
   it("ContextMenu exposes menu items and invokes onAction", async () => {

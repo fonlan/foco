@@ -28,6 +28,7 @@ export {
   Badge,
   Button,
   Card,
+  Checkbox,
   Chip,
   CloseButton,
   Description,
@@ -58,8 +59,20 @@ export {
   useOverlayState,
 } from "@heroui/react";
 
-export type { ButtonProps, Key, Selection } from "@heroui/react";
+export type {
+  ButtonProps,
+  CheckboxProps,
+  Key,
+  Selection,
+  SwitchProps,
+} from "@heroui/react";
 
-export { iconButton } from "./variants";
+export {
+  formField,
+  iconButton,
+  overlayPanel,
+  surfacePanel,
+  toolbarButton,
+} from "./variants";
 export { ContextMenu } from "./ContextMenu";
 export type { ContextMenuItem, ContextMenuProps } from "./ContextMenu";
