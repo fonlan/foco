@@ -1402,7 +1402,7 @@ function ChatPanelComponent({
                   {canRetryRun ? (
                     <button
                       aria-label={t("Retry last run")}
-                      className="composer-retry-button composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                      className="composer-retry-button composer-run-button"
                       onClick={onRetryRun}
                       title={t("Retry last run")}
                       type="button"
@@ -1423,8 +1423,8 @@ function ChatPanelComponent({
                       aria-label={runningButtonLabel}
                       className={
                         runningButtonSendsMessage
-                          ? "composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
-                          : "composer-run-button inline-flex size-8 items-center justify-center rounded-lg border border-[var(--danger)] bg-[var(--surface)] text-[var(--danger)] shadow-sm hover:bg-[var(--danger-soft)]"
+                          ? "composer-run-button"
+                          : "composer-run-button composer-run-button-danger"
                       }
                       disabled={
                         runningButtonSendsMessage &&
@@ -1457,7 +1457,7 @@ function ChatPanelComponent({
                             : undefined
                         }
                         aria-label={t("Send message")}
-                        className="composer-run-button inline-flex size-8 items-center justify-center rounded-lg bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)] hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:shadow-none"
+                        className="composer-run-button"
                         disabled={
                           (!draftMessage.trim() && !draftAttachments.length) ||
                           !selectedModelId ||
@@ -2076,7 +2076,6 @@ function ComposerSelectMenu({
               key={option.value}
               textValue={option.label}
             >
-              <Icon aria-hidden="true" className="size-3.5 shrink-0" />
               <Label className="min-w-0 flex-1 truncate">{option.label}</Label>
               {option.badge ? (
                 <Chip className="ms-auto" size="sm" variant="soft">
@@ -2169,7 +2168,6 @@ function BranchSelector({
                   key={branchName}
                   textValue={branchName}
                 >
-                  <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
                   <Label className="min-w-0 flex-1 truncate">{branchName}</Label>
                   <ListBox.ItemIndicator />
                 </ListBox.Item>
@@ -2192,7 +2190,6 @@ function BranchSelector({
                   key={worktree.path}
                   textValue={worktree.name}
                 >
-                  <GitBranch aria-hidden="true" className="size-3.5 shrink-0" />
                   <div className="min-w-0 flex-1">
                     <Label className="block truncate">{worktree.name}</Label>
                     <span className="block truncate text-xs font-normal text-muted">
@@ -3161,6 +3158,20 @@ function managedCommandStatusClass(presentation: ManagedCommandPresentation) {
   }
 }
 
+function managedCommandHeaderDetail(
+  detailText: string,
+  presentation: ManagedCommandPresentation,
+  t: Translate,
+) {
+  const processStatus = managedCommandStatusLabel(presentation, t);
+  if (!processStatus) {
+    return detailText;
+  }
+
+  const commandId = presentation.processId ?? detailText;
+  return [commandId, processStatus].filter(Boolean).join(" · ");
+}
+
 function CommandChunkLog({ chunks }: { chunks: ManagedCommandChunk[] }) {
   if (!chunks.length) {
     return null;
@@ -3218,11 +3229,11 @@ function ManagedCommandSummary({
       <div
         className={`flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 rounded-md border px-2 py-1.5 text-[11px] ${managedCommandStatusClass(presentation)}`}
       >
-        {statusLabel ? (
-          <span className="font-semibold">{statusLabel}</span>
-        ) : null}
         {presentation.processId ? (
           <span className="font-mono">{presentation.processId}</span>
+        ) : null}
+        {statusLabel ? (
+          <span className="font-semibold">{statusLabel}</span>
         ) : null}
         {presentation.pid !== null ? <span>PID {presentation.pid}</span> : null}
         {duration ? <span>{duration}</span> : null}
@@ -3669,13 +3680,23 @@ function ToolCallBlock({
   const managedStatusLabel = managedCommand
     ? managedCommandStatusLabel(managedCommand, t)
     : null;
+  const summaryDetailText =
+    toolCall.name === "get_command_output" && managedCommand
+      ? managedCommandHeaderDetail(detailText, managedCommand, t)
+      : detailText;
+  const completedCommandOutput =
+    !toolCall.isError &&
+    toolCall.name === "get_command_output" &&
+    toolCall.status === "completed";
   const summaryStatusLabel =
-    !toolCall.isError && managedStatusLabel
+    completedCommandOutput
+      ? toolStatusText(toolCall, t)
+      : !toolCall.isError && managedStatusLabel
       ? managedStatusLabel
       : toolStatusText(toolCall, t);
   const summaryStatusClass = toolCall.isError
     ? "bg-[var(--danger-soft)] text-[var(--danger)]"
-    : managedCommand && managedStatusLabel
+    : !completedCommandOutput && managedCommand && managedStatusLabel
       ? managedCommandStatusClass(managedCommand)
       : toolCall.status === "completed"
         ? "bg-[var(--success-soft)] text-[var(--success)]"
@@ -3737,15 +3758,15 @@ function ToolCallBlock({
               <span className="text-[var(--danger)]">-{changeStats.linesRemoved}</span>
             </span>
           ) : null}
-          {detailText ? (
+          {summaryDetailText ? (
             <span className="shrink-0 text-[var(--muted)]">·</span>
           ) : null}
-          {detailText ? (
+          {summaryDetailText ? (
             <span
               className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
-              title={detailText}
+              title={summaryDetailText}
             >
-              {detailText}
+              {summaryDetailText}
             </span>
           ) : null}
           <span

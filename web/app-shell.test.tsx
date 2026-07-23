@@ -1920,6 +1920,19 @@ describe("app-shell verification surfaces", () => {
       },
       status: "completed",
     };
+    const exitedOutputPoll = {
+      ...outputPoll,
+      id: "tool-command-output-exited",
+      output: {
+        ...outputPoll.output,
+        chunks: [],
+        cursorExpired: false,
+        endedAt: "2026-07-22T04:00:03.000Z",
+        exitCode: 17,
+        hasMore: false,
+        status: "exited",
+      },
+    };
     const stoppedCommand = {
       ...assistantMessage.toolCalls[0],
       id: "tool-stop-command",
@@ -1946,6 +1959,7 @@ describe("app-shell verification surfaces", () => {
     assistantMessage.toolCalls = [
       backgroundStart,
       outputPoll,
+      exitedOutputPoll,
       stoppedCommand,
       stopRequestedCommand,
     ];
@@ -1954,6 +1968,7 @@ describe("app-shell verification surfaces", () => {
         ? [
             { ...part, toolCall: backgroundStart },
             { ...part, toolCall: outputPoll },
+            { ...part, toolCall: exitedOutputPoll },
             { ...part, toolCall: stoppedCommand },
             { ...part, toolCall: stopRequestedCommand },
           ]
@@ -1976,16 +1991,29 @@ describe("app-shell verification surfaces", () => {
 
     await userEvent.click(await screen.findByText("Tool run"));
     const startSummary = await screen.findByLabelText("Run (run_command)");
-    const outputSummary = await screen.findByLabelText("Command Output (get_command_output)");
+    const outputSummaries = await screen.findAllByLabelText(
+      "Command Output (get_command_output)",
+    );
+    const [outputSummary, exitedOutputSummary] = outputSummaries;
     const stopSummaries = await screen.findAllByLabelText("Stop Command (stop_command)");
     const [stopSummary, stopRequestedSummary] = stopSummaries;
-    if (!stopSummary || !stopRequestedSummary) {
-      throw new Error("Expected both terminal and pending stop command cards");
+    if (
+      !outputSummary ||
+      !exitedOutputSummary ||
+      !stopSummary ||
+      !stopRequestedSummary
+    ) {
+      throw new Error("Expected managed command lifecycle cards");
     }
 
     const startStatus = within(startSummary).getByText("Backgrounded");
     expect(startStatus).toHaveClass("bg-[var(--success-soft)]", "text-[var(--success)]");
-    expect(outputSummary).toHaveTextContent("Background running");
+    expect(outputSummary.lastElementChild).toHaveTextContent("completed");
+    expect(outputSummary).toHaveTextContent(/process-demo.*Background running/);
+    expect(exitedOutputSummary.lastElementChild).toHaveTextContent("completed");
+    expect(exitedOutputSummary).toHaveTextContent(
+      /process-demo.*Exited · code 17/,
+    );
     expect(stopSummary).toHaveTextContent("Stopped");
 
     await userEvent.click(startSummary);

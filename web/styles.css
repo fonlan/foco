@@ -16,6 +16,26 @@
 }
 
 :root {
+  /* HeroUI semantic palette: a quiet violet workbench instead of neutral gray. */
+  --background: oklch(0.975 0.016 292);
+  --foreground: oklch(0.275 0.055 288);
+  --surface: oklch(0.995 0.006 292);
+  --surface-secondary: oklch(0.95 0.03 292);
+  --surface-tertiary: oklch(0.905 0.055 292);
+  --surface-hover: oklch(0.925 0.065 292);
+  --overlay: oklch(0.99 0.012 292);
+  --overlay-foreground: var(--foreground);
+  --muted: oklch(0.5 0.045 288);
+  --default: oklch(0.91 0.038 292);
+  --default-foreground: var(--foreground);
+  --accent: oklch(0.57 0.19 292);
+  --accent-foreground: oklch(0.99 0.006 292);
+  --accent-soft: oklch(0.89 0.07 292);
+  --accent-soft-foreground: oklch(0.4 0.12 292);
+  --border: oklch(0.82 0.045 292);
+  --border-secondary: oklch(0.87 0.03 292);
+  --background-inverse: oklch(0.22 0.055 292);
+  --focus: var(--accent);
   color: var(--foreground);
   background: var(--background);
   font-family:
@@ -30,6 +50,29 @@
   font-synthesis: none;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0;
+}
+
+.dark,
+[data-theme="dark"] {
+  --background: oklch(0.18 0.032 292);
+  --foreground: oklch(0.94 0.025 292);
+  --surface: oklch(0.225 0.04 292);
+  --surface-secondary: oklch(0.27 0.055 292);
+  --surface-tertiary: oklch(0.155 0.035 292);
+  --surface-hover: oklch(0.315 0.07 292);
+  --overlay: oklch(0.29 0.055 292);
+  --overlay-foreground: var(--foreground);
+  --muted: oklch(0.76 0.045 292);
+  --default: oklch(0.3 0.045 292);
+  --default-foreground: var(--foreground);
+  --accent: oklch(0.73 0.15 292);
+  --accent-foreground: oklch(0.22 0.055 292);
+  --accent-soft: oklch(0.34 0.1 292);
+  --accent-soft-foreground: oklch(0.91 0.06 292);
+  --border: oklch(0.39 0.05 292);
+  --border-secondary: oklch(0.33 0.04 292);
+  --background-inverse: oklch(0.12 0.025 292);
+  --focus: var(--accent);
 }
 
 * {
@@ -4032,22 +4075,18 @@ summary:focus-visible {
 
 
 .foco-nav-rail {
-  border-right-color: rgba(255, 255, 255, 0.08);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent 28%),
-    linear-gradient(180deg, var(--background-inverse), var(--surface-tertiary));
-  box-shadow: inset -1px 0 0 rgba(255, 255, 255, 0.05);
+  border-right-color: var(--border);
+  background: var(--surface-tertiary);
+  box-shadow: none;
 }
 
 .foco-nav-logo-button {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--surface);
 }
 
 .foco-logo-mark {
-  background: #ffffff;
-  box-shadow:
-    0 10px 24px rgba(0, 0, 0, 0.22),
-    0 0 0 1px rgba(255, 255, 255, 0.14);
+  background: var(--accent);
+  box-shadow: none;
 }
 
 .foco-nav-logo-button .foco-logo-mark {
@@ -4063,9 +4102,9 @@ summary:focus-visible {
 }
 
 .foco-nav-rail-button:hover {
-  background: color-mix(in oklab, var(--foreground) 10%, transparent);
-  color: #ffffff;
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--foreground) 12%, transparent);
+  background: var(--surface-hover);
+  color: var(--accent-soft-foreground);
+  box-shadow: none;
 }
 
 .foco-nav-rail-button-active {
@@ -4446,27 +4485,38 @@ summary:focus-visible {
 
 .composer-tool-button,
 .composer-team-toggle,
+.composer-fast-toggle,
 .composer-select-summary,
-.composer-branch-select {
+.composer-branch-select,
+.composer-run-button {
   border-color: var(--border);
   background: var(--surface);
-  color: var(--muted);
+  color: var(--accent-soft-foreground);
+  box-shadow: none;
 }
 
 .composer-team-toggle:not(.composer-team-toggle-enabled) {
-  border-color: var(--border);
-  background: var(--surface-secondary);
-  color: var(--foreground);
+  background: var(--surface);
+  color: var(--accent-soft-foreground);
 }
 
-.composer-team-toggle:not(.composer-team-toggle-enabled) > svg {
-  color: var(--accent-soft-foreground);
+.message-composer-control-row :is(
+  .composer-tool-button,
+  .composer-team-toggle,
+  .composer-fast-toggle,
+  .composer-select-summary,
+  .composer-branch-select,
+  .composer-run-button
+) svg {
+  color: currentColor;
 }
 
 .composer-tool-button:hover,
 .composer-team-toggle:hover,
+.composer-fast-toggle:hover,
 .composer-select-summary:hover,
-.composer-branch-select:hover {
+.composer-branch-select:hover,
+.composer-run-button:not(:disabled):hover {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-soft-foreground);
@@ -4474,10 +4524,38 @@ summary:focus-visible {
 
 .composer-tool-button:focus-visible,
 .composer-team-toggle:focus-visible,
+.composer-fast-toggle:focus-visible,
 .composer-select-summary:focus-visible,
-.composer-branch-select:focus-visible {
+.composer-branch-select:focus-visible,
+.composer-run-button:focus-visible {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
+}
+
+.composer-team-toggle.composer-team-toggle-enabled,
+.composer-fast-toggle.composer-fast-toggle-enabled {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-foreground);
+  box-shadow: none;
+}
+
+.composer-team-toggle.composer-team-toggle-enabled:hover,
+.composer-fast-toggle.composer-fast-toggle-enabled:hover {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.composer-run-button-danger {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.composer-run-button-danger:not(:disabled):hover {
+  border-color: var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .composer-select-popover {
@@ -4493,13 +4571,21 @@ summary:focus-visible {
 }
 
 .composer-run-button {
-  background: var(--foreground);
-  color: #ffffff;
-  box-shadow: var(--overlay-shadow);
+  display: inline-flex;
+  width: 1.875rem;
+  height: 1.875rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 0.4375rem;
 }
 
-.composer-run-button:not(:disabled):hover {
-  background: var(--accent);
+.composer-run-button:disabled {
+  border-color: var(--border);
+  background: var(--default);
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .context-sidebar,
