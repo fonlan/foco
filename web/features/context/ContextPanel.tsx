@@ -586,12 +586,15 @@ function WorkspaceFileTreeNodeRow({
           aria-label={isExpanded ? t("Collapse folder") : t("Expand folder")}
           className="workspace-file-tree-toggle"
           isDisabled={!isDirectory}
+          isIconOnly
           onPress={() => {
             if (isDirectory) {
               void onTogglePath(node);
             }
           }}
+          size="sm"
           type="button"
+          variant="ghost"
         >
           {isDirectory ? (
             isExpanded ? (

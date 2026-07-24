@@ -1803,14 +1803,24 @@ body,
   color: rgb(12 10 9);
 }
 
-.workspace-file-tree-toggle {
+.workspace-file-tree-toggle.button--icon-only.button--sm {
+  /* HeroUI's ghost variant supplies blue/gray defaults through these tokens.
+     Keep the disclosure control neutral in every interaction state while
+     retaining the library's accessible focus treatment. */
+  --button-bg: transparent;
+  --button-bg-hover: var(--surface-hover);
+  --button-bg-pressed: var(--surface-hover);
+  --button-fg: var(--muted);
   display: inline-flex;
   width: 1rem;
+  min-width: 1rem;
   height: 1rem;
+  min-height: 1rem;
   flex-shrink: 0;
   align-items: center;
   justify-content: center;
   border-radius: 0.25rem;
+  padding: 0;
   color: rgb(120 113 108);
 }
 
@@ -3533,7 +3543,7 @@ body,
 }
 .composer-select-label,
 .composer-select-popover .composer-select-option-label {
-  font-size: var(--foco-font-micro);
+  font-size: var(--foco-font-compact);
 }
 
 /* Control-row button labels: normal weight for visual consistency.
@@ -3579,10 +3589,12 @@ body,
 }
 
 .composer-model-select-compact {
-  width: clamp(3.6rem, 7.2vw, 5.6rem);
-  min-width: 3.6rem;
-  max-width: min(7.2rem, 12.8vw);
-  flex: 0 1 4.4rem;
+  /* Preserve the compact layout while giving model names roughly 30% more
+     room before they truncate. Mobile retains its icon-only control layout. */
+  width: clamp(4.7rem, 9.4vw, 7.3rem);
+  min-width: 4.7rem;
+  max-width: min(9.4rem, 16.6vw);
+  flex: 0 1 5.7rem;
 }
 
 .composer-thinking-select {
@@ -3613,6 +3625,20 @@ body,
   .composer-run-button
 ) {
   border: 1px solid var(--border);
+  /* The action row is a single control group: every button and select uses
+     the same compact label and 14px icon scale. */
+  font-size: var(--foco-font-compact);
+}
+
+.message-composer-control-row :is(
+  .composer-tool-button,
+  .composer-team-toggle,
+  .composer-fast-toggle,
+  .composer-select-summary,
+  .composer-run-button
+) svg {
+  width: 0.875rem;
+  height: 0.875rem;
 }
 
 .message-composer-control-row .composer-run-button {
