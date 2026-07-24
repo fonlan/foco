@@ -1147,9 +1147,9 @@ function ChatPanelComponent({
             tabIndex={0}
           />
 
-          <div className="composer-shell shrink-0 border-t border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-transparent px-3 py-1.5 sm:px-5">
+          <div className="composer-shell shrink-0 border-t border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-transparent">
             <form
-              className="message-composer-form mx-auto w-full max-w-[min(42rem,92%)] sm:max-w-[78%]"
+              className="message-composer-form mx-auto w-full"
               onSubmit={handleComposerSubmit}
             >
               <div className="composer-surface relative rounded-xl border border-[var(--border)] bg-[var(--surface)]">
@@ -1624,7 +1624,7 @@ const MessageRow = memo(function MessageRow({
     >
       <div className="message-card-shell">
         <div
-          className={`message-bubble flex max-w-[min(42rem,92%)] items-start gap-3 rounded-2xl border px-4 py-3 shadow-[var(--overlay-shadow)] sm:max-w-[78%] ${
+          className={`message-bubble flex w-full max-w-full items-start gap-3 rounded-2xl border px-4 py-3 shadow-[var(--overlay-shadow)] ${
             isUser
               ? "message-bubble-user flex-row rounded-tr-md"
               : "message-bubble-assistant flex-row rounded-tl-md"
@@ -2052,10 +2052,10 @@ function ComposerSelectMenu({
     >
       <Select.Trigger
         aria-label={triggerAriaLabel}
-        className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 px-2 text-xs font-medium"
+        className="composer-select-summary h-[1.75rem] min-h-[1.75rem] gap-1.5 px-2 text-[length:var(--foco-font-micro)] font-normal"
       >
         <Icon aria-hidden="true" className="size-3.5 shrink-0" />
-        <Select.Value className="composer-select-label min-w-0 flex-1 truncate">
+        <Select.Value className="composer-select-label min-w-0 flex-1 truncate leading-none">
           {({ defaultChildren, isPlaceholder }) =>
             isPlaceholder ? defaultChildren : selectedLabel
           }

@@ -14256,7 +14256,7 @@ export function App() {
             ) : null}
 
             <section className="app-main-panel flex min-w-0 flex-col">
-              <header className="app-toolbar shrink-0 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] backdrop-blur">
+              <header className="app-toolbar shrink-0 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)]">
                 <div className="flex min-w-0 items-center justify-between gap-2">
                   <MainTabBar
                     activeTab={activeMainTab}

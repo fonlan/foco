@@ -23,6 +23,8 @@
   --foco-control-radius: 0.5rem;
   --foco-surface-shadow: var(--surface-shadow);
   --foco-overlay-shadow: var(--overlay-shadow);
+  /* Opaque chrome for workspace/session/right-panel headers (not frosted). */
+  --foco-chrome: #f5f5f5;
   color: var(--foreground);
   background: var(--background);
   font-family:
@@ -46,6 +48,8 @@
   --chart-primary: var(--accent);
   --foco-surface-shadow: var(--surface-shadow);
   --foco-overlay-shadow: var(--overlay-shadow);
+  /* Dark chrome mirrors light: list body = surface, headers = secondary. */
+  --foco-chrome: var(--surface-secondary);
 }
 
 * {
@@ -181,7 +185,8 @@ summary {
   height: 100%;
   min-height: 0;
   overflow: hidden;
-  background: var(--surface);
+  background-color: var(--surface);
+  background-image: none;
   box-shadow: none;
 }
 
@@ -1366,7 +1371,9 @@ body,
 
 .workspace-sidebar {
   width: auto;
-  background: var(--surface);
+  /* Solid surface like model-routing-panel — no frosted/transparent mix. */
+  background-color: var(--surface);
+  background-image: none;
   box-shadow: none;
 }
 
@@ -1420,7 +1427,7 @@ body,
   min-height: var(--foco-header-height);
   height: var(--foco-header-height);
   padding: 0 0.75rem;
-  background: var(--surface);
+  background: var(--foco-chrome);
 }
 
 .workspace-sidebar-title {
@@ -1436,6 +1443,7 @@ body,
 .workspace-nav {
   padding: 0.625rem;
   min-height: 7.5rem;
+  background-color: var(--surface);
 }
 
 .model-routing-panel {
@@ -2142,7 +2150,7 @@ body,
   min-height: var(--foco-header-height);
   height: var(--foco-header-height);
   border-color: var(--border);
-  background: var(--surface);
+  background: var(--foco-chrome);
 }
 
 .chat-tab-list {
@@ -2394,11 +2402,16 @@ body,
 .composer-shell {
   border-color: var(--border);
   background: var(--surface);
+  /* Match .message-list horizontal inset so composer aligns with bubbles. */
   padding: 0.625rem 1.25rem;
 }
 
 .composer-shell .message-composer-form {
+  /* Same width contract as .message-stack / .message-bubble: fill the
+     padded shell. Do not add a separate max-width cap — a later
+     max-width: 100% rule already lets the stack expand with the panel. */
   width: 100%;
+  max-width: 100%;
 }
 
 .composer-surface {
@@ -2486,6 +2499,7 @@ body,
   height: var(--foco-header-height);
   align-items: stretch;
   padding: 0;
+  background: var(--foco-chrome);
 }
 
 .context-panel-tabs > .tabs__list-container,
@@ -3269,7 +3283,7 @@ body,
   }
 
   .composer-shell {
-    padding: 0.625rem;
+    padding: 0.375rem 0.25rem;
   }
 
   .message-composer-tool-row,
@@ -3361,7 +3375,7 @@ body,
   align-items: center;
   height: var(--foco-header-height);
   min-height: var(--foco-header-height);
-  background: var(--surface);
+  background: var(--foco-chrome);
   padding-top: 0;
   padding-right: 0;
   padding-bottom: 0;
@@ -3599,7 +3613,8 @@ body,
 }
 .composer-select-label,
 .composer-select-popover .composer-select-option-label {
-  font-size: var(--foco-font-compact);
+  font-size: var(--foco-font-micro);
+  line-height: 1;
 }
 
 /* Control-row button labels: normal weight for visual consistency.
@@ -3608,6 +3623,31 @@ body,
 .message-composer-control-row .composer-select-summary,
 .message-composer-control-row .composer-fast-toggle {
   font-weight: 400;
+  font-size: var(--foco-font-micro);
+  line-height: 1;
+}
+
+/* HeroUI Select.Trigger can carry extra block padding / min-height that drops
+   the label below Plan/Fast button text — lock both to the same box model. */
+.message-composer-control-row .composer-select-summary,
+.message-composer-control-row .composer-select-summary.select__trigger {
+  display: inline-flex;
+  height: 1.75rem;
+  min-height: 1.75rem;
+  max-height: 1.75rem;
+  align-items: center;
+  padding-block: 0;
+  line-height: 1;
+  box-shadow: none;
+}
+
+.message-composer-control-row .composer-select-label,
+.message-composer-control-row .composer-team-toggle-label,
+.message-composer-control-row .composer-fast-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  line-height: 1;
+  font-size: var(--foco-font-micro);
 }
 
 .message-composer-control-row .composer-select-popover button {
@@ -3682,8 +3722,9 @@ body,
 ) {
   border: 1px solid var(--border);
   /* The action row is a single control group: every button and select uses
-     the same compact label and 14px icon scale. */
-  font-size: var(--foco-font-compact);
+     the same micro label and 14px icon scale. */
+  font-size: var(--foco-font-micro);
+  line-height: 1;
 }
 
 .message-composer-control-row :is(
@@ -4112,13 +4153,14 @@ summary:focus-visible {
 .workspace-sidebar,
 .settings-section-nav-card {
   border-right: 1px solid var(--border);
-  background: var(--surface), var(--surface);
+  background-color: var(--surface);
+  background-image: none;
 }
 
 .workspace-sidebar-header,
 .settings-sidebar-header {
   border-bottom-color: var(--border);
-  background: var(--surface);
+  background: var(--foco-chrome);
 }
 
 .workspace-sidebar-title,
@@ -4175,7 +4217,7 @@ summary:focus-visible {
 .app-toolbar,
 .chat-tab-list {
   border-bottom-color: var(--border);
-  background: var(--surface);
+  background: var(--foco-chrome);
 }
 
 .chat-tab-item {
@@ -4497,7 +4539,7 @@ summary:focus-visible {
 
 .context-panel-tabs {
   border-bottom-color: var(--border);
-  background: var(--surface);
+  background: var(--foco-chrome);
 }
 
 .context-panel-tab {
@@ -4842,7 +4884,7 @@ summary:focus-visible {
 
 @media (max-width: 767px) {
   .message-list {
-    padding: 0.625rem;
+    padding: 0.25rem;
   }
 
   .message-stack {
@@ -4856,6 +4898,10 @@ summary:focus-visible {
 
   .message-bubble .message-avatar {
     display: none;
+  }
+
+  .composer-shell {
+    padding: 0.375rem 0.25rem;
   }
 
   .plan-locate-button {
@@ -4908,8 +4954,21 @@ summary:focus-visible {
 
 .composer-shell {
   padding-bottom: max(0.375rem, var(--foco-safe-bottom));
-  padding-left: max(0.75rem, var(--foco-safe-left));
-  padding-right: max(0.75rem, var(--foco-safe-right));
+  padding-left: max(1.25rem, var(--foco-safe-left));
+  padding-right: max(1.25rem, var(--foco-safe-right));
+}
+
+@media (max-width: 767px) {
+  .composer-shell {
+    padding-top: 0.375rem;
+    padding-bottom: max(0.375rem, var(--foco-safe-bottom));
+    padding-left: max(0.25rem, var(--foco-safe-left));
+    padding-right: max(0.25rem, var(--foco-safe-right));
+  }
+
+  .message-list {
+    padding: 0.25rem;
+  }
 }
 
 .app-error-toast,
@@ -4995,7 +5054,10 @@ summary:focus-visible {
   }
 
   .composer-shell {
+    padding-top: 0.375rem;
     padding-bottom: max(0.625rem, var(--foco-safe-bottom));
+    padding-left: max(0.25rem, var(--foco-safe-left));
+    padding-right: max(0.25rem, var(--foco-safe-right));
   }
 
   .settings-layout > .min-w-0,

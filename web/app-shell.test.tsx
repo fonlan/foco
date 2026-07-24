@@ -394,8 +394,6 @@ describe("app-shell verification surfaces", () => {
     expect(composer).toBeInTheDocument();
     expect(composer.closest("form")).toHaveClass(
       "message-composer-form",
-      "max-w-[min(42rem,92%)]",
-      "sm:max-w-[78%]",
     );
 
     await userEvent.click(screen.getByText("Tool run"));

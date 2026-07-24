@@ -1232,7 +1232,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
   });
 
-  it("compacts the Fast toggle to a 2rem icon button under the phone breakpoint", () => {
+  it("compacts the Fast toggle to a 1.75rem icon button under the phone breakpoint", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
     const chatPanelSource = readFileSync("features/chat/ChatPanel.tsx", "utf8");
 
@@ -1242,7 +1242,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Fast mode["']\)\}/);
 
     expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*2rem[\s\S]*?min-width:\s*2rem[\s\S]*?max-width:\s*2rem[\s\S]*?height:\s*2rem[\s\S]*?flex:\s*0 0 2rem/,
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*1\.75rem[\s\S]*?min-width:\s*1\.75rem[\s\S]*?max-width:\s*1\.75rem[\s\S]*?height:\s*1\.75rem[\s\S]*?flex:\s*0 0 1\.75rem/,
     );
     expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?padding-inline:\s*0/,
