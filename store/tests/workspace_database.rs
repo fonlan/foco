@@ -19091,6 +19091,18 @@ fn phase7_waiting_tasks_resume_after_dependency_finishes() {
         foco_agent::AgentAttemptStatus::Suspended
     );
     assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
+    let reconciliation = database
+        .startup_agent_reconciliation()
+        .expect("reconcile resumed task");
+    assert_eq!(
+        reconciliation
+            .iter()
+            .filter(|record| record.task.id == waiting_task_id)
+            .map(|record| &record.attempt.id)
+            .collect::<Vec<_>>(),
+        vec![&second_attempt_id],
+        "reconciliation must ignore the suspended wait attempt after a new attempt starts"
+    );
 }
 
 #[test]
@@ -19175,6 +19187,123 @@ fn phase7_waiting_tasks_resume_after_deadline() {
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].id, waiting_task_id);
     assert_eq!(resumed[0].status, AgentTaskStatus::Queued);
+    let resumed_attempt_id =
+        AgentAttemptId::new("agent-attempt-phase7-deadline-resumed").expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &waiting_task_id, &resumed_attempt_id)
+        .expect("claim deadline-resumed task")
+        .expect("deadline-resumed task claimed");
+    let reconciliation = database
+        .startup_agent_reconciliation()
+        .expect("reconcile deadline-resumed task");
+    assert_eq!(
+        reconciliation
+            .iter()
+            .filter(|record| record.task.id == waiting_task_id)
+            .map(|record| &record.attempt.id)
+            .collect::<Vec<_>>(),
+        vec![&resumed_attempt_id],
+        "reconciliation must ignore an expired round's suspended attempt"
+    );
+    assert!(
+        !database
+            .suspend_running_agent_task_with_wait_dependencies(&team_id, &waiting_task_id)
+            .expect("deadline-resumed wait must not re-suspend"),
+        "satisfied wait dependencies must not re-suspend a live resume attempt"
+    );
+    assert_eq!(
+        database
+            .agent_task(&waiting_task_id)
+            .expect("waiting task")
+            .expect("waiting task")
+            .status,
+        AgentTaskStatus::Running,
+        "deadline-resumed coordinator must stay running while synthesizing wait results"
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&waiting_task_id)
+            .expect("attempts")
+            .into_iter()
+            .find(|attempt| attempt.id == resumed_attempt_id)
+            .expect("resumed attempt")
+            .status,
+        foco_agent::AgentAttemptStatus::Running
+    );
+}
+
+#[test]
+fn suspend_running_agent_task_still_recovers_unsatisfied_wait_dependencies() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-unsatisfied-wait-recovery",
+        "unsatisfied-wait-recovery",
+    );
+    let worker_id =
+        create_test_agent_worker(&database, &team_id, "unsatisfied-wait-recovery-worker");
+    let parent_task =
+        AgentTaskId::new("agent-task-unsatisfied-wait-parent").expect("parent task");
+    let child_task = AgentTaskId::new("agent-task-unsatisfied-wait-child").expect("child task");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &parent_task,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue parent");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&parent_task),
+            input_json: "{}",
+        })
+        .expect("enqueue child");
+    let parent_attempt =
+        AgentAttemptId::new("agent-attempt-unsatisfied-wait-parent").expect("parent attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &parent_task, &parent_attempt)
+        .expect("claim parent")
+        .expect("claimed parent");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &parent_task,
+            dependency_task_id: &child_task,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-unsatisfied-wait"),
+            deadline_at: Some("2999-01-01T00:00:00.000Z"),
+        })
+        .expect("insert open wait dependency");
+
+    assert!(
+        database
+            .suspend_running_agent_task_with_wait_dependencies(&team_id, &parent_task)
+            .expect("unsatisfied wait must still suspend for recovery")
+    );
+    assert_eq!(
+        database
+            .agent_task(&parent_task)
+            .expect("parent task")
+            .expect("parent task")
+            .status,
+        AgentTaskStatus::Waiting
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&parent_task)
+            .expect("parent attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
 }
 
 #[test]

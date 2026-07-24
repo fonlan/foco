@@ -12574,6 +12574,138 @@ fn startup_reconciliation_preserves_attempt_with_active_durable_lease() {
 }
 
 #[test]
+fn startup_reconciliation_ignores_suspended_wait_attempt_after_task_resumes() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let (team_id, coordinator_id, parent_task_id, suspended_attempt_id) =
+        insert_claimed_agent_task_with_input_and_owner(
+            workspace.path(),
+            "wait-round-resumed",
+            "{}",
+            Some("agent-owner-wait-round"),
+        );
+    let resumed_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-wait-round-resumed").expect("attempt id");
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let worker_id = foco_agent::AgentInstanceId::new("agent-instance-wait-round-worker")
+            .expect("worker id");
+        let worker_definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-wait-round-worker")
+                .expect("definition id"),
+            revision: 1,
+            name: "Wait round worker".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Work.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_instances_with_limits(
+                &[foco_store::workspace::NewAgentInstance {
+                    id: &worker_id,
+                    team_id: &team_id,
+                    definition: &worker_definition,
+                    role: foco_agent::AgentRole::Worker,
+                    execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                    execution_root_path: None,
+                    worktree_base_revision: None,
+                    worktree_branch: None,
+                    worktree_status: None,
+                }],
+                2,
+                1,
+            )
+            .expect("create worker");
+        let dependency_task_id =
+            foco_agent::AgentTaskId::new("agent-task-wait-round-dependency").expect("task id");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &dependency_task_id,
+                team_id: &team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&coordinator_id),
+                parent_task_id: Some(&parent_task_id),
+                input_json: "{}",
+            })
+            .expect("enqueue dependency");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent");
+        database
+            .insert_agent_task_dependency(foco_store::workspace::NewAgentTaskDependency {
+                team_id: &team_id,
+                waiting_task_id: &parent_task_id,
+                dependency_task_id: &dependency_task_id,
+                wait_mode: foco_agent::AgentTaskWaitMode::All,
+                pending_tool_call_id: Some("call-wait-round"),
+                deadline_at: Some("2000-01-01T00:00:00.000Z"),
+            })
+            .expect("insert expired wait dependency");
+        assert_eq!(
+            database
+                .resume_satisfied_agent_tasks(1)
+                .expect("resume expired wait")
+                .len(),
+            1
+        );
+        database
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &parent_task_id,
+                &resumed_attempt_id,
+                Some("agent-owner-wait-round"),
+            )
+            .expect("claim resumed task")
+            .expect("resumed task claimed");
+    }
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    reconcile_agent_runtime(&state).expect("startup reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&parent_task_id)
+            .expect("parent task")
+            .expect("parent task")
+            .status,
+        foco_agent::AgentTaskStatus::Running,
+        "an old suspended wait attempt must not suspend the current resumed attempt"
+    );
+    let attempts = database
+        .agent_attempts_for_task(&parent_task_id)
+        .expect("parent attempts");
+    assert_eq!(attempts[0].id, suspended_attempt_id);
+    assert_eq!(attempts[0].status, foco_agent::AgentAttemptStatus::Suspended);
+    assert_eq!(attempts[1].id, resumed_attempt_id);
+    assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "attempt_recovery_deferred"
+            && event.payload_json.contains("lease_active")
+            && event.attempt_id.as_ref() == Some(&resumed_attempt_id)
+    }));
+}
+
+#[test]
 fn concurrent_startup_scans_keep_live_plan_attempt_for_original_coordinator_completion() {
     let workspace = tempfile::tempdir().expect("workspace");
     let profile = tempfile::tempdir().expect("profile");

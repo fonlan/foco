@@ -15675,6 +15675,10 @@ impl WorkspaceDatabase {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
+        // Only re-suspend when a wait round is still open. After deadline/child
+        // completion resume, dependencies remain for the resume prompt, but the
+        // wait is already satisfied — re-suspending would race a live attempt,
+        // immediately re-queue it, and collide on the active chat run registry.
         let owner_instance_id = transaction
             .query_row(
                 "SELECT task.owner_instance_id
@@ -15686,8 +15690,44 @@ impl WorkspaceDatabase {
                         SELECT 1 FROM agent_task_dependencies AS dependency
                         WHERE dependency.team_id = task.team_id
                           AND dependency.waiting_task_id = task.id
+                   )
+                   AND NOT (
+                        EXISTS (
+                            SELECT 1 FROM agent_task_dependencies AS dependency
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.deadline_at IS NOT NULL
+                              AND dependency.deadline_at <= ?3
+                        )
+                        OR (
+                            EXISTS (
+                                SELECT 1 FROM agent_task_dependencies AS dependency
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND dependency.wait_mode = 'all'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM agent_task_dependencies AS dependency
+                                JOIN agent_tasks AS required_task
+                                  ON required_task.id = dependency.dependency_task_id
+                                WHERE dependency.waiting_task_id = task.id
+                                  AND required_task.status NOT IN (
+                                      'completed', 'failed', 'cancelled', 'interrupted'
+                                  )
+                            )
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM agent_task_dependencies AS dependency
+                            JOIN agent_tasks AS required_task
+                              ON required_task.id = dependency.dependency_task_id
+                            WHERE dependency.waiting_task_id = task.id
+                              AND dependency.wait_mode = 'any'
+                              AND required_task.status IN (
+                                  'completed', 'failed', 'cancelled', 'interrupted'
+                              )
+                        )
                    )",
-                params![task_id.as_str(), team_id.as_str()],
+                params![task_id.as_str(), team_id.as_str(), now.as_str()],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -16058,8 +16098,8 @@ impl WorkspaceDatabase {
                     task.started_at, task.completed_at
                  FROM agent_attempts AS attempt
                  JOIN agent_tasks AS task ON task.id = attempt.task_id
-                 WHERE attempt.status IN ('running', 'suspended')
-                    OR task.status IN ('running', 'waiting')
+                 WHERE (attempt.status = 'running' AND task.status = 'running')
+                    OR (attempt.status = 'suspended' AND task.status = 'waiting')
                  ORDER BY attempt.team_id, task.owner_instance_id, task.sequence",
             )
             .map_err(|source| self.sqlite_error(source))?;
