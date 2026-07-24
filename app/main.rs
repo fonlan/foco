@@ -79,13 +79,14 @@ use foco_store::{
     },
 };
 use foco_tools::{
-    AGENT_CREATE_INSTANCES_TOOL, ASK_QUESTION_TOOL, BackgroundCommandRegistry, BuiltinToolRuntime,
-    CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL, DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL,
-    GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL, GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL,
-    GRAPH_FIND_CALLERS_TOOL, GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL,
-    GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL, RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL,
-    ToolExecution, ToolOutputStream, UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL,
-    UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL, WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
+    AGENT_CREATE_INSTANCES_TOOL, AGENT_WAIT_TASKS_TOOL, ASK_QUESTION_TOOL,
+    BackgroundCommandRegistry, BuiltinToolRuntime, CREATE_PLAN_TOOL, CREATE_TODO_GRAPH_TOOL,
+    DELETE_PLAN_TOOL, EDIT_FILE_TOOL, FIND_FILES_TOOL, GET_PLANS_TOOL, GET_TODO_GRAPH_TOOL,
+    GRAPH_EXPLORE_TOOL, GRAPH_FIND_CALLEES_TOOL, GRAPH_FIND_CALLERS_TOOL,
+    GRAPH_FIND_REFERENCES_TOOL, GRAPH_FIND_SYMBOLS_TOOL, GRAPH_RELATED_FILES_TOOL, READ_FILE_TOOL,
+    RUN_COMMAND_TOOL, SEARCH_TEXT_TOOL, SLEEP_TOOL, ToolExecution, ToolOutputStream,
+    UPDATE_PLAN_STEP_TOOL, UPDATE_PLAN_TOOL, UPDATE_TODO_GRAPH_TOOL, WEB_FETCH_TOOL,
+    WEB_SEARCH_TOOL, WRITE_FILE_TOOL, set_ripgrep_path,
 };
 use image::{ImageFormat, ImageReader};
 
@@ -159,7 +160,8 @@ use crate::runtime::{
     is_agent_tool_name, open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
     reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
     run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
-    spawn_code_graph_index_initialization, validate_agent_snapshot_for_workspace,
+    spawn_code_graph_index_initialization, try_register_implicit_wait_for_undelivered_children,
+    validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use crate::runtime::{
@@ -4410,6 +4412,93 @@ impl PreparedChatContext {
                                     rate_limit_retry_count = 0;
                                     turn_index = turn_index.saturating_add(1);
                                     continue 'agent_turns;
+                                }
+                                if let Some(agent_tool_context) = self.agent_tool_context.as_ref() {
+                                    match try_register_implicit_wait_for_undelivered_children(
+                                        agent_tool_context,
+                                    ) {
+                                        Ok(Some(implicit_wait)) => {
+                                            let wait_started_at = utc_timestamp();
+                                            let tool_call_event = ChatSseEvent::ToolCall {
+                                                assistant_message_id: self
+                                                    .assistant_message_id
+                                                    .clone(),
+                                                reasoning_duration_ms: None,
+                                                tool_call: ChatToolCallSummary {
+                                                    id: implicit_wait.tool_call_id.clone(),
+                                                    name: AGENT_WAIT_TASKS_TOOL.to_string(),
+                                                    status: "completed".to_string(),
+                                                    input: json!({
+                                                        "taskIds": implicit_wait.task_ids,
+                                                        "mode": "all",
+                                                        "deadlineMs": null,
+                                                        "timeoutMs": null,
+                                                    }),
+                                                    output: Some(implicit_wait.output.clone()),
+                                                    is_error: false,
+                                                    started_at: Some(wait_started_at.clone()),
+                                                    completed_at: Some(wait_started_at.clone()),
+                                                    live_output: None,
+                                                },
+                                            };
+                                            events.push(captured_event(&tool_call_event));
+                                            yield tool_call_event;
+                                            let result_event = ChatSseEvent::ToolResult {
+                                                assistant_message_id: self
+                                                    .assistant_message_id
+                                                    .clone(),
+                                                tool_call_id: implicit_wait.tool_call_id,
+                                                output: implicit_wait.output,
+                                                is_error: false,
+                                                started_at: wait_started_at.clone(),
+                                                completed_at: wait_started_at,
+                                            };
+                                            events.push(captured_event(&result_event));
+                                            yield result_event;
+                                            if let Some(event) = agent_team_refresh_event_for_context(
+                                                &self,
+                                                "agent_tool_result",
+                                                None,
+                                                false,
+                                            ) {
+                                                events.push(captured_event(&event));
+                                                yield event;
+                                            }
+                                            return;
+                                        }
+                                        Ok(None) => {}
+                                        Err(message) => {
+                                            let event = ChatSseEvent::Error {
+                                                message: message.clone(),
+                                            };
+                                            events.push(captured_event(&event));
+                                            let outcome = failed_chat_audit_outcome(
+                                                &self,
+                                                started_at,
+                                                &mut events,
+                                                &message,
+                                                None,
+                                            )
+                                            .await;
+                                            if let Err(persist_error) = persist_chat_result(
+                                                &self,
+                                                &request_started_at,
+                                                outcome,
+                                                &events,
+                                                None,
+                                                None,
+                                                &executed_tool_calls,
+                                            ) {
+                                                let event = ChatSseEvent::Error {
+                                                    message: persist_error.message,
+                                                };
+                                                yield event;
+                                            } else {
+                                                yield event;
+                                            }
+                                            return;
+                                        }
+                                    }
                                 }
                                 let assistant_message_text =
                                     assistant_message_text(&assistant_text, &executed_tool_calls);

@@ -145,7 +145,7 @@ fn agent_send_message_definition() -> ToolDefinition {
 fn agent_delegate_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_DELEGATE_TASK_TOOL,
-        description: "Create an asynchronous child task for an existing instance in the current Agent team. Returns immediately with the task id and selected instance id. Copy IDs exactly from agent_list.definitions[].id or agent_list.instances[].id; never use display names, role names, or hand-constructed IDs. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null). targetDefinitionId only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
+        description: "Create an asynchronous child task for an existing instance in the current Agent team. Returns immediately with the task id and selected instance id. The parent may continue other work in parallel. If the parent would finish while this child (or other undelivered children) still has no delivered wait result, the runtime implicitly waits and later resumes with child results. Copy IDs exactly from agent_list.definitions[].id or agent_list.instances[].id; never use display names, role names, or hand-constructed IDs. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null). targetDefinitionId only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -211,7 +211,7 @@ fn agent_cancel_task_definition() -> ToolDefinition {
 fn agent_wait_tasks_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_WAIT_TASKS_TOOL,
-        description: "Persistently wait for all specified Agent tasks in the current team, suspend the current run, and resume later with a paired tool result.",
+        description: "Explicitly wait for the specified Agent tasks in the current team before continuing. Suspends the current run and resumes later with a paired tool result. Use this to sync on specific taskIds early; if you omit it and would otherwise finish with undelivered child tasks, the runtime still registers an implicit wait for those children.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -559,10 +559,19 @@ mod tests {
             "never auto-creates",
             "agent_create_instances",
             "display names",
+            "implicitly waits",
         ] {
             assert!(
                 description.contains(fragment),
                 "delegate description missing `{fragment}`: {description}"
+            );
+        }
+
+        let wait_description = agent_wait_tasks_definition().description;
+        for fragment in ["Explicitly wait", "implicit wait"] {
+            assert!(
+                wait_description.contains(fragment),
+                "wait description missing `{fragment}`: {wait_description}"
             );
         }
 

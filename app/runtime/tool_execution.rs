@@ -2088,6 +2088,117 @@ fn execute_agent_wait_tasks(
     }))
 }
 
+/// Outcome of an implicit wait registered when a parent run would otherwise finalize.
+#[derive(Clone, Debug)]
+pub(crate) struct ImplicitAgentWait {
+    pub(crate) tool_call_id: String,
+    pub(crate) task_ids: Vec<String>,
+    pub(crate) output: Value,
+}
+
+/// If the current agent task still has child tasks whose results were never delivered via a wait
+/// round, register an implicit `agent_wait_tasks` dependency set and return a suspend payload.
+///
+/// "Delivered" means the child id is present in the current wait-dependency rows for this parent.
+/// Already-terminal undelivered children are included so finalize can suspend and immediately
+/// resume with their results instead of completing blind.
+pub(crate) fn try_register_implicit_wait_for_undelivered_children(
+    context: &AgentToolContext,
+) -> Result<Option<ImplicitAgentWait>, String> {
+    let team_id = agent_tool_team_id(context)?;
+    let actor_instance_id = agent_tool_instance_id(context)?;
+    let current_task_id = agent_tool_task_id(context)?;
+    let mut database =
+        WorkspaceDatabase::open_or_create(&context.workspace_path).map_err(agent_store_error)?;
+    let current_task = database
+        .agent_task_for_team(team_id, current_task_id)
+        .map_err(agent_store_error)?
+        .ok_or_else(|| {
+            agent_tool_error(
+                "not_found",
+                format!("current Agent task '{current_task_id}' was not found"),
+            )
+        })?;
+    let children = database
+        .agent_tasks_for_parent(team_id, current_task_id)
+        .map_err(agent_store_error)?;
+    if children.is_empty() {
+        return Ok(None);
+    }
+    let delivered: HashSet<AgentTaskId> = database
+        .agent_task_dependencies(current_task_id)
+        .map_err(agent_store_error)?
+        .into_iter()
+        .map(|dependency| dependency.dependency_task_id)
+        .collect();
+    let undelivered: Vec<AgentTaskRecord> = children
+        .into_iter()
+        .filter(|task| !delivered.contains(&task.id))
+        .collect();
+    if undelivered.is_empty() {
+        return Ok(None);
+    }
+    if undelivered.len() > AGENT_MAX_CHILD_TASKS_PER_TASK {
+        return Err(agent_tool_error(
+            "limit_exceeded",
+            format!(
+                "implicit agent wait exceeds {AGENT_MAX_CHILD_TASKS_PER_TASK} undelivered child tasks"
+            ),
+        ));
+    }
+    for dependency_task in &undelivered {
+        if dependency_task.owner_instance_id == *actor_instance_id
+            && dependency_task.sequence > current_task.sequence
+            && dependency_task.status.holds_queue_head()
+        {
+            return Err(agent_tool_error(
+                "queue_deadlock",
+                format!(
+                    "Agent task '{current_task_id}' cannot wait on later queued task '{}' in the same instance queue",
+                    dependency_task.id
+                ),
+            ));
+        }
+    }
+    let dependency_task_ids: Vec<AgentTaskId> =
+        undelivered.iter().map(|task| task.id.clone()).collect();
+    let tool_call_id = unique_id("implicit-wait");
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id,
+            waiting_task_id: current_task_id,
+            dependency_task_ids: &dependency_task_ids,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some(&tool_call_id),
+            deadline_at: None,
+            event_instance_id: Some(actor_instance_id),
+        })
+        .map_err(agent_store_error)?;
+    let task_ids: Vec<String> = dependency_task_ids
+        .iter()
+        .map(|task_id| task_id.to_string())
+        .collect();
+    Ok(Some(ImplicitAgentWait {
+        tool_call_id: tool_call_id.clone(),
+        task_ids: task_ids.clone(),
+        output: json!({
+            "waiting": true,
+            "implicit": true,
+            "taskId": current_task_id.to_string(),
+            "mode": AgentTaskWaitMode::All.as_str(),
+            "taskIds": task_ids.clone(),
+            "deadlineAt": Value::Null,
+            "suspend": {
+                "kind": "agent_wait_tasks",
+                "pendingToolCallId": tool_call_id,
+                "taskIds": task_ids,
+                "mode": AgentTaskWaitMode::All.as_str(),
+                "deadlineAt": Value::Null,
+            }
+        }),
+    }))
+}
+
 fn execute_agent_transfer_task(
     context: &AgentToolContext,
     workspace_path: &Path,
@@ -9070,6 +9181,168 @@ mod tests {
             "second resume must not include the prior wait-round child payload"
         );
         let _ = context;
+    }
+
+    #[test]
+    fn implicit_wait_registers_undelivered_children_and_skips_delivered() {
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions {
+                can_create_instances: true,
+                can_delegate: true,
+                allowed_agent_definition_ids: Vec::new(),
+            });
+        claim_parent_running(
+            workspace.path(),
+            &team_id,
+            &parent_task_id,
+            "implicit-wait-parent",
+        );
+        assert!(
+            try_register_implicit_wait_for_undelivered_children(&context)
+                .expect("implicit wait with no children")
+                .is_none()
+        );
+
+        let child_a = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "implicit-wait-a",
+        );
+        let child_b = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "implicit-wait-b",
+        );
+
+        let first = try_register_implicit_wait_for_undelivered_children(&context)
+            .expect("implicit wait with undelivered children")
+            .expect("must register wait");
+        assert_eq!(first.output["implicit"], true);
+        assert_eq!(first.output["suspend"]["kind"], "agent_wait_tasks");
+        assert_eq!(
+            first.output["suspend"]["pendingToolCallId"],
+            first.tool_call_id
+        );
+        let mut registered = first.task_ids.clone();
+        registered.sort();
+        let mut expected = vec![child_a.to_string(), child_b.to_string()];
+        expected.sort();
+        assert_eq!(registered, expected);
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let deps = database
+            .agent_task_dependencies(&parent_task_id)
+            .expect("dependencies");
+        assert_eq!(deps.len(), 2);
+        drop(database);
+
+        assert!(
+            try_register_implicit_wait_for_undelivered_children(&context)
+                .expect("second implicit wait while deps cover children")
+                .is_none(),
+            "children already in the wait round must not re-register"
+        );
+
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let parent_wait_result = format!(
+            r#"{{"control":{{"kind":"agent_wait_tasks","pendingToolCallId":"{}"}}}}"#,
+            first.tool_call_id
+        );
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(&parent_wait_result),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent after implicit wait");
+        for (child_id, suffix) in [
+            (&child_a, "implicit-wait-a"),
+            (&child_b, "implicit-wait-b"),
+        ] {
+            let child_attempt =
+                AgentAttemptId::new(format!("agent-attempt-{suffix}")).expect("child attempt");
+            database
+                .claim_runnable_agent_task(&team_id, child_id, &child_attempt)
+                .expect("claim child")
+                .expect("child claimed");
+            database
+                .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: child_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: foco_agent::AgentTaskTransition::Complete,
+                    result_json: Some(r#"{"text":"implicit child done"}"#),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("complete child");
+        }
+        let resumed = database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume after implicit wait");
+        assert!(
+            resumed
+                .iter()
+                .any(|task| task.id == parent_task_id && task.status == AgentTaskStatus::Queued)
+        );
+        drop(database);
+
+        assert!(
+            try_register_implicit_wait_for_undelivered_children(&context)
+                .expect("implicit wait after delivered children")
+                .is_none(),
+            "delivered children must not block finalize again"
+        );
+
+        // Create and finish a new child while the parent is still queued so the team
+        // concurrent-run slot is free, then claim the parent and confirm implicit wait
+        // picks up this undelivered (already terminal) child.
+        let child_c = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "implicit-wait-c",
+        );
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let child_c_attempt =
+            AgentAttemptId::new("agent-attempt-implicit-wait-c").expect("child c attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &child_c, &child_c_attempt)
+            .expect("claim child c")
+            .expect("child c claimed");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child_c,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"late child done"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete already-finished undelivered child");
+        let resume_attempt =
+            AgentAttemptId::new("agent-attempt-implicit-wait-resume").expect("parent attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &parent_task_id, &resume_attempt)
+            .expect("claim resumed parent")
+            .expect("parent claimed");
+        drop(database);
+
+        let late = try_register_implicit_wait_for_undelivered_children(&context)
+            .expect("implicit wait for terminal undelivered child")
+            .expect("must register wait for undelivered terminal child");
+        assert_eq!(late.task_ids, vec![child_c.to_string()]);
+        assert_eq!(late.output["implicit"], true);
     }
 
     #[test]

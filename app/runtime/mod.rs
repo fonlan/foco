@@ -87,6 +87,7 @@ pub(crate) use tool_execution::wait_for_tool_resource_lock;
 pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
     RepeatedToolCallDetector, execute_tool_calls_parallel, is_agent_tool_name, pending_tool_calls,
+    try_register_implicit_wait_for_undelivered_children,
 };
 pub(crate) use tool_execution::{
     budget_tool_execution, execute_tool, execute_tool_with_runtime, run_post_tool_hooks,

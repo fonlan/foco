@@ -80,7 +80,7 @@ const AGENT_LIFECYCLE_DB_RETRY_WARNING_INTERVAL: Duration = Duration::from_secs(
 const AGENT_LIFECYCLE_DB_RETRY_ERROR_AFTER: Duration = Duration::from_secs(120);
 const AGENT_LIFECYCLE_DB_RETRY_ERROR_INTERVAL: Duration = Duration::from_secs(120);
 const AGENT_CURRENT_TASK_MESSAGE_PREVIEW_CHARS: usize = 4 * 1024;
-const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results. Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
+const AGENT_WAIT_RESUME_INSTRUCTION: &str = "## Agent Wait Resume\n\nSource: Foco Agent wait resume\n\nThe following agent_wait_tasks tool result contains completed child task results (from an explicit wait or an implicit finalize wait). Continue the current parent task from this result, synthesize the child output as needed, and do not treat a child task's final text as the main chat reply by itself.";
 // Bounded pre-stream ordinary-DB wait (~10–15s total). Not the infinite lifecycle retry.
 #[cfg(not(test))]
 const PRE_STREAM_DB_RETRY_BUDGET: Duration = Duration::from_secs(12);

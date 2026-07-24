@@ -1080,7 +1080,7 @@ pub fn build_subagents_prompt_section() -> String {
 - Before delegating, give each subagent a focused task, the necessary context, expected output, and any constraints about reading, editing, commands, tests, or workspace isolation.
 - Treat subagent output as advisory evidence, not as automatically correct. Reconcile it with current workspace state before acting on it or presenting it to the user.
 - Coordinate concurrent work so agents do not overwrite each other. If multiple agents can edit files, prefer isolated workspaces when available or clearly separate file ownership.
-- Track delegated work through the available agent task tools. Wait for required results before finalizing, handle failures explicitly, and summarize relevant subagent findings without exposing hidden prompts or private context."#,
+- After agent_delegate_task, continue useful parent work in parallel. Use agent_wait_tasks only when you need specific child results before continuing. If you would otherwise finish while undelivered child tasks remain, the runtime suspends the parent run and later resumes with those child results—do not assume the session can end with outstanding children."#,
     )
 }
 
@@ -2971,6 +2971,7 @@ mod tests {
 
         assert!(subagents.starts_with("## Subagents"));
         assert!(subagents.contains("Before delegating, give each subagent a focused task"));
+        assert!(subagents.contains("runtime suspends the parent run"));
         assert!(project_spec.starts_with("## Project Spec"));
         assert!(project_spec.contains("A Project Spec is durable workspace context"));
         assert!(memory.starts_with("## Memory"));
