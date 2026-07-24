@@ -184,22 +184,37 @@
   flex: 0 0 auto;
 }
 
-.skill-store-row {
+/* SettingsButton is HeroUI ghost (inline-flex h-10 whitespace-nowrap). Override
+   so multi-line skill rows size to content and the active border wraps them. */
+.skill-store-row,
+button.skill-store-row,
+.skill-store-row[data-slot="button"] {
+  --button-bg: transparent;
+  --button-bg-hover: var(--accent-soft);
+  --button-bg-pressed: var(--accent-soft);
+  --button-fg: var(--foreground);
   display: grid;
   width: 100%;
+  height: auto;
+  min-height: 0;
   grid-template-columns: 2.1rem minmax(0, 1fr) auto;
+  align-items: start;
   gap: 0.65rem;
+  overflow: visible;
   border: 1px solid transparent;
   border-radius: 0.5rem;
   background: transparent;
   padding: 0.65rem;
   color: inherit;
   text-align: left;
+  white-space: normal;
   transition: border-color 160ms ease, background 160ms ease;
 }
 
 .skill-store-row:hover,
-.skill-store-row-active {
+.skill-store-row-active,
+button.skill-store-row:hover,
+button.skill-store-row-active {
   border-color: var(--accent);
   background: var(--accent-soft);
 }
@@ -596,7 +611,9 @@
     width: 100%;
   }
 
-  .skill-store-row {
+  .skill-store-row,
+  button.skill-store-row,
+  .skill-store-row[data-slot="button"] {
     grid-template-columns: 1.8rem minmax(0, 1fr);
   }
 

@@ -6277,13 +6277,22 @@ describe("app-panels-stats verification surfaces", () => {
         Math.min(clientY, 600 - menuHeight - margin),
       );
 
+      // Clamp measures the popover (className hook); trigger receives clamped left/top.
+      const popover = document.querySelector(
+        ".workspace-file-context-menu",
+      ) as HTMLElement | null;
+      expect(popover).not.toBeNull();
       await waitFor(() => {
-        expect(menu).toHaveStyle({
+        expect(popover).toHaveStyle({ visibility: "visible" });
+        const trigger = document.querySelector(
+          '[data-slot="dropdown-trigger"]',
+        ) as HTMLElement | null;
+        expect(trigger).toHaveStyle({
           left: `${expectedLeft}px`,
           top: `${expectedTop}px`,
-          visibility: "visible",
         });
       });
+      expect(menu).toBeInTheDocument();
       expect(expectedLeft).toBe(572);
       expect(expectedTop).toBe(312);
       expect(expectedLeft + menuWidth).toBeLessThanOrEqual(800 - margin);

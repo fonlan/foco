@@ -2792,6 +2792,7 @@ export function App() {
 
   useEffect(() => {
     if (!workspaceFileContextMenu) {
+      workspaceFileContextMenuRef.current = null;
       return;
     }
 
@@ -2841,38 +2842,59 @@ export function App() {
       return;
     }
 
+    function clampToViewport(element: HTMLElement) {
+      const margin = 8;
+      const rect = element.getBoundingClientRect();
+      workspaceFileContextMenuRef.current = element;
+      setWorkspaceFileContextMenu((current) => {
+        if (!current || current.positioned) {
+          return current;
+        }
+        return {
+          ...current,
+          left: Math.max(
+            margin,
+            Math.min(current.left, window.innerWidth - rect.width - margin),
+          ),
+          positioned: true,
+          top: Math.max(
+            margin,
+            Math.min(current.top, window.innerHeight - rect.height - margin),
+          ),
+        };
+      });
+    }
+
+    const cached = workspaceFileContextMenuRef.current;
     const element =
-      workspaceFileContextMenuRef.current ??
-      (document.querySelector(
-        ".workspace-file-context-menu",
-      ) as HTMLElement | null);
-    if (!element) {
+      cached && cached.isConnected
+        ? cached
+        : (document.querySelector(
+            ".workspace-file-context-menu",
+          ) as HTMLElement | null);
+
+    if (element) {
+      clampToViewport(element);
       return;
     }
-    workspaceFileContextMenuRef.current = element;
 
-    const margin = 8;
-    const rect = element.getBoundingClientRect();
-    const nextLeft = Math.max(
-      margin,
-      Math.min(
-        workspaceFileContextMenu.left,
-        window.innerWidth - rect.width - margin,
-      ),
-    );
-    const nextTop = Math.max(
-      margin,
-      Math.min(
-        workspaceFileContextMenu.top,
-        window.innerHeight - rect.height - margin,
-      ),
-    );
-    setWorkspaceFileContextMenu({
-      ...workspaceFileContextMenu,
-      left: nextLeft,
-      positioned: true,
-      top: nextTop,
+    // Popover may mount one frame after controlled isOpen; retry once, then
+    // show unclamped rather than staying forever hidden.
+    const retryId = window.requestAnimationFrame(() => {
+      const retry = document.querySelector(
+        ".workspace-file-context-menu",
+      ) as HTMLElement | null;
+      if (retry) {
+        clampToViewport(retry);
+        return;
+      }
+      setWorkspaceFileContextMenu((current) =>
+        current && !current.positioned
+          ? { ...current, positioned: true }
+          : current,
+      );
     });
+    return () => window.cancelAnimationFrame(retryId);
   }, [workspaceFileContextMenu]);
 
   useEffect(
@@ -14249,6 +14271,7 @@ export function App() {
                 }}
                 onOpenChange={(open) => {
                   if (!open) {
+                    workspaceFileContextMenuRef.current = null;
                     setWorkspaceFileContextMenu(null);
                   }
                 }}

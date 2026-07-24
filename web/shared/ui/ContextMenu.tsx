@@ -17,7 +17,7 @@ export type ContextMenuItem = {
 
 export type ContextMenuProps = {
   "aria-label": string;
-  /** Extra class on the menu surface (e.g. viewport-clamp measurement hooks). */
+  /** Extra class on the popover surface (e.g. viewport-clamp measurement hooks). */
   className?: string;
   isOpen: boolean;
   items: ContextMenuItem[];
@@ -36,7 +36,11 @@ export type ContextMenuProps = {
  * Right-click / long-press context menu built on HeroUI Dropdown + RAC Menu.
  * Positions via a fixed zero-size trigger at (left, top); React Aria owns
  * focus trap, Arrow/Home/End, Escape, and outside dismissal.
- * Callers may clamp left/top and flip `positioned` after measuring the menu.
+ *
+ * Do not position the Menu with `position: fixed` — HeroUI's dropdown popover
+ * uses `will-change-transform`, which makes fixed descendants resolve against
+ * the popover instead of the viewport and pushes the menu off-screen.
+ * Callers may clamp left/top and flip `positioned` after measuring the popover.
  */
 export function ContextMenu({
   "aria-label": ariaLabel,
@@ -61,28 +65,19 @@ export function ContextMenu({
         style={{ left, top }}
       />
       <Dropdown.Popover
-        className="max-w-[min(18rem,calc(100vw-1rem))]"
+        className={`max-w-[min(18rem,calc(100vw-1rem))] ${className ?? ""}`.trim()}
         placement="bottom start"
         style={{
-          // Keep the popover origin at the clamped anchor; menu styles mirror
-          // left/top/visibility for measurement and tests.
-          left,
-          top,
+          visibility: positioned ? "visible" : "hidden",
         }}
       >
         <Dropdown.Menu
           aria-label={ariaLabel}
-          className={`max-h-[min(70vh,24rem)] overflow-y-auto ${className ?? ""}`.trim()}
+          className="max-h-[min(70vh,24rem)] overflow-y-auto"
           disabledKeys={items
             .filter((item) => item.disabled)
             .map((item) => item.id)}
           onAction={onAction}
-          style={{
-            left,
-            position: "fixed",
-            top,
-            visibility: positioned ? "visible" : "hidden",
-          }}
         >
           {items.map((item) => (
             <Dropdown.Item
