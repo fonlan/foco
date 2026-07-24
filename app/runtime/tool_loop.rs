@@ -1,6 +1,15 @@
 use foco_providers::NeutralToolCall;
 
-use super::{ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, RepeatedToolCallDetector};
+use super::{
+    ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector, RepeatedToolCallDetector,
+    ToolLoopBeforeExecutionAction,
+};
+
+/// Source marker for automatic tool-call-loop interruptions (SSE + persisted parts).
+pub(crate) const TOOL_CALL_LOOP_GUARD_SOURCE: &str = "toolCallLoopGuard";
+/// Max automatic tool-call-loop recoveries per chat run before the guard fails the run.
+/// Independent from reasoning-loop recovery counting.
+pub(crate) const MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN: usize = 3;
 
 /// Per-run guardrails shared by local and remote chat tool loops.
 ///
@@ -18,7 +27,7 @@ impl ToolLoopGuard {
     pub(crate) fn check_before_execution(
         &mut self,
         tool_calls: &[NeutralToolCall],
-    ) -> Result<(), String> {
+    ) -> Result<ToolLoopBeforeExecutionAction, String> {
         self.repeated_tool_call_detector.check(tool_calls)
     }
 

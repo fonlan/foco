@@ -86,8 +86,8 @@ pub(crate) use tool_events::{ToolOutputDeltaEvent, ToolOutputDeltaSink};
 pub(crate) use tool_execution::wait_for_tool_resource_lock;
 pub(crate) use tool_execution::{
     AgentToolContext, ReadOnlyToolProgressAction, ReadOnlyToolProgressDetector,
-    RepeatedToolCallDetector, execute_tool_calls_parallel, is_agent_tool_name, pending_tool_calls,
-    try_register_implicit_wait_for_undelivered_children,
+    RepeatedToolCallDetector, ToolLoopBeforeExecutionAction, execute_tool_calls_parallel,
+    is_agent_tool_name, pending_tool_calls, try_register_implicit_wait_for_undelivered_children,
 };
 pub(crate) use tool_execution::{
     budget_tool_execution, execute_tool, execute_tool_with_runtime, run_post_tool_hooks,
@@ -97,7 +97,9 @@ pub(crate) use tool_locks::{
     ToolResourceLease, ToolResourceLockOwner, ToolResourceLockOwnerSnapshot,
     ToolResourceLockRegistry,
 };
-pub(crate) use tool_loop::ToolLoopGuard;
+pub(crate) use tool_loop::{
+    MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopGuard,
+};
 pub(crate) use web_tools::{
     execute_web_tool, is_web_tool_name, materialize_brokered_web_result,
     package_brokered_web_result_files, web_search_enabled, web_search_function_execution_allowed,

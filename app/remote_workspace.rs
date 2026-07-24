@@ -144,14 +144,16 @@ use crate::{
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
         AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, BrokeredTransferFile,
         CodeGraphIndexState, CodeGraphReadinessError, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
-        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
-        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
-        SidecarRuntimeConfigBundle, ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
-        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
-        materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
-        package_brokered_web_result_files, pre_stream_failure_user_message,
-        reasoning_loop_guard_message, release_code_graph_then_delete_worktree, run_post_tool_hooks,
+        MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionRegistry,
+        REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
+        ReasoningLoopDetector, SidecarRuntimeConfigBundle, TOOL_CALL_LOOP_GUARD_SOURCE,
+        ToolLoopBeforeExecutionAction, ToolLoopGuard, ToolOutputDeltaEvent,
+        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
+        execute_tool_with_runtime, execute_web_tool, image_tool_timeout_ms,
+        materialize_brokered_image_result, materialize_brokered_web_result,
+        open_workspace_database_ordinary_with_pre_stream_retry, package_brokered_web_result_files,
+        pre_stream_failure_user_message, reasoning_loop_guard_message,
+        release_code_graph_then_delete_worktree, run_post_tool_hooks,
         spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
         web_tool_timeout_ms,
     },
@@ -1061,11 +1063,12 @@ fn remote_sidecar_flush_open_content_parts(
     *flushed_reasoning_len = reasoning.len();
 }
 
-fn remote_sidecar_append_reasoning_loop_recovery_to_request(
+fn remote_sidecar_append_loop_recovery_to_request(
     messages: &mut Vec<NeutralChatMessage>,
     runtime_tool_state: &mut RemoteSidecarRuntimeToolState,
     turn_text: &str,
     turn_reasoning: &str,
+    recovery_content: &str,
 ) {
     if !turn_text.trim().is_empty() || !turn_reasoning.trim().is_empty() {
         messages.push(NeutralChatMessage {
@@ -1084,7 +1087,7 @@ fn remote_sidecar_append_reasoning_loop_recovery_to_request(
     }
     messages.push(NeutralChatMessage {
         role: NeutralChatRole::User,
-        content: REASONING_LOOP_RECOVERY_USER_TEXT.to_string(),
+        content: recovery_content.to_string(),
         attachments: Vec::new(),
         reasoning: None,
         tool_calls: Vec::new(),
@@ -17122,6 +17125,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut flushed_text_len = 0usize;
     let mut flushed_reasoning_len = 0usize;
     let mut reasoning_loop_recovery_count = 0usize;
+    let mut tool_call_loop_recovery_count = 0usize;
     let max_provider_retries = remote_sidecar_llm_request_retry_count(&stream_state);
     let mut provider_retry_count = 0u32;
     let mut rate_limit_retry_count = 0u32;
@@ -17543,25 +17547,116 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     cleanup_guard.disarm();
                     break;
                 }
-                if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
-                    sequence += 1;
-                    remote_sidecar_record_run_event(
-                        &run_stream,
-                        sequence,
-                        json!({
-                            "type": "error",
-                            "message": message,
-                        }),
-                    );
-                    sequence += 1;
-                    remote_sidecar_record_run_event(
-                        &run_stream,
-                        sequence,
-                        json!({ "type": "streamEnd" }),
-                    );
-                    remote_sidecar_finish_active_run(&stream_state, &run_id);
-                    cleanup_guard.disarm();
-                    break;
+                match tool_loop_guard.check_before_execution(&tool_calls) {
+                    Ok(ToolLoopBeforeExecutionAction::Continue) => {}
+                    Ok(ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+                        message,
+                        tool_names: _,
+                    }) => {
+                        if tool_call_loop_recovery_count < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN {
+                            tool_call_loop_recovery_count =
+                                tool_call_loop_recovery_count.saturating_add(1);
+                            remote_sidecar_flush_open_content_parts(
+                                &mut content_parts_prefix,
+                                &text,
+                                &reasoning,
+                                &mut flushed_text_len,
+                                &mut flushed_reasoning_len,
+                            );
+                            let interrupted_metrics = json!({
+                                "modelId": model_id,
+                                "providerId": provider_id,
+                                "totalLatencyMs": run_metrics.total_latency_ms(),
+                                "firstTokenLatencyMs": run_metrics.first_token_latency_ms,
+                                "outputTokens": null,
+                                "llmRequestIds": &run_metrics.llm_request_ids,
+                            });
+                            let guidance_id = unique_id("msg-guidance");
+                            let interruption_part = json!({
+                                "type": "userInterruption",
+                                "id": guidance_id,
+                                "content": message,
+                                "source": TOOL_CALL_LOOP_GUARD_SOURCE,
+                                "interruptedAssistantMetrics": interrupted_metrics,
+                            });
+                            content_parts_prefix.push(interruption_part);
+                            remote_sidecar_append_loop_recovery_to_request(
+                                &mut current_request.messages,
+                                &mut runtime_tool_state,
+                                &turn_text,
+                                &turn_reasoning,
+                                &message,
+                            );
+                            let guidance_payload = json!({
+                                "type": "guidanceApplied",
+                                "id": guidance_id,
+                                "content": message,
+                                "parts": [],
+                                "source": TOOL_CALL_LOOP_GUARD_SOURCE,
+                                "assistantMessageId": assistant_message_id,
+                                "interruptedAssistantId": assistant_message_id,
+                                "interruptedAssistantMetrics": interrupted_metrics,
+                            });
+                            sequence += 1;
+                            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                                database.insert_run_event(NewRunEvent {
+                                    id: &unique_id("run-event"),
+                                    chat_id: &chat_id,
+                                    run_id: &run_id,
+                                    sequence,
+                                    event_type: "guidance_applied",
+                                    payload_json: &guidance_payload.to_string(),
+                                })
+                            });
+                            remote_sidecar_record_run_event(
+                                &run_stream,
+                                sequence,
+                                guidance_payload,
+                            );
+                            last_yielded_sequence = sequence;
+                            // Same run continues with a new broker request; detector stays armed.
+                            continue;
+                        }
+
+                        sequence += 1;
+                        remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            json!({
+                                "type": "error",
+                                "message": message,
+                            }),
+                        );
+                        sequence += 1;
+                        remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            json!({ "type": "streamEnd" }),
+                        );
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        cleanup_guard.disarm();
+                        break;
+                    }
+                    Err(message) => {
+                        sequence += 1;
+                        remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            json!({
+                                "type": "error",
+                                "message": message,
+                            }),
+                        );
+                        sequence += 1;
+                        remote_sidecar_record_run_event(
+                            &run_stream,
+                            sequence,
+                            json!({ "type": "streamEnd" }),
+                        );
+                        remote_sidecar_finish_active_run(&stream_state, &run_id);
+                        cleanup_guard.disarm();
+                        break;
+                    }
                 }
                 if tool_loop_guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS) {
                     let recovery = runtime_tool_state.recover_after_round_cap(
@@ -17924,11 +18019,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         "interruptedAssistantMetrics": interrupted_metrics,
                     });
                     content_parts_prefix.push(interruption_part.clone());
-                    remote_sidecar_append_reasoning_loop_recovery_to_request(
+                    remote_sidecar_append_loop_recovery_to_request(
                         &mut current_request.messages,
                         &mut runtime_tool_state,
                         &turn_text,
                         &turn_reasoning,
+                        REASONING_LOOP_RECOVERY_USER_TEXT,
                     );
                     let guidance_payload = json!({
                         "type": "guidanceApplied",
@@ -25542,7 +25638,10 @@ mod tests {
         for round in 1..=MAX_AGENT_TOOL_ROUNDS {
             let tool_call =
                 test_remote_tool_call(format!("call-{round}"), format!("file-{round}.rs"));
-            assert!(guard.check_before_execution(&[tool_call]).is_ok());
+            assert!(matches!(
+                guard.check_before_execution(&[tool_call]),
+                Ok(ToolLoopBeforeExecutionAction::Continue)
+            ));
             assert!(!guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS));
             guard.record_executed_round();
             if round == 9 {
@@ -25551,11 +25650,10 @@ mod tests {
         }
 
         assert!(guard.reached_round_cap(MAX_AGENT_TOOL_ROUNDS));
-        assert!(
-            guard
-                .check_before_execution(&[test_remote_tool_call("overflow", "overflow.rs")])
-                .is_ok()
-        );
+        assert!(matches!(
+            guard.check_before_execution(&[test_remote_tool_call("overflow", "overflow.rs")]),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
     }
 
     #[test]
@@ -25563,26 +25661,44 @@ mod tests {
         let mut guard = ToolLoopGuard::default();
 
         for index in 1..crate::MAX_REPEATED_TOOL_CALL_BATCHES {
-            assert!(
-                guard
-                    .check_before_execution(&[test_remote_tool_call(
-                        format!("call-{index}"),
-                        "same.rs",
-                    )])
-                    .is_ok()
-            );
+            assert!(matches!(
+                guard.check_before_execution(&[test_remote_tool_call(
+                    format!("call-{index}"),
+                    "same.rs",
+                )]),
+                Ok(ToolLoopBeforeExecutionAction::Continue)
+            ));
         }
 
-        let error = guard
+        let action = guard
             .check_before_execution(&[test_remote_tool_call("call-3", "same.rs")])
-            .expect_err("third repeated batch should fail");
-        assert_eq!(
-            error,
-            format!(
-                "agent run repeated the same tool call batch {} times (read_file); possible tool-call loop",
-                crate::MAX_REPEATED_TOOL_CALL_BATCHES
-            )
-        );
+            .expect("third repeated batch should classify as recoverable");
+        match action {
+            ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+                message,
+                tool_names,
+            } => {
+                assert_eq!(
+                    message,
+                    format!(
+                        "agent run repeated the same tool call batch {} times (read_file); possible tool-call loop",
+                        crate::MAX_REPEATED_TOOL_CALL_BATCHES
+                    )
+                );
+                assert_eq!(tool_names, "read_file");
+            }
+            ToolLoopBeforeExecutionAction::Continue => {
+                panic!("third repeated batch should recover, not continue");
+            }
+        }
+
+        // Detector stays armed after recovery classification.
+        assert!(matches!(
+            guard
+                .check_before_execution(&[test_remote_tool_call("call-4", "same.rs")])
+                .expect("same batch remains recoverable"),
+            ToolLoopBeforeExecutionAction::RecoverRepeatedBatch { .. }
+        ));
     }
 
     #[test]
@@ -25597,7 +25713,10 @@ mod tests {
                 format!("call-{round}"),
                 format!("file-{round}.rs"),
             )];
-            assert!(guard.check_before_execution(&tool_calls).is_ok());
+            assert!(matches!(
+                guard.check_before_execution(&tool_calls),
+                Ok(ToolLoopBeforeExecutionAction::Continue)
+            ));
             guard.record_executed_round();
             runtime_tool_state.append_runtime_guard_message(
                 &mut messages,
@@ -25616,7 +25735,10 @@ mod tests {
         assert!(guard.executed_rounds() < MAX_AGENT_TOOL_ROUNDS);
 
         let next_tool_calls = [test_remote_tool_call("call-next", "next.rs")];
-        assert!(guard.check_before_execution(&next_tool_calls).is_ok());
+        assert!(matches!(
+            guard.check_before_execution(&next_tool_calls),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
         guard.record_executed_round();
         runtime_tool_state.append_runtime_guard_message(
             &mut messages,

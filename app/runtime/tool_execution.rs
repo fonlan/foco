@@ -83,6 +83,19 @@ struct ToolCallLoopSignature {
     arguments: Value,
 }
 
+/// Pre-execution classification shared by local and remote tool loops.
+///
+/// `Err` is reserved for fatal transport/structure validation failures.
+/// Recoverable repeated-batch loops return [`ToolLoopBeforeExecutionAction::RecoverRepeatedBatch`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ToolLoopBeforeExecutionAction {
+    Continue,
+    RecoverRepeatedBatch {
+        message: String,
+        tool_names: String,
+    },
+}
+
 #[derive(Default)]
 pub(crate) struct RepeatedToolCallDetector {
     previous_batch: Option<Vec<ToolCallLoopSignature>>,
@@ -90,7 +103,10 @@ pub(crate) struct RepeatedToolCallDetector {
 }
 
 impl RepeatedToolCallDetector {
-    pub(crate) fn check(&mut self, tool_calls: &[NeutralToolCall]) -> Result<(), String> {
+    pub(crate) fn check(
+        &mut self,
+        tool_calls: &[NeutralToolCall],
+    ) -> Result<ToolLoopBeforeExecutionAction, String> {
         validate_tool_call_transport_fields(tool_calls)?;
         let batch = tool_call_loop_signatures(tool_calls);
         if self.previous_batch.as_ref() == Some(&batch) {
@@ -101,7 +117,7 @@ impl RepeatedToolCallDetector {
         }
 
         if self.consecutive_count < MAX_REPEATED_TOOL_CALL_BATCHES {
-            return Ok(());
+            return Ok(ToolLoopBeforeExecutionAction::Continue);
         }
 
         let tool_names = self
@@ -116,9 +132,13 @@ impl RepeatedToolCallDetector {
             })
             .unwrap_or_default();
 
-        Err(format!(
-            "agent run repeated the same tool call batch {MAX_REPEATED_TOOL_CALL_BATCHES} times ({tool_names}); possible tool-call loop"
-        ))
+        // Keep detector state so the same batch remains blocked after recovery.
+        Ok(ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+            message: format!(
+                "agent run repeated the same tool call batch {MAX_REPEATED_TOOL_CALL_BATCHES} times ({tool_names}); possible tool-call loop"
+            ),
+            tool_names,
+        })
     }
 }
 
@@ -4596,13 +4616,29 @@ mod tests {
             thought_signatures: None,
         }];
         // First two identical batches are allowed (count < MAX); omission status is irrelevant.
-        assert!(detector.check(&batch).is_ok());
-        assert!(detector.check(&batch).is_ok());
+        assert!(matches!(
+            detector.check(&batch),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
+        assert!(matches!(
+            detector.check(&batch),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
         // Only the N-th identical batch trips the loop detector.
-        let err = detector
+        let action = detector
             .check(&batch)
-            .expect_err("identical batch should eventually trip the loop detector");
-        assert!(err.contains("repeated the same tool call batch"), "{err}");
+            .expect("identical batch should classify as recoverable loop");
+        match action {
+            ToolLoopBeforeExecutionAction::RecoverRepeatedBatch { message, .. } => {
+                assert!(
+                    message.contains("repeated the same tool call batch"),
+                    "{message}"
+                );
+            }
+            ToolLoopBeforeExecutionAction::Continue => {
+                panic!("identical batch should eventually trip the loop detector");
+            }
+        }
     }
 
     #[tokio::test]
@@ -4699,7 +4735,10 @@ mod tests {
             }),
             thought_signatures: None,
         }];
-        assert!(detector.check(&batch).is_ok());
+        assert!(matches!(
+            detector.check(&batch),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
         assert_eq!(
             fs::read_to_string(&marker).expect("file unchanged by detector"),
             "done"
@@ -4707,7 +4746,10 @@ mod tests {
         let mtime_before = fs::metadata(&marker)
             .and_then(|meta| meta.modified())
             .expect("mtime");
-        assert!(detector.check(&batch).is_ok());
+        assert!(matches!(
+            detector.check(&batch),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
         let mtime_after = fs::metadata(&marker)
             .and_then(|meta| meta.modified())
             .expect("mtime after");

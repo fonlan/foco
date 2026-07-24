@@ -8,7 +8,7 @@ use std::{
 
 use crate::runtime::{
     MAX_REASONING_LOOP_RECOVERIES_PER_RUN, REASONING_LOOP_GUARD_SOURCE,
-    REASONING_LOOP_RECOVERY_USER_TEXT, agent_run_event_kind,
+    REASONING_LOOP_RECOVERY_USER_TEXT, ToolLoopBeforeExecutionAction, agent_run_event_kind,
 };
 use axum::{
     Json, Router,
@@ -2825,77 +2825,94 @@ fn worktree_code_graph_failed_delete_restores_registry_entry() {
 fn repeated_tool_call_detector_rejects_third_identical_batch() {
     let mut detector = RepeatedToolCallDetector::default();
 
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-1",
-                "read_file",
-                json!({ "path": "README.md" }),
-            )])
-            .is_ok()
-    );
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-2",
-                "read_file",
-                json!({ "path": "README.md" }),
-            )])
-            .is_ok()
-    );
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-1",
+            "read_file",
+            json!({ "path": "README.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-2",
+            "read_file",
+            json!({ "path": "README.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
 
-    let error = detector
+    let action = detector
         .check(&[test_neutral_tool_call(
             "call-3",
             "read_file",
             json!({ "path": "README.md" }),
         )])
-        .expect_err("third identical batch should be rejected");
+        .expect("third identical batch should classify as recoverable");
 
-    assert!(error.contains("agent run repeated the same tool call batch 3 times"));
-    assert!(error.contains("read_file"));
+    match action {
+        ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+            message,
+            tool_names,
+        } => {
+            assert!(message.contains("agent run repeated the same tool call batch 3 times"));
+            assert_eq!(tool_names, "read_file");
+        }
+        ToolLoopBeforeExecutionAction::Continue => {
+            panic!("third identical batch should recover, not continue");
+        }
+    }
+
+    // Recovery must not reset the detector: the same batch stays blocked.
+    let still_blocked = detector
+        .check(&[test_neutral_tool_call(
+            "call-4",
+            "read_file",
+            json!({ "path": "README.md" }),
+        )])
+        .expect("fourth identical batch should still classify as recoverable");
+    assert!(matches!(
+        still_blocked,
+        ToolLoopBeforeExecutionAction::RecoverRepeatedBatch { .. }
+    ));
 }
 
 #[test]
 fn repeated_tool_call_detector_resets_when_arguments_change() {
     let mut detector = RepeatedToolCallDetector::default();
 
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-1",
-                "read_file",
-                json!({ "path": "README.md" }),
-            )])
-            .is_ok()
-    );
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-2",
-                "read_file",
-                json!({ "path": "README.md" }),
-            )])
-            .is_ok()
-    );
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-3",
-                "read_file",
-                json!({ "path": "CHANGELOG.md" }),
-            )])
-            .is_ok()
-    );
-    assert!(
-        detector
-            .check(&[test_neutral_tool_call(
-                "call-4",
-                "read_file",
-                json!({ "path": "CHANGELOG.md" }),
-            )])
-            .is_ok()
-    );
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-1",
+            "read_file",
+            json!({ "path": "README.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-2",
+            "read_file",
+            json!({ "path": "README.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-3",
+            "read_file",
+            json!({ "path": "CHANGELOG.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
+    assert!(matches!(
+        detector.check(&[test_neutral_tool_call(
+            "call-4",
+            "read_file",
+            json!({ "path": "CHANGELOG.md" }),
+        )]),
+        Ok(ToolLoopBeforeExecutionAction::Continue)
+    ));
 }
 
 #[test]
@@ -33397,7 +33414,7 @@ async fn main_chat_reasoning_loop_guard_auto_recovers_and_persists_user_interrup
     );
     assert_eq!(
         metadata.get("partsVersion").and_then(Value::as_i64),
-        Some(5)
+        Some(6)
     );
     let user_count = database
         .messages_for_chat(&chat_id)

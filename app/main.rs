@@ -151,15 +151,16 @@ use crate::runtime::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, ActiveChatRunRegistration, ActiveChatRunRegistry,
     ActiveChatRunSubscription, ActiveChatRunSummary, AgentScheduler, AgentToolContext,
     ChatRunCancellation, CodeGraphIndexState, CoordinatorTaskInput, GuidanceMessage,
-    MANUAL_GUIDANCE_SOURCE, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture,
-    QuestionAnswer, QuestionAnswerResponse, QuestionRegistry, QuestionRequest,
-    REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
-    ReasoningLoopDetector, RipgrepStatus, RipgrepToolSummary, ToolLoopGuard, ToolOutputDeltaEvent,
-    ToolResourceLockRegistry, chat_run_subscription_stream, default_guidance_source,
-    detect_ripgrep, execute_tool_calls_parallel, image_model_available, insert_agent_event,
-    is_agent_tool_name, open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
-    reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
-    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
+    MANUAL_GUIDANCE_SOURCE, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
+    MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionAnswer,
+    QuestionAnswerResponse, QuestionRegistry, QuestionRequest, REASONING_LOOP_GUARD_SOURCE,
+    REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
+    RipgrepStatus, RipgrepToolSummary, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
+    ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry, chat_run_subscription_stream,
+    default_guidance_source, detect_ripgrep, execute_tool_calls_parallel, image_model_available,
+    insert_agent_event, is_agent_tool_name, open_workspace_database_ordinary_with_pre_stream_retry,
+    pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
+    ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
     spawn_code_graph_index_initialization, try_register_implicit_wait_for_undelivered_children,
     validate_agent_snapshot_for_workspace,
 };
@@ -3309,6 +3310,7 @@ impl PreparedChatContext {
             let mut turn_retry_count = 0u32;
             let mut rate_limit_retry_count = 0u32;
             let mut reasoning_loop_recovery_count = 0usize;
+            let mut tool_call_loop_recovery_count = 0usize;
 
             'agent_turns: loop {
                 if chat_run_was_cancelled(&app_shutdown_rx, &run_cancellation_rx) {
@@ -4048,22 +4050,6 @@ impl PreparedChatContext {
                                         reasoning_duration_ms =
                                             Some(elapsed_millis(started));
                                     }
-                                    let turn_assistant_text =
-                                        assistant_message_text(&turn_text, &[]);
-                                    if !turn_assistant_text.trim().is_empty()
-                                        || !turn_reasoning.trim().is_empty()
-                                    {
-                                        self.provider_request.messages.push(
-                                            neutral_assistant_message(
-                                                turn_assistant_text,
-                                                non_empty_string(&turn_reasoning),
-                                            ),
-                                        );
-                                        self.message_source_sequences.push(None);
-                                        self.message_context_sources.push(
-                                            PromptContextSource::RuntimeAssistant,
-                                        );
-                                    }
                                     let turn_total_latency_ms =
                                         elapsed_millis(turn_started_at);
                                     let turn_metrics = turn_reply_metrics(
@@ -4074,23 +4060,17 @@ impl PreparedChatContext {
                                         None,
                                         vec![turn_llm_request_id],
                                     );
-                                    let recovery_guidance = GuidanceMessage {
-                                        id: unique_id("msg-guidance"),
-                                        content: REASONING_LOOP_RECOVERY_USER_TEXT
-                                            .to_string(),
-                                        attachments: Vec::new(),
-                                        source: REASONING_LOOP_GUARD_SOURCE.to_string(),
-                                        interrupted_assistant_id: Some(
-                                            self.assistant_message_id.clone(),
-                                        ),
-                                    };
-                                    for event in append_guidance_events(
+                                    for event in append_automatic_loop_recovery(
                                         &mut self.provider_request.messages,
                                         &mut self.message_source_sequences,
                                         &mut self.message_context_sources,
                                         &mut events,
-                                        vec![recovery_guidance],
-                                        Some(turn_metrics),
+                                        &turn_text,
+                                        &turn_reasoning,
+                                        REASONING_LOOP_RECOVERY_USER_TEXT.to_string(),
+                                        REASONING_LOOP_GUARD_SOURCE,
+                                        &self.assistant_message_id,
+                                        turn_metrics,
                                         &mut self.attachment_read_allowlist,
                                     ) {
                                         yield event;
@@ -4750,30 +4730,109 @@ impl PreparedChatContext {
                                 return;
                             }
 
-                            if let Err(message) = tool_loop_guard.check_before_execution(&tool_calls) {
-                                let event = ChatSseEvent::Error {
-                                    message: message.clone(),
-                                };
-                                events.push(captured_event(&event));
-                                let outcome = failed_chat_audit_outcome(
-                            &self,
-                            started_at,
-                            &mut events,
-                            &message,
-                            None,
-                        )
-                        .await;
+                            match tool_loop_guard.check_before_execution(&tool_calls) {
+                                Ok(ToolLoopBeforeExecutionAction::Continue) => {}
+                                Ok(ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+                                    message,
+                                    tool_names: _,
+                                }) => {
+                                    if tool_call_loop_recovery_count
+                                        < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN
+                                    {
+                                        tool_call_loop_recovery_count =
+                                            tool_call_loop_recovery_count.saturating_add(1);
+                                        if reasoning_duration_ms.is_none()
+                                            && let Some(started) = reasoning_started_at.take()
+                                        {
+                                            reasoning_duration_ms =
+                                                Some(elapsed_millis(started));
+                                        }
+                                        for event in append_automatic_loop_recovery(
+                                            &mut self.provider_request.messages,
+                                            &mut self.message_source_sequences,
+                                            &mut self.message_context_sources,
+                                            &mut events,
+                                            &turn_text,
+                                            &turn_reasoning,
+                                            message,
+                                            TOOL_CALL_LOOP_GUARD_SOURCE,
+                                            &self.assistant_message_id,
+                                            turn_metrics.clone(),
+                                            &mut self.attachment_read_allowlist,
+                                        ) {
+                                            yield event;
+                                        }
+                                        turn_retry_count = 0;
+                                        rate_limit_retry_count = 0;
+                                        turn_index = turn_index.saturating_add(1);
+                                        continue 'agent_turns;
+                                    }
 
-                                if let Err(persist_error) = persist_chat_result(&self, &request_started_at, outcome, &events, None, None, &executed_tool_calls) {
                                     let event = ChatSseEvent::Error {
-                                        message: persist_error.message,
+                                        message: message.clone(),
                                     };
-                                    yield event;
-                                } else {
-                                    yield event;
-                                }
+                                    events.push(captured_event(&event));
+                                    let outcome = failed_chat_audit_outcome(
+                                        &self,
+                                        started_at,
+                                        &mut events,
+                                        &message,
+                                        None,
+                                    )
+                                    .await;
 
-                                return;
+                                    if let Err(persist_error) = persist_chat_result(
+                                        &self,
+                                        &request_started_at,
+                                        outcome,
+                                        &events,
+                                        None,
+                                        None,
+                                        &executed_tool_calls,
+                                    ) {
+                                        let event = ChatSseEvent::Error {
+                                            message: persist_error.message,
+                                        };
+                                        yield event;
+                                    } else {
+                                        yield event;
+                                    }
+
+                                    return;
+                                }
+                                Err(message) => {
+                                    let event = ChatSseEvent::Error {
+                                        message: message.clone(),
+                                    };
+                                    events.push(captured_event(&event));
+                                    let outcome = failed_chat_audit_outcome(
+                                        &self,
+                                        started_at,
+                                        &mut events,
+                                        &message,
+                                        None,
+                                    )
+                                    .await;
+
+                                    if let Err(persist_error) = persist_chat_result(
+                                        &self,
+                                        &request_started_at,
+                                        outcome,
+                                        &events,
+                                        None,
+                                        None,
+                                        &executed_tool_calls,
+                                    ) {
+                                        let event = ChatSseEvent::Error {
+                                            message: persist_error.message,
+                                        };
+                                        yield event;
+                                    } else {
+                                        yield event;
+                                    }
+
+                                    return;
+                                }
                             }
 
                             let pending_tool_calls = pending_tool_calls(&tool_calls);
@@ -7441,8 +7500,10 @@ fn append_guidance_message(
     message_context_sources: &mut Vec<PromptContextSource>,
     guidance: &GuidanceMessage,
 ) {
-    let content = if guidance.source == REASONING_LOOP_GUARD_SOURCE {
-        // Recovery text is already the provider-facing control message.
+    let content = if guidance.source == REASONING_LOOP_GUARD_SOURCE
+        || guidance.source == TOOL_CALL_LOOP_GUARD_SOURCE
+    {
+        // Automatic guard recovery text is already the provider-facing control message.
         guidance.content.clone()
     } else {
         format!(
@@ -7514,6 +7575,50 @@ fn append_guidance_events(
             event
         })
         .collect()
+}
+
+/// Shared recovery boundary for reasoning-loop and tool-call-loop guards.
+///
+/// Appends partial assistant text/reasoning without tool_calls, then injects
+/// automatic guidance so the same run can continue with a redirected model turn.
+fn append_automatic_loop_recovery(
+    messages: &mut Vec<NeutralChatMessage>,
+    message_source_sequences: &mut Vec<Option<i64>>,
+    message_context_sources: &mut Vec<PromptContextSource>,
+    events: &mut Vec<CapturedAuditEvent>,
+    turn_text: &str,
+    turn_reasoning: &str,
+    recovery_content: String,
+    recovery_source: &str,
+    assistant_message_id: &str,
+    turn_metrics: ChatReplyMetrics,
+    attachment_read_allowlist: &mut Vec<PathBuf>,
+) -> Vec<ChatSseEvent> {
+    let turn_assistant_text = assistant_message_text(turn_text, &[]);
+    if !turn_assistant_text.trim().is_empty() || !turn_reasoning.trim().is_empty() {
+        messages.push(neutral_assistant_message(
+            turn_assistant_text,
+            non_empty_string(turn_reasoning),
+        ));
+        message_source_sequences.push(None);
+        message_context_sources.push(PromptContextSource::RuntimeAssistant);
+    }
+    let recovery_guidance = GuidanceMessage {
+        id: unique_id("msg-guidance"),
+        content: recovery_content,
+        attachments: Vec::new(),
+        source: recovery_source.to_string(),
+        interrupted_assistant_id: Some(assistant_message_id.to_string()),
+    };
+    append_guidance_events(
+        messages,
+        message_source_sequences,
+        message_context_sources,
+        events,
+        vec![recovery_guidance],
+        Some(turn_metrics),
+        attachment_read_allowlist,
+    )
 }
 
 fn turn_reply_metrics(
