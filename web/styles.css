@@ -3596,6 +3596,35 @@ body,
   gap: 0.25rem;
 }
 
+/* Composer controls remain individually bounded. The selected plan/fast
+   states use the neutral semantic surface, visibly distinct from ghost. */
+.message-composer-control-row :is(
+  .composer-tool-button,
+  .composer-team-toggle,
+  .composer-fast-toggle,
+  .composer-select-summary,
+  .composer-run-button
+) {
+  border: 1px solid var(--border);
+}
+
+.message-composer-control-row .composer-run-button {
+  border-color: var(--accent);
+}
+
+.message-composer-control-row .composer-run-button.button--danger {
+  border-color: var(--danger);
+}
+
+.message-composer-control-row :is(
+  .composer-team-toggle,
+  .composer-fast-toggle
+)[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
+}
+
 .fast-mode-confirmation-backdrop {
   position: fixed;
   z-index: 70;
@@ -3696,6 +3725,27 @@ body,
 .settings-layout textarea,
 .settings-layout button {
   font-size: var(--foco-font-ui);
+}
+
+/* SettingsButton uses HeroUI's ghost anatomy. Preserve each list row's own
+   surface and foreground instead of letting the generic ghost token turn it
+   into a blue/gray button. The variables are consumed by HeroUI itself, so
+   hover, focus and disabled behavior remain accessible. */
+.settings-layout .settings-list-select-button {
+  --button-bg: transparent;
+  --button-bg-hover: transparent;
+  --button-bg-pressed: transparent;
+  --button-fg: var(--foreground);
+}
+
+.settings-layout .settings-list-select-button-muted {
+  --button-fg: var(--muted);
+}
+
+/* Primary submit actions beneath settings forms remain clearly bounded. */
+.settings-layout .button[class*="bg-[var(--foreground)]"],
+.settings-layout .button[class*="bg-[var(--accent)]"] {
+  border: 1px solid currentcolor;
 }
 
 .settings-section-nav-card {

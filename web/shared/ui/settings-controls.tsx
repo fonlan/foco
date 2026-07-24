@@ -44,6 +44,7 @@ export function SettingsButton({ disabled, onClick, ...props }: ButtonHTMLAttrib
       {...(props as any)}
       isDisabled={disabled}
       onPress={onClick ? (event) => onClick({ ...event, stopPropagation: () => {} } as any) : undefined}
+      variant="ghost"
     />
   );
 }
@@ -198,7 +199,7 @@ export function SettingsSelect({
       {...(props as any)}
       ref={selectRef as any}
       aria-label={props["aria-label"] ?? inferredLabel ?? "Setting select"}
-      className={className}
+      className="w-full"
       isDisabled={disabled}
       selectionMode={multiple ? "multiple" : "single"}
       selectedKey={multiple || value == null ? null : String(value)}
@@ -213,7 +214,7 @@ export function SettingsSelect({
         change(selected == null ? "" : String(selected));
       }}
     >
-      <Select.Trigger>
+      <Select.Trigger className={`${className ?? ""} shadow-none`}>
         <Select.Value />
         <Select.Indicator />
       </Select.Trigger>

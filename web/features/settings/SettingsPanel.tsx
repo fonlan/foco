@@ -6329,9 +6329,9 @@ export function SettingsPanel({
                             ) : (
                               <>
                                 <SettingsButton
-                                  className={`min-w-0 flex-1 truncate text-left text-sm font-semibold ${isActive
-                                      ? "text-[var(--accent-soft-foreground)]"
-                                      : "text-[var(--muted)]"
+                                  className={`settings-list-select-button min-w-0 flex-1 truncate text-left text-sm font-semibold ${isActive
+                                      ? "text-[var(--foreground)]"
+                                      : "settings-list-select-button-muted text-[var(--muted)]"
                                     }`}
                                   onClick={() =>
                                     setPromptSettingsForm((current) => ({
@@ -8939,21 +8939,23 @@ export function SettingsPanel({
                         key={memory.id}
                       >
                         <SettingsButton
-                          className="min-w-0 text-left"
+                          className="settings-list-select-button flex w-full min-w-0 flex-col items-stretch justify-center gap-0 text-left"
                           onClick={() => setSelectedMemoryId(memory.id)}
                           type="button"
                         >
-                          <div className="flex flex-wrap items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
                             <CapabilityPill
+                              className="min-h-0 px-1.5 py-px text-[11px]"
                               label={memoryStatusLabel(memory.status, t)}
                               ok={memory.status === "active"}
                             />
                             <CapabilityPill
+                              className="min-h-0 px-1.5 py-px text-[11px]"
                               label={memoryKindLabel(memory.kind, t)}
                               ok={memory.pinned}
                             />
                             {memory.scope === "chat" && memory.chatId ? (
-                              <span className="text-xs font-semibold text-[var(--muted)]">
+                              <span className="text-[11px] font-semibold text-[var(--muted)]">
                                 {memory.chatId}
                               </span>
                             ) : null}
@@ -8965,7 +8967,7 @@ export function SettingsPanel({
                             {memory.updatedAt}
                           </div>
                         </SettingsButton>
-                        <div className="flex items-start justify-end gap-2">
+                        <div className="flex items-center justify-end gap-2 self-center">
                           <label
                             className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
                             title={memoryEnabledToggleLabel}
@@ -11308,7 +11310,7 @@ export function SettingsPanel({
 
                       return (
                         <div className="px-4 py-3" key={provider.id}>
-                          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                          <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
                             <SettingsButton
                               aria-expanded={isExpanded}
                               aria-label={
@@ -11320,7 +11322,7 @@ export function SettingsPanel({
                                     name: provider.name,
                                   })
                               }
-                              className="-mx-2 -my-1 flex min-w-0 items-start gap-2 rounded-lg px-2 py-1 text-left hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
+                              className="settings-list-select-button flex min-w-0 items-start gap-2 rounded-lg px-0 py-1 text-left focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
                               onClick={() => toggleProviderModels(provider.id)}
                               title={
                                 isExpanded
@@ -11335,7 +11337,7 @@ export function SettingsPanel({
                               />
                               <div className="min-w-0">
                                 <div className="flex flex-wrap items-center gap-2">
-                                  <span className="truncate text-sm font-medium">
+                                  <span className="truncate text-sm font-medium text-[var(--foreground)]">
                                     {provider.name}
                                   </span>
                                   <CapabilityPill
@@ -11385,7 +11387,7 @@ export function SettingsPanel({
                                 ) : null}
                               </div>
                             </SettingsButton>
-                            <div className="flex flex-wrap items-center justify-end gap-2 md:self-start">
+                            <div className="flex shrink-0 items-center justify-end gap-2 self-center">
                               <label
                                 className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
                                 title={providerToggleLabel}
