@@ -1305,9 +1305,12 @@ function ChatPanelComponent({
                   <Button
                     aria-label={t("Add attachment")}
                     className="composer-tool-button"
+                    isIconOnly
                     isDisabled={isSelectingAttachments}
                     onPress={onSelectAttachments}
+                    size="sm"
                     type="button"
+                    variant="ghost"
                   >
                     {isSelectingAttachments ? (
                       <LoaderCircle
@@ -1321,11 +1324,11 @@ function ChatPanelComponent({
                   <Button
                     aria-label={t("Plan mode")}
                     aria-pressed={isPlanModeEnabled}
-                    className={`composer-team-toggle ${
-                      isPlanModeEnabled ? "composer-team-toggle-enabled" : ""
-                    }`}
+                    className="composer-team-toggle"
                     onPress={() => onPlanModeEnabledChange(!isPlanModeEnabled)}
+                    size="sm"
                     type="button"
+                    variant={isPlanModeEnabled ? "tertiary" : "ghost"}
                   >
                     <ListChecks
                       aria-hidden="true"
@@ -1359,13 +1362,11 @@ function ChatPanelComponent({
                     <Button
                       aria-label={t("Fast mode")}
                       aria-pressed={selectedLatencyMode === "fast"}
-                      className={`composer-fast-toggle ${
-                        selectedLatencyMode === "fast"
-                          ? "composer-fast-toggle-enabled"
-                          : ""
-                      }`}
+                      className="composer-fast-toggle"
                       onPress={handleFastToggle}
+                      size="sm"
                       type="button"
+                      variant={selectedLatencyMode === "fast" ? "tertiary" : "ghost"}
                     >
                       <Zap aria-hidden="true" className="size-3.5 shrink-0" />
                       <span className="composer-fast-toggle-label">
@@ -1382,8 +1383,11 @@ function ChatPanelComponent({
                     <Button
                       aria-label={t("Retry last run")}
                       className="composer-retry-button composer-run-button"
+                      isIconOnly
                       onPress={onRetryRun}
+                      size="sm"
                       type="button"
+                      variant="tertiary"
                     >
                       <RefreshCw aria-hidden="true" className="size-4" />
                     </Button>
@@ -1399,19 +1403,18 @@ function ChatPanelComponent({
                   {isSendingMessage ? (
                     <Button
                       aria-label={runningButtonLabel}
-                      className={
-                        runningButtonSendsMessage
-                          ? "composer-run-button"
-                          : "composer-run-button composer-run-button-danger"
-                      }
+                      className="composer-run-button"
                       isDisabled={
                         runningButtonSendsMessage &&
                         (!canGuideActiveRun ||
                           !selectedModelId ||
                           Boolean(draftUnsupportedAttachmentMessage))
                       }
+                      isIconOnly
                       onPress={handleRunningRunButtonClick}
+                      size="sm"
                       type="button"
+                      variant={runningButtonSendsMessage ? "primary" : "danger"}
                     >
                       {runningButtonSendsMessage ? (
                         <Send aria-hidden="true" className="size-4" />
@@ -1427,8 +1430,7 @@ function ChatPanelComponent({
                       onMouseEnter={() => setIsSendButtonTooltipOpen(true)}
                       onMouseLeave={() => setIsSendButtonTooltipOpen(false)}
                     >
-                      {/* Modifier-aware native form submission needs the DOM button event. */}
-                      <button
+                      <Button
                         aria-describedby={
                           showSendButtonTooltip
                             ? "composer-send-button-tooltip"
@@ -1436,17 +1438,18 @@ function ChatPanelComponent({
                         }
                         aria-label={t("Send message")}
                         className="composer-run-button"
-                        data-heroui-exception="native-form-submit"
-                        disabled={
+                        isDisabled={
                           (!draftMessage.trim() && !draftAttachments.length) ||
                           !selectedModelId ||
                           Boolean(draftUnsupportedAttachmentMessage)
                         }
+                        isIconOnly
                         /* Queue modifiers are pointer-specific; normal submit remains native form behavior. */
                         onClick={(event) => {
                           if (isQueueModifierActive(event)) {
                             event.preventDefault();
-                            const form = event.currentTarget.form;
+                            const form = (event.currentTarget as HTMLButtonElement)
+                              .form;
                             if (!form) {
                               return;
                             }
@@ -1459,11 +1462,12 @@ function ChatPanelComponent({
                             );
                           }
                         }}
-                        title={sendButtonTitle}
+                        size="sm"
                         type="submit"
+                        variant="primary"
                       >
                         <Send aria-hidden="true" className="size-4" />
-                      </button>
+                      </Button>
                       {showSendButtonTooltip ? (
                         <span
                           className="composer-send-tooltip"
@@ -2037,9 +2041,9 @@ function ComposerSelectMenu({
     >
       <Select.Trigger
         aria-label={triggerAriaLabel}
-        className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 rounded-lg border border-border bg-surface px-2 text-xs font-medium"
+        className="composer-select-summary h-[1.875rem] min-h-[1.875rem] gap-2 px-2 text-xs font-medium"
       >
-        <Icon aria-hidden="true" className="size-3.5 shrink-0 text-accent" />
+        <Icon aria-hidden="true" className="size-3.5 shrink-0" />
         <Select.Value className="composer-select-label min-w-0 flex-1 truncate">
           {({ defaultChildren, isPlaceholder }) =>
             isPlaceholder ? defaultChildren : selectedLabel
@@ -2101,29 +2105,30 @@ function ReasoningBlock({
     : t("Expand thinking");
 
   return (
-    <div className="reasoning-block min-w-0 rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_80%,transparent)] p-2 text-[var(--muted)]">
+    <div className="reasoning-block min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-2 text-[var(--foreground)]">
       <Button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
-        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-[var(--muted)] hover:text-[var(--foreground)]"
+        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-[var(--foreground)] hover:text-[var(--foreground)]"
         onPress={() => setIsExpanded((current) => !current)}
         type="button"
+        variant="tertiary"
       >
         {isExpanded ? (
           <ChevronDown
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
+            className="size-3.5 shrink-0 text-[var(--foreground)]"
           />
         ) : (
           <ChevronRight
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
+            className="size-3.5 shrink-0 text-[var(--foreground)]"
           />
         )}
         <span className="shrink-0 font-semibold">{t("Thinking")}</span>
         {isExpanded ? null : (
           <span
-            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
+            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--foreground)]"
             title={preview}
           >
             {preview}
@@ -2131,7 +2136,7 @@ function ReasoningBlock({
         )}
         {durationLabel && durationTitle ? (
           <span
-            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--muted)]"
+            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--foreground)]"
             title={durationTitle}
           >
             {durationLabel}
@@ -2139,7 +2144,7 @@ function ReasoningBlock({
         ) : null}
       </Button>
       {isExpanded ? (
-        <div className="mt-2 border-l border-[var(--border)] pl-3 text-[var(--muted)]">
+        <div className="mt-2 border-l border-[var(--border)] pl-3 text-[var(--foreground)]">
           <MarkdownContent
             content={reasoning}
             isUser={false}

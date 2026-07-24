@@ -13650,10 +13650,12 @@ export function App() {
                   <div className="flex shrink-0 items-center gap-1.5">
                     <Button
                       aria-label={t("Refresh workspaces")}
-                      className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
+                      isIconOnly
                       isDisabled={isLoading}
                       onPress={() => void refreshWorkspaces()}
+                      size="sm"
                       type="button"
+                      variant="ghost"
                     >
                       <RefreshCw
                         aria-hidden="true"
@@ -13663,11 +13665,13 @@ export function App() {
                     <Button
                       aria-label={t("Search chats")}
                       aria-pressed={workspaceChatSearchOpen}
-                      className="inline-flex size-8 items-center justify-center rounded-lg text-[var(--muted)] transition hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                      isIconOnly
                       onPress={() =>
                         setWorkspaceChatSearchOpen((current) => !current)
                       }
+                      size="sm"
                       type="button"
+                      variant={workspaceChatSearchOpen ? "tertiary" : "ghost"}
                     >
                       <Search aria-hidden="true" className="size-3.5" />
                     </Button>
@@ -13769,6 +13773,7 @@ export function App() {
                               className={workspaceItemClass(isActive)}
                               onPress={() => toggleWorkspace(workspace.id)}
                               type="button"
+                              variant={isActive ? "tertiary" : "ghost"}
                             >
                               {isExpanded ? (
                                 <ChevronDown
@@ -13807,7 +13812,7 @@ export function App() {
                               aria-label={t("New chat in {name}", {
                                 name: workspace.name,
                               })}
-                              className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg text-[var(--muted)] hover:text-[var(--accent-soft-foreground)]"
+                              isIconOnly
                               isDisabled={isRemoteWorkspace && !isRemoteReady}
                               onPress={() => {
                                 if (isRemoteWorkspace && !isRemoteReady) {
@@ -13820,7 +13825,9 @@ export function App() {
                                 }
                                 startNewWorkspaceChat(workspace.id);
                               }}
+                              size="sm"
                               type="button"
+                              variant="ghost"
                             >
                               <Plus aria-hidden="true" className="size-4" />
                             </Button>
@@ -15569,6 +15576,7 @@ function NavRailButton({
       isDisabled={disabled}
       onPress={onClick}
       type="button"
+      variant="tertiary"
     >
       <Icon aria-hidden="true" className="size-4" />
     </Button>

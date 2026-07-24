@@ -15,13 +15,16 @@ a parallel product palette.
 
 | Role | Light | Dark | Use |
 | --- | --- | --- | --- |
-| Paper | `#F7F7F7` | neutral near-black | application background |
-| Surface | `#FFFFFF` | raised charcoal | panels and cards |
-| Ink | `#181818` | near-white | primary text |
-| Steel | `#707070` | neutral gray | metadata and quiet affordances |
-| Focus / active lane | `#3F3F46` | light neutral focus | keyboard focus and selected work |
+| Paper | HeroUI default near-white | HeroUI default near-black | application background |
+| Surface | HeroUI white | HeroUI raised neutral | panels and cards |
+| Ink | HeroUI eclipse | HeroUI snow | primary text |
+| Muted | HeroUI neutral | HeroUI neutral | metadata and quiet affordances |
+| Focus / active lane | HeroUI default accent | HeroUI default accent | keyboard focus, selected work, and primary actions |
 
-Status, charts, and terminal colors retain their existing semantic meanings.
+HeroUI owns the standard light and dark semantic palette, including `accent`,
+status colors, overlays, and focus states. Foco maps `--accent-soft` to HeroUI's
+neutral `default` state for dense workbench selections and hover surfaces, so
+only primary actions and focus affordances use the blue `accent`.
 The terminal palette is intentionally outside this UI theme contract.
 
 ## Component anatomy and density

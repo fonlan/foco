@@ -13766,20 +13766,17 @@ function SettingsNavButton({
   onClick: () => void;
 }) {
   return (
-    <SettingsButton
+    <Button
       aria-label={label}
       aria-current={active ? "page" : undefined}
-      className={`inline-flex h-10 w-full min-w-0 items-center gap-2 rounded-lg px-3 text-left text-sm font-semibold ${active
-          ? "bg-[var(--accent)] text-white shadow-[var(--overlay-shadow)]"
-          : "text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
-        }`}
-      onClick={onClick}
-      title={label}
+      className="h-10 w-full min-w-0 justify-start"
+      onPress={onClick}
       type="button"
+      variant={active ? "tertiary" : "ghost"}
     >
       <Icon aria-hidden="true" className="size-4 shrink-0" />
       <span className="min-w-0 truncate">{label}</span>
-    </SettingsButton>
+    </Button>
   );
 }
 

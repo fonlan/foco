@@ -10,7 +10,7 @@ function resetDocumentTheme() {
   document.documentElement.style.colorScheme = "";
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) {
-    meta.setAttribute("content", "#f7f7f7");
+    meta.setAttribute("content", "#f5f5f5");
   }
 }
 
@@ -35,7 +35,7 @@ describe("useDocumentTheme", () => {
     expect(document.documentElement.style.colorScheme).toBe("light");
     expect(
       document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
-    ).toBe("#f7f7f7");
+    ).toBe("#f5f5f5");
   });
 
   it("switches to dark and back at runtime", () => {
@@ -59,7 +59,7 @@ describe("useDocumentTheme", () => {
     expect(document.documentElement.style.colorScheme).toBe("dark");
     expect(
       document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
-    ).toBe("#181818");
+    ).toBe("#050505");
 
     rerender({ theme: "light" });
     expect(document.documentElement.classList.contains("light")).toBe(true);
@@ -67,6 +67,6 @@ describe("useDocumentTheme", () => {
     expect(document.documentElement.style.colorScheme).toBe("light");
     expect(
       document.querySelector('meta[name="theme-color"]')?.getAttribute("content"),
-    ).toBe("#f7f7f7");
+    ).toBe("#f5f5f5");
   });
 });

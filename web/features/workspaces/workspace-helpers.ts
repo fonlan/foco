@@ -1,6 +1,6 @@
 export function workspaceItemClass(active: boolean) {
   return `workspace-item flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
-    active ? "workspace-item-active text-[var(--accent-soft-foreground)]" : "text-[var(--muted)]"
+    active ? "workspace-item-active" : ""
   }`;
 }
 
@@ -12,10 +12,8 @@ export function workspaceNameFromPath(path: string) {
 }
 
 export function workspaceMenuClass(active: boolean) {
-  return `workspace-menu foco-reticle flex min-w-0 items-center gap-1 rounded-xl border px-1.5 py-1 transition-colors ${
-    active
-      ? "foco-reticle-on workspace-menu-active border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)] shadow-sm"
-      : "border-transparent bg-[color-mix(in_oklab,var(--surface-secondary)_60%,transparent)] text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] hover:text-[var(--foreground)]"
+  return `workspace-menu flex min-w-0 items-center gap-1 px-1.5 py-1 ${
+    active ? "workspace-menu-active" : ""
   }`;
 }
 
