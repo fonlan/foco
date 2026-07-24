@@ -1232,7 +1232,7 @@ describe("app-chat-stream verification surfaces", () => {
     );
   });
 
-  it("compacts the Fast toggle to a 1.75rem icon button under the phone breakpoint", () => {
+  it("compacts the Plan and Fast toggles to 1.75rem icon buttons under the phone breakpoint", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
     const chatPanelSource = readFileSync("features/chat/ChatPanel.tsx", "utf8");
 
@@ -1240,6 +1240,10 @@ describe("app-chat-stream verification surfaces", () => {
       /className=["']composer-fast-toggle-label["']/,
     );
     expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Fast mode["']\)\}/);
+    expect(chatPanelSource).toMatch(
+      /className=["']composer-team-toggle-label["']/,
+    );
+    expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Plan mode["']\)\}/);
 
     expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*1\.75rem[\s\S]*?min-width:\s*1\.75rem[\s\S]*?max-width:\s*1\.75rem[\s\S]*?height:\s*1\.75rem[\s\S]*?flex:\s*0 0 1\.75rem/,
@@ -1249,6 +1253,15 @@ describe("app-chat-stream verification surfaces", () => {
     );
     expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle[\s\S]*?width:\s*1\.75rem[\s\S]*?min-width:\s*1\.75rem[\s\S]*?max-width:\s*1\.75rem[\s\S]*?height:\s*1\.75rem[\s\S]*?flex:\s*0 0 1\.75rem/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle[\s\S]*?padding-inline:\s*0/,
+    );
+    expect(stylesCss).toMatch(
+      /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle-label,\s*\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/,
     );
     // Visible Fast label must remain shown outside the phone breakpoint.
     expect(stylesCss).not.toMatch(
