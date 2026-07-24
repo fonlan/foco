@@ -349,10 +349,10 @@ export function AgentsSettingsPanel({
 
       {dialogMode ? (
         <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && closeDialog()}>
-          <Modal.Container placement="center" scroll="inside" size="lg">
+          <Modal.Container className="sm:w-full" placement="center" scroll="inside" size="full">
           <Modal.Dialog
             aria-label={dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
-            className="flex max-h-[min(92dvh,56rem)] w-[min(96vw,72rem)] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
+            className="flex !h-auto max-h-[min(92dvh,56rem)] w-full max-w-[min(96vw,40rem)] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)] lg:max-w-[min(96vw,90rem)]"
           >
           <form
             className="flex min-h-0 flex-1 flex-col"
