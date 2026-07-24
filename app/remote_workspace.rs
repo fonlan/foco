@@ -17618,9 +17618,78 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             continue;
                         }
 
+                        // Exhausted automatic tool-call-loop recoveries: fail the run with
+                        // durable partial parts (same shape as reasoning-loop exhaustion).
+                        remote_sidecar_flush_open_content_parts(
+                            &mut content_parts_prefix,
+                            &text,
+                            &reasoning,
+                            &mut flushed_text_len,
+                            &mut flushed_reasoning_len,
+                        );
+                        let remaining_text = text.get(flushed_text_len..).unwrap_or(text.as_str());
+                        let remaining_reasoning = reasoning
+                            .get(flushed_reasoning_len..)
+                            .unwrap_or(reasoning.as_str());
+                        let total_latency_ms = run_metrics.total_latency_ms();
+                        let metrics = remote_chat_metrics(
+                            &model_id,
+                            &provider_id,
+                            &run_metrics,
+                            total_latency_ms,
+                        );
+                        let mut parts = remote_chat_parts_with_context_compression(
+                            remaining_text,
+                            (!remaining_reasoning.is_empty()).then_some(remaining_reasoning),
+                            &run_compression_events,
+                            &content_parts_prefix,
+                        );
+                        parts.push(json!({ "type": "error", "text": message }));
+                        let metadata = json!({
+                            "reasoning": if reasoning.is_empty() { Value::Null } else { Value::String(reasoning.clone()) },
+                            "parts": parts,
+                            "partsVersion": 6,
+                            "partsSource": "live_sse",
+                            "streamingState": "failed",
+                            "runFailure": {
+                                "code": "tool_call_loop_recovery_exhausted",
+                                "stage": "stream",
+                                "retryable": false,
+                                "runId": run_id,
+                                "message": message,
+                            },
+                            "metrics": metrics,
+                        });
+                        let metadata_json = metadata.to_string();
+                        match with_sidecar_workspace_database(&stream_state, |database| {
+                            remote_sidecar_persist_owned_assistant_message(
+                                database,
+                                &chat_id,
+                                &assistant_message_id,
+                                &queued_user_message_id,
+                                &run_id,
+                                &text,
+                                &metadata_json,
+                            )
+                        }) {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                remote_sidecar_finish_active_run(&stream_state, &run_id);
+                                break;
+                            }
+                            Err(error) => tracing::warn!(
+                                chat_id,
+                                assistant_message_id,
+                                error = %error,
+                                "failed to persist remote assistant after exhausted tool-call-loop recoveries"
+                            ),
+                        }
                         sequence += 1;
-                        remote_sidecar_record_run_event(
+                        remote_sidecar_record_durable_run_event(
+                            &stream_state,
                             &run_stream,
+                            &chat_id,
+                            &run_id,
                             sequence,
                             json!({
                                 "type": "error",
@@ -17633,6 +17702,14 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             sequence,
                             json!({ "type": "streamEnd" }),
                         );
+                        let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                            database.clear_remote_queued_run_if_owned(
+                                &chat_id,
+                                &queued_user_message_id,
+                                &assistant_message_id,
+                                &run_id,
+                            )
+                        });
                         remote_sidecar_finish_active_run(&stream_state, &run_id);
                         cleanup_guard.disarm();
                         break;
@@ -35067,6 +35144,426 @@ mod tests {
             }),
             "next-run history must keep tool result: {:?}",
             history.messages
+        );
+    }
+
+    const REMOTE_TOOL_LOOP_PROBE_PATH: &str = "LoopProbe.txt";
+    const REMOTE_TOOL_LOOP_PARTIAL_TEXT: &str = "Retrying the same tool batch.";
+    const REMOTE_TOOL_LOOP_RECOVERY_TEXT: &str = "Recovered after tool call loop";
+
+    fn remote_tool_loop_expected_error_message(tool_name: &str) -> String {
+        format!(
+            "agent run repeated the same tool call batch {} times ({tool_name}); possible tool-call loop",
+            crate::MAX_REPEATED_TOOL_CALL_BATCHES
+        )
+    }
+
+    fn remote_tool_loop_write_file_call(call_id: &str) -> Value {
+        json!({
+            "callId": call_id,
+            "name": "write_file",
+            "arguments": {
+                "path": REMOTE_TOOL_LOOP_PROBE_PATH,
+                "content": "loop-probe",
+                "startLine": null,
+                "endLine": null,
+                "timeoutMs": null
+            }
+        })
+    }
+
+    async fn remote_tool_loop_send_tool_batch(
+        broker_state: &RemoteSidecarState,
+        broker_rx: &mut mpsc::UnboundedReceiver<ControlEnvelope>,
+        call_id: &str,
+        include_partial_text: bool,
+    ) -> Value {
+        let request = loop {
+            let envelope = broker_rx.recv().await.expect("broker request");
+            if envelope.message_type == "request" {
+                break envelope;
+            }
+        };
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        if include_partial_text {
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": REMOTE_TOOL_LOOP_PARTIAL_TEXT,
+                    }),
+                    timestamp: None,
+                })
+                .expect("send partial text");
+        }
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "usage": { "inputTokens": 4, "outputTokens": 2 },
+                    "toolCalls": [remote_tool_loop_write_file_call(call_id)],
+                }),
+                timestamp: None,
+            })
+            .expect("send tool batch");
+        request.payload
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_sidecar_chat_stream_tool_loop_auto_recovers_without_third_execution() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        seed_remote_queued_chat(&mut database, "chat-1", "msg-user-1", "msg-assistant-1");
+        drop(database);
+
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let recovery_messages = Arc::new(std::sync::Mutex::new(None));
+        let recovery_messages_for_broker = recovery_messages.clone();
+        let broker = tokio::spawn(async move {
+            // Two executions of the same write_file batch.
+            let _ = remote_tool_loop_send_tool_batch(
+                &broker_state,
+                &mut broker_rx,
+                "call-loop-1",
+                false,
+            )
+            .await;
+            let _ = remote_tool_loop_send_tool_batch(
+                &broker_state,
+                &mut broker_rx,
+                "call-loop-2",
+                false,
+            )
+            .await;
+            // Third identical batch is intercepted and recovered.
+            let _ = remote_tool_loop_send_tool_batch(
+                &broker_state,
+                &mut broker_rx,
+                "call-loop-3",
+                true,
+            )
+            .await;
+
+            let fourth_request = loop {
+                let envelope = broker_rx.recv().await.expect("recovery broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let messages = fourth_request.payload["request"]["messages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            *recovery_messages_for_broker
+                .lock()
+                .expect("recovery messages lock") = Some(messages);
+            let fourth_id = fourth_request.id.expect("fourth request id");
+            let fourth_pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&fourth_id)
+                .cloned()
+                .expect("fourth pending");
+            fourth_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "stream".to_string(),
+                    id: Some(fourth_id.clone()),
+                    method: None,
+                    payload: json!({
+                        "kind": "textDelta",
+                        "delta": REMOTE_TOOL_LOOP_RECOVERY_TEXT,
+                    }),
+                    timestamp: None,
+                })
+                .expect("send recovery text");
+            fourth_pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "response".to_string(),
+                    id: Some(fourth_id),
+                    method: None,
+                    payload: json!({
+                        "usage": { "inputTokens": 7, "outputTokens": 3 },
+                        "toolCalls": [],
+                    }),
+                    timestamp: None,
+                })
+                .expect("send recovery response");
+        });
+
+        let body_result = tokio::time::timeout(
+            Duration::from_secs(8),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await;
+        broker.abort();
+        let _ = broker.await;
+        let bytes = body_result
+            .expect("tool loop recovery SSE body should finish")
+            .expect("SSE bytes");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        let expected_error = remote_tool_loop_expected_error_message("write_file");
+        assert!(text.contains("\"type\":\"guidanceApplied\""));
+        assert!(text.contains(TOOL_CALL_LOOP_GUARD_SOURCE));
+        assert!(text.contains(&expected_error));
+        assert!(text.contains("\"type\":\"complete\""));
+        assert!(text.contains(REMOTE_TOOL_LOOP_RECOVERY_TEXT));
+        assert!(!text.contains("\"type\":\"error\""));
+        assert_eq!(
+            text.matches("\"type\":\"toolCall\"").count(),
+            2,
+            "third batch must not emit toolCall SSE: {text}"
+        );
+        assert_eq!(
+            text.matches("\"type\":\"toolResult\"").count(),
+            2,
+            "third batch must not emit toolResult SSE: {text}"
+        );
+        assert!(
+            !text.contains("call-loop-3"),
+            "intercepted call id must not appear in SSE: {text}"
+        );
+
+        let recovery_messages = recovery_messages
+            .lock()
+            .expect("recovery messages lock")
+            .clone()
+            .expect("recovery request messages");
+        assert!(
+            recovery_messages.iter().any(|message| {
+                if message["role"] != "assistant" {
+                    return false;
+                }
+                let has_tool_calls = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty());
+                let has_content = message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(REMOTE_TOOL_LOOP_PARTIAL_TEXT));
+                has_content && !has_tool_calls
+            }),
+            "recovery RPC must include partial assistant without tool_calls: {recovery_messages:?}"
+        );
+        assert!(
+            recovery_messages.iter().any(|message| {
+                message["role"] == "user"
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains(&expected_error))
+            }),
+            "recovery RPC must include loop error user message: {recovery_messages:?}"
+        );
+        assert!(
+            !recovery_messages.iter().any(|message| {
+                message["role"] == "tool"
+                    && message
+                        .get("tool_call_id")
+                        .or_else(|| message.get("toolCallId"))
+                        .and_then(Value::as_str)
+                        == Some("call-loop-3")
+            }),
+            "third batch must not append tool result: {recovery_messages:?}"
+        );
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let tool_calls = database
+            .tool_calls_for_chat("chat-1")
+            .expect("tool calls for chat");
+        assert_eq!(
+            tool_calls.len(),
+            2,
+            "third batch must not be persisted: {tool_calls:?}"
+        );
+        assert!(
+            tool_calls
+                .iter()
+                .all(|tool_call| tool_call.id == "call-loop-1" || tool_call.id == "call-loop-2")
+        );
+
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        assert!(
+            assistant.content.contains(REMOTE_TOOL_LOOP_RECOVERY_TEXT),
+            "assistant content must include recovery text: {}",
+            assistant.content
+        );
+        assert!(
+            assistant.content.contains(REMOTE_TOOL_LOOP_PARTIAL_TEXT),
+            "assistant content must keep intercepted partial text: {}",
+            assistant.content
+        );
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("assistant parts");
+        assert!(
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                    && part.get("content").and_then(Value::as_str) == Some(expected_error.as_str())
+                    && part.get("source").and_then(Value::as_str)
+                        == Some(TOOL_CALL_LOOP_GUARD_SOURCE)
+            }),
+            "final parts must include toolCallLoopGuard userInterruption: {parts:?}"
+        );
+
+        let durable_events = database
+            .history_run_events_for_chat_messages("chat-1", &["msg-assistant-1".to_string()])
+            .expect("run events");
+        assert!(
+            durable_events
+                .iter()
+                .any(|event| event.event_type == "guidance_applied"),
+            "guidance_applied must be durable for rematerialize"
+        );
+        assert!(
+            state.active_runs.lock().expect("active runs").is_empty(),
+            "successful recovery must clear active runs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_sidecar_chat_stream_tool_loop_fails_after_max_recoveries() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        seed_remote_queued_chat(&mut database, "chat-1", "msg-user-1", "msg-assistant-1");
+        drop(database);
+
+        let (state, broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
+
+        let response = remote_sidecar_chat_stream(
+            State(state.clone()),
+            Json(json!({
+                "chatId": "chat-1",
+                "queuedUserMessageId": "msg-user-1",
+                "visibleAssistantMessageId": "msg-assistant-1",
+                "modelId": "model-1",
+                "providerId": "provider-1",
+            })),
+        )
+        .await
+        .expect("SSE response");
+
+        let broker_state = state.clone();
+        let max_recoveries = MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN;
+        let looping_batches = (crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1) + max_recoveries + 1;
+        let broker = tokio::spawn(async move {
+            for turn in 1..=looping_batches {
+                let _ = remote_tool_loop_send_tool_batch(
+                    &broker_state,
+                    &mut broker_rx,
+                    &format!("call-loop-{turn}"),
+                    false,
+                )
+                .await;
+            }
+        });
+
+        let body_result = tokio::time::timeout(
+            Duration::from_secs(10),
+            axum::body::to_bytes(response.into_response().into_body(), usize::MAX),
+        )
+        .await;
+        broker.abort();
+        let _ = broker.await;
+        let bytes = body_result
+            .expect("max recovery SSE body should finish")
+            .expect("SSE bytes");
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8 SSE");
+        let guidance_count = text.matches("\"type\":\"guidanceApplied\"").count();
+        assert_eq!(guidance_count, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN);
+        assert!(text.contains("\"type\":\"error\""));
+        assert!(text.contains("agent run repeated the same tool call batch"));
+        assert!(text.contains("write_file"));
+        assert!(text.contains("\"type\":\"streamEnd\""));
+        assert!(!text.contains("\"type\":\"complete\""));
+        assert_eq!(
+            text.matches("\"type\":\"toolCall\"").count(),
+            crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
+            "only the first two batches may execute: {text}"
+        );
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        let assistant = database
+            .message("msg-assistant-1")
+            .expect("assistant lookup")
+            .expect("assistant message");
+        let metadata =
+            serde_json::from_str::<Value>(&assistant.metadata_json).expect("assistant metadata");
+        let parts = metadata
+            .get("parts")
+            .and_then(Value::as_array)
+            .expect("final partial parts");
+        assert!(
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                    && part.get("source").and_then(Value::as_str)
+                        == Some(TOOL_CALL_LOOP_GUARD_SOURCE)
+            }),
+            "exhausted recoveries must keep tool-loop interruption parts: {parts:?}"
+        );
+        let tool_calls = database
+            .tool_calls_for_chat("chat-1")
+            .expect("tool calls for chat");
+        assert_eq!(
+            tool_calls.len(),
+            crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
+            "failed recoveries must not persist extra tool calls: {tool_calls:?}"
+        );
+        assert!(
+            metadata
+                .get("runFailure")
+                .and_then(|value| value.get("code"))
+                .and_then(Value::as_str)
+                == Some("tool_call_loop_recovery_exhausted"),
+            "exhausted recoveries must persist runFailure metadata: {metadata:?}"
+        );
+        assert_eq!(
+            metadata.get("streamingState").and_then(Value::as_str),
+            Some("failed")
         );
     }
 

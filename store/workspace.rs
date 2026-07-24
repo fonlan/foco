@@ -6734,8 +6734,9 @@ impl WorkspaceDatabase {
             (None, None) => {}
             _ => {
                 return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
-                    message: "queued run must include both assistantMessageId and assistantSequence"
-                        .to_string(),
+                    message:
+                        "queued run must include both assistantMessageId and assistantSequence"
+                            .to_string(),
                 });
             }
         }

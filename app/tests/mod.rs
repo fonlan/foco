@@ -7,9 +7,9 @@ use std::{
 };
 
 use crate::runtime::{
-    MAX_REASONING_LOOP_RECOVERIES_PER_RUN, REASONING_LOOP_GUARD_SOURCE,
-    REASONING_LOOP_RECOVERY_USER_TEXT, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
-    agent_run_event_kind,
+    MAX_REASONING_LOOP_RECOVERIES_PER_RUN, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
+    REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, TOOL_CALL_LOOP_GUARD_SOURCE,
+    ToolLoopBeforeExecutionAction, agent_run_event_kind,
 };
 use axum::{
     Json, Router,
@@ -2876,6 +2876,57 @@ fn repeated_tool_call_detector_rejects_third_identical_batch() {
         still_blocked,
         ToolLoopBeforeExecutionAction::RecoverRepeatedBatch { .. }
     ));
+}
+
+#[test]
+fn repeated_tool_call_detector_names_agent_delegate_task_in_recovery_message() {
+    let mut detector = RepeatedToolCallDetector::default();
+    let arguments = json!({
+        "targetInstanceId": "agent-instance-1",
+        "targetDefinitionId": null,
+        "input": { "message": "do work" },
+        "correlationId": null,
+        "timeoutMs": null
+    });
+
+    for index in 1..=2 {
+        let call_id = format!("call-delegate-{index}");
+        assert!(matches!(
+            detector.check(&[test_neutral_tool_call(
+                call_id.as_str(),
+                "agent_delegate_task",
+                arguments.clone(),
+            )]),
+            Ok(ToolLoopBeforeExecutionAction::Continue)
+        ));
+    }
+
+    let action = detector
+        .check(&[test_neutral_tool_call(
+            "call-delegate-3",
+            "agent_delegate_task",
+            arguments,
+        )])
+        .expect("third identical agent_delegate_task batch should recover");
+    match action {
+        ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
+            message,
+            tool_names,
+        } => {
+            assert!(
+                message.contains("agent_delegate_task"),
+                "recovery message must name the looping tool: {message}"
+            );
+            assert!(
+                message.contains("agent run repeated the same tool call batch 3 times"),
+                "recovery message must keep the shared loop wording: {message}"
+            );
+            assert_eq!(tool_names, "agent_delegate_task");
+        }
+        ToolLoopBeforeExecutionAction::Continue => {
+            panic!("third identical agent_delegate_task batch should recover, not continue");
+        }
+    }
 }
 
 #[test]
@@ -10845,9 +10896,11 @@ fn finalized_assistant_parts_persist_tool_call_loop_guard_and_replay_without_gui
     assert_eq!(replayed[1].role, NeutralChatRole::User);
     // Automatic guard sources must replay raw control text without manual guidance wrapping.
     assert_eq!(replayed[1].content, loop_error);
-    assert!(!replayed[1]
-        .content
-        .contains("User guidance for the current in-progress run"));
+    assert!(
+        !replayed[1]
+            .content
+            .contains("User guidance for the current in-progress run")
+    );
     assert_eq!(replayed[2].role, NeutralChatRole::Assistant);
     assert_eq!(replayed[2].content, "Recovered without repeating tools.");
 }
@@ -12847,7 +12900,10 @@ fn startup_reconciliation_ignores_suspended_wait_attempt_after_task_resumes() {
         .agent_attempts_for_task(&parent_task_id)
         .expect("parent attempts");
     assert_eq!(attempts[0].id, suspended_attempt_id);
-    assert_eq!(attempts[0].status, foco_agent::AgentAttemptStatus::Suspended);
+    assert_eq!(
+        attempts[0].status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
     assert_eq!(attempts[1].id, resumed_attempt_id);
     assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
     let events = database.agent_events_after(&team_id, -1).expect("events");
@@ -33937,6 +33993,436 @@ async fn plan_phase_reasoning_loop_recovery_keeps_task_attempt_and_derived_effec
             .expect("effects record")
             .status,
         "released"
+    );
+}
+
+const TOOL_LOOP_PROBE_PATH: &str = "LoopProbe.txt";
+const TOOL_LOOP_PROBE_ARGS: &str =
+    r#"{"path":"LoopProbe.txt","startLine":null,"endLine":null,"timeoutMs":null}"#;
+const TOOL_LOOP_RECOVERY_TEXT: &str = "Recovered after tool call loop";
+const TOOL_LOOP_PARTIAL_TEXT: &str = "Retrying the same tool batch.";
+
+fn tool_loop_expected_error_message(tool_name: &str) -> String {
+    format!(
+        "agent run repeated the same tool call batch {} times ({tool_name}); possible tool-call loop",
+        crate::MAX_REPEATED_TOOL_CALL_BATCHES
+    )
+}
+
+fn tool_loop_batch_sse(call_id: &str, include_partial_text: bool) -> String {
+    let mut body = String::new();
+    if include_partial_text {
+        body.push_str("data: ");
+        body.push_str(
+            &json!({
+                "id": "chat-tool-loop",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "content": TOOL_LOOP_PARTIAL_TEXT
+                    }
+                }]
+            })
+            .to_string(),
+        );
+        body.push_str("\n\n");
+    }
+    body.push_str("data: ");
+    body.push_str(
+        &json!({
+            "id": "chat-tool-loop",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": TOOL_LOOP_PROBE_ARGS
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string(),
+    );
+    body.push_str("\n\n");
+    body.push_str("data: ");
+    body.push_str(
+        &json!({
+            "id": "chat-tool-loop",
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 8 }
+        })
+        .to_string(),
+    );
+    body.push_str("\n\ndata: [DONE]\n\n");
+    body
+}
+
+/// Provider fixture for tool-call-loop recovery tests.
+///
+/// - First `loop_tool_request_count` requests return the same read_file batch
+///   (different call_ids). The third identical batch is intercepted by the guard.
+/// - Subsequent requests return a plain completion text.
+async fn serve_main_chat_tool_loop_fixture(
+    loop_tool_request_count: usize,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recovery_body = concat!(
+        "data: {\"id\":\"chat-tool-loop-recovered\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Recovered after tool call loop\"}}]}\n\n",
+        "data: {\"id\":\"chat-tool-loop-recovered\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":20,\"completion_tokens\":4}}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_string();
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen_for_handler = seen.clone();
+            move |Json(payload): Json<Value>| {
+                let seen = seen_for_handler.clone();
+                let recovery_body = recovery_body.clone();
+                async move {
+                    let request_count = {
+                        let mut requests = seen.lock().expect("tool loop request capture");
+                        requests.push(payload);
+                        requests.len()
+                    };
+                    let body = if request_count <= loop_tool_request_count {
+                        // Include partial text on the first recoverable batch so the next
+                        // provider request can assert a partial assistant without tool_calls.
+                        let include_partial_text =
+                            request_count == crate::MAX_REPEATED_TOOL_CALL_BATCHES;
+                        tool_loop_batch_sse(
+                            &format!("call-loop-{request_count}"),
+                            include_partial_text,
+                        )
+                    } else {
+                        recovery_body
+                    };
+                    ([(header::CONTENT_TYPE, "text/event-stream")], body).into_response()
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind tool loop fixture server");
+    let addr = listener.local_addr().expect("tool loop fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), seen, task)
+}
+
+#[tokio::test]
+async fn main_chat_tool_loop_guard_auto_recovers_without_third_execution() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    fs::write(workspace.path().join(TOOL_LOOP_PROBE_PATH), "probe content")
+        .expect("write tool loop probe file");
+    // 3 identical tool batches: execute twice, recover on the third, then complete.
+    let (base_url, seen, server_task) = serve_main_chat_tool_loop_fixture(3).await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 3;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Trigger the tool call loop guard".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare tool loop chat context");
+
+    let chat_id = context.chat_id.clone();
+    let assistant_message_id = context.assistant_message_id.clone();
+
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut tool_call_ids = Vec::new();
+    let mut tool_result_ids = Vec::new();
+    let mut guidance_applied = None;
+    let mut completed_text = None;
+    let mut error_message = None;
+    let mut stream_reset_count = 0;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::ToolCall { tool_call, .. } => tool_call_ids.push(tool_call.id),
+            ChatSseEvent::ToolResult { tool_call_id, .. } => tool_result_ids.push(tool_call_id),
+            ChatSseEvent::GuidanceApplied {
+                content, source, ..
+            } => guidance_applied = Some((content, source)),
+            ChatSseEvent::StreamReset { .. } => stream_reset_count += 1,
+            ChatSseEvent::Complete { text, .. } => completed_text = Some(text),
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    let expected_error = tool_loop_expected_error_message("read_file");
+    assert!(
+        error_message.is_none(),
+        "auto recovery must not emit Error: {error_message:?}"
+    );
+    assert_eq!(stream_reset_count, 0);
+    let completed_text = completed_text.expect("completed text");
+    assert!(
+        completed_text.contains(TOOL_LOOP_PARTIAL_TEXT),
+        "final content keeps partial text from the intercepted turn: {completed_text}"
+    );
+    assert!(
+        completed_text.contains(TOOL_LOOP_RECOVERY_TEXT),
+        "final content must include recovery completion text: {completed_text}"
+    );
+    assert_eq!(
+        tool_call_ids,
+        vec!["call-loop-1".to_string(), "call-loop-2".to_string()],
+        "third identical batch must not emit ToolCall"
+    );
+    assert_eq!(
+        tool_result_ids,
+        vec!["call-loop-1".to_string(), "call-loop-2".to_string()],
+        "third identical batch must not emit ToolResult"
+    );
+    assert_eq!(
+        guidance_applied
+            .as_ref()
+            .map(|(content, source)| (content.as_str(), source.as_str())),
+        Some((expected_error.as_str(), TOOL_CALL_LOOP_GUARD_SOURCE))
+    );
+
+    let seen = seen.lock().expect("tool loop request capture");
+    assert_eq!(
+        seen.len(),
+        4,
+        "two executions + one recovery injection + one completion request: {seen:?}"
+    );
+    let recovery_request = &seen[3];
+    let recovery_messages = recovery_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("recovery provider messages");
+    let has_partial_assistant = recovery_messages.iter().any(|message| {
+        if message["role"] != "assistant" {
+            return false;
+        }
+        let has_tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        let has_content = message
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|content| content.contains(TOOL_LOOP_PARTIAL_TEXT));
+        has_content && !has_tool_calls
+    });
+    let has_recovery_user = recovery_messages.iter().any(|message| {
+        message["role"] == "user"
+            && message
+                .get("content")
+                .and_then(Value::as_str)
+                .is_some_and(|content| content.contains(&expected_error))
+    });
+    assert!(
+        has_partial_assistant,
+        "recovery request must include partial assistant without tool_calls: {recovery_messages:?}"
+    );
+    assert!(
+        has_recovery_user,
+        "recovery request must include loop error user message: {recovery_messages:?}"
+    );
+    drop(seen);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let persisted_tool_calls = database
+        .tool_calls_for_chat(&chat_id)
+        .expect("persisted tool calls");
+    assert_eq!(
+        persisted_tool_calls.len(),
+        2,
+        "third batch must not be persisted: {persisted_tool_calls:?}"
+    );
+    assert!(
+        persisted_tool_calls
+            .iter()
+            .all(|tool_call| tool_call.id == "call-loop-1" || tool_call.id == "call-loop-2")
+    );
+    assert!(
+        !persisted_tool_calls
+            .iter()
+            .any(|tool_call| tool_call.id == "call-loop-3"),
+        "intercepted call-loop-3 must not appear in tool_calls table"
+    );
+
+    let assistant = database
+        .message(&assistant_message_id)
+        .expect("assistant message lookup")
+        .expect("assistant message persisted");
+    assert!(
+        assistant.content.contains(TOOL_LOOP_RECOVERY_TEXT),
+        "assistant content must include recovery text: {}",
+        assistant.content
+    );
+    assert!(
+        assistant.content.contains(TOOL_LOOP_PARTIAL_TEXT),
+        "assistant content must keep intercepted partial text: {}",
+        assistant.content
+    );
+    let metadata: Value =
+        serde_json::from_str(&assistant.metadata_json).expect("assistant metadata JSON");
+    let parts = metadata
+        .get("parts")
+        .and_then(Value::as_array)
+        .expect("assistant parts");
+    assert!(
+        parts.iter().any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("userInterruption")
+                && part.get("content").and_then(Value::as_str) == Some(expected_error.as_str())
+                && part.get("source").and_then(Value::as_str) == Some(TOOL_CALL_LOOP_GUARD_SOURCE)
+        }),
+        "persisted parts must include toolCallLoopGuard userInterruption: {parts:?}"
+    );
+    let user_count = database
+        .messages_for_chat(&chat_id)
+        .expect("messages")
+        .into_iter()
+        .filter(|message| message.role == "user")
+        .count();
+    assert_eq!(
+        user_count, 1,
+        "tool-loop interruption must not create a messages-table user row"
+    );
+}
+
+#[tokio::test]
+async fn main_chat_tool_loop_guard_fails_after_max_recoveries() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    fs::write(workspace.path().join(TOOL_LOOP_PROBE_PATH), "probe content")
+        .expect("write tool loop probe file");
+    // 2 executions + MAX recoveries + 1 failing batch.
+    let loop_tool_request_count =
+        (crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1) + MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN + 1;
+    let (base_url, seen, server_task) =
+        serve_main_chat_tool_loop_fixture(loop_tool_request_count).await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 0;
+    let workspace_id = config.workspaces[0].id.clone();
+    config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider")
+        .base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Exhaust tool call loop recoveries".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare tool loop exhaustion chat context");
+    let chat_id = context.chat_id.clone();
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut guidance_count = 0;
+    let mut tool_call_count = 0;
+    let mut error_message = None;
+    let mut completed = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::GuidanceApplied { .. } => guidance_count += 1,
+            ChatSseEvent::ToolCall { .. } => tool_call_count += 1,
+            ChatSseEvent::Complete { .. } => completed = true,
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert_eq!(guidance_count, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN);
+    assert_eq!(
+        tool_call_count,
+        crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
+        "only the first two batches may execute"
+    );
+    assert!(!completed);
+    let error_message = error_message.expect("max recovery exhausted error");
+    assert!(
+        error_message.contains("agent run repeated the same tool call batch"),
+        "exhausted error must keep loop wording: {error_message}"
+    );
+    assert!(
+        error_message.contains("read_file"),
+        "exhausted error must name the tool: {error_message}"
+    );
+    assert_eq!(
+        seen.lock().expect("tool loop request capture").len(),
+        loop_tool_request_count,
+        "provider requests must stop after the failing batch"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let persisted_tool_calls = database
+        .tool_calls_for_chat(&chat_id)
+        .expect("persisted tool calls");
+    assert_eq!(
+        persisted_tool_calls.len(),
+        crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
+        "recovered/failed batches must not persist tool calls: {persisted_tool_calls:?}"
     );
 }
 

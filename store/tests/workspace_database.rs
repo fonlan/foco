@@ -19244,8 +19244,7 @@ fn suspend_running_agent_task_still_recovers_unsatisfied_wait_dependencies() {
     );
     let worker_id =
         create_test_agent_worker(&database, &team_id, "unsatisfied-wait-recovery-worker");
-    let parent_task =
-        AgentTaskId::new("agent-task-unsatisfied-wait-parent").expect("parent task");
+    let parent_task = AgentTaskId::new("agent-task-unsatisfied-wait-parent").expect("parent task");
     let child_task = AgentTaskId::new("agent-task-unsatisfied-wait-child").expect("child task");
     database
         .enqueue_agent_task(NewAgentTask {

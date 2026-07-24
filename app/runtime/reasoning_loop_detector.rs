@@ -22,8 +22,7 @@ pub(crate) const MAX_REASONING_LOOP_RECOVERIES_PER_RUN: usize = 3;
 /// Automatic guard text is already provider-facing control content and must not be wrapped
 /// with the manual "User guidance..." prefix during live injection or history replay.
 pub(crate) fn is_automatic_guard_source(source: &str) -> bool {
-    source == REASONING_LOOP_GUARD_SOURCE
-        || source == super::tool_loop::TOOL_CALL_LOOP_GUARD_SOURCE
+    source == REASONING_LOOP_GUARD_SOURCE || source == super::tool_loop::TOOL_CALL_LOOP_GUARD_SOURCE
 }
 
 // ponytail: v1 intentionally favors low false positives: it only recognizes exact periodic

@@ -90,10 +90,7 @@ struct ToolCallLoopSignature {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ToolLoopBeforeExecutionAction {
     Continue,
-    RecoverRepeatedBatch {
-        message: String,
-        tool_names: String,
-    },
+    RecoverRepeatedBatch { message: String, tool_names: String },
 }
 
 #[derive(Default)]
@@ -9305,10 +9302,7 @@ mod tests {
                 interruption_reason: None,
             })
             .expect("suspend parent after implicit wait");
-        for (child_id, suffix) in [
-            (&child_a, "implicit-wait-a"),
-            (&child_b, "implicit-wait-b"),
-        ] {
+        for (child_id, suffix) in [(&child_a, "implicit-wait-a"), (&child_b, "implicit-wait-b")] {
             let child_attempt =
                 AgentAttemptId::new(format!("agent-attempt-{suffix}")).expect("child attempt");
             database
