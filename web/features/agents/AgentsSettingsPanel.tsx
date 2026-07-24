@@ -349,13 +349,16 @@ export function AgentsSettingsPanel({
 
       {dialogMode ? (
         <Modal.Backdrop isDismissable isOpen onOpenChange={(open) => !open && closeDialog()}>
-          <Modal.Container placement="center" size="lg">
+          <Modal.Container placement="center" scroll="inside" size="lg">
           <Modal.Dialog
             aria-label={dialogMode === "edit" ? t("Edit agent") : t("Create agent")}
-            className="my-auto w-[min(94vw,52rem)] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-4 shadow-[var(--overlay-shadow)]"
+            className="flex max-h-[min(92dvh,56rem)] w-[min(96vw,72rem)] flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--surface)] shadow-[var(--overlay-shadow)]"
           >
-          <form onSubmit={(event) => void submitDefinition(event)}>
-            <div className="flex items-center justify-between gap-3">
+          <form
+            className="flex min-h-0 flex-1 flex-col"
+            onSubmit={(event) => void submitDefinition(event)}
+          >
+            <div className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] px-4 py-3">
               <div className="flex min-w-0 items-center gap-2">
                 {dialogMode === "edit" ? (
                   <Pencil aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
@@ -378,171 +381,182 @@ export function AgentsSettingsPanel({
               </SettingsButton>
             </div>
 
-            {error ? (
-              <div className="mt-3 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
-                {error}
-              </div>
-            ) : null}
-
-            <div className="mt-4 grid gap-3 md:grid-cols-2">
-              <AgentTextField
-                autoFocus
-                label={t("Name")}
-                onChange={(value) => updateDraft({ name: value })}
-                value={draft.name}
-              />
-              <AgentTextField
-                inputMode="numeric"
-                label={t("Max instances")}
-                onChange={(value) => updateDraft({ maxInstances: value })}
-                type="number"
-                value={draft.maxInstances}
-              />
-              <label className="block md:col-span-2">
-                <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
-                  {t("Description")}
-                </span>
-                <SettingsInput
-                  className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-                  onChange={(event) => updateDraft({ description: event.target.value })}
-                  value={draft.description}
-                />
-              </label>
-              <AgentSelect label={t("Model")} value={draft.modelId} onChange={selectModel}>
-                <option value="">{t("Select model")}</option>
-                {enabledModels.map((model) => (
-                  <option key={model.id} value={model.id}>
-                    {model.displayName}
-                  </option>
-                ))}
-              </AgentSelect>
-              <AgentSelect
-                label={t("Thinking")}
-                onChange={(thinkingLevel) => updateDraft({ thinkingLevel })}
-                value={draft.thinkingLevel}
-              >
-                <option value="">{t("Model default")}</option>
-                {thinkingOptions.map((level) => (
-                  <option key={level.value} value={level.value}>
-                    {t(level.label)}
-                  </option>
-                ))}
-              </AgentSelect>
-              <AgentTextField
-                inputMode="numeric"
-                label={t("Max output tokens")}
-                onChange={(value) => updateDraft({ maxOutputTokens: value })}
-                placeholder={
-                  selectedModel?.maxOutputTokens ? String(selectedModel.maxOutputTokens) : ""
-                }
-                type="number"
-                value={draft.maxOutputTokens}
-              />
-              <div className="block md:col-span-2">
-                <span className="mb-1.5 flex items-center justify-between gap-3">
-                  <span className="text-xs font-semibold text-[var(--muted)]">
-                    {t("Agent role prompt")}
-                  </span>
-                  {defaultRolePrompt ? (
-                    <SettingsButton
-                      className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-                      disabled={operationKey !== null}
-                      onClick={restoreDefaultRolePrompt}
-                      type="button"
-                    >
-                      {t("Restore default Agent role prompt")}
-                    </SettingsButton>
-                  ) : null}
-                </span>
-                <SettingsTextArea
-                  aria-label={t("Agent role prompt")}
-                  className="min-h-40 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-                  onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
-                  value={draft.systemPrompt}
-                />
-              </div>
-              <details className="group/tools relative md:col-span-2">
-                <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition marker:content-none focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]">
-                  <span className="font-medium">{t("Allowed tools")}</span>
-                  <span className="text-xs text-[var(--muted)]">
-                    {t("{count} selected", { count: draft.allowedTools.length })}
-                  </span>
-                </summary>
-                <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 shadow-[var(--overlay-shadow)]">
-                  {selectableTools.map((tool) => (
-                    <AgentCheckbox
-                      checked={draft.allowedTools.includes(tool)}
-                      key={tool}
-                      label={tool}
-                      onChange={(checked) => toggleAllowedTool(tool, checked)}
-                    />
-                  ))}
-                  {!selectableTools.length ? (
-                    <p className="px-2 py-3 text-sm text-[var(--muted)]">
-                      {t("No tools available")}
-                    </p>
-                  ) : null}
+            <div className="panel-scroll min-h-0 flex-1 overflow-y-auto px-4 py-4">
+              {error ? (
+                <div className="mb-4 rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
+                  {error}
                 </div>
-              </details>
+              ) : null}
+
+              <div className="grid gap-4 lg:grid-cols-2 lg:gap-6">
+                <div className="grid min-w-0 content-start gap-3">
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <AgentTextField
+                      autoFocus
+                      label={t("Name")}
+                      onChange={(value) => updateDraft({ name: value })}
+                      value={draft.name}
+                    />
+                    <AgentTextField
+                      inputMode="numeric"
+                      label={t("Max instances")}
+                      onChange={(value) => updateDraft({ maxInstances: value })}
+                      type="number"
+                      value={draft.maxInstances}
+                    />
+                  </div>
+                  <label className="block">
+                    <span className="mb-1.5 block text-xs font-semibold text-[var(--muted)]">
+                      {t("Description")}
+                    </span>
+                    <SettingsInput
+                      className="h-10 w-full rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+                      onChange={(event) => updateDraft({ description: event.target.value })}
+                      value={draft.description}
+                    />
+                  </label>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <AgentSelect label={t("Model")} value={draft.modelId} onChange={selectModel}>
+                      <option value="">{t("Select model")}</option>
+                      {enabledModels.map((model) => (
+                        <option key={model.id} value={model.id}>
+                          {model.displayName}
+                        </option>
+                      ))}
+                    </AgentSelect>
+                    <AgentSelect
+                      label={t("Thinking")}
+                      onChange={(thinkingLevel) => updateDraft({ thinkingLevel })}
+                      value={draft.thinkingLevel}
+                    >
+                      <option value="">{t("Model default")}</option>
+                      {thinkingOptions.map((level) => (
+                        <option key={level.value} value={level.value}>
+                          {t(level.label)}
+                        </option>
+                      ))}
+                    </AgentSelect>
+                  </div>
+                  <AgentTextField
+                    inputMode="numeric"
+                    label={t("Max output tokens")}
+                    onChange={(value) => updateDraft({ maxOutputTokens: value })}
+                    placeholder={
+                      selectedModel?.maxOutputTokens ? String(selectedModel.maxOutputTokens) : ""
+                    }
+                    type="number"
+                    value={draft.maxOutputTokens}
+                  />
+                  <div className="block">
+                    <span className="mb-1.5 flex items-center justify-between gap-3">
+                      <span className="text-xs font-semibold text-[var(--muted)]">
+                        {t("Agent role prompt")}
+                      </span>
+                      {defaultRolePrompt ? (
+                        <SettingsButton
+                          className="inline-flex h-8 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] hover:text-[var(--accent-soft-foreground)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
+                          disabled={operationKey !== null}
+                          onClick={restoreDefaultRolePrompt}
+                          type="button"
+                        >
+                          {t("Restore default Agent role prompt")}
+                        </SettingsButton>
+                      ) : null}
+                    </span>
+                    <SettingsTextArea
+                      aria-label={t("Agent role prompt")}
+                      className="min-h-40 w-full resize-y rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 font-mono text-sm leading-6 text-[var(--foreground)] outline-none transition placeholder:text-[var(--muted)] focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)] lg:min-h-56"
+                      onChange={(event) => updateDraft({ systemPrompt: event.target.value })}
+                      value={draft.systemPrompt}
+                    />
+                  </div>
+                </div>
+
+                <div className="grid min-w-0 content-start gap-4">
+                  <details className="group/tools relative">
+                    <summary className="flex h-10 cursor-pointer list-none items-center justify-between rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-sm text-[var(--foreground)] outline-none transition marker:content-none focus-visible:border-[var(--accent)] focus-visible:ring-2 focus-visible:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]">
+                      <span className="font-medium">{t("Allowed tools")}</span>
+                      <span className="text-xs text-[var(--muted)]">
+                        {t("{count} selected", { count: draft.allowedTools.length })}
+                      </span>
+                    </summary>
+                    <div className="absolute z-10 mt-1 max-h-64 w-full overflow-y-auto rounded-xl border border-[var(--border)] bg-[var(--surface)] p-2 shadow-[var(--overlay-shadow)]">
+                      {selectableTools.map((tool) => (
+                        <AgentCheckbox
+                          checked={draft.allowedTools.includes(tool)}
+                          key={tool}
+                          label={tool}
+                          onChange={(checked) => toggleAllowedTool(tool, checked)}
+                        />
+                      ))}
+                      {!selectableTools.length ? (
+                        <p className="px-2 py-3 text-sm text-[var(--muted)]">
+                          {t("No tools available")}
+                        </p>
+                      ) : null}
+                    </div>
+                  </details>
+
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
+                      {t("Workspace isolation mode")}
+                    </legend>
+                    <div className="grid gap-2">
+                      <AgentCheckbox
+                        checked={draft.allowedExecutionWorkspaceModes.includes("shared")}
+                        description={t(
+                          "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.",
+                        )}
+                        label={t("Shared workspace")}
+                        onChange={(checked) => toggleAllowedExecutionWorkspaceMode("shared", checked)}
+                      />
+                      <AgentCheckbox
+                        checked={draft.allowedExecutionWorkspaceModes.includes("isolated_worktree")}
+                        description={t(
+                          "Creates a Foco-managed Git worktree for the instance. File changes stay isolated until you explicitly merge or delete them.",
+                        )}
+                        label={t("Isolated workspace")}
+                        onChange={(checked) =>
+                          toggleAllowedExecutionWorkspaceMode("isolated_worktree", checked)
+                        }
+                      />
+                    </div>
+                  </fieldset>
+
+                  <fieldset className="rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
+                    <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
+                      {t("Permissions")}
+                    </legend>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <AgentCheckbox
+                        checked={draft.canDelegate}
+                        label={t("Can delegate tasks")}
+                        onChange={(checked) => updateDraft({ canDelegate: checked })}
+                      />
+                      <AgentCheckbox
+                        checked={draft.canCreateInstances}
+                        label={t("Can create instances")}
+                        onChange={(checked) => updateDraft({ canCreateInstances: checked })}
+                      />
+                    </div>
+                    <div className="mt-3 grid gap-2 sm:grid-cols-2">
+                      {definitions
+                        .filter((definition) => definition.id !== editingDefinition?.id)
+                        .map((definition) => (
+                          <AgentCheckbox
+                            checked={draft.allowedAgentDefinitionIds.includes(definition.id)}
+                            key={definition.id}
+                            label={definition.name}
+                            onChange={(checked) => toggleAllowedDefinition(definition.id, checked)}
+                          />
+                        ))}
+                    </div>
+                  </fieldset>
+                </div>
+              </div>
             </div>
 
-            <fieldset className="mt-4 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
-              <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
-                {t("Workspace isolation mode")}
-              </legend>
-              <div className="grid gap-2">
-                <AgentCheckbox
-                  checked={draft.allowedExecutionWorkspaceModes.includes("shared")}
-                  description={t(
-                    "Uses the current chat workspace directly. Simpler, but file changes land in the shared workspace.",
-                  )}
-                  label={t("Shared workspace")}
-                  onChange={(checked) => toggleAllowedExecutionWorkspaceMode("shared", checked)}
-                />
-                <AgentCheckbox
-                  checked={draft.allowedExecutionWorkspaceModes.includes("isolated_worktree")}
-                  description={t(
-                    "Creates a Foco-managed Git worktree for the instance. File changes stay isolated until you explicitly merge or delete them.",
-                  )}
-                  label={t("Isolated workspace")}
-                  onChange={(checked) =>
-                    toggleAllowedExecutionWorkspaceMode("isolated_worktree", checked)
-                  }
-                />
-              </div>
-            </fieldset>
-
-            <fieldset className="mt-4 rounded-xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface-secondary)_70%,transparent)] px-3 py-3">
-              <legend className="px-1 text-xs font-semibold text-[var(--muted)]">
-                {t("Permissions")}
-              </legend>
-              <div className="grid gap-3 md:grid-cols-2">
-                <AgentCheckbox
-                  checked={draft.canDelegate}
-                  label={t("Can delegate tasks")}
-                  onChange={(checked) => updateDraft({ canDelegate: checked })}
-                />
-                <AgentCheckbox
-                  checked={draft.canCreateInstances}
-                  label={t("Can create instances")}
-                  onChange={(checked) => updateDraft({ canCreateInstances: checked })}
-                />
-              </div>
-              <div className="mt-3 grid gap-2 md:grid-cols-2">
-                {definitions
-                  .filter((definition) => definition.id !== editingDefinition?.id)
-                  .map((definition) => (
-                    <AgentCheckbox
-                      checked={draft.allowedAgentDefinitionIds.includes(definition.id)}
-                      key={definition.id}
-                      label={definition.name}
-                      onChange={(checked) => toggleAllowedDefinition(definition.id, checked)}
-                    />
-                  ))}
-              </div>
-            </fieldset>
-
-            <div className="mt-4 flex justify-end gap-2">
+            <div className="flex shrink-0 justify-end gap-2 border-t border-[var(--border)] px-4 py-3">
               <SettingsButton
                 className="inline-flex h-10 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] px-4 text-sm font-semibold text-[var(--muted)] transition hover:bg-[var(--surface-secondary)] active:translate-y-px disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 disabled={operationKey !== null}
