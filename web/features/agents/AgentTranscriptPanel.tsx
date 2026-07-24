@@ -491,11 +491,11 @@ export function AgentTranscriptPanel({
 
   return (
     <div className="chat-panel flex min-h-0 flex-1 flex-col overflow-hidden">
-      <header className="flex shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-        <div className="flex min-w-0 items-center gap-3">
+      <header className="context-panel-page-header flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <Button
             aria-label={t("Main chat")}
-            className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
+            className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
             onPress={onOpenMainChat}
             variant="ghost"
           >
@@ -511,17 +511,19 @@ export function AgentTranscriptPanel({
                 {t("Read-only")}
               </span>
             </div>
-            <div className="mt-1 flex min-w-0 flex-wrap gap-1.5 text-[11px] font-semibold uppercase tracking-normal text-[var(--muted)]">
+            <p className="truncate text-xs text-[var(--muted)]">
               <span>{instance?.role ?? t("Agent")}</span>
-              {instance ? <span>{instance.status}</span> : null}
+              {instance ? <span>{` · ${instance.status}`}</span> : null}
               {instance ? (
                 <span>
-                  {instance.executionWorkspaceMode === "isolated_worktree"
-                    ? t("isolated")
-                    : t("shared")}
+                  {` · ${
+                    instance.executionWorkspaceMode === "isolated_worktree"
+                      ? t("isolated")
+                      : t("shared")
+                  }`}
                 </span>
               ) : null}
-            </div>
+            </p>
           </div>
         </div>
         <Button

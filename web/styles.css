@@ -1819,13 +1819,13 @@ body,
   gap: 0.375rem;
   border-radius: 0.625rem;
   padding-right: 0.375rem;
-  color: rgb(68 64 60);
+  color: var(--foreground);
   font-size: 0.75rem;
 }
 
 .workspace-file-tree-row:hover {
-  background: rgba(255, 255, 255, 0.78);
-  color: rgb(12 10 9);
+  background: var(--surface-hover);
+  color: var(--foreground);
 }
 
 .workspace-file-tree-toggle.button--icon-only.button--sm {
@@ -1846,7 +1846,7 @@ body,
   justify-content: center;
   border-radius: 0.25rem;
   padding: 0;
-  color: rgb(120 113 108);
+  color: var(--muted);
 }
 
 .workspace-file-tree-toggle:disabled {
@@ -1860,11 +1860,11 @@ body,
 }
 
 .workspace-file-tree-folder-icon {
-  color: rgb(180 83 9);
+  color: var(--warning);
 }
 
 .workspace-file-tree-file-icon {
-  color: rgb(71 85 105);
+  color: color-mix(in oklab, var(--muted) 45%, var(--foreground));
 }
 
 .workspace-file-tree-name {
@@ -1878,7 +1878,7 @@ body,
 .workspace-file-tree-size {
   margin-left: auto;
   flex-shrink: 0;
-  color: rgb(168 162 158);
+  color: var(--muted);
   font-size: 0.68rem;
   font-variant-numeric: tabular-nums;
 }
@@ -3872,9 +3872,21 @@ body,
   --button-fg: var(--muted);
 }
 
-/* Primary submit actions beneath settings forms remain clearly bounded. */
+/* Primary submit actions beneath settings forms remain clearly bounded.
+   Foreground-filled buttons must use background-colored labels so dark mode
+   does not collapse into white-on-white (foreground is light in dark theme). */
 .settings-layout .button[class*="bg-[var(--foreground)]"],
-.settings-layout .button[class*="bg-[var(--accent)]"] {
+.settings-layout button[class*="bg-[var(--foreground)]"] {
+  --button-bg: var(--foreground);
+  --button-bg-hover: color-mix(in oklab, var(--foreground) 88%, var(--background));
+  --button-bg-pressed: color-mix(in oklab, var(--foreground) 80%, var(--background));
+  --button-fg: var(--background);
+  border: 1px solid transparent;
+  color: var(--background);
+}
+
+.settings-layout .button[class*="bg-[var(--accent)]"],
+.settings-layout button[class*="bg-[var(--accent)]"] {
   border: 1px solid currentcolor;
 }
 

@@ -5878,7 +5878,7 @@ export function SettingsPanel({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <SettingsButton
                     aria-label={t("Save general settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={
                       isSavingGeneral ||
                       !generalForm.listenHost.trim() ||
@@ -6149,7 +6149,7 @@ export function SettingsPanel({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <SettingsButton
                     aria-label={t("Save web search settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingWebSearch || !webSearchForm.activeProvider}
                     title={t("Save web search settings")}
                     type="submit"
@@ -6671,7 +6671,7 @@ export function SettingsPanel({
                 <div className="mt-4 flex flex-wrap gap-2">
                   <SettingsButton
                     aria-label={t("Save prompt settings")}
-                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                    className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                     disabled={isSavingPromptSettings}
                     title={t("Save prompt settings")}
                     type="submit"
@@ -7130,7 +7130,7 @@ export function SettingsPanel({
                 </label>
                 <SettingsButton
                   aria-label={t("Save plan settings")}
-                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingPlanSettings}
                   title={t("Save plan settings")}
                   type="submit"
@@ -8175,7 +8175,7 @@ export function SettingsPanel({
                 </div>
                 <SettingsButton
                   aria-label={t("Save memory settings")}
-                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                  className="mt-4 inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                   disabled={isSavingMemorySettings}
                   title={t("Save memory settings")}
                   type="submit"
@@ -9464,7 +9464,7 @@ export function SettingsPanel({
                       </label>
                       <SettingsButton
                         aria-label={t("Save workspace")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingWorkspace ||
                           isLoadingWorkspaceSpecSettings ||
@@ -10068,7 +10068,7 @@ export function SettingsPanel({
                       </label>
                       <SettingsButton
                         aria-label={t("Save hook")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isSavingHooks || !hookForm.event || !hookForm.type}
                         title={t("Save hook")}
                         type="submit"
@@ -10495,7 +10495,7 @@ export function SettingsPanel({
                     </label>
                     <SettingsButton
                       aria-label={t("Run hook test")}
-                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                      className="inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 text-sm font-semibold text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                       disabled={isTestingHooks || !selectedHookWorkspace}
                       title={t("Run hook test")}
                       type="submit"
@@ -11145,7 +11145,7 @@ export function SettingsPanel({
                       </div>
                       <SettingsButton
                         aria-label={t("Save provider")}
-                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                        className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingProvider ||
                           !providerForm.name.trim() ||
@@ -11612,7 +11612,7 @@ export function SettingsPanel({
                       )}
                       <SettingsButton
                         aria-label={t("Save MCP server")}
-                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                        className="inline-flex h-11 w-full items-center justify-center rounded-lg bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={
                           isSavingMcpServer ||
                           !mcpForm.name.trim() ||
@@ -12613,7 +12613,7 @@ export function SettingsPanel({
 
                         <SettingsButton
                           aria-label={t("Save model")}
-                          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                          className="inline-flex h-11 w-full items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={
                             isSaving ||
                             enabledNeedsLimits ||
@@ -12661,7 +12661,7 @@ export function SettingsPanel({
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
                       <SettingsButton
-                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                        className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-[var(--background)] shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                         disabled={isCheckingUpdate}
                         onClick={() => void checkForUpdate()}
                         type="button"
@@ -12810,7 +12810,7 @@ export function SettingsPanel({
                           {t("Not now")}
                         </SettingsButton>
                         <SettingsButton
-                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg bg-[var(--foreground)] px-3 py-2 text-sm font-semibold text-[var(--background)] shadow-sm hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                           disabled={isInstallingUpdate}
                           onClick={() => void installUpdate()}
                           type="button"
@@ -13207,7 +13207,7 @@ function RemoteServersSettingsSection({
               </SettingsButton>
               <SettingsButton
                 aria-label={t("Save remote server")}
-                className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--foreground)] text-white hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
+                className="inline-flex size-10 items-center justify-center rounded-lg bg-[var(--foreground)] text-[var(--background)] hover:bg-[var(--foreground)] disabled:cursor-not-allowed disabled:bg-[var(--default)]"
                 disabled={
                   isSaving ||
                   !form.name.trim() ||
