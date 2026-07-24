@@ -398,7 +398,7 @@ export function ScheduledTasksPage({
   }
 
   return (
-    <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-5 sm:py-6">
+    <div className="panel-scroll h-full min-h-0 flex-1 overflow-y-auto px-1 py-4 md:px-5 md:py-6">
       <div className="flex w-full min-w-0 flex-col gap-5">
         <section className="rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_85%,transparent)] px-4 py-4 shadow-sm">
           <div className="flex flex-wrap items-center justify-between gap-3">

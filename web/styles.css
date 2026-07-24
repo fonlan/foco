@@ -4130,7 +4130,8 @@ body,
 
   .settings-layout > .min-w-0 {
     flex: 1 1 auto;
-    padding: 0.75rem;
+    /* Match composer-shell: keep only a thin phone horizontal inset. */
+    padding: 0.75rem 0.25rem;
   }
 }
 
@@ -5119,11 +5120,18 @@ summary:focus-visible {
     padding-right: max(0.25rem, var(--foco-safe-right));
   }
 
+  /* Match .composer-shell: thin phone horizontal inset on global page bodies.
+     Apply once on the page content shell — not also on .global-main-panel —
+     so settings / skill store / stats / scheduled tasks do not stack padding. */
   .settings-layout > .min-w-0,
-  .global-main-panel,
   .skill-store-page {
-    padding-left: max(0.75rem, var(--foco-safe-left));
-    padding-right: max(0.75rem, var(--foco-safe-right));
+    padding-left: max(0.25rem, var(--foco-safe-left));
+    padding-right: max(0.25rem, var(--foco-safe-right));
+  }
+
+  .global-main-panel {
+    padding-left: 0;
+    padding-right: 0;
   }
 
   .settings-table-scroll,

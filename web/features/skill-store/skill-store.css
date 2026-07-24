@@ -580,6 +580,14 @@ button.skill-store-row-active {
   }
 }
 
+@media (max-width: 767px) {
+  .skill-store-page {
+    /* Match composer-shell / other global pages: maximize phone content width. */
+    padding-left: max(0.25rem, var(--foco-safe-left));
+    padding-right: max(0.25rem, var(--foco-safe-right));
+  }
+}
+
 @media (max-width: 560px) {
   .skill-store-header {
     align-items: flex-start;
