@@ -435,6 +435,7 @@ export function ApiStatsPanel({
           aria-label={t("View request details")}
           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onPress={() => void openRequestDetail(request)}
+          variant="ghost"
         >
           <Eye aria-hidden="true" className="size-4" />
         </Button>
@@ -540,6 +541,7 @@ export function ApiStatsPanel({
                   resumeAutoRefresh();
                 }
               }}
+              variant="ghost"
             >
               {autoRefreshEnabled ? (
                 <Pause aria-hidden="true" className="size-4" />
@@ -712,6 +714,7 @@ export function ApiStatsPanel({
                 <Button
                   aria-label={t("Choose visible columns")}
                   className="inline-flex h-9 items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                  variant="ghost"
                 >
                   <SlidersHorizontal aria-hidden="true" className="size-4" />
                   {t("Columns")}
@@ -809,6 +812,7 @@ export function ApiStatsPanel({
                   className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                   isDisabled={isLoading || currentPage <= 1}
                   onPress={() => goToAuditPage(currentPage - 1)}
+                  variant="ghost"
                 >
                   <ChevronLeft aria-hidden="true" className="size-4" />
                 </Button>
@@ -835,6 +839,7 @@ export function ApiStatsPanel({
                       isDisabled={isLoading}
                       key={item}
                       onPress={() => goToAuditPage(item)}
+                      variant="ghost"
                     >
                       {formatNumber(item, language)}
                     </Button>
@@ -847,7 +852,8 @@ export function ApiStatsPanel({
                     isLoading || totalPages === 0 || currentPage >= totalPages
                   }
                   onPress={() => goToAuditPage(currentPage + 1)}
-                >
+                      variant="ghost"
+                    >
                   <ChevronRight aria-hidden="true" className="size-4" />
                 </Button>
               </nav>
@@ -966,6 +972,7 @@ function AiRequestDetailDialog({
             }
             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
             onPress={onToggleAutoRefresh}
+            variant="ghost"
           >
             {autoRefreshEnabled ? (
               <Pause aria-hidden="true" className="size-4" />
@@ -977,6 +984,7 @@ function AiRequestDetailDialog({
             aria-label={t("Close request details")}
             className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
             onPress={onClose}
+            variant="ghost"
           >
             <X aria-hidden="true" className="size-4" />
           </Button>

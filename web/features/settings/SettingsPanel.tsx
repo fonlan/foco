@@ -5606,22 +5606,17 @@ export function SettingsPanel({
                           )}
                         </p>
                       </div>
-                      <label
+                      <SettingsInput
                         aria-label={t("Runtime tool-state compression")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center self-end rounded-lg border border-[var(--border)] bg-[var(--surface)] sm:self-auto"
-                      >
-                        <SettingsInput
-                          checked={generalForm.runtimeToolStateCompressionEnabled}
-                          className="size-4 accent-[var(--accent)]"
-                          onChange={(event) =>
-                            setGeneralForm((current) => ({
-                              ...current,
-                              runtimeToolStateCompressionEnabled: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                      </label>
+                        checked={generalForm.runtimeToolStateCompressionEnabled}
+                        onChange={(event) =>
+                          setGeneralForm((current) => ({
+                            ...current,
+                            runtimeToolStateCompressionEnabled: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
                     </div>
                   </fieldset>
                   <label className="block">
@@ -5670,22 +5665,17 @@ export function SettingsPanel({
                           }
                           ok={generalForm.apiSaveRequestResponseDetails}
                         />
-                        <label
+                        <SettingsInput
                           aria-label={t("Save request and response bodies")}
-                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                        >
-                          <SettingsInput
-                            checked={generalForm.apiSaveRequestResponseDetails}
-                            className="size-4 accent-[var(--accent)]"
-                            onChange={(event) =>
-                              setGeneralForm((current) => ({
-                                ...current,
-                                apiSaveRequestResponseDetails: event.target.checked,
-                              }))
-                            }
-                            type="checkbox"
-                          />
-                        </label>
+                          checked={generalForm.apiSaveRequestResponseDetails}
+                          onChange={(event) =>
+                            setGeneralForm((current) => ({
+                              ...current,
+                              apiSaveRequestResponseDetails: event.target.checked,
+                            }))
+                          }
+                          type="checkbox"
+                        />
                       </div>
                     </div>
                   </fieldset>
@@ -5710,22 +5700,17 @@ export function SettingsPanel({
                           }
                           ok={generalForm.autoStartEnabled}
                         />
-                        <label
+                        <SettingsInput
                           aria-label={t("Start Foco at startup")}
-                          className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                        >
-                          <SettingsInput
-                            checked={generalForm.autoStartEnabled}
-                            className="size-4 accent-[var(--accent)]"
-                            onChange={(event) =>
-                              setGeneralForm((current) => ({
-                                ...current,
-                                autoStartEnabled: event.target.checked,
-                              }))
-                            }
-                            type="checkbox"
-                          />
-                        </label>
+                          checked={generalForm.autoStartEnabled}
+                          onChange={(event) =>
+                            setGeneralForm((current) => ({
+                              ...current,
+                              autoStartEnabled: event.target.checked,
+                            }))
+                          }
+                          type="checkbox"
+                        />
                       </div>
                     </div>
                   </fieldset>
@@ -5983,22 +5968,17 @@ export function SettingsPanel({
                           )}
                         </p>
                       </div>
-                      <label
+                      <SettingsInput
                         aria-label={t("Allow web search for chat runs")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                      >
-                        <SettingsInput
-                          checked={webSearchForm.enabled}
-                          className="size-4 accent-[var(--accent)]"
-                          onChange={(event) =>
-                            setWebSearchForm((current) => ({
-                              ...current,
-                              enabled: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                      </label>
+                        checked={webSearchForm.enabled}
+                        onChange={(event) =>
+                          setWebSearchForm((current) => ({
+                            ...current,
+                            enabled: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
                     </div>
                   </fieldset>
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3 text-xs leading-5 text-[var(--muted)]">
@@ -6047,22 +6027,17 @@ export function SettingsPanel({
                           {t("Applies only to web_search requests sent to the configured search API.")}
                         </p>
                       </div>
-                      <label
+                      <SettingsInput
                         aria-label={t("Enable web search proxy")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                      >
-                        <SettingsInput
-                          checked={webSearchForm.apiProxyEnabled}
-                          className="size-4 accent-[var(--accent)]"
-                          onChange={(event) =>
-                            setWebSearchForm((current) => ({
-                              ...current,
-                              apiProxyEnabled: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                      </label>
+                        checked={webSearchForm.apiProxyEnabled}
+                        onChange={(event) =>
+                          setWebSearchForm((current) => ({
+                            ...current,
+                            apiProxyEnabled: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
                     </div>
                     <div className="mt-3 grid gap-3 lg:grid-cols-[180px_1fr]">
                       <label className="block">
@@ -6155,7 +6130,6 @@ export function SettingsPanel({
                             <label className="mt-3 flex items-center gap-2 text-xs font-semibold text-[var(--muted)]">
                               <SettingsInput
                                 checked={Boolean(webSearchForm[clearField])}
-                                className="size-4 accent-[var(--accent)]"
                                 onChange={(event) =>
                                   setWebSearchForm((current) => ({
                                     ...current,
@@ -6750,22 +6724,17 @@ export function SettingsPanel({
                           {t("Updates enabled workspace specs after successful chat turns.")}
                         </p>
                       </div>
-                      <label
+                      <SettingsInput
                         aria-label={t("Enable Auto Spec")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                      >
-                        <SettingsInput
-                          checked={specSettingsForm.autoEnabled}
-                          className="size-4 accent-[var(--accent)]"
-                          onChange={(event) =>
-                            queueSpecSettingsSave({
-                              ...specSettingsFormRef.current,
-                              autoEnabled: event.target.checked,
-                            })
-                          }
-                          type="checkbox"
-                        />
-                      </label>
+                        checked={specSettingsForm.autoEnabled}
+                        onChange={(event) =>
+                          queueSpecSettingsSave({
+                            ...specSettingsFormRef.current,
+                            autoEnabled: event.target.checked,
+                          })
+                        }
+                        type="checkbox"
+                      />
                     </div>
                     <div className="mt-3">
                       <label className="block">
@@ -6868,7 +6837,6 @@ export function SettingsPanel({
                     <label className="inline-flex items-center gap-2 text-sm font-medium text-[var(--muted)]">
                       <SettingsInput
                         checked={showRetryableSpecJobsOnly}
-                        className="size-4 accent-[var(--accent)]"
                         onChange={(event) =>
                           updateShowRetryableSpecJobsOnly(event.target.checked)
                         }
@@ -7576,7 +7544,6 @@ export function SettingsPanel({
                             </span>
                             <SettingsInput
                               checked={manualMemoryForm.pinned}
-                              className="size-4 accent-[var(--accent)]"
                               onChange={(event) =>
                                 setManualMemoryForm((current) => ({
                                   ...current,
@@ -7827,22 +7794,17 @@ export function SettingsPanel({
                           )}
                         </p>
                       </div>
-                      <label
+                      <SettingsInput
                         aria-label={t("Enable memory")}
-                        className="inline-flex size-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                      >
-                        <SettingsInput
-                          checked={memorySettingsForm.enabled}
-                          className="size-4 accent-[var(--accent)]"
-                          onChange={(event) =>
-                            setMemorySettingsForm((current) => ({
-                              ...current,
-                              enabled: event.target.checked,
-                            }))
-                          }
-                          type="checkbox"
-                        />
-                      </label>
+                        checked={memorySettingsForm.enabled}
+                        onChange={(event) =>
+                          setMemorySettingsForm((current) => ({
+                            ...current,
+                            enabled: event.target.checked,
+                          }))
+                        }
+                        type="checkbox"
+                      />
                     </div>
                   </fieldset>
 
@@ -8052,21 +8014,16 @@ export function SettingsPanel({
                           <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Enable Dream")}
                           </span>
-                          <label
+                          <SettingsInput
                             aria-label={t("Enable Dream")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                          >
-                            <SettingsInput
-                              checked={memorySettingsForm.dream.enabled}
-                              className="size-4 accent-[var(--accent)]"
-                              onChange={(event) =>
-                                updateMemoryDreamForm({
-                                  enabled: event.target.checked,
-                                })
-                              }
-                              type="checkbox"
-                            />
-                          </label>
+                            checked={memorySettingsForm.dream.enabled}
+                            onChange={(event) =>
+                              updateMemoryDreamForm({
+                                enabled: event.target.checked,
+                              })
+                            }
+                            type="checkbox"
+                          />
                         </div>
                       </div>
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
@@ -8074,21 +8031,16 @@ export function SettingsPanel({
                           <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Enable Auto Dream")}
                           </span>
-                          <label
+                          <SettingsInput
                             aria-label={t("Enable Auto Dream")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                          >
-                            <SettingsInput
-                              checked={memorySettingsForm.dream.autoEnabled}
-                              className="size-4 accent-[var(--accent)]"
-                              onChange={(event) =>
-                                updateMemoryDreamForm({
-                                  autoEnabled: event.target.checked,
-                                })
-                              }
-                              type="checkbox"
-                            />
-                          </label>
+                            checked={memorySettingsForm.dream.autoEnabled}
+                            onChange={(event) =>
+                              updateMemoryDreamForm({
+                                autoEnabled: event.target.checked,
+                              })
+                            }
+                            type="checkbox"
+                          />
                         </div>
                       </div>
                       <div className="rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] px-3 py-3">
@@ -8096,21 +8048,16 @@ export function SettingsPanel({
                           <span className="text-sm font-semibold text-[var(--foreground)]">
                             {t("Create transcript chat")}
                           </span>
-                          <label
+                          <SettingsInput
                             aria-label={t("Create transcript chat")}
-                            className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)]"
-                          >
-                            <SettingsInput
-                              checked={memorySettingsForm.dream.createTranscriptChat}
-                              className="size-4 accent-[var(--accent)]"
-                              onChange={(event) =>
-                                updateMemoryDreamForm({
-                                  createTranscriptChat: event.target.checked,
-                                })
-                              }
-                              type="checkbox"
-                            />
-                          </label>
+                            checked={memorySettingsForm.dream.createTranscriptChat}
+                            onChange={(event) =>
+                              updateMemoryDreamForm({
+                                createTranscriptChat: event.target.checked,
+                              })
+                            }
+                            type="checkbox"
+                          />
                         </div>
                       </div>
                     </div>
@@ -8968,27 +8915,18 @@ export function SettingsPanel({
                           </div>
                         </SettingsButton>
                         <div className="flex items-center justify-end gap-2 self-center">
-                          <label
-                            className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
-                            title={memoryEnabledToggleLabel}
-                          >
-                            <SettingsInput
+                          <SettingsInput
                               aria-label={memoryEnabledToggleLabel}
                               checked={memory.enabled}
-                              className="peer sr-only"
                               disabled={
                                 isMemoryEnabledPending || isLoadingMemories || isSavingMemory
                               }
                               onChange={(event) =>
                                 void updateMemoryEnabled(memory, event.target.checked)
                               }
-                              role="switch"
                               title={memoryEnabledToggleLabel}
                               type="checkbox"
                             />
-                            <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
-                          </label>
                           {memory.scope !== "global" ? (
                             <SettingsButton
                               aria-label={t("Promote one level")}
@@ -9489,7 +9427,6 @@ export function SettingsPanel({
                         </span>
                         <SettingsInput
                           checked={workspaceForm.pinned}
-                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setWorkspaceForm((current) => ({
                               ...current,
@@ -9509,7 +9446,6 @@ export function SettingsPanel({
                         </span>
                         <SettingsInput
                           checked={workspaceForm.specEnabled}
-                          className="size-4 accent-[var(--accent)]"
                           disabled={
                             isLoadingWorkspaceSpecSettings ||
                             !isWorkspaceSpecSettingsLoaded
@@ -9909,7 +9845,6 @@ export function SettingsPanel({
                         </span>
                         <SettingsInput
                           checked={hookForm.enabled}
-                          className="size-4 accent-[var(--accent)]"
                           onChange={(event) =>
                             setHookForm((current) => ({
                               ...current,
@@ -10090,7 +10025,6 @@ export function SettingsPanel({
                           </span>
                           <SettingsInput
                             checked={hookForm.asyncHook}
-                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -10106,7 +10040,6 @@ export function SettingsPanel({
                           </span>
                           <SettingsInput
                             checked={hookForm.asyncRewake}
-                            className="size-4 accent-[var(--accent)]"
                             onChange={(event) =>
                               setHookForm((current) => ({
                                 ...current,
@@ -10226,7 +10159,6 @@ export function SettingsPanel({
                   </span>
                   <SettingsInput
                     checked={Boolean(activeHookConfig?.disableAllHooks)}
-                    className="size-4 accent-[var(--accent)]"
                     disabled={isSavingHooks || !activeHookConfig}
                     onChange={(event) =>
                       updateHookConfig({
@@ -10243,7 +10175,6 @@ export function SettingsPanel({
                   </span>
                   <SettingsInput
                     checked={generalForm.hookAuditEnabled}
-                    className="size-4 accent-[var(--accent)]"
                     disabled={isSavingGeneral || !settings}
                     onChange={(event) => void saveHookAuditEnabled(event.target.checked)}
                     type="checkbox"
@@ -10309,11 +10240,9 @@ export function SettingsPanel({
                             >
                               <ArrowDown aria-hidden="true" className="size-4" />
                             </SettingsButton>
-                            <label className="relative inline-flex cursor-pointer items-center">
-                              <SettingsInput
+                            <SettingsInput
                                 aria-label={t("Enable hook group")}
                                 checked={entry.group.enabled !== false}
-                                className="peer sr-only"
                                 disabled={isSavingHooks}
                                 onChange={(event) =>
                                   toggleHookGroup(
@@ -10324,9 +10253,6 @@ export function SettingsPanel({
                                 }
                                 type="checkbox"
                               />
-                              <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
-                              <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
-                            </label>
                           </div>
                         </div>
                         <div className="mt-3 space-y-2">
@@ -10426,11 +10352,9 @@ export function SettingsPanel({
                                 >
                                   <Trash2 aria-hidden="true" className="size-4" />
                                 </SettingsButton>
-                                <label className="relative inline-flex cursor-pointer items-center">
-                                  <SettingsInput
+                                <SettingsInput
                                     aria-label={t("Enable hook")}
                                     checked={handler.enabled !== false}
-                                    className="peer sr-only"
                                     disabled={isSavingHooks}
                                     onChange={(event) =>
                                       toggleHookHandler(
@@ -10442,9 +10366,6 @@ export function SettingsPanel({
                                     }
                                     type="checkbox"
                                   />
-                                  <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
-                                  <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
-                                </label>
                               </div>
                             </div>
                           ))}
@@ -11310,7 +11231,7 @@ export function SettingsPanel({
 
                       return (
                         <div className="px-4 py-3" key={provider.id}>
-                          <div className="grid grid-cols-1 items-center gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
+                          <div className="grid grid-cols-1 items-start gap-3 sm:grid-cols-[minmax(0,1fr)_auto]">
                             <SettingsButton
                               aria-expanded={isExpanded}
                               aria-label={
@@ -11325,9 +11246,21 @@ export function SettingsPanel({
                               className="settings-list-select-button flex min-w-0 items-start gap-2 rounded-lg px-0 py-1 text-left focus:outline-none focus:ring-2 focus:ring-[var(--accent)]"
                               onClick={() => toggleProviderModels(provider.id)}
                               title={
-                                isExpanded
-                                  ? t("Hide provider models")
-                                  : t("Load provider models")
+                                [
+                                  isExpanded
+                                    ? t("Hide provider models")
+                                    : t("Load provider models"),
+                                  `${provider.id} / ${provider.kindLabel}`,
+                                  provider.hasApiKey ? t("key saved") : t("key missing"),
+                                  provider.autoSyncModels ? t("auto sync") : t("manual sync"),
+                                  provider.modelSyncFilterRegex
+                                    ? t("sync regex {pattern}", {
+                                        pattern: provider.modelSyncFilterRegex,
+                                      })
+                                    : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(" · ")
                               }
                               type="button"
                             >
@@ -11335,80 +11268,41 @@ export function SettingsPanel({
                                 aria-hidden="true"
                                 className={`mt-0.5 size-4 shrink-0 text-[var(--muted)] transition ${isExpanded ? "" : "-rotate-90"}`}
                               />
-                              <div className="min-w-0">
-                                <div className="flex flex-wrap items-center gap-2">
-                                  <span className="truncate text-sm font-medium text-[var(--foreground)]">
+                              <div className="min-w-0 overflow-hidden">
+                                {/* Keep collapsed rows to exactly two lines to avoid
+                                    status pills overlapping the base URL or adjacent rows. */}
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <span className="min-w-0 truncate text-sm font-medium text-[var(--foreground)]">
                                     {provider.name}
                                   </span>
                                   <CapabilityPill
+                                    className="shrink-0"
                                     label={
                                       provider.enabled ? t("enabled") : t("disabled")
                                     }
                                     ok={provider.enabled}
                                   />
-                                  <CapabilityPill
-                                    label={
-                                      provider.hasApiKey
-                                        ? t("key saved")
-                                        : t("key missing")
-                                    }
-                                    ok={provider.hasApiKey}
-                                  />
-                                  <CapabilityPill
-                                    label={
-                                      provider.autoSyncModels
-                                        ? t("auto sync")
-                                        : t("manual sync")
-                                    }
-                                    ok={provider.autoSyncModels}
-                                  />
                                 </div>
-                                <div className="mt-1 truncate text-xs font-medium text-[var(--muted)]">
-                                  {provider.id} / {provider.kindLabel}
+                                <div className="mt-1 truncate text-xs text-[var(--muted)]">
+                                  {provider.baseUrl ||
+                                    `${provider.id} / ${provider.kindLabel}`}
                                 </div>
-                                {provider.modelSyncFilterRegex ? (
-                                  <div className="mt-1 truncate font-mono text-xs text-[var(--muted)]">
-                                    {t("sync regex {pattern}", {
-                                      pattern: provider.modelSyncFilterRegex,
-                                    })}
-                                  </div>
-                                ) : null}
-                                {provider.modelRedirects?.length ? (
-                                  <div className="mt-1 truncate font-mono text-xs text-[var(--muted)]">
-                                    {provider.modelRedirects
-                                      .map((redirect) => `${redirect.from} -> ${redirect.to}`)
-                                      .join(", ")}
-                                  </div>
-                                ) : null}
-                                {provider.baseUrl ? (
-                                  <div className="mt-1 truncate text-xs text-[var(--muted)]">
-                                    {provider.baseUrl}
-                                  </div>
-                                ) : null}
                               </div>
                             </SettingsButton>
-                            <div className="flex shrink-0 items-center justify-end gap-2 self-center">
-                              <label
-                                className="relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center"
+                            <div className="flex shrink-0 items-center justify-end gap-2 self-start">
+                              <SettingsInput
+                                aria-label={providerToggleLabel}
+                                checked={provider.enabled}
+                                disabled={isProviderOperationPending}
+                                onChange={(event) =>
+                                  void toggleConfiguredProviderEnabled(
+                                    provider,
+                                    event.target.checked,
+                                  )
+                                }
                                 title={providerToggleLabel}
-                              >
-                                <SettingsInput
-                                  aria-label={providerToggleLabel}
-                                  checked={provider.enabled}
-                                  className="peer sr-only"
-                                  disabled={isProviderOperationPending}
-                                  onChange={(event) =>
-                                    void toggleConfiguredProviderEnabled(
-                                      provider,
-                                      event.target.checked,
-                                    )
-                                  }
-                                  title={providerToggleLabel}
-                                  type="checkbox"
-                                />
-                                <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                                <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
-                              </label>
+                                type="checkbox"
+                              />
                               <SettingsButton
                                 aria-label={t("Edit provider {name}", {
                                   name: provider.name,
@@ -11469,14 +11363,32 @@ export function SettingsPanel({
                                   />
                                   <span>{t("Provider models")}</span>
                                 </div>
-                                {modelList?.status === "ok" ? (
+                                <div className="flex min-w-0 flex-wrap items-center gap-2">
                                   <CapabilityPill
-                                    label={t("models {count}", {
-                                      count: modelList.models.length,
-                                    })}
-                                    ok={modelList.models.length > 0}
+                                    label={
+                                      provider.hasApiKey
+                                        ? t("key saved")
+                                        : t("key missing")
+                                    }
+                                    ok={provider.hasApiKey}
                                   />
-                                ) : null}
+                                  <CapabilityPill
+                                    label={
+                                      provider.autoSyncModels
+                                        ? t("auto sync")
+                                        : t("manual sync")
+                                    }
+                                    ok={provider.autoSyncModels}
+                                  />
+                                  {modelList?.status === "ok" ? (
+                                    <CapabilityPill
+                                      label={t("models {count}", {
+                                        count: modelList.models.length,
+                                      })}
+                                      ok={modelList.models.length > 0}
+                                    />
+                                  ) : null}
+                                </div>
                               </div>
                               {modelList?.status === "error" ? (
                                 <div className="mt-3 rounded-md border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
@@ -11566,11 +11478,9 @@ export function SettingsPanel({
                         ) : null}
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
-                        <label className="relative inline-flex cursor-pointer items-center">
-                          <SettingsInput
+                        <SettingsInput
                             aria-label={t("Enable MCP server")}
                             checked={mcpForm.enabled}
-                            className="peer sr-only"
                             onChange={(event) =>
                               setMcpForm((current) => ({
                                 ...current,
@@ -11579,9 +11489,6 @@ export function SettingsPanel({
                             }
                             type="checkbox"
                           />
-                          <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
-                          <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
-                        </label>
                         {mcpForm.id ? (
                           <SettingsButton
                             aria-label={t("Delete MCP server")}
@@ -11999,13 +11906,11 @@ export function SettingsPanel({
                                 >
                                   <Trash2 aria-hidden="true" className="size-4" />
                                 </SettingsButton>
-                                <label className="relative inline-flex cursor-pointer items-center">
-                                  <SettingsInput
+                                <SettingsInput
                                     aria-label={t("Enable skill {name}", {
                                       name: skill.name,
                                     })}
                                     checked={enabled}
-                                    className="peer sr-only"
                                     disabled={
                                       isSavingSkills ||
                                       isRefreshingSkills ||
@@ -12026,9 +11931,6 @@ export function SettingsPanel({
                                     }}
                                     type="checkbox"
                                   />
-                                  <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
-                                  <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
-                                </label>
                               </div>
                           </div>
                           <Warnings warnings={skill.warnings} />
@@ -12096,13 +11998,11 @@ export function SettingsPanel({
                         key={location.id}
                       >
                         <span className="min-w-0 break-all">{location.path}</span>
-                        <label className="relative inline-flex shrink-0 cursor-pointer items-center">
-                          <SettingsInput
+                        <SettingsInput
                             aria-label={t("Enable skill location {path}", {
                               path: location.path,
                             })}
                             checked={location.enabled}
-                            className="peer sr-only"
                             disabled={
                               isSavingSkills ||
                               isRefreshingSkills ||
@@ -12117,9 +12017,6 @@ export function SettingsPanel({
                             })}
                             type="checkbox"
                           />
-                          <span className="h-6 w-11 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)]" />
-                          <span className="absolute left-1 size-4 rounded-full bg-[var(--surface)] shadow transition peer-checked:translate-x-5" />
-                        </label>
                       </div>
                     ))
                   ) : (
@@ -12227,9 +12124,25 @@ export function SettingsPanel({
                             />
                           </div>
                         </div>
-                        <div className="flex shrink-0 items-center justify-end gap-2 sm:self-center">
-                          <label
-                            className="relative inline-flex h-6 w-11 cursor-pointer items-center disabled:cursor-not-allowed"
+                        <div className="flex shrink-0 items-center justify-end gap-2 sm:self-start">
+                          <SettingsInput
+                            aria-label={
+                              model.enabled
+                                ? t("Disable model {name}", {
+                                    name: model.displayName,
+                                  })
+                                : t("Enable model {name}", {
+                                    name: model.displayName,
+                                  })
+                            }
+                            checked={model.enabled}
+                            disabled={isSaving || (!model.canEnable && !model.enabled)}
+                            onChange={(event) =>
+                              void toggleConfiguredModelEnabled(
+                                model,
+                                event.target.checked,
+                              )
+                            }
                             title={
                               model.enabled
                                 ? t("Disable model {name}", {
@@ -12239,31 +12152,8 @@ export function SettingsPanel({
                                     name: model.displayName,
                                   })
                             }
-                          >
-                            <SettingsInput
-                              aria-label={
-                                model.enabled
-                                  ? t("Disable model {name}", {
-                                      name: model.displayName,
-                                    })
-                                  : t("Enable model {name}", {
-                                      name: model.displayName,
-                                    })
-                              }
-                              checked={model.enabled}
-                              className="peer sr-only"
-                              disabled={isSaving || (!model.canEnable && !model.enabled)}
-                              onChange={(event) =>
-                                void toggleConfiguredModelEnabled(
-                                  model,
-                                  event.target.checked,
-                                )
-                              }
-                              type="checkbox"
-                            />
-                            <span className="absolute inset-0 rounded-full bg-[var(--default)] transition peer-checked:bg-[var(--accent)] peer-disabled:cursor-not-allowed peer-disabled:opacity-50" />
-                            <span className="absolute left-0.5 top-0.5 size-5 rounded-full bg-[var(--surface)] shadow-sm transition peer-checked:translate-x-5 peer-disabled:opacity-80" />
-                          </label>
+                            type="checkbox"
+                          />
                           <SettingsButton
                             aria-label={t("Test model {name}", {
                               name: model.displayName,
@@ -12461,7 +12351,6 @@ export function SettingsPanel({
                                   <span>{t(modality)}</span>
                                   <SettingsInput
                                     checked={form.inputModalities.includes(modality)}
-                                    className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
                                       toggleModelModality(
                                         "inputModalities",
@@ -12488,7 +12377,6 @@ export function SettingsPanel({
                                   <span>{t(modality)}</span>
                                   <SettingsInput
                                     checked={form.outputModalities.includes(modality)}
-                                    className="size-4 accent-[var(--accent)]"
                                     onChange={(event) =>
                                       toggleModelModality(
                                         "outputModalities",
@@ -12560,7 +12448,6 @@ export function SettingsPanel({
                                     <SettingsInput
                                       aria-label={provider.name}
                                       checked={selectedProviderIds.has(provider.id)}
-                                      className="size-4 accent-[var(--accent)] disabled:cursor-not-allowed"
                                       disabled={!providerSupportsCurrentModel}
                                       onChange={(event) =>
                                         toggleModelProvider(

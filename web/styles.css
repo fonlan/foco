@@ -106,6 +106,7 @@ summary {
   button.chat-toolbar-profile,
   button.composer-run-button,
   button.composer-team-toggle,
+  button.composer-fast-toggle,
   button.composer-tool-button,
   button.context-memory-delete-button,
   button.diff-file-button,
@@ -135,6 +136,7 @@ summary {
     button.chat-toolbar-profile,
     button.composer-run-button,
     button.composer-team-toggle,
+    button.composer-fast-toggle,
     button.composer-tool-button,
     button.context-memory-delete-button,
     button.diff-file-button,
@@ -253,6 +255,10 @@ summary {
 }
 
 .app-error-toast-close {
+  --button-bg: color-mix(in oklab, var(--background) 12%, transparent);
+  --button-bg-hover: color-mix(in oklab, var(--background) 20%, transparent);
+  --button-bg-pressed: color-mix(in oklab, var(--background) 20%, transparent);
+  --button-fg: var(--danger-foreground);
   display: inline-flex;
   width: 1.8rem;
   height: 1.8rem;
@@ -297,6 +303,10 @@ summary {
 }
 
 .app-status-toast-close {
+  --button-bg: color-mix(in oklab, var(--background) 12%, transparent);
+  --button-bg-hover: color-mix(in oklab, var(--background) 20%, transparent);
+  --button-bg-pressed: color-mix(in oklab, var(--background) 20%, transparent);
+  --button-fg: var(--success-foreground);
   display: inline-flex;
   width: 1.8rem;
   height: 1.8rem;
@@ -1558,6 +1568,10 @@ body,
 .model-routing-model-toggle,
 .model-routing-model-button,
 .model-routing-provider-button {
+  --button-bg: transparent;
+  --button-bg-hover: color-mix(in srgb, var(--accent) 9%, transparent);
+  --button-bg-pressed: color-mix(in srgb, var(--accent) 12%, transparent);
+  --button-fg: inherit;
   border: 0;
   background: transparent;
   color: inherit;
@@ -2516,6 +2530,18 @@ body,
   border-bottom: 1px solid color-mix(in oklab, var(--border) 80%, transparent);
   background: var(--surface);
   padding: 0.5rem 0.75rem;
+}
+
+/* Keep the Source Control branch/target select as short as the Spec subtitle
+   line so this header matches other context-panel page headers. */
+.context-panel-page-header .source-control-target-trigger,
+.context-panel-page-header .source-control-target-trigger.select__trigger {
+  height: 1.5rem;
+  min-height: 1.5rem;
+  padding-block: 0;
+  font-size: 0.6875rem;
+  line-height: 1;
+  box-shadow: none;
 }
 
 @container (max-width: 32rem) {
@@ -3498,7 +3524,7 @@ body,
   border-bottom-right-radius: inherit;
   border-bottom-left-radius: inherit;
   background: var(--surface-secondary);
-  padding: 0.375rem 0.5rem;
+  padding: 0.3125rem 0.5rem;
 }
 
 .composer-control-spacer {
@@ -3544,18 +3570,18 @@ body,
 .message-composer-control-row .composer-tool-button,
 .message-composer-control-row .composer-run-button,
 .message-composer-control-row .context-usage-circle {
-  width: 1.875rem;
-  min-width: 1.875rem;
-  height: 1.875rem;
+  width: 1.75rem;
+  min-width: 1.75rem;
+  height: 1.75rem;
   flex: 0 0 auto;
 }
 
 .composer-team-toggle {
   display: inline-flex;
-  width: 4.5rem;
-  min-width: 4.5rem;
-  height: 1.875rem;
-  flex: 0 0 4.5rem;
+  width: 4.25rem;
+  min-width: 4.25rem;
+  height: 1.75rem;
+  flex: 0 0 4.25rem;
   align-items: center;
   justify-content: center;
   gap: 0.375rem;
@@ -3567,6 +3593,7 @@ body,
 }
 
 .message-composer-control-row .composer-team-toggle,
+.message-composer-control-row .composer-fast-toggle,
 .message-composer-control-row .composer-select-summary {
   border-radius: 0.4375rem;
 }
@@ -3635,10 +3662,10 @@ body,
 
 .composer-fast-toggle {
   display: inline-flex;
-  width: 4.5rem;
-  min-width: 4.5rem;
-  height: 1.875rem;
-  flex: 0 0 4.5rem;
+  width: 4.25rem;
+  min-width: 4.25rem;
+  height: 1.75rem;
+  flex: 0 0 4.25rem;
   align-items: center;
   justify-content: center;
   gap: 0.25rem;
@@ -3881,7 +3908,7 @@ body,
     flex-wrap: nowrap;
     gap: 0.25rem;
     overflow: visible;
-    padding: 0.375rem;
+    padding: 0.25rem 0.375rem;
   }
 
   .message-composer-control-row .composer-tool-button,
@@ -3893,23 +3920,24 @@ body,
   .composer-model-select,
   .composer-provider-select,
   .composer-thinking-select {
-    width: 2rem;
-    min-width: 2rem;
-    max-width: 2rem;
-    height: 2rem;
-    flex: 0 0 2rem;
+    width: 1.75rem;
+    min-width: 1.75rem;
+    max-width: 1.75rem;
+    height: 1.75rem;
+    flex: 0 0 1.75rem;
   }
 
   .message-composer-control-row .composer-select-summary,
   .composer-team-toggle,
   .composer-fast-toggle {
-    width: 2rem;
-    min-width: 2rem;
-    max-width: 2rem;
-    height: 2rem;
-    flex: 0 0 2rem;
+    width: 1.75rem;
+    min-width: 1.75rem;
+    max-width: 1.75rem;
+    height: 1.75rem;
+    flex: 0 0 1.75rem;
     padding-inline: 0;
     justify-content: center;
+    border-radius: 0.375rem;
   }
 
   .message-composer-control-row .composer-select-label,
@@ -4033,6 +4061,10 @@ summary:focus-visible {
 }
 
 .foco-nav-logo-button {
+  --button-bg: var(--surface);
+  --button-bg-hover: var(--surface);
+  --button-bg-pressed: var(--surface);
+  --button-fg: var(--foreground);
   background: var(--surface);
 }
 
@@ -4099,6 +4131,12 @@ summary:focus-visible {
 }
 
 .chat-item {
+  /* HeroUI Button reads these tokens; keep list rows neutral instead of
+     default primary blue + muted text. */
+  --button-bg: transparent;
+  --button-bg-hover: var(--surface-hover);
+  --button-bg-pressed: var(--surface-hover);
+  --button-fg: var(--muted);
   border-color: transparent;
   background: transparent;
   color: var(--muted);
@@ -4109,18 +4147,29 @@ summary:focus-visible {
 }
 
 .chat-item:hover {
+  --button-bg: var(--surface-hover);
+  --button-fg: var(--foreground);
   border-color: var(--border);
   background: var(--surface-hover);
   color: var(--foreground);
 }
 
 .chat-item-active {
+  --button-bg: var(--surface);
+  --button-fg: var(--foreground);
   border-color: var(--accent);
   background: var(--surface);
   color: var(--foreground);
   box-shadow:
     inset 2px 0 0 var(--accent),
     var(--surface-shadow);
+}
+
+.workspace-show-more-chats {
+  --button-bg: transparent;
+  --button-bg-hover: var(--surface-hover);
+  --button-bg-pressed: var(--surface-hover);
+  --button-fg: var(--muted);
 }
 
 .app-toolbar,
@@ -4187,6 +4236,10 @@ summary:focus-visible {
 .chat-tab-scroll-button,
 .chat-toolbar-button,
 .chat-toolbar-profile {
+  --button-bg: transparent;
+  --button-bg-hover: var(--surface-secondary);
+  --button-bg-pressed: var(--surface-secondary);
+  --button-fg: var(--muted);
   border-color: transparent;
   background: transparent;
   color: var(--muted);
@@ -4374,9 +4427,8 @@ summary:focus-visible {
 .composer-surface {
   border-color: var(--border-secondary);
   background: var(--surface);
-  box-shadow:
-    none,
-    var(--overlay-shadow);
+  /* Unfocused: no drop shadow. The control-row border is the only divider. */
+  box-shadow: none;
   transition:
     border-color 150ms ease,
     box-shadow 150ms ease;
@@ -4384,13 +4436,23 @@ summary:focus-visible {
 
 .composer-surface:focus-within {
   border-color: var(--accent);
-  box-shadow:
-    0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent),
-    var(--overlay-shadow);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--focus) 30%, transparent);
 }
 
 .message-composer-textarea {
   height: var(--composer-editor-height);
+  /* HeroUI TextArea defaults to shadow-field; that soft edge reads as a
+     bottom shadow line when the composer is unfocused. Keep the outer
+     composer-surface border as the only chrome. */
+  box-shadow: none;
+}
+
+.composer-surface .textarea,
+.composer-surface .textarea:hover,
+.composer-surface .textarea:focus,
+.composer-surface .textarea[data-focused="true"],
+.composer-surface .textarea[data-hovered="true"] {
+  box-shadow: none;
 }
 
 .message-composer-control-row {
@@ -4896,17 +4958,19 @@ summary:focus-visible {
     min-height: var(--foco-touch-target);
   }
 
+  /* Keep composer controls compact on phones; do not inflate to the
+     global 44px touch target (that made the send row feel oversized). */
   .message-composer-control-row .composer-tool-button,
   .message-composer-control-row .composer-run-button,
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
   .composer-fast-toggle,
   .message-composer-control-row .composer-select-summary {
-    width: var(--foco-touch-target);
-    min-width: var(--foco-touch-target);
-    max-width: var(--foco-touch-target);
-    height: var(--foco-touch-target);
-    flex: 0 0 var(--foco-touch-target);
+    width: 1.75rem;
+    min-width: 1.75rem;
+    max-width: 1.75rem;
+    height: 1.75rem;
+    flex: 0 0 1.75rem;
   }
 
   .workspace-sidebar {

@@ -269,7 +269,6 @@ export function AgentsSettingsPanel({
         </span>
         <SettingsInput
           checked={defaultTeamModeEnabled}
-          className="size-4 accent-[var(--accent)]"
           disabled={isSavingDefaultTeamMode}
           onChange={(event) =>
             void onDefaultTeamModeEnabledChange(event.target.checked)
@@ -670,7 +669,6 @@ function AgentCheckbox({
       </span>
       <SettingsInput
         checked={checked}
-        className="mt-0.5 size-4 shrink-0 accent-[var(--accent)]"
         onChange={(event) => onChange(event.target.checked)}
         type="checkbox"
       />

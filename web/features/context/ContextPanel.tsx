@@ -493,6 +493,7 @@ function WorkspaceFilesTab({
           isDisabled={isLoading}
           onPress={onRefresh}
           type="button"
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"
@@ -957,6 +958,7 @@ function ContextPlanTab({
           isDisabled={!runningPlanId}
           onPress={locateRunningPlan}
           type="button"
+          variant="ghost"
         >
           <LocateFixed aria-hidden="true" className="size-3.5" />
           <span className="plan-locate-button-label">{t("Locate")}</span>
@@ -1069,6 +1071,7 @@ function ContextPlanTab({
                                 className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                 onPress={() => onOpenPhaseChat(mergeChatId)}
                                 type="button"
+                                variant="ghost"
                               >
                                 <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
                                 {t("Merging")}
@@ -1100,6 +1103,7 @@ function ContextPlanTab({
                             isDisabled={operationKey !== null}
                             onPress={() => onAction(plan.id, "retry_merge")}
                             type="button"
+                            variant="ghost"
                           >
                             {isRetryingMerge ? (
                               <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
@@ -1135,6 +1139,7 @@ function ContextPlanTab({
                           isDisabled={operationKey !== null}
                           onPress={() => onAction(plan.id, action)}
                           type="button"
+                          variant="ghost"
                         >
                           {operationKey === actionKey ? (
                             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
@@ -1150,6 +1155,7 @@ function ContextPlanTab({
                         isDisabled={operationKey !== null}
                         onPress={() => onDeletePlan(plan.id)}
                         type="button"
+                        variant="ghost"
                       >
                         {operationKey === `delete:${plan.id}` ? (
                           <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
@@ -1240,7 +1246,8 @@ function ContextPlanTab({
                                   className="inline-flex size-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                   onPress={() => onOpenPhaseChat(implementationChatId)}
                                   type="button"
-                                >
+                              variant="ghost"
+                            >
                                   <MessageSquare aria-hidden="true" className="size-3.5" />
                                 </Button>
                               ) : null}
@@ -1258,6 +1265,7 @@ function ContextPlanTab({
                                       );
                                     }}
                                     type="button"
+                                    variant="ghost"
                                   >
                                     {isRetrying ? (
                                       <LoaderCircle aria-hidden="true" className="size-3.5 shrink-0 animate-spin" />
@@ -1274,6 +1282,7 @@ function ContextPlanTab({
                                       className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       isDisabled={operationKey !== null}
                                       type="button"
+                                      variant="ghost"
                                     >
                                       <ChevronDown aria-hidden="true" className="size-3.5" />
                                     </Button>
@@ -1762,7 +1771,8 @@ function ContextMemoryGroup({
                   isDisabled={meta.page <= 1}
                   onPress={() => onPageChange(meta.page - 1)}
                   type="button"
-                >
+                variant="ghost"
+              >
                   <ChevronLeft aria-hidden="true" className="size-4" />
                 </Button>
                 {paginationItems.map((item, index) =>
@@ -1790,6 +1800,7 @@ function ContextMemoryGroup({
                       key={item}
                       onPress={() => onPageChange(item)}
                       type="button"
+                      variant="ghost"
                     >
                       {formatNumber(item, language)}
                     </Button>
@@ -1801,7 +1812,8 @@ function ContextMemoryGroup({
                   isDisabled={meta.totalPages === 0 || meta.page >= meta.totalPages}
                   onPress={() => onPageChange(meta.page + 1)}
                   type="button"
-                >
+                      variant="ghost"
+                    >
                   <ChevronRight aria-hidden="true" className="size-4" />
                 </Button>
               </nav>
@@ -1889,6 +1901,7 @@ function ContextSpecTab({
           isDisabled={isLoading}
           onPress={onReload}
           type="button"
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"
@@ -1925,6 +1938,7 @@ function ContextSpecTab({
             isDisabled={!canEdit || !isDirty || isBusy || isLoading}
             onPress={onSave}
             type="button"
+            variant="ghost"
           >
             {operationKey === "save" ? (
               <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -1941,6 +1955,7 @@ function ContextSpecTab({
               }`}
             onPress={() => onPreviewChange(!previewEnabled)}
             type="button"
+            variant="ghost"
           >
             {previewEnabled ? (
               <EyeOff aria-hidden="true" className="size-4" />
@@ -1958,6 +1973,7 @@ function ContextSpecTab({
             isDisabled={!enabled || isBusy || isLoading}
             onPress={() => onSettingsChange(enabled, !injectEnabled)}
             type="button"
+            variant="ghost"
           >
             {operationKey === "settings" ? (
               <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -1974,7 +1990,8 @@ function ContextSpecTab({
               className="mt-2 inline-flex items-center gap-2 rounded-md border border-[var(--warning)] bg-[var(--surface)] px-2.5 py-1.5 text-xs font-semibold text-[var(--warning)] hover:bg-[var(--warning-soft)]"
               onPress={onReload}
               type="button"
-            >
+            variant="ghost"
+          >
               <RefreshCw
                 aria-hidden="true"
                 className="context-refresh-icon size-3.5"
@@ -2689,7 +2706,7 @@ function SourceControlPanel({
               <Label className="sr-only">{t("Source Control target")}</Label>
               <Select.Trigger
                 aria-label={t("Source Control target")}
-                className="mt-0.5 block w-full min-w-0 max-w-full truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--muted)] shadow-sm outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+                className="source-control-target-trigger mt-0.5 flex h-6 min-h-0 w-full min-w-0 max-w-full items-center truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-1.5 py-0 text-[0.6875rem] font-medium leading-none text-[var(--muted)] shadow-none outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
               >
                 <Select.Value />
                 <Select.Indicator />
@@ -2717,6 +2734,7 @@ function SourceControlPanel({
           isDisabled={isLoading}
           onPress={onRefresh}
           type="button"
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"
@@ -2752,6 +2770,7 @@ function SourceControlPanel({
               isDisabled={isCommitMessageInputDisabled || stagedFiles.length === 0}
               onPress={onGenerateCommitMessage}
               type="button"
+              variant="ghost"
             >
               {isGeneratingCommitMessage ? (
                 <LoaderCircle aria-hidden="true" className="size-4 animate-spin" />
@@ -2902,7 +2921,8 @@ function GitFileRow({
             onFileOperation(action, file.path);
           }}
           type="button"
-        >
+            variant="ghost"
+          >
           {isActionLoading ? (
             <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />
           ) : action === "stage" ? (
@@ -2920,6 +2940,7 @@ function GitFileRow({
               onFileOperation("discard", file.path);
             }}
             type="button"
+            variant="ghost"
           >
             {isDiscardLoading ? (
               <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />

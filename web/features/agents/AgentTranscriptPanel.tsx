@@ -497,6 +497,7 @@ export function AgentTranscriptPanel({
             aria-label={t("Main chat")}
             className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
             onPress={onOpenMainChat}
+            variant="ghost"
           >
             <ArrowLeft aria-hidden="true" className="size-4" />
           </Button>
@@ -528,6 +529,7 @@ export function AgentTranscriptPanel({
           className="inline-flex size-9 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           isDisabled={loading}
           onPress={() => void refreshTranscript()}
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"
@@ -587,6 +589,7 @@ export function AgentTranscriptPanel({
                 className="inline-flex items-center gap-2 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
                 isDisabled={loading}
                 onPress={() => void loadMoreTranscript()}
+                variant="ghost"
               >
                 {loading ? (
                   <LoaderCircle aria-hidden="true" className="size-3.5 animate-spin" />

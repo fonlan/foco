@@ -521,12 +521,14 @@ function MonacoFileEditor({
               <Button
                 className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                 onPress={() => void handleReloadConfirm("discard")}
+                variant="ghost"
               >
                 {t("No")}
               </Button>
               <Button
                 className="rounded-lg border border-[var(--border)] px-3 py-2 text-sm font-medium text-[var(--muted)] hover:bg-[var(--surface-secondary)]"
                 onPress={() => void handleReloadConfirm("cancel")}
+                variant="ghost"
               >
                 {t("Cancel")}
               </Button>

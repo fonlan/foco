@@ -13456,6 +13456,7 @@ export function App() {
               className="app-error-toast-close"
               onPress={() => setError(null)}
               type="button"
+              variant="ghost"
             >
               <X aria-hidden="true" className="size-4" />
             </Button>
@@ -13477,6 +13478,7 @@ export function App() {
               className="app-status-toast-close"
               onPress={() => setUpdateInstallNotice(null)}
               type="button"
+              variant="ghost"
             >
               <X aria-hidden="true" className="size-4" />
             </Button>
@@ -13575,6 +13577,7 @@ export function App() {
                 className="mobile-sidebar-backdrop"
                 onPress={() => setIsMobileWorkspaceOpen(false)}
                 type="button"
+                variant="ghost"
               />
             ) : null}
             <FocoNavRail
@@ -13689,6 +13692,7 @@ export function App() {
                       className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
                       onPress={() => setIsMobileWorkspaceOpen(false)}
                       type="button"
+                      variant="ghost"
                     >
                       <X aria-hidden="true" className="size-4" />
                     </Button>
@@ -13715,6 +13719,7 @@ export function App() {
                           className="absolute right-2 top-1/2 inline-flex size-5 -translate-y-1/2 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--muted)]"
                           onPress={() => setWorkspaceChatSearchQuery("")}
                           type="button"
+                          variant="ghost"
                         >
                           <X aria-hidden="true" className="size-3.5" />
                         </Button>
@@ -13858,6 +13863,7 @@ export function App() {
                                   void retryRemoteWorkspace(workspace)
                                 }
                                 type="button"
+                                variant="ghost"
                               >
                                 {retryingRemoteWorkspaceId === workspace.id ? (
                                   <LoaderCircle
@@ -13946,6 +13952,7 @@ export function App() {
                                           cancelWorkspaceChatLongPress
                                         }
                                         type="button"
+                                        variant="ghost"
                                       >
                                         <span
                                           aria-hidden="true"
@@ -14006,7 +14013,7 @@ export function App() {
                                           name: workspace.name,
                                         },
                                       )}
-                                      className="flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
+                                      className="workspace-show-more-chats flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
                                       isDisabled={paging?.isLoading}
                                       onPress={() =>
                                         void showMoreWorkspaceChats(
@@ -14014,6 +14021,7 @@ export function App() {
                                         )
                                       }
                                       type="button"
+                                      variant="ghost"
                                     >
                                       <ChevronDown
                                         aria-hidden="true"
@@ -15298,6 +15306,7 @@ function MainTabBar({
             isDisabled={!scrollState.canScrollLeft}
             onPress={() => scrollTabs(-1)}
             type="button"
+            variant="ghost"
           >
             <ChevronLeft aria-hidden="true" className="size-4" />
           </Button>
@@ -15441,6 +15450,7 @@ function MainTabBar({
             isDisabled={!scrollState.canScrollRight}
             onPress={() => scrollTabs(1)}
             type="button"
+            variant="ghost"
           >
             <ChevronRight aria-hidden="true" className="size-4" />
           </Button>
@@ -15509,6 +15519,7 @@ function FocoNavRail({
           className="foco-nav-logo-button"
           onPress={onReturnHome}
           type="button"
+          variant="ghost"
         >
           <FocoLogoMark />
         </Button>

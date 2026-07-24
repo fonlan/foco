@@ -1,6 +1,5 @@
 import {
   Button,
-  Checkbox,
   Input,
   Label,
   ListBox,
@@ -75,40 +74,33 @@ export const SettingsInput = forwardRef<HTMLInputElement, SettingsInputProps>(fu
   }
 
   if (type === "checkbox") {
-    if (props.role === "switch") {
-      return (
-        <Switch
-          {...(props as any)}
-          aria-label={props["aria-label"]}
-          isDisabled={disabled}
-          isSelected={Boolean(checked)}
-          onChange={(selected: boolean) =>
-            onChange?.(browserChange<HTMLInputElement>(selected ? "on" : "", selected))
-          }
-        >
-          <Switch.Content>
-            <Switch.Control>
-              <Switch.Thumb />
-            </Switch.Control>
-          </Switch.Content>
-        </Switch>
-      );
-    }
-
+    // Settings checkboxes are capsule switches end-to-end. Peer/hand-drawn
+    // tracks broke after the HeroUI migration because SettingsInput no longer
+    // renders a native input that peer-checked can target.
+    // Drop legacy checkbox sizing classes (size-4 / accent-*) so they do not
+    // shrink the Switch root into a square the capsule then overflows.
+    const {
+      className: _legacyCheckboxClassName,
+      role: _role,
+      ...switchProps
+    } = props as any;
     return (
-      <Checkbox
-        {...(props as any)}
+      <Switch
+        {...switchProps}
         aria-label={props["aria-label"]}
+        className="shrink-0"
         isDisabled={disabled}
         isSelected={Boolean(checked)}
-        onChange={(selected: boolean) => onChange?.(browserChange<HTMLInputElement>(selected ? "on" : "", selected))}
+        onChange={(selected: boolean) =>
+          onChange?.(browserChange<HTMLInputElement>(selected ? "on" : "", selected))
+        }
       >
-        <Checkbox.Content>
-          <Checkbox.Control>
-            <Checkbox.Indicator />
-          </Checkbox.Control>
-        </Checkbox.Content>
-      </Checkbox>
+        <Switch.Content>
+          <Switch.Control>
+            <Switch.Thumb />
+          </Switch.Control>
+        </Switch.Content>
+      </Switch>
     );
   }
 

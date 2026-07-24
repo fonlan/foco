@@ -62,6 +62,7 @@ export function AgentsRuntimePanel({
           className="inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
           isDisabled={!activeChatId || isLoading}
           onPress={() => void onRefresh()}
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"
@@ -156,6 +157,7 @@ function AgentInstanceCard({
           : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
         }`}
       onPress={onSelect}
+      variant="ghost"
     >
       <div className="flex min-w-0 items-start gap-2">
         <span

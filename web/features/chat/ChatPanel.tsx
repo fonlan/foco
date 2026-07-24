@@ -1046,6 +1046,7 @@ function ChatPanelComponent({
                     isDisabled={isLoadingMoreMessages}
                     onPress={requestMoreMessages}
                     type="button"
+                    variant="ghost"
                   >
                     {isLoadingMoreMessages ? (
                       <LoaderCircle
@@ -1167,6 +1168,7 @@ function ChatPanelComponent({
                           className="inline-flex size-4 items-center justify-center rounded-full text-[var(--accent-soft-foreground)] hover:bg-[var(--accent-soft)]"
                           onPress={() => onRemoveSkill(skill.key)}
                           type="button"
+                          variant="ghost"
                         >
                           <X aria-hidden="true" className="size-3" />
                         </Button>
@@ -1188,7 +1190,7 @@ function ChatPanelComponent({
                 ) : null}
                 <TextField aria-label={t("Message")} className="contents">
                   <TextArea
-                    className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-[var(--foreground)] outline-none placeholder:text-[var(--muted)]"
+                    className="message-composer-textarea min-h-16 w-full resize-none border-0 bg-transparent px-3 py-1.5 text-sm leading-6 text-[var(--foreground)] shadow-none outline-none placeholder:text-[var(--muted)]"
                     name="message"
                     onChange={(event) => onDraftMessageChange(event.target.value)}
                     // IME composition and modifier-aware queueing require the native keyboard event.
@@ -1753,8 +1755,8 @@ const MessageRow = memo(function MessageRow({
                   onPress={() => onCopyMessage(message.id, copyText)}
                   size="sm"
                   type="button"
-                  variant="ghost"
-                >
+                    variant="ghost"
+                  >
                   {isCopied ? (
                     <CheckCircle2 aria-hidden="true" className="size-3.5" />
                   ) : (
@@ -1780,6 +1782,7 @@ const MessageRow = memo(function MessageRow({
                             )
                           }
                           type="button"
+                          variant="ghost"
                         >
                           {skill?.name ?? skillId} ×
                         </Button>
@@ -1832,6 +1835,7 @@ const MessageRow = memo(function MessageRow({
                       )
                     }
                     type="button"
+                    variant="ghost"
                   >
                     {t("Add attachment")}
                   </Button>
@@ -1853,6 +1857,7 @@ const MessageRow = memo(function MessageRow({
                           )
                         }
                         type="button"
+                        variant="ghost"
                       >
                         {attachment.name} ×
                       </Button>
@@ -2121,8 +2126,8 @@ function ReasoningBlock({
         className="tool-call-summary h-auto w-full min-w-0 cursor-pointer items-center justify-start gap-1.5 p-0 text-left text-xs font-semibold text-[var(--muted)] hover:text-[var(--muted)]"
         onPress={() => setIsExpanded((current) => !current)}
         type="button"
-        variant="ghost"
-      >
+                    variant="ghost"
+                  >
         {isExpanded ? (
           <ChevronDown
             aria-hidden="true"
@@ -2299,6 +2304,7 @@ function ComposerAttachmentChip({
         className="inline-flex size-5 shrink-0 items-center justify-center rounded-full text-[var(--muted)] hover:bg-[var(--default)] hover:text-[var(--foreground)]"
         onPress={onRemove}
         type="button"
+        variant="ghost"
       >
         <X aria-hidden="true" className="size-3" />
       </Button>
@@ -2377,6 +2383,7 @@ function ChatReplyMetricsLine({
           className="inline-flex size-7 shrink-0 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
           onPress={onOpenApiRequests}
           type="button"
+          variant="ghost"
         >
           <Server aria-hidden="true" className="size-3.5" />
         </Button>
@@ -3650,6 +3657,7 @@ function ToolCallBlock({
                 setViewMode(viewMode === "compact" ? "raw" : "compact")
               }
               type="button"
+              variant="ghost"
             >
               {toggleLabel}
             </Button>
