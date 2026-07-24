@@ -13799,7 +13799,7 @@ export function App() {
 
                       return (
                         <div
-                          className={`mb-1.5 ${draggedWorkspaceId === workspace.id ? "opacity-80" : ""}`}
+                          className={`${draggedWorkspaceId === workspace.id ? "opacity-80" : ""}`}
                           draggable
                           key={workspace.id}
                           onDragEnd={handleWorkspaceDragEnd}
@@ -13847,7 +13847,7 @@ export function App() {
                                     <span className="block truncate">
                                       {workspace.name}
                                     </span>
-                                    <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
+                                    <span className="block truncate text-[9px] font-medium leading-3 text-[color-mix(in_oklab,var(--muted)_70%,transparent)]">
                                       {workspace.displayPath}
                                     </span>
                                   </span>
@@ -14022,8 +14022,8 @@ export function App() {
                                                 <span className="block truncate">
                                                   {chat.title}
                                                 </span>
-                                                <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
-                                                  <span className="min-w-0 truncate">
+                                                <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[10px] font-normal leading-tight">
+                                                  <span className="min-w-0 truncate text-[color-mix(in_oklab,var(--muted)_55%,transparent)]">
                                                     {formatChatCreatedAt(
                                                       chat.createdAt,
                                                     )}
@@ -14081,7 +14081,7 @@ export function App() {
                                                 name: workspace.name,
                                               },
                                             )}
-                                            className="workspace-show-more-chats flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
+                                            className="workspace-show-more-chats flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-[11px] font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
                                             isDisabled={paging?.isLoading}
                                             onPress={() =>
                                               void showMoreWorkspaceChats(
@@ -14101,7 +14101,7 @@ export function App() {
                                                   count: nextVisibleChatCount,
                                                 })}
                                               </span>
-                                              <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
+                                              <span className="mt-0.5 block truncate text-[10px] font-normal leading-tight text-[var(--muted)]">
                                                 {t("{count} hidden chats", {
                                                   count: hiddenChatCount,
                                                 })}

@@ -16,7 +16,7 @@ export function workspaceNameFromPath(path: string) {
 }
 
 export function chatItemClass() {
-  return "chat-item flex min-h-11 min-w-0 w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium";
+  return "chat-item flex min-h-11 min-w-0 w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[11px] font-medium";
 }
 
 export function moveItemId(
