@@ -1720,9 +1720,12 @@ const MessageRow = memo(function MessageRow({
                 {canEdit ? (
                   <Button
                     aria-label={t("Edit message")}
-                    className="message-action-menu"
+                    className="size-7 min-w-7"
+                    isIconOnly
                     onPress={() => onBeginEdit(message)}
+                    size="sm"
                     type="button"
+                    variant="ghost"
                   >
                     <Pencil aria-hidden="true" className="size-3.5" />
                   </Button>
@@ -1731,17 +1734,23 @@ const MessageRow = memo(function MessageRow({
                   <>
                     <Button
                       aria-label={t("Convert queued message to guidance")}
-                      className="message-action-menu"
+                      className="size-7 min-w-7"
+                      isIconOnly
                       onPress={() => onGuideQueuedMessage(message.id)}
+                      size="sm"
                       type="button"
+                      variant="ghost"
                     >
                       <ArrowUp aria-hidden="true" className="size-3.5" />
                     </Button>
                     <Button
                       aria-label={t("Withdraw queued message")}
-                      className="message-action-menu"
+                      className="size-7 min-w-7"
+                      isIconOnly
                       onPress={() => onWithdrawQueuedMessage(message.id)}
+                      size="sm"
                       type="button"
+                      variant="ghost"
                     >
                       <X aria-hidden="true" className="size-3.5" />
                     </Button>
@@ -1755,8 +1764,8 @@ const MessageRow = memo(function MessageRow({
                   onPress={() => onCopyMessage(message.id, copyText)}
                   size="sm"
                   type="button"
-                    variant="ghost"
-                  >
+                  variant="ghost"
+                >
                   {isCopied ? (
                     <CheckCircle2 aria-hidden="true" className="size-3.5" />
                   ) : (
@@ -1885,19 +1894,25 @@ const MessageRow = memo(function MessageRow({
                 <div className="flex justify-end gap-1.5">
                   <Button
                     aria-label={t("Cancel editing")}
-                    className="message-action-menu"
+                    className="size-7 min-w-7"
                     isDisabled={isSavingEdit}
+                    isIconOnly
                     onPress={onCancelEdit}
+                    size="sm"
                     type="button"
+                    variant="ghost"
                   >
                     <X aria-hidden="true" className="size-4" />
                   </Button>
                   <Button
                     aria-label={t("Save and regenerate")}
-                    className="message-action-menu"
+                    className="size-7 min-w-7"
                     isDisabled={isSavingEdit || !editingText.trim()}
+                    isIconOnly
                     onPress={() => onSaveEdit(message)}
+                    size="sm"
                     type="button"
+                    variant="ghost"
                   >
                     {isSavingEdit ? (
                       <LoaderCircle
