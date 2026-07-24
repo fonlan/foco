@@ -390,9 +390,13 @@ describe("app-shell verification surfaces", () => {
 
     expect(await screen.findAllByText("Default")).not.toHaveLength(0);
     expect(screen.getAllByText("Tool run").length).toBeGreaterThan(0);
-    expect(
-      await screen.findByPlaceholderText(defaultComposerPlaceholder),
-    ).toBeInTheDocument();
+    const composer = await screen.findByPlaceholderText(defaultComposerPlaceholder);
+    expect(composer).toBeInTheDocument();
+    expect(composer.closest("form")).toHaveClass(
+      "message-composer-form",
+      "max-w-[min(42rem,92%)]",
+      "sm:max-w-[78%]",
+    );
 
     await userEvent.click(screen.getByText("Tool run"));
 

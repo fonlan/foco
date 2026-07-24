@@ -1816,6 +1816,60 @@ describe("app-settings verification surfaces", () => {
     });
   });
 
+  it("keeps the theme button interactive while the optimistic save is pending", async () => {
+    const fetchMock = vi.mocked(fetch);
+    const firstThemeSave = deferred<Response>();
+    const themeSaveBodies: string[] = [];
+    let delayNextThemeSave = true;
+    fetchMock.mockImplementation((input, init) => {
+      const path = String(input).split("?")[0];
+      if (path === "/api/settings/general") {
+        themeSaveBodies.push(String(init?.body ?? ""));
+      }
+      if (path === "/api/settings/general" && delayNextThemeSave) {
+        delayNextThemeSave = false;
+        return firstThemeSave.promise;
+      }
+      return mockFetch(input, init);
+    });
+    renderApp();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Switch to dark theme" }),
+    );
+
+    const lightThemeButton = await screen.findByRole("button", {
+      name: "Switch to light theme",
+    });
+    expect(lightThemeButton).not.toBeDisabled();
+    await userEvent.click(lightThemeButton);
+
+    await waitFor(() => {
+      expect(document.documentElement.dataset.theme).toBe("light");
+    });
+    expect(themeSaveBodies).toHaveLength(1);
+    expect(themeSaveBodies[0]).toContain('"theme":"dark"');
+
+    await act(async () => {
+      firstThemeSave.resolve(
+        jsonResponse({
+          ...settings,
+          general: { ...settings.general, theme: "dark" },
+        }),
+      );
+      await firstThemeSave.promise;
+    });
+
+    await waitFor(() => {
+      expect(themeSaveBodies).toHaveLength(2);
+      expect(themeSaveBodies[1]).toContain('"theme":"light"');
+      expect(document.documentElement.dataset.theme).toBe("light");
+      expect(
+        screen.getByRole("button", { name: "Switch to dark theme" }),
+      ).not.toBeDisabled();
+    });
+  });
+
   it("saves the app theme from general settings", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

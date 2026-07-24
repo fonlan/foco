@@ -451,7 +451,16 @@ describe("app-panels-stats verification surfaces", () => {
       expect.objectContaining({ method: "POST" }),
     );
 
-    await userEvent.click(screen.getByRole("button", { name: "New terminal" }));
+    const newTerminalButton = screen.getByRole("button", { name: "New terminal" });
+    const terminalCloseButtons = screen.getAllByRole("button", {
+      name: "Close terminal",
+    });
+    expect(newTerminalButton).toHaveClass("button--ghost", "button--icon-only");
+    expect(terminalCloseButtons[1]).toHaveClass(
+      "button--ghost",
+      "button--icon-only",
+    );
+    await userEvent.click(newTerminalButton);
 
     const terminalList = await screen.findByRole("complementary", {
       name: "Terminal sessions",
@@ -4134,6 +4143,14 @@ describe("app-panels-stats verification surfaces", () => {
     expect(
       within(todoPanel).getByText("Inspect workspace changes"),
     ).toBeInTheDocument();
+    const todoTaskButton = within(todoPanel).getByRole("button", {
+      name: /Inspect workspace changes/,
+    });
+    expect(todoTaskButton).toHaveClass("button--ghost");
+    expect(todoTaskButton.closest(".card")).toHaveClass(
+      "todo-graph-task-card",
+      "card--default",
+    );
     expect(within(todoPanel).getByText("running")).toHaveClass(
       "bg-[var(--warning-soft)]",
       "text-[var(--warning)]",

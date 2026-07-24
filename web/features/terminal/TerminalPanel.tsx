@@ -71,9 +71,12 @@ function TerminalCommandButton({
     return (
       <Button
         aria-label={t("Run common command {name}", { name: command.name })}
-        className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
+        className="size-7 min-w-7"
         isDisabled={disabled}
+        isIconOnly
         onPress={() => onRun(command)}
+        size="sm"
+        variant="ghost"
       >
         <Play aria-hidden="true" className="size-3.5 fill-current" />
       </Button>
@@ -83,9 +86,12 @@ function TerminalCommandButton({
   return (
     <Dropdown>
       <Button
-        isDisabled={disabled}
         aria-label={t("Run common command")}
-        className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)] disabled:cursor-not-allowed disabled:text-[var(--muted)] disabled:hover:bg-transparent"
+        className="size-7 min-w-7"
+        isDisabled={disabled}
+        isIconOnly
+        size="sm"
+        variant="ghost"
       >
         <Play aria-hidden="true" className="size-3.5 fill-current" />
       </Button>
@@ -304,15 +310,21 @@ export function TerminalPanel({
               />
               <Button
                 aria-label={t("New terminal")}
-                className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--surface-secondary)] hover:text-[var(--foreground)]"
+                className="size-7 min-w-7"
+                isIconOnly
                 onPress={createSession}
+                size="sm"
+                variant="ghost"
               >
                 <Plus aria-hidden="true" className="size-3.5" />
               </Button>
               <Button
                 aria-label={t("Close terminal")}
-                className="inline-flex size-6 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
+                className="size-7 min-w-7"
+                isIconOnly
                 onPress={onClose}
+                size="sm"
+                variant="ghost"
               >
                 <X aria-hidden="true" className="size-3.5" />
               </Button>
@@ -340,15 +352,15 @@ export function TerminalPanel({
           >
             {sessions.map((session) => (
               <div
-                className={`flex w-full min-w-0 items-center gap-1 rounded-md text-xs ${session.clientId === activeSession?.clientId
-                    ? "bg-[var(--surface)] text-[var(--foreground)]"
-                    : "text-[var(--muted)] hover:bg-[var(--surface)] hover:text-[var(--foreground)]"
-                  }`}
+                className="flex w-full min-w-0 items-center gap-1 rounded-md text-xs"
                 key={session.clientId}
               >
                 <Button
-                  className="flex min-w-0 flex-1 items-center gap-2 px-2 py-2 text-left"
+                  className="h-auto min-w-0 flex-1 items-center justify-start gap-2 px-2 py-2 text-left"
                   onPress={() => setActiveClientId(session.clientId)}
+                  variant={
+                    session.clientId === activeSession?.clientId ? "tertiary" : "ghost"
+                  }
                 >
                   <span
                     aria-label={terminalStatusText(session.status, t)}
@@ -371,8 +383,11 @@ export function TerminalPanel({
                   aria-label={t("Close terminal {number}", {
                     number: session.number,
                   })}
-                  className="mr-1 inline-flex size-6 shrink-0 items-center justify-center rounded-md text-[var(--muted)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
+                  className="mr-1 size-7 min-w-7 shrink-0"
+                  isIconOnly
                   onPress={() => closeSession(session.clientId)}
+                  size="sm"
+                  variant="ghost"
                 >
                   <X aria-hidden="true" className="size-3.5" />
                 </Button>

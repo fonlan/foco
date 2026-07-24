@@ -83,6 +83,7 @@ import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
 import {
   Button,
+  Card,
   Checkbox,
   Dropdown,
   Label,
@@ -2492,16 +2493,18 @@ function TodoGraphTaskItem({
 
   return (
     <div>
-      <div
-        className="rounded-lg border border-[var(--border)] bg-[var(--surface)] shadow-sm transition hover:border-[var(--border)] hover:bg-[var(--surface-secondary)]"
+      <Card
+        className="todo-graph-task-card gap-0 overflow-hidden p-0"
         style={{ marginLeft: level ? Math.min(level * 14, 42) : 0 }}
+        variant="default"
       >
         <Button
           aria-controls={bodyId}
           aria-expanded={isExpanded}
-          className="flex w-full min-w-0 items-start gap-2 px-3 py-2 text-left focus:outline-none focus:ring-2 focus:ring-inset focus:ring-[var(--border)]"
+          className="h-auto min-h-0 w-full min-w-0 items-start justify-start gap-2 rounded-none px-3 py-2 text-left"
           onPress={() => setIsExpanded((current) => !current)}
           type="button"
+          variant="ghost"
         >
           {isExpanded ? (
             <ChevronDown
@@ -2540,7 +2543,7 @@ function TodoGraphTaskItem({
           </div>
         </Button>
         {isExpanded ? (
-          <div className="px-3 pb-2 pl-8" id={bodyId}>
+          <Card.Content className="px-3 pb-2 pl-8" id={bodyId}>
             {task.dependsOn.length ? (
               <div className="mt-1 flex flex-wrap gap-1.5">
                 {task.dependsOn.map((dependencyId) => (
@@ -2566,9 +2569,9 @@ function TodoGraphTaskItem({
                 ))}
               </ul>
             ) : null}
-          </div>
+          </Card.Content>
         ) : null}
-      </div>
+      </Card>
       {task.subtasks.length ? (
         <div className="mt-2 space-y-2">
           {task.subtasks.map((subtask) => (

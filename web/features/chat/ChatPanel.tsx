@@ -1147,7 +1147,10 @@ function ChatPanelComponent({
           />
 
           <div className="composer-shell shrink-0 border-t border-[color-mix(in_oklab,var(--border)_80%,transparent)] bg-transparent px-3 py-1.5 sm:px-5">
-            <form className="mx-auto max-w-5xl" onSubmit={handleComposerSubmit}>
+            <form
+              className="message-composer-form mx-auto w-full max-w-[min(42rem,92%)] sm:max-w-[78%]"
+              onSubmit={handleComposerSubmit}
+            >
               <div className="composer-surface relative rounded-xl border border-[var(--border)] bg-[var(--surface)]">
                 {selectedSkills.length ? (
                   <div className="flex flex-wrap gap-1.5 px-3 pt-2">
@@ -1340,7 +1343,7 @@ function ChatPanelComponent({
                   </Button>
                   <ComposerSelectMenu
                     ariaLabel={t("Model")}
-                    className="composer-model-select max-w-full"
+                    className="composer-model-select composer-model-select-compact max-w-full"
                     disabled={isLoadingSettings || !modelOptions.length}
                     emptyLabel={t("No enabled models")}
                     icon={Bot}
@@ -1744,10 +1747,13 @@ const MessageRow = memo(function MessageRow({
                 ) : null}
                 <Button
                   aria-label={copyLabel}
-                  className="message-action-menu"
+                  className="size-7 min-w-7"
+                  isIconOnly
                   isDisabled={!copyText}
                   onPress={() => onCopyMessage(message.id, copyText)}
+                  size="sm"
                   type="button"
+                  variant="ghost"
                 >
                   {isCopied ? (
                     <CheckCircle2 aria-hidden="true" className="size-3.5" />
@@ -2105,14 +2111,17 @@ function ReasoningBlock({
     : t("Expand thinking");
 
   return (
-    <div className="reasoning-block min-w-0 rounded-lg border border-[var(--border)] bg-[var(--surface-secondary)] p-2 text-[var(--foreground)]">
+    <div
+      className="reasoning-block tool-call-block group min-w-0 text-[var(--foreground)]"
+      data-expanded={isExpanded ? "true" : "false"}
+    >
       <Button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
-        className="tool-call-summary flex w-full min-w-0 cursor-pointer items-center gap-1.5 text-left text-xs font-semibold text-[var(--foreground)] hover:text-[var(--foreground)]"
+        className="tool-call-summary h-auto w-full min-w-0 cursor-pointer items-center justify-start gap-1.5 p-0 text-left text-xs font-semibold text-[var(--foreground)] hover:text-[var(--foreground)]"
         onPress={() => setIsExpanded((current) => !current)}
         type="button"
-        variant="tertiary"
+        variant="ghost"
       >
         {isExpanded ? (
           <ChevronDown
@@ -2144,7 +2153,7 @@ function ReasoningBlock({
         ) : null}
       </Button>
       {isExpanded ? (
-        <div className="mt-2 border-l border-[var(--border)] pl-3 text-[var(--foreground)]">
+        <div className="mt-2 text-[var(--foreground)]">
           <MarkdownContent
             content={reasoning}
             isUser={false}

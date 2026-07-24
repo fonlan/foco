@@ -147,7 +147,7 @@ function AgentInstanceCard({
         name: instance.definitionSnapshot.name,
       })}
       aria-pressed={isSelected}
-      className={`w-full rounded-lg border px-3 py-3 text-left transition ${isSelected
+      className={`agent-instance-card h-auto min-h-0 w-full flex-col items-stretch justify-start overflow-visible whitespace-normal rounded-lg border px-3 py-3 text-left transition ${isSelected
           ? "border-[var(--accent)] bg-[var(--accent-soft)] text-[var(--foreground)] shadow-sm"
           : "border-[var(--border)] bg-[var(--surface)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)]"
         }`}

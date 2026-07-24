@@ -1890,7 +1890,6 @@ export function App() {
     useState<Record<string, boolean>>({});
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSettings, setIsLoadingSettings] = useState(true);
-  const [isSavingTheme, setIsSavingTheme] = useState(false);
   const [isSavingWorkspace, setIsSavingWorkspace] = useState(false);
   const [isSelectingAttachments, setIsSelectingAttachments] = useState(false);
   const [pendingQuestion, setPendingQuestion] =
@@ -1930,6 +1929,8 @@ export function App() {
     new Map(),
   );
   const todoGraphRequestIdRef = useRef(0);
+  const themeSaveRevisionRef = useRef(0);
+  const themeSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
   const activePlansSingleFlightRef = useRef<
     Map<string, SingleFlightEntry<PlansResponse | null>>
   >(new Map());
@@ -13022,34 +13023,46 @@ export function App() {
     }
 
     const previousTheme = settings.general.theme;
+    const saveRevision = themeSaveRevisionRef.current + 1;
+    themeSaveRevisionRef.current = saveRevision;
     setSettings((current) =>
       current
         ? { ...current, general: { ...current.general, theme: nextTheme } }
         : current,
     );
-    setIsSavingTheme(true);
     setError(null);
 
+    const saveRequest = themeSaveQueueRef.current.then(() =>
+      requestJson<SettingsResponse>("/api/settings/general", {
+        body: JSON.stringify({
+          clearPassword: false,
+          hookAuditEnabled: settings.general.hookAuditEnabled,
+          language: settings.general.language,
+          listenHost: settings.general.webServer.listenHost,
+          listenPort: settings.general.webServer.listenPort,
+          password: null,
+          theme: nextTheme,
+        }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      }),
+    );
+    themeSaveQueueRef.current = saveRequest.then(
+      () => undefined,
+      () => undefined,
+    );
+
     try {
-      const data = await requestJson<SettingsResponse>(
-        "/api/settings/general",
-        {
-          body: JSON.stringify({
-            clearPassword: false,
-            hookAuditEnabled: settings.general.hookAuditEnabled,
-            language: settings.general.language,
-            listenHost: settings.general.webServer.listenHost,
-            listenPort: settings.general.webServer.listenPort,
-            password: null,
-            theme: nextTheme,
-          }),
-          headers: { "Content-Type": "application/json" },
-          method: "POST",
-        },
-      );
+      const data = await saveRequest;
+      if (themeSaveRevisionRef.current !== saveRevision) {
+        return;
+      }
       settingsSkillsSnapshotRef.current = JSON.stringify(data.skills);
       setSettings(data);
     } catch (requestError) {
+      if (themeSaveRevisionRef.current !== saveRevision) {
+        return;
+      }
       setError(errorMessage(requestError));
       setSettings((current) =>
         current
@@ -13059,8 +13072,6 @@ export function App() {
             }
           : current,
       );
-    } finally {
-      setIsSavingTheme(false);
     }
   }
 
@@ -13477,7 +13488,6 @@ export function App() {
               activeMode={viewMode}
               canLogout={canLogout}
               contextPanelButton={null}
-              isSavingTheme={isSavingTheme}
               onAddWorkspace={openWorkspaceDialog}
               onLogout={handleLogout}
               onHomeClick={handleHomeNavClick}
@@ -13570,7 +13580,6 @@ export function App() {
             <FocoNavRail
               activeMode={viewMode}
               canLogout={canLogout}
-              isSavingTheme={isSavingTheme}
               onAddWorkspace={openWorkspaceDialog}
               contextPanelButton={{
                 active: isContextPanelOpen,
@@ -13767,10 +13776,10 @@ export function App() {
                           }
                           onDrop={(event) => void handleWorkspaceDrop(event)}
                         >
-                          <div className={workspaceMenuClass(isActive)}>
+                          <div className={`${workspaceMenuClass(isActive)} relative`}>
                             <Button
                               aria-expanded={isExpanded}
-                              className={workspaceItemClass(isActive)}
+                              className={`${workspaceItemClass(isActive)} pr-9`}
                               onPress={() => toggleWorkspace(workspace.id)}
                               type="button"
                               variant={isActive ? "tertiary" : "ghost"}
@@ -13812,6 +13821,7 @@ export function App() {
                               aria-label={t("New chat in {name}", {
                                 name: workspace.name,
                               })}
+                              className="workspace-new-chat-button absolute right-0.5 top-1/2 z-10 -translate-y-1/2"
                               isIconOnly
                               isDisabled={isRemoteWorkspace && !isRemoteReady}
                               onPress={() => {
@@ -15455,7 +15465,6 @@ function FocoNavRail({
   activeMode,
   canLogout,
   contextPanelButton,
-  isSavingTheme,
   onAddWorkspace,
   onLogout,
   onHomeClick,
@@ -15472,7 +15481,6 @@ function FocoNavRail({
   activeMode: ViewMode;
   canLogout: boolean;
   contextPanelButton: NavRailAction | null;
-  isSavingTheme: boolean;
   onAddWorkspace: () => void;
   onLogout: () => Promise<void>;
   onHomeClick: () => void;
@@ -15544,7 +15552,6 @@ function FocoNavRail({
         />
         <NavRailButton
           active={theme === "dark"}
-          disabled={isSavingTheme}
           icon={SunMoon}
           label={themeLabel}
           onClick={onToggleTheme}
