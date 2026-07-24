@@ -1441,9 +1441,12 @@ body,
 }
 
 .workspace-nav {
-  padding: 0.625rem;
+  padding: 0;
   min-height: 7.5rem;
   background-color: var(--surface);
+  /* panel-scroll defaults to scrollbar-gutter: stable; don't reserve a blank
+     strip beside the new-chat control when the list isn't scrolling. */
+  scrollbar-gutter: auto;
 }
 
 .model-routing-panel {
@@ -1671,41 +1674,101 @@ body,
   color: var(--muted);
 }
 
-.workspace-item {
-  height: auto;
-  min-height: 2.75rem;
-  gap: 0.5rem;
-  padding-block: 0.375rem;
-  padding-left: 0.75rem;
-  padding-right: 2.5rem;
-  font-size: var(--foco-font-compact);
-}
-
 .workspace-expand-icon {
-  width: 0.875rem;
-  height: 0.875rem;
-  flex: 0 0 0.875rem;
+  width: 1rem;
+  height: 1rem;
+  flex: 0 0 1rem;
 }
 
-.workspace-menu > button:last-child {
-  width: 1.625rem;
-  height: 1.625rem;
+/*
+ * Heading owns the row fill so Trigger and new-chat always share the same
+ * resting background; children stay transparent. Hover paints a different
+ * highlight on the heading (including when expanded).
+ */
+.workspace-accordion .accordion__heading.workspace-accordion-heading {
+  align-items: stretch;
+  gap: 0;
+  background-color: transparent;
+}
+
+/* Selected workspace: quiet resting fill (not the hover highlight). */
+.workspace-accordion .accordion__heading:has(.workspace-item-active) {
+  background-color: color-mix(in oklab, var(--foreground) 4%, transparent);
+}
+
+/* Compact Accordion trigger (docs use py-4; sidebar needs denser rows). */
+.workspace-accordion .accordion__trigger {
+  padding-block: 0.5rem;
+  padding-inline: 0.75rem;
+  border-radius: 0;
+  min-height: 0;
+  height: auto;
+  background-color: transparent;
+}
+
+/* Suppress native per-trigger hover; heading handles hover fill. */
+@media (hover: hover) {
+  .workspace-accordion .accordion__trigger:hover,
+  .workspace-accordion .accordion__trigger[data-hovered="true"] {
+    background-color: transparent;
+  }
+
+  /* Distinct hover highlight — works for idle, selected, and expanded rows. */
+  .workspace-accordion .accordion__heading:hover {
+    background-color: var(--surface-hover);
+  }
+}
+
+/*
+ * New-chat is a HeroUI Button wearing accordion__trigger. Strip Button chrome
+ * so it stays visually identical to Trigger at rest (fill comes from heading).
+ */
+.workspace-accordion .workspace-new-chat-button.button.accordion__trigger {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 2.5rem;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  box-shadow: none;
+  border-radius: 0;
+  transform: none;
+  will-change: auto;
+  /* Symmetric — asymmetric end-only zero from accordion trigger shifts the +. */
+  padding-inline: 0;
+  --button-bg: transparent;
+  --button-bg-hover: transparent;
+  --button-bg-pressed: transparent;
+  --button-fg: inherit;
+  background-color: transparent;
+  color: inherit;
+}
+
+.workspace-accordion .workspace-new-chat-button.button.accordion__trigger svg {
+  /* HeroUI Button applies -mx-0.5 on icons; neutralize for true centering. */
+  margin-inline: 0;
+  margin-block: 0;
+}
+
+.workspace-accordion .workspace-new-chat-button.button.accordion__trigger:hover,
+.workspace-accordion
+  .workspace-new-chat-button.button.accordion__trigger[data-hovered="true"],
+.workspace-accordion .workspace-new-chat-button.button.accordion__trigger:active,
+.workspace-accordion
+  .workspace-new-chat-button.button.accordion__trigger[data-pressed="true"] {
+  transform: none;
+  background-color: transparent;
+}
+
+.workspace-accordion .workspace-accordion-body.accordion__body-inner {
+  padding: 0;
+  color: inherit;
 }
 
 .chat-item {
   min-height: 2.25rem;
   border-radius: 0.5rem;
-  border-color: transparent;
   padding: 0.3125rem 0.45rem;
-  color: var(--muted);
-}
-
-.chat-item:hover,
-.chat-item-active {
-  border-color: transparent;
-  background: var(--accent-soft);
-  box-shadow: none;
-  color: var(--foreground);
 }
 
 .session-status-dot,
@@ -4210,8 +4273,8 @@ summary:focus-visible {
   border-left-color: var(--border);
 }
 
-.chat-item {
-  /* HeroUI Button reads these tokens; keep list rows neutral instead of
+.chat-item.button--ghost {
+  /* HeroUI Button reads these tokens; keep idle rows neutral instead of
      default primary blue + muted text. */
   --button-bg: transparent;
   --button-bg-hover: var(--surface-hover);
@@ -4226,7 +4289,7 @@ summary:focus-visible {
     color 150ms ease;
 }
 
-.chat-item:hover {
+.chat-item.button--ghost:hover {
   --button-bg: var(--surface-hover);
   --button-fg: var(--foreground);
   border-color: var(--border);
@@ -4234,15 +4297,9 @@ summary:focus-visible {
   color: var(--foreground);
 }
 
-.chat-item-active {
-  --button-bg: var(--surface);
+.chat-item.button--tertiary {
   --button-fg: var(--foreground);
-  border-color: var(--accent);
-  background: var(--surface);
   color: var(--foreground);
-  box-shadow:
-    inset 2px 0 0 var(--accent),
-    var(--surface-shadow);
 }
 
 .workspace-show-more-chats {

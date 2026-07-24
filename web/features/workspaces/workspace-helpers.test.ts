@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { chatItemClass, workspaceItemClass, workspaceMenuClass, workspaceNameFromPath } from "./workspace-helpers";
+import {
+  chatItemClass,
+  workspaceItemClass,
+  workspaceNewChatButtonClass,
+  workspaceNameFromPath,
+} from "./workspace-helpers";
 
 describe("workspace helpers", () => {
   it("derives names from Windows and POSIX paths", () => {
@@ -8,17 +13,17 @@ describe("workspace helpers", () => {
     expect(workspaceNameFromPath("/home/fonla/Foco/")).toBe("Foco");
   });
 
-  it("marks active classes explicitly", () => {
+  it("marks active workspace trigger classes without custom chrome", () => {
     expect(workspaceItemClass(true)).toContain("workspace-item-active");
-    expect(workspaceMenuClass(true)).toContain("workspace-menu-active");
-    expect(chatItemClass(true)).toContain("chat-item-active");
-    expect(chatItemClass(false)).not.toContain("chat-item-active");
+    expect(workspaceItemClass(true)).not.toContain("rounded-lg");
+    expect(workspaceNewChatButtonClass(true)).toContain("workspace-item-active");
+    expect(workspaceNewChatButtonClass(true)).toContain("accordion__trigger");
+    expect(workspaceNewChatButtonClass(true)).not.toContain("rounded-lg");
   });
 
-  it("keeps workspace rows roomy enough for the inset new-chat action", () => {
-    expect(workspaceItemClass(false)).toContain("min-h-11");
-    expect(workspaceItemClass(false)).toContain("px-3");
-    expect(workspaceMenuClass(false)).toContain("px-2");
-    expect(workspaceMenuClass(false)).toContain("py-1.5");
+  it("keeps chat row helper layout-only", () => {
+    expect(workspaceNewChatButtonClass(false)).toContain("workspace-new-chat-button");
+    expect(chatItemClass()).toContain("chat-item");
+    expect(chatItemClass()).not.toContain("chat-item-active");
   });
 });

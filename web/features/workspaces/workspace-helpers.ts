@@ -1,5 +1,9 @@
 export function workspaceItemClass(active: boolean) {
-  return `workspace-item flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-semibold ${
+  return `workspace-item min-w-0 ${active ? "workspace-item-active" : ""}`;
+}
+
+export function workspaceNewChatButtonClass(active: boolean) {
+  return `accordion__trigger workspace-new-chat-button ${
     active ? "workspace-item-active" : ""
   }`;
 }
@@ -11,18 +15,8 @@ export function workspaceNameFromPath(path: string) {
   return parts.at(-1) ?? "";
 }
 
-export function workspaceMenuClass(active: boolean) {
-  return `workspace-menu flex min-w-0 items-center gap-1 px-2 py-1.5 ${
-    active ? "workspace-menu-active" : ""
-  }`;
-}
-
-export function chatItemClass(active: boolean) {
-  return `chat-item flex min-h-11 min-w-0 w-full items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-xs font-medium ${
-    active
-      ? "chat-item-active border-[var(--accent)] bg-[var(--surface)] text-[var(--foreground)] shadow-sm"
-      : "border-transparent text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
-  }`;
+export function chatItemClass() {
+  return "chat-item flex min-h-11 min-w-0 w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-medium";
 }
 
 export function moveItemId(

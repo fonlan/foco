@@ -216,7 +216,7 @@ import {
   reorderWorkspacesByIds,
   sameStringList,
   workspaceItemClass,
-  workspaceMenuClass,
+  workspaceNewChatButtonClass,
   workspaceNameFromPath,
 } from "./features/workspaces/workspace-helpers";
 import { WorkspaceDialog } from "./features/workspaces/WorkspaceDialog";
@@ -225,7 +225,19 @@ import {
   type FilePickerSelection,
 } from "./features/file-picker/FilePickerDialog";
 import { DeleteChatDialog } from "./features/chat/DeleteChatDialog";
-import { Button, ContextMenu, Input, Label, Modal, Radio, RadioGroup, Spinner, TextArea, TextField } from "./shared/ui";
+import {
+  Accordion,
+  Button,
+  ContextMenu,
+  Input,
+  Label,
+  Modal,
+  Radio,
+  RadioGroup,
+  Spinner,
+  TextArea,
+  TextField,
+} from "./shared/ui";
 import { ChatPanel, type ChatPanelHelpers } from "./features/chat/ChatPanel";
 import { ModelRoutingPanel } from "./features/models/ModelRoutingPanel";
 import {
@@ -12835,11 +12847,6 @@ export function App() {
     return runSucceeded ? requestChatId : null;
   }
 
-  function toggleWorkspace(workspaceId: string) {
-    const isCollapsingWorkspace = expandedWorkspaceId === workspaceId;
-    setExpandedWorkspaceId(isCollapsingWorkspace ? null : workspaceId);
-  }
-
   async function showMoreWorkspaceChats(workspaceId: string) {
     const paging = workspaceChatPaging[workspaceId];
     if (!paging?.hasMore || paging.isLoading) {
@@ -13422,6 +13429,7 @@ export function App() {
   const sidebarWorkspaces = isWorkspaceSearchActive
     ? workspaceChatSearchResults
     : displayedWorkspaces;
+
   const updateNavButton =
     updateStatus?.updateAvailable && !updateStatus.error
       ? {
@@ -13752,14 +13760,14 @@ export function App() {
 
                 <nav
                   aria-label={t("Workspace list")}
-                  className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto px-2 py-3"
+                  className="workspace-nav panel-scroll min-h-0 flex-1 overflow-y-auto"
                 >
                   {sidebarWorkspaces.length ? (
                     sidebarWorkspaces.map((workspace) => {
+                      const isActive = workspace.id === activeWorkspace?.id;
                       const isExpanded =
                         isWorkspaceSearchActive ||
                         expandedWorkspaceId === workspace.id;
-                      const isActive = workspace.id === activeWorkspace?.id;
                       const workspaceChats = isWorkspaceSearchActive
                         ? workspace.chats.map(
                             (chat): WorkspaceChatListItem => ({
@@ -13803,274 +13811,316 @@ export function App() {
                           }
                           onDrop={(event) => void handleWorkspaceDrop(event)}
                         >
-                          <div className={`${workspaceMenuClass(isActive)} relative`}>
-                            <Button
-                              aria-expanded={isExpanded}
-                              className={`${workspaceItemClass(isActive)} pr-10`}
-                              onPress={() => toggleWorkspace(workspace.id)}
-                              type="button"
-                              variant={isActive ? "tertiary" : "ghost"}
-                            >
-                              {isExpanded ? (
-                                <ChevronDown
-                                  aria-hidden="true"
-                                  className="workspace-expand-icon"
-                                />
-                              ) : (
-                                <ChevronRight
-                                  aria-hidden="true"
-                                  className="workspace-expand-icon"
-                                />
-                              )}
-                              <span className="relative inline-flex shrink-0">
-                                <WorkspaceIcon
-                                  className="size-4 shrink-0 rounded object-cover"
-                                  fallbackClassName="size-4 shrink-0"
-                                  isRemote={isRemoteWorkspace}
-                                  logoUrl={workspace.logoUrl}
-                                />
-                                {isRemoteWorkspace ? (
-                                  <span
-                                    className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`}
-                                  />
-                                ) : null}
-                              </span>
-                              <span className="min-w-0 flex-1 text-left">
-                                <span className="block truncate">
-                                  {workspace.name}
-                                </span>
-                                <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
-                                  {workspace.displayPath}
-                                </span>
-                              </span>
-                            </Button>
-                            <Button
-                              aria-label={t("New chat in {name}", {
-                                name: workspace.name,
-                              })}
-                              className="workspace-new-chat-button absolute right-2 top-1/2 z-10 -translate-y-1/2"
-                              isIconOnly
-                              isDisabled={isRemoteWorkspace && !isRemoteReady}
-                              onPress={() => {
-                                if (isRemoteWorkspace && !isRemoteReady) {
-                                  setError(
-                                    t(
-                                      "Remote workspace is offline. Retry the connection before opening remote operations.",
-                                    ),
-                                  );
-                                  return;
-                                }
-                                startNewWorkspaceChat(workspace.id);
-                              }}
-                              size="sm"
-                              type="button"
-                              variant="ghost"
-                            >
-                              <Plus aria-hidden="true" className="size-4" />
-                            </Button>
-                          </div>
-                          {isRemoteWorkspace && !isRemoteReady ? (
-                            <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-[var(--muted)]">
-                              {workspace.lastRemoteError ? (
-                                <span className="min-w-0 flex-1 truncate">
-                                  {workspace.lastRemoteError}
-                                </span>
-                              ) : null}
-                              <Button
-                                className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
-                                isDisabled={
-                                  retryingRemoteWorkspaceId === workspace.id
-                                }
-                                onPress={() =>
-                                  void retryRemoteWorkspace(workspace)
-                                }
-                                type="button"
-                                variant="ghost"
-                              >
-                                {retryingRemoteWorkspaceId === workspace.id ? (
-                                  <LoaderCircle
-                                    aria-hidden="true"
-                                    className="size-3 animate-spin"
-                                  />
-                                ) : (
-                                  <RefreshCw
-                                    aria-hidden="true"
-                                    className="size-3"
-                                  />
-                                )}
-                                {t("Retry")}
-                              </Button>
-                            </div>
-                          ) : null}
-                          {isExpanded ? (
-                            <div className="mt-1 space-y-1 border-l border-[color-mix(in_oklab,var(--border)_80%,transparent)] pl-3 pr-1.5">
-                              {visibleChats.length > 0 ? (
-                                <>
-                                  {visibleChats.map((chat) => {
-                                    const chatKey = chatRunKey(
-                                      workspace.id,
-                                      chat.id,
-                                    );
-                                    const scheduledChatKey =
-                                      chat.scheduledChatKey ?? null;
-                                    const sessionStatus =
-                                      chatSessionVisualStatusFor(chatKey, {
-                                        scheduledChatKey,
-                                        scheduledStatus:
-                                          chat.scheduledStatus ?? null,
-                                        workspaceActiveRun: chat.activeRun,
-                                      });
-                                    const statusDotClass =
-                                      chatSessionStatusDotClass(
-                                        sessionStatus.kind,
+                          <Accordion
+                            className="workspace-accordion"
+                            expandedKeys={isExpanded ? [workspace.id] : []}
+                            hideSeparator
+                            onExpandedChange={(keys) => {
+                              if (isWorkspaceSearchActive) {
+                                return;
+                              }
+
+                              setExpandedWorkspaceId(
+                                keys.has(workspace.id) ? workspace.id : null,
+                              );
+                            }}
+                          >
+                            <Accordion.Item id={workspace.id}>
+                              <Accordion.Heading className="workspace-accordion-heading">
+                                <Accordion.Trigger
+                                  className={workspaceItemClass(isActive)}
+                                >
+                                  <span className="relative mr-3 inline-flex shrink-0">
+                                    <WorkspaceIcon
+                                      className="size-4 shrink-0 rounded object-cover"
+                                      fallbackClassName="size-4 shrink-0"
+                                      isRemote={isRemoteWorkspace}
+                                      logoUrl={workspace.logoUrl}
+                                    />
+                                    {isRemoteWorkspace ? (
+                                      <span
+                                        className={`absolute -bottom-0.5 -right-0.5 size-2 rounded-full border border-white ${workspaceConnectionDotClass(workspace.connectionStatus)}`}
+                                      />
+                                    ) : null}
+                                  </span>
+                                  <span className="min-w-0 flex-1 text-left">
+                                    <span className="block truncate">
+                                      {workspace.name}
+                                    </span>
+                                    <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
+                                      {workspace.displayPath}
+                                    </span>
+                                  </span>
+                                  <Accordion.Indicator>
+                                    <ChevronDown
+                                      aria-hidden="true"
+                                      className="workspace-expand-icon"
+                                    />
+                                  </Accordion.Indicator>
+                                </Accordion.Trigger>
+                                <Button
+                                  aria-label={t("New chat in {name}", {
+                                    name: workspace.name,
+                                  })}
+                                  className={workspaceNewChatButtonClass(
+                                    isActive,
+                                  )}
+                                  isDisabled={
+                                    isRemoteWorkspace && !isRemoteReady
+                                  }
+                                  onPress={() => {
+                                    if (
+                                      isRemoteWorkspace &&
+                                      !isRemoteReady
+                                    ) {
+                                      setError(
+                                        t(
+                                          "Remote workspace is offline. Retry the connection before opening remote operations.",
+                                        ),
                                       );
-                                    const isChatActive =
-                                      activeWorkspace?.id === workspace.id &&
-                                      activeChatId === chat.id;
-                                    const chatDiffStats = chat.codeChangeStats;
-
-                                    return (
-                                      <Button
-                                        aria-current={
-                                          isChatActive ? "page" : undefined
-                                        }
-                                        className={chatItemClass(isChatActive)}
-                                        key={chat.id}
-                                        // Long-press and context-menu state need their pointer handlers below.
-                                        onClick={() => {
-                                          if (
-                                            suppressNextWorkspaceChatClickRef.current
-                                          ) {
-                                            suppressNextWorkspaceChatClickRef.current = false;
-                                            return;
-                                          }
-
-                                          selectWorkspaceChat(
+                                      return;
+                                    }
+                                    startNewWorkspaceChat(workspace.id);
+                                  }}
+                                  type="button"
+                                  variant="ghost"
+                                >
+                                  <Plus
+                                    aria-hidden="true"
+                                    className="size-4"
+                                  />
+                                </Button>
+                              </Accordion.Heading>
+                              {isRemoteWorkspace && !isRemoteReady ? (
+                                <div className="ml-9 mt-1 flex items-center gap-2 pr-1.5 text-[11px] leading-4 text-[var(--muted)]">
+                                  {workspace.lastRemoteError ? (
+                                    <span className="min-w-0 flex-1 truncate">
+                                      {workspace.lastRemoteError}
+                                    </span>
+                                  ) : null}
+                                  <Button
+                                    className="inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 font-semibold text-[var(--accent-soft-foreground)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] disabled:cursor-not-allowed disabled:text-[var(--muted)]"
+                                    isDisabled={
+                                      retryingRemoteWorkspaceId ===
+                                      workspace.id
+                                    }
+                                    onPress={() =>
+                                      void retryRemoteWorkspace(workspace)
+                                    }
+                                    type="button"
+                                    variant="ghost"
+                                  >
+                                    {retryingRemoteWorkspaceId ===
+                                    workspace.id ? (
+                                      <LoaderCircle
+                                        aria-hidden="true"
+                                        className="size-3 animate-spin"
+                                      />
+                                    ) : (
+                                      <RefreshCw
+                                        aria-hidden="true"
+                                        className="size-3"
+                                      />
+                                    )}
+                                    {t("Retry")}
+                                  </Button>
+                                </div>
+                              ) : null}
+                              <Accordion.Panel>
+                                <Accordion.Body className="workspace-accordion-body">
+                                  {isExpanded ? (
+                                  <div className="mt-1 space-y-1 border-l border-[color-mix(in_oklab,var(--border)_80%,transparent)] pl-3 pr-1.5">
+                                    {visibleChats.length > 0 ? (
+                                      <>
+                                        {visibleChats.map((chat) => {
+                                          const chatKey = chatRunKey(
                                             workspace.id,
                                             chat.id,
                                           );
-                                        }}
-                                        onContextMenu={(event) =>
-                                          openWorkspaceChatContextMenu(
-                                            event,
-                                            workspace,
-                                            chat,
-                                          )
-                                        }
-                                        onPointerCancel={
-                                          cancelWorkspaceChatLongPress
-                                        }
-                                        onPointerDown={(event) =>
-                                          startWorkspaceChatLongPress(
-                                            event,
-                                            workspace,
-                                            chat,
-                                          )
-                                        }
-                                        onPointerLeave={
-                                          cancelWorkspaceChatLongPress
-                                        }
-                                        onPointerUp={
-                                          cancelWorkspaceChatLongPress
-                                        }
-                                        type="button"
-                                        variant="ghost"
-                                      >
-                                        <span
-                                          aria-hidden="true"
-                                          className={`session-status-dot ${statusDotClass}`}
-                                        />
-                                        <span className="min-w-0 flex-1">
-                                          <span className="block truncate">
-                                            {chat.title}
-                                          </span>
-                                          <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
-                                            <span className="min-w-0 truncate">
-                                              {formatChatCreatedAt(
-                                                chat.createdAt,
-                                              )}
-                                            </span>
-                                            {chatDiffStats &&
-                                            hasGitDiffStats(chatDiffStats) ? (
+                                          const scheduledChatKey =
+                                            chat.scheduledChatKey ?? null;
+                                          const sessionStatus =
+                                            chatSessionVisualStatusFor(
+                                              chatKey,
+                                              {
+                                                scheduledChatKey,
+                                                scheduledStatus:
+                                                  chat.scheduledStatus ?? null,
+                                                workspaceActiveRun:
+                                                  chat.activeRun,
+                                              },
+                                            );
+                                          const statusDotClass =
+                                            chatSessionStatusDotClass(
+                                              sessionStatus.kind,
+                                            );
+                                          const isChatActive =
+                                            activeWorkspace?.id ===
+                                              workspace.id &&
+                                            activeChatId === chat.id;
+                                          const chatDiffStats =
+                                            chat.codeChangeStats;
+
+                                          return (
+                                            <Button
+                                              aria-current={
+                                                isChatActive
+                                                  ? "page"
+                                                  : undefined
+                                              }
+                                              className={chatItemClass()}
+                                              key={chat.id}
+                                              // Long-press and context-menu state need their pointer handlers below.
+                                              onClick={() => {
+                                                if (
+                                                  suppressNextWorkspaceChatClickRef.current
+                                                ) {
+                                                  suppressNextWorkspaceChatClickRef.current = false;
+                                                  return;
+                                                }
+
+                                                selectWorkspaceChat(
+                                                  workspace.id,
+                                                  chat.id,
+                                                );
+                                              }}
+                                              onContextMenu={(event) =>
+                                                openWorkspaceChatContextMenu(
+                                                  event,
+                                                  workspace,
+                                                  chat,
+                                                )
+                                              }
+                                              onPointerCancel={
+                                                cancelWorkspaceChatLongPress
+                                              }
+                                              onPointerDown={(event) =>
+                                                startWorkspaceChatLongPress(
+                                                  event,
+                                                  workspace,
+                                                  chat,
+                                                )
+                                              }
+                                              onPointerLeave={
+                                                cancelWorkspaceChatLongPress
+                                              }
+                                              onPointerUp={
+                                                cancelWorkspaceChatLongPress
+                                              }
+                                              type="button"
+                                              variant={
+                                                isChatActive
+                                                  ? "tertiary"
+                                                  : "ghost"
+                                              }
+                                            >
                                               <span
-                                                aria-label={t(
-                                                  "Code changes +{additions} -{deletions}",
-                                                  {
-                                                    additions:
-                                                      chatDiffStats.additions,
-                                                    deletions:
-                                                      chatDiffStats.deletions,
-                                                  },
-                                                )}
-                                                className="chat-diff-stats"
-                                                title={t(
-                                                  "Code changes +{additions} -{deletions}",
-                                                  {
-                                                    additions:
-                                                      chatDiffStats.additions,
-                                                    deletions:
-                                                      chatDiffStats.deletions,
-                                                  },
-                                                )}
-                                              >
-                                                <span className="chat-diff-add">
-                                                  +{chatDiffStats.additions}
+                                                aria-hidden="true"
+                                                className={`session-status-dot ${statusDotClass}`}
+                                              />
+                                              <span className="min-w-0 flex-1">
+                                                <span className="block truncate">
+                                                  {chat.title}
                                                 </span>
-                                                <span className="chat-diff-delete">
-                                                  -{chatDiffStats.deletions}
+                                                <span className="mt-0.5 flex min-w-0 items-center justify-between gap-2 text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
+                                                  <span className="min-w-0 truncate">
+                                                    {formatChatCreatedAt(
+                                                      chat.createdAt,
+                                                    )}
+                                                  </span>
+                                                  {chatDiffStats &&
+                                                  hasGitDiffStats(
+                                                    chatDiffStats,
+                                                  ) ? (
+                                                    <span
+                                                      aria-label={t(
+                                                        "Code changes +{additions} -{deletions}",
+                                                        {
+                                                          additions:
+                                                            chatDiffStats.additions,
+                                                          deletions:
+                                                            chatDiffStats.deletions,
+                                                        },
+                                                      )}
+                                                      className="chat-diff-stats"
+                                                      title={t(
+                                                        "Code changes +{additions} -{deletions}",
+                                                        {
+                                                          additions:
+                                                            chatDiffStats.additions,
+                                                          deletions:
+                                                            chatDiffStats.deletions,
+                                                        },
+                                                      )}
+                                                    >
+                                                      <span className="chat-diff-add">
+                                                        +
+                                                        {
+                                                          chatDiffStats.additions
+                                                        }
+                                                      </span>
+                                                      <span className="chat-diff-delete">
+                                                        -
+                                                        {
+                                                          chatDiffStats.deletions
+                                                        }
+                                                      </span>
+                                                    </span>
+                                                  ) : null}
                                                 </span>
                                               </span>
-                                            ) : null}
-                                          </span>
-                                        </span>
-                                      </Button>
-                                    );
-                                  })}
-                                  {hiddenChatCount > 0 ? (
-                                    <Button
-                                      aria-label={t(
-                                        "Show {count} more chats in {name}",
-                                        {
-                                          count: nextVisibleChatCount,
-                                          name: workspace.name,
-                                        },
-                                      )}
-                                      className="workspace-show-more-chats flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
-                                      isDisabled={paging?.isLoading}
-                                      onPress={() =>
-                                        void showMoreWorkspaceChats(
-                                          workspace.id,
-                                        )
-                                      }
-                                      type="button"
-                                      variant="ghost"
-                                    >
-                                      <ChevronDown
-                                        aria-hidden="true"
-                                        className="size-3.5 shrink-0"
-                                      />
-                                      <span className="min-w-0 flex-1">
-                                        <span className="block truncate">
-                                          {t("Show {count} more chats", {
-                                            count: nextVisibleChatCount,
-                                          })}
-                                        </span>
-                                        <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
-                                          {t("{count} hidden chats", {
-                                            count: hiddenChatCount,
-                                          })}
-                                        </span>
-                                      </span>
-                                    </Button>
+                                            </Button>
+                                          );
+                                        })}
+                                        {hiddenChatCount > 0 ? (
+                                          <Button
+                                            aria-label={t(
+                                              "Show {count} more chats in {name}",
+                                              {
+                                                count: nextVisibleChatCount,
+                                                name: workspace.name,
+                                              },
+                                            )}
+                                            className="workspace-show-more-chats flex min-h-10 min-w-0 w-full items-center gap-2 rounded-lg border border-transparent px-2 py-1.5 text-left text-xs font-medium text-[var(--muted)] hover:border-[var(--border)] hover:bg-[color-mix(in_oklab,var(--surface)_80%,transparent)] hover:text-[var(--foreground)]"
+                                            isDisabled={paging?.isLoading}
+                                            onPress={() =>
+                                              void showMoreWorkspaceChats(
+                                                workspace.id,
+                                              )
+                                            }
+                                            type="button"
+                                            variant="ghost"
+                                          >
+                                            <ChevronDown
+                                              aria-hidden="true"
+                                              className="size-3.5 shrink-0"
+                                            />
+                                            <span className="min-w-0 flex-1">
+                                              <span className="block truncate">
+                                                {t("Show {count} more chats", {
+                                                  count: nextVisibleChatCount,
+                                                })}
+                                              </span>
+                                              <span className="mt-0.5 block truncate text-[0.68rem] font-normal leading-tight text-[var(--muted)]">
+                                                {t("{count} hidden chats", {
+                                                  count: hiddenChatCount,
+                                                })}
+                                              </span>
+                                            </span>
+                                          </Button>
+                                        ) : null}
+                                      </>
+                                    ) : (
+                                      <div className="rounded-lg px-2 py-1.5 text-xs text-[var(--muted)]">
+                                        {t("No chats")}
+                                      </div>
+                                    )}
+                                  </div>
                                   ) : null}
-                                </>
-                              ) : (
-                                <div className="rounded-lg px-2 py-1.5 text-xs text-[var(--muted)]">
-                                  {t("No chats")}
-                                </div>
-                              )}
-                            </div>
-                          ) : null}
+                                </Accordion.Body>
+                              </Accordion.Panel>
+                            </Accordion.Item>
+                          </Accordion>
                         </div>
                       );
                     })
