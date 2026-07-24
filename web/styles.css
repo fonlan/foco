@@ -2546,8 +2546,8 @@ body,
   padding: 0.5rem 0.75rem;
 }
 
-/* Keep the Source Control branch/target select as short as the Spec subtitle
-   line so this header matches other context-panel page headers. */
+/* Inline branch/target select next to the Source Control title; keep it
+   shorter than the size-8 icon so the page header stays single-row. */
 .context-panel-page-header .source-control-target-trigger,
 .context-panel-page-header .source-control-target-trigger.select__trigger {
   height: 1.5rem;
@@ -2556,6 +2556,32 @@ body,
   font-size: 0.6875rem;
   line-height: 1;
   box-shadow: none;
+}
+
+/* File picker list rows are HeroUI Buttons; neutralize primary blue tokens. */
+.file-picker-entry {
+  --button-bg: transparent;
+  --button-bg-hover: var(--surface-hover);
+  --button-bg-pressed: var(--surface-hover);
+  --button-fg: var(--foreground);
+  border-color: transparent;
+  background: transparent;
+  color: var(--foreground);
+}
+
+.file-picker-entry:hover {
+  --button-bg: var(--surface-hover);
+  background: var(--surface-hover);
+}
+
+.file-picker-entry-selected,
+.file-picker-entry-selected:hover {
+  --button-bg: var(--accent-soft);
+  --button-bg-hover: var(--accent-soft);
+  --button-bg-pressed: var(--accent-soft);
+  --button-fg: var(--accent-soft-foreground);
+  background: var(--accent-soft);
+  color: var(--accent-soft-foreground);
 }
 
 @container (max-width: 32rem) {

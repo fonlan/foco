@@ -353,8 +353,9 @@ export function FilePickerDialog({
                           !selectable && !(entry.isDirectory && mode === "file")
                         }
                         aria-pressed={selected}
-                        className={`flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-focus ${selected ? "bg-accent text-accent-foreground" : "hover:bg-default"} ${entry.disabled ? "opacity-50" : ""}`}
+                        className={`file-picker-entry flex w-full items-center gap-3 rounded-xl px-3 py-2 text-left text-sm outline-none focus-visible:ring-2 focus-visible:ring-focus ${selected ? "file-picker-entry-selected" : ""} ${entry.disabled ? "opacity-50" : ""}`}
                         key={entry.path}
+                        variant="ghost"
                         onPress={() => {
                           if (entry.isDirectory && mode === "file") {
                             openPath(entry.path);

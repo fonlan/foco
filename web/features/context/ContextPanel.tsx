@@ -2695,38 +2695,39 @@ function SourceControlPanel({
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <GitCompare aria-hidden="true" className="size-4" />
           </span>
-          <div className="min-w-0 flex-1">
-            <span className="foco-eyebrow">{t("Source Control")}</span>
-            <Select
+          <h2 className="shrink-0 truncate text-sm font-semibold text-[var(--foreground)]">
+            {t("Source Control")}
+          </h2>
+          <Select
+            aria-label={t("Source Control target")}
+            className="min-w-0 flex-1"
+            isDisabled={sourceControlTargets.length <= 1 || isLoading}
+            selectedKey={sourceControlTargetKey}
+            onSelectionChange={(key) => onTargetChange(String(key ?? ""))}
+          >
+            <Label className="sr-only">{t("Source Control target")}</Label>
+            <Select.Trigger
               aria-label={t("Source Control target")}
-              isDisabled={sourceControlTargets.length <= 1 || isLoading}
-              selectedKey={sourceControlTargetKey}
-              onSelectionChange={(key) => onTargetChange(String(key ?? ""))}
+              className="source-control-target-trigger flex h-6 min-h-0 w-full min-w-0 max-w-full items-center truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-1.5 py-0 text-[0.6875rem] font-medium leading-none text-[var(--muted)] shadow-none outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
             >
-              <Label className="sr-only">{t("Source Control target")}</Label>
-              <Select.Trigger
-                aria-label={t("Source Control target")}
-                className="source-control-target-trigger mt-0.5 flex h-6 min-h-0 w-full min-w-0 max-w-full items-center truncate rounded-md border border-[var(--border)] bg-[var(--surface)] px-1.5 py-0 text-[0.6875rem] font-medium leading-none text-[var(--muted)] shadow-none outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-              >
-                <Select.Value />
-                <Select.Indicator />
-              </Select.Trigger>
-              <Select.Popover>
-                <ListBox>
-                  {sourceControlTargets.map((target) => (
-                    <ListBox.Item
-                      id={target.key}
-                      key={target.key}
-                      textValue={target.label}
-                    >
-                      {target.label}
-                      <ListBox.ItemIndicator />
-                    </ListBox.Item>
-                  ))}
-                </ListBox>
-              </Select.Popover>
-            </Select>
-          </div>
+              <Select.Value />
+              <Select.Indicator />
+            </Select.Trigger>
+            <Select.Popover>
+              <ListBox>
+                {sourceControlTargets.map((target) => (
+                  <ListBox.Item
+                    id={target.key}
+                    key={target.key}
+                    textValue={target.label}
+                  >
+                    {target.label}
+                    <ListBox.ItemIndicator />
+                  </ListBox.Item>
+                ))}
+              </ListBox>
+            </Select.Popover>
+          </Select>
         </div>
         <Button
           aria-label={t("Refresh diff")}
