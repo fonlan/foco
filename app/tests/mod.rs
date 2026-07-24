@@ -8,7 +8,8 @@ use std::{
 
 use crate::runtime::{
     MAX_REASONING_LOOP_RECOVERIES_PER_RUN, REASONING_LOOP_GUARD_SOURCE,
-    REASONING_LOOP_RECOVERY_USER_TEXT, ToolLoopBeforeExecutionAction, agent_run_event_kind,
+    REASONING_LOOP_RECOVERY_USER_TEXT, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
+    agent_run_event_kind,
 };
 use axum::{
     Json, Router,
@@ -10714,6 +10715,141 @@ fn finalized_assistant_parts_persist_user_interruption_boundary_and_replay() {
     assert_eq!(replayed[1].content, REASONING_LOOP_RECOVERY_USER_TEXT);
     assert_eq!(replayed[2].role, NeutralChatRole::Assistant);
     assert_eq!(replayed[2].content, "Recovered answer.");
+}
+
+#[test]
+fn finalized_assistant_parts_persist_tool_call_loop_guard_and_replay_without_guidance_wrap() {
+    let loop_error = "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+    let events = [
+        (
+            "text_delta",
+            json!({
+                "assistantMessageId": "assistant-tool-loop",
+                "type": "textDelta",
+                "delta": "Calling tools again."
+            }),
+        ),
+        (
+            "guidance_applied",
+            json!({
+                "type": "guidanceApplied",
+                "id": "msg-guidance-tool-loop-1",
+                "content": loop_error,
+                "source": TOOL_CALL_LOOP_GUARD_SOURCE,
+                "interruptedAssistantId": "assistant-tool-loop",
+                "interruptedAssistantMetrics": {
+                    "modelId": "model",
+                    "providerId": "provider",
+                    "totalLatencyMs": 20,
+                    "firstTokenLatencyMs": 2,
+                    "outputTokens": null,
+                    "llmRequestIds": ["req-tool-loop-1"]
+                },
+                "parts": []
+            }),
+        ),
+        (
+            "text_delta",
+            json!({
+                "assistantMessageId": "assistant-tool-loop",
+                "type": "textDelta",
+                "delta": "Recovered without repeating tools."
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-06-18T10:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let stored_parts = finalized_assistant_message_parts(
+        "assistant-tool-loop",
+        &events,
+        "Recovered without repeating tools.",
+        None,
+        &[],
+        None,
+    )
+    .expect("stored parts");
+    assert!(matches!(
+        &stored_parts[0],
+        StoredChatMessagePart::Text { text } if text == "Calling tools again."
+    ));
+    assert!(matches!(
+        &stored_parts[1],
+        StoredChatMessagePart::UserInterruption {
+            content,
+            source,
+            interrupted_assistant_metrics,
+            ..
+        } if content == loop_error
+            && source == TOOL_CALL_LOOP_GUARD_SOURCE
+            && interrupted_assistant_metrics.as_ref().is_some_and(|metrics| {
+                metrics.total_latency_ms == Some(20) && metrics.model_id == "model"
+            })
+    ));
+    assert!(matches!(
+        &stored_parts[2],
+        StoredChatMessagePart::Text { text } if text == "Recovered without repeating tools."
+    ));
+
+    let metadata_json = assistant_message_metadata_json(
+        None,
+        &[],
+        &CodeChangeStats::default(),
+        None,
+        Some(&stored_parts),
+        None,
+    )
+    .expect("assistant metadata");
+    let public_parts = assistant_parts_from_metadata(&metadata_json, &[])
+        .expect("hydrate parts")
+        .expect("stored parts present");
+    assert!(matches!(
+        &public_parts[1],
+        ChatMessagePart::UserInterruption {
+            content,
+            source,
+            ..
+        } if content == loop_error && source == TOOL_CALL_LOOP_GUARD_SOURCE
+    ));
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    database
+        .insert_chat("chat-tool-loop", "Tool loop")
+        .expect("chat");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-tool-loop",
+            chat_id: "chat-tool-loop",
+            role: "assistant",
+            content: "Recovered without repeating tools.",
+            sequence: 1,
+            metadata_json: Some(&metadata_json),
+        })
+        .expect("assistant message");
+    let message = database
+        .message("assistant-tool-loop")
+        .expect("lookup")
+        .expect("message");
+    let replayed =
+        neutral_messages_from_record(&database, message, &std::collections::HashSet::new())
+            .expect("replay");
+    assert_eq!(replayed.len(), 3);
+    assert_eq!(replayed[0].role, NeutralChatRole::Assistant);
+    assert_eq!(replayed[0].content, "Calling tools again.");
+    assert_eq!(replayed[1].role, NeutralChatRole::User);
+    // Automatic guard sources must replay raw control text without manual guidance wrapping.
+    assert_eq!(replayed[1].content, loop_error);
+    assert!(!replayed[1]
+        .content
+        .contains("User guidance for the current in-progress run"));
+    assert_eq!(replayed[2].role, NeutralChatRole::Assistant);
+    assert_eq!(replayed[2].content, "Recovered without repeating tools.");
 }
 
 #[test]

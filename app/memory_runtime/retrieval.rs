@@ -1614,7 +1614,7 @@ fn replay_stored_assistant_parts(
             StoredChatMessagePart::UserInterruption {
                 content, source, ..
             } => {
-                let provider_content = if source == REASONING_LOOP_GUARD_SOURCE {
+                let provider_content = if is_automatic_guard_source(&source) {
                     content
                 } else {
                     format!("User guidance for the current in-progress run:\n\n{content}")

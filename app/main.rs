@@ -158,9 +158,10 @@ use crate::runtime::{
     RipgrepStatus, RipgrepToolSummary, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
     ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry, chat_run_subscription_stream,
     default_guidance_source, detect_ripgrep, execute_tool_calls_parallel, image_model_available,
-    insert_agent_event, is_agent_tool_name, open_workspace_database_ordinary_with_pre_stream_retry,
-    pending_tool_calls, reasoning_loop_guard_message, recently_active_code_graph_workspaces,
-    ripgrep_tool_summary, run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
+    insert_agent_event, is_agent_tool_name, is_automatic_guard_source,
+    open_workspace_database_ordinary_with_pre_stream_retry, pending_tool_calls,
+    reasoning_loop_guard_message, recently_active_code_graph_workspaces, ripgrep_tool_summary,
+    run_chat_context_in_background, spawn_api_audit_cleanup_scheduler,
     spawn_code_graph_index_initialization, try_register_implicit_wait_for_undelivered_children,
     validate_agent_snapshot_for_workspace,
 };
@@ -7500,9 +7501,7 @@ fn append_guidance_message(
     message_context_sources: &mut Vec<PromptContextSource>,
     guidance: &GuidanceMessage,
 ) {
-    let content = if guidance.source == REASONING_LOOP_GUARD_SOURCE
-        || guidance.source == TOOL_CALL_LOOP_GUARD_SOURCE
-    {
+    let content = if is_automatic_guard_source(&guidance.source) {
         // Automatic guard recovery text is already the provider-facing control message.
         guidance.content.clone()
     } else {

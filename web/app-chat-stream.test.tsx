@@ -3570,6 +3570,377 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows tool-call-loop recovery as a non-editable synthetic user bubble", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const loopError =
+      "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "About to call tools again.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        content: loopError,
+        id: "tool-loop-1",
+        interruptedAssistantId: "message-assistant-stream",
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1500,
+        },
+        parts: [],
+        source: "toolCallLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    const recoveryText = await screen.findByText(loopError);
+    const recoveryRow = recoveryText.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(recoveryRow).not.toBeNull();
+    expect(recoveryRow?.className).toContain("message-row-user");
+    expect(
+      within(recoveryRow as HTMLElement).queryByText("Guidance pending"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(recoveryRow as HTMLElement).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText(/error/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: "Recovered without repeating tools.",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        toolCall: {
+          id: "call-after-tool-loop",
+          input: {},
+          isError: false,
+          name: "noop",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const recoveredAnswer = await screen.findByText(
+      "Recovered without repeating tools.",
+    );
+    const recoveredRow = recoveredAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(recoveredRow).not.toBeNull();
+    expect(recoveredRow).not.toBe(recoveryRow);
+    expect(
+      recoveryText.compareDocumentPosition(recoveredAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      within(recoveredRow as HTMLElement).getByText(/noop/),
+    ).toBeInTheDocument();
+
+    const interruptedRow = screen
+      .getByText("About to call tools again.")
+      .closest(".message-row") as HTMLElement | null;
+    expect(interruptedRow).not.toBeNull();
+    expect(
+      within(interruptedRow as HTMLElement).queryByText(
+        "Recovered without repeating tools.",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      within(interruptedRow as HTMLElement).queryByText(/noop/),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("routes consecutive tool-call-loop recoveries to the latest assistant bubble", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const durableAssistantId = "message-assistant-stream";
+    const recoveryText =
+      "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "first tool loop text",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        content: recoveryText,
+        id: "tool-loop-1",
+        interruptedAssistantId: durableAssistantId,
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1000,
+        },
+        parts: [],
+        source: "toolCallLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "first tool recovery answer",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        toolCall: {
+          id: "call-after-first-tool-loop",
+          input: {},
+          isError: false,
+          name: "first_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const firstRecoveryAnswer = await screen.findByText(
+      "first tool recovery answer",
+    );
+    const firstRecoveryAnswerRow = firstRecoveryAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(firstRecoveryAnswerRow).not.toBeNull();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).getByText(/first_tool/),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "second tool loop text",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        content: recoveryText,
+        id: "tool-loop-2",
+        interruptedAssistantId: durableAssistantId,
+        interruptedAssistantMetrics: {
+          firstTokenLatencyMs: null,
+          modelId: "gpt-test",
+          outputTokens: null,
+          providerId: "openai",
+          totalLatencyMs: 1500,
+        },
+        parts: [],
+        source: "toolCallLoopGuard",
+        type: "guidanceApplied",
+      });
+    });
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        delta: "second tool recovery answer",
+        type: "textDelta",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: durableAssistantId,
+        toolCall: {
+          id: "call-after-second-tool-loop",
+          input: {},
+          isError: false,
+          name: "second_tool",
+          output: null,
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const secondRecoveryAnswer = await screen.findByText(
+      "second tool recovery answer",
+    );
+    const secondRecoveryAnswerRow = secondRecoveryAnswer.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(secondRecoveryAnswerRow).not.toBeNull();
+    expect(secondRecoveryAnswerRow).not.toBe(firstRecoveryAnswerRow);
+
+    const recoveryBubbles = screen.getAllByText(recoveryText);
+    expect(recoveryBubbles).toHaveLength(2);
+    const firstRecoveryRow = recoveryBubbles[0].closest(
+      ".message-row",
+    ) as HTMLElement;
+    const secondRecoveryRow = recoveryBubbles[1].closest(
+      ".message-row",
+    ) as HTMLElement;
+    expect(firstRecoveryRow.className).toContain("message-row-user");
+    expect(secondRecoveryRow.className).toContain("message-row-user");
+    expect(
+      within(firstRecoveryRow).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(secondRecoveryRow).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).getByText(/second_tool/),
+    ).toBeInTheDocument();
+    expect(
+      within(secondRecoveryAnswerRow as HTMLElement).queryByText(
+        "first tool recovery answer",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).queryByText(
+        "second tool recovery answer",
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      within(firstRecoveryAnswerRow as HTMLElement).queryByText(/second_tool/),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("expands history toolCallLoopGuard interruptions into non-editable user bubbles", async () => {
+    const loopError =
+      "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+    appTestState.chatMessagesResponsesByChatKey = {
+      "workspace-1/chat-1": {
+        ...chatMessages,
+        messages: [
+          {
+            content: "trigger tool loop",
+            createdAt: "2026-06-10T08:00:00.000Z",
+            extractedMemories: [],
+            id: "message-user-tool-loop",
+            memoriesUsed: [],
+            metrics: null,
+            parts: [{ text: "trigger tool loop", type: "text" }],
+            reasoning: null,
+            role: "user",
+            toolCalls: [],
+          },
+          {
+            content: "partial final answer",
+            createdAt: "2026-06-10T08:00:02.000Z",
+            extractedMemories: [],
+            id: "message-assistant-tool-loop",
+            memoriesUsed: [],
+            metrics: {
+              firstTokenLatencyMs: 200,
+              llmRequestIds: ["req-final"],
+              modelId: "gpt-test",
+              outputTokens: 20,
+              providerId: "openai",
+              totalLatencyMs: 4000,
+            },
+            parts: [
+              { text: "before recovery", type: "text" },
+              {
+                content: loopError,
+                id: "tool-loop-hist-1",
+                interruptedAssistantMetrics: {
+                  firstTokenLatencyMs: 100,
+                  llmRequestIds: ["req-1"],
+                  modelId: "gpt-test",
+                  outputTokens: 5,
+                  providerId: "openai",
+                  totalLatencyMs: 1200,
+                },
+                source: "toolCallLoopGuard",
+                type: "userInterruption",
+              },
+              { text: "after recovery", type: "text" },
+            ],
+            reasoning: null,
+            role: "assistant",
+            toolCalls: [],
+          },
+        ] as typeof chatMessages.messages,
+        pagination: { hasMoreBefore: false, nextBeforeSequence: null },
+      },
+    };
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+
+    const recoveryBubble = await screen.findByText(loopError);
+    const recoveryRow = recoveryBubble.closest(
+      ".message-row",
+    ) as HTMLElement | null;
+    expect(recoveryRow?.className).toContain("message-row-user");
+    expect(
+      within(recoveryRow as HTMLElement).queryByRole("button", {
+        name: "Edit message",
+      }),
+    ).not.toBeInTheDocument();
+
+    const realUserRow = screen
+      .getByText("trigger tool loop")
+      .closest(".message-row") as HTMLElement | null;
+    expect(
+      within(realUserRow as HTMLElement).getByRole("button", {
+        name: "Edit message",
+      }),
+    ).toBeInTheDocument();
+
+    const beforeAnswer = screen.getByText("before recovery");
+    const afterAnswer = screen.getByText("after recovery");
+    expect(
+      beforeAnswer.compareDocumentPosition(recoveryBubble) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      recoveryBubble.compareDocumentPosition(afterAnswer) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("keeps updating a pre-guidance tool block after guidance is applied", async () => {
     renderApp();
 

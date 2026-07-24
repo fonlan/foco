@@ -17,6 +17,15 @@ pub(crate) const MANUAL_GUIDANCE_SOURCE: &str = "manualGuidance";
 /// Max automatic recoveries per chat run before the guard fails the run.
 pub(crate) const MAX_REASONING_LOOP_RECOVERIES_PER_RUN: usize = 3;
 
+/// Whether a guidance / userInterruption source is an automatic progress-guard recovery.
+///
+/// Automatic guard text is already provider-facing control content and must not be wrapped
+/// with the manual "User guidance..." prefix during live injection or history replay.
+pub(crate) fn is_automatic_guard_source(source: &str) -> bool {
+    source == REASONING_LOOP_GUARD_SOURCE
+        || source == super::tool_loop::TOOL_CALL_LOOP_GUARD_SOURCE
+}
+
 // ponytail: v1 intentionally favors low false positives: it only recognizes exact periodic
 // suffixes after whitespace-run normalization, checks at deterministic character boundaries,
 // and keeps a fixed tail. If production examples require fuzzier matching, upgrade the
@@ -280,5 +289,16 @@ mod tests {
         assert_eq!(detection, None);
         assert_eq!(detector.normalized_tail.len(), MAX_NORMALIZED_TAIL_CHARS);
         assert_eq!(detector.normalized_char_count, text.chars().count());
+    }
+
+    #[test]
+    fn automatic_guard_source_predicate_covers_known_sources() {
+        assert!(is_automatic_guard_source(REASONING_LOOP_GUARD_SOURCE));
+        assert!(is_automatic_guard_source(
+            super::super::tool_loop::TOOL_CALL_LOOP_GUARD_SOURCE
+        ));
+        assert!(!is_automatic_guard_source(MANUAL_GUIDANCE_SOURCE));
+        assert!(!is_automatic_guard_source("agentMessage"));
+        assert!(!is_automatic_guard_source("userInterruption"));
     }
 }

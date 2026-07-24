@@ -72,7 +72,7 @@ pub(crate) use questions::{
 pub(crate) use reasoning_loop_detector::{
     MANUAL_GUIDANCE_SOURCE, MAX_REASONING_LOOP_RECOVERIES_PER_RUN, REASONING_LOOP_GUARD_SOURCE,
     REASONING_LOOP_RECOVERY_USER_TEXT, ReasoningLoopDetector, default_guidance_source,
-    reasoning_loop_guard_message,
+    is_automatic_guard_source, reasoning_loop_guard_message,
 };
 pub(crate) use sidecar_config::{SidecarRuntimeConfigBundle, build_sidecar_runtime_config_bundle};
 pub(crate) use subscriptions::{

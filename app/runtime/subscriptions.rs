@@ -135,7 +135,7 @@ pub(crate) struct GuidanceMessage {
     pub(crate) id: String,
     pub(crate) content: String,
     pub(crate) attachments: Vec<NeutralChatAttachment>,
-    /// `manualGuidance`, `agentMessage`, or `reasoningLoopGuard`.
+    /// `manualGuidance`, `agentMessage`, `reasoningLoopGuard`, or `toolCallLoopGuard`.
     pub(crate) source: String,
     pub(crate) interrupted_assistant_id: Option<String>,
 }

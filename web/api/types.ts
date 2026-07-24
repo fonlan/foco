@@ -2554,8 +2554,9 @@ export type ShellMessage = {
   specUpdates: ChatSpecUpdateSummary[];
   runBadges?: ChatRunBadge[];
   /**
-   * Synthetic user bubble source (e.g. reasoningLoopGuard / expanded history
-   * interruption). Marks non-editable virtual messages; layout stays normal.
+   * Synthetic user bubble source (e.g. reasoningLoopGuard / toolCallLoopGuard /
+   * expanded history interruption). Marks non-editable virtual messages; layout
+   * stays normal.
    */
   syntheticSource?: string;
 };

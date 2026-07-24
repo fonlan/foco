@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
 
 describe("remote start run identity", () => {
@@ -1180,6 +1180,98 @@ describe("expandMessagesWithUserInterruptions", () => {
     ]);
     expect(expanded[1].syntheticSource).toBe("reasoningLoopGuard");
   });
+
+  it("expands toolCallLoopGuard interruptions as synthetic user bubbles", () => {
+    const loopError =
+      "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+    const assistant: ShellMessage = {
+      ...message("msg-assistant-tool-loop"),
+      content: "before after",
+      metrics: finalMetrics,
+      parts: [
+        { text: "before", type: "text" },
+        {
+          content: loopError,
+          id: "tool-loop-interrupt-1",
+          interruptedAssistantMetrics: interruptedMetrics,
+          source: "toolCallLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "after", type: "text" },
+      ],
+    };
+
+    const expanded = expandMessagesWithUserInterruptions([assistant]);
+    expect(expanded.map((item) => item.id)).toEqual([
+      "msg-assistant-tool-loop",
+      "tool-loop-interrupt-1",
+      "tool-loop-interrupt-1-assistant",
+    ]);
+    expect(expanded[1]).toMatchObject({
+      content: loopError,
+      id: "tool-loop-interrupt-1",
+      role: "user",
+      syntheticSource: "toolCallLoopGuard",
+    });
+    expect(expanded[1].pendingMode).toBeUndefined();
+    expect(expanded[2]).toMatchObject({
+      content: "after",
+      id: "tool-loop-interrupt-1-assistant",
+      metrics: finalMetrics,
+      role: "assistant",
+    });
+  });
+
+  it("keeps stable ids across mixed automatic guard interruptions", () => {
+    const assistant: ShellMessage = {
+      ...message("msg-assistant-mixed"),
+      metrics: finalMetrics,
+      parts: [
+        { text: "r1", type: "reasoning" },
+        {
+          content: "repeated reasoning loop, check and continue",
+          id: "interrupt-reasoning",
+          interruptedAssistantMetrics: interruptedMetrics,
+          source: "reasoningLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "mid", type: "text" },
+        {
+          content: "repeated tool-call batch blocked",
+          id: "interrupt-tool-loop",
+          interruptedAssistantMetrics: {
+            ...interruptedMetrics,
+            totalLatencyMs: 1500,
+          },
+          source: "toolCallLoopGuard",
+          type: "userInterruption",
+        },
+        { text: "final", type: "text" },
+      ],
+    };
+
+    const expanded = expandMessagesWithUserInterruptions([assistant]);
+    expect(expanded.map((item) => item.id)).toEqual([
+      "msg-assistant-mixed",
+      "interrupt-reasoning",
+      "interrupt-reasoning-assistant",
+      "interrupt-tool-loop",
+      "interrupt-tool-loop-assistant",
+    ]);
+    expect(expanded[1].syntheticSource).toBe("reasoningLoopGuard");
+    expect(expanded[3].syntheticSource).toBe("toolCallLoopGuard");
+  });
+});
+
+describe("isAutomaticGuardSource", () => {
+  it("recognizes reasoning and tool-call loop guards", () => {
+    expect(isAutomaticGuardSource("reasoningLoopGuard")).toBe(true);
+    expect(isAutomaticGuardSource("toolCallLoopGuard")).toBe(true);
+    expect(isAutomaticGuardSource("manualGuidance")).toBe(false);
+    expect(isAutomaticGuardSource("agentMessage")).toBe(false);
+    expect(isAutomaticGuardSource("userInterruption")).toBe(false);
+    expect(isAutomaticGuardSource(undefined)).toBe(false);
+  });
 });
 
 describe("planModeEnabledFromMessages", () => {
@@ -1235,6 +1327,16 @@ describe("planModeEnabledFromMessages", () => {
         }),
       ]),
     ).toBe(true);
+    expect(
+      planModeEnabledFromMessages([
+        userMessage("u1"),
+        userMessage("tool-loop-interrupt", {
+          sessionMode: "plan",
+          syntheticSource: "toolCallLoopGuard",
+        }),
+        message("a1"),
+      ]),
+    ).toBe(false);
   });
 
   it("returns false when there is no real user message", () => {

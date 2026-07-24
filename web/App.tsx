@@ -786,6 +786,16 @@ export function preserveCachedReasoningDurations(
   return changed ? nextMessages : messages;
 }
 
+/**
+ * Automatic progress-guard sources (reasoning / tool-call loop recovery).
+ * These become non-editable synthetic user bubbles in the chat UI.
+ */
+export function isAutomaticGuardSource(
+  source: string | null | undefined,
+): boolean {
+  return source === "reasoningLoopGuard" || source === "toolCallLoopGuard";
+}
+
 /** Stable UI expansion of assistant ordered parts that contain user interruptions. */
 export function expandMessagesWithUserInterruptions(
   messages: ShellMessage[],
@@ -10220,10 +10230,9 @@ export function App() {
     const pendingGuidanceMessageId =
       pendingGuidanceMessageIdsRef.current.get(guidance.id) ?? null;
     pendingGuidanceMessageIdsRef.current.delete(guidance.id);
-    const syntheticSource =
-      guidance.source === "reasoningLoopGuard"
-        ? "reasoningLoopGuard"
-        : undefined;
+    const syntheticSource = isAutomaticGuardSource(guidance.source)
+      ? guidance.source
+      : undefined;
     setMessagesForChatKey(chatKey, (current) => {
       if (current.some((message) => message.id === assistantId)) {
         return current;

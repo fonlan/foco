@@ -13704,9 +13704,9 @@ fn remote_sidecar_chat_messages_for_request(
                         crate::StoredChatMessagePart::UserInterruption {
                             content, source, ..
                         } => {
-                            let provider_content = if source
-                                == crate::runtime::REASONING_LOOP_GUARD_SOURCE
-                            {
+                            let provider_content = if crate::runtime::is_automatic_guard_source(
+                                &source,
+                            ) {
                                 content
                             } else {
                                 format!(
