@@ -6692,6 +6692,53 @@ impl WorkspaceDatabase {
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
+        // Coordinator claim requires the durable assistant placeholder to exist
+        // before the first provider request. Remote queue and rewrite already
+        // insert it; keep local queue on the same contract so pre-stream claim
+        // cannot fail with "queued assistant message was not found".
+        let assistant_message_id = queued_run
+            .get("assistantMessageId")
+            .or_else(|| queued_run.get("assistant_message_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let assistant_sequence = queued_run
+            .get("assistantSequence")
+            .or_else(|| queued_run.get("assistant_sequence"))
+            .and_then(Value::as_i64);
+        match (assistant_message_id, assistant_sequence) {
+            (Some(assistant_message_id), Some(assistant_sequence)) => {
+                if assistant_sequence != queued.user_message.sequence + 1 {
+                    return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                        message: format!(
+                            "queued assistant sequence {assistant_sequence} must follow user sequence {}",
+                            queued.user_message.sequence
+                        ),
+                    });
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO messages
+                            (id, chat_id, role, content, sequence, created_at, metadata_json)
+                         VALUES (?1, ?2, 'assistant', '', ?3, ?4, ?5)",
+                        params![
+                            assistant_message_id,
+                            queued.chat_id,
+                            assistant_sequence,
+                            now,
+                            r#"{"streamingState":"streaming"}"#
+                        ],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+            (None, None) => {}
+            _ => {
+                return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                    message: "queued run must include both assistantMessageId and assistantSequence"
+                        .to_string(),
+                });
+            }
+        }
         if let Some(snapshot) = queued.chat_spec_snapshot.as_ref() {
             let revision = workspace_spec_revision_to_i64(snapshot.revision, "spec_revision")?;
             transaction

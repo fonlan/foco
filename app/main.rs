@@ -5451,6 +5451,18 @@ async fn prepare_chat_context_for_output(
             })
             .map_err(ApiError::from_workspace_error)?;
         if agent_primary_chat_output {
+            // Safety net for older queued turns that only persisted the user
+            // message: claim_agent_chat_queued_run requires this placeholder.
+            database
+                .insert_message_if_absent(NewMessage {
+                    id: &assistant_message_id,
+                    chat_id: &chat_id,
+                    role: "assistant",
+                    content: "",
+                    sequence: assistant_sequence,
+                    metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+                })
+                .map_err(ApiError::from_workspace_error)?;
             database
                 .mark_chat_queued_run_started(
                     &chat_id,

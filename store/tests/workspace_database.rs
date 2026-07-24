@@ -20161,7 +20161,7 @@ fn queue_coordinator_chat_message_publishes_task_and_context_together() {
                 sequence: 0,
                 metadata_json: Some("{}"),
             },
-            chat_queued_run_json: r#"{"status":"queued","userMessageId":"msg-user-atomic-publish"}"#,
+            chat_queued_run_json: r#"{"status":"queued","userMessageId":"msg-user-atomic-publish","assistantMessageId":"msg-assistant-atomic-publish","assistantSequence":1}"#,
             chat_spec_snapshot: Some(NewChatSpecSnapshot {
                 revision: 7,
                 content_markdown: "# Snapshot",
@@ -20210,6 +20210,13 @@ fn queue_coordinator_chat_message_publishes_task_and_context_together() {
             .metadata_json
             .contains("msg-user-atomic-publish")
     );
+    let assistant = database
+        .message("msg-assistant-atomic-publish")
+        .expect("assistant lookup")
+        .expect("assistant placeholder created at queue time");
+    assert_eq!(assistant.role, "assistant");
+    assert_eq!(assistant.sequence, 1);
+    assert!(assistant.content.is_empty());
     assert!(
         database
             .agent_task(&task_id)
