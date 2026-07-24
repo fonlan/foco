@@ -466,6 +466,10 @@ describe("app-shell verification surfaces", () => {
     const reasoningToggle = screen.getByRole("button", {
       name: "Expand thinking",
     });
+    expect(reasoningToggle).toHaveClass("text-[var(--muted)]");
+    expect(reasoningToggle.closest(".reasoning-block")).toHaveClass(
+      "text-[var(--muted)]",
+    );
     expect(reasoningToggle).toHaveAttribute("aria-expanded", "false");
     expect(within(reasoningToggle).getByText("2 s")).toBeInTheDocument();
     expect(screen.getByText("Need file context. Then answer.")).toBeInTheDocument();

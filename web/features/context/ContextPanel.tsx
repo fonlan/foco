@@ -308,9 +308,10 @@ const ContextPanel = memo(function ContextPanel({
         className="context-panel-tabs panel-scroll"
         onSelectionChange={(key) => onTabChange(key as ContextPanelTab)}
         selectedKey={activeTab}
+        variant="secondary"
       >
-        <Tabs.ListContainer>
-          <Tabs.List aria-label={t("Context panel sections")}>
+        <Tabs.ListContainer className="h-full w-full">
+          <Tabs.List aria-label={t("Context panel sections")} className="h-full">
             {tabs.map((tab) => {
               const Icon = tab.icon;
               const isActive = activeTab === tab.id;
@@ -919,7 +920,7 @@ function ContextPlanTab({
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
+      <div className="context-panel-page-header flex flex-wrap items-center justify-between gap-2">
         <Checkbox
           className="flex min-w-0 items-start gap-2 text-xs text-[var(--muted)]"
           isDisabled={autoRunToggleDisabled}
@@ -1868,7 +1869,7 @@ function ContextSpecTab({
 
   return (
     <div className="flex h-full min-h-0 min-w-0 flex-col bg-[var(--background-secondary)]">
-      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
+      <div className="context-panel-page-header flex items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <ScrollText aria-hidden="true" className="size-4" />
@@ -2056,30 +2057,39 @@ function ContextStatsTab({
 
   if (isLoading && !statistics) {
     return (
-      <div className="context-empty-state">
-        <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
-        <h2>{t("Stats")}</h2>
-        <p>{t("Loading…")}</p>
+      <div className="flex h-full min-h-0 min-w-0 flex-col">
+        <ContextStatsHeader isLoading messageCount={null} />
+        <div className="context-empty-state context-stats-empty-state min-h-0 flex-1">
+          <LoaderCircle aria-hidden="true" className="size-5 animate-spin" />
+          <h2>{t("Stats")}</h2>
+          <p>{t("Loading…")}</p>
+        </div>
       </div>
     );
   }
 
   if (error && !statistics) {
     return (
-      <div className="context-empty-state">
-        <BarChart3 aria-hidden="true" className="size-5" />
-        <h2>{t("Stats")}</h2>
-        <p>{error}</p>
+      <div className="flex h-full min-h-0 min-w-0 flex-col">
+        <ContextStatsHeader isLoading={false} messageCount={null} />
+        <div className="context-empty-state context-stats-empty-state min-h-0 flex-1">
+          <BarChart3 aria-hidden="true" className="size-5" />
+          <h2>{t("Stats")}</h2>
+          <p>{error}</p>
+        </div>
       </div>
     );
   }
 
   if (!statistics) {
     return (
-      <div className="context-empty-state">
-        <BarChart3 aria-hidden="true" className="size-5" />
-        <h2>{t("Stats")}</h2>
-        <p>{t("No statistics for the active session yet.")}</p>
+      <div className="flex h-full min-h-0 min-w-0 flex-col">
+        <ContextStatsHeader isLoading={false} messageCount={null} />
+        <div className="context-empty-state context-stats-empty-state min-h-0 flex-1">
+          <BarChart3 aria-hidden="true" className="size-5" />
+          <h2>{t("Stats")}</h2>
+          <p>{t("No statistics for the active session yet.")}</p>
+        </div>
       </div>
     );
   }
@@ -2114,18 +2124,12 @@ function ContextStatsTab({
     : [];
 
   return (
-    <div className="context-stats-panel panel-scroll">
-      <div className="context-stats-header">
-        <div>
-          <h2>{t("Session statistics")}</h2>
-          <p>
-            {t("Messages")}: {formatNumber(statistics.messageCount, language)}
-          </p>
-        </div>
-        {isLoading ? (
-          <LoaderCircle aria-label={t("Loading…")} className="size-4 animate-spin" />
-        ) : null}
-      </div>
+    <div className="flex h-full min-h-0 min-w-0 flex-col">
+      <ContextStatsHeader
+        isLoading={isLoading}
+        messageCount={statistics.messageCount}
+      />
+      <div className="context-stats-panel panel-scroll min-h-0 flex-1">
 
       <ContextUsageTimelinePanel
         contextUsage={contextUsage}
@@ -2225,6 +2229,41 @@ function ContextStatsTab({
           ]}
         />
       </ContextStatsSection>
+      </div>
+    </div>
+  );
+}
+
+function ContextStatsHeader({
+  isLoading,
+  messageCount,
+}: {
+  isLoading: boolean;
+  messageCount: number | null;
+}) {
+  const { language, t } = useI18n();
+
+  return (
+    <div className="context-panel-page-header flex items-center justify-between gap-3">
+      <div className="flex min-w-0 items-center gap-2">
+        <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
+          <BarChart3 aria-hidden="true" className="size-4" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="truncate text-sm font-semibold">{t("Session statistics")}</h2>
+          <p className="truncate text-xs font-medium text-[var(--muted)]">
+            {messageCount === null
+              ? t("Stats")
+              : `${t("Messages")}: ${formatNumber(messageCount, language)}`}
+          </p>
+        </div>
+      </div>
+      {isLoading ? (
+        <LoaderCircle
+          aria-label={t("Loading…")}
+          className="size-4 shrink-0 animate-spin"
+        />
+      ) : null}
     </div>
   );
 }
@@ -2634,7 +2673,7 @@ function SourceControlPanel({
 
   return (
     <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--background-secondary)]">
-      <div className="flex items-center justify-between gap-3 border-b border-[color-mix(in_oklab,var(--border)_80%,transparent)] px-3 py-2">
+      <div className="context-panel-page-header flex items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
             <GitCompare aria-hidden="true" className="size-4" />

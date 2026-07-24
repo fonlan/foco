@@ -2112,13 +2112,13 @@ function ReasoningBlock({
 
   return (
     <div
-      className="reasoning-block tool-call-block group min-w-0 text-[var(--foreground)]"
+      className="reasoning-block tool-call-block group min-w-0 text-[var(--muted)]"
       data-expanded={isExpanded ? "true" : "false"}
     >
       <Button
         aria-expanded={isExpanded}
         aria-label={toggleLabel}
-        className="tool-call-summary h-auto w-full min-w-0 cursor-pointer items-center justify-start gap-1.5 p-0 text-left text-xs font-semibold text-[var(--foreground)] hover:text-[var(--foreground)]"
+        className="tool-call-summary h-auto w-full min-w-0 cursor-pointer items-center justify-start gap-1.5 p-0 text-left text-xs font-semibold text-[var(--muted)] hover:text-[var(--muted)]"
         onPress={() => setIsExpanded((current) => !current)}
         type="button"
         variant="ghost"
@@ -2126,18 +2126,18 @@ function ReasoningBlock({
         {isExpanded ? (
           <ChevronDown
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-[var(--foreground)]"
+            className="size-3.5 shrink-0 text-[var(--muted)]"
           />
         ) : (
           <ChevronRight
             aria-hidden="true"
-            className="size-3.5 shrink-0 text-[var(--foreground)]"
+            className="size-3.5 shrink-0 text-[var(--muted)]"
           />
         )}
         <span className="shrink-0 font-semibold">{t("Thinking")}</span>
         {isExpanded ? null : (
           <span
-            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--foreground)]"
+            className="min-w-0 flex-1 truncate font-mono text-[11px] font-medium text-[var(--muted)]"
             title={preview}
           >
             {preview}
@@ -2145,7 +2145,7 @@ function ReasoningBlock({
         )}
         {durationLabel && durationTitle ? (
           <span
-            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--foreground)]"
+            className="ml-auto shrink-0 tabular-nums text-[11px] font-semibold text-[var(--muted)]"
             title={durationTitle}
           >
             {durationLabel}
@@ -2153,7 +2153,7 @@ function ReasoningBlock({
         ) : null}
       </Button>
       {isExpanded ? (
-        <div className="mt-2 text-[var(--foreground)]">
+        <div className="mt-2 text-[var(--muted)]">
           <MarkdownContent
             content={reasoning}
             isUser={false}

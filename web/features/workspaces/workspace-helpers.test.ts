@@ -14,4 +14,11 @@ describe("workspace helpers", () => {
     expect(chatItemClass(true)).toContain("chat-item-active");
     expect(chatItemClass(false)).not.toContain("chat-item-active");
   });
+
+  it("keeps workspace rows roomy enough for the inset new-chat action", () => {
+    expect(workspaceItemClass(false)).toContain("min-h-11");
+    expect(workspaceItemClass(false)).toContain("px-3");
+    expect(workspaceMenuClass(false)).toContain("px-2");
+    expect(workspaceMenuClass(false)).toContain("py-1.5");
+  });
 });

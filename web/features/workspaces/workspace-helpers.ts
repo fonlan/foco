@@ -1,5 +1,5 @@
 export function workspaceItemClass(active: boolean) {
-  return `workspace-item flex h-9 min-w-0 flex-1 items-center gap-2 rounded-lg px-2 text-sm font-semibold ${
+  return `workspace-item flex min-h-11 min-w-0 flex-1 items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-semibold ${
     active ? "workspace-item-active" : ""
   }`;
 }
@@ -12,7 +12,7 @@ export function workspaceNameFromPath(path: string) {
 }
 
 export function workspaceMenuClass(active: boolean) {
-  return `workspace-menu flex min-w-0 items-center gap-1 px-1.5 py-1 ${
+  return `workspace-menu flex min-w-0 items-center gap-1 px-2 py-1.5 ${
     active ? "workspace-menu-active" : ""
   }`;
 }

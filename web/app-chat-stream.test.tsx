@@ -7083,6 +7083,7 @@ describe("app-chat-stream verification surfaces", () => {
       name: "Close chat tab Second chat",
     });
     expect(closeButton).toBeEnabled();
+    expect(closeButton).toHaveClass("button--ghost", "button--icon-only");
 
     await userEvent.click(closeButton);
 

@@ -42,10 +42,12 @@ export function AgentsRuntimePanel({
   const instances = snapshot?.instances ?? [];
 
   return (
-    <section className="panel-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
-      <div className="flex items-center justify-between gap-2">
+    <section className="flex min-h-0 flex-1 flex-col">
+      <div className="context-panel-page-header flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-2">
-          <Bot aria-hidden="true" className="size-5 shrink-0 text-[var(--accent-soft-foreground)]" />
+          <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
+            <Bot aria-hidden="true" className="size-4" />
+          </span>
           <div className="min-w-0">
             <h3 className="truncate text-sm font-semibold text-[var(--foreground)]">
               {t("Agents")}
@@ -69,37 +71,39 @@ export function AgentsRuntimePanel({
         </Button>
       </div>
 
-      {error ? (
-        <div className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
-          {error}
-        </div>
-      ) : null}
+      <div className="panel-scroll flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto p-3">
+        {error ? (
+          <div className="rounded-lg border border-[var(--danger)] bg-[var(--danger-soft)] px-3 py-2 text-sm text-[var(--danger)]">
+            {error}
+          </div>
+        ) : null}
 
-      {!activeChatId ? (
-        <AgentEmptyState text={t("Open a chat to view its Agent instances.")} />
-      ) : null}
+        {!activeChatId ? (
+          <AgentEmptyState text={t("Open a chat to view its Agent instances.")} />
+        ) : null}
 
-      {activeChatId && !snapshot && !error ? (
-        <AgentEmptyState
-          text={
-            isLoading
-              ? t("Loading agent instances…")
-              : t("No agent instances in this chat yet.")
-          }
-        />
-      ) : null}
-
-      {activeChatId && snapshot ? (
-        instances.length ? (
-          <AgentInstancesList
-            instances={instances}
-            onSelectInstance={onSelectInstance}
-            selectedInstanceId={selectedInstanceId}
+        {activeChatId && !snapshot && !error ? (
+          <AgentEmptyState
+            text={
+              isLoading
+                ? t("Loading agent instances…")
+                : t("No agent instances in this chat yet.")
+            }
           />
-        ) : (
-          <AgentEmptyState text={t("No agent instances in this chat yet.")} />
-        )
-      ) : null}
+        ) : null}
+
+        {activeChatId && snapshot ? (
+          instances.length ? (
+            <AgentInstancesList
+              instances={instances}
+              onSelectInstance={onSelectInstance}
+              selectedInstanceId={selectedInstanceId}
+            />
+          ) : (
+            <AgentEmptyState text={t("No agent instances in this chat yet.")} />
+          )
+        ) : null}
+      </div>
     </section>
   );
 }

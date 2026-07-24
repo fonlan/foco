@@ -452,6 +452,10 @@ describe("app-panels-stats verification surfaces", () => {
     );
 
     const newTerminalButton = screen.getByRole("button", { name: "New terminal" });
+    expect(newTerminalButton.closest(".terminal-panel")).toHaveAttribute(
+      "data-theme",
+      "dark",
+    );
     const terminalCloseButtons = screen.getAllByRole("button", {
       name: "Close terminal",
     });
@@ -3094,6 +3098,11 @@ describe("app-panels-stats verification surfaces", () => {
     });
 
     await userEvent.click(screen.getByRole("tab", { name: "Agents" }));
+    expect(
+      (await screen.findByRole("heading", { name: "Agents" })).closest(
+        ".context-panel-page-header",
+      ),
+    ).not.toBeNull();
     const agentRefreshButton = await screen.findByRole("button", {
       name: "Refresh",
     });
@@ -3107,8 +3116,13 @@ describe("app-panels-stats verification surfaces", () => {
     });
   });
   it("loads the Project Spec tab in the right panel with markdown preview enabled", async () => {
-    await openSpecPanel();
+    const specHeadings = await openSpecPanel();
 
+    expect(
+      specHeadings.some((heading) =>
+        Boolean(heading.closest(".context-panel-page-header")),
+      ),
+    ).toBe(true);
     expect(
       screen.getByRole("button", { name: "Edit markdown" }),
     ).toHaveAttribute("aria-pressed", "true");
@@ -3506,6 +3520,8 @@ describe("app-panels-stats verification surfaces", () => {
     await userEvent.click(screen.getByRole("tab", { name: "Git" }));
 
     expect(screen.getByText("Source Control")).toBeInTheDocument();
+    expect(screen.getByText("Source Control").closest(".context-panel-page-header")).not.toBeNull();
+    expect(contextPanel.querySelector(".context-panel-tabs")).toHaveClass("tabs--secondary");
     expect(
       screen.getAllByRole("button", { name: /README\.md M/ }),
     ).toHaveLength(2);
@@ -3635,7 +3651,12 @@ describe("app-panels-stats verification surfaces", () => {
 
     await userEvent.click(await screen.findByRole("tab", { name: "Stats" }));
 
-    expect(await screen.findByText("Session statistics")).toBeInTheDocument();
+    const statsTitle = await screen.findByText("Session statistics");
+    expect(statsTitle.closest(".context-panel-page-header")).not.toBeNull();
+    expect(document.querySelector(".context-stats-panel")).toHaveClass(
+      "min-h-0",
+      "flex-1",
+    );
     expect(screen.getByText("17.6K")).toBeInTheDocument();
     expect(
       within(

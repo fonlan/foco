@@ -13779,7 +13779,7 @@ export function App() {
                           <div className={`${workspaceMenuClass(isActive)} relative`}>
                             <Button
                               aria-expanded={isExpanded}
-                              className={`${workspaceItemClass(isActive)} pr-9`}
+                              className={`${workspaceItemClass(isActive)} pr-10`}
                               onPress={() => toggleWorkspace(workspace.id)}
                               type="button"
                               variant={isActive ? "tertiary" : "ghost"}
@@ -13821,7 +13821,7 @@ export function App() {
                               aria-label={t("New chat in {name}", {
                                 name: workspace.name,
                               })}
-                              className="workspace-new-chat-button absolute right-0.5 top-1/2 z-10 -translate-y-1/2"
+                              className="workspace-new-chat-button absolute right-2 top-1/2 z-10 -translate-y-1/2"
                               isIconOnly
                               isDisabled={isRemoteWorkspace && !isRemoteReady}
                               onPress={() => {
@@ -15415,9 +15415,12 @@ function MainTabBar({
                   <span className="ml-1 inline-flex size-7 shrink-0 items-center justify-center">
                     <Button
                       aria-label={t("Close chat tab {title}", { title })}
-                      className="inline-flex size-7 items-center justify-center rounded-md text-[var(--muted)] opacity-0 hover:bg-[var(--danger-soft)] hover:text-[var(--danger)] focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
+                      className="size-7 min-w-7 opacity-0 focus:opacity-100 group-hover:opacity-100 max-[767px]:opacity-100 max-[767px]:focus:opacity-100 max-[767px]:group-hover:opacity-100"
+                      isIconOnly
                       onPress={() => onCloseTab(tab)}
+                      size="sm"
                       type="button"
+                      variant="ghost"
                     >
                       <X aria-hidden="true" className="size-3.5" />
                     </Button>
