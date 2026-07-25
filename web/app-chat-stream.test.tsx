@@ -7069,6 +7069,63 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBe("STRONG");
   });
 
+  it("reconciles POST stream markdown after text delta then EOF without a terminal event", async () => {
+    const markdown = "# EOF summary\n\n- **Rendered after reconciliation**";
+    let reconcileAfterEof = false;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (reconcileAfterEof && path.endsWith("/messages")) {
+          return jsonResponse({
+            ...chatMessages,
+            activeRun: null,
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: markdown,
+                id: "message-assistant-stream",
+                parts: [{ text: markdown, type: "text" }],
+                status: undefined,
+              },
+            ],
+          });
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "markdown EOF",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        delta: markdown,
+        type: "textDelta",
+      });
+    });
+
+    reconcileAfterEof = true;
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+
+    const heading = await screen.findByRole("heading", { name: "EOF summary" });
+    const completedBubble = heading.closest(".message-bubble") as HTMLElement;
+    expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
+    expect(
+      within(completedBubble).getByText("Rendered after reconciliation").tagName,
+    ).toBe("STRONG");
+  });
+
   it("renders reattached active-run markdown after streamEnd without a complete event", async () => {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -7138,6 +7195,76 @@ describe("app-chat-stream verification surfaces", () => {
     expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
     expect(
       within(completedBubble).getByText("Rendered after reconnect").tagName,
+    ).toBe("STRONG");
+  });
+
+  it("reconciles a reattached active run after EOF without a terminal event", async () => {
+    const markdown = "# Reattached EOF\n\n- **Rendered from persisted message**";
+    let reconcileAfterEof = false;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: reconcileAfterEof ? markdown : "",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: reconcileAfterEof ? [{ text: markdown, type: "text" }] : [],
+                reasoning: null,
+                status: reconcileAfterEof ? undefined : "streaming",
+                toolCalls: [],
+              },
+            ],
+            activeRun: reconcileAfterEof
+              ? null
+              : {
+                  assistantMessageId: "message-assistant-stream",
+                  chatId: "chat-1",
+                  lastSequence: 0,
+                  runId: "request-stream",
+                  workspaceId: "workspace-1",
+                },
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+    await act(async () => {
+      enqueueChatStreamEventForRun("request-stream", {
+        assistantMessageId: "message-assistant-stream",
+        delta: markdown,
+        type: "textDelta",
+      });
+    });
+
+    reconcileAfterEof = true;
+    await act(async () => {
+      appTestState.chatStreamControllers.get("request-stream")?.close();
+    });
+
+    const heading = await screen.findByRole("heading", { name: "Reattached EOF" });
+    const completedBubble = heading.closest(".message-bubble") as HTMLElement;
+    expect(within(completedBubble).getByRole("list")).toBeInTheDocument();
+    expect(
+      within(completedBubble).getByText("Rendered from persisted message").tagName,
     ).toBe("STRONG");
   });
 

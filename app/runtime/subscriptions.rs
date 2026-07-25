@@ -1043,45 +1043,31 @@ pub(crate) fn chat_run_subscription_stream(
         }
 
 
-        if *subscription.completed_rx.borrow() {
-            match subscription.snapshot_after(last_sequence) {
-                Ok(replay) => {
-                    for event in replay {
-                        if event.sequence > last_sequence {
-                            last_sequence = event.sequence;
-                            yield Ok(sse_event_frame(&event));
+        let mut is_terminal = *subscription.completed_rx.borrow();
+        loop {
+            if is_terminal {
+                match subscription.snapshot_after(last_sequence) {
+                    Ok(replay) => {
+                        for event in replay {
+                            if event.sequence > last_sequence {
+                                last_sequence = event.sequence;
+                                yield Ok(sse_event_frame(&event));
+                            }
                         }
                     }
+                    Err(error) => {
+                        subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
+                        return;
+                    }
                 }
-                Err(error) => {
-                    subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
-                    return;
-                }
+                yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                return;
             }
-            yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-            return;
-        }
 
-        loop {
             tokio::select! {
                 changed = subscription.completed_rx.changed() => {
                     if changed.is_err() || *subscription.completed_rx.borrow() {
-                        match subscription.snapshot_after(last_sequence) {
-                            Ok(replay) => {
-                                for event in replay {
-                                    if event.sequence > last_sequence {
-                                        last_sequence = event.sequence;
-                                        yield Ok(sse_event_frame(&event));
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
-                                return;
-                            }
-                        }
-                        yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                        return;
+                        is_terminal = true;
                     }
                 }
                 event = subscription.event_rx.recv() => {
@@ -1121,22 +1107,10 @@ pub(crate) fn chat_run_subscription_stream(
                             }
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            match subscription.snapshot_after(last_sequence) {
-                                Ok(replay) => {
-                                    for event in replay {
-                                        if event.sequence > last_sequence {
-                                            last_sequence = event.sequence;
-                                            yield Ok(sse_event_frame(&event));
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
-                                    return;
-                                }
-                            }
-                            yield Ok(sse_event(&ChatSseEvent::StreamEnd));
-                            return;
+                            // Sender teardown can race the completion watch update.
+                            // Both signals must drain the authoritative snapshot before
+                            // the one terminal frame is emitted.
+                            is_terminal = true;
                         },
                     }
                 }
@@ -1323,6 +1297,78 @@ mod tests {
         assert!(text.contains("\"type\":\"complete\""), "{text}");
         assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
         assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_emits_stream_end_after_event_channel_closes() {
+        let (event_tx, event_rx) = broadcast::channel(1);
+        let (_completed_tx, completed_rx) = watch::channel(false);
+        let queued_event = ChatRunEventFrame {
+            sequence: 1,
+            event_type: "textDelta".to_string(),
+            payload_json: r#"{"type":"textDelta","delta":"queued before close"}"#.to_string(),
+        };
+        let subscription = ActiveChatRunSubscription {
+            replay: Vec::new(),
+            event_rx,
+            completed_rx,
+            after_sequence: 0,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: Arc::new(Mutex::new(vec![queued_event])),
+        };
+        drop(event_tx);
+
+        let body = Sse::new(chat_run_subscription_stream(subscription))
+            .into_response()
+            .into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        assert!(text.contains("queued before close"), "{text}");
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_drains_snapshot_when_completion_and_close_race() {
+        let (event_tx, event_rx) = broadcast::channel(1);
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscription = ActiveChatRunSubscription {
+            replay: Vec::new(),
+            event_rx,
+            completed_rx,
+            after_sequence: 0,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: events.clone(),
+        };
+        let terminal_event = ChatRunEventFrame {
+            sequence: 1,
+            event_type: "complete".to_string(),
+            payload_json: r#"{"type":"complete"}"#.to_string(),
+        };
+        events
+            .lock()
+            .expect("event cache")
+            .push(terminal_event.clone());
+        event_tx
+            .send(terminal_event)
+            .expect("subscription receiver");
+        completed_tx.send(true).expect("complete subscription");
+        drop(event_tx);
+
+        let body = Sse::new(chat_run_subscription_stream(subscription))
+            .into_response()
+            .into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        assert_eq!(text.matches("id: 1\n\n").count(), 1, "{text}");
+        assert_eq!(text.matches("\"type\":\"complete\"").count(), 1, "{text}");
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
     }
 
     #[tokio::test]

@@ -7217,13 +7217,18 @@ export function App() {
           );
         }
       }
-      if (activeRun) {
+      const expectedSessionOwnsActiveRun =
+        expectedStreamSession !== undefined &&
+        isCurrentChatStreamSession(chatKey, expectedStreamSession) &&
+        activeRun?.runId === expectedStreamSession.runId;
+      if (activeRun && !expectedSessionOwnsActiveRun) {
         void subscribeActiveChatRun(activeRun);
       } else if (!hasLocalActiveRun) {
         setChatRunning(chatKey, false);
         setActiveRunInfoForChatKey(chatKey, null);
         clearWorkspaceChatActiveRun(workspaceId, chatId);
       }
+      return activeRun;
     } catch (requestError) {
       if (
         loadingChatControllersRef.current.get(chatKey) === controller &&
@@ -10845,7 +10850,7 @@ export function App() {
         throw new Error(message);
       }
 
-      await readChatStream(
+      const termination = await readChatStream(
         response,
         (streamEvent, meta) => {
           if (!ownsSession()) {
@@ -11471,6 +11476,30 @@ export function App() {
         { signal: abortController.signal },
       );
 
+      if (termination === "eof" && ownsSession()) {
+        flushStreamDeltaBuffers();
+        const serverActiveRun = await loadChatMessages(
+          activeRun.workspaceId,
+          activeRun.chatId,
+          session,
+        );
+        if (ownsSession()) {
+          if (serverActiveRun === null) {
+            finishStreamingAssistantMessage(currentAssistantMessageId);
+            finishChatRun(
+              chatKey,
+              activeRun.runId,
+              activeRun.workspaceId,
+              activeRun.chatId,
+            );
+          } else {
+            // A failed reconciliation is not proof of completion. Preserve the
+            // streaming message and use the ordinary active-run reconnect path.
+            shouldReconnect = true;
+          }
+        }
+      }
+
       if (ownsSession()) {
         await refreshWorkspaces();
       }
@@ -11646,6 +11675,7 @@ export function App() {
     let streamHadError = false;
     let hasGuidanceTurns = false;
     let activeRunId: string | null = null;
+    let reconnectAfterEof: ActiveChatRunSummary | null = null;
     let terminalContextUsageRefreshRequested = false;
     const abortController = new AbortController();
     const session = claimChatStreamSession(
@@ -12058,7 +12088,7 @@ export function App() {
         throw new Error(await responseErrorMessage(response));
       }
 
-      await readChatStream(response, (streamEvent) => {
+      const termination = await readChatStream(response, (streamEvent) => {
         if (!ownsSession()) {
           return;
         }
@@ -12775,9 +12805,40 @@ export function App() {
         }
       });
 
+      if (termination === "eof" && ownsSession() && requestChatId) {
+        flushStreamDeltaBuffers();
+        const serverActiveRun = await loadChatMessages(
+          request.workspaceId,
+          requestChatId,
+          session,
+        );
+        if (ownsSession()) {
+          if (serverActiveRun === null) {
+            finishStreamingAssistantMessage(currentAssistantMessageId);
+            finishChatRun(
+              currentRunningChatKey,
+              activeRunId,
+              request.workspaceId,
+              requestChatId,
+            );
+          } else {
+            // The server still owns a run, or the reconciliation request could
+            // not determine its state. Reattach instead of completing on EOF.
+            reconnectAfterEof = serverActiveRun ?? activeRunSummaryFromInfo({
+              acceptingGuidance: activeRunId !== null,
+              assistantMessageId: session.assistantMessageId,
+              chatId: requestChatId,
+              chatKey: currentRunningChatKey,
+              runId: activeRunId,
+              workspaceId: request.workspaceId,
+            });
+          }
+        }
+      }
+
       if (ownsSession()) {
         await refreshWorkspaces();
-        runSucceeded = !streamHadError;
+        runSucceeded = !streamHadError && reconnectAfterEof === null;
       }
     } catch (requestError) {
       if (!ownsSession()) {
@@ -12817,19 +12878,25 @@ export function App() {
       flushStreamDeltaBuffers();
       finishLiveReasoningDuration();
       stopLiveReasoningDuration();
-      refreshTerminalContextUsage();
       if (
         activeRunAbortByChatKeyRef.current.get(currentRunningChatKey) ===
         abortController
       ) {
         activeRunAbortByChatKeyRef.current.delete(currentRunningChatKey);
-        finishChatRun(
-          currentRunningChatKey,
-          activeRunId,
-          request.workspaceId,
-          requestChatId,
-        );
-        releaseChatStreamSession(currentRunningChatKey, session);
+        if (reconnectAfterEof) {
+          releaseChatStreamSession(currentRunningChatKey, session);
+          setChatRunning(currentRunningChatKey, true);
+          void subscribeActiveChatRun(reconnectAfterEof, true);
+        } else {
+          refreshTerminalContextUsage();
+          finishChatRun(
+            currentRunningChatKey,
+            activeRunId,
+            request.workspaceId,
+            requestChatId,
+          );
+          releaseChatStreamSession(currentRunningChatKey, session);
+        }
       }
     }
 
@@ -18060,6 +18127,8 @@ type ChatStreamFrameMeta = {
   id: string | null;
 };
 
+type ChatStreamTermination = "complete" | "streamEnd" | "eof";
+
 class StreamIdleError extends Error {
   constructor(timeoutMs: number) {
     super(`chat stream was idle for ${timeoutMs}ms`);
@@ -18090,7 +18159,7 @@ async function readChatStream(
   response: Response,
   onEvent: (event: ChatStreamEvent, meta: ChatStreamFrameMeta) => void,
   options: { idleTimeoutMs?: number; signal?: AbortSignal } = {},
-) {
+): Promise<ChatStreamTermination> {
   if (!response.body) {
     throw new Error("chat stream response has no body");
   }
@@ -18122,7 +18191,7 @@ async function readChatStream(
       );
     } catch (error) {
       if (sawCompletionEvent && isChatStreamTransportCloseError(error)) {
-        return;
+        return "complete";
       }
       throw error;
     }
@@ -18145,11 +18214,16 @@ async function readChatStream(
         throw error;
       }
     }
-    return;
+    return "streamEnd";
   }
 
   buffer += decoder.decode();
   readSseFrames(`${buffer}\n\n`, handleEvent);
+  return shouldStopReading
+    ? "streamEnd"
+    : sawCompletionEvent
+      ? "complete"
+      : "eof";
 }
 
 function isChatStreamTransportCloseError(error: unknown) {
