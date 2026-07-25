@@ -478,6 +478,10 @@ pub(crate) fn app_router(state: AppState) -> Router {
             "/api/models/route",
             post(crate::http::settings::update_model_route),
         )
+        .route(
+            "/api/models/fast-mode",
+            post(crate::http::settings::update_model_fast_mode),
+        )
         .route("/api/models/test", post(crate::http::settings::test_model))
         .route(
             "/api/models/delete",

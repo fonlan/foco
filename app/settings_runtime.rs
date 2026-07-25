@@ -776,6 +776,7 @@ pub(crate) fn configured_model_summary_for_config(
     let mut summary = configured_model_summary(model);
     summary.supports_thinking = model_supports_thinking(model, config);
     summary.supports_fast = model_supports_fast_latency_mode(model, config);
+    summary.fast_mode_enabled = summary.supports_fast && model.fast_mode_enabled;
     summary.warnings = model_warnings(model, config, summary.can_enable, summary.supports_thinking);
     summary
 }
@@ -1029,6 +1030,7 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         system_prompt_name: model.system_prompt_name.clone(),
         supports_thinking: false,
         supports_fast: false,
+        fast_mode_enabled: false,
         supported_thinking_levels: Vec::new(),
         warnings: Vec::new(),
     }

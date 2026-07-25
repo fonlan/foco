@@ -7282,35 +7282,24 @@ async fn broker_llm_stream(
         }
     };
 
-    let latency_mode = if request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND {
-        match payload
-            .get("latencyMode")
-            .cloned()
-            .and_then(|value| serde_json::from_value(value).ok())
-            .unwrap_or_default()
-        {
-            foco_providers::LatencyMode::Fast => {
-                match provider_config.supports_fast_latency_mode(&model_id) {
-                    Ok(true) => foco_providers::LatencyMode::Fast,
-                    Ok(false) => foco_providers::LatencyMode::Standard,
-                    Err(error) => {
-                        let _ = send_broker_llm_error(
-                            write,
-                            id,
-                            "bad_request",
-                            error.to_string(),
-                            provider_id.as_str(),
-                            model_id.as_str(),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-            }
-            foco_providers::LatencyMode::Standard => foco_providers::LatencyMode::Standard,
-        }
+    let latency_mode = match if request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND {
+        crate::effective_chat_latency_mode(model, &provider_config)
     } else {
-        foco_providers::LatencyMode::Standard
+        Ok(foco_providers::LatencyMode::Standard)
+    } {
+        Ok(latency_mode) => latency_mode,
+        Err(error) => {
+            let _ = send_broker_llm_error(
+                write,
+                id,
+                "bad_request",
+                error.message().to_string(),
+                provider_id.as_str(),
+                model_id.as_str(),
+            )
+            .await;
+            return;
+        }
     };
 
     let mut request = payload
@@ -7401,6 +7390,7 @@ async fn broker_llm_stream(
             "providerId": provider_id.as_str(),
             "modelId": model_id.as_str(),
             "requestKind": audit_writer.context.request_kind.as_str(),
+            "latencyMode": latency_mode,
         }),
     }];
 
@@ -29048,6 +29038,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "RemoteSystem".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -38490,6 +38481,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: String::new(),
             metadata_key: None,
             metadata_source_url: None,
@@ -38693,6 +38685,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: String::new(),
             metadata_key: None,
             metadata_source_url: None,
@@ -39020,6 +39013,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: String::new(),
             metadata_key: None,
             metadata_source_url: None,
@@ -39252,6 +39246,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "RemoteSystem".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -39511,6 +39506,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: String::new(),
             metadata_key: None,
             metadata_source_url: None,
@@ -39644,6 +39640,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: String::new(),
             metadata_key: None,
             metadata_source_url: None,
@@ -39906,6 +39903,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "RemoteSystem".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -42561,6 +42559,7 @@ mod tests {
             active_provider_id: Some("openai-resp".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "Default".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -42788,6 +42787,7 @@ mod tests {
                 active_provider_id: Some("matrix-provider".to_string()),
                 thinking_level: None,
                 web_search_mode: case.mode,
+                fast_mode_enabled: false,
                 system_prompt_name: "Default".to_string(),
                 metadata_key: None,
                 metadata_source_url: None,
@@ -42935,6 +42935,7 @@ mod tests {
             active_provider_id: Some("openai-resp".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "Default".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -46168,6 +46169,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "RemoteSystem".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -46389,6 +46391,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "RemoteSystem".to_string(),
             metadata_key: None,
             metadata_source_url: None,

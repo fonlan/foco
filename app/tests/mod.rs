@@ -4517,6 +4517,7 @@ fn apply_patch_eligibility_allows_only_native_openai_gpt_routes_after_redirects(
             active_provider_id: Some("provider".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5170,6 +5171,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -5186,6 +5188,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: Some("low".to_string()),
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -5550,6 +5553,96 @@ async fn model_route_update_rejects_invalid_routes_without_mutating_config() {
     let mut expected = original;
     expected.models[0].enabled = false;
     assert_eq!(*state.config.lock().expect("config lock"), expected);
+    assert!(!state.config_file.exists());
+}
+
+#[tokio::test]
+async fn model_fast_mode_update_persists_enabled_preference_for_supported_active_route() {
+    let fixture = prompt_state_fixture(|config| {
+        config
+            .providers
+            .push(model_route_test_provider("fast-provider", true));
+        let mut fast_model = config
+            .models
+            .iter()
+            .find(|model| model.id == "model")
+            .expect("base model")
+            .clone();
+        fast_model.id = "gpt-5".to_string();
+        fast_model.display_name = "GPT-5".to_string();
+        fast_model.provider_ids = vec!["fast-provider".to_string()];
+        fast_model.active_provider_id = Some("fast-provider".to_string());
+        config.models.push(fast_model);
+    });
+    let state = fixture.state;
+
+    let response = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "gpt-5".to_string(),
+            fast_mode_enabled: true,
+        }),
+    )
+    .await
+    .expect("enable Fast mode")
+    .0;
+
+    assert!(response.fast_mode_enabled);
+    let summary = response
+        .configured_models
+        .iter()
+        .find(|model| model.id == "gpt-5")
+        .expect("model summary");
+    assert!(summary.supports_fast);
+    assert!(summary.fast_mode_enabled);
+
+    let disk_config: GlobalConfig =
+        serde_json::from_str(&fs::read_to_string(&state.config_file).expect("saved config"))
+            .expect("parse saved config");
+    assert!(
+        state
+            .config
+            .lock()
+            .expect("config lock")
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("stored model")
+            .fast_mode_enabled
+    );
+    assert!(
+        disk_config
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("saved model")
+            .fast_mode_enabled
+    );
+}
+
+#[tokio::test]
+async fn model_fast_mode_enable_rejects_unsupported_active_route_without_mutating_config() {
+    let fixture = prompt_state_fixture(|_| {});
+    let state = fixture.state;
+    let original = state.config.lock().expect("config lock").clone();
+
+    let error = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "model".to_string(),
+            fast_mode_enabled: true,
+        }),
+    )
+    .await
+    .err()
+    .expect("unsupported route rejected");
+
+    assert_eq!(error.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        error.message,
+        "model does not support Fast mode on its active route: model"
+    );
+    assert_eq!(*state.config.lock().expect("config lock"), original);
     assert!(!state.config_file.exists());
 }
 
@@ -13946,6 +14039,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25262,6 +25356,7 @@ Search memory before repo work.
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25588,6 +25683,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25711,6 +25807,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -25808,6 +25905,7 @@ Use the existing product UI conventions.
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26119,6 +26217,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -26521,6 +26620,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27108,6 +27208,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27217,6 +27318,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27236,6 +27338,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27788,6 +27891,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28012,6 +28116,7 @@ async fn prepare_prompt_context_memory_budget_follows_context_budget_percent() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28190,6 +28295,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28471,6 +28577,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28689,6 +28796,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29172,6 +29280,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29191,6 +29300,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29440,6 +29550,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29767,6 +29878,7 @@ async fn ai_statistics_list_and_detail_expose_wire_derived_transport() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30230,6 +30342,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30392,6 +30505,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -32426,6 +32540,7 @@ fn test_model_settings(id: &str) -> ModelSettings {
         active_provider_id: None,
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -36636,6 +36751,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         active_provider_id: Some("provider".to_string()),
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
+        fast_mode_enabled: false,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,

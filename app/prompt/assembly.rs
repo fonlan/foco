@@ -52,7 +52,8 @@ pub(crate) async fn prepare_prompt_context_with_lifecycle(
     // is resolved only from the current global configuration at request preparation time.
     let _legacy_provider_id = optional_trimmed_string(request.provider_id);
     let thinking_level = optional_trimmed_string(request.thinking_level);
-    let requested_latency_mode = request.latency_mode;
+    // Kept for request/history compatibility; model-level configuration is authoritative.
+    let _legacy_latency_mode = request.latency_mode;
     let requested_skill_ids = request.skill_ids;
     let session_mode = optional_trimmed_string(request.session_mode);
     if let Some(mode) = session_mode.as_deref() {
@@ -103,16 +104,7 @@ pub(crate) async fn prepare_prompt_context_with_lifecycle(
         ))
     })?;
     let provider_config = provider_connection_config(provider)?;
-    let latency_mode = match requested_latency_mode {
-        foco_providers::LatencyMode::Fast
-            if provider_config
-                .supports_fast_latency_mode(&model.id)
-                .map_err(|error| ApiError::bad_request(error.to_string()))? =>
-        {
-            foco_providers::LatencyMode::Fast
-        }
-        _ => foco_providers::LatencyMode::Standard,
-    };
+    let latency_mode = effective_chat_latency_mode(model, &provider_config)?;
     sync_mcp_workspace(&state.mcp_registry, workspace, config)
         .await
         .map_err(ApiError::from_mcp_error)?;

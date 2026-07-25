@@ -1347,6 +1347,11 @@ pub struct ModelSettings {
     /// Defaults to [`WebSearchMode::Auto`] for configs that predate this field.
     #[serde(default, rename = "webSearchMode")]
     pub web_search_mode: WebSearchMode,
+    /// Whether chat-completion requests for this model should use the supported fast tier.
+    ///
+    /// Defaults to disabled so existing global configuration remains Standard.
+    #[serde(default, rename = "fastModeEnabled")]
+    pub fast_mode_enabled: bool,
     #[serde(default = "default_system_prompt_name")]
     pub system_prompt_name: String,
     pub metadata_key: Option<String>,
@@ -4605,6 +4610,7 @@ mod tests {
             active_provider_id: None,
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: "Missing".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -4638,6 +4644,7 @@ mod tests {
             active_provider_id: None,
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: IMAGE_GENERATION_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5300,6 +5307,7 @@ mod tests {
             active_provider_id: None,
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5311,6 +5319,21 @@ mod tests {
             input_modalities: vec!["text".to_string()],
             output_modalities: vec!["text".to_string()],
         }
+    }
+
+    #[test]
+    fn model_settings_without_fast_mode_enabled_defaults_to_standard() {
+        let mut legacy = serde_json::to_value(enabled_memory_model("legacy-model"))
+            .expect("serialize model settings");
+        legacy
+            .as_object_mut()
+            .expect("model settings serialize as an object")
+            .remove("fastModeEnabled");
+
+        let model: ModelSettings =
+            serde_json::from_value(legacy).expect("legacy model settings deserialize");
+
+        assert!(!model.fast_mode_enabled);
     }
 
     fn add_enabled_spec_model(config: &mut GlobalConfig, id: &str) {
@@ -5348,6 +5371,7 @@ mod tests {
             active_provider_id: None,
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5375,6 +5399,7 @@ mod tests {
             active_provider_id: None,
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5413,6 +5438,7 @@ mod tests {
             active_provider_id: Some("provider-1".to_string()),
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
+            fast_mode_enabled: false,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,

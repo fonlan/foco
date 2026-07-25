@@ -2940,6 +2940,24 @@ fn resolve_active_model_route(
     Ok((config, model, provider, provider_config))
 }
 
+pub(crate) fn effective_chat_latency_mode(
+    model: &ModelSettings,
+    provider_config: &ProviderConnectionConfig,
+) -> Result<foco_providers::LatencyMode, ApiError> {
+    if !model.fast_mode_enabled {
+        return Ok(foco_providers::LatencyMode::Standard);
+    }
+
+    let supports_fast = provider_config
+        .supports_fast_latency_mode(&model.id)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    Ok(if supports_fast {
+        foco_providers::LatencyMode::Fast
+    } else {
+        foco_providers::LatencyMode::Standard
+    })
+}
+
 impl PreparedChatContext {
     pub(crate) fn attach_agent_correlation(
         &self,
@@ -3025,6 +3043,7 @@ impl PreparedChatContext {
         self.memory_settings = self.global_config.memory.clone();
         self.model_id = model.id.clone();
         self.provider_id = provider.id.clone();
+        self.latency_mode = effective_chat_latency_mode(&model, &provider_config)?;
         self.provider_config = provider_config;
         self.provider_request.model_id = model.id.clone();
         if let Some(pending) = self.pending_memory_retrieval.as_mut() {
@@ -3043,6 +3062,15 @@ impl PreparedChatContext {
         self.provider_request.prompt_cache_retention = Some(PROMPT_CACHE_RETENTION_24H.to_string());
 
         Ok(())
+    }
+
+    fn update_queued_run_latency_mode(&self) -> Result<(), ApiError> {
+        let Some(message_id) = self.queued_user_message_id.as_deref() else {
+            return Ok(());
+        };
+        let mut database = open_workspace_database(&self.workspace_path)?;
+        update_message_queued_latency_mode(&mut database, message_id, self.latency_mode)
+            .map_err(ApiError::from_workspace_error)
     }
 
     pub(crate) fn record_finished_llm_request(&mut self, mut request: CapturedLlmRequest) {
@@ -3567,6 +3595,37 @@ impl PreparedChatContext {
                     }
                     return;
                 }
+                if let Err(error) = self.update_queued_run_latency_mode() {
+                    let message = error.message;
+                    let event = ChatSseEvent::Error {
+                        message: message.clone(),
+                    };
+                    events.push(captured_event(&event));
+                    let outcome = failed_chat_audit_outcome(
+                        &self,
+                        started_at,
+                        &mut events,
+                        &message,
+                        None,
+                    )
+                    .await;
+                    if let Err(persist_error) = persist_chat_result(
+                        &self,
+                        &request_started_at,
+                        outcome,
+                        &events,
+                        None,
+                        None,
+                        &executed_tool_calls,
+                    ) {
+                        yield ChatSseEvent::Error {
+                            message: persist_error.message,
+                        };
+                    } else {
+                        yield event;
+                    }
+                    return;
+                }
                 let packed_messages = match pack_neutral_messages(
                     self.provider_request.messages.clone(),
                     &self.message_source_sequences,
@@ -3628,6 +3687,7 @@ impl PreparedChatContext {
                         "llmRequestId": &turn_llm_request_id,
                         "runId": &self.llm_request_id,
                         "turnIndex": turn_index,
+                        "latencyMode": self.latency_mode,
                     })
                     .to_string(),
                 }];
@@ -11284,6 +11344,27 @@ fn queued_user_message_metadata_json(
             "failed to serialize queued user metadata: {source}"
         ))
     })
+}
+
+fn update_message_queued_latency_mode(
+    database: &mut WorkspaceDatabase,
+    message_id: &str,
+    latency_mode: foco_providers::LatencyMode,
+) -> Result<(), WorkspaceDatabaseError> {
+    let mut fields = serde_json::Map::new();
+    fields.insert("latencyMode".to_string(), json!(latency_mode));
+    let mut nested_fields = serde_json::Map::new();
+    nested_fields.insert("latencyMode".to_string(), json!(latency_mode));
+    database
+        .mutate_message_metadata(
+            message_id,
+            MessageMetadataMutation::MergeFieldsAndNestedObjectFields {
+                fields,
+                key: "queuedRun".to_string(),
+                nested_fields,
+            },
+        )
+        .map(|_| ())
 }
 
 fn merge_queued_origin_metadata(

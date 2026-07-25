@@ -1220,6 +1220,8 @@ export type ConfiguredModelSummary = {
   supportsThinking: boolean;
   /** Server-resolved Fast eligibility for the active provider and upstream model. */
   supportsFast?: boolean;
+  /** Model-level Fast preference, effective only while the active route supports it. */
+  fastModeEnabled?: boolean;
   supportedThinkingLevels: string[];
   warnings: string[];
 };

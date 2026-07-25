@@ -1699,6 +1699,7 @@ async fn llm_context_compression_summary_once(
             "assistantMessageId": &context.assistant_message_id,
             "llmRequestId": &request_id,
             "runId": &context.llm_request_id,
+            "latencyMode": foco_providers::LatencyMode::Standard,
         })
         .to_string(),
     }];

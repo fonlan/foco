@@ -370,6 +370,7 @@ mod tests {
                 active_provider_id: Some("openai-resp".to_string()),
                 thinking_level: None,
                 web_search_mode: foco_providers::WebSearchMode::Native,
+                fast_mode_enabled: false,
                 system_prompt_name: "Default".to_string(),
                 metadata_key: None,
                 metadata_source_url: None,

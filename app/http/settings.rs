@@ -342,6 +342,22 @@ pub(crate) struct UpdateModelRouteResponse {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UpdateModelFastModeRequest {
+    pub(crate) model_id: String,
+    pub(crate) fast_mode_enabled: bool,
+}
+
+/// Lightweight success body for `POST /api/models/fast-mode`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UpdateModelFastModeResponse {
+    pub(crate) model_id: String,
+    pub(crate) fast_mode_enabled: bool,
+    pub(crate) configured_models: Vec<ConfiguredModelSummary>,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RevealProviderApiKeyRequest {
     pub(crate) id: String,
@@ -805,6 +821,7 @@ pub(crate) struct ConfiguredModelSummary {
     pub(crate) system_prompt_name: String,
     pub(crate) supports_thinking: bool,
     pub(crate) supports_fast: bool,
+    pub(crate) fast_mode_enabled: bool,
     pub(crate) supported_thinking_levels: Vec<String>,
     pub(crate) warnings: Vec<String>,
 }
@@ -2856,6 +2873,58 @@ async fn fetch_and_write_model_metadata_cache_from_url(
     Ok(cache)
 }
 
+pub(crate) async fn update_model_fast_mode(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateModelFastModeRequest>,
+) -> Result<Json<UpdateModelFastModeResponse>, ApiError> {
+    let mut config = config_update_snapshot(&state).await?;
+    let model_id = request.model_id.trim();
+
+    if model_id.is_empty() {
+        return Err(ApiError::bad_request("model id must not be empty"));
+    }
+
+    if request.fast_mode_enabled {
+        let (model, provider) = config
+            .resolve_active_model_provider(model_id)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        let provider_config = provider_connection_config(provider)?;
+        let supports_fast = provider_config
+            .supports_fast_latency_mode(&model.id)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        if !supports_fast {
+            return Err(ApiError::bad_request(format!(
+                "model does not support Fast mode on its active route: {model_id}"
+            )));
+        }
+    }
+
+    let model = config
+        .models
+        .iter_mut()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| ApiError::bad_request(format!("model was not found: {model_id}")))?;
+    model.fast_mode_enabled = request.fast_mode_enabled;
+    save_config(&state, &mut config)?;
+
+    let fast_mode_enabled = config
+        .models
+        .iter()
+        .find(|model| model.id == model_id)
+        .is_some_and(|model| model.fast_mode_enabled);
+    Ok(Json(UpdateModelFastModeResponse {
+        model_id: model_id.to_string(),
+        fast_mode_enabled,
+        configured_models: config
+            .models
+            .iter()
+            .map(|model| {
+                crate::settings_runtime::configured_model_summary_for_config(model, &config)
+            })
+            .collect(),
+    }))
+}
+
 pub(crate) async fn update_model_route(
     State(state): State<AppState>,
     Json(request): Json<UpdateModelRouteRequest>,
@@ -3049,6 +3118,7 @@ pub(crate) async fn save_manual_model(
         active_provider_id,
         thinking_level,
         web_search_mode,
+        fast_mode_enabled: existing_model.is_some_and(|model| model.fast_mode_enabled),
         system_prompt_name,
         metadata_key: metadata_key
             .clone()
