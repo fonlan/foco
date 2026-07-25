@@ -3392,12 +3392,31 @@ function contextCompressionKindLabel(
   return t("Rule");
 }
 
-function contextCompressionStatusLabel(status: string, t: Translate) {
+function contextCompressionStatusLabel(
+  status: string,
+  detail: Extract<ChatMessagePart, { type: "contextCompression" }>["detail"],
+  t: Translate,
+) {
   if (status === "start") {
     return t("Compressing");
   }
+  if (status === "retrying") {
+    return t("Retrying compression");
+  }
   if (status === "completed") {
     return t("Compressed");
+  }
+  if (status === "skipped") {
+    return t("Skipped; continuing chat");
+  }
+  if (status === "failed") {
+    if (detail.compressionMode === "required_overflow") {
+      return t("Compression failed; context is still too large");
+    }
+    return t("Compression failed");
+  }
+  if (status === "cancelled") {
+    return t("Compression cancelled");
   }
   return status || "-";
 }
@@ -3428,7 +3447,10 @@ function ContextCompressionBlock({
   const { t } = useI18n();
   const detail = compression.detail;
   const kindLabel = contextCompressionKindLabel(compression.kind, t);
-  const statusLabel = contextCompressionStatusLabel(compression.status, t);
+  const statusLabel = contextCompressionStatusLabel(compression.status, detail, t);
+  const isPending =
+    compression.status === "start" || compression.status === "retrying";
+  const degraded = detail.action === "continue_without_compression";
   const originalTokenCount = detail.originalTokenCount ?? null;
   const summaryTokenCount = detail.summaryTokenCount ?? null;
   const savedLabel = formatContextCompressionTokenDelta(
@@ -3451,13 +3473,24 @@ function ContextCompressionBlock({
     ],
     [t("Provider"), detail.providerId || "-"],
     [t("Model"), detail.modelId || "-"],
+    [t("Provider request ID"), detail.providerRequestId ?? "-"],
     ["snapshotId", detail.snapshotId ?? "-"],
+    [t("Compression ID"), detail.compressionId ?? "-"],
     ["kind", compression.kind],
+    [t("Mode"), detail.compressionMode ?? "-"],
+    [
+      t("Attempt"),
+      typeof detail.attemptIndex === "number" ? String(detail.attemptIndex + 1) : "-",
+    ],
+    [t("Outcome"), detail.outcome ?? "-"],
+    [t("Action"), detail.action ?? "-"],
+    [t("Degraded"), degraded ? t("Yes") : t("No")],
+    ...(detail.errorMessage ? [[t("Error"), detail.errorMessage]] : []),
   ];
 
   return (
     <details
-      aria-busy={compression.status === "start" ? true : undefined}
+      aria-busy={isPending ? true : undefined}
       className="tool-call-block group min-w-0"
     >
       <summary className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-[var(--muted)] marker:hidden">
@@ -3477,19 +3510,21 @@ function ContextCompressionBlock({
           {savedLabel} · {modelLabel}
         </span>
         <span
-          aria-live={compression.status === "start" ? "polite" : undefined}
+          aria-live={isPending ? "polite" : undefined}
           className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${
             compression.status === "completed"
               ? "bg-[var(--success-soft)] text-[var(--success)]"
-              : compression.status === "start"
+              : isPending
                 ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+                : compression.status === "failed"
+                  ? "bg-[var(--danger-soft)] text-[var(--danger)]"
                 : "bg-[var(--surface-secondary)] text-[var(--muted)]"
           }`}
         >
           {statusLabel}
         </span>
         <span className="sr-only">
-          {compression.status === "start"
+          {isPending
             ? t("Context compression in progress")
             : compression.status === "completed"
               ? t("Context compression completed")

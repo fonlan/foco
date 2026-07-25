@@ -2432,6 +2432,180 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("merges retry and Normal degradation events into one visible compression card", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "recover from compression failure",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const compressionId = "compression-server-error";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId,
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          compressionId,
+          kind: "llm",
+          originalTokenCount: 235744,
+          providerId: "openai",
+          modelId: "gpt-test",
+          providerRequestId: "llm-audit-server-error",
+          compressionMode: "normal",
+          attemptIndex: 0,
+          outcome: "started",
+          action: "request",
+          status: "start",
+        },
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId,
+        kind: "llm",
+        status: "retrying",
+        type: "contextCompression",
+        detail: {
+          compressionId,
+          kind: "llm",
+          originalTokenCount: 235744,
+          providerId: "openai",
+          modelId: "gpt-test",
+          providerRequestId: "llm-audit-server-error",
+          compressionMode: "normal",
+          attemptIndex: 1,
+          outcome: "failed",
+          action: "retry",
+          errorMessage: "server_error from provider",
+          status: "retrying",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Retrying compression")).toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId,
+        kind: "llm",
+        status: "skipped",
+        type: "contextCompression",
+        detail: {
+          compressionId,
+          kind: "llm",
+          originalTokenCount: 235744,
+          providerId: "openai",
+          modelId: "gpt-test",
+          providerRequestId: "llm-audit-server-error",
+          compressionMode: "normal",
+          attemptIndex: 2,
+          outcome: "failed",
+          action: "continue_without_compression",
+          errorMessage: "server_error from provider",
+          status: "skipped",
+        },
+      });
+    });
+
+    expect(
+      await screen.findAllByText("Skipped; continuing chat"),
+    ).toHaveLength(2);
+    expect(screen.queryByText("Retrying compression")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    await userEvent.click(screen.getByText("Context compression"));
+    expect(screen.getByText("Compression ID")).toBeInTheDocument();
+    expect(screen.getByText(compressionId)).toBeInTheDocument();
+    expect(screen.getByText("Provider request ID")).toBeInTheDocument();
+    expect(screen.getByText("llm-audit-server-error")).toBeInTheDocument();
+    expect(screen.getByText("server_error from provider")).toBeInTheDocument();
+    expect(screen.getByText("Yes")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
+  it("replaces a live compression card with a snapshot-persistence failure", async () => {
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "show a durable compression failure",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const compressionId = "compression-persistence-failure";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId,
+        kind: "llm",
+        status: "start",
+        type: "contextCompression",
+        detail: {
+          compressionId,
+          kind: "llm",
+          originalTokenCount: 235744,
+          providerId: "openai",
+          modelId: "gpt-test",
+          status: "start",
+        },
+      });
+    });
+
+    expect(await screen.findByText("Compressing")).toBeInTheDocument();
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        compressionId,
+        kind: "llm",
+        status: "failed",
+        type: "contextCompression",
+        detail: {
+          compressionId,
+          kind: "llm",
+          originalTokenCount: 235744,
+          providerId: "openai",
+          modelId: "gpt-test",
+          providerRequestId: "llm-audit-persistence-failure",
+          compressionMode: "normal",
+          attemptIndex: 1,
+          outcome: "failed",
+          action: "snapshot_persistence_failed",
+          errorMessage:
+            "Checkpoint could not be saved; chat context was left unchanged",
+          status: "failed",
+        },
+      });
+    });
+
+    expect(await screen.findAllByText("Compression failed")).not.toHaveLength(0);
+    expect(screen.queryByText("Compressing")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Context compression")).toHaveLength(1);
+    await userEvent.click(screen.getByText("Context compression"));
+    expect(
+      screen.getByText("Checkpoint could not be saved; chat context was left unchanged"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("llm-audit-persistence-failure")).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("keeps same-second compression attempts distinct by compression ID", async () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));

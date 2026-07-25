@@ -607,6 +607,69 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
     });
   });
 
+  it("does not let a replayed retry downgrade a skipped Normal compression", () => {
+    const skippedOnServer = {
+      ...message("assistant-live"),
+      parts: [
+        {
+          detail: {
+            action: "continue_without_compression",
+            attemptIndex: 2,
+            compressionId: "compression-skipped",
+            compressionMode: "normal" as const,
+            errorMessage: "server_error from provider",
+            kind: "llm" as const,
+            outcome: "failed",
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "skipped" as const,
+          },
+          id: "compression-skipped",
+          kind: "llm" as const,
+          status: "skipped" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+    const replayedRetry = {
+      ...skippedOnServer,
+      parts: [
+        {
+          detail: {
+            action: "retry",
+            attemptIndex: 1,
+            compressionId: "compression-skipped",
+            compressionMode: "normal" as const,
+            kind: "llm" as const,
+            outcome: "failed",
+            startedAt: "2026-07-23T10:00:00Z",
+            status: "retrying" as const,
+          },
+          id: "compression-skipped",
+          kind: "llm" as const,
+          status: "retrying" as const,
+          type: "contextCompression" as const,
+        },
+      ],
+    };
+
+    const result = overlayStaleLoadedContextCompressionParts(
+      [skippedOnServer],
+      [replayedRetry],
+    );
+    const compressionPart = result[0]?.parts.find(
+      (part) => part.type === "contextCompression",
+    );
+
+    expect(compressionPart).toMatchObject({
+      detail: {
+        action: "continue_without_compression",
+        attemptIndex: 2,
+        errorMessage: "server_error from provider",
+      },
+      status: "skipped",
+    });
+  });
+
   it("keeps same-second compression lifecycles distinct by compression ID", () => {
     const liveAssistant = {
       ...message("assistant-live"),

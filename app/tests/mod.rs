@@ -7063,19 +7063,21 @@ async fn ensure_context_compression_reaches_llm_branch_at_95_percent() {
     let total_used_context_tokens = prepared_context_total_used_tokens(&context);
     assert!(total_used_context_tokens >= 950);
 
-    let error = ensure_context_compression(&mut context, None)
+    let result = ensure_context_compression(&mut context, None)
         .await
-        .expect_err("llm compression branch should try the provider");
-
-    assert!(error.message().contains("API key"));
+        .expect("Normal compression should degrade after provider failure");
+    assert_eq!(
+        result.events.last().map(|event| event.status.as_str()),
+        Some("skipped")
+    );
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
-/// Live sink must receive LLM `start` before the summary provider request fails (no completed).
+/// A preventive compression failure is live-visible as `start` then `skipped`, without a snapshot.
 #[tokio::test]
-async fn ensure_context_compression_emits_live_start_before_summary_provider_failure() {
+async fn ensure_context_compression_emits_live_start_then_skipped_for_normal_provider_failure() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-llm-compression-live-start-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
     let mut messages = vec![neutral_text_message(
@@ -7099,10 +7101,10 @@ async fn ensure_context_compression_emits_live_start_before_summary_provider_fai
     assert!(prepared_context_total_used_tokens(&context) >= 950);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-    let error = ensure_context_compression(&mut context, Some(event_tx))
+    let result = ensure_context_compression(&mut context, Some(event_tx))
         .await
-        .expect_err("llm compression branch should try the provider");
-    assert!(error.message().contains("API key"));
+        .expect("Normal compression should safely continue after provider failure");
+    assert_eq!(result.events.len(), 2);
 
     let start = event_rx
         .try_recv()
@@ -7112,10 +7114,17 @@ async fn ensure_context_compression_emits_live_start_before_summary_provider_fai
     assert!(start.started_at.is_some());
     assert!(start.completed_at.is_none());
     assert!(start.snapshot_id.is_none());
-    assert!(
-        event_rx.try_recv().is_err(),
-        "no completed without snapshot"
+    let skipped = event_rx
+        .try_recv()
+        .expect("skipped event should follow the failed Normal summary");
+    assert_eq!(skipped.status, "skipped");
+    assert_eq!(skipped.compression_id, start.compression_id);
+    assert_eq!(
+        skipped.action.as_deref(),
+        Some("continue_without_compression")
     );
+    assert!(skipped.error_message.is_some());
+    assert!(event_rx.try_recv().is_err(), "only one start/skipped pair");
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -7226,11 +7235,13 @@ async fn ensure_context_compression_reaches_llm_branch_from_provider_input_below
     assert!((800..950).contains(&total_used_context_tokens));
     context.last_chat_completion_input_tokens = Some(950);
 
-    let error = ensure_context_compression(&mut context, None)
+    let result = ensure_context_compression(&mut context, None)
         .await
-        .expect_err("provider input >= 95% should force llm compression");
-
-    assert!(error.message().contains("API key"));
+        .expect("Normal compression should degrade after provider failure");
+    assert_eq!(
+        result.events.last().map(|event| event.status.as_str()),
+        Some("skipped")
+    );
     assert!(context.compression_snapshots.is_empty());
 
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
@@ -8221,6 +8232,12 @@ fn assistant_parts_checkpoint_replay_start_index_uses_last_active_llm_part() {
                 completed_at: None,
                 provider_id: "p".to_string(),
                 model_id: "m".to_string(),
+                provider_request_id: None,
+                compression_mode: None,
+                attempt_index: None,
+                outcome: None,
+                action: None,
+                error_message: None,
             },
         },
         StoredChatMessagePart::ToolCall {
@@ -8241,6 +8258,12 @@ fn assistant_parts_checkpoint_replay_start_index_uses_last_active_llm_part() {
                 completed_at: None,
                 provider_id: "p".to_string(),
                 model_id: "m".to_string(),
+                provider_request_id: None,
+                compression_mode: None,
+                attempt_index: None,
+                outcome: None,
+                action: None,
+                error_message: None,
             },
         },
         StoredChatMessagePart::Text {
@@ -8287,15 +8310,92 @@ async fn ensure_context_compression_tries_llm_when_recent_large_group_would_be_d
     context.active_tool_start_index = context.provider_request.messages.len();
     assert!(prepared_context_total_used_tokens(&context) >= 950);
 
-    let error = ensure_context_compression(&mut context, None)
+    let result = ensure_context_compression(&mut context, None)
         .await
-        .expect_err("large recent group should enter the LLM compression branch");
+        .expect("normal compression may safely degrade when the checkpoint cannot be built");
 
     assert!(
-        error.message().contains("API key") || error.message().contains("hierarchy"),
-        "unexpected error: {}",
-        error.message()
+        result.events.iter().any(|event| {
+            event.kind == "llm"
+                && event.status == "skipped"
+                && event.action.as_deref() == Some("continue_without_compression")
+                && event.error_message.as_deref()
+                    == Some("Provider request failed; continuing without compression")
+        }),
+        "large recent group should enter the LLM compression branch and report a safe degradation: {result:?}"
     );
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[tokio::test]
+async fn context_compression_retries_http_200_responses_server_error_then_persists_one_snapshot() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-compression-server-error-retry"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let (base_url, attempts, server_task) =
+        serve_context_compression_responses_server_error_then_success_fixture().await;
+    let messages = vec![
+        neutral_text_message(NeutralChatRole::System, "system".to_string()),
+        neutral_text_message(NeutralChatRole::Assistant, "small history".repeat(10)),
+        neutral_text_message(NeutralChatRole::Assistant, "large history".repeat(1_000)),
+        neutral_text_message(NeutralChatRole::User, "continue".to_string()),
+    ];
+    let sequences = vec![None, Some(0), Some(1), Some(2)];
+    let sources = vec![
+        PromptContextSource::ReservedPrompt,
+        PromptContextSource::StoredMessage { sequence: 0 },
+        PromptContextSource::StoredMessage { sequence: 1 },
+        PromptContextSource::CurrentUser { sequence: 2 },
+    ];
+    let mut context =
+        test_prepared_chat_context(workspace_dir.clone(), messages, sequences, sources, 300);
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir)
+        .expect("workspace database for compression audit");
+    database
+        .insert_chat(&context.chat_id, "compression retry test")
+        .expect("insert compression retry chat");
+    context.provider_config.base_url = Some(base_url);
+    context.global_config.app.llm_request_retry_count = 1;
+    // Use the prior completion's provider usage to trigger Normal compression while leaving
+    // enough room for this fixture's checkpoint request to be summarized in one provider call.
+    context.context_budget.context_window = 10_000;
+    context.last_chat_completion_input_tokens = Some(9_500);
+    let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
+    context.app_shutdown_rx = app_shutdown_rx;
+    context.active_tool_start_index = context.provider_request.messages.len();
+
+    let result = ensure_context_compression(&mut context, None).await.expect(
+        "a retryable Responses server_error should recover on the next compression attempt",
+    );
+    server_task.abort();
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "expected retry events={:?}, captured_attempts={}",
+        result.events,
+        context.captured_llm_requests.len()
+    );
+    assert_eq!(context.captured_llm_requests.len(), 2);
+    assert_eq!(
+        context.captured_llm_requests[0].outcome.final_state,
+        "failed"
+    );
+    assert_eq!(
+        context.captured_llm_requests[1].outcome.final_state,
+        "succeeded"
+    );
+    assert_eq!(context.compression_snapshots.len(), 1);
+    assert!(result.events.iter().any(|event| {
+        event.status == "retrying"
+            && event.attempt_index == Some(1)
+            && event.action.as_deref() == Some("retry")
+    }));
+    assert!(result.events.iter().any(|event| {
+        event.status == "completed"
+            && event.attempt_index == Some(1)
+            && event.action.as_deref() == Some("checkpoint_persisted")
+    }));
+
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
@@ -8473,7 +8573,7 @@ async fn ensure_context_compression_disabled_overflow_skips_runtime_tool_state_e
         .await
         .expect_err("disabled runtime tool-state still enters full LLM checkpoint");
 
-    assert!(error.message().contains("API key"));
+    assert!(error.message().contains("could not produce a checkpoint"));
     assert!(
         context
             .message_context_sources
@@ -8542,7 +8642,7 @@ async fn ensure_context_compression_tries_llm_for_required_overflow_snapshots() 
         .await
         .expect_err("required overflow should try the LLM fallback");
 
-    assert!(error.message().contains("API key"));
+    assert!(error.message().contains("could not produce a checkpoint"));
     // Failed LLM checkpoint must not reset the local 80% cycle counter (no half success).
     assert_eq!(
         context.runtime_tool_state_compression_count,
@@ -33181,6 +33281,51 @@ async fn serve_main_chat_responses_capacity_then_success_fixture() -> (
     (format!("http://{addr}/v1"), attempts, task)
 }
 
+async fn serve_context_compression_responses_server_error_then_success_fixture() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_route = Arc::clone(&attempts);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || {
+            let attempts = Arc::clone(&attempts_for_route);
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let headers = [(header::CONTENT_TYPE, "text/event-stream")];
+                if attempt == 1 {
+                    // OpenAI Responses can return this legal provider error after HTTP 200.
+                    let body = concat!(
+                        "event: response.failed\n",
+                        "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-compression-server-error\",\"status\":\"failed\",\"model\":\"gpt-5.4\",\"error\":{\"code\":\"server_error\",\"type\":\"server_error\",\"message\":\"temporary compression failure\"}}}\n\n"
+                    );
+                    return (headers, body).into_response();
+                }
+                let body = concat!(
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"compressed checkpoint\"}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-compression-success\",\"status\":\"completed\",\"model\":\"gpt-5.4\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"compressed checkpoint\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":20,\"output_tokens\":3,\"total_tokens\":23}}}\n\n"
+                );
+                (headers, body).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind compression Responses retry fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("compression Responses retry fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), attempts, task)
+}
+
 async fn serve_main_chat_responses_capacity_exhaust_fixture() -> (
     String,
     Arc<std::sync::atomic::AtomicUsize>,
@@ -39672,6 +39817,35 @@ fn preparing_main_service_with_contended_lock_skips_config_loading() {
 
     assert!(matches!(startup, MainServiceStartup::Contended));
     assert!(!config_loader_called.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[test]
+fn local_context_compression_merge_never_regresses_a_newer_terminal_attempt() {
+    let newer_terminal = ContextCompressionEventDetail {
+        attempt_index: Some(2),
+        ..Default::default()
+    };
+    let replayed_retry = ContextCompressionEventDetail {
+        attempt_index: Some(1),
+        ..Default::default()
+    };
+    assert!(!context_compression_part_should_replace(
+        &newer_terminal,
+        "skipped",
+        &replayed_retry,
+        "retrying",
+    ));
+
+    let earlier_terminal = ContextCompressionEventDetail {
+        attempt_index: Some(1),
+        ..Default::default()
+    };
+    assert!(context_compression_part_should_replace(
+        &earlier_terminal,
+        "failed",
+        &newer_terminal,
+        "skipped",
+    ));
 }
 
 #[test]

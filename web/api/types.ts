@@ -489,6 +489,12 @@ export type ChatContextCompressionDetail = {
   completedAt?: string | null;
   providerId?: string | null;
   modelId?: string | null;
+  providerRequestId?: string | null;
+  compressionMode?: "normal" | "required_overflow" | null;
+  attemptIndex?: number | null;
+  outcome?: string | null;
+  action?: string | null;
+  errorMessage?: string | null;
 };
 
 export type ChatContextCompressionPart = {

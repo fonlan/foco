@@ -88,7 +88,12 @@ use crate::{
     GitCommitMessageResponse, GitDiffResponse, GitStatusResponse, LLM_REQUEST_TIMEOUT_MS,
     MAX_AGENT_TOOL_ROUNDS, PromptContextSource, api_audit_save_details,
     append_hook_context_messages, append_pending_tool_state_messages, config_snapshot,
-    config_update_snapshot, estimate_tool_schema_tokens,
+    config_update_snapshot,
+    context_compression_policy::{
+        ContextCompressionAttemptDeadline, ContextCompressionFailureAction, ContextCompressionMode,
+        ContextCompressionRetryBudget, context_compression_failure_action,
+    },
+    estimate_tool_schema_tokens,
     git_backend::{
         agent_worktree_relative_path, commit_staged_changes, create_agent_worktree,
         delete_agent_worktree, discard_git_file, fast_forward_shared_workspace_to_agent_worktree,
@@ -597,6 +602,7 @@ impl RemoteSidecarRuntimeToolState {
                 completed_at: None,
                 provider_id: provider_id.to_string(),
                 model_id: model_id.to_string(),
+                ..Default::default()
             },
         );
         remote_push_context_compression_event(
@@ -613,6 +619,7 @@ impl RemoteSidecarRuntimeToolState {
                 completed_at: Some(utc_timestamp()),
                 provider_id: provider_id.to_string(),
                 model_id: model_id.to_string(),
+                ..Default::default()
             },
         );
         Ok(true)
@@ -673,12 +680,28 @@ impl RemoteSidecarRuntimeToolState {
                 completed_at: None,
                 provider_id: provider_id.to_string(),
                 model_id: model_id.to_string(),
+                provider_request_id: None,
+                compression_mode: Some(ContextCompressionMode::from(mode).as_str().to_string()),
+                attempt_index: Some(0),
+                outcome: Some("started".to_string()),
+                action: Some("request".to_string()),
+                error_message: None,
             },
         );
         let compression_start_event_index = events.len() - 1;
 
-        let (summary, resolved_provider_id) =
-            match remote_sidecar_run_broker_context_compression_summary(
+        let retry_budget = ContextCompressionRetryBudget::from_configured_retry_count(
+            remote_sidecar_llm_request_retry_count(state),
+        );
+        let retry_started_at = Instant::now();
+        let mut retries_used = 0;
+        let (summary, resolved_provider_id, provider_request_id) = loop {
+            let attempt_deadline = ContextCompressionAttemptDeadline::new(
+                retry_budget
+                    .remaining_deadline(retry_started_at.elapsed())
+                    .unwrap_or_default(),
+            );
+            let outcome = remote_sidecar_run_broker_context_compression_summary_with_deadline(
                 state,
                 Some(run_stream),
                 workspace_id,
@@ -690,34 +713,198 @@ impl RemoteSidecarRuntimeToolState {
                 model_id,
                 self.context_budget.context_window,
                 &checkpoint_messages,
+                attempt_deadline,
             )
-            .await
-            {
+            .await;
+            match outcome {
                 RemoteSidecarContextCompressionOutcome::Succeeded {
                     summary,
                     provider_id,
+                    request_id,
                     ..
-                } => (summary, provider_id),
+                } => break (summary, provider_id, request_id),
                 RemoteSidecarContextCompressionOutcome::Cancelled => {
-                    events.truncate(compression_start_event_index);
+                    let mut event = events[compression_start_event_index].clone();
+                    event.status = "cancelled".to_string();
+                    event.completed_at = Some(utc_timestamp());
+                    event.outcome = Some("cancelled".to_string());
+                    event.action = Some(ContextCompressionFailureAction::Stop.as_str().to_string());
+                    remote_push_context_compression_event(events, event_tx, event);
                     return Err(ApiError::bad_request(
                         "context compression summary was cancelled",
                     ));
                 }
-                RemoteSidecarContextCompressionOutcome::Failed { message } => {
-                    events.truncate(compression_start_event_index);
+                RemoteSidecarContextCompressionOutcome::Failed {
+                    message: _,
+                    request_id,
+                } => {
+                    let action = context_compression_failure_action(
+                        ContextCompressionMode::from(mode),
+                        crate::provider_retry::ProviderRetryClass::NonRetryable,
+                        retries_used,
+                        retry_budget,
+                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
+                        run_stream.is_cancel_requested() || run_stream.is_finished(),
+                    );
+                    tracing::warn!(
+                        workspace_id,
+                        chat_id,
+                        run_id,
+                        compression_id = %compression_id,
+                        provider_id,
+                        model_id,
+                        compression_mode = ContextCompressionMode::from(mode).as_str(),
+                        input_token_count = original_tokens,
+                        retry_class = "non_retryable",
+                        attempt_index = retries_used,
+                        action = action.as_str(),
+                        "remote context compression provider attempt failed"
+                    );
+                    let mut event = events[compression_start_event_index].clone();
+                    event.status = match action {
+                        ContextCompressionFailureAction::ContinueWithoutCompression => "skipped",
+                        ContextCompressionFailureAction::FailRequiredOverflow => "failed",
+                        ContextCompressionFailureAction::Stop => "cancelled",
+                        ContextCompressionFailureAction::Retry => "retrying",
+                    }
+                    .to_string();
+                    event.completed_at = Some(utc_timestamp());
+                    event.attempt_index = Some(retries_used);
+                    event.outcome = Some("failed".to_string());
+                    event.action = Some(action.as_str().to_string());
+                    event.provider_request_id = request_id;
+                    event.error_message = Some(
+                        remote_sidecar_context_compression_event_error_summary(action).to_string(),
+                    );
+                    remote_push_context_compression_event(events, event_tx, event);
+                    if matches!(
+                        action,
+                        ContextCompressionFailureAction::ContinueWithoutCompression
+                    ) {
+                        return Ok(false);
+                    }
                     return Err(ApiError::bad_request(
-                        remote_sidecar_context_compression_failure_message(
-                            RemoteSidecarContextCompressionFailureKind::SummaryGeneration,
-                            &message,
-                        ),
+                        "context compression is required to fit the next provider request; the compression provider could not produce a checkpoint. Start a new chat or reduce the conversation before retrying.",
                     ));
                 }
-            };
+                RemoteSidecarContextCompressionOutcome::RetryableFailure {
+                    message: _,
+                    request_id,
+                    retry_class,
+                    retry_after,
+                } => {
+                    let mut action = context_compression_failure_action(
+                        ContextCompressionMode::from(mode),
+                        retry_class,
+                        retries_used,
+                        retry_budget,
+                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
+                        run_stream.is_cancel_requested() || run_stream.is_finished(),
+                    );
+                    let next_retry_ordinal = retries_used.saturating_add(1);
+                    // Do not publish a retry that cannot be scheduled. A deadline can expire
+                    // between the initial policy decision and calculating the bounded backoff;
+                    // re-evaluate with the current remaining budget to produce the proper
+                    // Normal skip or RequiredOverflow terminal event.
+                    let retry_delay = matches!(action, ContextCompressionFailureAction::Retry)
+                        .then(|| {
+                            retry_budget.retry_backoff(
+                                retry_class,
+                                retries_used,
+                                retry_started_at.elapsed(),
+                                retry_after,
+                            )
+                        })
+                        .flatten();
+                    if matches!(action, ContextCompressionFailureAction::Retry)
+                        && retry_delay.is_none()
+                    {
+                        action = context_compression_failure_action(
+                            ContextCompressionMode::from(mode),
+                            retry_class,
+                            retries_used,
+                            retry_budget,
+                            retry_budget.remaining_deadline(retry_started_at.elapsed()),
+                            run_stream.is_cancel_requested() || run_stream.is_finished(),
+                        );
+                    }
+                    tracing::warn!(
+                        workspace_id,
+                        chat_id,
+                        run_id,
+                        compression_id = %compression_id,
+                        provider_id,
+                        model_id,
+                        compression_mode = ContextCompressionMode::from(mode).as_str(),
+                        input_token_count = original_tokens,
+                        retry_class = retry_class.as_str(),
+                        attempt_index = retries_used,
+                        action = action.as_str(),
+                        "remote context compression provider attempt failed"
+                    );
+                    let mut event = events[compression_start_event_index].clone();
+                    event.status = match action {
+                        ContextCompressionFailureAction::Retry => "retrying",
+                        ContextCompressionFailureAction::ContinueWithoutCompression => "skipped",
+                        ContextCompressionFailureAction::FailRequiredOverflow => "failed",
+                        ContextCompressionFailureAction::Stop => "cancelled",
+                    }
+                    .to_string();
+                    event.completed_at = Some(utc_timestamp());
+                    event.attempt_index = Some(
+                        if matches!(action, ContextCompressionFailureAction::Retry) {
+                            next_retry_ordinal
+                        } else {
+                            retries_used
+                        },
+                    );
+                    event.outcome = Some("failed".to_string());
+                    event.action = Some(action.as_str().to_string());
+                    event.provider_request_id = request_id;
+                    event.error_message = Some(
+                        remote_sidecar_context_compression_event_error_summary(action).to_string(),
+                    );
+                    remote_push_context_compression_event(events, event_tx, event);
+                    if matches!(action, ContextCompressionFailureAction::Retry)
+                        && let Some(delay) = retry_delay
+                    {
+                        if remote_sidecar_wait_context_compression_backoff(run_stream, delay).await
+                        {
+                            return Err(ApiError::bad_request(
+                                "context compression summary was cancelled",
+                            ));
+                        }
+                        retries_used = next_retry_ordinal;
+                        continue;
+                    }
+                    if matches!(
+                        action,
+                        ContextCompressionFailureAction::ContinueWithoutCompression
+                    ) {
+                        return Ok(false);
+                    }
+                    return Err(ApiError::bad_request(
+                        "context compression is required to fit the next provider request; the compression provider could not produce a checkpoint. Start a new chat or reduce the conversation before retrying.",
+                    ));
+                }
+            }
+        };
         events[compression_start_event_index].provider_id = resolved_provider_id.clone();
 
         if !context_compression_summary_has_benefit(&summary, original_tokens) {
+            let skipped_event = remote_sidecar_context_compression_no_snapshot_event(
+                events[compression_start_event_index].clone(),
+                "skipped",
+                &resolved_provider_id,
+                model_id,
+                &provider_request_id,
+                mode,
+                retries_used,
+                "summary_not_beneficial",
+                "Compression summary did not reduce context enough; continuing without compression",
+            );
             events.truncate(compression_start_event_index);
+            remote_push_context_compression_event(events, event_tx, skipped_event);
             return Ok(false);
         }
         let summary_token_count = estimate_text_tokens(&summary);
@@ -726,7 +913,19 @@ impl RemoteSidecarRuntimeToolState {
             match remote_sidecar_hook_environment(state, None).await {
                 Ok(environment) => environment,
                 Err(error) => {
+                    let failed_event = remote_sidecar_context_compression_no_snapshot_event(
+                        events[compression_start_event_index].clone(),
+                        "failed",
+                        &resolved_provider_id,
+                        model_id,
+                        &provider_request_id,
+                        mode,
+                        retries_used,
+                        "pre_compact_setup_failed",
+                        "Compression pre-save checks could not start; chat context was left unchanged",
+                    );
                     events.truncate(compression_start_event_index);
+                    remote_push_context_compression_event(events, event_tx, failed_event);
                     run_stream.push_hook_notifications(vec![HookNotification {
                         event: "PreCompact".to_string(),
                         level: "error".to_string(),
@@ -764,7 +963,19 @@ impl RemoteSidecarRuntimeToolState {
         run_stream.push_hook_notifications(pre_summary.hook_messages("PreCompact"));
         self.append_hook_context(messages, &pre_summary.additional_context);
         if pre_summary.first_block_reason().is_some() {
+            let skipped_event = remote_sidecar_context_compression_no_snapshot_event(
+                events[compression_start_event_index].clone(),
+                "skipped",
+                &resolved_provider_id,
+                model_id,
+                &provider_request_id,
+                mode,
+                retries_used,
+                "pre_compact_blocked",
+                "Compression was blocked by a PreCompact hook; continuing without compression",
+            );
             events.truncate(compression_start_event_index);
+            remote_push_context_compression_event(events, event_tx, skipped_event);
             return Ok(false);
         }
 
@@ -805,7 +1016,30 @@ impl RemoteSidecarRuntimeToolState {
         ) {
             Ok(prepared) => prepared,
             Err(error) => {
+                let failed_event = remote_sidecar_snapshot_persistence_failure_event(
+                    events[compression_start_event_index].clone(),
+                    &resolved_provider_id,
+                    model_id,
+                    &provider_request_id,
+                    mode,
+                    retries_used,
+                );
                 events.truncate(compression_start_event_index);
+                remote_push_context_compression_event(events, event_tx, failed_event);
+                tracing::warn!(
+                    workspace_id,
+                    chat_id,
+                    run_id,
+                    compression_id,
+                    provider_id = %resolved_provider_id,
+                    model_id,
+                    compression_mode = ContextCompressionMode::from(mode).as_str(),
+                    input_token_count = original_tokens,
+                    attempt_index = retries_used,
+                    outcome = "failed",
+                    action = "snapshot_persistence_failed",
+                    "remote context compression checkpoint preparation failed"
+                );
                 return Err(error);
             }
         };
@@ -814,7 +1048,30 @@ impl RemoteSidecarRuntimeToolState {
                 .map_err(ApiError::from_workspace_error)?;
             insert_context_compression_snapshot_record(&mut database, &prepared)
         })() {
+            let failed_event = remote_sidecar_snapshot_persistence_failure_event(
+                events[compression_start_event_index].clone(),
+                &resolved_provider_id,
+                model_id,
+                &provider_request_id,
+                mode,
+                retries_used,
+            );
             events.truncate(compression_start_event_index);
+            remote_push_context_compression_event(events, event_tx, failed_event);
+            tracing::warn!(
+                workspace_id,
+                chat_id,
+                run_id,
+                compression_id,
+                provider_id = %resolved_provider_id,
+                model_id,
+                compression_mode = ContextCompressionMode::from(mode).as_str(),
+                input_token_count = original_tokens,
+                attempt_index = retries_used,
+                outcome = "failed",
+                action = "snapshot_persistence_failed",
+                "remote context compression checkpoint persistence failed"
+            );
             return Err(error);
         }
 
@@ -828,6 +1085,19 @@ impl RemoteSidecarRuntimeToolState {
         // Pre-compression provider input is stale after a durable checkpoint.
         self.last_chat_completion_input_tokens = None;
 
+        tracing::info!(
+            workspace_id,
+            chat_id,
+            run_id,
+            provider_id = %resolved_provider_id,
+            model_id,
+            compression_mode = ContextCompressionMode::from(mode).as_str(),
+            input_token_count = prepared.snapshot.original_token_count,
+            summary_token_count = prepared.snapshot.summary_token_count,
+            attempt_index = retries_used,
+            outcome = "succeeded",
+            "remote context compression checkpoint persisted"
+        );
         remote_push_context_compression_event(
             events,
             event_tx,
@@ -842,6 +1112,12 @@ impl RemoteSidecarRuntimeToolState {
                 completed_at: Some(utc_timestamp()),
                 provider_id: resolved_provider_id.clone(),
                 model_id: model_id.to_string(),
+                provider_request_id: Some(provider_request_id),
+                compression_mode: Some(ContextCompressionMode::from(mode).as_str().to_string()),
+                attempt_index: Some(retries_used),
+                outcome: Some("succeeded".to_string()),
+                action: Some("checkpoint_persisted".to_string()),
+                error_message: None,
             },
         );
 
@@ -3013,6 +3289,22 @@ async fn remote_sidecar_wait_provider_retry_backoff_cancellable(
                 }
             }
         }
+    }
+}
+
+async fn remote_sidecar_wait_context_compression_backoff(
+    run_stream: &RemoteActiveRunStream,
+    delay: std::time::Duration,
+) -> bool {
+    if run_stream.is_cancel_requested() || run_stream.is_finished() {
+        return true;
+    }
+    let mut cancel_rx = run_stream.subscribe_cancel();
+    let mut finished_rx = run_stream.subscribe_finished();
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        changed = cancel_rx.changed() => changed.is_err() || run_stream.is_cancel_requested() || run_stream.is_finished(),
+        changed = finished_rx.changed() => changed.is_err() || run_stream.is_cancel_requested() || run_stream.is_finished(),
     }
 }
 
@@ -9653,6 +9945,12 @@ fn remote_context_compression_part(detail: &RemoteSidecarContextCompressionEvent
             "completedAt": detail.completed_at,
             "providerId": detail.provider_id,
             "modelId": detail.model_id,
+            "providerRequestId": detail.provider_request_id,
+            "compressionMode": detail.compression_mode,
+            "attemptIndex": detail.attempt_index,
+            "outcome": detail.outcome,
+            "action": detail.action,
+            "errorMessage": detail.error_message,
         }
     })
 }
@@ -9719,6 +10017,20 @@ fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
         .cloned()
         .unwrap_or(Value::String("pending".to_string()));
 
+    let current_status = current_object
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let next_status_text = next_status.as_str().unwrap_or_default();
+    if !remote_context_compression_part_should_replace(
+        current_object.get("detail"),
+        current_status,
+        next_object.get("detail"),
+        next_status_text,
+    ) {
+        return;
+    }
+
     let mut detail = current_object
         .get("detail")
         .cloned()
@@ -9733,6 +10045,12 @@ fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
             "summaryTokenCount",
             "startedAt",
             "completedAt",
+            "providerRequestId",
+            "compressionMode",
+            "attemptIndex",
+            "outcome",
+            "action",
+            "errorMessage",
         ] {
             if let Some(value) = next_detail_object.get(key).filter(|value| !value.is_null()) {
                 detail_object.insert(key.to_string(), value.clone());
@@ -9769,6 +10087,46 @@ fn remote_merge_context_compression_part(current: &mut Value, next: Value) {
     current_object.insert("status".to_string(), next_status);
     current_object.insert("kind".to_string(), next_kind);
     current_object.insert("detail".to_string(), detail);
+}
+
+fn remote_context_compression_part_should_replace(
+    current_detail: Option<&Value>,
+    current_status: &str,
+    next_detail: Option<&Value>,
+    next_status: &str,
+) -> bool {
+    let current_terminal = remote_context_compression_status_is_terminal(current_status);
+    let next_terminal = remote_context_compression_status_is_terminal(next_status);
+    if current_terminal != next_terminal {
+        return next_terminal;
+    }
+    let current_attempt = current_detail
+        .and_then(|detail| detail.get("attemptIndex"))
+        .and_then(Value::as_u64);
+    let next_attempt = next_detail
+        .and_then(|detail| detail.get("attemptIndex"))
+        .and_then(Value::as_u64);
+    if let (Some(current_attempt), Some(next_attempt)) = (current_attempt, next_attempt)
+        && current_attempt != next_attempt
+    {
+        return next_attempt > current_attempt;
+    }
+    remote_context_compression_status_rank(next_status)
+        >= remote_context_compression_status_rank(current_status)
+}
+
+fn remote_context_compression_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "skipped" | "failed" | "cancelled")
+}
+
+fn remote_context_compression_status_rank(status: &str) -> u8 {
+    if remote_context_compression_status_is_terminal(status) {
+        2
+    } else if status == "retrying" {
+        1
+    } else {
+        0
+    }
 }
 
 fn remote_push_context_compression_part(
@@ -15878,11 +16236,18 @@ enum RemoteSidecarContextCompressionOutcome {
     },
     Failed {
         message: String,
+        request_id: Option<String>,
+    },
+    RetryableFailure {
+        message: String,
+        request_id: Option<String>,
+        retry_class: crate::provider_retry::ProviderRetryClass,
+        retry_after: Option<std::time::Duration>,
     },
     Cancelled,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct RemoteSidecarContextCompressionEventDetail {
     status: String,
     kind: String,
@@ -15894,6 +16259,80 @@ struct RemoteSidecarContextCompressionEventDetail {
     completed_at: Option<String>,
     provider_id: String,
     model_id: String,
+    provider_request_id: Option<String>,
+    compression_mode: Option<String>,
+    attempt_index: Option<u32>,
+    outcome: Option<String>,
+    action: Option<String>,
+    error_message: Option<String>,
+}
+
+fn remote_sidecar_context_compression_event_error_summary(
+    action: ContextCompressionFailureAction,
+) -> &'static str {
+    match action {
+        ContextCompressionFailureAction::Retry => "Provider request failed; retrying compression",
+        ContextCompressionFailureAction::ContinueWithoutCompression => {
+            "Provider request failed; continuing without compression"
+        }
+        ContextCompressionFailureAction::FailRequiredOverflow => {
+            "Provider request failed; context is still too large"
+        }
+        ContextCompressionFailureAction::Stop => "Compression cancelled",
+    }
+}
+
+fn remote_sidecar_context_compression_no_snapshot_event(
+    mut event: RemoteSidecarContextCompressionEventDetail,
+    status: &str,
+    provider_id: &str,
+    model_id: &str,
+    provider_request_id: &str,
+    mode: LlmContextCompressionMode,
+    attempt_index: u32,
+    action: &str,
+    error_message: &str,
+) -> RemoteSidecarContextCompressionEventDetail {
+    event.status = status.to_string();
+    event.snapshot_id = None;
+    event.summary_token_count = None;
+    event.completed_at = Some(utc_timestamp());
+    event.provider_id = provider_id.to_string();
+    event.model_id = model_id.to_string();
+    event.provider_request_id = Some(provider_request_id.to_string());
+    event.compression_mode = Some(ContextCompressionMode::from(mode).as_str().to_string());
+    event.attempt_index = Some(attempt_index);
+    event.outcome = Some(status.to_string());
+    event.action = Some(action.to_string());
+    event.error_message = Some(error_message.to_string());
+    event
+}
+
+/// Convert an already-emitted live start into the one safe terminal event used
+/// when checkpoint preparation or persistence fails. The provider response was
+/// valid, but the original prompt remains active because no snapshot is durable.
+fn remote_sidecar_snapshot_persistence_failure_event(
+    mut event: RemoteSidecarContextCompressionEventDetail,
+    provider_id: &str,
+    model_id: &str,
+    provider_request_id: &str,
+    mode: LlmContextCompressionMode,
+    attempt_index: u32,
+) -> RemoteSidecarContextCompressionEventDetail {
+    event.status = "failed".to_string();
+    event.snapshot_id = None;
+    event.summary_token_count = None;
+    event.completed_at = Some(utc_timestamp());
+    event.provider_id = provider_id.to_string();
+    event.model_id = model_id.to_string();
+    event.provider_request_id = Some(provider_request_id.to_string());
+    event.compression_mode = Some(ContextCompressionMode::from(mode).as_str().to_string());
+    event.attempt_index = Some(attempt_index);
+    event.outcome = Some("failed".to_string());
+    event.action = Some("snapshot_persistence_failed".to_string());
+    event.error_message =
+        Some("Checkpoint could not be saved; chat context was left unchanged".to_string());
+    event
 }
 
 fn remote_push_context_compression_event(
@@ -15929,6 +16368,12 @@ fn remote_sidecar_context_compression_sse_event(
             "completedAt": detail.completed_at,
             "providerId": detail.provider_id,
             "modelId": detail.model_id,
+            "providerRequestId": detail.provider_request_id,
+            "compressionMode": detail.compression_mode,
+            "attemptIndex": detail.attempt_index,
+            "outcome": detail.outcome,
+            "action": detail.action,
+            "errorMessage": detail.error_message,
         },
     })
 }
@@ -15948,6 +16393,38 @@ async fn remote_sidecar_run_broker_context_compression_summary(
     model_id: &str,
     context_window: u64,
     checkpoint_messages: &[NeutralChatMessage],
+) -> RemoteSidecarContextCompressionOutcome {
+    remote_sidecar_run_broker_context_compression_summary_with_deadline(
+        state,
+        run_stream,
+        workspace_id,
+        chat_id,
+        run_id,
+        user_message_id,
+        assistant_message_id,
+        provider_id,
+        model_id,
+        context_window,
+        checkpoint_messages,
+        ContextCompressionAttemptDeadline::new(Duration::from_millis(LLM_REQUEST_TIMEOUT_MS)),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn remote_sidecar_run_broker_context_compression_summary_with_deadline(
+    state: &RemoteSidecarState,
+    run_stream: Option<&RemoteActiveRunStream>,
+    workspace_id: &str,
+    chat_id: &str,
+    run_id: &str,
+    user_message_id: &str,
+    assistant_message_id: &str,
+    provider_id: &str,
+    model_id: &str,
+    context_window: u64,
+    checkpoint_messages: &[NeutralChatMessage],
+    deadline: ContextCompressionAttemptDeadline,
 ) -> RemoteSidecarContextCompressionOutcome {
     let compression_prompt = {
         let runtime_config = state.runtime_config.lock().ok();
@@ -15993,6 +16470,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
         Err(error) => {
             return RemoteSidecarContextCompressionOutcome::Failed {
                 message: error.message().to_string(),
+                request_id: None,
             };
         }
     };
@@ -16008,6 +16486,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                     "context compression hierarchy exceeded max depth ({})",
                     crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
                 ),
+                request_id: None,
             };
         }
 
@@ -16019,6 +16498,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                         "context compression hierarchy exceeded max requests ({})",
                         crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
                     ),
+                    request_id: None,
                 };
             }
             return remote_sidecar_run_broker_context_compression_summary_once(
@@ -16033,6 +16513,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                 model_id,
                 &compression_prompt,
                 &pending[0],
+                deadline,
             )
             .await;
         }
@@ -16047,6 +16528,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                     pending.len(),
                     crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
                 ),
+                request_id: None,
             };
         }
 
@@ -16059,6 +16541,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                         "context compression hierarchy exceeded max requests ({})",
                         crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
                     ),
+                    request_id: None,
                 };
             }
             match remote_sidecar_run_broker_context_compression_summary_once(
@@ -16073,6 +16556,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                 model_id,
                 &compression_prompt,
                 chunk,
+                deadline,
             )
             .await
             {
@@ -16097,6 +16581,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                         "context compression hierarchy exceeded max requests ({})",
                         crate::LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS
                     ),
+                    request_id: None,
                 };
             }
             return remote_sidecar_run_broker_context_compression_summary_once(
@@ -16111,6 +16596,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
                 model_id,
                 &compression_prompt,
                 &merge_messages,
+                deadline,
             )
             .await;
         }
@@ -16122,6 +16608,7 @@ async fn remote_sidecar_run_broker_context_compression_summary(
             Err(error) => {
                 return RemoteSidecarContextCompressionOutcome::Failed {
                     message: error.message().to_string(),
+                    request_id: None,
                 };
             }
         }
@@ -16140,14 +16627,22 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
     model_id: &str,
     compression_system_prompt: &str,
     checkpoint_messages: &[NeutralChatMessage],
+    deadline: ContextCompressionAttemptDeadline,
 ) -> RemoteSidecarContextCompressionOutcome {
+    let Some(timeout_ms) = deadline.remaining_millis() else {
+        return RemoteSidecarContextCompressionOutcome::RetryableFailure {
+            message: "context compression retry budget was exhausted".to_string(),
+            request_id: None,
+            retry_class: crate::provider_retry::ProviderRetryClass::Network,
+            retry_after: None,
+        };
+    };
     let request = crate::prompt::build_context_compression_summary_request_with_prompt(
         model_id,
         checkpoint_messages,
         compression_system_prompt,
     );
     let broker_request_id = unique_id("broker-ctx-compress");
-    let request_started_at = Instant::now();
     if let Some(run_stream) = run_stream {
         run_stream.set_broker_request_id(broker_request_id.clone());
     }
@@ -16157,7 +16652,7 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         "runId": run_id,
         "requestId": broker_request_id,
         "requestKind": BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
-        "timeoutMs": LLM_REQUEST_TIMEOUT_MS,
+        "timeoutMs": timeout_ms,
         "userMessageId": user_message_id,
         "assistantMessageId": assistant_message_id,
         "providerId": provider_id,
@@ -16166,7 +16661,7 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
     });
 
     let mut broker_rx = match timeout(
-        crate::remaining_llm_request_timeout(request_started_at, LLM_REQUEST_TIMEOUT_MS),
+        deadline.remaining().unwrap_or_default(),
         remote_sidecar_broker_request(state, &broker_request_id, "llm.stream", broker_payload),
     )
     .await
@@ -16174,18 +16669,24 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
         Err(_) => {
             remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
             state.broker_pending.lock().await.remove(&broker_request_id);
-            return RemoteSidecarContextCompressionOutcome::Failed {
+            return RemoteSidecarContextCompressionOutcome::RetryableFailure {
                 message: crate::llm_request_timeout_message(
                     BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
-                    LLM_REQUEST_TIMEOUT_MS,
+                    timeout_ms,
                 ),
+                request_id: Some(broker_request_id.clone()),
+                retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                retry_after: None,
             };
         }
         Ok(Ok(rx)) => rx,
         Ok(Err(_)) => {
-            return RemoteSidecarContextCompressionOutcome::Failed {
+            return RemoteSidecarContextCompressionOutcome::RetryableFailure {
                 message: "context compression summary failed: remote broker is unavailable"
                     .to_string(),
+                request_id: Some(broker_request_id.clone()),
+                retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                retry_after: None,
             };
         }
     };
@@ -16224,11 +16725,8 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
             return RemoteSidecarContextCompressionOutcome::Cancelled;
         }
 
-        let envelope = match timeout(
-            crate::remaining_llm_request_timeout(request_started_at, LLM_REQUEST_TIMEOUT_MS),
-            broker_rx.recv(),
-        )
-        .await
+        let envelope = match timeout(deadline.remaining().unwrap_or_default(), broker_rx.recv())
+            .await
         {
             Ok(Some(envelope)) => envelope,
             Ok(None) => {
@@ -16253,14 +16751,17 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                         "error": { "message": message },
                     }),
                 );
-                return RemoteSidecarContextCompressionOutcome::Failed {
+                return RemoteSidecarContextCompressionOutcome::RetryableFailure {
                     message: message.to_string(),
+                    request_id: Some(broker_request_id.clone()),
+                    retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                    retry_after: None,
                 };
             }
             Err(_) => {
                 let message = crate::llm_request_timeout_message(
                     BROKER_CONTEXT_COMPRESSION_REQUEST_KIND,
-                    LLM_REQUEST_TIMEOUT_MS,
+                    timeout_ms,
                 );
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
@@ -16288,7 +16789,12 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     remote_sidecar_cancel_broker_request_id(state, &broker_request_id);
                 }
                 state.broker_pending.lock().await.remove(&broker_request_id);
-                return RemoteSidecarContextCompressionOutcome::Failed { message };
+                return RemoteSidecarContextCompressionOutcome::RetryableFailure {
+                    message,
+                    request_id: Some(broker_request_id.clone()),
+                    retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                    retry_after: None,
+                };
             }
         };
 
@@ -16375,7 +16881,10 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                             "error": { "message": message },
                         }),
                     );
-                    return RemoteSidecarContextCompressionOutcome::Failed { message };
+                    return RemoteSidecarContextCompressionOutcome::Failed {
+                        message,
+                        request_id: Some(audit_request_id),
+                    };
                 }
                 let summary = output_text.trim().to_string();
                 if summary.is_empty() {
@@ -16399,7 +16908,10 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                             "error": { "message": message },
                         }),
                     );
-                    return RemoteSidecarContextCompressionOutcome::Failed { message };
+                    return RemoteSidecarContextCompressionOutcome::Failed {
+                        message,
+                        request_id: Some(audit_request_id),
+                    };
                 }
                 let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
                 let total_latency_ms = compression_metrics.total_latency_ms();
@@ -16466,6 +16978,24 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                     );
                     return RemoteSidecarContextCompressionOutcome::Cancelled;
                 }
+                let retry_class = classify_remote_broker_retry_class(
+                    code,
+                    envelope
+                        .payload
+                        .get("retryable")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    envelope.payload.get("statusCode").and_then(Value::as_i64),
+                    envelope.payload.get("failureKind").and_then(Value::as_str),
+                    envelope.payload.get("providerCode").and_then(Value::as_str),
+                    envelope.payload.get("providerType").and_then(Value::as_str),
+                    message,
+                );
+                let retry_after = envelope
+                    .payload
+                    .get("retryAfterSeconds")
+                    .and_then(Value::as_u64)
+                    .map(std::time::Duration::from_secs);
                 let message = format!("context compression summary failed: {message}");
                 let _ = persist_sidecar_llm_audit_for_kind_for_state(
                     state,
@@ -16484,7 +17014,12 @@ async fn remote_sidecar_run_broker_context_compression_summary_once(
                         "error": { "message": message },
                     }),
                 );
-                return RemoteSidecarContextCompressionOutcome::Failed { message };
+                return RemoteSidecarContextCompressionOutcome::RetryableFailure {
+                    message,
+                    request_id: Some(broker_request_id.clone()),
+                    retry_class,
+                    retry_after,
+                };
             }
             _ => {}
         }
@@ -17483,6 +18018,33 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         let (packed_messages, _compression_events) = match compression_result {
             Ok(result) => result,
             Err(error) => {
+                if run_stream.is_cancel_requested() || run_stream.is_finished() {
+                    if !run_compression_events.is_empty() {
+                        let metadata = json!({
+                            "parts": remote_chat_parts_with_context_compression(
+                                "",
+                                None,
+                                &run_compression_events,
+                                &content_parts_prefix,
+                            ),
+                            "partsVersion": 6,
+                            "partsSource": "live_sse",
+                            "streamingState": "cancelled",
+                        });
+                        let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                            database.update_existing_message_content(
+                                &assistant_message_id,
+                                &chat_id,
+                                "assistant",
+                                "",
+                                &metadata.to_string(),
+                            )
+                        });
+                    }
+                    remote_sidecar_finish_active_run(&stream_state, &run_id);
+                    cleanup_guard.disarm();
+                    break;
+                }
                 let message = error.message;
                 if !run_compression_events.is_empty() {
                     // Keep live start/completed compression blocks durable in message parts
@@ -37039,7 +37601,7 @@ mod tests {
             .await;
             broker.await.expect("broker");
             match outcome {
-                RemoteSidecarContextCompressionOutcome::Failed { message } => {
+                RemoteSidecarContextCompressionOutcome::Failed { message, .. } => {
                     assert!(message.contains("empty text"));
                 }
                 other => panic!("expected failed empty summary, got {other:?}"),
@@ -37103,7 +37665,7 @@ mod tests {
             .await;
             broker.await.expect("broker");
             match outcome {
-                RemoteSidecarContextCompressionOutcome::Failed { message } => {
+                RemoteSidecarContextCompressionOutcome::Failed { message, .. } => {
                     assert!(message.contains("unsupported tool"));
                 }
                 other => panic!("expected failed tool summary, got {other:?}"),
@@ -37146,6 +37708,284 @@ mod tests {
             )
             .contains("still exceeds the model input budget")
         );
+    }
+
+    #[test]
+    fn remote_broker_server_error_uses_the_shared_compression_retry_policy() {
+        let retry_class = classify_remote_broker_retry_class(
+            "server_error",
+            false,
+            Some(200),
+            None,
+            Some("server_error"),
+            Some("server_error"),
+            "temporary provider failure",
+        );
+        assert_eq!(
+            retry_class,
+            crate::provider_retry::ProviderRetryClass::TransientServer
+        );
+
+        let budget = ContextCompressionRetryBudget::from_configured_retry_count(1);
+        assert_eq!(
+            context_compression_failure_action(
+                ContextCompressionMode::Normal,
+                retry_class,
+                0,
+                budget,
+                Some(Duration::from_secs(1)),
+                false,
+            ),
+            ContextCompressionFailureAction::Retry
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_snapshot_prepare_failure_terminates_the_live_compression() {
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut events = Vec::new();
+        let start = RemoteSidecarContextCompressionEventDetail {
+            status: "start".to_string(),
+            kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+            compression_id: Some("compression-prepare-failure".to_string()),
+            original_token_count: Some(235_744),
+            started_at: Some("2026-07-25T10:00:00Z".to_string()),
+            provider_id: "configured-provider".to_string(),
+            model_id: "configured-model".to_string(),
+            compression_mode: Some("normal".to_string()),
+            attempt_index: Some(0),
+            outcome: Some("started".to_string()),
+            action: Some("request".to_string()),
+            ..Default::default()
+        };
+        remote_push_context_compression_event(&mut events, Some(&event_tx), start.clone());
+        let compression_start_event_index = events.len() - 1;
+
+        let failed = remote_sidecar_snapshot_persistence_failure_event(
+            events[compression_start_event_index].clone(),
+            "resolved-provider",
+            "resolved-model",
+            "audit-request-1",
+            LlmContextCompressionMode::Normal,
+            1,
+        );
+        events.truncate(compression_start_event_index);
+        remote_push_context_compression_event(&mut events, Some(&event_tx), failed);
+
+        let live_start = event_rx.recv().await.expect("live start event");
+        let live_failed = event_rx.recv().await.expect("live failed event");
+        assert_eq!(live_start.status, "start");
+        assert_eq!(live_failed.status, "failed");
+        assert_eq!(live_start.compression_id, live_failed.compression_id);
+        assert_eq!(events.len(), 1);
+        let failed = &events[0];
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.compression_id.as_deref(),
+            Some("compression-prepare-failure")
+        );
+        assert_eq!(failed.snapshot_id, None);
+        assert_eq!(failed.summary_token_count, None);
+        assert_eq!(failed.provider_id, "resolved-provider");
+        assert_eq!(failed.model_id, "resolved-model");
+        assert_eq!(
+            failed.provider_request_id.as_deref(),
+            Some("audit-request-1")
+        );
+        assert_eq!(failed.compression_mode.as_deref(), Some("normal"));
+        assert_eq!(failed.attempt_index, Some(1));
+        assert_eq!(failed.outcome.as_deref(), Some("failed"));
+        assert_eq!(
+            failed.action.as_deref(),
+            Some("snapshot_persistence_failed")
+        );
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("Checkpoint could not be saved; chat context was left unchanged")
+        );
+        assert!(failed.completed_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_prepare_overflow_terminates_live_compression_without_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-prepare-overflow", "Remote chat", "{}")
+            .expect("insert chat");
+        drop(database);
+
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let mut config =
+            foco_store::config::GlobalConfig::first_run(workspace.path().to_path_buf());
+        config.models.push(foco_store::config::ModelSettings {
+            id: "model-1".to_string(),
+            display_name: "Model 1".to_string(),
+            enabled: true,
+            provider_ids: vec!["provider-1".to_string()],
+            active_provider_id: Some("provider-1".to_string()),
+            thinking_level: None,
+            web_search_mode: WebSearchMode::Auto,
+            system_prompt_name: String::new(),
+            metadata_key: None,
+            metadata_source_url: None,
+            metadata_refreshed_at: None,
+            limits: Some(foco_store::config::ModelLimits {
+                context_window: 128_000,
+                max_output_tokens: 4096,
+            }),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+        });
+        let bundle = build_sidecar_runtime_config_bundle(workspace.path(), &config, 1)
+            .expect("runtime bundle");
+        *state.runtime_config.lock().expect("runtime config") = Some(bundle);
+        let broker_state = state.clone();
+        let run_stream = RemoteActiveRunStream::new("chat-prepare-overflow".to_string());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let mut messages = vec![
+            neutral_text_message(NeutralChatRole::User, "old-history-0 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-1 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "old-history-2 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::Assistant, "old-history-3 ".repeat(400)),
+            neutral_text_message(NeutralChatRole::User, "current turn".to_string()),
+        ];
+        let mut runtime_tool_state = RemoteSidecarRuntimeToolState {
+            message_source_sequences: vec![Some(0), Some(1), Some(2), Some(3), Some(4)],
+            message_context_sources: vec![
+                PromptContextSource::StoredMessage { sequence: 0 },
+                PromptContextSource::StoredMessage { sequence: 1 },
+                PromptContextSource::StoredMessage { sequence: 2 },
+                PromptContextSource::StoredMessage { sequence: 3 },
+                PromptContextSource::CurrentUser { sequence: 4 },
+            ],
+            active_tool_start_index: messages.len(),
+            next_runtime_tool_batch_index: 0,
+            runtime_tool_state_compression_count: 0,
+            context_budget: ContextBudget {
+                context_window: 1_000,
+                max_output_tokens: 0,
+                system_prompt_tokens: 0,
+                tool_schema_tokens: 0,
+                safety_tokens: 0,
+                available_message_tokens: 10_000,
+            },
+            compression_enabled: false,
+            compression_snapshots: vec![foco_store::workspace::ContextCompressionSnapshotRecord {
+                id: "ctx-max-sequence".to_string(),
+                chat_id: "chat-prepare-overflow".to_string(),
+                run_id: "prior-run".to_string(),
+                sequence: i64::MAX,
+                summary: "prior summary".to_string(),
+                source_message_start_sequence: 0,
+                source_message_end_sequence: 0,
+                original_token_count: 1,
+                summary_token_count: 1,
+                created_at: "2026-07-25T10:00:00Z".to_string(),
+                metadata_json: "{}".to_string(),
+            }],
+            last_chat_completion_input_tokens: None,
+        };
+        let groups = crate::prompt::context_message_groups(
+            &messages,
+            &runtime_tool_state.message_source_sequences,
+            &runtime_tool_state.message_context_sources,
+            messages.len(),
+        )
+        .expect("message groups");
+        let original_messages = messages.clone();
+        let compression_task = tokio::spawn({
+            let state = state.clone();
+            let run_stream = run_stream.clone();
+            async move {
+                let mut events = Vec::new();
+                let result = runtime_tool_state
+                    .ensure_llm_context_compression(
+                        &mut messages,
+                        &groups,
+                        &mut events,
+                        Some(&event_tx),
+                        LlmContextCompressionMode::RequiredOverflow,
+                        0,
+                        &state,
+                        &run_stream,
+                        "workspace",
+                        "chat-prepare-overflow",
+                        "run-prepare-overflow",
+                        "msg-user-1",
+                        "msg-assistant-1",
+                        "provider-1",
+                        "model-1",
+                    )
+                    .await;
+                (result, events, messages, runtime_tool_state)
+            }
+        });
+
+        let request = timeout(Duration::from_secs(2), broker_rx.recv())
+            .await
+            .expect("broker request")
+            .expect("broker envelope");
+        assert_eq!(request.method.as_deref(), Some("llm.stream"));
+        let id = request.id.clone().expect("request id");
+        let pending = broker_state
+            .broker_pending
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .expect("pending response channel");
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(id),
+                method: None,
+                payload: json!({
+                    "llmRequestId": "broker-prepare-overflow",
+                    "text": "compact summary for continuation",
+                    "toolCalls": [],
+                    "usage": { "inputTokens": 100, "outputTokens": 20 }
+                }),
+                timestamp: None,
+            })
+            .expect("response");
+
+        let (result, events, messages_after, runtime_after) =
+            compression_task.await.expect("compression join");
+        let error = result.expect_err("sequence overflow must stop checkpoint preparation");
+        assert!(error.message.contains("snapshot sequence overflowed"));
+        assert_eq!(messages_after, original_messages);
+        assert_eq!(runtime_after.compression_snapshots.len(), 1);
+        assert_eq!(events.len(), 1);
+        let failed = &events[0];
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.action.as_deref(),
+            Some("snapshot_persistence_failed")
+        );
+        assert_eq!(
+            failed.error_message.as_deref(),
+            Some("Checkpoint could not be saved; chat context was left unchanged")
+        );
+        assert_eq!(
+            failed.provider_request_id.as_deref(),
+            Some("broker-prepare-overflow")
+        );
+
+        let live_start = event_rx.recv().await.expect("live start event");
+        let live_failed = event_rx.recv().await.expect("live failed event");
+        assert_eq!(live_start.status, "start");
+        assert_eq!(live_failed.status, "failed");
+        assert_eq!(live_start.compression_id, live_failed.compression_id);
+
+        let snapshots = WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("reopen db")
+            .context_compression_snapshots_for_chat("chat-prepare-overflow")
+            .expect("snapshots");
+        assert!(snapshots.is_empty());
     }
 
     #[tokio::test]
@@ -37628,6 +38468,22 @@ mod tests {
         assert!(events.iter().all(|event| {
             event.kind != CONTEXT_COMPRESSION_KIND_LLM || event.status != "completed"
         }));
+        assert_eq!(events.len(), 1);
+        let terminal_event = &events[0];
+        assert_eq!(terminal_event.status, "skipped");
+        assert_eq!(terminal_event.compression_mode.as_deref(), Some("normal"));
+        assert_eq!(
+            terminal_event.action.as_deref(),
+            Some("pre_compact_blocked")
+        );
+        assert_eq!(
+            terminal_event.error_message.as_deref(),
+            Some("Compression was blocked by a PreCompact hook; continuing without compression")
+        );
+        assert_eq!(
+            terminal_event.provider_request_id.as_deref(),
+            Some("broker-block")
+        );
         assert!(runtime_after.compression_snapshots.is_empty());
         // PreCompact block must not clear a still-valid pre-compression provider sample.
         assert_eq!(
@@ -38237,6 +39093,23 @@ mod tests {
                 .all(|event| event.kind != CONTEXT_COMPRESSION_KIND_LLM
                     || event.status != "completed")
         );
+        assert_eq!(events.len(), 1);
+        let terminal_event = &events[0];
+        assert_eq!(terminal_event.status, "skipped");
+        assert_eq!(
+            terminal_event.action.as_deref(),
+            Some("summary_not_beneficial")
+        );
+        assert_eq!(
+            terminal_event.error_message.as_deref(),
+            Some(
+                "Compression summary did not reduce context enough; continuing without compression"
+            )
+        );
+        assert_eq!(
+            terminal_event.provider_request_id.as_deref(),
+            Some("broker-no-benefit-1")
+        );
         assert!(
             messages_after
                 .iter()
@@ -38497,6 +39370,12 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                compression_mode: Some("normal".to_string()),
+                attempt_index: Some(0),
+                outcome: Some("succeeded".to_string()),
+                action: Some("checkpoint_persisted".to_string()),
+                error_message: None,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -38533,6 +39412,19 @@ mod tests {
             detail.get("originalTokenCount").and_then(Value::as_i64),
             Some(1200)
         );
+        assert_eq!(
+            detail.get("compressionMode").and_then(Value::as_str),
+            Some("normal")
+        );
+        assert_eq!(detail.get("attemptIndex").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            detail.get("outcome").and_then(Value::as_str),
+            Some("succeeded")
+        );
+        assert_eq!(
+            detail.get("action").and_then(Value::as_str),
+            Some("checkpoint_persisted")
+        );
     }
 
     #[test]
@@ -38541,7 +39433,7 @@ mod tests {
             RemoteSidecarContextCompressionEventDetail {
                 status: "start".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
-                compression_id: None,
+                compression_id: Some("compression-1".to_string()),
                 snapshot_id: None,
                 original_token_count: Some(1200),
                 summary_token_count: None,
@@ -38549,11 +39441,12 @@ mod tests {
                 completed_at: None,
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
                 kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
-                compression_id: None,
+                compression_id: Some("compression-1".to_string()),
                 snapshot_id: Some("ctx-1".to_string()),
                 original_token_count: Some(1200),
                 summary_token_count: Some(80),
@@ -38561,6 +39454,23 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                provider_request_id: Some("request-1".to_string()),
+                ..Default::default()
+            },
+            // A replayed retry event must not regress the durable terminal card.
+            RemoteSidecarContextCompressionEventDetail {
+                status: "retrying".to_string(),
+                kind: CONTEXT_COMPRESSION_KIND_LLM.to_string(),
+                compression_id: Some("compression-1".to_string()),
+                started_at: Some("2026-07-12T00:00:00Z".to_string()),
+                completed_at: Some("2026-07-12T00:00:02Z".to_string()),
+                provider_id: "provider-1".to_string(),
+                model_id: "model-1".to_string(),
+                attempt_index: Some(1),
+                outcome: Some("failed".to_string()),
+                action: Some("retry".to_string()),
+                error_message: Some("Provider request failed; retrying compression".to_string()),
+                ..Default::default()
             },
         ];
         let parts = remote_chat_parts_with_context_compression("Done.", None, &events, &[]);
@@ -38574,7 +39484,17 @@ mod tests {
             Some("completed")
         );
         assert_eq!(parts[0].get("kind").and_then(Value::as_str), Some("llm"));
-        assert_eq!(parts[0].get("id").and_then(Value::as_str), Some("ctx-1"));
+        assert_eq!(
+            parts[0].get("id").and_then(Value::as_str),
+            Some("compression-1")
+        );
+        assert_eq!(
+            parts[0]
+                .get("detail")
+                .and_then(|detail| detail.get("providerRequestId"))
+                .and_then(Value::as_str),
+            Some("request-1")
+        );
         assert_eq!(
             parts[0]
                 .get("detail")
@@ -38600,6 +39520,7 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
@@ -38612,6 +39533,7 @@ mod tests {
                 completed_at: Some("2026-07-12T00:01:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         ];
         let parts =
@@ -38653,6 +39575,7 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         );
         remote_sidecar_persist_context_compression_run_event(
@@ -38805,6 +39728,7 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         );
         remote_sidecar_persist_context_compression_run_event(
@@ -39017,6 +39941,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_context_compression_merge_never_regresses_a_newer_terminal_attempt() {
+        let newer_terminal = json!({ "attemptIndex": 2 });
+        let replayed_retry = json!({ "attemptIndex": 1 });
+        assert!(!remote_context_compression_part_should_replace(
+            Some(&newer_terminal),
+            "skipped",
+            Some(&replayed_retry),
+            "retrying",
+        ));
+
+        let earlier_terminal = json!({ "attemptIndex": 1 });
+        assert!(remote_context_compression_part_should_replace(
+            Some(&earlier_terminal),
+            "failed",
+            Some(&newer_terminal),
+            "skipped",
+        ));
+    }
+
     #[tokio::test]
     async fn remote_sidecar_chat_messages_returns_persisted_context_compression_parts() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
@@ -39121,6 +40065,7 @@ mod tests {
                 completed_at: Some("2026-07-12T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         );
         remote_sidecar_persist_context_compression_run_event(
@@ -39250,6 +40195,7 @@ mod tests {
                 completed_at: None,
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         );
         let completed_payload = remote_sidecar_context_compression_sse_event(
@@ -39265,6 +40211,7 @@ mod tests {
                 completed_at: Some("2026-07-13T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         );
         remote_sidecar_persist_context_compression_run_event(
@@ -39294,6 +40241,7 @@ mod tests {
                 completed_at: None,
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
             RemoteSidecarContextCompressionEventDetail {
                 status: "completed".to_string(),
@@ -39306,6 +40254,7 @@ mod tests {
                 completed_at: Some("2026-07-13T00:00:01Z".to_string()),
                 provider_id: "provider-1".to_string(),
                 model_id: "model-1".to_string(),
+                ..Default::default()
             },
         ];
         let parts = remote_chat_parts_with_context_compression(

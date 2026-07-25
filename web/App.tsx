@@ -699,12 +699,7 @@ export function overlayStaleLoadedContextCompressionParts(
       if (serverPart?.type !== "contextCompression") {
         continue;
       }
-      // A persisted completed part is newer than a local start. Conversely,
-      // never let an old server start downgrade a locally completed lifecycle.
-      const merged =
-        serverPart.status === "completed" || livePart.status !== "completed"
-          ? mergeContextCompressionPart(livePart, serverPart)
-          : mergeContextCompressionPart(serverPart, livePart);
+      const merged = mergeContextCompressionPart(serverPart, livePart);
       if (merged !== serverPart) {
         parts[serverIndex] = merged;
         changed = true;
@@ -16435,28 +16430,98 @@ function mergeContextCompressionPart(
   current: ChatContextCompressionPart,
   next: ChatContextCompressionPart,
 ): ChatContextCompressionPart {
+  // Reconnect and history reload can replay an older event after a terminal
+  // event. Preserve the terminal state (or the later attempt) so cards never
+  // appear to move backwards.
+  const [preferred, supplementary] = contextCompressionPartShouldReplace(
+    current,
+    next,
+  )
+    ? [next, current]
+    : [current, next];
   const detail = normalizedContextCompressionDetail({
-    ...current.detail,
-    ...next.detail,
+    ...supplementary.detail,
+    ...preferred.detail,
     compressionId:
-      next.detail.compressionId ?? current.detail.compressionId ?? null,
-    snapshotId: next.detail.snapshotId ?? current.detail.snapshotId ?? null,
+      preferred.detail.compressionId ??
+      supplementary.detail.compressionId ??
+      null,
+    snapshotId:
+      preferred.detail.snapshotId ?? supplementary.detail.snapshotId ?? null,
     originalTokenCount:
-      next.detail.originalTokenCount ??
-      current.detail.originalTokenCount ??
+      preferred.detail.originalTokenCount ??
+      supplementary.detail.originalTokenCount ??
       null,
     summaryTokenCount:
-      next.detail.summaryTokenCount ?? current.detail.summaryTokenCount ?? null,
-    startedAt: next.detail.startedAt ?? current.detail.startedAt ?? null,
-    completedAt: next.detail.completedAt ?? current.detail.completedAt ?? null,
-    providerId: next.detail.providerId ?? current.detail.providerId ?? null,
-    modelId: next.detail.modelId ?? current.detail.modelId ?? null,
+      preferred.detail.summaryTokenCount ??
+      supplementary.detail.summaryTokenCount ??
+      null,
+    startedAt: preferred.detail.startedAt ?? supplementary.detail.startedAt ?? null,
+    completedAt:
+      preferred.detail.completedAt ?? supplementary.detail.completedAt ?? null,
+    providerId: preferred.detail.providerId ?? supplementary.detail.providerId ?? null,
+    modelId: preferred.detail.modelId ?? supplementary.detail.modelId ?? null,
+    providerRequestId:
+      preferred.detail.providerRequestId ??
+      supplementary.detail.providerRequestId ??
+      null,
+    compressionMode:
+      preferred.detail.compressionMode ??
+      supplementary.detail.compressionMode ??
+      null,
+    attemptIndex:
+      preferred.detail.attemptIndex ?? supplementary.detail.attemptIndex ?? null,
+    outcome: preferred.detail.outcome ?? supplementary.detail.outcome ?? null,
+    action: preferred.detail.action ?? supplementary.detail.action ?? null,
+    errorMessage:
+      preferred.detail.errorMessage ?? supplementary.detail.errorMessage ?? null,
   });
   return {
-    ...next,
-    id: detail.compressionId ?? detail.snapshotId ?? current.id,
+    ...preferred,
+    id: detail.compressionId ?? detail.snapshotId ?? preferred.id,
     detail,
   };
+}
+
+function contextCompressionPartShouldReplace(
+  current: ChatContextCompressionPart,
+  next: ChatContextCompressionPart,
+) {
+  const currentTerminal = isTerminalContextCompressionStatus(current.status);
+  const nextTerminal = isTerminalContextCompressionStatus(next.status);
+  if (currentTerminal !== nextTerminal) {
+    return nextTerminal;
+  }
+
+  const currentAttempt = current.detail.attemptIndex;
+  const nextAttempt = next.detail.attemptIndex;
+  if (currentAttempt != null && nextAttempt != null && currentAttempt !== nextAttempt) {
+    return nextAttempt > currentAttempt;
+  }
+
+  return (
+    contextCompressionStatusRank(next.status) >=
+    contextCompressionStatusRank(current.status)
+  );
+}
+
+function isTerminalContextCompressionStatus(status: string) {
+  return (
+    status === "completed" ||
+    status === "skipped" ||
+    status === "failed" ||
+    status === "cancelled"
+  );
+}
+
+function contextCompressionStatusRank(status: string) {
+  if (isTerminalContextCompressionStatus(status)) {
+    return 2;
+  }
+  if (status === "retrying") {
+    return 1;
+  }
+  return 0;
 }
 
 function normalizedContextCompressionDetail(
@@ -16473,6 +16538,12 @@ function normalizedContextCompressionDetail(
     completedAt: detail.completedAt ?? null,
     providerId: detail.providerId ?? null,
     modelId: detail.modelId ?? null,
+    providerRequestId: detail.providerRequestId ?? null,
+    compressionMode: detail.compressionMode ?? null,
+    attemptIndex: detail.attemptIndex ?? null,
+    outcome: detail.outcome ?? null,
+    action: detail.action ?? null,
+    errorMessage: detail.errorMessage ?? null,
   };
 }
 
@@ -18908,6 +18979,11 @@ function parseContextCompressionDetail(
     "provider_id",
   );
   const modelId = optionalNullableStringField(value, "modelId", "model_id");
+  const providerRequestId = optionalNullableStringField(
+    value,
+    "providerRequestId",
+    "provider_request_id",
+  );
   const originalTokenCount = optionalNumberField(
     value,
     "originalTokenCount",
@@ -18917,6 +18993,19 @@ function parseContextCompressionDetail(
     value,
     "summaryTokenCount",
     "summary_token_count",
+  );
+  const compressionMode = optionalNullableStringField(
+    value,
+    "compressionMode",
+    "compression_mode",
+  );
+  const attemptIndex = optionalNumberField(value, "attemptIndex", "attempt_index");
+  const outcome = optionalNullableStringField(value, "outcome");
+  const action = optionalNullableStringField(value, "action");
+  const errorMessage = optionalNullableStringField(
+    value,
+    "errorMessage",
+    "error_message",
   );
 
   if (
@@ -18928,8 +19017,18 @@ function parseContextCompressionDetail(
     completedAt === false ||
     providerId === false ||
     modelId === false ||
+    providerRequestId === false ||
     originalTokenCount === false ||
-    summaryTokenCount === false
+    summaryTokenCount === false ||
+    compressionMode === false ||
+    attemptIndex === false ||
+    outcome === false ||
+    action === false ||
+    errorMessage === false ||
+    (compressionMode !== undefined &&
+      compressionMode !== null &&
+      compressionMode !== "normal" &&
+      compressionMode !== "required_overflow")
   ) {
     return false;
   }
@@ -18945,6 +19044,12 @@ function parseContextCompressionDetail(
     completedAt: completedAt ?? null,
     providerId: providerId ?? null,
     modelId: modelId ?? null,
+    providerRequestId: providerRequestId ?? null,
+    compressionMode: compressionMode ?? null,
+    attemptIndex: attemptIndex ?? null,
+    outcome: outcome ?? null,
+    action: action ?? null,
+    errorMessage: errorMessage ?? null,
   });
 }
 

@@ -176,6 +176,7 @@ pub(crate) use crate::runtime::{
 use crate::runtime::{ReadOnlyToolProgressDetector, RepeatedToolCallDetector};
 use crate::scheduled_tasks::scheduler::ScheduledTaskScheduler;
 
+mod context_compression_policy;
 mod git_backend;
 mod hooks;
 mod hooks_support;
@@ -2662,6 +2663,24 @@ struct ContextCompressionEventDetail {
     completed_at: Option<String>,
     provider_id: String,
     model_id: String,
+    /// Provider/audit request ID for the attempt that produced this event; safe to join with AI Statistics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_request_id: Option<String>,
+    /// LLM checkpoint trigger mode; absent for local runtime tool-state compression.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compression_mode: Option<String>,
+    /// Zero-based provider attempt index for this checkpoint request body.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_index: Option<u32>,
+    /// Stable terminal/request outcome, such as `started`, `succeeded`, or `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<String>,
+    /// Action selected by the compression failure policy.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    /// Provider diagnostic retained for the user-visible compression block; credentials are sanitized upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -3402,6 +3421,16 @@ impl PreparedChatContext {
                                 }
                                 break result;
                             }
+                            changed = app_shutdown_rx.changed() => {
+                                if changed.is_err() || *app_shutdown_rx.borrow() {
+                                    break Err(ApiError::bad_request(SHUTDOWN_MESSAGE));
+                                }
+                            }
+                            changed = run_cancellation_rx.changed() => {
+                                if changed.is_err() || *run_cancellation_rx.borrow() {
+                                    break Err(ApiError::bad_request("chat run cancelled"));
+                                }
+                            }
                             maybe_detail = compression_event_rx.recv() => {
                                 let Some(detail) = maybe_detail else {
                                     break compression_future.await;
@@ -3424,6 +3453,27 @@ impl PreparedChatContext {
                     Ok(result) => result,
                     Err(error) => {
                         let message = error.message;
+                        if message == SHUTDOWN_MESSAGE || message == "chat run cancelled" {
+                            if message == SHUTDOWN_MESSAGE {
+                                cancellation.cancel();
+                            }
+                            let event = match finish_cancelled_chat_run_with_message(
+                                &self,
+                                &request_started_at,
+                                started_at,
+                                &mut events,
+                                &executed_tool_calls,
+                                &message,
+                            )
+                            .await {
+                                Ok(event) => event,
+                                Err(error) => ChatSseEvent::Error {
+                                    message: error.message,
+                                },
+                            };
+                            yield event;
+                            return;
+                        }
                         let event = ChatSseEvent::Error {
                             message: message.clone(),
                         };
@@ -12504,6 +12554,12 @@ fn materialize_missing_assistant_parts(
                     completed_at: Some(snapshot.created_at.clone()),
                     provider_id: String::new(),
                     model_id: String::new(),
+                    provider_request_id: None,
+                    compression_mode: None,
+                    attempt_index: None,
+                    outcome: Some("succeeded".to_string()),
+                    action: Some("checkpoint_persisted".to_string()),
+                    error_message: None,
                 },
             };
             let parts = parts_by_message.entry(message_id.clone()).or_default();
@@ -12638,6 +12694,12 @@ fn context_compression_part_from_value(value: &Value) -> Option<ChatMessagePart>
             completed_at: None,
             provider_id: String::new(),
             model_id: String::new(),
+            provider_request_id: None,
+            compression_mode: None,
+            attempt_index: None,
+            outcome: None,
+            action: None,
+            error_message: None,
         });
     detail.status = status.clone();
     detail.kind = kind.clone();
@@ -12721,6 +12783,7 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
     else {
         return;
     };
+
     let ChatMessagePart::ContextCompression {
         id: next_id,
         status: next_status,
@@ -12730,6 +12793,10 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
     else {
         return;
     };
+
+    if !context_compression_part_should_replace(detail, status, &next_detail, &next_status) {
+        return;
+    }
 
     detail.compression_id = next_detail
         .compression_id
@@ -12753,6 +12820,18 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
     if !next_detail.model_id.is_empty() {
         detail.model_id = next_detail.model_id;
     }
+    detail.provider_request_id = next_detail
+        .provider_request_id
+        .or_else(|| detail.provider_request_id.clone());
+    detail.compression_mode = next_detail
+        .compression_mode
+        .or_else(|| detail.compression_mode.clone());
+    detail.attempt_index = next_detail.attempt_index.or(detail.attempt_index);
+    detail.outcome = next_detail.outcome.or_else(|| detail.outcome.clone());
+    detail.action = next_detail.action.or_else(|| detail.action.clone());
+    detail.error_message = next_detail
+        .error_message
+        .or_else(|| detail.error_message.clone());
     detail.status = next_status.clone();
     detail.kind = next_kind.clone();
     *id = detail
@@ -12762,6 +12841,39 @@ fn merge_context_compression_part(current: &mut ChatMessagePart, next: ChatMessa
         .unwrap_or(next_id);
     *status = next_status;
     *kind = next_kind;
+}
+
+fn context_compression_part_should_replace(
+    current: &ContextCompressionEventDetail,
+    current_status: &str,
+    next: &ContextCompressionEventDetail,
+    next_status: &str,
+) -> bool {
+    let current_terminal = context_compression_status_is_terminal(current_status);
+    let next_terminal = context_compression_status_is_terminal(next_status);
+    if current_terminal != next_terminal {
+        return next_terminal;
+    }
+    if let (Some(current_attempt), Some(next_attempt)) = (current.attempt_index, next.attempt_index)
+        && current_attempt != next_attempt
+    {
+        return next_attempt > current_attempt;
+    }
+    context_compression_status_rank(next_status) >= context_compression_status_rank(current_status)
+}
+
+fn context_compression_status_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "skipped" | "failed" | "cancelled")
+}
+
+fn context_compression_status_rank(status: &str) -> u8 {
+    if context_compression_status_is_terminal(status) {
+        2
+    } else if status == "retrying" {
+        1
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

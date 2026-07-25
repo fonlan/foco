@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use foco_agent::{ContextPackItem, context_compression_trigger_tokens, estimate_text_tokens};
 use foco_providers::{
@@ -11,6 +11,10 @@ use foco_store::workspace::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::context_compression_policy::{
+    ContextCompressionAttemptDeadline, ContextCompressionFailureAction, ContextCompressionMode,
+    ContextCompressionRetryBudget, context_compression_failure_action,
+};
 use crate::http::chat::{ContextUsageResponse, ContextUsageSegments};
 use crate::*;
 
@@ -237,7 +241,35 @@ fn context_compression_event_detail(
         completed_at,
         provider_id: context.provider_id.clone(),
         model_id: context.model_id.clone(),
+        provider_request_id: None,
+        compression_mode: None,
+        attempt_index: None,
+        outcome: None,
+        action: None,
+        error_message: None,
     }
+}
+
+fn context_compression_no_snapshot_event(
+    mut event: ContextCompressionEventDetail,
+    status: &str,
+    provider_request_id: &str,
+    mode: LlmContextCompressionMode,
+    attempt_index: u32,
+    action: &str,
+    error_message: &str,
+) -> ContextCompressionEventDetail {
+    event.status = status.to_string();
+    event.snapshot_id = None;
+    event.summary_token_count = None;
+    event.completed_at = Some(utc_timestamp());
+    event.provider_request_id = Some(provider_request_id.to_string());
+    event.compression_mode = Some(ContextCompressionMode::from(mode).as_str().to_string());
+    event.attempt_index = Some(attempt_index);
+    event.outcome = Some(status.to_string());
+    event.action = Some(action.to_string());
+    event.error_message = Some(error_message.to_string());
+    event
 }
 
 /// Record a compression event for the returned batch and, when present, push it on the live sink.
@@ -250,6 +282,21 @@ fn push_context_compression_event(
         let _ = tx.send(detail.clone());
     }
     events.push(detail);
+}
+
+/// Sleep between isolated compression attempts while allowing application shutdown to preempt the
+/// wait. The enclosing chat stream handles user cancellation before its next provider turn.
+async fn wait_context_compression_retry_backoff_cancellable(
+    app_shutdown_rx: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if *app_shutdown_rx.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        changed = app_shutdown_rx.changed() => changed.is_err() || *app_shutdown_rx.borrow(),
+    }
 }
 
 fn compress_runtime_tool_state_with_events_if_needed(
@@ -475,35 +522,171 @@ async fn ensure_llm_context_compression(
     let compression_started_at = utc_timestamp();
     // Emit start before the summary provider request so the UI can show the compression block
     // while the dedicated checkpoint LLM call is still in flight.
-    push_context_compression_event(
-        events,
-        event_tx,
-        context_compression_event_detail(
-            "start",
-            CONTEXT_COMPRESSION_KIND_LLM,
-            Some(compression_id.clone()),
-            None,
-            Some(i64::try_from(original_tokens).map_err(|_| {
-                ApiError::internal("context compression original token count exceeds i64")
-            })?),
-            None,
-            Some(compression_started_at.clone()),
-            None,
-            context,
-        ),
+    let mut start_event = context_compression_event_detail(
+        "start",
+        CONTEXT_COMPRESSION_KIND_LLM,
+        Some(compression_id.clone()),
+        None,
+        Some(i64::try_from(original_tokens).map_err(|_| {
+            ApiError::internal("context compression original token count exceeds i64")
+        })?),
+        None,
+        Some(compression_started_at.clone()),
+        None,
+        context,
     );
+    start_event.compression_mode = Some(ContextCompressionMode::from(mode).as_str().to_string());
+    start_event.attempt_index = Some(0);
+    start_event.outcome = Some("started".to_string());
+    start_event.action = Some("request".to_string());
+    push_context_compression_event(events, event_tx, start_event);
     // Index of the live start event; pop only from the batch vec on failure (live already sent).
     let compression_start_event_index = events.len() - 1;
 
-    let summary = match llm_context_compression_summary(context, &checkpoint_messages).await {
-        Ok(summary) => summary,
-        Err(error) => {
-            events.truncate(compression_start_event_index);
-            return Err(error);
+    let retry_budget = ContextCompressionRetryBudget::from_configured_retry_count(
+        context.global_config.app.llm_request_retry_count,
+    );
+    let retry_started_at = Instant::now();
+    let mut retries_used = 0;
+    let summary = loop {
+        let attempt_deadline = ContextCompressionAttemptDeadline::new(
+            retry_budget
+                .remaining_deadline(retry_started_at.elapsed())
+                .unwrap_or_default(),
+        );
+        match llm_context_compression_summary(context, &checkpoint_messages, attempt_deadline).await
+        {
+            Ok(summary) => break summary,
+            Err(error) => {
+                let elapsed = retry_started_at.elapsed();
+                let remaining_deadline = retry_budget.remaining_deadline(elapsed);
+                let mut action = context_compression_failure_action(
+                    ContextCompressionMode::from(mode),
+                    error.retry_class,
+                    retries_used,
+                    retry_budget,
+                    remaining_deadline,
+                    *context.app_shutdown_rx.borrow(),
+                );
+                let next_retry_ordinal = retries_used.saturating_add(1);
+                // Decide whether the backoff still fits before emitting `retrying`. The deadline
+                // can expire between the first policy decision and this calculation; in that
+                // case re-evaluate so Normal compression emits its terminal safe degradation
+                // instead of leaving a retrying card and failing the chat.
+                let retry_delay = matches!(action, ContextCompressionFailureAction::Retry)
+                    .then(|| {
+                        retry_budget.retry_backoff(
+                            error.retry_class,
+                            retries_used,
+                            retry_started_at.elapsed(),
+                            error.retry_after,
+                        )
+                    })
+                    .flatten();
+                if matches!(action, ContextCompressionFailureAction::Retry) && retry_delay.is_none()
+                {
+                    action = context_compression_failure_action(
+                        ContextCompressionMode::from(mode),
+                        error.retry_class,
+                        retries_used,
+                        retry_budget,
+                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
+                        *context.app_shutdown_rx.borrow(),
+                    );
+                }
+                tracing::warn!(
+                    workspace_id = %context.workspace_id,
+                    chat_id = %context.chat_id,
+                    run_id = %context.llm_request_id,
+                    compression_id = %compression_id,
+                    provider_id = %context.provider_id,
+                    model_id = %context.model_id,
+                    compression_mode = ContextCompressionMode::from(mode).as_str(),
+                    input_token_count = original_tokens,
+                    retry_class = error.retry_class.as_str(),
+                    attempt_index = retries_used,
+                    action = action.as_str(),
+                    "context compression provider attempt failed"
+                );
+                let mut terminal_event = context_compression_event_detail(
+                    match action {
+                        ContextCompressionFailureAction::ContinueWithoutCompression => "skipped",
+                        ContextCompressionFailureAction::FailRequiredOverflow => "failed",
+                        ContextCompressionFailureAction::Stop => "cancelled",
+                        ContextCompressionFailureAction::Retry => "retrying",
+                    },
+                    CONTEXT_COMPRESSION_KIND_LLM,
+                    Some(compression_id.clone()),
+                    None,
+                    Some(i64::try_from(original_tokens).map_err(|_| {
+                        ApiError::internal("context compression original token count exceeds i64")
+                    })?),
+                    None,
+                    Some(compression_started_at.clone()),
+                    Some(utc_timestamp()),
+                    context,
+                );
+                terminal_event.compression_mode =
+                    Some(ContextCompressionMode::from(mode).as_str().to_string());
+                terminal_event.attempt_index = Some(
+                    if matches!(action, ContextCompressionFailureAction::Retry) {
+                        next_retry_ordinal
+                    } else {
+                        retries_used
+                    },
+                );
+                terminal_event.outcome = Some("failed".to_string());
+                terminal_event.action = Some(action.as_str().to_string());
+                terminal_event.provider_request_id = error.request_id.clone();
+                // Provider diagnostics stay in the audit record. Chat history deliberately
+                // carries only a stable, action-oriented summary.
+                terminal_event.error_message =
+                    Some(context_compression_event_error_summary(action).to_string());
+                push_context_compression_event(events, event_tx, terminal_event);
+
+                if matches!(action, ContextCompressionFailureAction::Retry)
+                    && let Some(delay) = retry_delay
+                {
+                    if wait_context_compression_retry_backoff_cancellable(
+                        &mut context.app_shutdown_rx,
+                        delay,
+                    )
+                    .await
+                    {
+                        return Err(ApiError::bad_request(
+                            "context compression summary was cancelled",
+                        ));
+                    }
+                    retries_used = next_retry_ordinal;
+                    continue;
+                }
+
+                if matches!(
+                    action,
+                    ContextCompressionFailureAction::ContinueWithoutCompression
+                ) {
+                    return Ok(false);
+                }
+                return Err(ApiError::bad_request(
+                    "context compression is required to fit the next provider request; the compression provider could not produce a checkpoint. Start a new chat or reduce the conversation before retrying.",
+                ));
+            }
         }
     };
+    let provider_request_id = summary.request_id.clone();
+    let summary = summary.text;
     if !context_compression_summary_has_benefit(&summary, original_tokens) {
+        let skipped_event = context_compression_no_snapshot_event(
+            events[compression_start_event_index].clone(),
+            "skipped",
+            &provider_request_id,
+            mode,
+            retries_used,
+            "summary_not_beneficial",
+            "Compression summary did not reduce context enough; continuing without compression",
+        );
         events.truncate(compression_start_event_index);
+        push_context_compression_event(events, event_tx, skipped_event);
         return Ok(false);
     }
     let summary_token_count = estimate_text_tokens(&summary);
@@ -544,7 +727,17 @@ async fn ensure_llm_context_compression(
         &pre_summary.additional_context,
     );
     if pre_summary.first_block_reason().is_some() {
+        let skipped_event = context_compression_no_snapshot_event(
+            events[compression_start_event_index].clone(),
+            "skipped",
+            &provider_request_id,
+            mode,
+            retries_used,
+            "pre_compact_blocked",
+            "Compression was blocked by a PreCompact hook; continuing without compression",
+        );
         events.truncate(compression_start_event_index);
+        push_context_compression_event(events, event_tx, skipped_event);
         return Ok(false);
     }
 
@@ -577,6 +770,42 @@ async fn ensure_llm_context_compression(
         Ok(snapshot) => snapshot,
         Err(error) => {
             events.truncate(compression_start_event_index);
+            let mut failed_event = context_compression_event_detail(
+                "failed",
+                CONTEXT_COMPRESSION_KIND_LLM,
+                Some(compression_id.clone()),
+                None,
+                Some(i64::try_from(original_tokens).map_err(|_| {
+                    ApiError::internal("context compression original token count exceeds i64")
+                })?),
+                None,
+                Some(compression_started_at.clone()),
+                Some(utc_timestamp()),
+                context,
+            );
+            failed_event.compression_mode =
+                Some(ContextCompressionMode::from(mode).as_str().to_string());
+            failed_event.attempt_index = Some(retries_used);
+            failed_event.outcome = Some("failed".to_string());
+            failed_event.action = Some("snapshot_persistence_failed".to_string());
+            failed_event.provider_request_id = Some(provider_request_id.clone());
+            failed_event.error_message =
+                Some("Checkpoint could not be saved; chat context was left unchanged".to_string());
+            push_context_compression_event(events, event_tx, failed_event);
+            tracing::warn!(
+                workspace_id = %context.workspace_id,
+                chat_id = %context.chat_id,
+                run_id = %context.llm_request_id,
+                compression_id,
+                provider_id = %context.provider_id,
+                model_id = %context.model_id,
+                compression_mode = ContextCompressionMode::from(mode).as_str(),
+                input_token_count = original_tokens,
+                attempt_index = retries_used,
+                outcome = "failed",
+                action = "snapshot_persistence_failed",
+                "context compression checkpoint persistence failed"
+            );
             return Err(error);
         }
     };
@@ -586,20 +815,36 @@ async fn ensure_llm_context_compression(
     // Normal gate uses only the post-checkpoint local estimate until a new chat completion lands.
     context.last_chat_completion_input_tokens = None;
     // completed only after snapshot is durable so history reload never sees a half-success block.
-    push_context_compression_event(
-        events,
-        event_tx,
-        context_compression_event_detail(
-            "completed",
-            CONTEXT_COMPRESSION_KIND_LLM,
-            Some(compression_id),
-            Some(snapshot.id.clone()),
-            Some(snapshot.original_token_count),
-            Some(snapshot.summary_token_count),
-            Some(compression_started_at),
-            Some(utc_timestamp()),
-            context,
-        ),
+    let mut completed_event = context_compression_event_detail(
+        "completed",
+        CONTEXT_COMPRESSION_KIND_LLM,
+        Some(compression_id),
+        Some(snapshot.id.clone()),
+        Some(snapshot.original_token_count),
+        Some(snapshot.summary_token_count),
+        Some(compression_started_at),
+        Some(utc_timestamp()),
+        context,
+    );
+    completed_event.compression_mode =
+        Some(ContextCompressionMode::from(mode).as_str().to_string());
+    completed_event.attempt_index = Some(retries_used);
+    completed_event.outcome = Some("succeeded".to_string());
+    completed_event.action = Some("checkpoint_persisted".to_string());
+    completed_event.provider_request_id = Some(provider_request_id);
+    push_context_compression_event(events, event_tx, completed_event);
+    tracing::info!(
+        workspace_id = %context.workspace_id,
+        chat_id = %context.chat_id,
+        run_id = %context.llm_request_id,
+        provider_id = %context.provider_id,
+        model_id = %context.model_id,
+        compression_mode = ContextCompressionMode::from(mode).as_str(),
+        input_token_count = original_tokens,
+        summary_token_count,
+        attempt_index = retries_used,
+        outcome = "succeeded",
+        "context compression checkpoint persisted"
     );
 
     let post_summary = context
@@ -637,6 +882,21 @@ async fn ensure_llm_context_compression(
     );
 
     Ok(true)
+}
+
+fn context_compression_event_error_summary(
+    action: ContextCompressionFailureAction,
+) -> &'static str {
+    match action {
+        ContextCompressionFailureAction::Retry => "Provider request failed; retrying compression",
+        ContextCompressionFailureAction::ContinueWithoutCompression => {
+            "Provider request failed; continuing without compression"
+        }
+        ContextCompressionFailureAction::FailRequiredOverflow => {
+            "Provider request failed; context is still too large"
+        }
+        ContextCompressionFailureAction::Stop => "Compression cancelled",
+    }
 }
 
 pub(crate) fn llm_context_compression_group_indices(
@@ -1222,57 +1482,73 @@ pub(crate) fn build_chunk_merge_checkpoint_messages(
 async fn llm_context_compression_summary(
     context: &mut PreparedChatContext,
     checkpoint_messages: &[NeutralChatMessage],
-) -> Result<String, ApiError> {
+    deadline: ContextCompressionAttemptDeadline,
+) -> Result<ContextCompressionSummary, ContextCompressionSummaryError> {
     let compression_prompt =
         effective_context_compression_system_prompt(&context.global_config.prompts).to_string();
     let input_budget = compression_request_input_token_budget(
         context.context_budget.context_window,
         &compression_prompt,
     );
-    let mut pending =
-        plan_context_compression_checkpoint_chunks(checkpoint_messages, input_budget)?;
+    let mut pending = plan_context_compression_checkpoint_chunks(checkpoint_messages, input_budget)
+        .map_err(ContextCompressionSummaryError::non_retryable)?;
     let mut requests_used = 0usize;
     let mut depth = 0usize;
 
     loop {
         depth = depth.saturating_add(1);
         if depth > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
-            return Err(ApiError::internal(format!(
-                "context compression hierarchy exceeded max depth ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
-            )));
+            return Err(ContextCompressionSummaryError::non_retryable(
+                ApiError::internal(format!(
+                    "context compression hierarchy exceeded max depth ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                )),
+            ));
         }
         if pending.len() == 1 {
             requests_used = requests_used.saturating_add(1);
             if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
-                return Err(ApiError::internal(format!(
-                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
-                )));
+                return Err(ContextCompressionSummaryError::non_retryable(
+                    ApiError::internal(format!(
+                        "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                    )),
+                ));
             }
-            return llm_context_compression_summary_once(context, &pending[0], &compression_prompt)
-                .await;
+            return llm_context_compression_summary_once(
+                context,
+                &pending[0],
+                &compression_prompt,
+                deadline,
+            )
+            .await;
         }
 
         // Fail early when chunk summaries + one merge cannot fit the remaining request budget.
         let remaining =
             LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS.saturating_sub(requests_used);
         if pending.len().saturating_add(1) > remaining {
-            return Err(ApiError::internal(format!(
-                "context compression hierarchy needs at least {} requests for {} chunks plus merge, but only {remaining} remain (max {LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})",
-                pending.len().saturating_add(1),
-                pending.len()
-            )));
+            return Err(ContextCompressionSummaryError::non_retryable(
+                ApiError::internal(format!(
+                    "context compression hierarchy needs at least {} requests for {} chunks plus merge, but only {remaining} remain (max {LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})",
+                    pending.len().saturating_add(1),
+                    pending.len()
+                )),
+            ));
         }
 
         let mut chunk_summaries = Vec::with_capacity(pending.len());
         for chunk in &pending {
             requests_used = requests_used.saturating_add(1);
             if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
-                return Err(ApiError::internal(format!(
-                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
-                )));
+                return Err(ContextCompressionSummaryError::non_retryable(
+                    ApiError::internal(format!(
+                        "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                    )),
+                ));
             }
             chunk_summaries.push(
-                llm_context_compression_summary_once(context, chunk, &compression_prompt).await?,
+                llm_context_compression_summary_once(context, chunk, &compression_prompt, deadline)
+                    .await?
+                    .text,
             );
         }
 
@@ -1280,18 +1556,69 @@ async fn llm_context_compression_summary(
         if checkpoint_messages_estimated_tokens(&merge_messages) <= input_budget {
             requests_used = requests_used.saturating_add(1);
             if requests_used > LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS {
-                return Err(ApiError::internal(format!(
-                    "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
-                )));
+                return Err(ContextCompressionSummaryError::non_retryable(
+                    ApiError::internal(format!(
+                        "context compression hierarchy exceeded max requests ({LLM_CONTEXT_COMPRESSION_MAX_HIERARCHY_REQUESTS})"
+                    )),
+                ));
             }
             return llm_context_compression_summary_once(
                 context,
                 &merge_messages,
                 &compression_prompt,
+                deadline,
             )
             .await;
         }
-        pending = plan_context_compression_checkpoint_chunks(&merge_messages, input_budget)?;
+        pending = plan_context_compression_checkpoint_chunks(&merge_messages, input_budget)
+            .map_err(ContextCompressionSummaryError::non_retryable)?;
+    }
+}
+
+/// A completed summary keeps the final audit ID for safe UI and audit correlation.
+#[derive(Debug)]
+struct ContextCompressionSummary {
+    text: String,
+    request_id: String,
+}
+
+/// A compression request failure keeps the provider classifier intact until the retry policy
+/// decides whether another isolated summary request is safe to start.
+#[derive(Debug)]
+struct ContextCompressionSummaryError {
+    message: String,
+    request_id: Option<String>,
+    retry_class: crate::provider_retry::ProviderRetryClass,
+    retry_after: Option<Duration>,
+}
+
+impl ContextCompressionSummaryError {
+    fn non_retryable(error: ApiError) -> Self {
+        Self {
+            message: error.message,
+            request_id: None,
+            retry_class: crate::provider_retry::ProviderRetryClass::NonRetryable,
+            retry_after: None,
+        }
+    }
+
+    fn provider(
+        error: &foco_providers::ProviderConfigError,
+        retry_after: Option<Duration>,
+        request_id: Option<String>,
+    ) -> Self {
+        Self {
+            message: error.user_message(),
+            request_id,
+            retry_class: crate::provider_retry::classify_provider_retry_class(error),
+            retry_after,
+        }
+    }
+}
+
+impl From<ApiError> for ContextCompressionSummaryError {
+    fn from(error: ApiError) -> Self {
+        Self::non_retryable(error)
     }
 }
 
@@ -1341,7 +1668,16 @@ async fn llm_context_compression_summary_once(
     context: &mut PreparedChatContext,
     checkpoint_messages: &[NeutralChatMessage],
     compression_system_prompt: &str,
-) -> Result<String, ApiError> {
+    deadline: ContextCompressionAttemptDeadline,
+) -> Result<ContextCompressionSummary, ContextCompressionSummaryError> {
+    let Some(request_timeout) = deadline.remaining() else {
+        return Err(ContextCompressionSummaryError {
+            message: "context compression retry budget was exhausted".to_string(),
+            request_id: None,
+            retry_class: crate::provider_retry::ProviderRetryClass::Network,
+            retry_after: None,
+        });
+    };
     let mut request = build_context_compression_summary_request_with_prompt(
         &context.model_id,
         checkpoint_messages,
@@ -1382,7 +1718,7 @@ async fn llm_context_compression_summary_once(
     let observer = capture.observer();
     let capture_details = observer.is_some();
     let mut stream = match timeout(
-        remaining_llm_request_timeout(started_at, LLM_REQUEST_TIMEOUT_MS),
+        request_timeout,
         stream_chat_with_capture_observer(
             &context.provider_config,
             request,
@@ -1405,7 +1741,12 @@ async fn llm_context_compression_summary_once(
                     "failed to persist provider request wire before terminal LLM audit"
                 );
             }
-            let message = source.to_string();
+            let failure = ContextCompressionSummaryError::provider(
+                &source.error,
+                None,
+                Some(request_id.clone()),
+            );
+            let message = failure.message.clone();
             let request_body_json =
                 captured_context_compression_request_body(context, &capture, &request_id);
             let response_body_json = best_effort_context_compression_audit_detail(
@@ -1414,7 +1755,7 @@ async fn llm_context_compression_summary_once(
                 capture.failed_response_json(message.clone(), source.status_code(), false),
             );
             context.record_finished_llm_request(CapturedLlmRequest {
-                id: request_id,
+                id: request_id.clone(),
                 request_kind: "contextCompression",
                 request_started_at,
                 request_body_json,
@@ -1429,7 +1770,7 @@ async fn llm_context_compression_summary_once(
                 },
                 terminal_persisted: false,
             });
-            return Err(ApiError::internal(message));
+            return Err(failure);
         }
         Err(_) => {
             let message =
@@ -1442,7 +1783,7 @@ async fn llm_context_compression_summary_once(
                 capture.failed_response_json(message.clone(), None, false),
             );
             context.record_finished_llm_request(CapturedLlmRequest {
-                id: request_id,
+                id: request_id.clone(),
                 request_kind: "contextCompression",
                 request_started_at,
                 request_body_json,
@@ -1453,7 +1794,12 @@ async fn llm_context_compression_summary_once(
                 },
                 terminal_persisted: false,
             });
-            return Err(ApiError::internal(message));
+            return Err(ContextCompressionSummaryError {
+                message,
+                request_id: Some(request_id.clone()),
+                retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                retry_after: None,
+            });
         }
     };
     let mut output_text = String::new();
@@ -1463,7 +1809,7 @@ async fn llm_context_compression_summary_once(
 
     loop {
         let event_result = match timeout(
-            remaining_llm_request_timeout(started_at, LLM_REQUEST_TIMEOUT_MS),
+            deadline.remaining().unwrap_or_default(),
             stream.next_event(),
         )
         .await
@@ -1487,7 +1833,7 @@ async fn llm_context_compression_summary_once(
                     ),
                 );
                 context.record_finished_llm_request(CapturedLlmRequest {
-                    id: request_id,
+                    id: request_id.clone(),
                     request_kind: "contextCompression",
                     request_started_at,
                     request_body_json,
@@ -1498,7 +1844,12 @@ async fn llm_context_compression_summary_once(
                     },
                     terminal_persisted: false,
                 });
-                return Err(ApiError::internal(message));
+                return Err(ContextCompressionSummaryError {
+                    message,
+                    request_id: Some(request_id.clone()),
+                    retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                    retry_after: None,
+                });
             }
         };
         let Some(event_result) = event_result else {
@@ -1512,7 +1863,7 @@ async fn llm_context_compression_summary_once(
                 capture.failed_stream_response_json(&stream, message, stream.http_status(), true),
             );
             context.record_finished_llm_request(CapturedLlmRequest {
-                id: request_id,
+                id: request_id.clone(),
                 request_kind: "contextCompression",
                 request_started_at,
                 request_body_json,
@@ -1523,12 +1874,22 @@ async fn llm_context_compression_summary_once(
                 },
                 terminal_persisted: false,
             });
-            return Err(ApiError::internal(message));
+            return Err(ContextCompressionSummaryError {
+                message: message.to_string(),
+                request_id: Some(request_id.clone()),
+                retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                retry_after: stream.retry_after(),
+            });
         };
         let event = match event_result {
             Ok(event) => event,
             Err(source) => {
-                let message = source.to_string();
+                let failure = ContextCompressionSummaryError::provider(
+                    &source,
+                    stream.retry_after(),
+                    Some(request_id.clone()),
+                );
+                let message = failure.message.clone();
                 let request_body_json =
                     captured_context_compression_request_body(context, &capture, &request_id);
                 let response_body_json = best_effort_context_compression_audit_detail(
@@ -1544,7 +1905,7 @@ async fn llm_context_compression_summary_once(
                     )
                 });
                 context.record_finished_llm_request(CapturedLlmRequest {
-                    id: request_id,
+                    id: request_id.clone(),
                     request_kind: "contextCompression",
                     request_started_at,
                     request_body_json,
@@ -1559,7 +1920,7 @@ async fn llm_context_compression_summary_once(
                     },
                     terminal_persisted: false,
                 });
-                return Err(ApiError::internal(message));
+                return Err(failure);
             }
         };
         events.push(captured_provider_event(&event));
@@ -1590,7 +1951,7 @@ async fn llm_context_compression_summary_once(
                     capture.failed_response_json(message.clone(), None, true),
                 );
                 context.record_finished_llm_request(CapturedLlmRequest {
-                    id: request_id,
+                    id: request_id.clone(),
                     request_kind: "contextCompression",
                     request_started_at,
                     request_body_json,
@@ -1601,7 +1962,9 @@ async fn llm_context_compression_summary_once(
                     },
                     terminal_persisted: false,
                 });
-                return Err(ApiError::internal(message));
+                return Err(ContextCompressionSummaryError::non_retryable(
+                    ApiError::internal(message),
+                ));
             }
             NeutralChatStreamEvent::Complete { text, usage, .. } => {
                 if !text.trim().is_empty() {
@@ -1629,7 +1992,7 @@ async fn llm_context_compression_summary_once(
                     )
                 });
                 context.record_finished_llm_request(CapturedLlmRequest {
-                    id: request_id,
+                    id: request_id.clone(),
                     request_kind: "contextCompression",
                     request_started_at,
                     request_body_json,
@@ -1640,7 +2003,9 @@ async fn llm_context_compression_summary_once(
                     },
                     terminal_persisted: false,
                 });
-                return Err(ApiError::internal(message));
+                return Err(ContextCompressionSummaryError::non_retryable(
+                    ApiError::internal(message),
+                ));
             }
         }
     }
@@ -1656,7 +2021,7 @@ async fn llm_context_compression_summary_once(
             capture.failed_response_json(message, None, false),
         );
         context.record_finished_llm_request(CapturedLlmRequest {
-            id: request_id,
+            id: request_id.clone(),
             request_kind: "contextCompression",
             request_started_at,
             request_body_json,
@@ -1667,7 +2032,9 @@ async fn llm_context_compression_summary_once(
             },
             terminal_persisted: false,
         });
-        return Err(ApiError::internal(message));
+        return Err(ContextCompressionSummaryError::non_retryable(
+            ApiError::internal(message),
+        ));
     }
     let request_body_json =
         captured_context_compression_request_body(context, &capture, &request_id);
@@ -1677,7 +2044,7 @@ async fn llm_context_compression_summary_once(
         capture.response_json(stream.final_response_dump()),
     );
     context.record_finished_llm_request(CapturedLlmRequest {
-        id: request_id,
+        id: request_id.clone(),
         request_kind: "contextCompression",
         request_started_at,
         request_body_json,
@@ -1705,7 +2072,10 @@ async fn llm_context_compression_summary_once(
         terminal_persisted: false,
     });
 
-    Ok(summary)
+    Ok(ContextCompressionSummary {
+        text: summary,
+        request_id,
+    })
 }
 
 /// Prepared snapshot write + in-memory replacement. Callers insert into their
@@ -2781,20 +3151,13 @@ fn compressed_active_tool_start_index(
 fn next_context_snapshot_sequence(
     snapshots: &[ContextCompressionSnapshotRecord],
 ) -> Result<i64, ApiError> {
-    let next = snapshots
+    let last = snapshots
         .iter()
         .map(|snapshot| snapshot.sequence)
         .max()
-        .unwrap_or(-1)
-        + 1;
-
-    if next < 0 {
-        return Err(ApiError::internal(
-            "context compression snapshot sequence overflowed",
-        ));
-    }
-
-    Ok(next)
+        .unwrap_or(-1);
+    last.checked_add(1)
+        .ok_or_else(|| ApiError::internal("context compression snapshot sequence overflowed"))
 }
 
 #[allow(dead_code)]
