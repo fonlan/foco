@@ -784,6 +784,11 @@ pub struct PlanPhaseAttemptRecord {
     pub completed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// Runtime incarnation that owns the unbound begin→attach dispatch window.
+    /// Internal recovery metadata only; omitted from PlanRecord JSON so the UI
+    /// protocol stays unchanged. NULL means legacy/previous-runtime ownership.
+    #[serde(skip)]
+    pub dispatch_owner_incarnation: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

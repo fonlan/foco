@@ -163,10 +163,6 @@ impl AgentScheduler {
 }
 
 async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
-    if let Err(error) = reconcile_agent_runtime(&state) {
-        tracing::error!(error = %error.message, "Agent scheduler startup reconciliation failed");
-    }
-
     let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
     let mut runs = JoinSet::new();
     let mut run_identities = HashMap::new();
@@ -178,7 +174,7 @@ async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
     loop {
         if scan {
             scan = false;
-            if let Err(error) = reconcile_agent_attempt_leases(&state) {
+            if let Err(error) = reconcile_agent_attempt_leases(&state, None) {
                 tracing::error!(
                     error = %error.message,
                     "Agent scheduler lease reconciliation failed"
@@ -361,14 +357,20 @@ pub(crate) fn reconcile_running_llm_request_audits_on_startup(state: &AppState) 
     }
 }
 
-pub(crate) fn reconcile_agent_runtime(state: &AppState) -> Result<(), ApiError> {
+pub(crate) fn reconcile_agent_runtime(
+    state: &AppState,
+    plan_dispatch_owner_incarnation: &str,
+) -> Result<(), ApiError> {
     reconcile_running_llm_request_audits_on_startup(state);
-    reconcile_agent_attempt_leases(state)
+    reconcile_agent_attempt_leases(state, Some(plan_dispatch_owner_incarnation))
 }
 
-/// Reconcile only Agent lifecycle state after startup. Unlike the full startup
-/// path, this is safe to repeat while coordinators and provider requests run.
-fn reconcile_agent_attempt_leases(state: &AppState) -> Result<(), ApiError> {
+/// Reconcile Agent lifecycle state during ordinary scheduler scans. Plan
+/// dispatch-window recovery runs only from the ordered startup bootstrap.
+fn reconcile_agent_attempt_leases(
+    state: &AppState,
+    plan_dispatch_owner_incarnation: Option<&str>,
+) -> Result<(), ApiError> {
     let config = config_snapshot(state)?;
     for workspace in config.local_workspaces() {
         let reconciliation = (|| -> Result<(), ApiError> {
@@ -504,26 +506,29 @@ fn reconcile_agent_attempt_leases(state: &AppState) -> Result<(), ApiError> {
                 &record.task.id,
             )?;
             }
-            database
-                .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .fail_running_plan_phases_without_agent_runs(
-                    "Plan phase start did not create an implementation chat or Agent task",
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            // Before terminal attempt reconciliation: reopen false `completed`
-            // phases whose bound Agent task is still Queued/Running/Waiting so a
-            // stale completed phase cannot force live attempts terminal.
-            database
-                .reconcile_prematurely_completed_plan_phases_with_active_tasks()
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .reconcile_plan_phase_attempts_for_terminal_phases()
-                .map_err(ApiError::from_workspace_error)?;
-            database
-                .discard_terminal_plan_phase_derived_effects(RESTART_INTERRUPTION_REASON)
-                .map_err(ApiError::from_workspace_error)?;
+            if let Some(dispatch_owner_incarnation) = plan_dispatch_owner_incarnation {
+                database
+                    .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .fail_running_plan_phases_without_agent_runs(
+                        "Plan phase start did not create an implementation chat or Agent task",
+                        dispatch_owner_incarnation,
+                    )
+                    .map_err(ApiError::from_workspace_error)?;
+                // Before terminal attempt reconciliation: reopen false `completed`
+                // phases whose bound Agent task is still Queued/Running/Waiting so a
+                // stale completed phase cannot force live attempts terminal.
+                database
+                    .reconcile_prematurely_completed_plan_phases_with_active_tasks()
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .reconcile_plan_phase_attempts_for_terminal_phases()
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .discard_terminal_plan_phase_derived_effects(RESTART_INTERRUPTION_REASON)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
             for instance in database
                 .isolated_agent_instances()
                 .map_err(ApiError::from_workspace_error)?
@@ -563,7 +568,9 @@ fn reconcile_agent_attempt_leases(state: &AppState) -> Result<(), ApiError> {
             );
         }
     }
-    if let Err(error) = crate::plan_runtime::reconcile_plan_derived_effects(state) {
+    if plan_dispatch_owner_incarnation.is_some()
+        && let Err(error) = crate::plan_runtime::reconcile_plan_derived_effects(state)
+    {
         tracing::warn!(error = %error.message, "failed to reconcile integrated plan derived effects");
     }
     Ok(())
@@ -3625,6 +3632,7 @@ mod tests {
                 Some("provider-test"),
                 Some("model-test"),
                 None,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("begin plan attempt");
         database
@@ -3633,6 +3641,7 @@ mod tests {
                 "chat-fail-claimed-task",
                 &team_id,
                 &task_id,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("attach task");
         database

@@ -36,18 +36,19 @@ use foco_store::{
         NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
         NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
         NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
-        PlanPhaseAttemptTrigger, PlanStepPatch, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL,
-        RegisterAgentTaskWaitDependencies, RemotePreStreamFailureClosureOutcome,
-        RemoteQueuedRunClaimOutcome, RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage,
-        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
-        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
-        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
-        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
-        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
-        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
-        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
+        PlanPhaseAttemptConflictReason, PlanPhaseAttemptTrigger, PlanStepPatch,
+        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+        QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL, RegisterAgentTaskWaitDependencies,
+        RemotePreStreamFailureClosureOutcome, RemoteQueuedRunClaimOutcome,
+        RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
+        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
+        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
+        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
+        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
+        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
+        WorkspaceSpecWriteDecision, initialize_workspace_databases,
+        llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -56,6 +57,9 @@ use foco_store::{
 };
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
+
+const TEST_DISPATCH_OWNER: &str = "test-dispatch-owner";
+const OTHER_DISPATCH_OWNER: &str = "other-dispatch-owner";
 
 #[cfg(unix)]
 fn sqlite_sidecar_path(database_path: &Path, suffix: &str) -> PathBuf {
@@ -1731,6 +1735,7 @@ fn mark_plan_invalid_is_narrow_and_rejects_active_or_terminal_plans() {
             None,
             None,
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin active attempt");
     let active_error = database
@@ -2104,6 +2109,7 @@ fn plan_auto_run_desired_and_block_survive_reopen_and_retry_clears_block() {
             None,
             None,
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin retry");
     let state = reopened.plan_auto_run_state().expect("retry state");
@@ -2139,6 +2145,7 @@ fn disabling_auto_run_while_blocked_prevents_retry_resume() {
             None,
             None,
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin retry");
     let state = database.plan_auto_run_state().expect("retry state");
@@ -2355,6 +2362,7 @@ fn resume_after_pause_keeps_running_phase_and_execution_identity() {
             Some("provider-test"),
             Some("model-test"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -2374,7 +2382,13 @@ fn resume_after_pause_keeps_running_phase_and_execution_identity() {
         })
         .expect("enqueue task");
     let attached = database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-pause-resume-active", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-pause-resume-active",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach run");
     assert_eq!(attached.status, "running");
     assert_eq!(
@@ -2482,6 +2496,7 @@ fn resume_after_pause_keeps_waiting_agent_task_without_restart() {
             Some("provider-test"),
             Some("model-test"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -2501,7 +2516,13 @@ fn resume_after_pause_keeps_waiting_agent_task_without_restart() {
         })
         .expect("enqueue");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-pause-resume-waiting", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-pause-resume-waiting",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach");
     let worker_id =
         create_test_agent_worker(&mut database, &team_id, "pause-resume-waiting-worker");
@@ -2598,6 +2619,7 @@ fn resume_after_pause_keeps_queued_attempt_without_agent_task() {
             Some("provider-test"),
             Some("model-test"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     assert_eq!(attempt.status, "queued");
@@ -2867,6 +2889,7 @@ fn plan_start_pause_resume_state_contract_matrix() {
             Some("provider-test"),
             Some("model-test"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("attempt");
     database
@@ -2918,6 +2941,7 @@ fn plan_start_pause_resume_state_contract_matrix() {
             Some("provider-test"),
             Some("model-test"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("task attempt");
     let (team_id, instance_id) =
@@ -2934,7 +2958,13 @@ fn plan_start_pause_resume_state_contract_matrix() {
         })
         .expect("enqueue");
     database
-        .attach_plan_phase_attempt_run(&task_attempt.id, "chat-contract-task", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &task_attempt.id,
+            "chat-contract-task",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach");
     database
         .transition_plan("plan-contract-task", "pause")
@@ -3277,6 +3307,7 @@ fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
     let repaired = database
         .fail_running_plan_phases_without_agent_runs(
             "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
         )
         .expect("repair running phase without Agent run");
     assert_eq!(repaired, 1);
@@ -3299,6 +3330,1119 @@ fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
         failed.phases[0].error_message.as_deref(),
         Some("Plan phase start did not create an implementation chat or Agent task"),
     );
+}
+
+#[test]
+fn current_dispatch_owner_queued_attempt_survives_recovery_and_can_attach() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-current",
+            title: "Current owner dispatch",
+            overview: "Live begin→attach window must not be recovered away.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-dispatch-owner-current-phase",
+                title: "Phase",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-dispatch-owner-current-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-dispatch-owner-current", "start")
+        .expect("start plan");
+
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-current",
+            "plan-dispatch-owner-current-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("begin attempt");
+    assert_eq!(attempt.status, "queued");
+    assert_eq!(
+        attempt.dispatch_owner_incarnation.as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+    assert!(attempt.implementation_chat_id.is_none());
+    assert!(attempt.agent_team_id.is_none());
+    assert!(attempt.agent_task_id.is_none());
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("recovery scan");
+    assert_eq!(
+        repaired, 0,
+        "current-owner queued attempt must not be recovered"
+    );
+
+    let still_running = database
+        .plan("plan-dispatch-owner-current")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(still_running.status, "running");
+    assert_eq!(still_running.phases[0].status, "running");
+    assert_eq!(still_running.phases[0].attempts[0].status, "queued");
+    assert_eq!(
+        still_running.phases[0].attempts[0]
+            .dispatch_owner_incarnation
+            .as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+    assert!(still_running.phases[0].error_message.is_none());
+
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-dispatch-owner-current",
+        "dispatch-owner-current",
+    );
+    let task_id = AgentTaskId::new("agent-task-dispatch-owner-current").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-current",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("attach after recovery scan");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(
+        attached.phases[0].implementation_chat_id.as_deref(),
+        Some("chat-dispatch-owner-current")
+    );
+    assert_eq!(
+        attached.phases[0].agent_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+    assert!(attached.phases[0].error_message.is_none());
+}
+
+#[test]
+fn recovery_skips_when_current_owner_begins_on_previously_orphan_running_phase() {
+    // Deterministic stand-in for SELECT→begin→fail interleaving:
+    // 1) phase is an unbound running orphan (would match recovery candidate scan)
+    // 2) current runtime begins a queued attempt (concurrent with recovery)
+    // 3) recovery continues with the *stale* candidate via the post-scan fail path
+    //    (not the full scan, which would already filter the phase out)
+    // Old fail_plan_phase_by_id after scan would kill the live attempt; the
+    // conditional Immediate re-validation must skip so attach cannot see
+    // "cannot attach while failed" after an orphan-start error.
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-toctou",
+            title: "Recovery TOCTOU",
+            overview: "Begin after orphan scan must not be recovered away.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-dispatch-owner-toctou-phase",
+                title: "Phase",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-dispatch-owner-toctou-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    let orphan = database
+        .transition_plan("plan-dispatch-owner-toctou", "start")
+        .expect("start plan into unbound running orphan");
+    assert_eq!(orphan.status, "running");
+    assert_eq!(orphan.phases[0].status, "running");
+    assert!(orphan.phases[0].attempts.is_empty());
+    assert!(orphan.phases[0].implementation_chat_id.is_none());
+    assert!(orphan.phases[0].agent_task_id.is_none());
+
+    // Stale candidate as if recovery already selected this phase before begin.
+    let stale_plan_id = "plan-dispatch-owner-toctou";
+    let stale_phase_id = "plan-dispatch-owner-toctou-phase";
+
+    let attempt = database
+        .begin_plan_phase_attempt(
+            stale_plan_id,
+            stale_phase_id,
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("current owner begin after orphan scan");
+    assert_eq!(attempt.status, "queued");
+    assert_eq!(
+        attempt.dispatch_owner_incarnation.as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+
+    // Post-scan fail path with the pre-begin candidate — this is the race window.
+    let failed = database
+        .try_fail_unbound_running_plan_phase_for_recovery_for_tests(
+            stale_plan_id,
+            stale_phase_id,
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("stale-candidate recovery after current-owner begin");
+    assert!(
+        !failed,
+        "post-scan recovery must skip once current owner owns the queued attempt"
+    );
+
+    // Full scan must also report zero (defense in depth at candidate filter).
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("full recovery after current-owner begin");
+    assert_eq!(
+        repaired, 0,
+        "full recovery scan must also skip current-owner queued attempt"
+    );
+
+    let still_live = database
+        .plan("plan-dispatch-owner-toctou")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(still_live.status, "running");
+    assert_eq!(still_live.phases[0].status, "running");
+    assert_eq!(still_live.phases[0].attempts[0].status, "queued");
+    assert_eq!(
+        still_live.phases[0].attempts[0]
+            .dispatch_owner_incarnation
+            .as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+    assert!(
+        still_live.phases[0].error_message.is_none(),
+        "must not produce the orphan-start → attach-while-failed chain"
+    );
+
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-dispatch-owner-toctou",
+        "dispatch-owner-toctou",
+    );
+    let task_id = AgentTaskId::new("agent-task-dispatch-owner-toctou").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-toctou",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("attach must succeed without cannot-attach-while-failed");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+    assert!(attached.phases[0].error_message.is_none());
+}
+
+/// True multi-thread barrier: recovery runs after begin and before attach on a second connection.
+#[test]
+fn concurrent_barrier_protects_current_owner_between_begin_and_attach() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let workspace_path = workspace.path().to_path_buf();
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("database");
+        database
+            .create_plan(NewPlan {
+                id: "plan-dispatch-owner-barrier",
+                title: "Barrier race",
+                overview: "Concurrent recovery must not kill current-owner begin→attach.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: "plan-dispatch-owner-barrier-phase",
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-dispatch-owner-barrier-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-dispatch-owner-barrier", "start")
+            .expect("start plan");
+    }
+
+    let begin_done = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let recovery_done = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let repaired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+
+    let begin_done_for_recovery = begin_done.clone();
+    let recovery_done_for_recovery = recovery_done.clone();
+    let repaired_for_recovery = repaired.clone();
+    let workspace_path_for_recovery = workspace_path.clone();
+    let recovery = std::thread::spawn(move || {
+        begin_done_for_recovery.wait();
+        let mut database = WorkspaceDatabase::open_or_create_ungated(&workspace_path_for_recovery)
+            .expect("recovery database");
+        let count = database
+            .fail_running_plan_phases_without_agent_runs(
+                "Plan phase start did not create an implementation chat or Agent task",
+                TEST_DISPATCH_OWNER,
+            )
+            .expect("concurrent recovery");
+        repaired_for_recovery.store(count, std::sync::atomic::Ordering::SeqCst);
+        recovery_done_for_recovery.wait();
+    });
+
+    let attempt = {
+        let mut database =
+            WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("dispatch database");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                "plan-dispatch-owner-barrier",
+                "plan-dispatch-owner-barrier-phase",
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider-test"),
+                Some("model-test"),
+                None,
+                TEST_DISPATCH_OWNER,
+            )
+            .expect("begin attempt");
+        drop(database);
+        begin_done.wait();
+        recovery_done.wait();
+        attempt
+    };
+    recovery.join().expect("recovery thread");
+    assert_eq!(
+        repaired.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "current owner must survive concurrent recovery"
+    );
+
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(&workspace_path).expect("attach database");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-dispatch-owner-barrier",
+        "dispatch-owner-barrier",
+    );
+    let task_id = AgentTaskId::new("agent-task-dispatch-owner-barrier").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-barrier",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("attach after concurrent recovery");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+    assert!(attached.phases[0].error_message.is_none());
+    assert_eq!(attached.phases[0].attempts.len(), 1);
+}
+
+#[test]
+fn old_and_null_dispatch_owners_are_recovered_without_attach_race() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+
+    for (plan_id, phase_id, step_id, owner) in [
+        (
+            "plan-dispatch-owner-old",
+            "plan-dispatch-owner-old-phase",
+            "plan-dispatch-owner-old-step",
+            Some(OTHER_DISPATCH_OWNER),
+        ),
+        (
+            "plan-dispatch-owner-null",
+            "plan-dispatch-owner-null-phase",
+            "plan-dispatch-owner-null-step",
+            None,
+        ),
+    ] {
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: plan_id,
+                overview: "Legacy unbound dispatch must fail on recovery.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: phase_id,
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: step_id,
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+        if let Some(owner) = owner {
+            database
+                .begin_plan_phase_attempt(
+                    plan_id,
+                    phase_id,
+                    PlanPhaseAttemptTrigger::Initial,
+                    Some("provider-test"),
+                    Some("model-test"),
+                    None,
+                    owner,
+                )
+                .expect("begin attempt");
+        } else {
+            // Simulate a pre-migration unbound attempt with NULL owner.
+            let connection =
+                Connection::open(database.database_path()).expect("open fixture database");
+            connection
+                .execute(
+                    "INSERT INTO plan_phase_attempts (
+                        id, plan_id, phase_id, sequence, trigger, status,
+                        provider_id, model_id, created_at, updated_at
+                     ) VALUES (
+                        'plan-phase-attempt-null-owner', ?1, ?2, 0, 'initial', 'queued',
+                        'provider-test', 'model-test',
+                        '2026-07-24T00:00:00.000Z', '2026-07-24T00:00:00.000Z'
+                     )",
+                    params![plan_id, phase_id],
+                )
+                .expect("seed null-owner attempt");
+            drop(connection);
+        }
+    }
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("recovery scan");
+    assert_eq!(repaired, 2);
+
+    for (plan_id, phase_id) in [
+        ("plan-dispatch-owner-old", "plan-dispatch-owner-old-phase"),
+        ("plan-dispatch-owner-null", "plan-dispatch-owner-null-phase"),
+    ] {
+        let failed = database.plan(plan_id).expect("plan").expect("plan");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.phases[0].status, "failed");
+        assert_eq!(
+            failed.phases[0].error_message.as_deref(),
+            Some("Plan phase start did not create an implementation chat or Agent task")
+        );
+        let attempts = database
+            .plan_phase_attempts_for_phase(phase_id)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].status, "failed");
+        assert_eq!(
+            attempts[0].error_message.as_deref(),
+            Some("Plan phase start did not create an implementation chat or Agent task")
+        );
+
+        let (team_id, instance_id) =
+            create_test_agent_team(&mut database, &format!("chat-{plan_id}"), plan_id);
+        let task_id = AgentTaskId::new(format!("agent-task-{plan_id}")).expect("task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue task");
+        let attach_error = database
+            .attach_plan_phase_attempt_run(
+                &attempts[0].id,
+                &format!("chat-{plan_id}"),
+                &team_id,
+                &task_id,
+                TEST_DISPATCH_OWNER,
+            )
+            .expect_err("failed attempt must not attach");
+        assert!(matches!(
+            attach_error,
+            WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                reason: PlanPhaseAttemptConflictReason::Terminal,
+                ..
+            }
+        ));
+        let after = database
+            .plan_phase_attempts_for_phase(phase_id)
+            .expect("attempts after attach conflict");
+        assert_eq!(after[0].status, "failed");
+        assert_eq!(
+            after[0].error_message.as_deref(),
+            Some("Plan phase start did not create an implementation chat or Agent task"),
+            "original recovery error must not be overwritten by attach conflict"
+        );
+    }
+}
+
+#[test]
+fn current_owner_retry_survives_recovery_after_failed_phase() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-retry",
+            title: "Retry owner",
+            overview: "Failed phase retry under current owner must stay live.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-dispatch-owner-retry-phase",
+                title: "Phase",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-dispatch-owner-retry-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-dispatch-owner-retry", "start")
+        .expect("start plan");
+    let first = database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-retry",
+            "plan-dispatch-owner-retry-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            OTHER_DISPATCH_OWNER,
+        )
+        .expect("begin first attempt");
+    database
+        .fail_plan_phase_by_id(
+            "plan-dispatch-owner-retry",
+            "plan-dispatch-owner-retry-phase",
+            "first attempt failed",
+        )
+        .expect("fail first attempt");
+
+    let retry = database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-retry",
+            "plan-dispatch-owner-retry-phase",
+            PlanPhaseAttemptTrigger::Retry,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("begin retry");
+    assert_eq!(retry.status, "queued");
+    assert_eq!(
+        retry.dispatch_owner_incarnation.as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+    assert_ne!(retry.id, first.id);
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("recovery scan");
+    assert_eq!(repaired, 0);
+    database
+        .reconcile_plan_phase_attempts_for_terminal_phases()
+        .expect("terminal-phase reconciliation");
+
+    let plan = database
+        .plan("plan-dispatch-owner-retry")
+        .expect("plan")
+        .expect("plan");
+    assert_eq!(plan.status, "running");
+    assert_eq!(plan.phases[0].status, "running");
+    let attempts = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-retry-phase")
+        .expect("attempts");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[1].status, "queued");
+    assert_eq!(
+        attempts[1].dispatch_owner_incarnation.as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+}
+
+#[test]
+fn attach_plan_phase_attempt_rejects_owner_mismatch_terminal_and_duplicate() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-attach",
+            title: "Attach conflicts",
+            overview: "Attach must enforce owner and terminal state.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-dispatch-owner-attach-phase",
+                title: "Phase",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-dispatch-owner-attach-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-dispatch-owner-attach", "start")
+        .expect("start plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-attach",
+            "plan-dispatch-owner-attach-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("begin attempt");
+
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-dispatch-owner-attach",
+        "dispatch-owner-attach",
+    );
+    let task_id = AgentTaskId::new("agent-task-dispatch-owner-attach").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+
+    let mismatch = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-attach",
+            &team_id,
+            &task_id,
+            OTHER_DISPATCH_OWNER,
+        )
+        .expect_err("owner mismatch");
+    assert!(matches!(
+        mismatch,
+        WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+            reason: PlanPhaseAttemptConflictReason::OwnerMismatch,
+            ..
+        }
+    ));
+    let still_queued = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-attach-phase")
+        .expect("attempts");
+    assert_eq!(still_queued[0].status, "queued");
+    assert!(still_queued[0].implementation_chat_id.is_none());
+
+    let attached = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-attach",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("attach once");
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+
+    let duplicate = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-attach-2",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect_err("duplicate attach");
+    assert!(matches!(
+        duplicate,
+        WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+            reason: PlanPhaseAttemptConflictReason::AlreadyAttached,
+            ..
+        }
+    ));
+    let after_duplicate = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-attach-phase")
+        .expect("attempts");
+    assert_eq!(
+        after_duplicate[0].implementation_chat_id.as_deref(),
+        Some("chat-dispatch-owner-attach")
+    );
+
+    database
+        .fail_plan_phase_by_id(
+            "plan-dispatch-owner-attach",
+            "plan-dispatch-owner-attach-phase",
+            "terminal failure",
+        )
+        .expect("fail phase");
+    let terminal = database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-dispatch-owner-attach-3",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect_err("terminal attach");
+    assert!(matches!(
+        terminal,
+        WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+            reason: PlanPhaseAttemptConflictReason::Terminal,
+            ..
+        }
+    ));
+    let after_terminal = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-attach-phase")
+        .expect("attempts");
+    assert_eq!(after_terminal[0].status, "failed");
+    assert_eq!(
+        after_terminal[0].error_message.as_deref(),
+        Some("terminal failure")
+    );
+}
+
+#[test]
+fn concurrent_active_attempt_still_blocks_begin() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-concurrent",
+            title: "Concurrent begin",
+            overview: "Only one active implementation attempt is allowed.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-dispatch-owner-concurrent-phase",
+                title: "Phase",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-dispatch-owner-concurrent-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create plan");
+    database
+        .transition_plan("plan-dispatch-owner-concurrent", "start")
+        .expect("start plan");
+    database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-concurrent",
+            "plan-dispatch-owner-concurrent-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            "  test-dispatch-owner  ",
+        )
+        .expect("begin first");
+    let conflict = database
+        .begin_plan_phase_attempt(
+            "plan-dispatch-owner-concurrent",
+            "plan-dispatch-owner-concurrent-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider-test"),
+            Some("model-test"),
+            None,
+            OTHER_DISPATCH_OWNER,
+        )
+        .expect_err("second begin must conflict");
+    assert!(
+        conflict
+            .to_string()
+            .contains("already has an active attempt"),
+        "unexpected concurrent begin error: {conflict}"
+    );
+    let attempts = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-concurrent-phase")
+        .expect("attempts");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "queued");
+    assert_eq!(
+        attempts[0].dispatch_owner_incarnation.as_deref(),
+        Some(TEST_DISPATCH_OWNER)
+    );
+}
+
+#[test]
+fn plan_phase_attempt_dispatch_owner_migration_preserves_history() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-dispatch-owner-migration",
+            title: "Migration history",
+            overview: "Upgrade must keep attempt history.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![
+                NewPlanPhase {
+                    id: "plan-dispatch-owner-migration-completed",
+                    title: "Completed",
+                    summary: "Done.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-dispatch-owner-migration-completed-step",
+                        title: "Work",
+                        detail: "Done.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-dispatch-owner-migration-failed",
+                    title: "Failed",
+                    summary: "Fail.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-dispatch-owner-migration-failed-step",
+                        title: "Work",
+                        detail: "Fail.",
+                        acceptance: vec!["failed".to_string()],
+                    }],
+                },
+                NewPlanPhase {
+                    id: "plan-dispatch-owner-migration-queued",
+                    title: "Queued",
+                    summary: "Queued.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-dispatch-owner-migration-queued-step",
+                        title: "Work",
+                        detail: "Queue.",
+                        acceptance: vec!["queued".to_string()],
+                    }],
+                },
+            ],
+        })
+        .expect("create plan");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-dispatch-owner-migration",
+        "dispatch-owner-migration",
+    );
+    let task_id =
+        AgentTaskId::new("agent-task-dispatch-owner-migration").expect("migration task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("migration task");
+
+    let database_path = database.database_path().to_path_buf();
+    drop(database);
+
+    let connection = Connection::open(&database_path).expect("open database");
+    connection
+        .execute_batch(
+            r#"
+            INSERT INTO plan_phase_attempts (
+                id, plan_id, phase_id, sequence, trigger, status,
+                provider_id, model_id, commit_id, error_message,
+                implementation_chat_id, agent_team_id, agent_task_id,
+                started_at, completed_at, created_at, updated_at, dispatch_owner_incarnation
+            ) VALUES
+            (
+                'plan-phase-attempt-migration-completed',
+                'plan-dispatch-owner-migration',
+                'plan-dispatch-owner-migration-completed',
+                0, 'initial', 'completed',
+                'provider', 'model', 'commit-completed', NULL,
+                'chat-dispatch-owner-migration', 'agent-team-dispatch-owner-migration', 'agent-task-dispatch-owner-migration',
+                '2026-07-01T00:00:00.000Z', '2026-07-01T00:01:00.000Z',
+                '2026-07-01T00:00:00.000Z', '2026-07-01T00:01:00.000Z',
+                'legacy-owner'
+            ),
+            (
+                'plan-phase-attempt-migration-failed',
+                'plan-dispatch-owner-migration',
+                'plan-dispatch-owner-migration-failed',
+                0, 'retry', 'failed',
+                'provider', 'model', NULL, 'phase failed',
+                NULL, NULL, NULL,
+                '2026-07-01T00:02:00.000Z', '2026-07-01T00:03:00.000Z',
+                '2026-07-01T00:02:00.000Z', '2026-07-01T00:03:00.000Z',
+                NULL
+            ),
+            (
+                'plan-phase-attempt-migration-queued',
+                'plan-dispatch-owner-migration',
+                'plan-dispatch-owner-migration-queued',
+                0, 'initial', 'queued',
+                'provider', 'model', NULL, NULL,
+                NULL, NULL, NULL,
+                NULL, NULL,
+                '2026-07-01T00:04:00.000Z', '2026-07-01T00:04:00.000Z',
+                'legacy-owner'
+            );
+
+            UPDATE plan_phases
+            SET status = 'completed', commit_id = 'commit-completed',
+                completed_at = '2026-07-01T00:01:00.000Z'
+            WHERE id = 'plan-dispatch-owner-migration-completed';
+            UPDATE plan_phases
+            SET status = 'failed', error_message = 'phase failed',
+                completed_at = '2026-07-01T00:03:00.000Z'
+            WHERE id = 'plan-dispatch-owner-migration-failed';
+            UPDATE plan_phases
+            SET status = 'running'
+            WHERE id = 'plan-dispatch-owner-migration-queued';
+            "#,
+        )
+        .expect("seed attempt history");
+
+    // Simulate schema 46 by rebuilding the table without the new column.
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE plan_phase_attempts_pre_047 (
+                id TEXT PRIMARY KEY NOT NULL CHECK (id GLOB 'plan-phase-attempt-*'),
+                plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+                phase_id TEXT NOT NULL REFERENCES plan_phases(id) ON DELETE CASCADE,
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                trigger TEXT NOT NULL CHECK (trigger IN ('initial', 'retry', 'model_override_retry', 'merge_auto', 'merge_retry')),
+                status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'completed', 'failed', 'cancelled', 'interrupted')),
+                provider_id TEXT CHECK (provider_id IS NULL OR length(provider_id) > 0),
+                model_id TEXT CHECK (model_id IS NULL OR length(model_id) > 0),
+                thinking_level TEXT CHECK (thinking_level IS NULL OR length(thinking_level) > 0),
+                implementation_chat_id TEXT REFERENCES chats(id) ON DELETE SET NULL,
+                agent_team_id TEXT REFERENCES agent_teams(id) ON DELETE SET NULL,
+                agent_task_id TEXT REFERENCES agent_tasks(id) ON DELETE SET NULL,
+                commit_id TEXT,
+                error_message TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE (phase_id, sequence)
+            );
+            INSERT INTO plan_phase_attempts_pre_047 (
+                id, plan_id, phase_id, sequence, trigger, status,
+                provider_id, model_id, thinking_level,
+                implementation_chat_id, agent_team_id, agent_task_id,
+                commit_id, error_message, started_at, completed_at, created_at, updated_at
+            )
+            SELECT
+                id, plan_id, phase_id, sequence, trigger, status,
+                provider_id, model_id, thinking_level,
+                implementation_chat_id, agent_team_id, agent_task_id,
+                commit_id, error_message, started_at, completed_at, created_at, updated_at
+            FROM plan_phase_attempts;
+            DROP TABLE plan_phase_attempts;
+            ALTER TABLE plan_phase_attempts_pre_047 RENAME TO plan_phase_attempts;
+            CREATE INDEX plan_phase_attempts_plan_phase_sequence_idx
+            ON plan_phase_attempts (plan_id, phase_id, sequence);
+            CREATE INDEX plan_phase_attempts_agent_task_idx
+            ON plan_phase_attempts (agent_task_id);
+            PRAGMA user_version = 46;
+            "#,
+        )
+        .expect("downgrade to schema 46 shape");
+    drop(connection);
+
+    let database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("migrate to 47");
+    assert_eq!(
+        database.schema_version().expect("schema version"),
+        WORKSPACE_SCHEMA_VERSION
+    );
+
+    let completed = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-migration-completed")
+        .expect("completed attempts");
+    assert_eq!(completed.len(), 1);
+    assert_eq!(completed[0].status, "completed");
+    assert_eq!(completed[0].trigger, "initial");
+    assert_eq!(completed[0].commit_id.as_deref(), Some("commit-completed"));
+    assert_eq!(completed[0].provider_id.as_deref(), Some("provider"));
+    assert_eq!(completed[0].model_id.as_deref(), Some("model"));
+    assert_eq!(
+        completed[0].implementation_chat_id.as_deref(),
+        Some("chat-dispatch-owner-migration")
+    );
+    assert_eq!(
+        completed[0].agent_team_id.as_deref(),
+        Some(team_id.as_str())
+    );
+    assert_eq!(
+        completed[0].agent_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+    assert!(completed[0].dispatch_owner_incarnation.is_none());
+
+    let failed = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-migration-failed")
+        .expect("failed attempts");
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].status, "failed");
+    assert_eq!(failed[0].trigger, "retry");
+    assert_eq!(failed[0].error_message.as_deref(), Some("phase failed"));
+    assert!(failed[0].dispatch_owner_incarnation.is_none());
+
+    let queued = database
+        .plan_phase_attempts_for_phase("plan-dispatch-owner-migration-queued")
+        .expect("queued attempts");
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].status, "queued");
+    assert_eq!(queued[0].trigger, "initial");
+    assert!(queued[0].dispatch_owner_incarnation.is_none());
+
+    let connection = Connection::open(database.database_path()).expect("open migrated db");
+    assert!(column_exists(
+        &connection,
+        "plan_phase_attempts",
+        "dispatch_owner_incarnation"
+    ));
+    for invalid_owner in [
+        "",
+        " owner",
+        "owner ",
+        "\towner",
+        "owner\n",
+        "\t\r\n",
+        "owner with space",
+        "owner\u{2003}",
+        "\u{2003}owner",
+    ] {
+        let result = connection.execute(
+            "UPDATE plan_phase_attempts
+             SET dispatch_owner_incarnation = ?1
+             WHERE id = 'plan-phase-attempt-migration-completed'",
+            params![invalid_owner],
+        );
+        assert!(
+            result.is_err(),
+            "migration constraint must reject non-normalized owner: {invalid_owner:?}"
+        );
+    }
+    connection
+        .execute(
+            "UPDATE plan_phase_attempts
+             SET dispatch_owner_incarnation = ?1
+             WHERE id = 'plan-phase-attempt-migration-completed'",
+            params!["normalized-owner"],
+        )
+        .expect("normalized owner must be accepted");
+    let index_count: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name IN (
+                   'plan_phase_attempts_plan_phase_sequence_idx',
+                   'plan_phase_attempts_agent_task_idx'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .expect("index count");
+    assert_eq!(index_count, 2);
+    let mut fk_stmt = connection
+        .prepare("PRAGMA foreign_key_check(plan_phase_attempts)")
+        .expect("prepare fk check");
+    let fk_rows: Vec<()> = fk_stmt
+        .query_map([], |_| Ok(()))
+        .expect("fk rows")
+        .collect::<Result<_, _>>()
+        .expect("collect fk");
+    assert!(fk_rows.is_empty(), "foreign keys must remain valid");
+
+    // PlanRecord JSON must not expose the internal owner field.
+    let plan = database
+        .plan("plan-dispatch-owner-migration")
+        .expect("plan")
+        .expect("plan");
+    let json = serde_json::to_value(&plan).expect("serialize plan");
+    let attempt_json = &json["phases"][0]["attempts"][0];
+    assert!(attempt_json.get("dispatchOwnerIncarnation").is_none());
+    assert!(attempt_json.get("dispatch_owner_incarnation").is_none());
 }
 
 #[test]
@@ -3372,11 +4516,18 @@ fn plan_phase_derived_effects_are_idempotent_and_survive_reopen() {
                 Some("provider"),
                 Some("model"),
                 None,
+                TEST_DISPATCH_OWNER,
             )
             .expect("begin attempt");
         attempt_id = attempt.id.clone();
         database
-            .attach_plan_phase_attempt_run(&attempt.id, "chat-derived-effects", &team_id, &task_id)
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                "chat-derived-effects",
+                &team_id,
+                &task_id,
+                TEST_DISPATCH_OWNER,
+            )
             .expect("attach run");
         let input = NewPlanPhaseDerivedEffects {
             attempt_id: &attempt.id,
@@ -3470,6 +4621,7 @@ fn terminal_plan_phase_attempt_discards_unconfirmed_derived_effects() {
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) =
@@ -3506,7 +4658,13 @@ fn terminal_plan_phase_attempt_discards_unconfirmed_derived_effects() {
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-terminal-effects", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-terminal-effects",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     database
         .insert_plan_phase_derived_effects(NewPlanPhaseDerivedEffects {
@@ -3596,10 +4754,17 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
             Some("provider-a"),
             Some("model-a"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin first attempt");
     database
-        .attach_plan_phase_attempt_run(&first_attempt.id, "chat-plan-restart", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &first_attempt.id,
+            "chat-plan-restart",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach phase attempt");
 
     database
@@ -3661,6 +4826,7 @@ fn starting_failed_plan_phase_clears_previous_agent_run() {
             Some("provider-a"),
             Some("model-a"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin retry for restarted failed phase");
     assert_eq!(retry_attempt.trigger, "retry");
@@ -3703,6 +4869,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
             Some("provider-a"),
             Some("model-a"),
             Some("low"),
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin first attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -3727,6 +4894,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
             "chat-plan-attempt-history-1",
             &team_id,
             &first_task_id,
+            TEST_DISPATCH_OWNER,
         )
         .expect("attach first attempt");
     database
@@ -3742,6 +4910,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
                 Some("provider-a"),
                 Some("model-a"),
                 Some("low"),
+                TEST_DISPATCH_OWNER
             )
             .is_ok(),
         "failed phase can retry"
@@ -3755,6 +4924,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
                 Some("provider-a"),
                 Some("model-a"),
                 Some("low"),
+                TEST_DISPATCH_OWNER
             )
             .is_err(),
         "active retry is protected from duplicate dispatch"
@@ -3792,6 +4962,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
             "chat-plan-attempt-history-2",
             &team_id,
             &second_task_id,
+            TEST_DISPATCH_OWNER,
         )
         .expect("attach retry attempt");
     database
@@ -3818,6 +4989,7 @@ fn plan_phase_attempt_history_survives_retry_and_second_failure() {
                 Some("provider-b"),
                 Some("model-b"),
                 Some("high"),
+                TEST_DISPATCH_OWNER
             )
             .is_ok(),
         "failed retry can be retried again with override config"
@@ -3861,6 +5033,7 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
             Some("provider-a"),
             Some("model-a"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -3880,7 +5053,13 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-plan-cancelled-phase", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-plan-cancelled-phase",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     database
         .claim_runnable_agent_task(
@@ -3948,6 +5127,7 @@ fn cancelled_plan_phase_run_marks_phase_cancelled_and_retryable() {
                 Some("provider-a"),
                 Some("model-a"),
                 None,
+                TEST_DISPATCH_OWNER
             )
             .is_ok(),
         "cancelled phase can retry"
@@ -4103,6 +5283,7 @@ fn retry_rejects_phase_with_incomplete_predecessor_without_creating_attempt() {
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect_err("later phase retry must be rejected");
     assert!(matches!(error, WorkspaceDatabaseError::InvalidPlan { .. }));
@@ -4182,6 +5363,7 @@ fn retry_allows_earliest_cancelled_phase_with_completed_later_history() {
             Some("provider-b"),
             Some("model-b"),
             Some("high"),
+            TEST_DISPATCH_OWNER,
         )
         .expect("retry earliest cancelled phase");
     assert_eq!(attempt.sequence, 0);
@@ -4380,6 +5562,7 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
                 Some("provider"),
                 Some("model"),
                 None,
+                TEST_DISPATCH_OWNER,
             )
             .expect("begin phase attempt");
         database
@@ -4388,6 +5571,7 @@ fn terminal_agent_task_reconciliation_finishes_stale_running_plan_phase() {
                 &format!("chat-stale-{suffix}"),
                 &team_id,
                 &task_id,
+                TEST_DISPATCH_OWNER,
             )
             .expect("attach phase attempt");
         database
@@ -4481,6 +5665,7 @@ fn plan_phase_attempt_stays_running_when_step_completion_has_active_execution() 
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -4500,7 +5685,13 @@ fn plan_phase_attempt_stays_running_when_step_completion_has_active_execution() 
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-attempt-step-active", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-attempt-step-active",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
 
     let updated = database
@@ -4568,6 +5759,7 @@ fn plan_step_completion_keeps_phase_running_for_queued_running_and_waiting_tasks
                 Some("provider"),
                 Some("model"),
                 None,
+                TEST_DISPATCH_OWNER,
             )
             .expect("begin attempt");
         let (team_id, instance_id) = create_test_agent_team(
@@ -4593,6 +5785,7 @@ fn plan_step_completion_keeps_phase_running_for_queued_running_and_waiting_tasks
                 &format!("chat-step-active-{suffix}"),
                 &team_id,
                 &task_id,
+                TEST_DISPATCH_OWNER,
             )
             .expect("attach attempt");
         if suffix != "queued" {
@@ -4707,6 +5900,7 @@ fn plan_phase_completes_only_after_bound_task_completion_entry() {
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -4726,7 +5920,13 @@ fn plan_phase_completes_only_after_bound_task_completion_entry() {
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-complete-after-task", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-complete-after-task",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     let agent_attempt_id =
         AgentAttemptId::new("agent-attempt-complete-after-task").expect("attempt id");
@@ -4956,6 +6156,7 @@ fn plan_phase_follows_task_terminal_status_even_when_all_steps_completed() {
                 Some("provider"),
                 Some("model"),
                 None,
+                TEST_DISPATCH_OWNER,
             )
             .expect("begin attempt");
         let (team_id, instance_id) = create_test_agent_team(
@@ -4980,6 +6181,7 @@ fn plan_phase_follows_task_terminal_status_even_when_all_steps_completed() {
                 &format!("chat-steps-done-{suffix}"),
                 &team_id,
                 &task_id,
+                TEST_DISPATCH_OWNER,
             )
             .expect("attach attempt");
         let agent_attempt_id =
@@ -5089,6 +6291,7 @@ fn plan_phase_failed_status_stays_failed_after_step_edit_when_all_steps_complete
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -5113,6 +6316,7 @@ fn plan_phase_failed_status_stays_failed_after_step_edit_when_all_steps_complete
             "chat-failed-sticky-step-edit",
             &team_id,
             &task_id,
+            TEST_DISPATCH_OWNER,
         )
         .expect("attach attempt");
     let agent_attempt_id =
@@ -5509,6 +6713,7 @@ fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
                 Some("provider"),
                 Some("model"),
                 None,
+                TEST_DISPATCH_OWNER,
             )
             .expect("begin attempt");
         let (team_id, instance_id) = create_test_agent_team(
@@ -5534,6 +6739,7 @@ fn plan_phase_attempt_reconciliation_copies_terminal_phase_state() {
                 &format!("chat-attempt-reconcile-{suffix}"),
                 &team_id,
                 &task_id,
+                TEST_DISPATCH_OWNER,
             )
             .expect("attach attempt");
         let connection = Connection::open(database.database_path()).expect("open database");
@@ -5619,6 +6825,7 @@ fn reconcile_prematurely_completed_plan_phases_reopens_active_task_phase() {
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) =
@@ -5635,7 +6842,13 @@ fn reconcile_prematurely_completed_plan_phases_reopens_active_task_phase() {
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-reopen", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-premature-reopen",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     let agent_attempt_id =
         AgentAttemptId::new("agent-attempt-premature-reopen").expect("attempt id");
@@ -5786,6 +6999,7 @@ fn reconcile_prematurely_completed_plan_phases_skips_when_later_phase_active() {
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -5805,7 +7019,13 @@ fn reconcile_prematurely_completed_plan_phases_skips_when_later_phase_active() {
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-skip-later", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-premature-skip-later",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     database
         .claim_runnable_agent_task(
@@ -5912,6 +7132,7 @@ fn reconcile_prematurely_completed_plan_phases_skips_real_commit_and_terminal_ta
             Some("provider"),
             Some("model"),
             None,
+            TEST_DISPATCH_OWNER,
         )
         .expect("begin attempt");
     let (team_id, instance_id) = create_test_agent_team(
@@ -5931,7 +7152,13 @@ fn reconcile_prematurely_completed_plan_phases_skips_real_commit_and_terminal_ta
         })
         .expect("enqueue task");
     database
-        .attach_plan_phase_attempt_run(&attempt.id, "chat-premature-skip-real", &team_id, &task_id)
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-premature-skip-real",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
         .expect("attach attempt");
     let agent_attempt_id =
         AgentAttemptId::new("agent-attempt-premature-skip-real").expect("attempt id");

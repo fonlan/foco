@@ -21,12 +21,12 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
     open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
-    reconcile_running_llm_request_audits_on_startup, validate_agent_snapshot_for_workspace,
+    reconcile_agent_runtime, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use agent_scheduler::{
     agent_lifecycle_retry_until_shutdown_for_test, agent_wait_resume_messages,
-    fail_claimed_task_with_retry, reconcile_agent_runtime, recover_panicked_coordinator_for_test,
+    fail_claimed_task_with_retry, recover_panicked_coordinator_for_test,
     retain_agent_snapshot_tools,
 };
 #[cfg(test)]

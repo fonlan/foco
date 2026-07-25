@@ -1564,6 +1564,23 @@ ON agent_attempts (status, lease_renewed_at)
 WHERE status IN ('running', 'suspended');
 "#;
 
+// Plan phase dispatch owns a non-atomic window between begin_plan_phase_attempt
+// and attach_plan_phase_attempt_run. Persist the creating runtime incarnation so
+// startup recovery can spare the current runtime's unbound queued attempts while
+// still failing legacy/NULL or previous-owner leftovers. Internal metadata only;
+// no new phase status and no PlanRecord JSON change.
+pub(crate) const MIGRATION_047: &str = r#"
+ALTER TABLE plan_phase_attempts
+ADD COLUMN dispatch_owner_incarnation TEXT
+CHECK (
+    dispatch_owner_incarnation IS NULL
+    OR (
+        length(dispatch_owner_incarnation) > 0
+        AND dispatch_owner_incarnation NOT GLOB '*[^A-Za-z0-9._:-]*'
+    )
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

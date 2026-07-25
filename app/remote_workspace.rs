@@ -3046,6 +3046,8 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
     let active_runs = Arc::new(Mutex::new(Vec::new()));
     let state = RemoteSidecarState {
         token: options.token.clone(),
+        plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+            .map_err(|error| std::io::Error::other(error.message))?,
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
@@ -4097,6 +4099,18 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
             interrupted += 1;
         }
     }
+    database.fail_running_plan_phases_for_terminal_agent_tasks(
+        "remote sidecar lost the Agent attempt owner lease",
+    )?;
+    database.fail_running_plan_phases_without_agent_runs(
+        "Plan phase start did not create an implementation chat or Agent task",
+        state.plan_dispatch_owner_incarnation.as_str(),
+    )?;
+    database.reconcile_prematurely_completed_plan_phases_with_active_tasks()?;
+    database.reconcile_plan_phase_attempts_for_terminal_phases()?;
+    database.discard_terminal_plan_phase_derived_effects(
+        "remote sidecar lost the Agent attempt owner lease",
+    )?;
     Ok(interrupted)
 }
 
@@ -4142,6 +4156,8 @@ fn remote_plan_queued_run_id_from_message(
 #[derive(Clone)]
 pub(crate) struct RemoteSidecarState {
     token: String,
+    /// Owner shared by this sidecar's recovery and Plan dispatch lifecycle.
+    plan_dispatch_owner_incarnation: String,
     last_config_hash: Arc<Mutex<Option<String>>>,
     runtime_config: Arc<Mutex<Option<SidecarRuntimeConfigBundle>>>,
     /// Per canonical execution-root code graph lifecycle (index + watcher).
@@ -18326,6 +18342,14 @@ fn remote_sidecar_fail_plan_task(
                 interruption_reason: None,
             })
             .map_err(ApiError::from_workspace_error)?;
+    } else if task.status == AgentTaskStatus::Queued {
+        database
+            .cancel_queued_agent_task(
+                &task.team_id,
+                &task.id,
+                &json!({ "message": message }).to_string(),
+            )
+            .map_err(ApiError::from_workspace_error)?;
     }
     // Merge failures route to await_plan_merge_retry via fail_plan_phase_run and
     // must keep awaiting-integration derived effects for a later successful retry.
@@ -22466,13 +22490,101 @@ fn remote_fail_plan_phase_dispatch(
     let Ok(mut database) = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state)) else {
         return;
     };
+    let Ok(Some(plan)) = database.plan(plan_id) else {
+        return;
+    };
+    let Some(phase) = plan.phases.iter().find(|phase| phase.id == phase_id) else {
+        return;
+    };
+    if phase.status != "running" || phase.agent_task_id.is_some() {
+        let attempt = phase.attempts.last();
+        tracing::info!(
+            plan_id,
+            phase_id,
+            attempt_id = ?attempt.map(|attempt| &attempt.id),
+            current_owner = %state.plan_dispatch_owner_incarnation,
+            stored_owner = ?attempt.and_then(|attempt| attempt.dispatch_owner_incarnation.as_deref()),
+            attempt_status = ?attempt.map(|attempt| &attempt.status),
+            transition = "preserve_existing_terminal_or_attached_state",
+            error = message,
+            "remote Plan dispatch failure did not overwrite a durable state transition"
+        );
+        return;
+    }
     if let Err(error) = database.fail_plan_phase_start(plan_id, phase_id, message) {
         tracing::error!(
             plan_id,
             phase_id,
+            current_owner = %state.plan_dispatch_owner_incarnation,
             error = %error,
             "failed to durably close remote Plan phase dispatch error"
         );
+    }
+}
+
+fn remote_cleanup_unattached_plan_dispatch(
+    state: &RemoteSidecarState,
+    team_id: &AgentTeamId,
+    task_id: &AgentTaskId,
+    created_worktree: Option<&Path>,
+    dispatch_error: &ApiError,
+) {
+    let cleanup = (|| -> Result<bool, ApiError> {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .cancel_queued_agent_task(
+                team_id,
+                task_id,
+                &json!({
+                    "message": dispatch_error.message,
+                    "code": "plan_phase_attach_failed",
+                })
+                .to_string(),
+            )
+            .map_err(ApiError::from_workspace_error)
+    })();
+    match cleanup {
+        Ok(true) => tracing::info!(
+            workspace_id = %state.workspace_id,
+            team_id = %team_id,
+            task_id = %task_id,
+            transition = "cancel_unattached_queued_task",
+            "cancelled remote Plan Coordinator task after attempt attach failure"
+        ),
+        Ok(false) => tracing::warn!(
+            workspace_id = %state.workspace_id,
+            team_id = %team_id,
+            task_id = %task_id,
+            transition = "unattached_task_not_queued",
+            "remote Plan Coordinator task was no longer queued during attach failure cleanup"
+        ),
+        Err(error) => tracing::error!(
+            workspace_id = %state.workspace_id,
+            team_id = %team_id,
+            task_id = %task_id,
+            error = %error.message,
+            "failed to cancel unattached remote Plan Coordinator task"
+        ),
+    }
+    if let Some(worktree_path) = created_worktree {
+        if let Err(error) =
+            delete_agent_worktree(Path::new(&state.workspace_path), worktree_path, false)
+        {
+            tracing::warn!(
+                workspace_id = %state.workspace_id,
+                worktree_path = %worktree_path.display(),
+                error = %error.message,
+                "failed to delete newly created remote Plan worktree after attach failure"
+            );
+        } else {
+            tracing::info!(
+                workspace_id = %state.workspace_id,
+                worktree_path = %worktree_path.display(),
+                transition = "delete_unattached_worktree",
+                "deleted newly created remote Plan worktree after attach failure"
+            );
+        }
     }
 }
 
@@ -22509,6 +22621,7 @@ async fn remote_sidecar_dispatch_plan_phase(
                         Some(&selection.provider_id),
                         Some(&selection.model_id),
                         selection.thinking_level.as_deref(),
+                        state.plan_dispatch_owner_incarnation.as_str(),
                     )
                     .map_err(ApiError::from_workspace_error)?
                     .id
@@ -22559,16 +22672,20 @@ async fn remote_sidecar_dispatch_plan_phase(
             .map_err(ApiError::from_workspace_error)?;
         remote_sidecar_plan_worktree(&database, &workspace_path, &plan)?
     };
-    let worktree = match worktree {
-        Some(worktree) => worktree,
+    let (worktree, created_worktree) = match worktree {
+        Some(worktree) => (worktree, None),
         None => {
             let created = create_agent_worktree(&workspace_path, instance_id.as_str())?;
-            RemotePlanWorktree {
-                root_path: created.root_path,
-                base_revision: created.base_revision,
-                branch: created.branch,
-                phase_id: phase.id.clone(),
-            }
+            let root_path = created.root_path;
+            (
+                RemotePlanWorktree {
+                    root_path: root_path.clone(),
+                    base_revision: created.base_revision,
+                    branch: created.branch,
+                    phase_id: phase.id.clone(),
+                },
+                Some(root_path),
+            )
         }
     };
     let worktree_root = agent_worktree_relative_path(&workspace_path, &worktree.root_path)?;
@@ -22581,6 +22698,7 @@ async fn remote_sidecar_dispatch_plan_phase(
         "message": prompt,
     })
     .to_string();
+    let mut attempt_attached = false;
     let dispatched_plan = (|| {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
@@ -22609,8 +22727,15 @@ async fn remote_sidecar_dispatch_plan_phase(
             })
             .map_err(ApiError::from_workspace_error)?;
         database
-            .attach_plan_phase_attempt_run(&attempt_id, &chat_id, &team_id, &task_id)
+            .attach_plan_phase_attempt_run(
+                &attempt_id,
+                &chat_id,
+                &team_id,
+                &task_id,
+                state.plan_dispatch_owner_incarnation.as_str(),
+            )
             .map_err(ApiError::from_workspace_error)?;
+        attempt_attached = true;
         let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         database
@@ -22632,7 +22757,30 @@ async fn remote_sidecar_dispatch_plan_phase(
     let dispatched_plan = match dispatched_plan {
         Ok(plan) => plan,
         Err(error) => {
-            remote_fail_plan_phase_dispatch(state, &plan.id, &phase.id, &error.message);
+            if attempt_attached {
+                if let Err(cleanup_error) =
+                    remote_sidecar_fail_plan_task(state, &task_id, &error.message)
+                {
+                    tracing::error!(
+                        plan_id = %plan.id,
+                        phase_id = %phase.id,
+                        task_id = %task_id,
+                        error = %cleanup_error.message,
+                        original_error = %error.message,
+                        transition = "fail_attached_task_after_dispatch_error",
+                        "failed to close attached remote Plan task after dispatch error"
+                    );
+                }
+            } else {
+                remote_cleanup_unattached_plan_dispatch(
+                    state,
+                    &team_id,
+                    &task_id,
+                    created_worktree.as_deref(),
+                    &error,
+                );
+                remote_fail_plan_phase_dispatch(state, &plan.id, &phase.id, &error.message);
+            }
             return Err(error);
         }
     };
@@ -22782,6 +22930,7 @@ async fn remote_sidecar_plans_phase_retry(
                 Some(&selection.provider_id),
                 Some(&selection.model_id),
                 selection.thinking_level.as_deref(),
+                state.plan_dispatch_owner_incarnation.as_str(),
             )
             .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
         database
@@ -23994,6 +24143,7 @@ mod tests {
                 Some("provider"),
                 Some("model"),
                 None,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("begin attempt");
         let with_attempt = database
@@ -24001,6 +24151,227 @@ mod tests {
             .expect("reload plan")
             .expect("plan");
         assert!(!remote_plan_requires_initial_dispatch(&with_attempt));
+    }
+
+    #[test]
+    fn remote_sidecar_recovery_fails_old_unbound_plan_dispatch_attempt() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .create_plan(foco_store::workspace::NewPlan {
+                id: "plan-remote-old-dispatch-owner",
+                title: "Remote old dispatch owner",
+                overview: "A previous sidecar dispatch must not block restart recovery.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![foco_store::workspace::NewPlanPhase {
+                    id: "plan-remote-old-dispatch-owner-phase",
+                    title: "Phase",
+                    summary: "Implement.",
+                    steps: vec![foco_store::workspace::NewPlanStep {
+                        id: "plan-remote-old-dispatch-owner-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan("plan-remote-old-dispatch-owner", "start")
+            .expect("start plan");
+        database
+            .begin_plan_phase_attempt(
+                "plan-remote-old-dispatch-owner",
+                "plan-remote-old-dispatch-owner-phase",
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider-test"),
+                Some("model-test"),
+                None,
+                "previous-sidecar-incarnation",
+            )
+            .expect("begin old dispatch attempt");
+        drop(database);
+
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().into_owned(), 0);
+        assert_eq!(
+            reconcile_remote_sidecar_agent_attempt_leases(&state).expect("remote sidecar recovery"),
+            0,
+            "no agent lease should be interrupted for an unbound dispatch"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let plan = database
+            .plan("plan-remote-old-dispatch-owner")
+            .expect("plan")
+            .expect("plan");
+        assert_eq!(plan.status, "failed");
+        assert_eq!(plan.phases[0].status, "failed");
+        assert_eq!(plan.phases[0].attempts[0].status, "failed");
+        assert_eq!(
+            plan.phases[0].attempts[0].error_message.as_deref(),
+            Some("Plan phase start did not create an implementation chat or Agent task")
+        );
+        // Sidecar DB terminal reason is the durable source of truth for main UI snapshots.
+        assert!(
+            plan.phases[0]
+                .error_message
+                .as_deref()
+                .is_none_or(|message| !message.contains("cannot attach while failed")),
+            "sidecar recovery must not leave a secondary attach wrap for the main UI snapshot"
+        );
+    }
+
+    /// Current sidecar owner queued attempt must survive recovery so attach can complete.
+    /// Asserts sidecar DB state that the proxy/main UI snapshot would surface.
+    #[test]
+    fn remote_sidecar_recovery_protects_current_owner_unbound_plan_dispatch_attempt() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().into_owned(), 0);
+        let current_owner = state.plan_dispatch_owner_incarnation.clone();
+        let plan_id = "plan-remote-current-dispatch-owner";
+        let phase_id = "plan-remote-current-dispatch-owner-phase";
+
+        let attempt_id = {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database
+                .create_plan(foco_store::workspace::NewPlan {
+                    id: plan_id,
+                    title: "Remote current dispatch owner",
+                    overview: "Live sidecar begin→attach window must not be recovered away.",
+                    status: "ready",
+                    source_chat_id: None,
+                    phases: vec![foco_store::workspace::NewPlanPhase {
+                        id: phase_id,
+                        title: "Phase",
+                        summary: "Implement.",
+                        steps: vec![foco_store::workspace::NewPlanStep {
+                            id: "plan-remote-current-dispatch-owner-step",
+                            title: "Work",
+                            detail: "Do it.",
+                            acceptance: vec!["done".to_string()],
+                        }],
+                    }],
+                })
+                .expect("create plan");
+            database
+                .transition_plan(plan_id, "start")
+                .expect("start plan");
+            let attempt = database
+                .begin_plan_phase_attempt(
+                    plan_id,
+                    phase_id,
+                    PlanPhaseAttemptTrigger::Initial,
+                    Some("provider-test"),
+                    Some("model-test"),
+                    None,
+                    current_owner.as_str(),
+                )
+                .expect("begin current-owner attempt");
+            attempt.id
+        };
+
+        assert_eq!(
+            reconcile_remote_sidecar_agent_attempt_leases(&state)
+                .expect("remote sidecar recovery for current owner"),
+            0,
+            "current-owner unbound dispatch must not interrupt agent leases"
+        );
+
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reopen database");
+        let plan = database.plan(plan_id).expect("plan").expect("plan");
+        assert_eq!(plan.status, "running", "sidecar DB must stay running");
+        assert_eq!(plan.phases[0].status, "running");
+        assert_eq!(plan.phases[0].attempts.len(), 1);
+        assert_eq!(plan.phases[0].attempts[0].id, attempt_id);
+        assert_eq!(plan.phases[0].attempts[0].status, "queued");
+        assert_eq!(
+            plan.phases[0].attempts[0]
+                .dispatch_owner_incarnation
+                .as_deref(),
+            Some(current_owner.as_str())
+        );
+        assert!(
+            plan.phases[0].error_message.is_none(),
+            "main UI snapshot must not show a recovery failure for a live owner"
+        );
+
+        // Attach under the same sidecar owner — the proxy success path.
+        let team_id =
+            foco_agent::AgentTeamId::new("agent-team-remote-current-owner").expect("team id");
+        let instance_id = foco_agent::AgentInstanceId::new("agent-instance-remote-current-owner")
+            .expect("instance id");
+        let task_id =
+            foco_agent::AgentTaskId::new("agent-task-remote-current-owner").expect("task id");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-remote-current-owner")
+                .expect("definition id"),
+            revision: 1,
+            name: "Remote current owner".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "Coordinate.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 1,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        };
+        database
+            .insert_chat("chat-remote-current-owner", "Remote current owner")
+            .expect("chat insert");
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-remote-current-owner",
+                coordinator_instance_id: &instance_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            })
+            .expect("team create");
+        database
+            .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &instance_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: r#"{"message":"Remote phase"}"#,
+            })
+            .expect("enqueue task");
+        let attached = database
+            .attach_plan_phase_attempt_run(
+                &attempt_id,
+                "chat-remote-current-owner",
+                &team_id,
+                &task_id,
+                current_owner.as_str(),
+            )
+            .expect("attach after current-owner recovery");
+        assert_eq!(attached.status, "running");
+        assert_eq!(attached.phases[0].status, "running");
+        assert_eq!(attached.phases[0].attempts[0].status, "running");
+        assert_eq!(
+            attached.phases[0].implementation_chat_id.as_deref(),
+            Some("chat-remote-current-owner")
+        );
+        assert_eq!(
+            attached.phases[0].agent_task_id.as_deref(),
+            Some(task_id.as_str())
+        );
+        assert!(attached.phases[0].error_message.is_none());
+        assert!(attached.error_message.is_none());
     }
 
     #[test]
@@ -24224,6 +24595,7 @@ mod tests {
                 Some("provider-test"),
                 Some("model-test"),
                 None,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("begin merge attempt");
         database
@@ -24287,6 +24659,7 @@ mod tests {
                 "chat-remote-direct-merge",
                 &team_id,
                 &task_id,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("attach merge attempt");
         let agent_attempt_id =
@@ -24374,6 +24747,7 @@ mod tests {
                 Some("provider-test"),
                 Some("model-test"),
                 None,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("begin attempt");
         database
@@ -24430,7 +24804,13 @@ mod tests {
             })
             .expect("enqueue coordinator task");
         database
-            .attach_plan_phase_attempt_run(&attempt.id, "chat-remote-cancel", &team_id, &task_id)
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                "chat-remote-cancel",
+                &team_id,
+                &task_id,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
+            )
             .expect("attach plan attempt");
         let agent_attempt_id =
             AgentAttemptId::new("agent-attempt-remote-cancel").expect("agent attempt id");
@@ -24692,6 +25072,8 @@ mod tests {
         (
             RemoteSidecarState {
                 token: "token".to_string(),
+                plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                    .expect("test plan dispatch owner"),
                 last_config_hash: Arc::new(Mutex::new(None)),
                 runtime_config: Arc::new(Mutex::new(None)),
                 code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -28559,6 +28941,8 @@ mod tests {
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
+            plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                .expect("test plan dispatch owner"),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -31612,6 +31996,8 @@ mod tests {
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
+            plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                .expect("test plan dispatch owner"),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -38628,6 +39014,8 @@ mod tests {
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
+            plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                .expect("test plan dispatch owner"),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -38698,6 +39086,8 @@ mod tests {
         let (broker_tx, _) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
+            plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                .expect("test plan dispatch owner"),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -44946,6 +45336,8 @@ mod tests {
         let (broker_tx, mut broker_rx) = tokio::sync::broadcast::channel::<ControlEnvelope>(8);
         let state = RemoteSidecarState {
             token: "token".to_string(),
+            plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
+                .expect("test plan dispatch owner"),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -45274,6 +45666,7 @@ mod tests {
                 Some("provider-1"),
                 Some("model-1"),
                 None,
+                crate::plan_dispatch_owner_incarnation().expect("plan dispatch owner"),
             )
             .expect("begin phase attempt");
         database

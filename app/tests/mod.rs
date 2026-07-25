@@ -11993,7 +11993,7 @@ fn agent_scheduler_reconciliation_interrupts_active_attempt_without_replaying_qu
     }
 
     let state = test_app_state(config, workspace_dir.clone());
-    reconcile_agent_runtime(&state).expect("reconcile");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation()).expect("reconcile");
     let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
     assert_eq!(
         database
@@ -12104,6 +12104,7 @@ fn plan_phase_waiting_lifecycle_keeps_running_when_steps_complete() {
             Some("provider"),
             Some("model"),
             None,
+            "test-dispatch-owner",
         )
         .expect("begin attempt");
     let plan_attempt_id = plan_attempt.id.clone();
@@ -12117,7 +12118,13 @@ fn plan_phase_waiting_lifecycle_keeps_running_when_steps_complete() {
     assert_eq!(parent.status, foco_agent::AgentTaskStatus::Waiting);
 
     database
-        .attach_plan_phase_attempt_run(&plan_attempt_id, chat_id, &parent.team_id, &parent_task_id)
+        .attach_plan_phase_attempt_run(
+            &plan_attempt_id,
+            chat_id,
+            &parent.team_id,
+            &parent_task_id,
+            "test-dispatch-owner",
+        )
         .expect("attach plan phase");
 
     let worker_id =
@@ -12368,6 +12375,7 @@ fn agent_scheduler_reconciliation_repairs_premature_plan_phase_completion() {
                 Some("provider"),
                 Some("model"),
                 None,
+                "test-dispatch-owner",
             )
             .expect("begin attempt");
         attempt_id = attempt.id.clone();
@@ -12384,6 +12392,7 @@ fn agent_scheduler_reconciliation_repairs_premature_plan_phase_completion() {
                 "chat-premature-startup",
                 &task.team_id,
                 &task_id,
+                "test-dispatch-owner",
             )
             .expect("attach");
         database
@@ -12436,7 +12445,8 @@ fn agent_scheduler_reconciliation_repairs_premature_plan_phase_completion() {
     }
 
     let state = test_app_state(config, profile_dir.clone());
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
     let plan = database.plan(plan_id).expect("plan").expect("plan");
@@ -12523,6 +12533,7 @@ fn agent_scheduler_reconciliation_skips_premature_repair_when_later_phase_active
                 Some("provider"),
                 Some("model"),
                 None,
+                "test-dispatch-owner",
             )
             .expect("begin attempt");
         attempt1_id = attempt.id.clone();
@@ -12539,6 +12550,7 @@ fn agent_scheduler_reconciliation_skips_premature_repair_when_later_phase_active
                 "chat-premature-skip-later-app",
                 &task.team_id,
                 &task_id,
+                "test-dispatch-owner",
             )
             .expect("attach");
 
@@ -12588,7 +12600,8 @@ fn agent_scheduler_reconciliation_skips_premature_repair_when_later_phase_active
     }
 
     let state = test_app_state(config, profile_dir.clone());
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
     let plan = database.plan(plan_id).expect("plan").expect("plan");
@@ -12692,7 +12705,8 @@ fn agent_scheduler_startup_recovers_running_task_with_registered_wait_dependenci
     };
 
     let state = test_app_state(config, profile_dir.clone());
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
     let parent = database
@@ -12752,7 +12766,8 @@ fn startup_reconciliation_preserves_attempt_with_active_durable_lease() {
         prompt_test_config(workspace.path().to_path_buf()),
         profile.path().to_path_buf(),
     );
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     assert_eq!(
@@ -12791,7 +12806,8 @@ fn startup_reconciliation_ignores_suspended_wait_attempt_after_task_resumes() {
             Some("agent-owner-wait-round"),
         );
     let resumed_attempt_id =
-        foco_agent::AgentAttemptId::new("agent-attempt-wait-round-resumed").expect("attempt id");
+        foco_agent::AgentAttemptId::new("agent-attempt-wait-round-resumed-retry")
+            .expect("attempt id");
 
     {
         let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
@@ -12884,7 +12900,8 @@ fn startup_reconciliation_ignores_suspended_wait_attempt_after_task_resumes() {
         prompt_test_config(workspace.path().to_path_buf()),
         profile.path().to_path_buf(),
     );
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     assert_eq!(
@@ -12971,7 +12988,8 @@ fn concurrent_startup_scans_keep_live_plan_attempt_for_original_coordinator_comp
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                reconcile_agent_runtime(&state).expect("concurrent startup reconciliation");
+                reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+                    .expect("concurrent startup reconciliation");
             })
         })
         .collect::<Vec<_>>();
@@ -13127,8 +13145,10 @@ fn expired_lease_reconciliation_closes_plan_chat_once_and_rejects_late_completio
         prompt_test_config(workspace.path().to_path_buf()),
         profile.path().to_path_buf(),
     );
-    reconcile_agent_runtime(&state).expect("first expired-lease reconciliation");
-    reconcile_agent_runtime(&state).expect("repeated expired-lease reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("first expired-lease reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("repeated expired-lease reconciliation");
 
     let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     assert_eq!(
@@ -13333,7 +13353,8 @@ fn startup_reconciliation_closes_owned_implementation_chat_before_failing_task()
         prompt_test_config(workspace.path().to_path_buf()),
         profile.path().to_path_buf(),
     );
-    reconcile_agent_runtime(&state).expect("startup reconciliation");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation");
 
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     assert_eq!(
@@ -13665,7 +13686,8 @@ async fn shutdown_hands_running_task_to_startup_reconciliation() {
             foco_agent::AgentTaskStatus::Running
         );
     }
-    reconcile_agent_runtime(&state).expect("startup reconciliation closes the orphaned run");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("startup reconciliation closes the orphaned run");
     let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
     assert_eq!(
         database
@@ -17093,11 +17115,18 @@ fn persist_chat_result_for_plan_phase_defers_derived_effects_until_integration()
                 Some("openai-responses"),
                 Some("gpt-5.4"),
                 None,
+                "test-dispatch-owner",
             )
             .expect("begin attempt");
         attempt_id = attempt.id.clone();
         database
-            .attach_plan_phase_attempt_run(&attempt.id, "chat-1", &team_id, &task_id)
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                "chat-1",
+                &team_id,
+                &task_id,
+                "test-dispatch-owner",
+            )
             .expect("attach attempt");
         context.plan_phase_provenance = Some(PlanPhaseRunProvenance {
             plan_id: attempt.plan_id,
@@ -33848,11 +33877,18 @@ async fn plan_phase_reasoning_loop_recovery_keeps_task_attempt_and_derived_effec
                 Some("provider"),
                 Some("model"),
                 None,
+                "test-dispatch-owner",
             )
             .expect("begin attempt");
         plan_attempt_id = attempt.id.clone();
         database
-            .attach_plan_phase_attempt_run(&attempt.id, &chat_id, &team_id, &task_id)
+            .attach_plan_phase_attempt_run(
+                &attempt.id,
+                &chat_id,
+                &team_id,
+                &task_id,
+                "test-dispatch-owner",
+            )
             .expect("attach attempt");
         database
             .claim_runnable_agent_task(&team_id, &task_id, &attempt_id)
@@ -36224,6 +36260,8 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         agent_scheduler,
         scheduled_task_scheduler,
         plan_auto_run_scheduler,
+        plan_dispatch_owner_incarnation: new_plan_dispatch_owner_incarnation()
+            .expect("test plan dispatch owner"),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -36232,6 +36270,787 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         preview_sessions: crate::runtime::PreviewSessionRegistry::default(),
         openai_resp_ws_sessions: Arc::new(OpenAiRespWsSessionRegistry::default()),
     }
+}
+
+#[test]
+fn plan_auto_run_startup_waits_for_reconciliation_barrier() {
+    let reconciliation_entered = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let allow_reconciliation_to_finish = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let reconciliation_finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let first_phase_attempt_created =
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let entered_for_reconciliation = reconciliation_entered.clone();
+    let release_for_reconciliation = allow_reconciliation_to_finish.clone();
+    let reconciliation_finished_for_start = reconciliation_finished.clone();
+    let reconciliation_finished_for_attempt = reconciliation_finished.clone();
+    let first_attempt_for_start = first_phase_attempt_created.clone();
+    let startup = std::thread::spawn(move || {
+        start_plan_auto_run_after_reconciliation(
+            || {
+                entered_for_reconciliation.wait();
+                release_for_reconciliation.wait();
+                reconciliation_finished_for_start.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                assert!(
+                    reconciliation_finished_for_attempt.load(std::sync::atomic::Ordering::SeqCst),
+                    "auto-run may create its first phase attempt only after reconciliation completes"
+                );
+                first_attempt_for_start.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+    });
+
+    reconciliation_entered.wait();
+    assert!(
+        !first_phase_attempt_created.load(std::sync::atomic::Ordering::SeqCst),
+        "auto-run must not create a phase attempt while reconciliation is blocked"
+    );
+    allow_reconciliation_to_finish.wait();
+    startup
+        .join()
+        .expect("startup thread")
+        .expect("startup barrier");
+    assert!(first_phase_attempt_created.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+/// Deterministic barrier recreates the real 18ms begin→attach race window:
+/// reconciliation runs after begin but before attach. Current owner must survive,
+/// attach must succeed, and the Agent task must remain claimable by the scheduler.
+#[test]
+fn plan_phase_begin_attach_window_survives_concurrent_reconciliation() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-begin-attach-race"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-begin-attach-race-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let current_owner = state.plan_dispatch_owner_incarnation().to_string();
+    let plan_id = "plan-begin-attach-race";
+    let phase_id = "plan-begin-attach-race-phase";
+    let chat_id = "chat-begin-attach-race";
+
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Begin attach race",
+                overview: "Current-owner queued attempt must survive concurrent recovery.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: phase_id,
+                    title: "Phase one",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-begin-attach-race-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+    }
+
+    let begin_done = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let recovery_done = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let recovery_repaired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(usize::MAX));
+
+    let begin_done_for_recovery = begin_done.clone();
+    let recovery_done_for_recovery = recovery_done.clone();
+    let recovery_repaired_for_thread = recovery_repaired.clone();
+    let workspace_path_for_recovery = workspace.path.clone();
+    let current_owner_for_recovery = current_owner.clone();
+    let recovery_thread = std::thread::spawn(move || {
+        begin_done_for_recovery.wait();
+        // App-level reconciliation opens its own DB connection and must not kill the
+        // live current-owner queued attempt sitting in the begin→attach window.
+        let mut state_for_reconcile = test_app_state(
+            prompt_test_config(workspace_path_for_recovery.clone()),
+            env::temp_dir().join(unique_id("foco-plan-begin-attach-race-reconcile-profile")),
+        );
+        state_for_reconcile.plan_dispatch_owner_incarnation = current_owner_for_recovery.clone();
+        reconcile_agent_runtime(
+            &state_for_reconcile,
+            state_for_reconcile.plan_dispatch_owner_incarnation(),
+        )
+        .expect("app reconciliation during begin/attach window");
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_path_for_recovery).expect("recovery db");
+        let repaired = database
+            .fail_running_plan_phases_without_agent_runs(
+                "Plan phase start did not create an implementation chat or Agent task",
+                &current_owner_for_recovery,
+            )
+            .expect("store recovery scan after app reconciliation");
+        recovery_repaired_for_thread.store(repaired, std::sync::atomic::Ordering::SeqCst);
+        drop(database);
+        recovery_done_for_recovery.wait();
+    });
+
+    let attempt = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace.path).expect("dispatch db");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                plan_id,
+                phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+                &current_owner,
+            )
+            .expect("begin current-owner attempt");
+        // Release the write lock before recovery runs so the barrier is not a lock-order stall.
+        drop(database);
+        begin_done.wait();
+        recovery_done.wait();
+        attempt
+    };
+    recovery_thread.join().expect("recovery thread");
+
+    assert_eq!(
+        recovery_repaired.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "current-owner queued attempt must not be recovered during begin/attach window"
+    );
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path).expect("attach db");
+    let still_live = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(still_live.status, "running");
+    assert_eq!(still_live.phases[0].status, "running");
+    assert_eq!(still_live.phases[0].attempts.len(), 1);
+    assert_eq!(still_live.phases[0].attempts[0].status, "queued");
+    assert_eq!(
+        still_live.phases[0].attempts[0]
+            .dispatch_owner_incarnation
+            .as_deref(),
+        Some(current_owner.as_str())
+    );
+    assert!(
+        still_live.phases[0].error_message.is_none(),
+        "must not produce orphan-start → cannot-attach-while-failed chain"
+    );
+    assert!(
+        still_live
+            .error_message
+            .as_deref()
+            .is_none_or(|message| !message.contains("cannot attach while failed")),
+        "plan error must not be secondary attach wrapping: {:?}",
+        still_live.error_message
+    );
+
+    let team_id = foco_agent::AgentTeamId::new("agent-team-begin-attach-race").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-begin-attach-race").expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-begin-attach-race").expect("task id");
+    let agent_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-begin-attach-race").expect("attempt id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-begin-attach-race").expect("definition id"),
+        revision: 1,
+        name: "Begin attach race".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .insert_chat(chat_id, "Begin attach race")
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"message":"Implement phase"}"#,
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(&attempt.id, chat_id, &team_id, &task_id, &current_owner)
+        .expect("attach after concurrent recovery");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(attached.phases[0].attempts.len(), 1);
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+    assert_eq!(
+        attached.phases[0].implementation_chat_id.as_deref(),
+        Some(chat_id)
+    );
+    assert_eq!(
+        attached.phases[0].agent_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+    assert!(attached.phases[0].error_message.is_none());
+
+    let claimed = database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim after attach")
+        .expect("task must be claimable by scheduler");
+    assert_eq!(claimed.status, foco_agent::AgentTaskStatus::Running);
+
+    let final_plan = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(
+        final_plan.phases[0].attempts.len(),
+        1,
+        "no duplicate attempt"
+    );
+    let tasks = database.agent_tasks_for_team(&team_id).expect("list tasks");
+    assert_eq!(tasks.len(), 1, "no orphan tasks");
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+/// Same fixture as the concurrent current-owner race, but the leftover attempt is owned by a
+/// previous runtime. Reconciliation must fail it; explicit Retry under the new owner succeeds.
+#[test]
+fn plan_phase_old_owner_is_recovered_then_retry_runs_under_current_owner() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-old-owner-retry"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-old-owner-retry-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let current_owner = state.plan_dispatch_owner_incarnation().to_string();
+    let old_owner = "previous-runtime-incarnation";
+    let plan_id = "plan-old-owner-retry";
+    let phase_id = "plan-old-owner-retry-phase";
+    let chat_id = "chat-old-owner-retry";
+
+    let first_attempt_id = {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Old owner retry",
+                overview: "Leftover old-owner dispatch must fail, then Retry under current owner.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: phase_id,
+                    title: "Phase one",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-old-owner-retry-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                plan_id,
+                phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+                old_owner,
+            )
+            .expect("begin old-owner attempt");
+        attempt.id
+    };
+
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("recover old owner");
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path).expect("after recovery");
+    let failed = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(failed.status, "failed");
+    assert_eq!(failed.phases[0].status, "failed");
+    assert_eq!(failed.phases[0].attempts.len(), 1);
+    assert_eq!(failed.phases[0].attempts[0].id, first_attempt_id);
+    assert_eq!(failed.phases[0].attempts[0].status, "failed");
+    assert_eq!(
+        failed.phases[0].attempts[0].error_message.as_deref(),
+        Some("Plan phase start did not create an implementation chat or Agent task")
+    );
+    assert!(
+        failed.phases[0]
+            .error_message
+            .as_deref()
+            .is_none_or(|message| !message.contains("cannot attach while failed")),
+        "must keep the original orphan-start reason, not a secondary attach wrap"
+    );
+
+    // Explicit Retry under the current runtime owner.
+    let retry = database
+        .begin_plan_phase_attempt(
+            plan_id,
+            phase_id,
+            PlanPhaseAttemptTrigger::Retry,
+            Some("provider"),
+            Some("model"),
+            None,
+            &current_owner,
+        )
+        .expect("begin retry under current owner");
+    assert_eq!(retry.status, "queued");
+    assert_eq!(
+        retry.dispatch_owner_incarnation.as_deref(),
+        Some(current_owner.as_str())
+    );
+    assert_ne!(retry.id, first_attempt_id);
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            &current_owner,
+        )
+        .expect("recovery must spare current-owner retry");
+    assert_eq!(repaired, 0);
+
+    let team_id = foco_agent::AgentTeamId::new("agent-team-old-owner-retry").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-old-owner-retry").expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-old-owner-retry").expect("task id");
+    let agent_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-old-owner-retry").expect("attempt id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-old-owner-retry").expect("definition id"),
+        revision: 1,
+        name: "Old owner retry".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .insert_chat(chat_id, "Old owner retry")
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"message":"Retry phase"}"#,
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(&retry.id, chat_id, &team_id, &task_id, &current_owner)
+        .expect("attach retry");
+    assert_eq!(attached.status, "running");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(attached.phases[0].attempts.len(), 2);
+    assert_eq!(attached.phases[0].attempts[1].status, "running");
+    assert!(attached.phases[0].error_message.is_none());
+
+    let claimed = database
+        .claim_runnable_agent_task(&team_id, &task_id, &agent_attempt_id)
+        .expect("claim retry task")
+        .expect("retry task claimable");
+    assert_eq!(claimed.status, foco_agent::AgentTaskStatus::Running);
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+/// Ready Plan Phase 1 under auto-run: recovery during the live owner window must not mark the
+/// plan invalid or wrap attach with a secondary failure. Exactly one attempt/chat/team/task.
+#[test]
+fn plan_auto_run_ready_phase_survives_recovery_with_single_implementation_identity() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-auto-run-ready-race"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-auto-run-ready-race-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let current_owner = state.plan_dispatch_owner_incarnation().to_string();
+    let plan_id = "plan-auto-run-ready-race";
+    let phase_id = "plan-auto-run-ready-race-phase";
+    let chat_id = "chat-auto-run-ready-race";
+
+    let attempt_id = {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+        database
+            .create_plan(NewPlan {
+                id: plan_id,
+                title: "Auto-run ready race",
+                overview: "Ready plan Phase 1 must keep a single implementation identity.",
+                status: "ready",
+                source_chat_id: None,
+                phases: vec![NewPlanPhase {
+                    id: phase_id,
+                    title: "Phase one",
+                    summary: "Implement.",
+                    steps: vec![NewPlanStep {
+                        id: "plan-auto-run-ready-race-step",
+                        title: "Work",
+                        detail: "Do it.",
+                        acceptance: vec!["done".to_string()],
+                    }],
+                }],
+            })
+            .expect("create plan");
+        database
+            .set_plan_auto_run_enabled(true)
+            .expect("enable auto-run");
+        // Auto-run would call start → begin. Seed the same durable state.
+        database
+            .transition_plan(plan_id, "start")
+            .expect("start plan");
+        let attempt = database
+            .begin_plan_phase_attempt(
+                plan_id,
+                phase_id,
+                PlanPhaseAttemptTrigger::Initial,
+                Some("provider"),
+                Some("model"),
+                None,
+                &current_owner,
+            )
+            .expect("begin auto-run attempt");
+        attempt.id
+    };
+
+    // Startup-style recovery while auto-run is mid-dispatch.
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("recovery during auto-run dispatch");
+
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path).expect("after recovery");
+    let auto_run = database.plan_auto_run_state().expect("auto-run state");
+    assert!(auto_run.desired_enabled);
+    assert!(
+        auto_run.blocked_reason.is_none(),
+        "auto-run must not block on a live current-owner dispatch: {:?}",
+        auto_run.blocked_reason
+    );
+
+    let plan = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(plan.status, "running");
+    assert_eq!(plan.phases[0].status, "running");
+    assert_eq!(plan.phases[0].attempts.len(), 1);
+    assert_eq!(plan.phases[0].attempts[0].id, attempt_id);
+    assert_eq!(plan.phases[0].attempts[0].status, "queued");
+    assert!(
+        plan.error_message
+            .as_deref()
+            .is_none_or(|message| !message.contains("Plan auto-run skipped invalid item")),
+        "must not mark ready plan invalid: {:?}",
+        plan.error_message
+    );
+    assert!(
+        plan.phases[0]
+            .error_message
+            .as_deref()
+            .is_none_or(|message| !message.contains("cannot attach while failed")),
+        "must not wrap with cannot attach while failed: {:?}",
+        plan.phases[0].error_message
+    );
+
+    let team_id = foco_agent::AgentTeamId::new("agent-team-auto-run-ready-race").expect("team id");
+    let instance_id = foco_agent::AgentInstanceId::new("agent-instance-auto-run-ready-race")
+        .expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-auto-run-ready-race").expect("task id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-auto-run-ready-race").expect("definition id"),
+        revision: 1,
+        name: "Auto-run ready race".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .insert_chat(chat_id, "Auto-run ready race")
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"message":"Auto-run phase"}"#,
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(&attempt_id, chat_id, &team_id, &task_id, &current_owner)
+        .expect("attach auto-run attempt");
+    assert_eq!(attached.phases[0].attempts.len(), 1);
+    assert_eq!(
+        attached.phases[0].implementation_chat_id.as_deref(),
+        Some(chat_id)
+    );
+    assert_eq!(
+        attached.phases[0].agent_team_id.as_deref(),
+        Some(team_id.as_str())
+    );
+    assert_eq!(
+        attached.phases[0].agent_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+
+    // Second begin must not create a duplicate live attempt while one is running.
+    let duplicate = database.begin_plan_phase_attempt(
+        plan_id,
+        phase_id,
+        PlanPhaseAttemptTrigger::Initial,
+        Some("provider"),
+        Some("model"),
+        None,
+        &current_owner,
+    );
+    assert!(
+        duplicate.is_err(),
+        "must not create a second implementation attempt while one is attached"
+    );
+    let final_plan = database.plan(plan_id).expect("plan").expect("plan");
+    assert_eq!(final_plan.phases[0].attempts.len(), 1);
+    let tasks = database.agent_tasks_for_team(&team_id).expect("list tasks");
+    assert_eq!(tasks.len(), 1);
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+/// Continuous Plan timeline: previous plan just completed, auto-run immediately schedules the
+/// next ready plan. Phase 1 of the next plan enters running under the current owner.
+#[test]
+fn plan_auto_run_schedules_next_plan_after_previous_completes() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-plan-auto-run-continuous"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-plan-auto-run-continuous-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let current_owner = state.plan_dispatch_owner_incarnation().to_string();
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace.path).expect("workspace database");
+    database
+        .create_plan(NewPlan {
+            id: "plan-continuous-previous",
+            title: "Previous plan",
+            overview: "Just completed.",
+            status: "completed",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-continuous-previous-phase",
+                title: "Done phase",
+                summary: "Finished.",
+                steps: vec![NewPlanStep {
+                    id: "plan-continuous-previous-step",
+                    title: "Done",
+                    detail: "Done.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create previous plan");
+    database
+        .create_plan(NewPlan {
+            id: "plan-continuous-next",
+            title: "Next plan",
+            overview: "Must start immediately after previous completion.",
+            status: "ready",
+            source_chat_id: None,
+            phases: vec![NewPlanPhase {
+                id: "plan-continuous-next-phase",
+                title: "Phase one",
+                summary: "Implement.",
+                steps: vec![NewPlanStep {
+                    id: "plan-continuous-next-step",
+                    title: "Work",
+                    detail: "Do it.",
+                    acceptance: vec!["done".to_string()],
+                }],
+            }],
+        })
+        .expect("create next plan");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable auto-run");
+
+    let candidate = database
+        .next_plan_auto_run_candidate()
+        .expect("next candidate");
+    match candidate {
+        foco_store::workspace::PlanAutoRunSelection::Candidate(candidate) => {
+            assert_eq!(candidate.plan_id, "plan-continuous-next");
+            assert_eq!(candidate.action, "start");
+        }
+        other => panic!("expected next ready plan candidate, got {other:?}"),
+    }
+
+    // Simulate the immediate auto-run dispatch of the next plan's Phase 1.
+    database
+        .transition_plan("plan-continuous-next", "start")
+        .expect("start next plan");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "plan-continuous-next",
+            "plan-continuous-next-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            Some("provider"),
+            Some("model"),
+            None,
+            &current_owner,
+        )
+        .expect("begin next plan phase");
+    reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation())
+        .expect("recovery must not kill the just-scheduled next plan");
+
+    let chat_id = "chat-continuous-next";
+    let team_id = foco_agent::AgentTeamId::new("agent-team-continuous-next").expect("team id");
+    let instance_id =
+        foco_agent::AgentInstanceId::new("agent-instance-continuous-next").expect("instance id");
+    let task_id = foco_agent::AgentTaskId::new("agent-task-continuous-next").expect("task id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-continuous-next").expect("definition id"),
+        revision: 1,
+        name: "Continuous next".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 1,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    database
+        .insert_chat(chat_id, "Continuous next")
+        .expect("chat insert");
+    database
+        .create_agent_team(foco_store::workspace::NewAgentTeam {
+            id: &team_id,
+            chat_id,
+            coordinator_instance_id: &instance_id,
+            coordinator_definition: &definition,
+            coordinator_execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+            coordinator_execution_root_path: None,
+            coordinator_worktree_base_revision: None,
+            coordinator_worktree_branch: None,
+            coordinator_worktree_status: None,
+            max_concurrent_runs: 1,
+        })
+        .expect("team create");
+    database
+        .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: r#"{"message":"Next plan phase"}"#,
+        })
+        .expect("enqueue task");
+    let attached = database
+        .attach_plan_phase_attempt_run(&attempt.id, chat_id, &team_id, &task_id, &current_owner)
+        .expect("attach next plan phase");
+    assert_eq!(attached.status, "running");
+    assert_eq!(attached.phases[0].status, "running");
+    assert_eq!(attached.phases[0].attempts[0].status, "running");
+    assert!(attached.error_message.is_none());
+
+    // While next plan is in flight, auto-run must report busy/running rather than re-dispatch.
+    assert!(
+        database
+            .plan_auto_run_has_in_flight()
+            .expect("in flight after next plan starts")
+    );
+    match database
+        .next_plan_auto_run_candidate()
+        .expect("candidate while running")
+    {
+        foco_store::workspace::PlanAutoRunSelection::Running { plan_id, .. } => {
+            assert_eq!(plan_id, "plan-continuous-next");
+        }
+        other => panic!("expected running next plan, got {other:?}"),
+    }
+
+    drop(database);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
 }
 
 async fn serve_skill_store_detail_fixture() -> (String, tokio::task::JoinHandle<()>) {

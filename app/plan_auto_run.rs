@@ -194,8 +194,24 @@ async fn dispatch_next_plan_auto_run(
     .await
     {
         Ok(_) => Ok(PlanAutoRunDispatch::Dispatched),
-        Err(error) if error.message.starts_with("invalid plan:") => {
+        Err(error) if error.status() == StatusCode::BAD_REQUEST => {
             let mut database = open_workspace_database(&workspace.path)?;
+            let still_selected = matches!(
+                database
+                    .next_plan_auto_run_candidate()
+                    .map_err(ApiError::from_workspace_error)?,
+                PlanAutoRunSelection::Candidate(ref current)
+                    if current.plan_id == candidate.plan_id && current.action == candidate.action
+            );
+            if !still_selected {
+                tracing::info!(
+                    workspace_id = %workspace.id,
+                    plan_id = %candidate.plan_id,
+                    status = %error.status(),
+                    "Plan auto-run observed a durable state transition while dispatching"
+                );
+                return Ok(PlanAutoRunDispatch::Blocked);
+            }
             let error_message = format!("Plan auto-run skipped invalid item: {}", error.message);
             match database.mark_plan_invalid(&candidate.plan_id, &error_message) {
                 Ok(_) => {
@@ -203,7 +219,7 @@ async fn dispatch_next_plan_auto_run(
                         workspace_id = %workspace.id,
                         plan_id = %candidate.plan_id,
                         error = %error.message,
-                        "Plan auto-run reconciled invalid candidate as failed"
+                        "Plan auto-run reconciled structurally invalid candidate as failed"
                     );
                     Ok(PlanAutoRunDispatch::Blocked)
                 }
@@ -225,6 +241,15 @@ async fn dispatch_next_plan_auto_run(
                     Err(error)
                 }
             }
+        }
+        Err(error) if error.status() == StatusCode::CONFLICT => {
+            tracing::info!(
+                workspace_id = %workspace.id,
+                plan_id = %candidate.plan_id,
+                status = %error.status(),
+                "Plan auto-run observed a concurrent Plan phase transition"
+            );
+            Ok(PlanAutoRunDispatch::Blocked)
         }
         Err(error) => {
             let mut database = open_workspace_database(&workspace.path)?;

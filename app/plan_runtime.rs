@@ -131,7 +131,7 @@ pub(crate) async fn transition_plan_action(
     match dispatch_plan_phase(state, &workspace.id, dispatch_plan, None).await {
         Ok(plan) => Ok(plan),
         Err(error) => {
-            fail_plan_phase_dispatch_error(&workspace, &plan, &error)?;
+            fail_plan_phase_dispatch_error(state, &workspace, &plan, &error)?;
             Err(error)
         }
     }
@@ -240,6 +240,7 @@ pub(crate) async fn retry_plan_phase(
                 Some(selection.provider_id.as_str()),
                 Some(selection.model_id.as_str()),
                 selection.thinking_level.as_deref(),
+                state.plan_dispatch_owner_incarnation(),
             )
             .map_err(ApiError::from_workspace_error)?;
         database
@@ -272,7 +273,7 @@ pub(crate) async fn retry_plan_phase(
             Ok(plan)
         }
         Err(error) => {
-            fail_plan_phase_dispatch_error(&workspace, &plan, &error)?;
+            fail_plan_phase_dispatch_error(state, &workspace, &plan, &error)?;
             Err(error)
         }
     }
@@ -773,6 +774,7 @@ async fn continue_plan_if_ready(
 }
 
 fn fail_plan_phase_dispatch_error(
+    state: &AppState,
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
     error: &ApiError,
@@ -781,10 +783,80 @@ fn fail_plan_phase_dispatch_error(
         return Ok(());
     };
     let mut database = open_workspace_database(&workspace.path)?;
+    let Some(current_plan) = database
+        .plan(&plan.id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    let Some(current_phase) = current_plan
+        .phases
+        .iter()
+        .find(|phase| phase.id == phase_id)
+    else {
+        return Ok(());
+    };
+    if current_phase.status != "running" || current_phase.agent_task_id.is_some() {
+        let attempt = current_phase.attempts.last();
+        tracing::info!(
+            plan_id = %plan.id,
+            phase_id,
+            attempt_id = ?attempt.map(|attempt| &attempt.id),
+            current_owner = %state.plan_dispatch_owner_incarnation(),
+            stored_owner = ?attempt.and_then(|attempt| attempt.dispatch_owner_incarnation.as_deref()),
+            attempt_status = ?attempt.map(|attempt| &attempt.status),
+            transition = "preserve_existing_terminal_or_attached_state",
+            error = %error.message,
+            "Plan phase dispatch failure did not overwrite a durable state transition"
+        );
+        return Ok(());
+    }
     database
         .fail_plan_phase_start(&plan.id, phase_id, &error.message)
         .map_err(ApiError::from_workspace_error)?;
     Ok(())
+}
+
+fn cancel_unattached_plan_phase_task(
+    workspace: &WorkspaceConfig,
+    team_id: &AgentTeamId,
+    task_id: &AgentTaskId,
+    dispatch_error: &ApiError,
+) {
+    let result = (|| -> Result<bool, ApiError> {
+        let mut database = open_workspace_database(&workspace.path)?;
+        let error_json = serde_json::json!({
+            "message": dispatch_error.message,
+            "code": "plan_phase_attach_failed",
+        })
+        .to_string();
+        database
+            .cancel_queued_agent_task(team_id, task_id, &error_json)
+            .map_err(ApiError::from_workspace_error)
+    })();
+    match result {
+        Ok(true) => tracing::info!(
+            workspace_id = %workspace.id,
+            team_id = %team_id,
+            task_id = %task_id,
+            transition = "cancel_unattached_queued_task",
+            "cancelled Plan Coordinator task after attempt attach failure"
+        ),
+        Ok(false) => tracing::warn!(
+            workspace_id = %workspace.id,
+            team_id = %team_id,
+            task_id = %task_id,
+            transition = "unattached_task_not_queued",
+            "Plan Coordinator task was no longer queued during attach failure cleanup"
+        ),
+        Err(error) => tracing::error!(
+            workspace_id = %workspace.id,
+            team_id = %team_id,
+            task_id = %task_id,
+            error = %error.message,
+            "failed to cancel unattached Plan Coordinator task"
+        ),
+    }
 }
 
 async fn dispatch_plan_phase(
@@ -844,6 +916,7 @@ async fn dispatch_plan_phase(
                     Some(selection.provider_id.as_str()),
                     Some(selection.model_id.as_str()),
                     selection.thinking_level.as_deref(),
+                    state.plan_dispatch_owner_incarnation(),
                 )
                 .map_err(ApiError::from_workspace_error)?;
             (Some(attempt.id), selection)
@@ -895,14 +968,28 @@ async fn dispatch_plan_phase(
         .as_ref()
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
     let mut database = open_workspace_database(&workspace.path)?;
-    let plan = if let Some(attempt_id) = attempt_id.as_deref() {
+    let attached = if let Some(attempt_id) = attempt_id.as_deref() {
         database
-            .attach_plan_phase_attempt_run(attempt_id, &queued.chat_id, team_id, task_id)
-            .map_err(ApiError::from_workspace_error)?
+            .attach_plan_phase_attempt_run(
+                attempt_id,
+                &queued.chat_id,
+                team_id,
+                task_id,
+                state.plan_dispatch_owner_incarnation(),
+            )
+            .map_err(ApiError::from_workspace_error)
     } else {
         database
             .attach_plan_phase_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
-            .map_err(ApiError::from_workspace_error)?
+            .map_err(ApiError::from_workspace_error)
+    };
+    let plan = match attached {
+        Ok(plan) => plan,
+        Err(error) => {
+            drop(database);
+            cancel_unattached_plan_phase_task(workspace, team_id, task_id, &error);
+            return Err(error);
+        }
     };
     state.agent_scheduler.wake()?;
     Ok(plan)
@@ -2069,6 +2156,7 @@ mod tests {
             completed_at: Some("2026-01-01T00:01:00Z".to_string()),
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:01:00Z".to_string(),
+            dispatch_owner_incarnation: None,
         }
     }
 

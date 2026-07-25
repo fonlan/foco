@@ -96,13 +96,13 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    MIGRATION_045, MIGRATION_046, Migration,
+    MIGRATION_045, MIGRATION_046, MIGRATION_047, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 46;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 47;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -462,6 +462,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 46,
         sql: MIGRATION_046,
+    },
+    Migration {
+        version: 47,
+        sql: MIGRATION_047,
     },
 ];
 
@@ -3014,62 +3018,134 @@ impl WorkspaceDatabase {
         provider_id: Option<&str>,
         model_id: Option<&str>,
         thinking_level: Option<&str>,
+        dispatch_owner_incarnation: &str,
     ) -> Result<PlanPhaseAttemptRecord, WorkspaceDatabaseError> {
-        let plan = self
-            .plan(plan_id)?
+        let dispatch_owner_incarnation =
+            normalize_required_dispatch_owner(dispatch_owner_incarnation)?;
+        let plan_id = plan_id.trim();
+        let phase_id = phase_id.trim();
+        let provider_id = normalized_optional_text(provider_id);
+        let model_id = normalized_optional_text(model_id);
+        let thinking_level = normalized_optional_text(thinking_level);
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        // Validate plan/phase/active-attempt state, allocate sequence, cancel
+        // leftover merge attempts, and write the queued attempt in one Immediate
+        // transaction so concurrent begin/cancel/recovery cannot observe a
+        // half-applied transition or race on UNIQUE(phase_id, sequence).
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let plan_status: String = transaction
+            .query_row(
+                "SELECT status FROM plans WHERE id = ?1",
+                params![plan_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan was not found: {}", plan_id.trim()),
+                message: format!("plan was not found: {plan_id}"),
             })?;
-        if matches!(plan.status.as_str(), "completed" | "cancelled") {
+        if matches!(plan_status.as_str(), "completed" | "cancelled") {
             return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan '{}' cannot retry while {}", plan.id, plan.status),
+                message: format!("plan '{plan_id}' cannot retry while {plan_status}"),
             });
         }
-        let phase = plan
-            .phases
-            .iter()
-            .find(|phase| phase.id == phase_id.trim())
-            .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+
+        let (phase_status, phase_sequence, phase_agent_task_id): (String, i64, Option<String>) =
+            transaction
+                .query_row(
+                    "SELECT status, sequence, agent_task_id
+                     FROM plan_phases
+                     WHERE plan_id = ?1 AND id = ?2",
+                    params![plan_id, phase_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()
+                .map_err(|source| sqlite_error(&database_path, source))?
+                .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan phase '{phase_id}' does not belong to plan '{plan_id}'"),
+                })?;
+
+        let incomplete_predecessor: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT id, status
+                 FROM plan_phases
+                 WHERE plan_id = ?1
+                   AND sequence < ?2
+                   AND status != 'completed'
+                 ORDER BY sequence ASC
+                 LIMIT 1",
+                params![plan_id, phase_sequence],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if let Some((predecessor_id, predecessor_status)) = incomplete_predecessor {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
                 message: format!(
-                    "plan phase '{}' does not belong to plan '{}'",
-                    phase_id.trim(),
-                    plan.id
+                    "plan phase '{phase_id}' cannot start while earlier phase '{predecessor_id}' is {predecessor_status}"
                 ),
-            })?;
-        self.ensure_plan_phase_predecessors_completed(&plan, phase)?;
+            });
+        }
+
         // Implementation attempts only care about non-merge active attempts.
         // Stale merge_auto/merge_retry rows must not block phase retry/restart.
-        if (!matches!(phase.status.as_str(), "failed" | "cancelled")
-            && phase.agent_task_id.is_some())
-            || self.phase_has_active_implementation_attempt(&phase.id)?
+        let active_implementation_attempts: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1
+                   AND status IN ('queued', 'running')
+                   AND trigger NOT IN ('merge_auto', 'merge_retry')",
+                params![phase_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if (!matches!(phase_status.as_str(), "failed" | "cancelled")
+            && phase_agent_task_id
+                .as_ref()
+                .is_some_and(|task_id| !task_id.trim().is_empty()))
+            || active_implementation_attempts > 0
         {
             return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan phase '{}' already has an active attempt", phase.id),
+                message: format!("plan phase '{phase_id}' already has an active attempt"),
             });
         }
+
         if matches!(
             trigger,
             PlanPhaseAttemptTrigger::Retry | PlanPhaseAttemptTrigger::ModelOverrideRetry
-        ) && !matches!(phase.status.as_str(), "failed" | "cancelled")
-            && !(phase.status == "running"
-                && phase.attempts.iter().any(|attempt| {
-                    !Self::is_merge_attempt_trigger(&attempt.trigger)
-                        && matches!(
-                            attempt.status.as_str(),
-                            "failed" | "cancelled" | "interrupted"
+        ) {
+            let retryable = matches!(phase_status.as_str(), "failed" | "cancelled")
+                || (phase_status == "running" && {
+                    let terminal_implementation_attempts: i64 = transaction
+                        .query_row(
+                            "SELECT COUNT(*)
+                             FROM plan_phase_attempts
+                             WHERE phase_id = ?1
+                               AND trigger NOT IN ('merge_auto', 'merge_retry')
+                               AND status IN ('failed', 'cancelled', 'interrupted')",
+                            params![phase_id],
+                            |row| row.get(0),
                         )
-                }))
-        {
-            return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan phase '{}' is not retryable", phase.id),
-            });
+                        .map_err(|source| sqlite_error(&database_path, source))?;
+                    terminal_implementation_attempts > 0
+                });
+            if !retryable {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: format!("plan phase '{phase_id}' is not retryable"),
+                });
+            }
         }
 
         // Restarting a failed/cancelled phase cancels any leftover merge attempts
         // so they cannot keep the plan in merge-in-flight after re-implementation.
-        if matches!(phase.status.as_str(), "failed" | "cancelled") {
-            let now = now_timestamp();
-            self.connection
+        if matches!(phase_status.as_str(), "failed" | "cancelled") {
+            transaction
                 .execute(
                     "UPDATE plan_phase_attempts
                      SET status = 'cancelled',
@@ -3080,39 +3156,46 @@ impl WorkspaceDatabase {
                        AND phase_id = ?2
                        AND trigger IN ('merge_auto', 'merge_retry')
                        AND status IN ('queued', 'running')",
-                    params![plan.id.as_str(), phase.id.as_str(), now],
+                    params![plan_id, phase_id, now],
                 )
-                .map_err(|source| self.sqlite_error(source))?;
+                .map_err(|source| sqlite_error(&database_path, source))?;
         }
 
-        let sequence = self.next_plan_phase_attempt_sequence(&phase.id)?;
-        let attempt_id = format!("plan-phase-attempt-{}-{sequence}", phase.id.trim());
-        let now = now_timestamp();
-        let provider_id = normalized_optional_text(provider_id);
-        let model_id = normalized_optional_text(model_id);
-        let thinking_level = normalized_optional_text(thinking_level);
-        self.connection
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0)
+                 FROM plan_phase_attempts
+                 WHERE phase_id = ?1",
+                params![phase_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let attempt_id = format!("plan-phase-attempt-{phase_id}-{sequence}");
+
+        transaction
             .execute(
                 "INSERT INTO plan_phase_attempts (
                     id, plan_id, phase_id, sequence, trigger, status,
-                    provider_id, model_id, thinking_level, created_at, updated_at
+                    provider_id, model_id, thinking_level,
+                    dispatch_owner_incarnation, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?9)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?10)",
                 params![
                     attempt_id.as_str(),
-                    plan.id.as_str(),
-                    phase.id.as_str(),
+                    plan_id,
+                    phase_id,
                     sequence,
                     trigger.as_str(),
                     provider_id,
                     model_id,
                     thinking_level,
+                    dispatch_owner_incarnation,
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
-        self.connection
+        transaction
             .execute(
                 "UPDATE plan_steps
                  SET status = 'pending',
@@ -3124,10 +3207,10 @@ impl WorkspaceDatabase {
                        SELECT 1 FROM plan_phases
                        WHERE plan_id = ?1 AND id = ?2 AND status IN ('failed', 'cancelled')
                    )",
-                params![plan.id.as_str(), phase.id.as_str(), now],
+                params![plan_id, phase_id, now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let phase_updated = transaction
             .execute(
                 "UPDATE plan_phases
                  SET status = 'running',
@@ -3140,11 +3223,18 @@ impl WorkspaceDatabase {
                      started_at = CASE WHEN status IN ('failed', 'cancelled') THEN ?3 ELSE COALESCE(started_at, ?3) END,
                      completed_at = NULL,
                      updated_at = ?3
-                 WHERE plan_id = ?1 AND id = ?2",
-                params![plan.id.as_str(), phase.id.as_str(), now],
+                 WHERE plan_id = ?1
+                   AND id = ?2
+                   AND status IN ('pending', 'running', 'failed', 'cancelled')",
+                params![plan_id, phase_id, now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if phase_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan phase '{phase_id}' could not transition for attempt begin"),
+            });
+        }
+        let plan_updated = transaction
             .execute(
                 "UPDATE plans
                  SET status = 'running',
@@ -3154,10 +3244,19 @@ impl WorkspaceDatabase {
                      completed_by_user_at = NULL,
                      error_message = NULL,
                      updated_at = ?3
-                 WHERE id = ?1",
-                params![plan.id.as_str(), phase.id.as_str(), now],
+                 WHERE id = ?1
+                   AND status NOT IN ('completed', 'cancelled')",
+                params![plan_id, phase_id, now],
             )
-            .map_err(|source| self.sqlite_error(source))?;
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if plan_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!("plan '{plan_id}' could not transition for attempt begin"),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
 
         self.clear_plan_auto_run_block()?;
         self.plan_phase_attempt(&attempt_id)?
@@ -3172,22 +3271,53 @@ impl WorkspaceDatabase {
         implementation_chat_id: &str,
         agent_team_id: &AgentTeamId,
         agent_task_id: &AgentTaskId,
+        dispatch_owner_incarnation: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
+        let dispatch_owner_incarnation =
+            normalize_required_dispatch_owner(dispatch_owner_incarnation)?;
         let attempt = self.plan_phase_attempt(attempt_id)?.ok_or_else(|| {
             WorkspaceDatabaseError::InvalidPlan {
                 message: format!("plan phase attempt was not found: {}", attempt_id.trim()),
             }
         })?;
         if !matches!(attempt.status.as_str(), "queued" | "running") {
-            return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!(
-                    "plan phase attempt '{}' cannot attach while {}",
-                    attempt.id, attempt.status
-                ),
+            return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                attempt_id: attempt.id,
+                reason: PlanPhaseAttemptConflictReason::Terminal,
             });
         }
+        if attempt.implementation_chat_id.is_some()
+            || attempt.agent_team_id.is_some()
+            || attempt.agent_task_id.is_some()
+        {
+            return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                attempt_id: attempt.id,
+                reason: PlanPhaseAttemptConflictReason::AlreadyAttached,
+            });
+        }
+        match attempt.dispatch_owner_incarnation.as_deref() {
+            Some(owner) if owner == dispatch_owner_incarnation => {}
+            Some(_) => {
+                return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                    attempt_id: attempt.id,
+                    reason: PlanPhaseAttemptConflictReason::OwnerMismatch,
+                });
+            }
+            None => {
+                return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                    attempt_id: attempt.id,
+                    reason: PlanPhaseAttemptConflictReason::MissingOwner,
+                });
+            }
+        }
+
         let now = now_timestamp();
-        self.connection
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let attempt_updated = transaction
             .execute(
                 "UPDATE plan_phase_attempts
                  SET status = 'running',
@@ -3196,42 +3326,29 @@ impl WorkspaceDatabase {
                      agent_task_id = ?4,
                      started_at = COALESCE(started_at, ?5),
                      updated_at = ?5
-                 WHERE id = ?1",
+                 WHERE id = ?1
+                   AND status IN ('queued', 'running')
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL
+                   AND dispatch_owner_incarnation = ?6",
                 params![
                     attempt.id.as_str(),
                     implementation_chat_id.trim(),
                     agent_team_id.as_str(),
                     agent_task_id.as_str(),
-                    now
+                    now,
+                    dispatch_owner_incarnation
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.attach_plan_phase_run_fields(
-            &attempt.plan_id,
-            &attempt.phase_id,
-            implementation_chat_id,
-            agent_team_id,
-            agent_task_id,
-        )
-    }
-
-    pub fn plan_phase_attempts_for_phase(
-        &self,
-        phase_id: &str,
-    ) -> Result<Vec<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
-        self.plan_phase_attempts_for_phase_inner(phase_id)
-    }
-
-    fn attach_plan_phase_run_fields(
-        &mut self,
-        plan_id: &str,
-        phase_id: &str,
-        implementation_chat_id: &str,
-        agent_team_id: &AgentTeamId,
-        agent_task_id: &AgentTaskId,
-    ) -> Result<PlanRecord, WorkspaceDatabaseError> {
-        let now = now_timestamp();
-        self.connection
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if attempt_updated != 1 {
+            return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                attempt_id: attempt.id,
+                reason: PlanPhaseAttemptConflictReason::ConcurrentStateChange,
+            });
+        }
+        let phase_updated = transaction
             .execute(
                 "UPDATE plan_phases
                  SET implementation_chat_id = ?3,
@@ -3239,36 +3356,41 @@ impl WorkspaceDatabase {
                      agent_task_id = ?5,
                      error_message = NULL,
                      updated_at = ?6
-                 WHERE plan_id = ?1 AND id = ?2",
+                 WHERE plan_id = ?1
+                   AND id = ?2
+                   AND status = 'running'",
                 params![
-                    plan_id.trim(),
-                    phase_id.trim(),
+                    attempt.plan_id.as_str(),
+                    attempt.phase_id.as_str(),
                     implementation_chat_id.trim(),
                     agent_team_id.as_str(),
                     agent_task_id.as_str(),
                     now
                 ],
             )
-            .map_err(|source| self.sqlite_error(source))?;
-        self.plan(plan_id)?
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if phase_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan phase '{}' cannot attach attempt '{}' while not running",
+                    attempt.phase_id, attempt.id
+                ),
+            });
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        self.plan(&attempt.plan_id)?
             .ok_or_else(|| WorkspaceDatabaseError::InvalidPlan {
-                message: format!("plan was not found after phase attach: {}", plan_id.trim()),
+                message: format!("plan was not found after phase attach: {}", attempt.plan_id),
             })
     }
 
-    fn next_plan_phase_attempt_sequence(
+    pub fn plan_phase_attempts_for_phase(
         &self,
         phase_id: &str,
-    ) -> Result<i64, WorkspaceDatabaseError> {
-        self.connection
-            .query_row(
-                "SELECT COALESCE(MAX(sequence) + 1, 0)
-                 FROM plan_phase_attempts
-                 WHERE phase_id = ?1",
-                params![phase_id.trim()],
-                |row| row.get(0),
-            )
-            .map_err(|source| self.sqlite_error(source))
+    ) -> Result<Vec<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
+        self.plan_phase_attempts_for_phase_inner(phase_id)
     }
 
     #[allow(dead_code)] // retained for diagnostics / future callers that need any active attempt
@@ -3446,7 +3568,7 @@ impl WorkspaceDatabase {
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
                         commit_id, error_message, started_at, completed_at,
-                        created_at, updated_at
+                        created_at, updated_at, dispatch_owner_incarnation
                  FROM plan_phase_attempts
                  WHERE id = ?1",
                 params![attempt_id.trim()],
@@ -3467,7 +3589,7 @@ impl WorkspaceDatabase {
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
                         commit_id, error_message, started_at, completed_at,
-                        created_at, updated_at
+                        created_at, updated_at, dispatch_owner_incarnation
                  FROM plan_phase_attempts
                  WHERE phase_id = ?1
                  ORDER BY sequence ASC",
@@ -4149,7 +4271,8 @@ impl WorkspaceDatabase {
                 "SELECT id, plan_id, phase_id, sequence, trigger, status,
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
-                        commit_id, error_message, started_at, completed_at, created_at, updated_at
+                        commit_id, error_message, started_at, completed_at,
+                        created_at, updated_at, dispatch_owner_incarnation
                  FROM plan_phase_attempts
                  WHERE agent_task_id = ?1
                  ORDER BY sequence DESC
@@ -4163,24 +4286,6 @@ impl WorkspaceDatabase {
 
     fn is_merge_attempt_trigger(trigger: &str) -> bool {
         matches!(trigger, "merge_auto" | "merge_retry")
-    }
-
-    fn ensure_plan_phase_predecessors_completed(
-        &self,
-        plan: &PlanRecord,
-        phase: &PlanPhaseRecord,
-    ) -> Result<(), WorkspaceDatabaseError> {
-        if let Some(predecessor) = plan.phases.iter().find(|candidate| {
-            candidate.sequence < phase.sequence && candidate.status != "completed"
-        }) {
-            return Err(WorkspaceDatabaseError::InvalidPlan {
-                message: format!(
-                    "plan phase '{}' cannot start while earlier phase '{}' is {}",
-                    phase.id, predecessor.id, predecessor.status
-                ),
-            });
-        }
-        Ok(())
     }
 
     fn plan_phase_for_plan(
@@ -4611,7 +4716,16 @@ impl WorkspaceDatabase {
     pub fn fail_running_plan_phases_without_agent_runs(
         &mut self,
         error_message: &str,
+        current_dispatch_owner_incarnation: &str,
     ) -> Result<usize, WorkspaceDatabaseError> {
+        let current_dispatch_owner_incarnation =
+            normalize_required_dispatch_owner(current_dispatch_owner_incarnation)?;
+        let error_message = error_message.trim();
+        // Candidate scan is advisory only. Each phase is re-validated and failed
+        // inside an Immediate transaction with owner/status predicates so a
+        // concurrent begin that inserts a current-owner queued attempt cannot be
+        // killed after the scan (the original orphan-start → attach-while-failed
+        // race).
         let phases = {
             let mut statement = self
                 .connection
@@ -4621,21 +4735,193 @@ impl WorkspaceDatabase {
                      WHERE status = 'running'
                        AND implementation_chat_id IS NULL
                        AND agent_team_id IS NULL
-                       AND agent_task_id IS NULL",
+                       AND agent_task_id IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                           FROM plan_phase_attempts AS attempt
+                           WHERE attempt.phase_id = plan_phases.id
+                             AND attempt.plan_id = plan_phases.plan_id
+                             AND attempt.status IN ('queued', 'running')
+                             AND attempt.trigger NOT IN ('merge_auto', 'merge_retry')
+                             AND attempt.dispatch_owner_incarnation = ?1
+                       )",
                 )
                 .map_err(|source| self.sqlite_error(source))?;
             let rows = statement
-                .query_map([], |row| {
+                .query_map(params![current_dispatch_owner_incarnation], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|source| self.sqlite_error(source))?;
             collect_rows(rows, &self.database_path)?
         };
-        let count = phases.len();
+        let mut count = 0usize;
         for (plan_id, phase_id) in phases {
-            self.fail_plan_phase_by_id(&plan_id, &phase_id, error_message)?;
+            if self.try_fail_unbound_running_plan_phase_for_recovery(
+                &plan_id,
+                &phase_id,
+                error_message,
+                &current_dispatch_owner_incarnation,
+            )? {
+                count += 1;
+            }
         }
         Ok(count)
+    }
+
+    /// Atomically fail one unbound running phase when it still has no
+    /// current-owner active implementation attempt. Returns `false` when the
+    /// recovery predicate no longer holds (skip, do not error).
+    fn try_fail_unbound_running_plan_phase_for_recovery(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+        current_dispatch_owner_incarnation: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        // Fail the phase only while it remains an unbound running orphan without
+        // a live current-owner dispatch window. If begin already wrote a
+        // current-owner queued attempt, affected-row count is 0 and we skip.
+        let phase_updated = transaction
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1
+                   AND id = ?2
+                   AND status = 'running'
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL
+                   AND EXISTS (
+                       SELECT 1 FROM plans
+                       WHERE id = ?1
+                         AND status NOT IN ('completed', 'cancelled')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM plan_phase_attempts AS attempt
+                       WHERE attempt.phase_id = plan_phases.id
+                         AND attempt.plan_id = plan_phases.plan_id
+                         AND attempt.status IN ('queued', 'running')
+                         AND attempt.trigger NOT IN ('merge_auto', 'merge_retry')
+                         AND attempt.dispatch_owner_incarnation = ?5
+                   )",
+                params![
+                    plan_id,
+                    phase_id,
+                    error_message,
+                    now,
+                    current_dispatch_owner_incarnation
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if phase_updated != 1 {
+            return Ok(false);
+        }
+
+        // Only terminalize attempts that are not owned by the current runtime.
+        // Defense in depth: the phase predicate already required no current-owner
+        // active attempt, so this should only hit legacy/NULL/old owners.
+        transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('queued', 'running')
+                   AND (
+                       dispatch_owner_incarnation IS NULL
+                       OR dispatch_owner_incarnation != ?5
+                   )",
+                params![
+                    plan_id,
+                    phase_id,
+                    error_message,
+                    now,
+                    current_dispatch_owner_incarnation
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'failed',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('pending', 'running')",
+                params![plan_id, phase_id, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let plan_updated = transaction
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = ?3,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1
+                   AND status NOT IN ('completed', 'cancelled')",
+                params![plan_id, error_message, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if plan_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "plan '{plan_id}' could not transition while recovering unbound phase '{phase_id}'"
+                ),
+            });
+        }
+        block_plan_auto_run_transaction(
+            &transaction,
+            &database_path,
+            "waiting_for_retry",
+            plan_id,
+            phase_id,
+            &now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
+    }
+
+    /// Test helper: apply the post-candidate recovery fail path for one phase.
+    ///
+    /// Simulates recovery continuing after a stale candidate SELECT so tests can
+    /// deterministically cover SELECT→begin→fail interleaving without threads.
+    /// Production recovery always re-validates through this same path after scan.
+    #[doc(hidden)]
+    pub fn try_fail_unbound_running_plan_phase_for_recovery_for_tests(
+        &mut self,
+        plan_id: &str,
+        phase_id: &str,
+        error_message: &str,
+        current_dispatch_owner_incarnation: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let current_dispatch_owner_incarnation =
+            normalize_required_dispatch_owner(current_dispatch_owner_incarnation)?;
+        self.try_fail_unbound_running_plan_phase_for_recovery(
+            plan_id,
+            phase_id,
+            error_message.trim(),
+            &current_dispatch_owner_incarnation,
+        )
     }
 
     /// Startup-only repair for the pre-fix bug where step aggregation marked a
@@ -18629,6 +18915,10 @@ pub enum WorkspaceDatabaseError {
     InvalidPlan {
         message: String,
     },
+    PlanPhaseAttemptConflict {
+        attempt_id: String,
+        reason: PlanPhaseAttemptConflictReason,
+    },
     InvalidScheduledTaskData {
         message: String,
     },
@@ -18699,6 +18989,28 @@ pub enum WorkspaceDatabaseError {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlanPhaseAttemptConflictReason {
+    OwnerMismatch,
+    MissingOwner,
+    Terminal,
+    AlreadyAttached,
+    ConcurrentStateChange,
+}
+
+impl fmt::Display for PlanPhaseAttemptConflictReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let reason = match self {
+            Self::OwnerMismatch => "dispatch owner mismatch",
+            Self::MissingOwner => "missing dispatch owner",
+            Self::Terminal => "attempt is terminal",
+            Self::AlreadyAttached => "attempt is already attached",
+            Self::ConcurrentStateChange => "concurrent state change",
+        };
+        formatter.write_str(reason)
+    }
+}
+
 impl fmt::Display for WorkspaceDatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -18721,6 +19033,12 @@ impl fmt::Display for WorkspaceDatabaseError {
             }
             Self::InvalidPlan { message } => {
                 write!(formatter, "invalid plan: {message}")
+            }
+            Self::PlanPhaseAttemptConflict { attempt_id, reason } => {
+                write!(
+                    formatter,
+                    "plan phase attempt '{attempt_id}' attach conflict: {reason}"
+                )
             }
             Self::InvalidScheduledTaskData { message } => {
                 write!(formatter, "invalid scheduled task data: {message}")
@@ -18825,6 +19143,7 @@ impl std::error::Error for WorkspaceDatabaseError {
             | Self::InvalidMessageMetadata { .. }
             | Self::ChatRewriteConflict { .. }
             | Self::InvalidPlan { .. }
+            | Self::PlanPhaseAttemptConflict { .. }
             | Self::InvalidScheduledTaskData { .. }
             | Self::InvalidWorkspaceSpec { .. }
             | Self::InvalidToolCall { .. }
@@ -18921,6 +19240,7 @@ fn plan_phase_attempt_from_row(
         completed_at: row.get(15)?,
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
+        dispatch_owner_incarnation: row.get(18)?,
     })
 }
 
@@ -18979,6 +19299,21 @@ fn normalized_optional_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn normalize_required_dispatch_owner(value: &str) -> Result<&str, WorkspaceDatabaseError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b':' | b'-'))
+    {
+        return Err(WorkspaceDatabaseError::InvalidPlan {
+            message: "dispatch_owner_incarnation must use only ASCII letters, digits, '.', '_', ':', or '-'"
+                .to_string(),
+        });
+    }
+    Ok(trimmed)
 }
 
 fn validate_plan_view(view: &str) -> Result<(), WorkspaceDatabaseError> {
@@ -20488,6 +20823,15 @@ fn run_migrations(
                         database_path,
                         "workspace_spec_jobs",
                         "lease_renewed_at",
+                    )?
+            }
+            47 => {
+                !table_exists(&transaction, database_path, "plan_phase_attempts")?
+                    || table_has_column(
+                        &transaction,
+                        database_path,
+                        "plan_phase_attempts",
+                        "dispatch_owner_incarnation",
                     )?
             }
             _ => false,

@@ -6,7 +6,7 @@ use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Component, Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant, UNIX_EPOCH},
@@ -426,6 +426,9 @@ pub(crate) struct AppState {
     agent_scheduler: AgentScheduler,
     scheduled_task_scheduler: ScheduledTaskScheduler,
     plan_auto_run_scheduler: PlanAutoRunScheduler,
+    /// Owner shared by this application's startup reconciliation and every
+    /// local Plan phase begin→attach dispatch.
+    plan_dispatch_owner_incarnation: String,
     tool_resource_locks: ToolResourceLockRegistry,
     background_command_registry: BackgroundCommandRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
@@ -787,6 +790,8 @@ async fn run_server_until_shutdown(
             (owned_shutdown_tx, owned_shutdown_rx)
         }
     };
+    let plan_dispatch_owner_incarnation = new_plan_dispatch_owner_incarnation()
+        .map_err(|error| std::io::Error::other(error.message))?;
     let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
     let (scheduled_task_scheduler, scheduled_task_scheduler_wake_rx) =
         ScheduledTaskScheduler::new();
@@ -821,6 +826,7 @@ async fn run_server_until_shutdown(
         agent_scheduler: agent_scheduler.clone(),
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
+        plan_dispatch_owner_incarnation,
         tool_resource_locks: ToolResourceLockRegistry::default(),
         background_command_registry: BackgroundCommandRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
@@ -831,12 +837,17 @@ async fn run_server_until_shutdown(
         #[cfg(all(windows, not(debug_assertions)))]
         tray_menu_update_notifier,
     };
-    crate::runtime::reconcile_running_llm_request_audits_on_startup(&state);
+    // Reconcile durable Agent/Plan state before any scheduler can scan. In
+    // particular, this closes old-owner dispatch windows without letting an
+    // auto-run scan observe their transient pre-recovery state.
+    let plan_auto_run_scheduler_task = start_plan_auto_run_after_reconciliation(
+        || crate::runtime::reconcile_agent_runtime(&state, state.plan_dispatch_owner_incarnation()),
+        || plan_auto_run_scheduler.spawn(state.clone(), plan_auto_run_scheduler_wake_rx),
+    )
+    .map_err(|error| std::io::Error::other(error.message))?;
     let agent_scheduler_task = agent_scheduler.spawn(state.clone(), agent_scheduler_wake_rx);
     let scheduled_task_scheduler_task =
         scheduled_task_scheduler.spawn(state.clone(), scheduled_task_scheduler_wake_rx);
-    let plan_auto_run_scheduler_task =
-        plan_auto_run_scheduler.spawn(state.clone(), plan_auto_run_scheduler_wake_rx);
     let memory_dream_scheduler_task = memory_dream_scheduler.spawn(state.clone());
     crate::spec_runtime::wake_workspace_spec_runners_for_startup(&state)
         .map_err(|error| std::io::Error::other(error.message))?;
@@ -8246,6 +8257,45 @@ pub(crate) fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{timestamp}-{suffix}")
 }
 
+impl AppState {
+    pub(crate) fn plan_dispatch_owner_incarnation(&self) -> &str {
+        &self.plan_dispatch_owner_incarnation
+    }
+}
+
+/// Makes startup reconciliation a hard barrier for the first Plan auto-run scan.
+pub(crate) fn start_plan_auto_run_after_reconciliation<T>(
+    reconcile: impl FnOnce() -> Result<(), ApiError>,
+    start_auto_run: impl FnOnce() -> T,
+) -> Result<T, ApiError> {
+    reconcile()?;
+    Ok(start_auto_run())
+}
+
+pub(crate) fn new_plan_dispatch_owner_incarnation() -> Result<String, ApiError> {
+    let mut entropy = [0_u8; 32];
+    getrandom::fill(&mut entropy).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to generate plan dispatch owner incarnation: {source}"
+        ))
+    })?;
+    let encoded = entropy
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("plan-dispatch-owner-{encoded}"))
+}
+
+#[cfg(test)]
+pub(crate) fn plan_dispatch_owner_incarnation() -> Result<&'static str, ApiError> {
+    static OWNER: OnceLock<Result<String, String>> = OnceLock::new();
+    OWNER
+        .get_or_init(|| new_plan_dispatch_owner_incarnation().map_err(|error| error.message))
+        .as_ref()
+        .map(String::as_str)
+        .map_err(|message| ApiError::internal(message.clone()))
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -8328,7 +8378,8 @@ impl ApiError {
         error: foco_store::workspace::WorkspaceDatabaseError,
     ) -> Self {
         match error {
-            foco_store::workspace::WorkspaceDatabaseError::ChatRewriteConflict { .. } => {
+            foco_store::workspace::WorkspaceDatabaseError::ChatRewriteConflict { .. }
+            | foco_store::workspace::WorkspaceDatabaseError::PlanPhaseAttemptConflict { .. } => {
                 Self::conflict(error.to_string())
             }
             foco_store::workspace::WorkspaceDatabaseError::AgentDomain { .. }
