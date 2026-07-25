@@ -365,6 +365,39 @@ describe("ModelRoutingPanel", () => {
       expect(onFastModeChange).toHaveBeenCalledWith("gpt-4.1", true);
     });
     expect(screen.queryByRole("group")).toBeNull();
+    expect(fastToggle.parentElement?.closest("button")).toBeNull();
+  });
+
+  it("reflects an enabled Fast preference and disables its icon while the update is pending", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    let resolveUpdate: (result: { ok: true } | { ok: false; error: string }) => void =
+      () => undefined;
+    const onFastModeChange = vi.fn(
+      () =>
+        new Promise<{ ok: true } | { ok: false; error: string }>((resolve) => {
+          resolveUpdate = resolve;
+        }),
+    );
+    renderPanel(undefined, {
+      onFastModeChange,
+      panelModels: [{ ...models[0]!, fastModeEnabled: true, supportsFast: true }],
+    });
+
+    const fastToggle = screen.getByRole("button", {
+      name: "Disable Fast mode for GPT-4.1",
+    });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(fastToggle);
+    await waitFor(() => {
+      expect(onFastModeChange).toHaveBeenCalledWith("gpt-4.1", false);
+    });
+    expect(fastToggle).toBeDisabled();
+
+    await act(async () => {
+      resolveUpdate({ ok: true });
+    });
+    await waitFor(() => expect(fastToggle).not.toBeDisabled());
   });
 
   it("disables Fast for unavailable eligible models", () => {

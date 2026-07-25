@@ -6136,6 +6136,16 @@ describe("app-chat-stream verification surfaces", () => {
   });
 
   it("schedules a new workspace chat until the current workspace run finishes", async () => {
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0]!,
+          fastModeEnabled: true,
+          supportsFast: true,
+        },
+      ],
+    } as typeof settings;
     const fetchMock = vi.mocked(fetch);
     const consoleErrorSpy = vi.spyOn(console, "error");
     fetchMock.mockImplementation(async (input, init) => {
@@ -6209,6 +6219,7 @@ describe("app-chat-stream verification surfaces", () => {
     expect(queueCall).toBeDefined();
     expect(JSON.parse(String(queueCall?.[1]?.body))).toMatchObject({
       deferStart: true,
+      latencyMode: "fast",
       message: "Scheduled task",
     });
 

@@ -5425,6 +5425,23 @@ fn model_route_test_provider(id: &str, enabled: bool) -> ProviderSettings {
     }
 }
 
+fn add_fast_mode_test_model(config: &mut GlobalConfig) {
+    config
+        .providers
+        .push(model_route_test_provider("fast-provider", true));
+    let mut fast_model = config
+        .models
+        .iter()
+        .find(|model| model.id == "model")
+        .expect("base model")
+        .clone();
+    fast_model.id = "gpt-5".to_string();
+    fast_model.display_name = "GPT-5".to_string();
+    fast_model.provider_ids = vec!["fast-provider".to_string()];
+    fast_model.active_provider_id = Some("fast-provider".to_string());
+    config.models.push(fast_model);
+}
+
 #[tokio::test]
 async fn model_route_update_switches_active_provider_and_returns_model_summary() {
     let fixture = prompt_state_fixture(|config| {
@@ -5647,6 +5664,116 @@ async fn model_fast_mode_enable_rejects_unsupported_active_route_without_mutatin
 }
 
 #[tokio::test]
+async fn model_fast_mode_disable_persists_and_invalid_enable_requests_leave_config_unchanged() {
+    let fixture = prompt_state_fixture(|config| {
+        add_fast_mode_test_model(config);
+        config
+            .models
+            .iter_mut()
+            .find(|model| model.id == "gpt-5")
+            .expect("fast model")
+            .fast_mode_enabled = true;
+    });
+    let state = fixture.state;
+
+    let disabled = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "gpt-5".to_string(),
+            fast_mode_enabled: false,
+        }),
+    )
+    .await
+    .expect("disable Fast mode")
+    .0;
+    assert!(!disabled.fast_mode_enabled);
+    assert!(
+        !state
+            .config
+            .lock()
+            .expect("config lock")
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("fast model")
+            .fast_mode_enabled
+    );
+
+    let persisted: GlobalConfig =
+        serde_json::from_str(&fs::read_to_string(&state.config_file).expect("saved config"))
+            .expect("parse saved config");
+    assert!(
+        !persisted
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("persisted fast model")
+            .fast_mode_enabled
+    );
+
+    let original = state.config.lock().expect("config lock").clone();
+    state.config.lock().expect("config lock").models[0].enabled = false;
+    let disabled_model = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "model".to_string(),
+            fast_mode_enabled: true,
+        }),
+    )
+    .await
+    .err()
+    .expect("disabled model must reject Fast enable");
+    assert_eq!(disabled_model.status, StatusCode::BAD_REQUEST);
+
+    let missing_model = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "missing-model".to_string(),
+            fast_mode_enabled: true,
+        }),
+    )
+    .await
+    .err()
+    .expect("missing model must reject Fast enable");
+    assert_eq!(missing_model.status, StatusCode::BAD_REQUEST);
+
+    let mut expected = original;
+    expected.models[0].enabled = false;
+    assert_eq!(*state.config.lock().expect("config lock"), expected);
+}
+
+#[tokio::test]
+async fn model_fast_mode_save_failure_keeps_in_memory_preference_unchanged() {
+    let fixture = prompt_state_fixture(add_fast_mode_test_model);
+    let state = fixture.state;
+    fs::create_dir_all(&state.config_file).expect("blocking config path directory");
+
+    let error = crate::http::settings::update_model_fast_mode(
+        State(state.clone()),
+        Json(crate::http::settings::UpdateModelFastModeRequest {
+            model_id: "gpt-5".to_string(),
+            fast_mode_enabled: true,
+        }),
+    )
+    .await
+    .err()
+    .expect("save should fail");
+
+    assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        !state
+            .config
+            .lock()
+            .expect("config lock")
+            .models
+            .iter()
+            .find(|model| model.id == "gpt-5")
+            .expect("fast model")
+            .fast_mode_enabled
+    );
+}
+
+#[tokio::test]
 async fn model_route_save_failure_keeps_in_memory_route_unchanged() {
     let fixture = prompt_state_fixture(|config| {
         config
@@ -5813,6 +5940,43 @@ async fn model_route_endpoint_is_wired_through_the_http_router() {
         .find(|model| model["id"] == "model")
         .expect("configured model response");
     assert_eq!(configured_model["activeProviderId"], "provider-2");
+
+    app_task.abort();
+}
+
+#[tokio::test]
+async fn model_fast_mode_endpoint_updates_the_model_preference_through_the_http_router() {
+    let fixture = prompt_state_fixture(add_fast_mode_test_model);
+    let state = fixture.state;
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind Fast mode fixture");
+    let addr = listener.local_addr().expect("Fast mode fixture address");
+    let app_task = tokio::spawn(async move {
+        let _ = axum::serve(listener, crate::http::router::app_router(state)).await;
+    });
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/models/fast-mode"))
+        .json(&json!({
+            "modelId": "gpt-5",
+            "fastModeEnabled": true,
+        }))
+        .send()
+        .await
+        .expect("Fast mode request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.expect("Fast mode response");
+    assert_eq!(body["modelId"], "gpt-5");
+    assert_eq!(body["fastModeEnabled"], true);
+    let configured_model = body["configuredModels"]
+        .as_array()
+        .expect("configured model list")
+        .iter()
+        .find(|model| model["id"] == "gpt-5")
+        .expect("configured Fast model");
+    assert_eq!(configured_model["supportsFast"], true);
+    assert_eq!(configured_model["fastModeEnabled"], true);
 
     app_task.abort();
 }
@@ -26086,6 +26250,59 @@ async fn refresh_model_route_picks_up_route_switch_before_next_provider_request(
         context.provider_request.prompt_cache_key, previous_cache_key,
         "prompt cache key must include the resolved provider"
     );
+
+    drop(context);
+    drop(state);
+    remove_dir_if_exists(&workspace_dir);
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
+async fn refresh_model_route_picks_up_fast_mode_change_before_next_provider_request() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-refresh-fast-mode-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-refresh-fast-mode-profile-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+
+    let mut config = prompt_test_config(workspace_dir.clone());
+    add_fast_mode_test_model(&mut config);
+    let state = test_app_state(config.clone(), profile_dir.clone());
+    let mut context = prepare_chat_context(
+        &state,
+        &config,
+        &config.workspaces[0].id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "gpt-5".to_string(),
+            provider_id: Some("fast-provider".to_string()),
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "use the latest Fast preference".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("chat context");
+    assert_eq!(context.latency_mode, foco_providers::LatencyMode::Standard);
+
+    state
+        .config
+        .lock()
+        .expect("config lock")
+        .models
+        .iter_mut()
+        .find(|model| model.id == "gpt-5")
+        .expect("fast model")
+        .fast_mode_enabled = true;
+    context.refresh_model_route().expect("refresh model route");
+
+    assert_eq!(context.latency_mode, foco_providers::LatencyMode::Fast);
+    assert_eq!(context.provider_id, "fast-provider");
 
     drop(context);
     drop(state);

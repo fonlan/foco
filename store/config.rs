@@ -5336,6 +5336,30 @@ mod tests {
         assert!(!model.fast_mode_enabled);
     }
 
+    #[test]
+    fn model_settings_round_trip_preserves_fast_mode_enabled_and_rejects_unknown_fields() {
+        let mut model = enabled_memory_model("fast-model");
+        model.fast_mode_enabled = true;
+        let serialized = serde_json::to_value(&model).expect("serialize model settings");
+
+        assert_eq!(serialized["fastModeEnabled"], true);
+        let restored: ModelSettings =
+            serde_json::from_value(serialized.clone()).expect("deserialize model settings");
+        assert!(restored.fast_mode_enabled);
+
+        let mut with_unknown_field = serialized;
+        with_unknown_field
+            .as_object_mut()
+            .expect("model settings serialize as an object")
+            .insert(
+                "unexpectedFastSetting".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        let error = serde_json::from_value::<ModelSettings>(with_unknown_field)
+            .expect_err("unknown model settings field must be rejected");
+        assert!(error.to_string().contains("unexpectedFastSetting"));
+    }
+
     fn add_enabled_spec_model(config: &mut GlobalConfig, id: &str) {
         config.providers.push(ProviderSettings {
             id: "spec-provider".to_string(),
