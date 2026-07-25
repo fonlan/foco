@@ -1065,7 +1065,7 @@ async fn sleep_until_shutdown(shutdown_rx: &mut watch::Receiver<bool>, duration:
     }
 }
 
-/// Wait for a 429 staircase delay while remaining responsive to app shutdown and run cancel.
+/// Wait for a provider retry delay while remaining responsive to app shutdown and run cancel.
 /// Returns `true` when the wait was interrupted by cancel/shutdown.
 async fn wait_provider_retry_backoff_cancellable(
     app_shutdown_rx: &mut watch::Receiver<bool>,
@@ -1097,13 +1097,28 @@ async fn wait_provider_retry_backoff_cancellable(
     }
 }
 
-/// Sleep for a 429 staircase delay on internal (non-chat) provider retry paths.
-async fn wait_provider_429_retry_backoff(status_code: Option<i64>, retry_ordinal: u32) {
+/// Sleep for a classified provider retry delay on internal (non-chat) provider retry paths.
+async fn wait_provider_retry_backoff(
+    class: crate::provider_retry::ProviderRetryClass,
+    retry_ordinal: u32,
+) {
     if let Some(delay) =
-        crate::provider_retry::provider_429_retry_backoff_i64(status_code, retry_ordinal)
+        crate::provider_retry::provider_retry_backoff_for_class(class, retry_ordinal, None)
     {
         tokio::time::sleep(delay).await;
     }
+}
+
+/// Backward-compatible helper for status-code-only internal paths.
+async fn wait_provider_429_retry_backoff(status_code: Option<i64>, retry_ordinal: u32) {
+    let class = match status_code.and_then(|code| u16::try_from(code).ok()) {
+        Some(429) => crate::provider_retry::ProviderRetryClass::RateLimit,
+        Some(500..=599) => crate::provider_retry::ProviderRetryClass::TransientServer,
+        Some(408 | 409) => crate::provider_retry::ProviderRetryClass::Network,
+        None => crate::provider_retry::ProviderRetryClass::Network,
+        Some(_) => return,
+    };
+    wait_provider_retry_backoff(class, retry_ordinal).await;
 }
 
 async fn sync_all_mcp_workspaces(
@@ -3654,12 +3669,13 @@ impl PreparedChatContext {
                             );
                         }
                         let status_code = error.status_code().map(i64::from);
-                        let message = error.to_string();
-                        if should_retry_provider_stream_error(
+                        let message = error.error.user_message();
+                        let retry_decision = crate::provider_retry::provider_retry_decision(
                             &error.error,
                             turn_retry_count,
                             self.global_config.app.llm_request_retry_count,
-                        ) {
+                        );
+                        if retry_decision.retryable {
                             self.capture_failed_llm_request(
                                 &turn_capture,
                                 turn_llm_request_id,
@@ -3692,18 +3708,13 @@ impl PreparedChatContext {
                             };
                             events.push(captured_event(&event));
                             yield event;
-                            let retry_ordinal = if error.status_code() == Some(429) {
-                                rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
-                                Some(rate_limit_retry_count)
-                            } else {
-                                None
-                            };
-                            if let Some(delay) = retry_ordinal.and_then(|retry_ordinal| {
-                                crate::provider_retry::provider_429_retry_backoff(
-                                    error.status_code(),
-                                    retry_ordinal,
+                            if let Some(delay) =
+                                crate::provider_retry::provider_retry_backoff_for_class(
+                                    retry_decision.class,
+                                    turn_retry_count,
+                                    None,
                                 )
-                            }) {
+                            {
                                 if wait_provider_retry_backoff_cancellable(
                                     &mut app_shutdown_rx,
                                     &mut run_cancellation_rx,
@@ -3859,12 +3870,13 @@ impl PreparedChatContext {
                             let provider_status_code = provider_status_code(&error);
                             let audit_status_code = provider_status_code
                                 .or_else(|| provider_stream.http_status().map(i64::from));
-                            let message = error.to_string();
-                            if should_retry_provider_stream_error(
+                            let message = error.user_message();
+                            let retry_decision = crate::provider_retry::provider_retry_decision(
                                 &error,
                                 turn_retry_count,
                                 self.global_config.app.llm_request_retry_count,
-                            ) {
+                            );
+                            if retry_decision.retryable {
                                 self.capture_failed_stream_llm_request(
                                     &turn_capture,
                                     &provider_stream,
@@ -3898,19 +3910,13 @@ impl PreparedChatContext {
                                 };
                                 events.push(captured_event(&event));
                                 yield event;
-                                let retry_ordinal = if error.status_code() == Some(429) {
-                                    rate_limit_retry_count =
-                                        rate_limit_retry_count.saturating_add(1);
-                                    Some(rate_limit_retry_count)
-                                } else {
-                                    None
-                                };
-                                if let Some(delay) = retry_ordinal.and_then(|retry_ordinal| {
-                                    crate::provider_retry::provider_429_retry_backoff(
-                                        error.status_code(),
-                                        retry_ordinal,
+                                if let Some(delay) =
+                                    crate::provider_retry::provider_retry_backoff_for_class(
+                                        retry_decision.class,
+                                        turn_retry_count,
+                                        None,
                                     )
-                                }) {
+                                {
                                     if wait_provider_retry_backoff_cancellable(
                                         &mut app_shutdown_rx,
                                         &mut run_cancellation_rx,
@@ -6253,14 +6259,22 @@ pub(crate) async fn audited_provider_text_request(
                         },
                     )
                     .map_err(ApiError::from_workspace_error)?;
-                if attempt_index >= retry_count {
+                if attempt_index >= retry_count
+                    || !structured_llm_outcome::is_provider_transport_retryable(
+                        error.failure_kind,
+                        error.status_code,
+                    )
+                {
                     return Err(ApiError::internal(error.message));
                 }
-                if error.status_code == Some(429) {
-                    rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
-                    wait_provider_429_retry_backoff(error.status_code, rate_limit_retry_count)
-                        .await;
-                }
+                rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                let class = match error.status_code.and_then(|code| u16::try_from(code).ok()) {
+                    Some(429) => crate::provider_retry::ProviderRetryClass::RateLimit,
+                    Some(500..=599) => crate::provider_retry::ProviderRetryClass::TransientServer,
+                    Some(408 | 409) | None => crate::provider_retry::ProviderRetryClass::Network,
+                    Some(_) => crate::provider_retry::ProviderRetryClass::TransientServer,
+                };
+                wait_provider_retry_backoff(class, rate_limit_retry_count).await;
             }
         }
     }
@@ -6702,16 +6716,19 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                                 status_code = ?error.status_code,
                                 "retrying single-tool provider transport failure"
                             );
-                            // Only transport ProviderRetry waits on 429; output repair neither
-                            // waits nor resets the rate-limit staircase for this call.
-                            if error.status_code == Some(429) {
-                                rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
-                                wait_provider_429_retry_backoff(
-                                    error.status_code,
-                                    rate_limit_retry_count,
-                                )
-                                .await;
-                            }
+                            // Additional provider retries are 1-based for the backoff staircase.
+                            rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
+                            let class = match error.status_code.and_then(|code| u16::try_from(code).ok())
+                            {
+                                Some(429) => crate::provider_retry::ProviderRetryClass::RateLimit,
+                                Some(500..=599) => {
+                                    crate::provider_retry::ProviderRetryClass::TransientServer
+                                }
+                                Some(408 | 409) => crate::provider_retry::ProviderRetryClass::Network,
+                                None => crate::provider_retry::ProviderRetryClass::Network,
+                                Some(_) => crate::provider_retry::ProviderRetryClass::TransientServer,
+                            };
+                            wait_provider_retry_backoff(class, rate_limit_retry_count).await;
                         }
                         continue;
                     }
@@ -6779,6 +6796,45 @@ impl AuditedProviderError {
             message,
             status_code,
             audit_status_code: status_code,
+            response_body_json: None,
+            failure_kind,
+        }
+    }
+
+    fn from_provider_config_error(source: &ProviderConfigError) -> Self {
+        let message = source.user_message();
+        let observed_status = source.status_code().map(i64::from);
+        let retry_class = crate::provider_retry::classify_provider_retry_class(source);
+        // Structured retry uses status_code; keep observed status for retryable failures and
+        // force a non-retryable 4xx when the structured class is terminal but status is absent
+        // (common for HTTP 200 SSE provider error events).
+        let status_code = if retry_class.is_retryable() {
+            observed_status
+        } else {
+            observed_status.or(Some(400))
+        };
+        let failure_kind = match source.stream_failure_kind() {
+            Some(foco_providers::ProviderStreamFailureKind::ProtocolParse) => {
+                structured_llm_outcome::StructuredLlmFailureKind::SchemaInvalid
+            }
+            Some(
+                foco_providers::ProviderStreamFailureKind::Capacity
+                | foco_providers::ProviderStreamFailureKind::RateLimit
+                | foco_providers::ProviderStreamFailureKind::ServerError
+                | foco_providers::ProviderStreamFailureKind::Auth
+                | foco_providers::ProviderStreamFailureKind::Permission
+                | foco_providers::ProviderStreamFailureKind::InvalidRequest
+                | foco_providers::ProviderStreamFailureKind::ContextLength
+                | foco_providers::ProviderStreamFailureKind::Other,
+            ) => structured_llm_outcome::StructuredLlmFailureKind::ProviderError,
+            None => {
+                structured_llm_outcome::classify_provider_tool_failure_kind(&message, status_code)
+            }
+        };
+        Self {
+            message,
+            status_code,
+            audit_status_code: observed_status,
             response_body_json: None,
             failure_kind,
         }
@@ -6869,12 +6925,13 @@ async fn run_provider_stream_for_text(
     })?
     .map_err(|source| {
         let _ = capture.persist_request_failure(&source);
-        AuditedProviderError::new(source.to_string(), source.status_code().map(i64::from))
-            .with_response_body_json(
-                capture
-                    .failed_response_json(source.to_string(), source.status_code(), false)
-                    .unwrap_or(None),
-            )
+        let error = AuditedProviderError::from_provider_config_error(&source.error);
+        let message = error.message.clone();
+        error.with_response_body_json(
+            capture
+                .failed_response_json(message, source.status_code(), false)
+                .unwrap_or(None),
+        )
     })?;
     let mut output_text = String::new();
     let mut events = Vec::new();
@@ -6897,11 +6954,11 @@ async fn run_provider_stream_for_text(
             break;
         };
         let event = event_result.map_err(|source| {
-            AuditedProviderError::new(
-                format!("{request_kind} stream failed: {source}"),
-                provider_status_code(&source),
-            )
-            .with_stream_final_response(capture, &stream)
+            let mut error = AuditedProviderError::from_provider_config_error(&source);
+            if !error.message.starts_with(request_kind) {
+                error.message = format!("{request_kind} stream failed: {}", error.message);
+            }
+            error.with_stream_final_response(capture, &stream)
         })?;
         events.push(event.clone());
 
@@ -7022,12 +7079,13 @@ async fn run_provider_stream_for_tool(
     })?
     .map_err(|source| {
         let _ = capture.persist_request_failure(&source);
-        AuditedProviderError::new(source.to_string(), source.status_code().map(i64::from))
-            .with_response_body_json(
-                capture
-                    .failed_response_json(source.to_string(), source.status_code(), false)
-                    .unwrap_or(None),
-            )
+        let error = AuditedProviderError::from_provider_config_error(&source.error);
+        let message = error.message.clone();
+        error.with_response_body_json(
+            capture
+                .failed_response_json(message, source.status_code(), false)
+                .unwrap_or(None),
+        )
     })?;
     let mut output_text = String::new();
     let mut tool_arguments = None;
@@ -7051,11 +7109,11 @@ async fn run_provider_stream_for_tool(
             break;
         };
         let event = event_result.map_err(|source| {
-            AuditedProviderError::new(
-                format!("{request_kind} stream failed: {source}"),
-                provider_status_code(&source),
-            )
-            .with_stream_final_response(capture, &stream)
+            let mut error = AuditedProviderError::from_provider_config_error(&source);
+            if !error.message.starts_with(request_kind) {
+                error.message = format!("{request_kind} stream failed: {}", error.message);
+            }
+            error.with_stream_final_response(capture, &stream)
         })?;
         events.push(event.clone());
 

@@ -8968,12 +8968,42 @@ fn provider_stream_retry_skips_non_retryable_errors() {
         message: "connection reset".to_string(),
         status_code: None,
     };
+    let capacity = ProviderConfigError::ProviderStream(Box::new(
+        foco_providers::ProviderStreamErrorDetail {
+            message: "The model is currently overloaded".to_string(),
+            status_code: None,
+            kind: foco_providers::ProviderStreamFailureKind::Capacity,
+            code: Some("model_capacity".to_string()),
+            error_type: None,
+            param: None,
+            event_type: Some("error".to_string()),
+            diagnostic_kind: Some("provider_error_event".to_string()),
+            model_id: Some("gpt-test".to_string()),
+            adapter: Some("OpenAI Responses".to_string()),
+        },
+    ));
+    let parse = ProviderConfigError::ProviderStream(Box::new(
+        foco_providers::ProviderStreamErrorDetail {
+            message: "Failed to parse stream data: invalid json".to_string(),
+            status_code: None,
+            kind: foco_providers::ProviderStreamFailureKind::ProtocolParse,
+            code: None,
+            error_type: None,
+            param: None,
+            event_type: None,
+            diagnostic_kind: Some("invalid_json".to_string()),
+            model_id: Some("gpt-test".to_string()),
+            adapter: Some("OpenAI Responses".to_string()),
+        },
+    ));
 
     assert!(!should_retry_provider_stream_error(&bad_request, 0, 3));
     assert!(should_retry_provider_stream_error(&rate_limited, 0, 3));
     assert!(should_retry_provider_stream_error(&unavailable, 0, 3));
     assert!(should_retry_provider_stream_error(&network, 0, 3));
     assert!(!should_retry_provider_stream_error(&network, 3, 3));
+    assert!(should_retry_provider_stream_error(&capacity, 0, 3));
+    assert!(!should_retry_provider_stream_error(&parse, 0, 3));
     assert!(!should_retry_provider_stream_error(
         &ProviderConfigError::InvalidRequest("missing attachment".to_string()),
         0,

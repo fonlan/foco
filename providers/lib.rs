@@ -3372,12 +3372,82 @@ impl ProviderConnectionConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderStreamFailureKind {
+    Capacity,
+    RateLimit,
+    ServerError,
+    Auth,
+    Permission,
+    InvalidRequest,
+    ContextLength,
+    ProtocolParse,
+    Other,
+}
+
+impl ProviderStreamFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Capacity => "capacity",
+            Self::RateLimit => "rate_limit",
+            Self::ServerError => "server_error",
+            Self::Auth => "auth",
+            Self::Permission => "permission",
+            Self::InvalidRequest => "invalid_request",
+            Self::ContextLength => "context_length",
+            Self::ProtocolParse => "protocol_parse",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn is_retryable(self) -> bool {
+        matches!(
+            self,
+            Self::Capacity | Self::RateLimit | Self::ServerError
+        )
+    }
+}
+
+/// Structured OpenAI Responses / provider stream failure retained across the Foco boundary.
+///
+/// Raw frames stay on audit `streamDiagnostic`; this type only carries control-flow fields and a
+/// short, safe user-facing message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderStreamErrorDetail {
+    pub message: String,
+    pub status_code: Option<u16>,
+    pub kind: ProviderStreamFailureKind,
+    pub code: Option<String>,
+    pub error_type: Option<String>,
+    pub param: Option<String>,
+    pub event_type: Option<String>,
+    pub diagnostic_kind: Option<String>,
+    pub model_id: Option<String>,
+    pub adapter: Option<String>,
+}
+
+impl ProviderStreamErrorDetail {
+    pub fn user_message(&self) -> &str {
+        self.message.as_str()
+    }
+
+    pub fn summary_with_model_context(&self) -> String {
+        match self.model_id.as_deref().filter(|value| !value.is_empty()) {
+            Some(model_id) => format!("{} (model '{model_id}')", self.message),
+            None => self.message.clone(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProviderConfigError {
     Connection {
         message: String,
         status_code: Option<u16>,
     },
+    /// Successfully decoded provider stream failure (`type:error` / `response.failed`) or a true
+    /// stream parse failure classified as [`ProviderStreamFailureKind::ProtocolParse`].
+    ProviderStream(Box<ProviderStreamErrorDetail>),
     EmptyBaseUrl,
     EmptyProxyUrl,
     InvalidBaseUrl {
@@ -3403,6 +3473,7 @@ impl ProviderConfigError {
     pub fn status_code(&self) -> Option<u16> {
         match self {
             Self::Connection { status_code, .. } => *status_code,
+            Self::ProviderStream(detail) => detail.status_code,
             Self::EmptyBaseUrl
             | Self::EmptyProxyUrl
             | Self::InvalidBaseUrl { .. }
@@ -3416,15 +3487,80 @@ impl ProviderConfigError {
         }
     }
 
+    /// Short, safe message suitable for chat failure bubbles.
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::ProviderStream(detail) => detail.summary_with_model_context(),
+            other => other.to_string(),
+        }
+    }
+
+    pub fn stream_detail(&self) -> Option<&ProviderStreamErrorDetail> {
+        match self {
+            Self::ProviderStream(detail) => Some(detail),
+            _ => None,
+        }
+    }
+
+    pub fn stream_failure_kind(&self) -> Option<ProviderStreamFailureKind> {
+        self.stream_detail().map(|detail| detail.kind)
+    }
+
     pub(crate) fn from_genai_error_with_context(
         source: genai::Error,
         context: &ProviderErrorContext,
     ) -> Self {
-        let status_code = genai_error_status_code(&source).map(|status| status.as_u16());
-
-        Self::Connection {
-            message: format!("{context}: {source}"),
-            status_code,
+        match source {
+            genai::Error::ProviderStream(inner) => {
+                let message = sanitize_provider_stream_message(&inner.message);
+                let kind = classify_provider_stream_failure_kind(
+                    inner.code.as_deref(),
+                    inner.error_type.as_deref(),
+                    &message,
+                    None,
+                );
+                Self::ProviderStream(Box::new(ProviderStreamErrorDetail {
+                    message,
+                    // SSE error events commonly arrive on HTTP 200; leave status unset so
+                    // classification uses structured code/type/message instead of transport status.
+                    status_code: None,
+                    kind,
+                    code: inner.code,
+                    error_type: inner.error_type,
+                    param: inner.param,
+                    event_type: Some(inner.event_type),
+                    diagnostic_kind: Some(provider_stream_diagnostic_kind_label(
+                        inner.diagnostic_kind,
+                    )),
+                    model_id: Some(context.model_id.clone()),
+                    adapter: Some(context.adapter.to_string()),
+                }))
+            }
+            genai::Error::StreamParse {
+                model_iden,
+                serde_error,
+            } => {
+                let message = format!("Failed to parse stream data: {serde_error}");
+                Self::ProviderStream(Box::new(ProviderStreamErrorDetail {
+                    message,
+                    status_code: None,
+                    kind: ProviderStreamFailureKind::ProtocolParse,
+                    code: None,
+                    error_type: None,
+                    param: None,
+                    event_type: None,
+                    diagnostic_kind: Some("invalid_json".to_string()),
+                    model_id: Some(model_iden.model_name.to_string()),
+                    adapter: Some(context.adapter.to_string()),
+                }))
+            }
+            other => {
+                let status_code = genai_error_status_code(&other).map(|status| status.as_u16());
+                Self::Connection {
+                    message: format!("{context}: {other}"),
+                    status_code,
+                }
+            }
         }
     }
 }
@@ -3434,6 +3570,9 @@ impl fmt::Display for ProviderConfigError {
         match self {
             Self::Connection { message, .. } => {
                 write!(formatter, "provider connection failed: {message}")
+            }
+            Self::ProviderStream(detail) => {
+                write!(formatter, "{}", detail.summary_with_model_context())
             }
             Self::EmptyBaseUrl => write!(formatter, "provider base URL must not be empty"),
             Self::EmptyProxyUrl => write!(formatter, "AI API proxy URL must not be empty"),
@@ -3477,6 +3616,168 @@ impl fmt::Display for ProviderConfigError {
 
 impl std::error::Error for ProviderConfigError {}
 
+const PROVIDER_STREAM_MESSAGE_LIMIT_CHARS: usize = 512;
+
+fn sanitize_provider_stream_message(message: &str) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        return "provider stream error".to_string();
+    }
+    let mut out = String::new();
+    for (index, ch) in trimmed.chars().enumerate() {
+        if index >= PROVIDER_STREAM_MESSAGE_LIMIT_CHARS {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn provider_stream_diagnostic_kind_label(
+    kind: genai::OpenAIRespStreamDiagnosticKind,
+) -> String {
+    match kind {
+        genai::OpenAIRespStreamDiagnosticKind::ProviderErrorEvent => {
+            "provider_error_event".to_string()
+        }
+        genai::OpenAIRespStreamDiagnosticKind::ResponseFailed => "response_failed".to_string(),
+        genai::OpenAIRespStreamDiagnosticKind::InvalidJson => "invalid_json".to_string(),
+        genai::OpenAIRespStreamDiagnosticKind::TransportError => "transport_error".to_string(),
+        genai::OpenAIRespStreamDiagnosticKind::UnexpectedEof => "unexpected_eof".to_string(),
+    }
+}
+
+/// Classify a provider stream failure from structured fields and optional HTTP status.
+pub fn classify_provider_stream_failure_kind(
+    code: Option<&str>,
+    error_type: Option<&str>,
+    message: &str,
+    status_code: Option<u16>,
+) -> ProviderStreamFailureKind {
+    let code = code.unwrap_or("").to_ascii_lowercase();
+    let error_type = error_type.unwrap_or("").to_ascii_lowercase();
+    let message = message.to_ascii_lowercase();
+    let haystack = format!("{code} {error_type} {message}");
+
+    if matches!(status_code, Some(401))
+        || contains_any(
+            &haystack,
+            &[
+                "invalid_api_key",
+                "authentication",
+                "unauthorized",
+                "invalid auth",
+                "incorrect api key",
+                "invalid api key",
+            ],
+        )
+    {
+        return ProviderStreamFailureKind::Auth;
+    }
+    if matches!(status_code, Some(403))
+        || contains_any(
+            &haystack,
+            &["permission", "forbidden", "access_denied", "not allowed"],
+        )
+    {
+        return ProviderStreamFailureKind::Permission;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "context_length",
+            "context length",
+            "maximum context",
+            "max context",
+            "context window",
+            "too many tokens",
+            "token limit",
+            "max_tokens",
+        ],
+    ) {
+        return ProviderStreamFailureKind::ContextLength;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "failed to parse stream",
+            "invalid_json",
+            "invalid json",
+            "parse stream",
+            "protocol parse",
+        ],
+    ) {
+        return ProviderStreamFailureKind::ProtocolParse;
+    }
+    if matches!(status_code, Some(429))
+        || contains_any(
+            &haystack,
+            &[
+                "rate_limit",
+                "rate limit",
+                "too many requests",
+                "rate_limited",
+                "requests per",
+            ],
+        )
+    {
+        return ProviderStreamFailureKind::RateLimit;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "capacity",
+            "overloaded",
+            "insufficient_quota",
+            "insufficient quota",
+            "model_capacity",
+            "no capacity",
+            "out of capacity",
+            "resource_exhausted",
+            "server is busy",
+            "high demand",
+        ],
+    ) {
+        return ProviderStreamFailureKind::Capacity;
+    }
+    if matches!(status_code, Some(500..=599))
+        || contains_any(
+            &haystack,
+            &[
+                "server_error",
+                "internal_error",
+                "internal server",
+                "service_unavailable",
+                "bad_gateway",
+                "gateway_timeout",
+                "temporarily unavailable",
+            ],
+        )
+    {
+        return ProviderStreamFailureKind::ServerError;
+    }
+    if matches!(status_code, Some(400 | 404 | 422))
+        || contains_any(
+            &haystack,
+            &[
+                "invalid_request",
+                "invalid request",
+                "bad request",
+                "not found",
+                "validation_error",
+            ],
+        )
+    {
+        return ProviderStreamFailureKind::InvalidRequest;
+    }
+    ProviderStreamFailureKind::Other
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
 fn genai_error_status_code(source: &genai::Error) -> Option<StatusCode> {
     match source {
         genai::Error::HttpError { status, .. } => Some(*status),
@@ -3503,6 +3804,7 @@ fn genai_error_status_code(source: &genai::Error) -> Option<StatusCode> {
         | genai::Error::ChatResponseGeneration { .. }
         | genai::Error::ChatResponse { .. }
         | genai::Error::StreamParse { .. }
+        | genai::Error::ProviderStream(_)
         | genai::Error::Resolver { .. }
         | genai::Error::AdapterNotSupported { .. }
         | genai::Error::AdapterKindMismatch { .. }
@@ -8443,5 +8745,89 @@ mod tests {
             .expect("connection failures surface through the stream");
         while stream.next_event().await.is_some() {}
         assert_eq!(stream.http_status(), None);
+    }
+
+    #[test]
+    fn classify_provider_stream_failure_kind_covers_capacity_rate_limit_and_parse() {
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("model_capacity"),
+                None,
+                "The model is currently overloaded",
+                None,
+            ),
+            ProviderStreamFailureKind::Capacity
+        );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("rate_limit_exceeded"),
+                Some("rate_limit_error"),
+                "Too many requests",
+                None,
+            ),
+            ProviderStreamFailureKind::RateLimit
+        );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("server_error"),
+                Some("server_error"),
+                "The server had an error",
+                None,
+            ),
+            ProviderStreamFailureKind::ServerError
+        );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                None,
+                None,
+                "Failed to parse stream data: invalid json",
+                None,
+            ),
+            ProviderStreamFailureKind::ProtocolParse
+        );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("invalid_api_key"),
+                Some("invalid_request_error"),
+                "Incorrect API key provided",
+                None,
+            ),
+            ProviderStreamFailureKind::Auth
+        );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("context_length_exceeded"),
+                Some("invalid_request_error"),
+                "This model's maximum context length is 128000 tokens",
+                None,
+            ),
+            ProviderStreamFailureKind::ContextLength
+        );
+    }
+
+    #[test]
+    fn provider_stream_error_user_message_prefers_provider_text() {
+        let error = ProviderConfigError::ProviderStream(Box::new(ProviderStreamErrorDetail {
+            message: "The model is currently overloaded".to_string(),
+            status_code: None,
+            kind: ProviderStreamFailureKind::Capacity,
+            code: Some("model_capacity".to_string()),
+            error_type: None,
+            param: None,
+            event_type: Some("error".to_string()),
+            diagnostic_kind: Some("provider_error_event".to_string()),
+            model_id: Some("gpt-test".to_string()),
+            adapter: Some("OpenAI Responses".to_string()),
+        }));
+        assert_eq!(
+            error.user_message(),
+            "The model is currently overloaded (model 'gpt-test')"
+        );
+        assert!(!error.user_message().contains("Failed to parse stream data"));
+        assert_eq!(
+            error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::Capacity)
+        );
+        assert!(error.stream_detail().is_some());
     }
 }

@@ -28,7 +28,7 @@ foco-store = { path = "store" }
 foco-tools = { path = "tools" }
 fancy-regex = "0.18.0"
 futures-util = { version = "0.3.31", features = ["sink"] }
-genai = { git = "https://github.com/fonlan/rust-genai.git", rev = "d9a1e023920c531adb26137bece5df5b1cbf4d32", default-features = true }
+genai = { git = "https://github.com/fonlan/rust-genai.git", rev = "d64cca7e5131b7bbe9487c084e4e93006387b8b2", default-features = true }
 getrandom = "0.3.4"
 tokio-tungstenite = "0.29.0"
 tungstenite = "0.29.0"
