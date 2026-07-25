@@ -14589,11 +14589,6 @@ export function App() {
                 isLoadingDiff={isLoadingDiff}
                 isLoadingContextMemories={isLoadingContextMemories}
                 isLoadingPlans={isLoadingActivePlans}
-                isPlanAutoRunBusy={
-                  isPlanAutoRunBusy ||
-                  isPlanAutoRunUpdating ||
-                  planOperationKey !== null
-                }
                 isPlanAutoRunEnabled={isPlanAutoRunEnabled}
                 planAutoRunBlockedReason={planAutoRunBlockedReason}
                 isPlanAutoRunToggleDisabled={!activeWorkspace?.id}

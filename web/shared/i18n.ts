@@ -358,7 +358,6 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "No active plans for this workspace.": "当前工作区暂无活跃计划。",
     "Auto run plans": "全自动执行计划",
     "Run every active plan in order": "按顺序执行每个活跃计划",
-    "Auto running": "自动执行中",
     "Auto run waiting for plan readiness": "等待计划进入可执行状态",
     "Auto run paused until phase retry": "自动执行已暂停，等待重试失败阶段",
     "Auto run paused until cancelled phase retry":

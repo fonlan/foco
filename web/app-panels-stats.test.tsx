@@ -1561,7 +1561,7 @@ describe("app-panels-stats verification surfaces", () => {
       expect(autoRunRequests).toContainEqual({ enabled: true, method: "PUT" });
     });
     expect(autoRunCheckbox).toBeChecked();
-    expect(await screen.findByText("Auto running")).toBeInTheDocument();
+    expect(screen.queryByText("Auto running")).not.toBeInTheDocument();
   });
 
   it("refreshes active plans when backend auto-run becomes busy", async () => {
@@ -2942,6 +2942,24 @@ describe("app-panels-stats verification surfaces", () => {
       }
     }
 
+    function expectPhaseExpandButtonGhost(planTitle: string, phaseTitle: string) {
+      const planCard = screen.getByText(planTitle).closest("article");
+      if (!planCard) {
+        throw new Error(`Expected plan card for ${planTitle}`);
+      }
+      const phaseButton = within(planCard)
+        .getAllByRole("button")
+        .find(
+          (button) =>
+            button.getAttribute("aria-expanded") != null &&
+            button.textContent?.includes(phaseTitle),
+        );
+      if (!phaseButton) {
+        throw new Error(`Expected phase expand button for ${phaseTitle}`);
+      }
+      expect(phaseButton).toHaveClass("button--ghost");
+    }
+
     expectPlanStatusTone("Merged implementation plan", "Implemented", [
       "bg-[var(--success-soft)]",
       "text-[var(--success-soft-foreground)]",
@@ -2962,6 +2980,16 @@ describe("app-panels-stats verification surfaces", () => {
       "bg-[var(--warning-soft)]",
       "text-[var(--warning)]",
     ]);
+    expectPhaseExpandButtonGhost(
+      "Completed status colors",
+      "Completed color phase",
+    );
+    expectPhaseExpandButtonGhost("Failed status colors", "Failed color phase");
+    expectPhaseExpandButtonGhost(
+      "Cancelled status colors",
+      "Cancelled color phase",
+    );
+    expectPhaseExpandButtonGhost("Ready status colors", "Ready color phase");
   });
 
   async function openSpecPanel() {

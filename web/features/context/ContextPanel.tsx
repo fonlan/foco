@@ -148,7 +148,6 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingChatStatistics,
   isLoadingContextMemories,
   isLoadingPlans,
-  isPlanAutoRunBusy,
   isPlanAutoRunEnabled,
   planAutoRunBlockedReason,
   isPlanAutoRunToggleDisabled,
@@ -224,7 +223,6 @@ const ContextPanel = memo(function ContextPanel({
   isLoadingChatStatistics: boolean;
   isLoadingContextMemories: boolean;
   isLoadingPlans: boolean;
-  isPlanAutoRunBusy: boolean;
   isPlanAutoRunEnabled: boolean;
   planAutoRunBlockedReason: string | null;
   isPlanAutoRunToggleDisabled: boolean;
@@ -343,7 +341,6 @@ const ContextPanel = memo(function ContextPanel({
 
         {activeTab === "plan" ? (
           <ContextPlanTab
-            autoRunBusy={isPlanAutoRunBusy}
             autoRunEnabled={isPlanAutoRunEnabled}
             autoRunBlockedReason={planAutoRunBlockedReason}
             autoRunToggleDisabled={isPlanAutoRunToggleDisabled}
@@ -722,7 +719,6 @@ function ContextTodoGraphTab({
 }
 
 function ContextPlanTab({
-  autoRunBusy,
   autoRunEnabled,
   autoRunBlockedReason,
   autoRunToggleDisabled,
@@ -741,7 +737,6 @@ function ContextPlanTab({
   providers,
   thinkingLevels,
 }: {
-  autoRunBusy: boolean;
   autoRunEnabled: boolean;
   autoRunBlockedReason: string | null;
   autoRunToggleDisabled: boolean;
@@ -777,7 +772,6 @@ function ContextPlanTab({
     plan: Plan;
     phase: PlanPhase;
   } | null>(null);
-  const showAutoRunBusy = autoRunEnabled && autoRunBusy;
   const autoRunBlockedLabel = autoRunBlockedReason
     ? t(
         autoRunBlockedReason === "waiting_for_ready"
@@ -942,12 +936,7 @@ function ContextPlanTab({
             </span>
           </Checkbox.Content>
         </Checkbox>
-        {showAutoRunBusy ? (
-          <span className="inline-flex h-6 shrink-0 items-center gap-1.5 rounded-full border border-[var(--warning)] bg-[var(--warning-soft)] px-2 text-xs font-medium text-[var(--warning)]">
-            <LoaderCircle aria-hidden="true" className="size-3 animate-spin" />
-            {t("Auto running")}
-          </span>
-        ) : autoRunEnabled && autoRunBlockedLabel ? (
+        {autoRunEnabled && autoRunBlockedLabel ? (
           <span className="inline-flex min-h-6 shrink-0 items-center rounded-full border border-[var(--border)] bg-[var(--surface-secondary)] px-2 py-1 text-xs font-medium text-[var(--muted)]">
             {autoRunBlockedLabel}
           </span>
@@ -1218,6 +1207,7 @@ function ContextPlanTab({
                                 });
                               }}
                               type="button"
+                              variant="ghost"
                             >
                               <ChevronRight
                                 aria-hidden="true"
