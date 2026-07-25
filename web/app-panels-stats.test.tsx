@@ -946,7 +946,7 @@ describe("app-panels-stats verification surfaces", () => {
       screen.getByText("No active plans for this workspace."),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Locate running plan" }),
+      screen.getByRole("button", { name: "Locate running or failed plan" }),
     ).toBeDisabled();
   });
 
@@ -1491,7 +1491,7 @@ describe("app-panels-stats verification surfaces", () => {
     });
     planListPanel!.scrollTop = 0;
     await userEvent.click(
-      screen.getByRole("button", { name: "Locate running plan" }),
+      screen.getByRole("button", { name: "Locate running or failed plan" }),
     );
     expect(planListPanel?.scrollTop).toBe(450);
     expect(screen.getByText("Ready scroll decoy")).toBeInTheDocument();
@@ -1502,6 +1502,179 @@ describe("app-panels-stats verification surfaces", () => {
           context.textContent?.includes("Running scroll target"),
       ),
     ).toBe(false);
+  });
+
+  it("locates a failed plan when no plan is running", async () => {
+    const failedPlan: Plan = {
+      ...planFixture,
+      activePhaseId: null,
+      id: "plan-failed-scroll",
+      sortOrder: 0,
+      status: "failed",
+      title: "Failed scroll target",
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [failedPlan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    const rect = (top: number, height: number) =>
+      ({
+        bottom: top + height,
+        height,
+        left: 0,
+        right: 320,
+        top,
+        width: 320,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return this.classList.contains("context-list-panel") ? 200 : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.classList.contains("context-list-panel")) {
+          return rect(0, 200);
+        }
+        if (this.textContent?.includes("Failed scroll target")) {
+          return rect(500, 100);
+        }
+        return rect(0, 0);
+      },
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByRole("tab", { name: "Plan" }));
+
+    const failedTitle = await screen.findByText("Failed scroll target");
+    const planListPanel = failedTitle.closest(
+      ".context-list-panel",
+    ) as HTMLElement | null;
+    expect(planListPanel).not.toBeNull();
+    const locateButton = screen.getByRole("button", {
+      name: "Locate running or failed plan",
+    });
+    expect(locateButton).toBeEnabled();
+    await waitFor(() => {
+      expect(planListPanel?.scrollTop).toBe(450);
+    });
+
+    planListPanel!.scrollTop = 0;
+    await userEvent.click(locateButton);
+    expect(planListPanel?.scrollTop).toBe(450);
+  });
+
+  it("prefers the running plan over a failed plan when locating", async () => {
+    const failedPlan: Plan = {
+      ...planFixture,
+      activePhaseId: null,
+      id: "plan-failed-decoy",
+      sortOrder: 0,
+      status: "failed",
+      title: "Failed scroll decoy",
+    };
+    const runningPlan: Plan = {
+      ...planFixture,
+      id: "plan-running-target",
+      sortOrder: 1,
+      status: "running",
+      title: "Running priority target",
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/plans") {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [failedPlan, runningPlan],
+            totalCount: 2,
+            totalPages: 1,
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+
+    const rect = (top: number, height: number) =>
+      ({
+        bottom: top + height,
+        height,
+        left: 0,
+        right: 320,
+        top,
+        width: 320,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      }) as DOMRect;
+    vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+      function (this: HTMLElement) {
+        return this.classList.contains("context-list-panel") ? 200 : 0;
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        if (this.classList.contains("context-list-panel")) {
+          return rect(0, 200);
+        }
+        if (this.textContent?.includes("Failed scroll decoy")) {
+          return rect(300, 100);
+        }
+        if (this.textContent?.includes("Running priority target")) {
+          return rect(700, 100);
+        }
+        return rect(0, 0);
+      },
+    );
+
+    renderApp();
+    await userEvent.click(await screen.findByRole("tab", { name: "Plan" }));
+
+    const runningTitle = await screen.findByText("Running priority target");
+    const planListPanel = runningTitle.closest(
+      ".context-list-panel",
+    ) as HTMLElement | null;
+    expect(planListPanel).not.toBeNull();
+    expect(screen.getByText("Failed scroll decoy")).toBeInTheDocument();
+    await waitFor(() => {
+      expect(planListPanel?.scrollTop).toBe(650);
+    });
+
+    planListPanel!.scrollTop = 0;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Locate running or failed plan" }),
+    );
+    expect(planListPanel?.scrollTop).toBe(650);
   });
 
   it("hides the Plan locate label only under the phone breakpoint", () => {

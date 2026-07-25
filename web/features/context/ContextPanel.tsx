@@ -33,6 +33,7 @@ import {
 } from "lucide-react";
 import {
   memo,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -785,11 +786,14 @@ function ContextPlanTab({
                 : "Auto run paused after a scheduler error",
       )
     : null;
-  const runningPlan = plans.find((plan) => plan.status === "running") ?? null;
-  const runningPlanId = runningPlan?.id ?? null;
-  const runningPlanArticleRef = useRef<HTMLElement | null>(null);
+  const locatablePlan =
+    plans.find((plan) => plan.status === "running") ??
+    plans.find((plan) => plan.status === "failed") ??
+    null;
+  const locatablePlanId = locatablePlan?.id ?? null;
+  const locatablePlanArticleRef = useRef<HTMLElement | null>(null);
   const planListPanelRef = useRef<HTMLDivElement | null>(null);
-  const lastScrolledRunningPlanId = useRef<string | null>(null);
+  const lastScrolledLocatablePlanId = useRef<string | null>(null);
   const [draggedPlanId, setDraggedPlanId] = useState<string | null>(null);
   const [planOrderPreview, setPlanOrderPreview] = useState<string[] | null>(null);
   const planOrderPreviewRef = useRef<string[] | null>(null);
@@ -864,46 +868,16 @@ function ContextPlanTab({
     clearPlanOrderDrag();
   };
 
-  useEffect(() => {
-    if (!runningPlanId) {
-      lastScrolledRunningPlanId.current = null;
-      return;
-    }
-    if (lastScrolledRunningPlanId.current === runningPlanId) {
-      return;
-    }
-
-    const animationFrameId = window.requestAnimationFrame(() => {
-      const planListPanel = planListPanelRef.current;
-      const runningPlanArticle = runningPlanArticleRef.current;
-      if (!planListPanel || !runningPlanArticle) {
-        return;
-      }
-
-      const containerRect = planListPanel.getBoundingClientRect();
-      const articleRect = runningPlanArticle.getBoundingClientRect();
-      // ponytail: one-shot centering for the plain list; switch to the virtual list API if this panel virtualizes.
-      planListPanel.scrollTop = Math.max(
-        0,
-        planListPanel.scrollTop +
-          articleRect.top -
-          containerRect.top -
-          (planListPanel.clientHeight - articleRect.height) / 2,
-      );
-      lastScrolledRunningPlanId.current = runningPlanId;
-    });
-
-    return () => window.cancelAnimationFrame(animationFrameId);
-  }, [runningPlanId]);
-
-  const locateRunningPlan = () => {
+  const centerLocatablePlan = useCallback(() => {
     const planListPanel = planListPanelRef.current;
-    const runningPlanArticle = runningPlanArticleRef.current;
-    if (!planListPanel || !runningPlanArticle) {
+    const locatablePlanArticle = locatablePlanArticleRef.current;
+    if (!planListPanel || !locatablePlanArticle) {
       return;
     }
+
     const containerRect = planListPanel.getBoundingClientRect();
-    const articleRect = runningPlanArticle.getBoundingClientRect();
+    const articleRect = locatablePlanArticle.getBoundingClientRect();
+    // ponytail: one-shot centering for the plain list; switch to the virtual list API if this panel virtualizes.
     planListPanel.scrollTop = Math.max(
       0,
       planListPanel.scrollTop +
@@ -911,7 +885,24 @@ function ContextPlanTab({
         containerRect.top -
         (planListPanel.clientHeight - articleRect.height) / 2,
     );
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!locatablePlanId) {
+      lastScrolledLocatablePlanId.current = null;
+      return;
+    }
+    if (lastScrolledLocatablePlanId.current === locatablePlanId) {
+      return;
+    }
+
+    const animationFrameId = window.requestAnimationFrame(() => {
+      centerLocatablePlan();
+      lastScrolledLocatablePlanId.current = locatablePlanId;
+    });
+
+    return () => window.cancelAnimationFrame(animationFrameId);
+  }, [centerLocatablePlan, locatablePlanId]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -942,10 +933,10 @@ function ContextPlanTab({
           </span>
         ) : null}
         <Button
-          aria-label={t("Locate running plan")}
+          aria-label={t("Locate running or failed plan")}
           className="plan-locate-button inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
-          isDisabled={!runningPlanId}
-          onPress={locateRunningPlan}
+          isDisabled={!locatablePlanId}
+          onPress={centerLocatablePlan}
           type="button"
           variant="ghost"
         >
@@ -1018,7 +1009,7 @@ function ContextPlanTab({
                   key={plan.id}
                   onDragOver={canReorderPlan ? (event) => handlePlanDragOver(event, plan) : undefined}
                   onDrop={canReorderPlan ? (event) => handlePlanDrop(event, plan) : undefined}
-                  ref={plan.id === runningPlanId ? runningPlanArticleRef : undefined}
+                  ref={plan.id === locatablePlanId ? locatablePlanArticleRef : undefined}
                 >
                   <div className="context-memory-item-header">
                     <div className="context-memory-badges">
