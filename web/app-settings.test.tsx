@@ -79,6 +79,23 @@ const userEvent = { ...userEventApi, selectOptions };
 describe("app-settings verification surfaces", () => {
   beforeEach(resetAppTestEnvironment);
 
+  it("uses the right settings column as the only primary scroll container", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    const settingsShell = settingsNav.closest(".settings-shell");
+    const settingsContent = screen.getByText("General settings").closest(".settings-content-scroll");
+
+    expect(settingsShell).not.toBeNull();
+    expect(settingsShell).not.toHaveClass("panel-scroll");
+    expect(settingsShell).not.toHaveClass("overflow-y-auto");
+    expect(settingsContent).not.toBeNull();
+    expect(settingsContent).toHaveClass("panel-scroll");
+    expect(settingsShell?.querySelectorAll(".settings-content-scroll.panel-scroll")).toHaveLength(1);
+    expect(settingsContent?.closest(".settings-shell")).toBe(settingsShell);
+  });
+
   it("shows settings sections for providers, models, MCP servers, and skills", async () => {
     renderApp();
 
@@ -974,11 +991,11 @@ describe("app-settings verification surfaces", () => {
 
     const specTable = within(specHistorySection as HTMLElement).getByRole("table");
     const specTableScroller = specTable.parentElement;
-    const settingsScroller = specTable.closest(".settings-shell") as HTMLElement | null;
+    const settingsScroller = specTable.closest(".settings-content-scroll") as HTMLElement | null;
     expect(specTableScroller).toHaveClass("overflow-x-auto");
     expect(settingsScroller).not.toBeNull();
     if (!specTableScroller || !settingsScroller) {
-      throw new Error("Expected Spec job history to live inside settings scroller");
+      throw new Error("Expected Spec job history to live inside settings content scroller");
     }
     settingsScroller.style.overflowY = "auto";
     Object.defineProperties(settingsScroller, {
@@ -2946,12 +2963,12 @@ describe("app-settings verification surfaces", () => {
     const dreamTable = screen.getByRole("table");
     expect(within(dreamTable).getByRole("columnheader", { name: "Actions" })).toBeInTheDocument();
     const dreamTableScroller = dreamTable.parentElement;
-    const settingsScroller = dreamTable.closest(".settings-shell") as HTMLElement | null;
+    const settingsScroller = dreamTable.closest(".settings-content-scroll") as HTMLElement | null;
     expect(dreamTableScroller).toHaveClass("overflow-x-auto");
     expect(dreamTableScroller).toHaveClass("settings-table-scroll");
     expect(settingsScroller).not.toBeNull();
     if (!dreamTableScroller || !settingsScroller) {
-      throw new Error("Expected Dream history to live inside settings scroller");
+      throw new Error("Expected Dream history to live inside settings content scroller");
     }
     settingsScroller.style.overflowY = "auto";
     Object.defineProperties(settingsScroller, {

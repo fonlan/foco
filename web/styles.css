@@ -3881,6 +3881,7 @@ body,
 
 .settings-layout {
   height: 100%;
+  min-height: 0;
   max-width: none;
   gap: 0;
   grid-template-columns: 14.5rem minmax(0, 1fr);
@@ -3968,7 +3969,7 @@ body,
   padding: 0.5rem;
 }
 
-.settings-layout > .min-w-0 {
+.settings-content-scroll {
   min-height: 0;
   overflow-y: auto;
   padding: 1rem;
@@ -4128,8 +4129,8 @@ body,
     min-width: max-content;
   }
 
-  .settings-layout > .min-w-0 {
-    flex: 1 1 auto;
+  .settings-content-scroll {
+    flex: 1 1 0;
     /* Match composer-shell: keep only a thin phone horizontal inset. */
     padding: 0.75rem 0.25rem;
   }
@@ -4669,7 +4670,7 @@ summary:focus-visible {
   color: var(--foreground);
 }
 
-.settings-layout > .min-w-0 {
+.settings-content-scroll {
   background: var(--background), var(--background);
 }
 
@@ -5123,7 +5124,7 @@ summary:focus-visible {
   /* Match .composer-shell: thin phone horizontal inset on global page bodies.
      Apply once on the page content shell — not also on .global-main-panel —
      so settings / skill store / stats / scheduled tasks do not stack padding. */
-  .settings-layout > .min-w-0,
+  .settings-content-scroll,
   .skill-store-page {
     padding-left: max(0.25rem, var(--foco-safe-left));
     padding-right: max(0.25rem, var(--foco-safe-right));

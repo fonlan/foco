@@ -5334,7 +5334,7 @@ export function SettingsPanel({
 
 
   return (
-    <div className="settings-shell panel-scroll min-h-0 flex-1 overflow-y-auto">
+    <div className="settings-shell min-h-0 flex-1">
       {modelTestToast ? (
         <div
           aria-live={modelTestToast.kind === "success" ? "polite" : "assertive"}
@@ -5466,7 +5466,7 @@ export function SettingsPanel({
           </nav>
         </aside>
 
-        <div className="min-w-0 flex flex-col gap-5">
+        <div className="settings-content-scroll panel-scroll min-w-0 flex flex-col gap-5">
           <section className="rounded-2xl border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_75%,transparent)] px-4 py-4 shadow-[var(--overlay-shadow)]">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="min-w-0">
