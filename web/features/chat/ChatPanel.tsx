@@ -3702,7 +3702,7 @@ function ToolCallBlock({
             </div>
             <Button
               aria-label={toggleLabel}
-              className="shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0.5 text-[11px] font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+              className="h-5 min-h-0 shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0 text-[11px] leading-4 font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
               onPress={() =>
                 setViewMode(viewMode === "compact" ? "raw" : "compact")
               }

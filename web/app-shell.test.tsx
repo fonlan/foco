@@ -698,12 +698,15 @@ describe("app-shell verification surfaces", () => {
 
     const rawButton = within(assistantBubble).getByRole("button", { name: "原始" });
     expect(rawButton).toHaveTextContent("原始");
+    expect(rawButton).toHaveClass("h-5", "min-h-0", "py-0", "leading-4");
 
     await userEvent.click(rawButton);
 
-    expect(within(assistantBubble).getByRole("button", { name: "精简" })).toHaveTextContent(
+    const compactButton = within(assistantBubble).getByRole("button", { name: "精简" });
+    expect(compactButton).toHaveTextContent(
       "精简",
     );
+    expect(compactButton).toHaveClass("h-5", "min-h-0", "py-0", "leading-4");
   });
 
   it("opens API statistics filtered to the assistant reply request", async () => {
