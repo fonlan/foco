@@ -481,7 +481,7 @@ fn web_search_definition() -> ToolDefinition {
 fn web_fetch_definition() -> ToolDefinition {
     ToolDefinition {
         name: WEB_FETCH_TOOL,
-        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. Large pages use the shared soft output budget (~50KiB / 2,000 lines) and ~128KiB complete envelope hard limit: when over the soft budget the tool succeeds (is_error=false) with an explicit complete-line prefix of the readable text (truncated=true, nextStartLine, note) and saves the full credential-free readable result under the tool execution workspace `.foco/web-results/` as fullResultPath (local sessions write the local workspace; SSH sessions transfer via broker into the sidecar workspace so fullResultPath is readable by a later read_file). Prefer continuing with nextStartLine or read_file on fullResultPath rather than assuming mid-line cuts. Optional startLine/endLine still select a 1-based inclusive slice of the readable text before the shared complete-line soft cap applies. Field names truncated, nextStartLine, fullResultPath, and note are identical for local and SSH paths. A single complete line that cannot fit the hard envelope is a recoverable error; a single line over soft but under hard is returned fully with truncated when more remains, or softBudgetExceeded=true with truncated=false and no nextStartLine when that line is the entire content. SKILL.md integrity rules do not apply to web tools.",
+        description: "Fetch an HTTP or HTTPS URL and return readable text content with basic page metadata. Large pages use the shared soft output budget (~50KiB / 2,000 lines) and ~128KiB complete envelope hard limit: when over the soft budget the tool succeeds (is_error=false) with an explicit complete-line prefix of the readable text (truncated=true, nextStartLine, note) and saves the full credential-free readable result under the tool execution workspace `.foco/web-results/` as fullResultPath (local sessions write the local workspace; SSH sessions transfer via broker into the sidecar workspace so fullResultPath is readable by a later read_file). Prefer continuing with nextStartLine or read_file on fullResultPath rather than assuming mid-line cuts. Optional startLine/endLine only select a 1-based inclusive slice of already-downloaded readable text; they do not reduce network download time or response size. For a request or response-body timeout, retry with a valid larger timeoutMs or use a more direct/smaller source rather than only narrowing the line range. Field names truncated, nextStartLine, fullResultPath, and note are identical for local and SSH paths. A single complete line that cannot fit the hard envelope is a recoverable error; a single line over soft but under hard is returned fully with truncated when more remains, or softBudgetExceeded=true with truncated=false and no nextStartLine when that line is the entire content. SKILL.md integrity rules do not apply to web tools.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -502,7 +502,9 @@ fn web_fetch_definition() -> ToolDefinition {
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
-                    "description": "Optional tool timeout in milliseconds. Defaults to 15000."
+                    "minimum": 1,
+                    "maximum": 120000,
+                    "description": "Optional HTTP request timeout in milliseconds. Valid range is 1-120000; defaults to 15000. On a request or response-body timeout, retry with a larger valid timeoutMs or use a more direct/smaller source."
                 }
             },
             "required": ["url", "startLine", "endLine", "timeoutMs"]
@@ -1408,6 +1410,27 @@ mod tests {
         assert_eq!(
             definition.input_schema["properties"]["timeoutMs"]["type"],
             json!(["integer", "null"])
+        );
+    }
+
+    #[test]
+    fn web_fetch_schema_documents_timeout_bounds_and_line_range_behavior() {
+        let definition = web_fetch_definition();
+        let timeout = &definition.input_schema["properties"]["timeoutMs"];
+
+        assert_eq!(timeout["minimum"], json!(1));
+        assert_eq!(timeout["maximum"], json!(120_000));
+        assert!(
+            timeout["description"]
+                .as_str()
+                .expect("timeout description")
+                .contains("1-120000"),
+        );
+        assert!(
+            definition
+                .description
+                .contains("do not reduce network download time")
+                && definition.description.contains("response-body timeout"),
         );
     }
 }

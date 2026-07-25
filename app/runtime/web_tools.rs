@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -36,6 +37,10 @@ const DEFAULT_WEB_SEARCH_RESULT_LIMIT: usize = 5;
 const MAX_WEB_SEARCH_RESULT_LIMIT: usize = 10;
 const MAX_WEB_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const FOCO_WEB_USER_AGENT: &str = "Foco/0.1";
+const WEB_FETCH_REDIRECT_LIMIT: usize = 5;
+const WEB_FETCH_MAX_CAUSE_DEPTH: usize = 4;
+const WEB_FETCH_MAX_CAUSE_CHARS: usize = 480;
+const WEB_FETCH_MAX_SINGLE_CAUSE_CHARS: usize = 240;
 
 /// Workspace-relative cache directory for large web tool results (credential-free).
 const WEB_RESULTS_DIR: &str = "web-results";
@@ -660,7 +665,9 @@ async fn tavily_search(
         .await
         .map_err(|source| format!("Tavily search request failed: {source}"))?;
     let status = response.status();
-    let body_bytes = read_web_response_body_limited(response, "Tavily search").await?;
+    let body_bytes = read_web_response_body_limited(response, "Tavily search")
+        .await
+        .map_err(|source| source.into_context_message("Tavily search"))?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
     if !status.is_success() {
         return Err(format_web_status_error("Tavily search", status, &body));
@@ -714,7 +721,9 @@ async fn brave_search(
         .await
         .map_err(|source| format!("Brave search request failed: {source}"))?;
     let status = response.status();
-    let body_bytes = read_web_response_body_limited(response, "Brave search").await?;
+    let body_bytes = read_web_response_body_limited(response, "Brave search")
+        .await
+        .map_err(|source| source.into_context_message("Brave search"))?;
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
     if !status.is_success() {
         return Err(format_web_status_error("Brave search", status, &body));
@@ -760,14 +769,14 @@ async fn execute_web_fetch(
     let client = reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(FOCO_WEB_USER_AGENT)
-        .redirect(reqwest::redirect::Policy::limited(5))
+        .redirect(reqwest::redirect::Policy::limited(WEB_FETCH_REDIRECT_LIMIT))
         .build()
-        .map_err(|source| format!("failed to create web_fetch HTTP client: {source}"))?;
-    let response = client
-        .get(url.clone())
-        .send()
-        .await
-        .map_err(|source| format!("web_fetch request failed: {source}"))?;
+        .map_err(|source| {
+            format_web_fetch_request_error(&url, timeout, WebFetchErrorStage::Request, &source)
+        })?;
+    let response = client.get(url.clone()).send().await.map_err(|source| {
+        format_web_fetch_request_error(&url, timeout, WebFetchErrorStage::Request, &source)
+    })?;
     let final_url = response.url().to_string();
     let status = response.status();
     let content_type = response
@@ -776,7 +785,17 @@ async fn execute_web_fetch(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     // Bound both success and error bodies (incl. chunked 4xx/5xx without Content-Length).
-    let bytes = read_web_response_body_limited(response, "web_fetch").await?;
+    let bytes = read_web_response_body_limited(response, "web_fetch")
+        .await
+        .map_err(|source| match source {
+            WebResponseBodyReadError::Transport(source) => format_web_fetch_request_error(
+                &url,
+                timeout,
+                WebFetchErrorStage::ResponseBody,
+                &source,
+            ),
+            WebResponseBodyReadError::Message(message) => message,
+        })?;
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
         return Err(format_web_status_error("web_fetch", status, &body));
@@ -1580,6 +1599,235 @@ fn parse_fetch_url(value: &str) -> Result<reqwest::Url, String> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum WebFetchErrorStage {
+    Request,
+    ResponseBody,
+}
+
+impl WebFetchErrorStage {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Request => "request",
+            Self::ResponseBody => "response-body",
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum WebFetchRequestErrorKind {
+    Timeout,
+    Connect,
+    Redirect,
+    Request,
+    Unknown,
+}
+
+impl WebFetchRequestErrorKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connect => "connect",
+            Self::Redirect => "redirect",
+            Self::Request => "request",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+fn classify_web_fetch_request_error(error: &reqwest::Error) -> WebFetchRequestErrorKind {
+    if error.is_timeout() {
+        WebFetchRequestErrorKind::Timeout
+    } else if error.is_connect() {
+        WebFetchRequestErrorKind::Connect
+    } else if error.is_redirect() {
+        WebFetchRequestErrorKind::Redirect
+    } else if error.is_builder() || error.is_request() {
+        WebFetchRequestErrorKind::Request
+    } else {
+        WebFetchRequestErrorKind::Unknown
+    }
+}
+
+fn format_web_fetch_request_error(
+    url: &reqwest::Url,
+    timeout: Duration,
+    stage: WebFetchErrorStage,
+    error: &reqwest::Error,
+) -> String {
+    let kind = classify_web_fetch_request_error(error);
+    let target = safe_web_fetch_target(url);
+    let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX));
+    let prefix = format!(
+        "web_fetch request failed [kind={}, stage={}] for {target}.",
+        kind.label(),
+        stage.label()
+    );
+    let cause = web_fetch_error_causes(error);
+
+    let detail = match kind {
+        WebFetchRequestErrorKind::Timeout => format!(
+            " Request timeout budget: {timeout_ms} ms (maximum {MAX_WEB_TOOL_TIMEOUT_MS} ms). Action: retry the request or increase timeoutMs within 1-{MAX_WEB_TOOL_TIMEOUT_MS} ms; a more direct or smaller source may also help."
+        ),
+        WebFetchRequestErrorKind::Connect => {
+            " Action: check DNS, TCP connectivity, TLS certificates, or proxy configuration; retry or use a direct/alternative URL.".to_string()
+        }
+        WebFetchRequestErrorKind::Redirect => format!(
+            " Redirect policy follows at most {WEB_FETCH_REDIRECT_LIMIT} redirects. Action: use a direct or final URL instead of a redirect chain."
+        ),
+        WebFetchRequestErrorKind::Request => {
+            " Action: verify the URL and request settings, then retry or use a direct/alternative URL.".to_string()
+        }
+        WebFetchRequestErrorKind::Unknown => {
+            " Action: retry once; if it persists, check network, DNS, TLS, and proxy settings or use an alternative URL.".to_string()
+        }
+    };
+
+    match cause {
+        Some(cause) => format!("{prefix} Cause: {cause}.{detail}"),
+        None => format!("{prefix}{detail}"),
+    }
+}
+
+fn safe_web_fetch_target(url: &reqwest::Url) -> String {
+    url.origin().ascii_serialization()
+}
+
+fn web_fetch_error_causes(error: &(dyn Error + 'static)) -> Option<String> {
+    let mut causes = Vec::new();
+    let mut source = error.source();
+    let mut visited_sources = 0;
+    while let Some(current) = source {
+        if visited_sources >= WEB_FETCH_MAX_CAUSE_DEPTH {
+            break;
+        }
+        visited_sources += 1;
+        let message = sanitize_web_fetch_diagnostic_text(&bounded_web_fetch_error_display(current));
+        if !message.is_empty() && !causes.iter().any(|existing| existing == &message) {
+            causes.push(message);
+        }
+        source = current.source();
+    }
+
+    format_web_fetch_cause_chain(causes)
+}
+
+fn bounded_web_fetch_error_display(error: &(dyn Error + 'static)) -> String {
+    let mut writer = BoundedWebFetchDiagnosticWriter::new(WEB_FETCH_MAX_SINGLE_CAUSE_CHARS);
+    let _ = std::fmt::write(&mut writer, format_args!("{error}"));
+    writer.into_string()
+}
+
+struct BoundedWebFetchDiagnosticWriter {
+    output: String,
+    max_chars: usize,
+}
+
+impl BoundedWebFetchDiagnosticWriter {
+    fn new(max_chars: usize) -> Self {
+        Self {
+            output: String::new(),
+            max_chars,
+        }
+    }
+
+    fn into_string(self) -> String {
+        self.output
+    }
+}
+
+impl std::fmt::Write for BoundedWebFetchDiagnosticWriter {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        let available = self.max_chars.saturating_sub(self.output.chars().count());
+        if available == 0 {
+            return Err(std::fmt::Error);
+        }
+
+        let mut characters = value.chars();
+        for _ in 0..available {
+            let Some(character) = characters.next() else {
+                return Ok(());
+            };
+            self.output.push(character);
+        }
+
+        if characters.next().is_some() {
+            Err(std::fmt::Error)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn format_web_fetch_cause_chain(causes: Vec<String>) -> Option<String> {
+    if causes.is_empty() {
+        return None;
+    }
+
+    let mut output = String::new();
+    for cause in causes {
+        let separator = if output.is_empty() { "" } else { " -> " };
+        let remaining = WEB_FETCH_MAX_CAUSE_CHARS.saturating_sub(output.chars().count());
+        if remaining <= separator.chars().count() {
+            break;
+        }
+        output.push_str(separator);
+        let available = remaining - separator.chars().count();
+        if cause.chars().count() > available {
+            output.extend(cause.chars().take(available.saturating_sub(1)));
+            output.push('…');
+            break;
+        }
+        output.push_str(&cause);
+    }
+    Some(output)
+}
+
+fn sanitize_web_fetch_diagnostic_text(value: &str) -> String {
+    let without_urls = redact_web_fetch_url_tokens(value);
+    without_urls
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn redact_web_fetch_url_tokens(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut remaining = value;
+    while let Some(start) = find_web_fetch_url_start(remaining) {
+        output.push_str(&remaining[..start]);
+        let token_end = remaining[start..]
+            .find(char::is_whitespace)
+            .map(|offset| start + offset)
+            .unwrap_or(remaining.len());
+        output.push_str("[URL]");
+        remaining = &remaining[token_end..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn find_web_fetch_url_start(value: &str) -> Option<usize> {
+    [b"http://".as_slice(), b"https://".as_slice()]
+        .into_iter()
+        .filter_map(|scheme| {
+            value
+                .as_bytes()
+                .windows(scheme.len())
+                .position(|candidate| candidate.eq_ignore_ascii_case(scheme))
+        })
+        .min()
+}
+
 fn parse_web_fetch_line_range(
     start_line: Option<usize>,
     end_line: Option<usize>,
@@ -1629,17 +1877,31 @@ fn format_web_status_error(context: &str, status: reqwest::StatusCode, body: &st
 /// Read an HTTP response body with the shared raw web response size ceiling.
 ///
 /// Applies to success and error statuses, including chunked transfers without Content-Length.
+enum WebResponseBodyReadError {
+    Transport(reqwest::Error),
+    Message(String),
+}
+
+impl WebResponseBodyReadError {
+    fn into_context_message(self, context: &str) -> String {
+        match self {
+            Self::Transport(source) => format!("failed to read {context} response: {source}"),
+            Self::Message(message) => message,
+        }
+    }
+}
+
 async fn read_web_response_body_limited(
     mut response: reqwest::Response,
     context: &str,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, WebResponseBodyReadError> {
     if response
         .content_length()
         .is_some_and(|length| length > MAX_WEB_FETCH_BYTES as u64)
     {
-        return Err(format!(
+        return Err(WebResponseBodyReadError::Message(format!(
             "{context} response is too large to read (max {MAX_WEB_FETCH_BYTES} bytes)"
-        ));
+        )));
     }
 
     let mut body = Vec::with_capacity(
@@ -1651,16 +1913,17 @@ async fn read_web_response_body_limited(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|source| format!("failed to read {context} response: {source}"))?
+        .map_err(WebResponseBodyReadError::Transport)?
     {
-        let next_len = body
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| format!("{context} response size overflowed while reading"))?;
+        let next_len = body.len().checked_add(chunk.len()).ok_or_else(|| {
+            WebResponseBodyReadError::Message(format!(
+                "{context} response size overflowed while reading"
+            ))
+        })?;
         if next_len > MAX_WEB_FETCH_BYTES {
-            return Err(format!(
+            return Err(WebResponseBodyReadError::Message(format!(
                 "{context} response is too large to read (exceeded {MAX_WEB_FETCH_BYTES} bytes)"
-            ));
+            )));
         }
         body.extend_from_slice(&chunk);
     }
@@ -1726,7 +1989,7 @@ fn truncate_chars(value: String, max_chars: usize) -> (String, bool) {
 mod tests {
     use super::*;
     use axum::Router;
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{Response, StatusCode, header};
     use axum::routing::get;
     use foco_tools::ToolExecution;
@@ -2871,6 +3134,239 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn execute_web_fetch_reports_request_timeout_without_leaking_url_credentials() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                "late"
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve");
+        });
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let timeout_ms = 25;
+        let url = format!("http://user:secret@{addr}/slow?access_token=hidden#private");
+        let err = execute_web_tool(
+            &WebSearchSettings::default(),
+            WEB_FETCH_TOOL,
+            json!({ "url": url, "timeoutMs": timeout_ms }),
+            Duration::from_millis(timeout_ms),
+            workspace.path(),
+        )
+        .await
+        .expect_err("request timeout");
+
+        assert!(err.contains("[kind=timeout, stage=request]"), "{err}");
+        assert!(
+            err.contains("Request timeout budget: 25 ms (maximum 120000 ms)")
+                && err.contains("increase timeoutMs within 1-120000 ms"),
+            "{err}"
+        );
+        assert!(err.contains(&format!("for http://{addr}.")), "{err}");
+        assert!(
+            !err.contains("user:secret")
+                && !err.contains("access_token=hidden")
+                && !err.contains("private"),
+            "{err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn execute_web_fetch_reports_response_body_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let app = Router::new().route(
+            "/slow-body",
+            get(|| async {
+                let body = async_stream::stream! {
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"first chunk"));
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    yield Ok::<_, std::io::Error>(Bytes::from_static(b"late chunk"));
+                };
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/plain")
+                    .body(Body::from_stream(body))
+                    .expect("response")
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve");
+        });
+
+        let workspace = tempfile::tempdir().expect("workspace");
+        let timeout_ms = 50;
+        let err = execute_web_tool(
+            &WebSearchSettings::default(),
+            WEB_FETCH_TOOL,
+            json!({ "url": format!("http://{addr}/slow-body"), "timeoutMs": timeout_ms }),
+            Duration::from_millis(timeout_ms),
+            workspace.path(),
+        )
+        .await
+        .expect_err("body timeout");
+
+        assert!(err.contains("[kind=timeout, stage=response-body]"), "{err}");
+        assert!(
+            err.contains("increase timeoutMs within 1-120000 ms"),
+            "{err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn execute_web_fetch_reports_connect_and_redirect_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let refused_addr = listener.local_addr().expect("addr");
+        drop(listener);
+        let workspace = tempfile::tempdir().expect("workspace");
+        let connect_err = execute_web_tool(
+            &WebSearchSettings::default(),
+            WEB_FETCH_TOOL,
+            json!({ "url": format!("http://{refused_addr}/"), "timeoutMs": 1_000 }),
+            Duration::from_secs(1),
+            workspace.path(),
+        )
+        .await
+        .expect_err("connection refused");
+        assert!(
+            connect_err.contains("[kind=connect, stage=request]"),
+            "{connect_err}"
+        );
+        assert!(
+            connect_err.contains("DNS, TCP connectivity, TLS certificates, or proxy configuration"),
+            "{connect_err}"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let app = Router::new().route(
+            "/loop",
+            get(|| async {
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(header::LOCATION, "/loop")
+                    .body(Body::empty())
+                    .expect("response")
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+                .expect("serve");
+        });
+
+        let redirect_err = execute_web_tool(
+            &WebSearchSettings::default(),
+            WEB_FETCH_TOOL,
+            json!({ "url": format!("http://{addr}/loop"), "timeoutMs": 1_000 }),
+            Duration::from_secs(1),
+            workspace.path(),
+        )
+        .await
+        .expect_err("redirect loop");
+        assert!(
+            redirect_err.contains("[kind=redirect, stage=request]"),
+            "{redirect_err}"
+        );
+        assert!(
+            redirect_err.contains("Redirect policy follows at most 5 redirects")
+                && redirect_err.contains("direct or final URL"),
+            "{redirect_err}"
+        );
+
+        let _ = shutdown_tx.send(());
+        let _ = server.await;
+    }
+
+    #[test]
+    fn web_fetch_diagnostic_sanitizes_url_tokens_and_bounds_controlled_causes() {
+        let cause = format!(
+            "connection to HTTP://user:secret@example.test/path?access_token=hidden#private\n{}",
+            "x".repeat(WEB_FETCH_MAX_CAUSE_CHARS + 100)
+        );
+        let sanitized = sanitize_web_fetch_diagnostic_text(&cause);
+
+        assert!(
+            sanitized.contains("connection to [URL]")
+                && !sanitized.contains("secret")
+                && !sanitized.contains("access_token")
+                && !sanitized.contains('\n'),
+            "{sanitized}"
+        );
+        let bounded = format_web_fetch_cause_chain(vec![sanitized.clone(), sanitized])
+            .expect("non-empty cause chain");
+        assert!(
+            bounded.chars().count() <= WEB_FETCH_MAX_CAUSE_CHARS && bounded.ends_with('…'),
+            "{bounded}"
+        );
+    }
+
+    #[test]
+    fn web_fetch_diagnostic_limits_source_visits_before_deduplication() {
+        #[derive(Debug)]
+        struct TestCause {
+            message: &'static str,
+            source: Option<Box<Self>>,
+        }
+
+        impl std::fmt::Display for TestCause {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.message)
+            }
+        }
+
+        impl Error for TestCause {
+            fn source(&self) -> Option<&(dyn Error + 'static)> {
+                self.source
+                    .as_deref()
+                    .map(|source| source as &(dyn Error + 'static))
+            }
+        }
+
+        let deepest = TestCause {
+            message: "must-not-appear",
+            source: None,
+        };
+        let chain = (0..=WEB_FETCH_MAX_CAUSE_DEPTH).fold(deepest, |source, _| TestCause {
+            message: "duplicate",
+            source: Some(Box::new(source)),
+        });
+        let causes = web_fetch_error_causes(&chain).expect("cause chain");
+
+        assert!(
+            causes.contains("duplicate") && !causes.contains("must-not-appear"),
+            "{causes}"
+        );
     }
 
     #[test]
