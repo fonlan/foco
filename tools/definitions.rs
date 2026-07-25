@@ -1165,7 +1165,7 @@ fn run_command_definition() -> ToolDefinition {
                 },
                 "cwd": {
                     "type": ["string", "null"],
-                    "description": "Optional workspace-relative working directory. Defaults to the workspace root."
+                    "description": "Optional working directory. Use a workspace-relative directory, or an absolute directory within the current execution workspace (including its root or subdirectories). Defaults to the workspace root; paths outside the workspace are not supported."
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],

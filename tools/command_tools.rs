@@ -33,7 +33,7 @@ pub(crate) fn run_command(
     let command = request.command.trim();
     let args = request.args.unwrap_or_default();
     let cwd = match request.cwd.as_deref() {
-        Some(cwd) => resolve_workspace_path(workspace_path, cwd)?,
+        Some(cwd) => resolve_command_cwd(workspace_path, cwd)?,
         None => fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
             path: workspace_path.to_path_buf(),
             source,
@@ -123,6 +123,30 @@ pub(crate) fn run_command(
         result["retryUnsafe"] = Value::Bool(true);
     }
     Ok(result)
+}
+
+fn resolve_command_cwd(workspace_path: &Path, input: &str) -> Result<PathBuf, ToolRuntimeError> {
+    let trimmed = input.trim();
+    if !Path::new(trimmed).is_absolute() {
+        return resolve_workspace_path(workspace_path, input);
+    }
+
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+    let cwd = fs::canonicalize(trimmed).map_err(|source| ToolRuntimeError::Io {
+        path: PathBuf::from(trimmed),
+        source,
+    })?;
+
+    if !cwd.starts_with(&workspace) {
+        return Err(ToolRuntimeError::InvalidPath(format!(
+            "command cwd is outside the execution workspace: {trimmed}"
+        )));
+    }
+
+    Ok(cwd)
 }
 
 pub(crate) fn get_command_output(
@@ -754,6 +778,78 @@ struct SleepInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn command_cwd_resolves_absolute_workspace_root_to_canonical_path() {
+        let workspace = tempdir().expect("workspace");
+        let expected = fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let cwd = resolve_command_cwd(
+            workspace.path(),
+            workspace.path().to_str().expect("UTF-8 workspace path"),
+        )
+        .expect("resolve absolute workspace root");
+
+        assert_eq!(cwd, expected);
+    }
+
+    #[test]
+    fn command_cwd_resolves_absolute_workspace_subdirectory_to_canonical_path() {
+        let workspace = tempdir().expect("workspace");
+        let subdirectory = workspace.path().join("nested");
+        fs::create_dir(&subdirectory).expect("create subdirectory");
+        let expected = fs::canonicalize(&subdirectory).expect("canonical subdirectory");
+        let cwd = resolve_command_cwd(
+            workspace.path(),
+            subdirectory.to_str().expect("UTF-8 subdirectory path"),
+        )
+        .expect("resolve absolute workspace subdirectory");
+
+        assert_eq!(cwd, expected);
+    }
+
+    #[test]
+    fn command_cwd_resolves_relative_directory() {
+        let workspace = tempdir().expect("workspace");
+        let subdirectory = workspace.path().join("nested");
+        fs::create_dir(&subdirectory).expect("create subdirectory");
+        let expected = fs::canonicalize(&subdirectory).expect("canonical subdirectory");
+        let cwd = resolve_command_cwd(workspace.path(), "nested")
+            .expect("resolve relative workspace subdirectory");
+
+        assert_eq!(cwd, expected);
+    }
+
+    #[test]
+    fn command_cwd_rejects_absolute_directory_outside_workspace() {
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside directory");
+        let error = resolve_command_cwd(
+            workspace.path(),
+            outside.path().to_str().expect("UTF-8 outside path"),
+        )
+        .expect_err("outside cwd must be rejected");
+
+        assert!(matches!(error, ToolRuntimeError::InvalidPath(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_cwd_rejects_workspace_symlink_that_resolves_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempdir().expect("workspace");
+        let outside = tempdir().expect("outside directory");
+        let symlink_path = workspace.path().join("outside-link");
+        symlink(outside.path(), &symlink_path).expect("create outside symlink");
+        let error = resolve_command_cwd(
+            workspace.path(),
+            symlink_path.to_str().expect("UTF-8 symlink path"),
+        )
+        .expect_err("symlink cwd escaping workspace must be rejected");
+
+        assert!(matches!(error, ToolRuntimeError::InvalidPath(_)));
+    }
 
     #[test]
     fn paginated_command_output_keeps_the_first_unreturned_chunk_reachable() {
