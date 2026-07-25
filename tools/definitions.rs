@@ -380,7 +380,7 @@ fn graph_related_files_definition() -> ToolDefinition {
 fn graph_explore_definition() -> ToolDefinition {
     ToolDefinition {
         name: GRAPH_EXPLORE_TOOL,
-        description: "Default code graph tool for source context: find indexed code graph symbols and return matching source snippets with real 1-based line numbers. Use this instead of graph_find_symbols plus read_file when you need code for a symbol or likely target. Snippet collection stops at whole-snippet boundaries under the shared soft output budget (~50 KiB); lower limit or contextLines when truncated.",
+        description: "Default code graph tool for source context: find indexed code graph symbols and return matching source snippets with real 1-based line numbers. Use this instead of graph_find_symbols plus read_file when you need code for a symbol or likely target. limit controls only the first preview. When results are truncated by limit or the shared soft output budget, the response provides totalCount, fullResultPath, and nextStartLine; use read_file on that workspace-local plain-text snapshot starting at nextStartLine to continue. If complete collection reaches its safety limit, refine the query instead.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

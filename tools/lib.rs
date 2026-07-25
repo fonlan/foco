@@ -116,6 +116,7 @@ const MAX_GRAPH_EXPLORE_RESULT_LIMIT: usize = 20;
 const DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES: usize = 2;
 const MAX_GRAPH_EXPLORE_CONTEXT_LINES: usize = 20;
 const MAX_GRAPH_EXPLORE_SYMBOL_LINES: usize = 240;
+/// Hard bound for graph_explore's complete snippet collection before it may publish a snapshot.
 const MAX_GRAPH_EXPLORE_OUTPUT_BYTES: usize = 512 * 1024;
 const DEFAULT_FILE_TOOL_TIMEOUT_MS: u64 = 5_000;
 const DEFAULT_GRAPH_TOOL_TIMEOUT_MS: u64 = 10_000;
@@ -3998,6 +3999,148 @@ mod tests {
     }
 
     #[test]
+    fn graph_explore_limit_writes_complete_snapshot_with_line_continuation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        insert_graph_explore_snapshot_fixture(workspace.path());
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({
+                "query": "helper",
+                "kind": "function",
+                "limit": 1,
+                "contextLines": 0,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["totalCount"], 3);
+        assert_eq!(result.output["returnedCount"], 1);
+        assert_eq!(result.output["snippets"][0]["path"], "a.rs");
+        let full_result_path = result.output["fullResultPath"]
+            .as_str()
+            .expect("full result path");
+        assert!(full_result_path.starts_with(".foco/graph-results/"));
+        let next_start_line = result.output["nextStartLine"]
+            .as_u64()
+            .expect("next start line") as usize;
+        let snapshot = fs::read_to_string(workspace.path().join(full_result_path))
+            .expect("read graph snapshot");
+        assert!(
+            snapshot
+                .lines()
+                .nth(next_start_line - 1)
+                .is_some_and(|line| line == "=== graph_explore snippet 2 ==="),
+            "nextStartLine must start the next complete snippet record: {snapshot}"
+        );
+
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": full_result_path,
+                "startLine": next_start_line,
+                "endLine": next_start_line + 10,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!read_back.is_error, "{:?}", read_back.output);
+        assert!(
+            read_back.output["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("b_helper")),
+            "continuation should expose the second snippet: {:?}",
+            read_back.output
+        );
+    }
+
+    #[test]
+    fn graph_explore_complete_preview_does_not_create_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        insert_graph_explore_snapshot_fixture(workspace.path());
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({
+                "query": "helper",
+                "kind": "function",
+                "limit": 3,
+                "contextLines": 0,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], false);
+        assert_eq!(result.output["totalCount"], 3);
+        assert!(result.output.get("fullResultPath").is_none());
+        assert!(!workspace.path().join(".foco/graph-results").exists());
+    }
+
+    #[test]
+    fn graph_explore_collection_safety_limit_refuses_incomplete_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(workspace.path().join("many.rs"), "fn helper() {}\n").expect("write source");
+        let names = (0..1_001)
+            .map(|index| format!("helper_{index}"))
+            .collect::<Vec<_>>();
+        let symbols = names
+            .iter()
+            .map(|name| NewCodeGraphSymbol {
+                name,
+                qualified_name: name,
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(1),
+                end_column: Some(14),
+                signature: Some("fn helper()"),
+                documentation: None,
+            })
+            .collect::<Vec<_>>();
+        WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database")
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "many.rs",
+                language: Some("rust"),
+                size_bytes: Some(15),
+                modified_at: Some("2026-07-25T00:00:00.000Z"),
+                content_hash: "many-helpers",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "fn helper() {}",
+            })
+            .expect("graph index");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({
+                "query": "helper",
+                "limit": 1,
+                "contextLines": 0,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(result.is_error, "{:?}", result.output);
+        assert_error_contains(&result, "graph_explore collection incomplete");
+        assert!(result.output.get("totalCount").is_none());
+        assert!(result.output.get("fullResultPath").is_none());
+        assert!(!workspace.path().join(".foco/graph-results").exists());
+    }
+
+    #[test]
     fn writes_workspace_file() {
         let workspace = tempfile::tempdir().expect("workspace");
 
@@ -7521,5 +7664,46 @@ mod tests {
                 fts_body: "fn caller_entry() {}",
             })
             .expect("caller graph index");
+    }
+
+    fn insert_graph_explore_snapshot_fixture(workspace_path: &Path) {
+        let mut database = WorkspaceDatabase::open_or_create(workspace_path).expect("database");
+        for (path, name) in [
+            ("a.rs", "a_helper"),
+            ("b.rs", "b_helper"),
+            ("c.rs", "c_helper"),
+        ] {
+            let source = format!("fn {name}() {{\n    println!(\"{name}\");\n}}\n");
+            fs::write(workspace_path.join(path), &source).expect("write graph source");
+            let symbols = [NewCodeGraphSymbol {
+                name,
+                qualified_name: name,
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(3),
+                end_column: Some(1),
+                signature: Some("fn helper()"),
+                documentation: None,
+            }];
+            database
+                .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                    path,
+                    language: Some("rust"),
+                    size_bytes: Some(source.len() as i64),
+                    modified_at: Some("2026-07-25T00:00:00.000Z"),
+                    content_hash: path,
+                    parse_status: "parsed",
+                    parse_error_message: None,
+                    symbols: &symbols,
+                    imports: &[],
+                    references: &[],
+                    edges: &[],
+                    fts_body: &source,
+                })
+                .expect("graph index");
+        }
     }
 }

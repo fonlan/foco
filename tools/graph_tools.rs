@@ -1,4 +1,9 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use foco_store::workspace::{
     CodeGraphImportRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
@@ -7,9 +12,7 @@ use foco_store::workspace::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::output_budget::{
-    TOOL_OUTPUT_SOFT_BYTE_LIMIT, soft_limit_array_prefix_len_with_overhead,
-};
+use crate::output_budget::soft_limit_array_prefix_len_with_overhead;
 use crate::{
     DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES, DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT,
     DEFAULT_GRAPH_RESULT_LIMIT, DEFAULT_GRAPH_TOOL_TIMEOUT_MS, LineRange,
@@ -23,6 +26,11 @@ use crate::{
 
 const GRAPH_LIST_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
 const GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
+const GRAPH_EXPLORE_PAGE_SIZE: i64 = 100;
+const MAX_GRAPH_EXPLORE_COLLECTION_SYMBOLS: usize = 1_000;
+const GRAPH_RESULTS_DIR: &str = "graph-results";
+const MAX_GRAPH_RESULT_FILES: usize = 20;
+const GRAPH_RESULT_TTL: Duration = Duration::from_secs(60 * 60);
 
 pub(crate) fn graph_find_symbols(
     workspace_path: &Path,
@@ -265,46 +273,54 @@ pub(crate) fn graph_explore(
     let request: GraphExploreInput = parse_arguments(arguments)?;
     let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GRAPH_TOOL_TIMEOUT_MS)?;
     let context_lines = graph_explore_context_lines(request.context_lines)?;
+    let preview_limit = graph_explore_limit(request.limit)?;
     let database = open_code_graph_database(workspace_path)?;
-    let (symbols, query, path, truncated_matches) =
-        resolve_graph_explore_symbols(&database, &request)?;
-    let mut snippets = Vec::new();
-    let mut output_bytes = 0usize;
-    let mut output_truncated = false;
+    let (symbols, query, path) = resolve_graph_explore_symbols(&database, &request)?;
+    let snippets = collect_graph_explore_snippets(workspace_path, symbols, context_lines)?;
+    let total_count = snippets.len();
+    let preview_candidates = snippets
+        .iter()
+        .take(preview_limit)
+        .map(|snippet| snippet.value.clone())
+        .collect::<Vec<_>>();
+    let (preview, soft_truncated) =
+        soft_limit_preview_records(preview_candidates, GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES)?;
+    let returned_count = preview.len();
+    let truncated = returned_count < total_count;
 
-    for symbol in symbols {
-        let snippet = graph_symbol_source_snippet(workspace_path, symbol, context_lines)?;
-        let content_bytes = snippet["content"]
-            .as_str()
-            .map(str::len)
-            .unwrap_or_default();
-        // Keep domain collection under both the legacy explore ceiling and soft budget.
-        let soft_ceiling =
-            TOOL_OUTPUT_SOFT_BYTE_LIMIT.saturating_sub(GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES);
-        let hard_ceiling = MAX_GRAPH_EXPLORE_OUTPUT_BYTES.min(soft_ceiling);
-        if output_bytes.saturating_add(content_bytes) > hard_ceiling {
-            output_truncated = true;
-            break;
-        }
-        output_bytes = output_bytes.saturating_add(content_bytes);
-        snippets.push(snippet);
-    }
-
-    let (snippets, soft_truncated) =
-        soft_limit_preview_records(snippets, GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES)?;
-    let truncated = truncated_matches || output_truncated || soft_truncated;
-    let returned_count = snippets.len();
-
-    Ok(json!({
+    let mut output = json!({
         "query": query,
         "path": path,
         "contextLines": context_lines,
-        "snippets": snippets,
+        "snippets": preview,
         "truncated": truncated,
-        "outputTruncated": output_truncated || soft_truncated,
+        "outputTruncated": soft_truncated,
+        "totalCount": total_count,
         "returnedCount": returned_count,
         "timeoutMs": timeout_ms
-    }))
+    });
+
+    if truncated {
+        let snapshot = write_graph_explore_snapshot(workspace_path, &snippets)?;
+        let next_start_line = snapshot
+            .snippet_start_lines
+            .get(returned_count)
+            .copied()
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot continuation line".to_string(),
+                )
+            })?;
+        let full_result_path = graph_snapshot_text_relative_path(&snapshot.id);
+        output["nextOffset"] = json!(returned_count);
+        output["nextStartLine"] = json!(next_start_line);
+        output["fullResultPath"] = json!(full_result_path);
+        output["note"] = json!(format!(
+            "Results truncated: showing {returned_count} of {total_count} snippets. The complete stable snapshot is at '{full_result_path}'. Continue with read_file(path='{full_result_path}', startLine={next_start_line}, endLine=<small range>)."
+        ));
+    }
+
+    Ok(output)
 }
 
 fn open_code_graph_database(
@@ -376,15 +392,7 @@ fn resolve_graph_symbol(
 fn resolve_graph_explore_symbols(
     database: &WorkspaceDatabase,
     request: &GraphExploreInput,
-) -> Result<
-    (
-        Vec<CodeGraphSymbolRecord>,
-        Option<String>,
-        Option<String>,
-        bool,
-    ),
-    ToolRuntimeError,
-> {
+) -> Result<(Vec<CodeGraphSymbolRecord>, Option<String>, Option<String>), ToolRuntimeError> {
     let query = request
         .query
         .as_deref()
@@ -410,24 +418,305 @@ fn resolve_graph_explore_symbols(
                     "code graph symbol was not found: {symbol_id}"
                 ))
             })?;
-            Ok((vec![symbol], None, None, false))
+            Ok((vec![symbol], None, None))
         }
         (None, Some(query)) => {
-            let limit = graph_explore_limit(request.limit)?;
             let path = request
                 .path
                 .as_deref()
                 .map(normalize_workspace_path_text)
                 .transpose()?;
-            let mut symbols = database.find_code_graph_symbols(
+            let symbols = collect_graph_explore_symbols_pagewise(
+                database,
                 query,
                 request.kind.as_deref(),
                 path.as_deref(),
-                graph_query_limit(limit)?,
             )?;
-            let truncated = truncate_records(&mut symbols, limit);
-            Ok((symbols, Some(query.to_string()), path, truncated))
+            Ok((symbols, Some(query.to_string()), path))
         }
+    }
+}
+
+fn collect_graph_explore_symbols_pagewise(
+    database: &WorkspaceDatabase,
+    query: &str,
+    kind: Option<&str>,
+    path: Option<&str>,
+) -> Result<Vec<CodeGraphSymbolRecord>, ToolRuntimeError> {
+    let mut symbols = Vec::new();
+    let mut offset = 0_i64;
+
+    loop {
+        let page = database.find_code_graph_symbols_page(
+            query,
+            kind,
+            path,
+            GRAPH_EXPLORE_PAGE_SIZE,
+            offset,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+
+        for symbol in page {
+            if symbols.len() == MAX_GRAPH_EXPLORE_COLLECTION_SYMBOLS {
+                return Err(graph_explore_collection_incomplete_error(format!(
+                    "matched more than {MAX_GRAPH_EXPLORE_COLLECTION_SYMBOLS} symbols"
+                )));
+            }
+            symbols.push(symbol);
+        }
+
+        offset = offset.checked_add(GRAPH_EXPLORE_PAGE_SIZE).ok_or_else(|| {
+            graph_explore_collection_incomplete_error("pagination offset overflow".to_string())
+        })?;
+    }
+
+    Ok(symbols)
+}
+
+struct GraphExploreSnippet {
+    value: Value,
+}
+
+fn collect_graph_explore_snippets(
+    workspace_path: &Path,
+    symbols: Vec<CodeGraphSymbolRecord>,
+    context_lines: usize,
+) -> Result<Vec<GraphExploreSnippet>, ToolRuntimeError> {
+    let mut snippets = Vec::with_capacity(symbols.len());
+    let mut collection_bytes = 0usize;
+
+    for symbol in symbols {
+        let value = graph_symbol_source_snippet(workspace_path, symbol, context_lines)?;
+        let serialized_bytes = serde_json::to_vec(&value)
+            .map_err(|source| {
+                ToolRuntimeError::InvalidArguments(format!(
+                    "failed to serialize graph_explore snippet: {source}"
+                ))
+            })?
+            .len();
+        if collection_bytes.saturating_add(serialized_bytes) > MAX_GRAPH_EXPLORE_OUTPUT_BYTES {
+            return Err(graph_explore_collection_incomplete_error(format!(
+                "snippet data exceeds the {MAX_GRAPH_EXPLORE_OUTPUT_BYTES}-byte collection safety limit"
+            )));
+        }
+        collection_bytes = collection_bytes.saturating_add(serialized_bytes);
+        snippets.push(GraphExploreSnippet { value });
+    }
+
+    Ok(snippets)
+}
+
+fn graph_explore_collection_incomplete_error(detail: String) -> ToolRuntimeError {
+    ToolRuntimeError::InvalidArguments(format!(
+        "graph_explore collection incomplete: {detail}; refine query, kind, or path and try again"
+    ))
+}
+
+struct GraphExploreSnapshot {
+    id: String,
+    snippet_start_lines: Vec<usize>,
+}
+
+fn write_graph_explore_snapshot(
+    workspace_path: &Path,
+    snippets: &[GraphExploreSnippet],
+) -> Result<GraphExploreSnapshot, ToolRuntimeError> {
+    let results_dir = workspace_path.join(".foco").join(GRAPH_RESULTS_DIR);
+    fs::create_dir_all(&results_dir).map_err(|source| ToolRuntimeError::Io {
+        path: results_dir.clone(),
+        source,
+    })?;
+    prune_graph_results_dir(&results_dir);
+
+    let (contents, snippet_start_lines) = render_graph_explore_snapshot(snippets)?;
+    let id = next_graph_snapshot_id();
+    let path = results_dir.join(format!("{id}.txt"));
+    fs::write(&path, contents).map_err(|source| ToolRuntimeError::Io { path, source })?;
+
+    Ok(GraphExploreSnapshot {
+        id,
+        snippet_start_lines,
+    })
+}
+
+fn render_graph_explore_snapshot(
+    snippets: &[GraphExploreSnippet],
+) -> Result<(String, Vec<usize>), ToolRuntimeError> {
+    let mut contents = String::new();
+    let mut snippet_start_lines = Vec::with_capacity(snippets.len());
+    let mut next_line = 1usize;
+
+    for (index, snippet) in snippets.iter().enumerate() {
+        snippet_start_lines.push(next_line);
+        let symbol = snippet.value.get("symbol").ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(
+                "failed to render graph_explore snapshot: snippet is missing symbol".to_string(),
+            )
+        })?;
+        let symbol_id = symbol
+            .get("symbolId")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot: symbol is missing symbolId"
+                        .to_string(),
+                )
+            })?;
+        let path = snippet
+            .value
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot: snippet is missing path".to_string(),
+                )
+            })?;
+        let name = symbol.get("name").and_then(Value::as_str).ok_or_else(|| {
+            ToolRuntimeError::InvalidArguments(
+                "failed to render graph_explore snapshot: symbol is missing name".to_string(),
+            )
+        })?;
+        let qualified_name = symbol
+            .get("qualifiedName")
+            .and_then(Value::as_str)
+            .unwrap_or(name);
+        let kind = symbol
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let start_line = snippet
+            .value
+            .get("startLine")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot: snippet is missing startLine"
+                        .to_string(),
+                )
+            })?;
+        let end_line = snippet
+            .value
+            .get("endLine")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot: snippet is missing endLine"
+                        .to_string(),
+                )
+            })?;
+        let content = snippet
+            .value
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ToolRuntimeError::InvalidArguments(
+                    "failed to render graph_explore snapshot: snippet is missing content"
+                        .to_string(),
+                )
+            })?;
+
+        append_graph_snapshot_line(
+            &mut contents,
+            &mut next_line,
+            &format!("=== graph_explore snippet {} ===", index + 1),
+        );
+        append_graph_snapshot_line(
+            &mut contents,
+            &mut next_line,
+            &format!("symbolId: {symbol_id}"),
+        );
+        append_graph_snapshot_line(&mut contents, &mut next_line, &format!("path: {path}"));
+        append_graph_snapshot_line(
+            &mut contents,
+            &mut next_line,
+            &format!("symbol: {qualified_name} ({kind})"),
+        );
+        append_graph_snapshot_line(
+            &mut contents,
+            &mut next_line,
+            &format!("sourceLines: {start_line}-{end_line}"),
+        );
+        append_graph_snapshot_line(&mut contents, &mut next_line, "source:");
+        contents.push_str(content);
+        if !content.ends_with('\n') {
+            contents.push('\n');
+        }
+        next_line = next_line.saturating_add(content.lines().count());
+        append_graph_snapshot_line(
+            &mut contents,
+            &mut next_line,
+            &format!("=== end graph_explore snippet {} ===", index + 1),
+        );
+        append_graph_snapshot_line(&mut contents, &mut next_line, "");
+    }
+
+    Ok((contents, snippet_start_lines))
+}
+
+fn append_graph_snapshot_line(contents: &mut String, next_line: &mut usize, line: &str) {
+    contents.push_str(line);
+    contents.push('\n');
+    *next_line = next_line.saturating_add(1);
+}
+
+fn graph_snapshot_text_relative_path(snapshot_id: &str) -> String {
+    format!(".foco/{GRAPH_RESULTS_DIR}/{snapshot_id}.txt")
+}
+
+static GRAPH_RESULTS_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_graph_snapshot_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or(0);
+    let counter = GRAPH_RESULTS_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("graph-explore-{nanos}-{counter}")
+}
+
+/// Best-effort cache cleanup mirrors search_text retention without allowing cleanup failures to
+/// turn an otherwise usable graph result into an error.
+fn prune_graph_results_dir(results_dir: &Path) {
+    let Ok(read_dir) = fs::read_dir(results_dir) else {
+        return;
+    };
+
+    let now = SystemTime::now();
+    let mut snapshots: Vec<(PathBuf, SystemTime)> = Vec::new();
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        let is_snapshot = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("graph-explore-") && name.ends_with(".txt"));
+        if !is_snapshot {
+            continue;
+        }
+
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age > GRAPH_RESULT_TTL)
+        {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        snapshots.push((path, modified));
+    }
+
+    if snapshots.len() < MAX_GRAPH_RESULT_FILES {
+        return;
+    }
+
+    snapshots.sort_by_key(|(_, modified)| *modified);
+    let remove_count = snapshots.len() + 1 - MAX_GRAPH_RESULT_FILES;
+    for (path, _) in snapshots.into_iter().take(remove_count) {
+        let _ = fs::remove_file(path);
     }
 }
 

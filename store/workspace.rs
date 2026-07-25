@@ -17419,6 +17419,19 @@ impl WorkspaceDatabase {
         path: Option<&str>,
         limit: i64,
     ) -> Result<Vec<CodeGraphSymbolRecord>, WorkspaceDatabaseError> {
+        self.find_code_graph_symbols_page(query, kind, path, limit, 0)
+    }
+
+    /// Find a stable page of code graph symbols. The final id tie-breaker keeps offset
+    /// pagination deterministic when multiple declarations share the same source position.
+    pub fn find_code_graph_symbols_page(
+        &self,
+        query: &str,
+        kind: Option<&str>,
+        path: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CodeGraphSymbolRecord>, WorkspaceDatabaseError> {
         let query_like = format!("%{}%", query.trim().to_ascii_lowercase());
         let kind = kind.map(str::trim).filter(|value| !value.is_empty());
         let path = path.map(str::trim).filter(|value| !value.is_empty());
@@ -17445,13 +17458,22 @@ impl WorkspaceDatabase {
                     CASE WHEN lower(s.name) = lower(?5) THEN 0 ELSE 1 END,
                     f.path ASC,
                     s.start_line ASC,
-                    s.name ASC
-                 LIMIT ?6",
+                    s.name ASC,
+                    s.id ASC
+                 LIMIT ?6 OFFSET ?7",
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(
-                params![query_like, kind, path, path_prefix, query.trim(), limit],
+                params![
+                    query_like,
+                    kind,
+                    path,
+                    path_prefix,
+                    query.trim(),
+                    limit,
+                    offset
+                ],
                 code_graph_symbol_from_row,
             )
             .map_err(|source| self.sqlite_error(source))?;
