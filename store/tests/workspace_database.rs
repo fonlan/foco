@@ -658,6 +658,103 @@ fn remote_queued_run_claim_replays_for_owner_and_rejects_other_run() {
 }
 
 #[test]
+fn remote_queued_run_requeue_returns_only_the_current_owner_to_queue() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-remote-requeue", "Remote requeue")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-remote-requeue",
+            chat_id: "chat-remote-requeue",
+            role: "user",
+            content: "continue",
+            sequence: 0,
+            metadata_json: Some(
+                &json!({
+                    "keep": "metadata",
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "user-remote-requeue",
+                        "assistantMessageId": "assistant-remote-requeue",
+                    }
+                })
+                .to_string(),
+            ),
+        })
+        .expect("user insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-remote-requeue",
+            chat_id: "chat-remote-requeue",
+            role: "assistant",
+            content: "",
+            sequence: 1,
+            metadata_json: Some(r#"{"streamingState":"streaming"}"#),
+        })
+        .expect("assistant insert");
+    database
+        .claim_remote_queued_run(
+            "chat-remote-requeue",
+            "user-remote-requeue",
+            "assistant-remote-requeue",
+            "remote-run-owner",
+        )
+        .expect("claim queued run");
+
+    assert_eq!(
+        database
+            .requeue_remote_queued_run_if_owned(
+                "chat-remote-requeue",
+                "user-remote-requeue",
+                "assistant-remote-requeue",
+                "remote-run-other",
+            )
+            .expect("late requeue"),
+        RemoteQueuedRunClearOutcome::NotOwned
+    );
+    assert_eq!(
+        database
+            .requeue_remote_queued_run_if_owned(
+                "chat-remote-requeue",
+                "user-remote-requeue",
+                "assistant-remote-requeue",
+                "remote-run-owner",
+            )
+            .expect("owner requeue"),
+        RemoteQueuedRunClearOutcome::Cleared
+    );
+
+    let user = database
+        .message("user-remote-requeue")
+        .expect("user lookup")
+        .expect("user message");
+    let metadata: Value = serde_json::from_str(&user.metadata_json).expect("user metadata");
+    assert_eq!(metadata["keep"], "metadata");
+    assert_eq!(
+        metadata["queuedRun"],
+        json!({
+            "status": "queued",
+            "userMessageId": "user-remote-requeue",
+            "assistantMessageId": "assistant-remote-requeue",
+        })
+    );
+    assert_eq!(
+        database
+            .claim_remote_queued_run(
+                "chat-remote-requeue",
+                "user-remote-requeue",
+                "assistant-remote-requeue",
+                "remote-run-resumed",
+            )
+            .expect("resumed claim"),
+        RemoteQueuedRunClaimOutcome::Claimed
+    );
+}
+
+#[test]
 fn agent_queued_run_claim_and_clear_require_the_full_durable_owner() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -18658,7 +18755,7 @@ fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
             owner_instance_id: &coordinator_id,
             origin_instance_id: None,
             parent_task_id: None,
-            input_json: "{}",
+            input_json: r#"{"planTaskKind":"implementation"}"#,
         })
         .expect("enqueue parent");
     database
@@ -18718,7 +18815,7 @@ fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
     );
     assert!(
         database
-            .resume_satisfied_agent_tasks(10)
+            .resume_satisfied_agent_tasks_with_input_key(10, "planTaskKind")
             .expect("resume before child done")
             .is_empty()
     );
@@ -18742,7 +18839,7 @@ fn running_agent_task_with_wait_dependencies_recovers_as_waiting() {
         .expect("complete child");
 
     let resumed = database
-        .resume_satisfied_agent_tasks(10)
+        .resume_satisfied_agent_tasks_with_input_key(10, "planTaskKind")
         .expect("resume after child done");
     assert_eq!(resumed.len(), 1);
     assert_eq!(resumed[0].id, parent_task);
@@ -25212,4 +25309,73 @@ fn structured_llm_outcome_classification_preserves_call_id_when_none() {
     );
     assert_eq!(row.attempt_index, Some(1));
     assert_eq!(row.structured_call_id.as_deref(), Some("call-preserved"));
+}
+
+#[test]
+fn completed_tool_result_and_terminal_event_commit_together() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-atomic-tool-result", "Atomic terminal tool result")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-atomic-tool-result",
+            chat_id: "chat-atomic-tool-result",
+            role: "assistant",
+            content: "",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("assistant insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "call-atomic-tool-result",
+            chat_id: "chat-atomic-tool-result",
+            run_id: "run-atomic-tool-result",
+            message_id: Some("assistant-atomic-tool-result"),
+            tool_name: "agent_wait_tasks",
+            input_json: "{}",
+            status: "running",
+            started_at: "2026-07-25T00:00:00Z",
+            completed_at: None,
+        })
+        .expect("tool call insert");
+
+    database
+        .complete_tool_call_with_result_and_run_event(
+            NewToolResult {
+                id: "call-atomic-tool-result-result",
+                tool_call_id: "call-atomic-tool-result",
+                output_json: r#"{"waiting":false}"#,
+                is_error: false,
+                created_at: "2026-07-25T00:00:01Z",
+            },
+            NewRunEvent {
+                id: "event-atomic-tool-result",
+                chat_id: "chat-atomic-tool-result",
+                run_id: "run-atomic-tool-result",
+                sequence: 1,
+                event_type: "toolResult",
+                payload_json: r#"{"type":"toolResult","assistantMessageId":"assistant-atomic-tool-result","toolCallId":"call-atomic-tool-result","terminal":true}"#,
+            },
+        )
+        .expect("atomic terminal persistence");
+
+    let persisted = database
+        .tool_call_with_result("call-atomic-tool-result")
+        .expect("tool call lookup")
+        .expect("tool call");
+    assert_eq!(persisted.status, "completed");
+    assert!(persisted.result.is_some());
+    assert!(
+        database
+            .has_terminal_tool_result_run_event(
+                "chat-atomic-tool-result",
+                "assistant-atomic-tool-result",
+                "call-atomic-tool-result",
+            )
+            .expect("terminal event lookup")
+    );
 }

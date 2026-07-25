@@ -7328,6 +7328,227 @@ impl WorkspaceDatabase {
         Ok(outcome)
     }
 
+    /// Return a suspended remote run to the durable queue without creating a new
+    /// user/assistant turn. The owner tuple prevents an old runner from handing
+    /// off a replacement turn after it has lost ownership.
+    pub fn requeue_remote_queued_run_if_owned(
+        &mut self,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+    ) -> Result<RemoteQueuedRunClearOutcome, WorkspaceDatabaseError> {
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(user) = message_from_transaction(&transaction, &database_path, user_message_id)?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        };
+        if user.chat_id != chat_id || user.role != "user" {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        }
+        let mut metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let Some(queued_run) = metadata
+            .get_mut(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        };
+        let matches_owner = queued_run
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "running")
+            && queued_run
+                .get("userMessageId")
+                .or_else(|| queued_run.get("user_message_id"))
+                .and_then(Value::as_str)
+                == Some(user_message_id)
+            && queued_run
+                .get("assistantMessageId")
+                .or_else(|| queued_run.get("assistant_message_id"))
+                .and_then(Value::as_str)
+                == Some(assistant_message_id)
+            && queued_run.get("runId").and_then(Value::as_str) == Some(run_id);
+        if !matches_owner {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(RemoteQueuedRunClearOutcome::NotOwned);
+        }
+        queued_run.insert("status".to_string(), Value::String("queued".to_string()));
+        queued_run.remove("runId");
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("user message metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![metadata_json, user_message_id, chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(RemoteQueuedRunClearOutcome::Cleared)
+    }
+
+    /// Suspend a remote Plan Coordinator and return its owned queued run in the
+    /// same transaction. A scanner can therefore never claim the task while its
+    /// durable chat identity still points at the previous running owner.
+    pub fn suspend_remote_plan_task_and_requeue_run(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        attempt_id: &AgentAttemptId,
+        owner_incarnation: &str,
+        chat_id: &str,
+        user_message_id: &str,
+        assistant_message_id: &str,
+        run_id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let owner_instance_id = transaction
+            .query_row(
+                "SELECT task.owner_instance_id
+                 FROM agent_tasks AS task
+                 WHERE task.id = ?1 AND task.team_id = ?2 AND task.status = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM agent_attempts AS attempt
+                       WHERE attempt.id = ?3 AND attempt.task_id = task.id
+                         AND attempt.team_id = task.team_id AND attempt.status = 'running'
+                         AND attempt.owner_incarnation = ?4
+                   )",
+                params![
+                    task_id.as_str(),
+                    team_id.as_str(),
+                    attempt_id.as_str(),
+                    owner_incarnation,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let Some(owner_instance_id) = owner_instance_id else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        };
+        let user = message_from_transaction(&transaction, &database_path, user_message_id)?
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("queued user message was not found: {user_message_id}"),
+            })?;
+        if user.chat_id != chat_id || user.role != "user" {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "queued user message does not belong to its remote Plan chat".to_string(),
+            });
+        }
+        let mut metadata = parse_json_object(&user.metadata_json, "user message metadata")?;
+        let queued_run = metadata
+            .get_mut(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object_mut)
+            .ok_or_else(|| WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "user message metadata.queuedRun must be an object".to_string(),
+            })?;
+        let matches_owner = queued_run
+            .get("status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status == "running")
+            && queued_run
+                .get("userMessageId")
+                .or_else(|| queued_run.get("user_message_id"))
+                .and_then(Value::as_str)
+                == Some(user_message_id)
+            && queued_run
+                .get("assistantMessageId")
+                .or_else(|| queued_run.get("assistant_message_id"))
+                .and_then(Value::as_str)
+                == Some(assistant_message_id)
+            && queued_run.get("runId").and_then(Value::as_str) == Some(run_id);
+        if !matches_owner {
+            return Err(WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: "remote Plan queuedRun owner changed before suspend".to_string(),
+            });
+        }
+        queued_run.insert("status".to_string(), Value::String("queued".to_string()));
+        queued_run.remove("runId");
+        let metadata_json = serde_json::to_string(&metadata).map_err(|source| {
+            WorkspaceDatabaseError::InvalidMessageMetadata {
+                message: format!("user message metadata is invalid JSON: {source}"),
+            }
+        })?;
+        transaction
+            .execute(
+                "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                params![metadata_json, user_message_id, chat_id],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let task_updated = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'waiting', updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2 AND status = 'running'",
+                params![task_id.as_str(), team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if task_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("remote Plan task '{task_id}' changed before suspend"),
+            });
+        }
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE agent_attempts
+                 SET status = 'suspended', completed_at = NULL
+                 WHERE id = ?1 AND task_id = ?2 AND team_id = ?3
+                   AND status = 'running' AND owner_incarnation = ?4",
+                params![
+                    attempt_id.as_str(),
+                    task_id.as_str(),
+                    team_id.as_str(),
+                    owner_incarnation,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if attempt_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: format!("remote Plan task '{task_id}' has no active attempt to suspend"),
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE agent_instances
+                 SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'waiting' END,
+                     updated_at = ?3
+                 WHERE id = ?1 AND team_id = ?2",
+                params![owner_instance_id, team_id.as_str(), now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
+    }
+
     pub fn clear_remote_queued_run_if_owned(
         &mut self,
         chat_id: &str,
@@ -10199,6 +10420,121 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         Ok(())
+    }
+
+    /// Complete a tool call and append its terminal run event in one durable
+    /// operation so recovery never observes a completed card without its SSE event.
+    pub fn complete_tool_call_with_result_and_run_event(
+        &mut self,
+        tool_result: NewToolResult<'_>,
+        event: NewRunEvent<'_>,
+    ) -> Result<(), WorkspaceDatabaseError> {
+        let output_json = redact_audit_json(tool_result.output_json, "tool_result.output_json")?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let changed = transaction
+            .execute(
+                "INSERT INTO tool_results
+                    (id, tool_call_id, output_json, is_error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET
+                    output_json = excluded.output_json,
+                    is_error = excluded.is_error,
+                    created_at = excluded.created_at
+                 WHERE tool_results.tool_call_id = excluded.tool_call_id",
+                params![
+                    tool_result.id,
+                    tool_result.tool_call_id,
+                    output_json,
+                    if tool_result.is_error { 1_i64 } else { 0_i64 },
+                    tool_result.created_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if changed == 0 {
+            return Err(WorkspaceDatabaseError::InvalidToolCall {
+                message: format!(
+                    "tool result '{}' already exists for a different tool call",
+                    tool_result.id
+                ),
+            });
+        }
+        let completed = transaction
+            .execute(
+                "UPDATE tool_calls
+                 SET status = ?2, completed_at = ?3
+                 WHERE id = ?1",
+                params![
+                    tool_result.tool_call_id,
+                    if tool_result.is_error {
+                        "error"
+                    } else {
+                        "completed"
+                    },
+                    tool_result.created_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if completed != 1 {
+            return Err(WorkspaceDatabaseError::MissingToolCall {
+                id: tool_result.tool_call_id.to_string(),
+            });
+        }
+        transaction
+            .execute(
+                "INSERT INTO run_events
+                    (id, chat_id, run_id, sequence, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    event.id,
+                    event.chat_id,
+                    event.run_id,
+                    event.sequence,
+                    event.event_type,
+                    event.payload_json,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(())
+    }
+
+    /// Whether a terminal ToolResult event for this exact card has been
+    /// durably appended, independently of the tool result table.
+    pub fn has_terminal_tool_result_run_event(
+        &self,
+        chat_id: &str,
+        assistant_message_id: &str,
+        tool_call_id: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM run_events
+                    WHERE chat_id = ?1
+                      AND event_type = 'toolResult'
+                      AND COALESCE(
+                          json_extract(payload_json, '$.assistantMessageId'),
+                          json_extract(payload_json, '$.assistant_message_id')
+                      ) = ?2
+                      AND COALESCE(
+                          json_extract(payload_json, '$.toolCallId'),
+                          json_extract(payload_json, '$.tool_call_id')
+                      ) = ?3
+                      AND json_extract(payload_json, '$.terminal') = 1
+                )",
+                params![chat_id, assistant_message_id, tool_call_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|exists| exists != 0)
+            .map_err(|source| self.sqlite_error(source))
     }
 
     /// Durably applies one live Agent message guidance event and consumes that message.
@@ -14894,6 +15230,41 @@ impl WorkspaceDatabase {
         &mut self,
         limit: i64,
     ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.resume_satisfied_agent_tasks_matching(limit, None, false)
+    }
+
+    /// Resume only suspended Agent tasks whose input carries the selected JSON
+    /// discriminator. Remote Plan coordinators use this to share the durable
+    /// wait state machine without claiming ordinary sidecar collaboration work.
+    pub fn resume_satisfied_agent_tasks_with_input_key(
+        &mut self,
+        limit: i64,
+        input_key: &str,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        if input_key.trim().is_empty() {
+            return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                message: "Agent task input key must not be empty".to_string(),
+            });
+        }
+        self.resume_satisfied_agent_tasks_matching(limit, Some(input_key), false)
+    }
+
+    /// Resume suspended tasks durably attached to a Plan phase or phase attempt.
+    /// This binding predates the remote input discriminator and therefore keeps
+    /// legacy remote Plan implementation tasks recoverable.
+    pub fn resume_satisfied_plan_agent_tasks(
+        &mut self,
+        limit: i64,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        self.resume_satisfied_agent_tasks_matching(limit, None, true)
+    }
+
+    fn resume_satisfied_agent_tasks_matching(
+        &mut self,
+        limit: i64,
+        input_key: Option<&str>,
+        plan_bound_only: bool,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
         if limit <= 0 {
             return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
                 message: "waiting Agent task resume limit must be greater than 0".to_string(),
@@ -14915,6 +15286,18 @@ impl WorkspaceDatabase {
                      WHERE task.status = 'waiting'
                        AND instance.status IN ('waiting', 'draining')
                        AND team.status IN ('active', 'draining')
+                       AND (?3 IS NULL OR json_type(task.input_json, '$.' || ?3) IS NOT NULL)
+                       AND (
+                           ?4 = 0
+                           OR EXISTS (
+                               SELECT 1 FROM plan_phases AS phase
+                               WHERE phase.agent_task_id = task.id
+                           )
+                           OR EXISTS (
+                               SELECT 1 FROM plan_phase_attempts AS attempt
+                               WHERE attempt.agent_task_id = task.id
+                           )
+                       )
                        AND EXISTS (
                             SELECT 1 FROM agent_task_dependencies AS dependency
                             WHERE dependency.waiting_task_id = task.id
@@ -14956,13 +15339,16 @@ impl WorkspaceDatabase {
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
             let rows = statement
-                .query_map(params![now.as_str(), limit], |row| {
-                    Ok((
-                        agent_id_from_row::<AgentTaskId>(row, 0)?,
-                        agent_id_from_row::<AgentTeamId>(row, 1)?,
-                        agent_id_from_row::<AgentInstanceId>(row, 2)?,
-                    ))
-                })
+                .query_map(
+                    params![now.as_str(), limit, input_key, plan_bound_only],
+                    |row| {
+                        Ok((
+                            agent_id_from_row::<AgentTaskId>(row, 0)?,
+                            agent_id_from_row::<AgentTeamId>(row, 1)?,
+                            agent_id_from_row::<AgentInstanceId>(row, 2)?,
+                        ))
+                    },
+                )
                 .map_err(|source| sqlite_error(&database_path, source))?;
             collect_rows(rows, &database_path)?
         };

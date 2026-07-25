@@ -3070,7 +3070,7 @@ pub(crate) fn agent_wait_resume_messages(
     ])
 }
 
-fn agent_wait_resume_tool_result(
+pub(crate) fn agent_wait_resume_tool_result(
     dependencies: &[AgentTaskDependencyRecord],
     dependency_tasks: &[AgentTaskRecord],
 ) -> Result<Value, ApiError> {

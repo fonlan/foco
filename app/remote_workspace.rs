@@ -60,9 +60,10 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
         MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
         NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        PlanPhaseAttemptTrigger, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-        RemotePreStreamFailureClosureOutcome, RewriteChatFromUserMessage, TerminalSessionRecord,
-        TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        NewToolResult, PlanPhaseAttemptTrigger, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, RemotePreStreamFailureClosureOutcome,
+        RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
+        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
         WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
@@ -3425,6 +3426,30 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
                     error = %error,
                     "failed to recheck remote Agent attempt leases"
                 );
+            }
+            let resume_state = reconciliation_state.clone();
+            match tokio::task::spawn_blocking(move || {
+                tokio::runtime::Handle::current()
+                    .block_on(remote_sidecar_resume_satisfied_plan_waits(&resume_state))
+            })
+            .await
+            {
+                Ok(Ok(resumed)) if resumed > 0 => tracing::info!(
+                    workspace_id = %reconciliation_state.workspace_id,
+                    resumed,
+                    "resumed satisfied remote Plan Agent waits"
+                ),
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => tracing::warn!(
+                    workspace_id = %reconciliation_state.workspace_id,
+                    error = %error.message,
+                    "failed to resume satisfied remote Plan Agent waits"
+                ),
+                Err(error) => tracing::error!(
+                    workspace_id = %reconciliation_state.workspace_id,
+                    error = %error,
+                    "remote Plan wait resume worker exited unexpectedly"
+                ),
             }
         }
     });
@@ -17451,6 +17476,7 @@ fn remote_sidecar_log_run_stream_recovery_failure(
 #[derive(Clone, Debug)]
 struct RemotePlanTaskBinding {
     task_id: AgentTaskId,
+    team_id: AgentTeamId,
     attempt_id: AgentAttemptId,
     owner_incarnation: String,
 }
@@ -17459,6 +17485,7 @@ const REMOTE_PLAN_TASK_KIND_FIELD: &str = "planTaskKind";
 const REMOTE_PLAN_TASK_KIND_IMPLEMENTATION: &str = "implementation";
 const REMOTE_PLAN_TASK_KIND_MERGE: &str = "merge";
 const REMOTE_PLAN_MERGE_MODE_FIELD: &str = "planMergeMode";
+const REMOTE_SIDECAR_WAIT_RESUME_SCAN_LIMIT: i64 = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RemotePlanMergeMode {
@@ -17843,8 +17870,79 @@ fn remote_sidecar_validate_plan_task_binding(
     }
     Ok(Some(RemotePlanTaskBinding {
         task_id: task.id,
+        team_id: task.team_id,
         attempt_id: attempt.id,
         owner_incarnation,
+    }))
+}
+
+fn remote_sidecar_plan_wait_resume(
+    database: &WorkspaceDatabase,
+    task_id: &AgentTaskId,
+) -> Result<Option<RemotePlanWaitResume>, ApiError> {
+    let dependencies = database
+        .agent_task_dependencies(task_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let Some(tool_call_id) = dependencies
+        .iter()
+        .find_map(|dependency| dependency.pending_tool_call_id.clone())
+    else {
+        return Ok(None);
+    };
+    let dependency_tasks = dependencies
+        .iter()
+        .map(|dependency| {
+            database
+                .agent_task_for_team(&dependency.team_id, &dependency.dependency_task_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::internal(format!(
+                        "remote Agent wait dependency task '{}' was not found",
+                        dependency.dependency_task_id
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let provider_messages =
+        crate::runtime::agent_wait_resume_messages(&dependencies, &dependency_tasks)?;
+    let persisted_tool_call = database
+        .tool_call_with_result(&tool_call_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let persisted_output = persisted_tool_call
+        .as_ref()
+        .and_then(|tool_call| tool_call.result.as_ref())
+        .map(|result| {
+            serde_json::from_str::<Value>(&result.output_json).map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to parse persisted remote agent_wait_tasks result: {error}"
+                ))
+            })
+        })
+        .transpose()?;
+    // The run event, rather than the tool_results row, is the durable proof that
+    // clients received the terminal card. Older sidecars could crash after the
+    // result write and before the event write, so replay that missing event.
+    let persisted_terminal_output =
+        persisted_output.filter(|output| output.get("waiting") == Some(&Value::Bool(false)));
+    let terminal_event_pending = match (&persisted_tool_call, &persisted_terminal_output) {
+        (Some(tool_call), Some(_)) if tool_call.message_id.is_some() => !database
+            .has_terminal_tool_result_run_event(
+                &tool_call.chat_id,
+                tool_call.message_id.as_deref().unwrap_or_default(),
+                &tool_call_id,
+            )
+            .map_err(ApiError::from_workspace_error)?,
+        _ => true,
+    };
+    let output = match persisted_terminal_output {
+        Some(output) => output,
+        None => crate::runtime::agent_wait_resume_tool_result(&dependencies, &dependency_tasks)?,
+    };
+    Ok(Some(RemotePlanWaitResume {
+        tool_call_id,
+        output,
+        provider_messages,
+        terminal_event_pending,
     }))
 }
 
@@ -17873,6 +17971,18 @@ struct RemoteSidecarChatRunContext {
     skill_read_root_dirs: Vec<PathBuf>,
     attachment_read_allowlist: Vec<PathBuf>,
     initial_runtime_tool_state: RemoteSidecarRuntimeToolState,
+    wait_resume: Option<RemotePlanWaitResume>,
+}
+
+#[derive(Clone)]
+struct RemotePlanWaitResume {
+    tool_call_id: String,
+    output: Value,
+    provider_messages: Vec<NeutralChatMessage>,
+    /// The terminal SSE event may have been persisted before a crash. The resumed
+    /// provider context still needs the paired tool messages, but clients must not
+    /// receive a duplicate terminal card update.
+    terminal_event_pending: bool,
 }
 
 struct RemotePlanAttemptLeaseHeartbeat {
@@ -17955,6 +18065,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         skill_read_root_dirs,
         attachment_read_allowlist,
         initial_runtime_tool_state,
+        wait_resume,
     } = ctx;
 
     // Create first so disconnect during mark/prepare still clears queuedRun.
@@ -18016,6 +18127,12 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     let mut run_compression_events: Vec<RemoteSidecarContextCompressionEventDetail> = Vec::new();
     // Ordered parts closed by reasoning-loop recoveries (before open turn suffix).
     let mut content_parts_prefix: Vec<Value> = Vec::new();
+    if let Some(wait_resume) = wait_resume.as_ref() {
+        content_parts_prefix.push(json!({
+            "type": "toolCall",
+            "tool_call_id": wait_resume.tool_call_id,
+        }));
+    }
     let mut flushed_text_len = 0usize;
     let mut flushed_reasoning_len = 0usize;
     let mut reasoning_loop_recovery_count = 0usize;
@@ -18046,6 +18163,58 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         }),
     );
     let mut last_yielded_sequence = sequence;
+    if let Some(wait_resume) = wait_resume.as_ref()
+        && wait_resume.terminal_event_pending
+    {
+        let completed_at = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+        let event_sequence = sequence + 1;
+        let terminal_event = json!({
+            "type": "toolResult",
+            "assistantMessageId": assistant_message_id,
+            "toolCallId": wait_resume.tool_call_id,
+            "output": wait_resume.output,
+            "isError": false,
+            "terminal": true,
+            "startedAt": completed_at,
+            "completedAt": completed_at,
+        });
+        let payload_json = terminal_event.to_string();
+        let result_id = format!("{}-result", wait_resume.tool_call_id);
+        let output_json =
+            serde_json::to_string(&wait_resume.output).unwrap_or_else(|_| "null".to_string());
+        let persisted = with_sidecar_workspace_database(&stream_state, |database| {
+            database.complete_tool_call_with_result_and_run_event(
+                NewToolResult {
+                    id: &result_id,
+                    tool_call_id: &wait_resume.tool_call_id,
+                    output_json: &output_json,
+                    is_error: false,
+                    created_at: &completed_at,
+                },
+                NewRunEvent {
+                    id: &unique_id("run-event"),
+                    chat_id: &chat_id,
+                    run_id: &run_id,
+                    sequence: event_sequence,
+                    event_type: "toolResult",
+                    payload_json: &payload_json,
+                },
+            )
+        });
+        match persisted {
+            Ok(()) => {
+                sequence = event_sequence;
+                remote_sidecar_record_run_event(&run_stream, sequence, terminal_event);
+                last_yielded_sequence = sequence;
+            }
+            Err(error) => tracing::error!(
+                chat_id,
+                tool_call_id = %wait_resume.tool_call_id,
+                error = %error,
+                "failed to atomically persist terminal remote agent wait result"
+            ),
+        }
+    }
 
     'run: loop {
         // Explicit cancel / edit-delete invalidation: stop before the next turn.
@@ -18902,16 +19071,18 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             });
                             break 'run;
                         }
-                        let _ = with_sidecar_workspace_database(&stream_state, |database| {
-                            remote_sidecar_record_tool_result(
-                                database,
-                                tool_call,
-                                &output,
-                                is_error,
-                                &started_at,
-                                &completed_at,
-                            )
-                        });
+                        if terminal {
+                            let _ = with_sidecar_workspace_database(&stream_state, |database| {
+                                remote_sidecar_record_tool_result(
+                                    database,
+                                    tool_call,
+                                    &output,
+                                    is_error,
+                                    &started_at,
+                                    &completed_at,
+                                )
+                            });
+                        }
                         events.append(&mut extra_events);
                         batch_hook_additional_context.extend(additional_context);
                         events.push(json!({
@@ -18926,33 +19097,30 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         }));
                         if !terminal {
                             if let Some(plan_task) = plan_task.as_ref() {
-                                let wait_result =
+                                let handoff =
                                     with_sidecar_workspace_database(&stream_state, |database| {
-                                        let Some(task) = database.agent_task(&plan_task.task_id)?
-                                        else {
-                                            return Ok(());
-                                        };
-                                        if task.status == AgentTaskStatus::Running {
-                                            database.update_agent_task_state(
-                                                AgentTaskStateUpdate {
-                                                    team_id: &task.team_id,
-                                                    task_id: &task.id,
-                                                    expected_status: AgentTaskStatus::Running,
-                                                    transition: AgentTaskTransition::Wait,
-                                                    result_json: None,
-                                                    error_json: None,
-                                                    interruption_reason: None,
-                                                },
-                                            )?;
-                                        }
-                                        Ok(())
+                                        database.suspend_remote_plan_task_and_requeue_run(
+                                            &plan_task.team_id,
+                                            &plan_task.task_id,
+                                            &plan_task.attempt_id,
+                                            &plan_task.owner_incarnation,
+                                            &chat_id,
+                                            &queued_user_message_id,
+                                            &assistant_message_id,
+                                            &run_id,
+                                        )
                                     });
-                                if let Err(error) = wait_result {
-                                    tracing::error!(
+                                match handoff {
+                                    Ok(true) => {}
+                                    Ok(false) => tracing::warn!(
+                                        task_id = %plan_task.task_id,
+                                        "remote Plan task changed before durable wait handoff"
+                                    ),
+                                    Err(error) => tracing::error!(
                                         task_id = %plan_task.task_id,
                                         error = %error,
-                                        "failed to suspend remote Plan Agent task after agent_wait_tasks"
-                                    );
+                                        "failed to atomically suspend remote Plan Agent task and requeue its chat"
+                                    ),
                                 }
                             }
                             // The wait control result is deliberately not a
@@ -19667,6 +19835,151 @@ fn remote_sidecar_schedule_plan_continuation(
     });
 }
 
+fn remote_sidecar_resume_payload(
+    database: &WorkspaceDatabase,
+    state: &RemoteSidecarState,
+    task: &foco_store::workspace::AgentTaskRecord,
+) -> Result<Value, ApiError> {
+    let (queued_user_message_id, assistant_message_id) =
+        remote_plan_task_message_identity_from_input(&task.input_json)?.ok_or_else(|| {
+            ApiError::internal(format!(
+                "remote Plan Agent task '{}' has no queued chat identity",
+                task.id
+            ))
+        })?;
+    let user_message = database
+        .message(&queued_user_message_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "queued message '{}' for remote Plan Agent task '{}' was not found",
+                queued_user_message_id, task.id
+            ))
+        })?;
+    let queued_run = remote_message_queued_run(&user_message.metadata_json).ok_or_else(|| {
+        ApiError::internal(format!(
+            "queued message '{}' has no remote run metadata",
+            queued_user_message_id
+        ))
+    })?;
+    if queued_run.get("status").and_then(Value::as_str) != Some("queued") {
+        return Err(ApiError::internal(format!(
+            "queued message '{}' is not available for remote Plan wait resume",
+            queued_user_message_id
+        )));
+    }
+    let model_id = queued_run
+        .get("modelId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "queued message '{}' has no model for remote Plan wait resume",
+                queued_user_message_id
+            ))
+        })?;
+    let instance = database
+        .agent_instance(&task.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "remote Plan Coordinator '{}' was not found",
+                task.owner_instance_id
+            ))
+        })?;
+    let tool_workspace_path = instance
+        .execution_root_path
+        .as_deref()
+        .map(|root| Path::new(&state.workspace_path).join(root))
+        .unwrap_or_else(|| PathBuf::from(&state.workspace_path));
+    Ok(json!({
+        "chatId": user_message.chat_id,
+        "queuedUserMessageId": queued_user_message_id,
+        "visibleAssistantMessageId": assistant_message_id,
+        "modelId": model_id,
+        "providerId": queued_run.get("providerId").cloned().unwrap_or(Value::Null),
+        "thinkingLevel": queued_run.get("thinkingLevel").cloned().unwrap_or(Value::Null),
+        "latencyMode": queued_run.get("latencyMode").cloned().unwrap_or(Value::Null),
+        "toolWorkspacePath": tool_workspace_path,
+        "planTaskId": task.id,
+    }))
+}
+
+async fn remote_sidecar_resume_satisfied_plan_waits(
+    state: &RemoteSidecarState,
+) -> Result<usize, ApiError> {
+    if state
+        .runtime_config
+        .lock()
+        .map_err(|_| ApiError::internal("remote sidecar runtime configuration lock is poisoned"))?
+        .is_none()
+    {
+        return Ok(0);
+    }
+
+    let resumed_tasks = {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .resume_satisfied_plan_agent_tasks(REMOTE_SIDECAR_WAIT_RESUME_SCAN_LIMIT)
+            .map_err(ApiError::from_workspace_error)?
+    };
+    let mut resumed = 0;
+    for resumed_task in resumed_tasks {
+        let task_id = resumed_task.id.clone();
+        let start = (|| {
+            let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            let attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let Some(task) = database
+                .claim_runnable_agent_task_with_owner(
+                    &resumed_task.team_id,
+                    &task_id,
+                    &attempt_id,
+                    Some(state.agent_owner_incarnation()),
+                )
+                .map_err(ApiError::from_workspace_error)?
+            else {
+                return Ok(None);
+            };
+            remote_sidecar_resume_payload(&database, state, &task).map(Some)
+        })();
+        match start {
+            Ok(Some(payload)) => {
+                match remote_sidecar_start_chat_run(state.clone(), payload).await {
+                    Ok(_) => resumed += 1,
+                    Err(error) => {
+                        let message = format!("failed to resume remote Plan wait: {error:?}");
+                        if let Err(close_error) =
+                            remote_sidecar_fail_plan_task(state, &task_id, &message)
+                        {
+                            tracing::error!(
+                                task_id = %task_id,
+                                error = %close_error.message,
+                                "failed to close remote Plan task after wait resume startup failure"
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                if let Err(close_error) =
+                    remote_sidecar_fail_plan_task(state, &task_id, &error.message)
+                {
+                    tracing::error!(
+                        task_id = %task_id,
+                        error = %close_error.message,
+                        "failed to close remote Plan task after wait resume preparation failure"
+                    );
+                }
+            }
+        }
+    }
+    Ok(resumed)
+}
+
 fn remote_sidecar_plan_worktree(
     database: &WorkspaceDatabase,
     workspace_path: &Path,
@@ -20266,7 +20579,14 @@ async fn remote_sidecar_start_chat_run(
         .map(AgentTaskId::new)
         .transpose()
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let (chat_title, assistant_message_id, assistant_sequence, session_mode, plan_task) = {
+    let (
+        chat_title,
+        assistant_message_id,
+        assistant_sequence,
+        session_mode,
+        plan_task,
+        wait_resume,
+    ) = {
         let (_startup_cancel_tx, startup_cancel_rx) = watch::channel(false);
         let database = open_workspace_database_ordinary_with_pre_stream_retry(
             sidecar_workspace_path(&state),
@@ -20318,12 +20638,17 @@ async fn remote_sidecar_start_chat_run(
             &tool_workspace_path,
             &shared_workspace_path,
         )?;
+        let wait_resume = match plan_task.as_ref() {
+            Some(binding) => remote_sidecar_plan_wait_resume(&database, &binding.task_id)?,
+            None => None,
+        };
         (
             chat.title,
             assistant_message_id,
             assistant_sequence,
             session_mode,
             plan_task,
+            wait_resume,
         )
     };
     // Prewarm only after the chat and, when present, Plan task binding have
@@ -20490,7 +20815,12 @@ async fn remote_sidecar_start_chat_run(
             }
         }
     };
-    let initial_provider_request = initial_prepared.provider_request.clone();
+    let mut initial_provider_request = initial_prepared.provider_request.clone();
+    if let Some(wait_resume) = &wait_resume {
+        initial_provider_request
+            .messages
+            .extend(wait_resume.provider_messages.clone());
+    }
     let latency_mode = initial_prepared.latency_mode;
     let tool_catalog = initial_prepared.tool_catalog.clone();
     let session_mode = initial_prepared.session_mode.clone();
@@ -20518,6 +20848,7 @@ async fn remote_sidecar_start_chat_run(
             skill_read_root_dirs,
             attachment_read_allowlist,
             initial_runtime_tool_state,
+            wait_resume,
         },
     ));
     Ok(run_stream)
