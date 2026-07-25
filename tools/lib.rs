@@ -3961,6 +3961,20 @@ mod tests {
     }
 
     #[test]
+    fn graph_explore_definition_documents_snapshot_continuation() {
+        let definition = builtin_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == GRAPH_EXPLORE_TOOL)
+            .expect("graph_explore definition");
+
+        assert!(definition.description.contains(".foco/graph-results/"));
+        assert!(definition.description.contains("nextOffset"));
+        assert!(definition.description.contains("nextStartLine"));
+        assert!(definition.description.contains("read_file"));
+        assert!(definition.description.contains("Do not lower limit"));
+    }
+
+    #[test]
     fn graph_explore_returns_symbol_source_snippets() {
         let workspace = tempfile::tempdir().expect("workspace");
         fs::write(
@@ -4058,6 +4072,136 @@ mod tests {
     }
 
     #[test]
+    fn graph_explore_soft_budget_writes_snapshot_without_splitting_snippets() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let padding = "x".repeat(18_000);
+        let source = format!(
+            "fn helper_one() {{ /* {padding} */ }}\nfn helper_two() {{ /* {padding} */ }}\nfn helper_three() {{ /* {padding} */ }}\n"
+        );
+        fs::write(workspace.path().join("large.rs"), source).expect("write source");
+        let symbols = [
+            NewCodeGraphSymbol {
+                name: "helper_one",
+                qualified_name: "helper_one",
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(1),
+                end_column: None,
+                signature: Some("fn helper_one()"),
+                documentation: None,
+            },
+            NewCodeGraphSymbol {
+                name: "helper_two",
+                qualified_name: "helper_two",
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(2),
+                start_column: Some(1),
+                end_line: Some(2),
+                end_column: None,
+                signature: Some("fn helper_two()"),
+                documentation: None,
+            },
+            NewCodeGraphSymbol {
+                name: "helper_three",
+                qualified_name: "helper_three",
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(3),
+                start_column: Some(1),
+                end_line: Some(3),
+                end_column: None,
+                signature: Some("fn helper_three()"),
+                documentation: None,
+            },
+        ];
+        WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database")
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "large.rs",
+                language: Some("rust"),
+                size_bytes: Some(usize::try_from(3 * (padding.len() + 24)).expect("size") as i64),
+                modified_at: Some("2026-07-26T00:00:00.000Z"),
+                content_hash: "large-helpers",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "fn helper_one() {} fn helper_two() {} fn helper_three() {}",
+            })
+            .expect("graph index");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({
+                "query": "helper",
+                "limit": 5,
+                "contextLines": 0,
+                "timeoutMs": null
+            }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["outputTruncated"], true);
+        assert_eq!(result.output["totalCount"], 3);
+        assert_eq!(result.output["returnedCount"], 2);
+        assert_eq!(result.output["nextOffset"], 2);
+        let snippets = result.output["snippets"].as_array().expect("snippets");
+        assert!(
+            snippets.iter().all(|snippet| snippet["content"]
+                .as_str()
+                .is_some_and(|content| content.contains(&padding))),
+            "soft-budget preview must preserve whole snippets: {snippets:?}"
+        );
+        let full_result_path = result.output["fullResultPath"]
+            .as_str()
+            .expect("full result path");
+        let next_start_line = result.output["nextStartLine"]
+            .as_u64()
+            .expect("next start line") as usize;
+        let snapshot = fs::read_to_string(workspace.path().join(full_result_path))
+            .expect("read graph snapshot");
+        assert!(snapshot.contains("helper_one"));
+        assert!(snapshot.contains("helper_two"));
+        assert!(snapshot.contains("helper_three"));
+        assert!(
+            result.output["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("read_file")),
+            "continuation note: {:?}",
+            result.output["note"]
+        );
+
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": full_result_path,
+                "startLine": next_start_line,
+                "endLine": next_start_line + 10,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!read_back.is_error, "{:?}", read_back.output);
+        assert!(
+            read_back.output["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("helper_three")),
+            "continuation should expose the omitted snippet: {:?}",
+            read_back.output
+        );
+    }
+
+    #[test]
     fn graph_explore_complete_preview_does_not_create_snapshot() {
         let workspace = tempfile::tempdir().expect("workspace");
         insert_graph_explore_snapshot_fixture(workspace.path());
@@ -4138,6 +4282,216 @@ mod tests {
         assert!(result.output.get("totalCount").is_none());
         assert!(result.output.get("fullResultPath").is_none());
         assert!(!workspace.path().join(".foco/graph-results").exists());
+    }
+
+    #[test]
+    fn graph_explore_cr_only_snapshot_continuation_starts_at_next_record() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        fs::write(
+            workspace.path().join("a.rs"),
+            "fn a_helper() {}\r// trailing context\r",
+        )
+        .expect("write a source");
+        fs::write(workspace.path().join("b.rs"), "fn b_helper() {}\r").expect("write b source");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        for (path, name, end_line) in [("a.rs", "a_helper", 2), ("b.rs", "b_helper", 1)] {
+            let symbols = [NewCodeGraphSymbol {
+                name,
+                qualified_name: name,
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(end_line),
+                end_column: None,
+                signature: Some("fn helper()"),
+                documentation: None,
+            }];
+            database
+                .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                    path,
+                    language: Some("rust"),
+                    size_bytes: Some(32),
+                    modified_at: Some("2026-07-26T00:00:00.000Z"),
+                    content_hash: path,
+                    parse_status: "parsed",
+                    parse_error_message: None,
+                    symbols: &symbols,
+                    imports: &[],
+                    references: &[],
+                    edges: &[],
+                    fts_body: "helper",
+                })
+                .expect("graph index");
+        }
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({ "query": "helper", "limit": 1, "contextLines": 0, "timeoutMs": null }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        let snapshot_path = result.output["fullResultPath"]
+            .as_str()
+            .expect("snapshot path");
+        let next_start_line = result.output["nextStartLine"].as_u64().expect("next line") as usize;
+        let read_back = execute_builtin_tool(
+            workspace.path(),
+            READ_FILE_TOOL,
+            json!({
+                "path": snapshot_path,
+                "startLine": next_start_line,
+                "endLine": next_start_line,
+                "timeoutMs": null
+            }),
+        );
+        assert!(!read_back.is_error, "{:?}", read_back.output);
+        assert!(
+            read_back.output["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("=== graph_explore snippet 2 ===")),
+            "continuation should begin at the next record: {:?}",
+            read_back.output
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn graph_explore_refuses_symlinked_snapshot_directory() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let external = tempfile::tempdir().expect("external");
+        insert_graph_explore_snapshot_fixture(workspace.path());
+        std::os::unix::fs::symlink(
+            external.path(),
+            workspace.path().join(".foco/graph-results"),
+        )
+        .expect("graph results symlink");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({ "query": "helper", "limit": 1, "contextLines": 0, "timeoutMs": null }),
+        );
+
+        assert!(result.is_error, "{:?}", result.output);
+        assert_error_contains(&result, "must not be a symbolic link");
+        assert!(
+            fs::read_dir(external.path())
+                .expect("external contents")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn graph_explore_refuses_snapshot_line_that_read_file_cannot_return() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let padding = "x".repeat(output_budget::TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT);
+        fs::write(
+            workspace.path().join("large.rs"),
+            format!("fn huge_helper() {{ /* {padding} */ }}\n"),
+        )
+        .expect("write source");
+        let symbols = [NewCodeGraphSymbol {
+            name: "huge_helper",
+            qualified_name: "huge_helper",
+            kind: "function",
+            visibility: None,
+            metadata_json: None,
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(1),
+            end_column: None,
+            signature: Some("fn huge_helper()"),
+            documentation: None,
+        }];
+        WorkspaceDatabase::open_or_create(workspace.path())
+            .expect("database")
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path: "large.rs",
+                language: Some("rust"),
+                size_bytes: Some((padding.len() + 32) as i64),
+                modified_at: Some("2026-07-26T00:00:00.000Z"),
+                content_hash: "huge-helper",
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols: &symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "huge_helper",
+            })
+            .expect("graph index");
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({ "query": "helper", "limit": 1, "contextLines": 0, "timeoutMs": null }),
+        );
+
+        assert!(result.is_error, "{:?}", result.output);
+        assert_error_contains(&result, "readable-line safety limit");
+        assert!(!workspace.path().join(".foco/graph-results").exists());
+    }
+
+    #[test]
+    fn graph_explore_measures_dynamic_metadata_before_publishing_preview() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let query = "q".repeat(30_000);
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        for (path, name) in [("a.rs", "first"), ("b.rs", "second")] {
+            let source = format!("fn {name}() {{}}\n");
+            fs::write(workspace.path().join(path), &source).expect("write source");
+            let symbols = [NewCodeGraphSymbol {
+                name,
+                qualified_name: name,
+                kind: "function",
+                visibility: None,
+                metadata_json: None,
+                start_line: Some(1),
+                start_column: Some(1),
+                end_line: Some(1),
+                end_column: None,
+                signature: Some("fn helper()"),
+                documentation: Some(&query),
+            }];
+            database
+                .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                    path,
+                    language: Some("rust"),
+                    size_bytes: Some(source.len() as i64),
+                    modified_at: Some("2026-07-26T00:00:00.000Z"),
+                    content_hash: path,
+                    parse_status: "parsed",
+                    parse_error_message: None,
+                    symbols: &symbols,
+                    imports: &[],
+                    references: &[],
+                    edges: &[],
+                    fts_body: &source,
+                })
+                .expect("graph index");
+        }
+
+        let result = execute_builtin_tool(
+            workspace.path(),
+            GRAPH_EXPLORE_TOOL,
+            json!({ "query": query, "limit": 2, "contextLines": 0, "timeoutMs": null }),
+        );
+
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["truncated"], true);
+        assert_eq!(result.output["outputTruncated"], true);
+        assert_eq!(result.output["totalCount"], 2);
+        assert_eq!(result.output["returnedCount"], 0);
+        assert!(result.output.get("fullResultPath").is_some());
+        let measurement = output_budget::measure_tool_execution(&result).expect("measurement");
+        assert!(
+            measurement.serialized_bytes <= output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+            "serialized graph_explore response exceeded the shared soft budget: {measurement:?}"
+        );
     }
 
     #[test]

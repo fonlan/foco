@@ -13520,6 +13520,99 @@ fn code_graph_query_helpers_return_compact_relationships() {
 }
 
 #[test]
+fn code_graph_symbol_pages_are_stable_and_cover_all_matches() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    let first_file_symbols = [
+        NewCodeGraphSymbol {
+            name: "helper",
+            qualified_name: "helper",
+            kind: "function",
+            visibility: None,
+            metadata_json: None,
+            start_line: Some(1),
+            start_column: Some(1),
+            end_line: Some(1),
+            end_column: Some(12),
+            signature: Some("fn helper()"),
+            documentation: None,
+        },
+        NewCodeGraphSymbol {
+            name: "helper",
+            qualified_name: "helper",
+            kind: "function",
+            visibility: None,
+            metadata_json: None,
+            start_line: Some(1),
+            start_column: Some(2),
+            end_line: Some(1),
+            end_column: Some(13),
+            signature: Some("fn helper()"),
+            documentation: None,
+        },
+    ];
+    let second_file_symbols = [NewCodeGraphSymbol {
+        name: "helper",
+        qualified_name: "helper",
+        kind: "function",
+        visibility: None,
+        metadata_json: None,
+        start_line: Some(1),
+        start_column: Some(1),
+        end_line: Some(1),
+        end_column: Some(12),
+        signature: Some("fn helper()"),
+        documentation: None,
+    }];
+    for (path, symbols) in [
+        ("a.rs", first_file_symbols.as_slice()),
+        ("b.rs", second_file_symbols.as_slice()),
+    ] {
+        database
+            .replace_code_graph_file_index(NewCodeGraphFileIndex {
+                path,
+                language: Some("rust"),
+                size_bytes: Some(16),
+                modified_at: Some("2026-07-26T00:00:00.000Z"),
+                content_hash: path,
+                parse_status: "parsed",
+                parse_error_message: None,
+                symbols,
+                imports: &[],
+                references: &[],
+                edges: &[],
+                fts_body: "fn helper() {}",
+            })
+            .expect("graph index");
+    }
+
+    let first_page = database
+        .find_code_graph_symbols_page("helper", Some("function"), None, 2, 0)
+        .expect("first page");
+    let second_page = database
+        .find_code_graph_symbols_page("helper", Some("function"), None, 2, 2)
+        .expect("second page");
+    let complete = database
+        .find_code_graph_symbols("helper", Some("function"), None, 10)
+        .expect("complete query");
+    let paged_ids = first_page
+        .iter()
+        .chain(&second_page)
+        .map(|symbol| symbol.id)
+        .collect::<Vec<_>>();
+    let complete_ids = complete.iter().map(|symbol| symbol.id).collect::<Vec<_>>();
+
+    assert_eq!(first_page.len(), 2);
+    assert_eq!(first_page[0].path, "a.rs");
+    assert_eq!(first_page[1].path, "a.rs");
+    assert!(first_page[0].id < first_page[1].id);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].path, "b.rs");
+    assert_eq!(paged_ids, complete_ids);
+}
+
+#[test]
 fn replacing_code_graph_file_index_clears_old_fts_entries() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

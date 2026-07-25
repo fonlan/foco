@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -12,25 +13,31 @@ use foco_store::workspace::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::output_budget::soft_limit_array_prefix_len_with_overhead;
+use crate::output_budget::{
+    TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
+    TOOL_OUTPUT_SOFT_LINE_LIMIT, measure_tool_execution, soft_limit_array_prefix_len_with_overhead,
+};
 use crate::{
     DEFAULT_GRAPH_EXPLORE_CONTEXT_LINES, DEFAULT_GRAPH_EXPLORE_RESULT_LIMIT,
     DEFAULT_GRAPH_RESULT_LIMIT, DEFAULT_GRAPH_TOOL_TIMEOUT_MS, LineRange,
     MAX_GRAPH_EXPLORE_CONTEXT_LINES, MAX_GRAPH_EXPLORE_OUTPUT_BYTES,
     MAX_GRAPH_EXPLORE_RESULT_LIMIT, MAX_GRAPH_EXPLORE_SYMBOL_LINES, MAX_GRAPH_RESULT_LIMIT,
-    MAX_RANGED_READ_SOURCE_BYTES, count_text_lines, decode_text_file,
+    MAX_RANGED_READ_SOURCE_BYTES, ToolExecution, count_text_lines, decode_text_file,
     errors::{ToolRuntimeError, tool_timeout_ms},
     normalize_read_line_range, normalize_workspace_path_text, numbered_content, parse_arguments,
     read_line_range, resolve_workspace_file,
 };
 
 const GRAPH_LIST_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
-const GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES: usize = 2 * 1024;
 const GRAPH_EXPLORE_PAGE_SIZE: i64 = 100;
 const MAX_GRAPH_EXPLORE_COLLECTION_SYMBOLS: usize = 1_000;
 const GRAPH_RESULTS_DIR: &str = "graph-results";
 const MAX_GRAPH_RESULT_FILES: usize = 20;
 const GRAPH_RESULT_TTL: Duration = Duration::from_secs(60 * 60);
+/// Leaves room for read_file's line number, path, and enclosing response metadata.
+const GRAPH_SNAPSHOT_READ_FILE_LINE_RESERVE_BYTES: usize = 1024;
+const MAX_GRAPH_SNAPSHOT_LINE_BYTES: usize =
+    TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT - GRAPH_SNAPSHOT_READ_FILE_LINE_RESERVE_BYTES;
 
 pub(crate) fn graph_find_symbols(
     workspace_path: &Path,
@@ -277,50 +284,99 @@ pub(crate) fn graph_explore(
     let database = open_code_graph_database(workspace_path)?;
     let (symbols, query, path) = resolve_graph_explore_symbols(&database, &request)?;
     let snippets = collect_graph_explore_snippets(workspace_path, symbols, context_lines)?;
-    let total_count = snippets.len();
-    let preview_candidates = snippets
-        .iter()
-        .take(preview_limit)
-        .map(|snippet| snippet.value.clone())
-        .collect::<Vec<_>>();
-    let (preview, soft_truncated) =
-        soft_limit_preview_records(preview_candidates, GRAPH_EXPLORE_RESPONSE_OVERHEAD_BYTES)?;
-    let returned_count = preview.len();
-    let truncated = returned_count < total_count;
-
-    let mut output = json!({
-        "query": query,
-        "path": path,
-        "contextLines": context_lines,
-        "snippets": preview,
-        "truncated": truncated,
-        "outputTruncated": soft_truncated,
-        "totalCount": total_count,
-        "returnedCount": returned_count,
-        "timeoutMs": timeout_ms
-    });
-
-    if truncated {
-        let snapshot = write_graph_explore_snapshot(workspace_path, &snippets)?;
-        let next_start_line = snapshot
-            .snippet_start_lines
-            .get(returned_count)
-            .copied()
-            .ok_or_else(|| {
-                ToolRuntimeError::InvalidArguments(
-                    "failed to render graph_explore snapshot continuation line".to_string(),
-                )
-            })?;
-        let full_result_path = graph_snapshot_text_relative_path(&snapshot.id);
-        output["nextOffset"] = json!(returned_count);
-        output["nextStartLine"] = json!(next_start_line);
-        output["fullResultPath"] = json!(full_result_path);
-        output["note"] = json!(format!(
-            "Results truncated: showing {returned_count} of {total_count} snippets. The complete stable snapshot is at '{full_result_path}'. Continue with read_file(path='{full_result_path}', startLine={next_start_line}, endLine=<small range>)."
-        ));
+    let (output, snapshot) = graph_explore_preview_response(
+        query,
+        path,
+        context_lines,
+        timeout_ms,
+        &snippets,
+        preview_limit,
+    )?;
+    if let Some(snapshot) = snapshot {
+        write_graph_explore_snapshot(workspace_path, &snapshot)?;
     }
 
     Ok(output)
+}
+
+fn graph_explore_preview_response(
+    query: Option<String>,
+    path: Option<String>,
+    context_lines: usize,
+    timeout_ms: u64,
+    snippets: &[GraphExploreSnippet],
+    preview_limit: usize,
+) -> Result<(Value, Option<GraphExploreSnapshot>), ToolRuntimeError> {
+    let total_count = snippets.len();
+    let requested_count = preview_limit.min(total_count);
+    let mut returned_count = requested_count;
+    let mut snapshot = None;
+
+    loop {
+        let truncated = returned_count < total_count;
+        if truncated && snapshot.is_none() {
+            snapshot = Some(prepare_graph_explore_snapshot(snippets)?);
+        }
+
+        let preview = snippets[..returned_count]
+            .iter()
+            .map(|snippet| snippet.value.clone())
+            .collect::<Vec<_>>();
+        let mut output = json!({
+            "query": query,
+            "path": path,
+            "contextLines": context_lines,
+            "snippets": preview,
+            "truncated": truncated,
+            "outputTruncated": returned_count < requested_count,
+            "totalCount": total_count,
+            "returnedCount": returned_count,
+            "timeoutMs": timeout_ms
+        });
+
+        if let Some(snapshot) = snapshot.as_ref() {
+            let next_start_line = snapshot
+                .snippet_start_lines
+                .get(returned_count)
+                .copied()
+                .ok_or_else(|| {
+                    ToolRuntimeError::InvalidArguments(
+                        "failed to render graph_explore snapshot continuation line".to_string(),
+                    )
+                })?;
+            let full_result_path = graph_snapshot_text_relative_path(&snapshot.id);
+            output["nextOffset"] = json!(returned_count);
+            output["nextStartLine"] = json!(next_start_line);
+            output["fullResultPath"] = json!(&full_result_path);
+            output["note"] = json!(format!(
+                "Results truncated: showing {returned_count} of {total_count} snippets. The complete stable snapshot is at '{full_result_path}'. Continue with read_file(path='{full_result_path}', startLine={next_start_line}, endLine=<small range>)."
+            ));
+        }
+
+        if graph_explore_response_fits_soft_budget(&output)? {
+            return Ok((output, snapshot));
+        }
+        let Some(next_returned_count) = returned_count.checked_sub(1) else {
+            return Err(ToolRuntimeError::InvalidArguments(
+                "graph_explore response metadata exceeds the shared output budget; refine query or path and try again".to_string(),
+            ));
+        };
+        returned_count = next_returned_count;
+    }
+}
+
+fn graph_explore_response_fits_soft_budget(output: &Value) -> Result<bool, ToolRuntimeError> {
+    let measurement = measure_tool_execution(&ToolExecution {
+        output: output.clone(),
+        is_error: false,
+    })
+    .map_err(|source| {
+        ToolRuntimeError::InvalidArguments(format!(
+            "failed to measure graph_explore response output: {source}"
+        ))
+    })?;
+    Ok(measurement.serialized_bytes <= TOOL_OUTPUT_SOFT_BYTE_LIMIT
+        && measurement.text_lines <= TOOL_OUTPUT_SOFT_LINE_LIMIT)
 }
 
 fn open_code_graph_database(
@@ -516,29 +572,88 @@ fn graph_explore_collection_incomplete_error(detail: String) -> ToolRuntimeError
 
 struct GraphExploreSnapshot {
     id: String,
+    contents: String,
     snippet_start_lines: Vec<usize>,
+}
+
+fn prepare_graph_explore_snapshot(
+    snippets: &[GraphExploreSnippet],
+) -> Result<GraphExploreSnapshot, ToolRuntimeError> {
+    let (contents, snippet_start_lines) = render_graph_explore_snapshot(snippets)?;
+    Ok(GraphExploreSnapshot {
+        id: next_graph_snapshot_id(),
+        contents,
+        snippet_start_lines,
+    })
 }
 
 fn write_graph_explore_snapshot(
     workspace_path: &Path,
-    snippets: &[GraphExploreSnippet],
-) -> Result<GraphExploreSnapshot, ToolRuntimeError> {
-    let results_dir = workspace_path.join(".foco").join(GRAPH_RESULTS_DIR);
-    fs::create_dir_all(&results_dir).map_err(|source| ToolRuntimeError::Io {
-        path: results_dir.clone(),
-        source,
-    })?;
+    snapshot: &GraphExploreSnapshot,
+) -> Result<(), ToolRuntimeError> {
+    let results_dir = graph_results_dir(workspace_path)?;
     prune_graph_results_dir(&results_dir);
 
-    let (contents, snippet_start_lines) = render_graph_explore_snapshot(snippets)?;
-    let id = next_graph_snapshot_id();
-    let path = results_dir.join(format!("{id}.txt"));
-    fs::write(&path, contents).map_err(|source| ToolRuntimeError::Io { path, source })?;
+    let path = results_dir.join(format!("{}.txt", snapshot.id));
+    fs::write(&path, &snapshot.contents).map_err(|source| ToolRuntimeError::Io { path, source })?;
 
-    Ok(GraphExploreSnapshot {
-        id,
-        snippet_start_lines,
-    })
+    Ok(())
+}
+
+fn graph_results_dir(workspace_path: &Path) -> Result<PathBuf, ToolRuntimeError> {
+    let workspace = fs::canonicalize(workspace_path).map_err(|source| ToolRuntimeError::Io {
+        path: workspace_path.to_path_buf(),
+        source,
+    })?;
+    let foco_dir = workspace.join(".foco");
+    ensure_non_symlink_directory(&foco_dir)?;
+    let results_dir = foco_dir.join(GRAPH_RESULTS_DIR);
+    ensure_non_symlink_directory(&results_dir)?;
+
+    let canonical_results_dir =
+        fs::canonicalize(&results_dir).map_err(|source| ToolRuntimeError::Io {
+            path: results_dir.clone(),
+            source,
+        })?;
+    if !canonical_results_dir.starts_with(&workspace) {
+        return Err(ToolRuntimeError::InvalidPath(format!(
+            "graph_explore snapshot directory escapes the workspace: {}",
+            results_dir.display()
+        )));
+    }
+
+    Ok(canonical_results_dir)
+}
+
+fn ensure_non_symlink_directory(path: &Path) -> Result<(), ToolRuntimeError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(ToolRuntimeError::InvalidPath(format!(
+                "graph_explore snapshot directory must not be a symbolic link: {}",
+                path.display()
+            )));
+        }
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(ToolRuntimeError::InvalidPath(format!(
+                "graph_explore snapshot directory is not a directory: {}",
+                path.display()
+            )));
+        }
+        Err(source) if source.kind() == ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(ToolRuntimeError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+
+    fs::create_dir(path).map_err(|source| ToolRuntimeError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    ensure_non_symlink_directory(path)
 }
 
 fn render_graph_explore_snapshot(
@@ -616,6 +731,11 @@ fn render_graph_explore_snapshot(
                         .to_string(),
                 )
             })?;
+        if longest_complete_line_bytes(content) > MAX_GRAPH_SNAPSHOT_LINE_BYTES {
+            return Err(graph_explore_collection_incomplete_error(format!(
+                "a snapshot source line exceeds the {MAX_GRAPH_SNAPSHOT_LINE_BYTES}-byte readable-line safety limit"
+            )));
+        }
 
         append_graph_snapshot_line(
             &mut contents,
@@ -643,7 +763,7 @@ fn render_graph_explore_snapshot(
         if !content.ends_with('\n') {
             contents.push('\n');
         }
-        next_line = next_line.saturating_add(content.lines().count());
+        next_line = next_line.saturating_add(count_text_lines(content));
         append_graph_snapshot_line(
             &mut contents,
             &mut next_line,
@@ -653,6 +773,33 @@ fn render_graph_explore_snapshot(
     }
 
     Ok((contents, snippet_start_lines))
+}
+
+fn longest_complete_line_bytes(content: &str) -> usize {
+    let bytes = content.as_bytes();
+    let mut longest = 0;
+    let mut start = 0;
+    let mut index = 0;
+
+    while index < bytes.len() {
+        let end = match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => index + 2,
+            b'\r' | b'\n' => index + 1,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        longest = longest.max(end - start);
+        start = end;
+        index = end;
+    }
+
+    if start < bytes.len() {
+        longest.max(bytes.len() - start)
+    } else {
+        longest
+    }
 }
 
 fn append_graph_snapshot_line(contents: &mut String, next_line: &mut usize, line: &str) {

@@ -42199,8 +42199,8 @@ mod tests {
             normal.route("get_plans"),
             Some(&RemoteToolRoute::SidecarLocal)
         );
-        // Spec tools share the same builtin definitions and SidecarLocal route (no remote fork).
-        for name in ["read_spec", "update_spec"] {
+        // These tools share the same builtin definitions and SidecarLocal route (no remote fork).
+        for name in ["read_spec", "update_spec", "graph_explore"] {
             let local = foco_tools::builtin_tool_definitions()
                 .into_iter()
                 .find(|tool| tool.name == name)
