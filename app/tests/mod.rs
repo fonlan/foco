@@ -1314,6 +1314,7 @@ fn test_prepared_chat_context(
     let mcp_registry = Arc::new(McpRegistry::default());
 
     PreparedChatContext {
+        lifecycle: crate::plan_merge::PlanMergeChatLifecycle::Standard,
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
         tool_workspace_path: workspace_dir.clone(),
@@ -8425,6 +8426,7 @@ fn context_usage_preview_reports_packed_usage_and_large_group_llm_plan() {
     context.active_tool_start_index = context.provider_request.messages.len();
     let context_window = context.context_budget.context_window;
     let preview = PreparedPromptContext {
+        lifecycle: crate::plan_merge::PlanMergeChatLifecycle::Standard,
         workspace_id: context.workspace_id,
         workspace_path: context.workspace_path,
         model_id: context.model_id,
@@ -16951,6 +16953,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
     let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
     let context = PreparedChatContext {
+        lifecycle: crate::plan_merge::PlanMergeChatLifecycle::Standard,
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
         tool_workspace_path: workspace_dir.clone(),
@@ -18969,6 +18972,7 @@ async fn worker_chat_context_does_not_replace_parent_queued_run() {
             attachments: Vec::new(),
         },
         false,
+        crate::plan_merge::PlanMergeChatLifecycle::Standard,
     )
     .await
     .expect("worker chat context");
@@ -19031,6 +19035,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
     let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
     let context = PreparedChatContext {
+        lifecycle: crate::plan_merge::PlanMergeChatLifecycle::Standard,
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
         tool_workspace_path: workspace_dir.clone(),
@@ -19454,6 +19459,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
     let (_app_shutdown_tx, app_shutdown_rx) = watch::channel(false);
     let mcp_registry = Arc::new(McpRegistry::default());
     let context = PreparedChatContext {
+        lifecycle: crate::plan_merge::PlanMergeChatLifecycle::Standard,
         workspace_id: "workspace-1".to_string(),
         workspace_path: workspace_dir.clone(),
         tool_workspace_path: workspace_dir.clone(),

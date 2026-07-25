@@ -126,3 +126,56 @@ mod tests {
         );
     }
 }
+/// Controls chat lifecycle side effects for durable Plan merge sessions.
+///
+/// A merge Coordinator has no user-authored implementation result of its own:
+/// its successful output only integrates an earlier Plan phase. Keeping this
+/// policy distinct prevents merge prompts from being treated as a second source
+/// for memory and Workspace Spec derivation while preserving the implementation
+/// phase's separately persisted effects.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PlanMergeChatLifecycle {
+    #[default]
+    Standard,
+    PlanMerge,
+}
+
+impl PlanMergeChatLifecycle {
+    pub(crate) fn allows_memory_retrieval(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn allows_derived_effects(self) -> bool {
+        matches!(self, Self::Standard)
+    }
+
+    pub(crate) fn from_local_correlation(correlation_id: Option<&str>) -> Self {
+        correlation_id
+            .is_some_and(|value| value.trim_start().starts_with("plan_merge:"))
+            .then_some(Self::PlanMerge)
+            .unwrap_or(Self::Standard)
+    }
+}
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::PlanMergeChatLifecycle;
+
+    #[test]
+    fn local_plan_merge_correlation_disables_chat_memory_and_derived_effects() {
+        let lifecycle =
+            PlanMergeChatLifecycle::from_local_correlation(Some("plan_merge:plan-1:phase-1"));
+
+        assert!(!lifecycle.allows_memory_retrieval());
+        assert!(!lifecycle.allows_derived_effects());
+    }
+
+    #[test]
+    fn ordinary_and_non_merge_correlations_keep_chat_lifecycle_effects() {
+        for correlation in [None, Some("plan_phase:plan-1:phase-1"), Some("user-action")] {
+            let lifecycle = PlanMergeChatLifecycle::from_local_correlation(correlation);
+
+            assert!(lifecycle.allows_memory_retrieval());
+            assert!(lifecycle.allows_derived_effects());
+        }
+    }
+}

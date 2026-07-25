@@ -4,7 +4,7 @@ mod environment;
 mod prompt_files;
 
 pub(crate) use assembly::{
-    plan_mode_builtin_tool_allowed, prepare_prompt_context,
+    plan_mode_builtin_tool_allowed, prepare_prompt_context, prepare_prompt_context_with_lifecycle,
     truncate_workspace_spec_markdown_for_prompt,
 };
 pub(crate) use compression::{

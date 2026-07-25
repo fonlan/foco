@@ -447,6 +447,15 @@ pub(crate) enum QueuedChatMessageOrigin {
 }
 
 impl QueuedChatMessageOrigin {
+    pub(crate) fn lifecycle(&self) -> crate::plan_merge::PlanMergeChatLifecycle {
+        match self {
+            Self::PlanMerge { .. } => crate::plan_merge::PlanMergeChatLifecycle::PlanMerge,
+            Self::User | Self::ScheduledTask { .. } | Self::PlanPhase { .. } => {
+                crate::plan_merge::PlanMergeChatLifecycle::Standard
+            }
+        }
+    }
+
     fn is_user_direct_chat(&self) -> bool {
         matches!(self, Self::User)
     }
@@ -800,12 +809,13 @@ pub(crate) async fn queue_chat_message_internal(
     let requested_skill_ids = skill_ids.clone().unwrap_or_default();
     let requested_session_mode = session_mode.clone();
     let origin_metadata = origin.metadata_value();
+    let lifecycle = origin.lifecycle();
     let preallocated_chat_id = if chat_id.is_none() {
         Some(unique_id("chat"))
     } else {
         None
     };
-    let prompt_context = prepare_prompt_context(
+    let prompt_context = crate::prompt::prepare_prompt_context_with_lifecycle(
         state,
         &config,
         workspace_id,
@@ -825,6 +835,7 @@ pub(crate) async fn queue_chat_message_internal(
         },
         preallocated_chat_id,
         PromptAssemblyPurpose::ChatRun,
+        lifecycle,
     )
     .await?;
     validate_provider_request_thinking_level(
@@ -2795,4 +2806,35 @@ pub(crate) async fn delete_chat(
         &state.active_chat_runs,
         Some(&state.remote_workspace_manager),
     )
+}
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::QueuedChatMessageOrigin;
+    use crate::plan_merge::PlanMergeChatLifecycle;
+
+    #[test]
+    fn plan_merge_origin_uses_merge_lifecycle() {
+        let origin = QueuedChatMessageOrigin::PlanMerge {
+            plan_id: "plan-1".to_string(),
+            phase_id: "phase-1".to_string(),
+        };
+
+        assert_eq!(origin.lifecycle(), PlanMergeChatLifecycle::PlanMerge);
+    }
+
+    #[test]
+    fn ordinary_origins_keep_standard_lifecycle() {
+        assert_eq!(
+            QueuedChatMessageOrigin::PlanPhase {
+                plan_id: "plan-1".to_string(),
+                phase_id: "phase-1".to_string(),
+            }
+            .lifecycle(),
+            PlanMergeChatLifecycle::Standard
+        );
+        assert_eq!(
+            QueuedChatMessageOrigin::User.lifecycle(),
+            PlanMergeChatLifecycle::Standard
+        );
+    }
 }

@@ -25,6 +25,27 @@ pub(crate) async fn prepare_prompt_context(
     preallocated_chat_id: Option<String>,
     purpose: PromptAssemblyPurpose,
 ) -> Result<PreparedPromptContext, ApiError> {
+    prepare_prompt_context_with_lifecycle(
+        state,
+        config,
+        workspace_id,
+        request,
+        preallocated_chat_id,
+        purpose,
+        crate::plan_merge::PlanMergeChatLifecycle::Standard,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_prompt_context_with_lifecycle(
+    state: &AppState,
+    config: &GlobalConfig,
+    workspace_id: &str,
+    request: PromptContextRequest,
+    preallocated_chat_id: Option<String>,
+    purpose: PromptAssemblyPurpose,
+    lifecycle: crate::plan_merge::PlanMergeChatLifecycle,
+) -> Result<PreparedPromptContext, ApiError> {
     let workspace_id = workspace_id.trim();
     let model_id = request.model_id.trim();
     // `providerId` remains accepted in persisted/legacy request payloads, but model routing
@@ -373,11 +394,12 @@ pub(crate) async fn prepare_prompt_context(
     } else {
         Vec::new()
     };
+    let memory_retrieval_enabled = config.memory.enabled && lifecycle.allows_memory_retrieval();
     let active_stored_memory_keys = active_prompt_context_memory_keys(
         state,
         config,
         workspace,
-        config.memory.enabled,
+        memory_retrieval_enabled,
         &prompt_context_injections,
     )?;
     let existing_stable_context_messages = stored_stable_prompt_context_messages(
@@ -396,8 +418,21 @@ pub(crate) async fn prepare_prompt_context(
     // inputs are captured here and applied after the chat has been persisted.
     // Context preview builds must keep memory inline so the usage estimate stays
     // accurate.
-    let defer_memory = config.memory.enabled && matches!(purpose, PromptAssemblyPurpose::ChatRun);
-    let memory_context = if defer_memory {
+    let defer_memory =
+        memory_retrieval_enabled && matches!(purpose, PromptAssemblyPurpose::ChatRun);
+    let memory_context = if !memory_retrieval_enabled {
+        Some(MemoryPromptContext {
+            stable_message: None,
+            turn_message: None,
+            memories_used: Vec::new(),
+            context_tokens: 0,
+            budget_tokens: 0,
+            stable_memory_keys: Vec::new(),
+            turn_memory_keys: Vec::new(),
+            stable_memory_summaries: Vec::new(),
+            turn_memory_summaries: Vec::new(),
+        })
+    } else if defer_memory {
         None
     } else {
         Some(
@@ -627,6 +662,7 @@ pub(crate) async fn prepare_prompt_context(
         tool_choice: foco_providers::NeutralToolChoice::Auto,
     };
     Ok(PreparedPromptContext {
+        lifecycle,
         workspace_id: workspace.id.clone(),
         workspace_path: workspace.path.clone(),
         chat_id,

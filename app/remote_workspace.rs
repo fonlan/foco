@@ -17479,6 +17479,7 @@ struct RemotePlanTaskBinding {
     team_id: AgentTeamId,
     attempt_id: AgentAttemptId,
     owner_incarnation: String,
+    lifecycle: crate::plan_merge::PlanMergeChatLifecycle,
 }
 
 const REMOTE_PLAN_TASK_KIND_FIELD: &str = "planTaskKind";
@@ -17529,6 +17530,15 @@ enum RemotePlanTaskKind {
 }
 
 impl RemotePlanTaskKind {
+    fn lifecycle(&self) -> crate::plan_merge::PlanMergeChatLifecycle {
+        match self {
+            Self::Merge { .. } => crate::plan_merge::PlanMergeChatLifecycle::PlanMerge,
+            Self::LegacyImplementation | Self::Implementation { .. } => {
+                crate::plan_merge::PlanMergeChatLifecycle::Standard
+            }
+        }
+    }
+
     fn expected_execution_workspace_mode(&self) -> AgentExecutionWorkspaceMode {
         match self {
             Self::LegacyImplementation | Self::Implementation { .. } => {
@@ -17873,6 +17883,7 @@ fn remote_sidecar_validate_plan_task_binding(
         team_id: task.team_id,
         attempt_id: attempt.id,
         owner_incarnation,
+        lifecycle: task_kind.lifecycle(),
     }))
 }
 
@@ -20660,6 +20671,15 @@ async fn remote_sidecar_start_chat_run(
         &tool_workspace_path,
         format!("remote-chat:{chat_id}"),
     );
+    if plan_task
+        .as_ref()
+        .is_some_and(|binding| !binding.lifecycle.allows_memory_retrieval())
+    {
+        tracing::debug!(
+            chat_id,
+            "remote Plan merge chat is classified to skip automatic memory retrieval and chat-derived effects"
+        );
+    }
 
     let (run_id, run_stream) = match remote_sidecar_reserve_active_run(
         &state,
@@ -48161,5 +48181,31 @@ mod tests {
             retry_attempt.agent_task_id.as_deref(),
             Some(auto_task_id.as_str())
         );
+    }
+}
+#[cfg(test)]
+mod plan_task_lifecycle_tests {
+    use super::{RemotePlanMergeMode, RemotePlanTaskKind};
+    use crate::plan_merge::PlanMergeChatLifecycle;
+
+    #[test]
+    fn remote_merge_task_kind_uses_merge_lifecycle() {
+        let kind = RemotePlanTaskKind::Merge {
+            plan_id: "plan-1".to_string(),
+            phase_id: "phase-1".to_string(),
+            merge_mode: RemotePlanMergeMode::DirectAuto,
+        };
+
+        assert_eq!(kind.lifecycle(), PlanMergeChatLifecycle::PlanMerge);
+    }
+
+    #[test]
+    fn remote_implementation_task_kind_keeps_standard_lifecycle() {
+        let kind = RemotePlanTaskKind::Implementation {
+            plan_id: "plan-1".to_string(),
+            phase_id: "phase-1".to_string(),
+        };
+
+        assert_eq!(kind.lifecycle(), PlanMergeChatLifecycle::Standard);
     }
 }

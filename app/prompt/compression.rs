@@ -3390,6 +3390,9 @@ fn persist_inline_chat_derived_effects(
     context: &PreparedChatContext,
     final_state: &str,
 ) -> Result<bool, ApiError> {
+    if !context.lifecycle.allows_derived_effects() {
+        return Ok(false);
+    }
     if final_state != "succeeded" {
         return Ok(false);
     }

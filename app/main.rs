@@ -2334,6 +2334,7 @@ struct PlanPhaseDerivedEffectsContext {
 
 #[derive(Clone)]
 struct PreparedChatContext {
+    lifecycle: crate::plan_merge::PlanMergeChatLifecycle,
     workspace_id: String,
     workspace_path: PathBuf,
     tool_workspace_path: PathBuf,
@@ -2409,6 +2410,7 @@ struct PreparedChatContext {
 }
 
 struct PreparedPromptContext {
+    lifecycle: crate::plan_merge::PlanMergeChatLifecycle,
     workspace_id: String,
     workspace_path: PathBuf,
     model_id: String,
@@ -5519,7 +5521,15 @@ async fn prepare_chat_context(
     workspace_id: &str,
     request: ChatStreamRequest,
 ) -> Result<PreparedChatContext, ApiError> {
-    prepare_chat_context_for_output(state, config, workspace_id, request, true).await
+    prepare_chat_context_for_output(
+        state,
+        config,
+        workspace_id,
+        request,
+        true,
+        crate::plan_merge::PlanMergeChatLifecycle::Standard,
+    )
+    .await
 }
 
 async fn prepare_chat_context_for_output(
@@ -5528,6 +5538,7 @@ async fn prepare_chat_context_for_output(
     workspace_id: &str,
     request: ChatStreamRequest,
     agent_primary_chat_output: bool,
+    lifecycle: crate::plan_merge::PlanMergeChatLifecycle,
 ) -> Result<PreparedChatContext, ApiError> {
     let queued_user_message_id = request
         .queued_user_message_id
@@ -5559,13 +5570,14 @@ async fn prepare_chat_context_for_output(
     } else {
         None
     };
-    let prompt_context = prepare_prompt_context(
+    let prompt_context = crate::prompt::prepare_prompt_context_with_lifecycle(
         state,
         config,
         workspace_id,
         request.into_prompt_request(),
         preallocated_chat_id,
         PromptAssemblyPurpose::ChatRun,
+        lifecycle,
     )
     .await?;
     validate_provider_request_thinking_level(
@@ -5811,6 +5823,7 @@ async fn prepare_chat_context_for_output(
     }
 
     let mut context = PreparedChatContext {
+        lifecycle: prompt_context.lifecycle,
         workspace_id: prompt_context.workspace_id,
         workspace_path: prompt_context.workspace_path.clone(),
         tool_workspace_path: prompt_context.workspace_path,

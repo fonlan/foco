@@ -1472,6 +1472,9 @@ async fn run_coordinator_task_inner(
             attachments: task_input.attachments.clone(),
         },
         agent_primary_chat_output,
+        crate::plan_merge::PlanMergeChatLifecycle::from_local_correlation(
+            task_input.correlation_id.as_deref(),
+        ),
     )
     .await
     .map_err(|error| {
