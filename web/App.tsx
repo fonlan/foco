@@ -1517,6 +1517,45 @@ type WorkspaceChatPagingState = Record<
   }
 >;
 
+const MOBILE_SIDEBAR_OUTSIDE_TARGET_PX = 48;
+
+function mobileSafeAreaInsetWidth() {
+  if (typeof document === "undefined" || !document.body) {
+    return 0;
+  }
+
+  const probe = document.createElement("div");
+  probe.style.cssText = [
+    "position:fixed",
+    "visibility:hidden",
+    "pointer-events:none",
+    "padding-left:env(safe-area-inset-left, 0px)",
+    "padding-right:env(safe-area-inset-right, 0px)",
+  ].join(";");
+  document.body.append(probe);
+
+  const styles = window.getComputedStyle(probe);
+  const insetWidth =
+    (Number.parseFloat(styles.paddingLeft) || 0) +
+    (Number.parseFloat(styles.paddingRight) || 0);
+  probe.remove();
+  return insetWidth;
+}
+
+function workspaceSidebarMaxWidthForViewport(
+  viewportWidth: number,
+  safeAreaInsetWidth = 0,
+) {
+  if (viewportWidth >= MOBILE_BREAKPOINT_PX) {
+    return WORKSPACE_SIDEBAR_MAX_WIDTH;
+  }
+
+  return Math.min(
+    WORKSPACE_SIDEBAR_MAX_WIDTH,
+    Math.max(0, viewportWidth - MOBILE_SIDEBAR_OUTSIDE_TARGET_PX - safeAreaInsetWidth),
+  );
+}
+
 export function App() {
   const [initialBrowserRoute] = useState(() => currentBrowserRoute());
   const [authStatus, setAuthStatus] = useState<AuthStatusResponse | null>(null);
@@ -1777,6 +1816,10 @@ export function App() {
   const appShellRef = useRef<HTMLDivElement | null>(null);
   const contextPanelResizeDragRef = useRef<PanelResizeDragSession | null>(null);
   const [sidebarWidth, setSidebarWidth] = useState(WORKSPACE_SIDEBAR_MIN_WIDTH);
+  const [sidebarViewportWidth, setSidebarViewportWidth] = useState(() =>
+    typeof window === "undefined" ? MOBILE_BREAKPOINT_PX : window.innerWidth,
+  );
+  const [sidebarSafeAreaInsetWidth, setSidebarSafeAreaInsetWidth] = useState(0);
   const [isResizingSidebar, setIsResizingSidebar] = useState(false);
   const [isMobileWorkspaceOpen, setIsMobileWorkspaceOpen] = useState(false);
   const [isWorkspaceSidebarOpen, setIsWorkspaceSidebarOpen] = useState(true);
@@ -2599,17 +2642,50 @@ export function App() {
     ? unsupportedAttachmentMessage(selectedModel, unsupportedDraftAttachment, t)
     : null;
 
+  const workspaceSidebarMaxWidth = workspaceSidebarMaxWidthForViewport(
+    sidebarViewportWidth,
+    sidebarSafeAreaInsetWidth,
+  );
+  const workspaceSidebarMinWidth = Math.min(
+    WORKSPACE_SIDEBAR_MIN_WIDTH,
+    workspaceSidebarMaxWidth,
+  );
+  const clampWorkspaceSidebarWidth = useCallback((width: number) => {
+    return Math.min(
+      Math.max(width, workspaceSidebarMinWidth),
+      workspaceSidebarMaxWidth,
+    );
+  }, [workspaceSidebarMaxWidth, workspaceSidebarMinWidth]);
+
   const updateSidebarWidthFromClientX = useCallback((clientX: number) => {
     const sidebarLeft =
       workspaceSidebarRef.current?.getBoundingClientRect().left ?? 0;
     const nextWidth = clientX - sidebarLeft;
 
-    setSidebarWidth(
-      Math.min(
-        Math.max(nextWidth, WORKSPACE_SIDEBAR_MIN_WIDTH),
-        WORKSPACE_SIDEBAR_MAX_WIDTH,
-      ),
-    );
+    setSidebarWidth(clampWorkspaceSidebarWidth(nextWidth));
+  }, [clampWorkspaceSidebarWidth]);
+
+  useEffect(() => {
+    function updateSidebarWidthForViewport() {
+      const viewportWidth = window.innerWidth;
+      const safeAreaInsetWidth = mobileSafeAreaInsetWidth();
+      const maxWidth = workspaceSidebarMaxWidthForViewport(
+        viewportWidth,
+        safeAreaInsetWidth,
+      );
+
+      setSidebarViewportWidth(viewportWidth);
+      setSidebarSafeAreaInsetWidth(safeAreaInsetWidth);
+      setSidebarWidth((current) =>
+        Math.min(Math.max(current, Math.min(WORKSPACE_SIDEBAR_MIN_WIDTH, maxWidth)), maxWidth),
+      );
+    }
+
+    updateSidebarWidthForViewport();
+    window.addEventListener("resize", updateSidebarWidthForViewport);
+    return () => {
+      window.removeEventListener("resize", updateSidebarWidthForViewport);
+    };
   }, []);
 
   const previewContextPanelHeight = useCallback((value: number) => {
@@ -13677,6 +13753,7 @@ export function App() {
                 "--diff-panel-width": `${diffPanelWidth}px`,
                 "--context-panel-min-height": `${CONTEXT_PANEL_MIN_HEIGHT}px`,
                 "--context-panel-mobile-height": `${contextPanelMobileHeight}px`,
+                "--sidebar-max-width": `${workspaceSidebarMaxWidth}px`,
                 "--sidebar-width": `${sidebarWidth}px`,
               } as CSSProperties
             }
@@ -13735,9 +13812,9 @@ export function App() {
               <div
                 aria-label={t("Resize workspace sidebar")}
                 aria-orientation="vertical"
-                aria-valuemax={WORKSPACE_SIDEBAR_MAX_WIDTH}
-                aria-valuemin={WORKSPACE_SIDEBAR_MIN_WIDTH}
-                aria-valuenow={sidebarWidth}
+                aria-valuemax={workspaceSidebarMaxWidth}
+                aria-valuemin={workspaceSidebarMinWidth}
+                aria-valuenow={Math.min(sidebarWidth, workspaceSidebarMaxWidth)}
                 className={`workspace-sidebar-splitter cursor-col-resize ${
                   isResizingSidebar ? "workspace-sidebar-splitter-active" : ""
                 }`}
@@ -13745,14 +13822,14 @@ export function App() {
                   if (event.key === "ArrowLeft") {
                     event.preventDefault();
                     setSidebarWidth((current) =>
-                      Math.max(current - 24, WORKSPACE_SIDEBAR_MIN_WIDTH),
+                      clampWorkspaceSidebarWidth(current - 24),
                     );
                   }
 
                   if (event.key === "ArrowRight") {
                     event.preventDefault();
                     setSidebarWidth((current) =>
-                      Math.min(current + 24, WORKSPACE_SIDEBAR_MAX_WIDTH),
+                      clampWorkspaceSidebarWidth(current + 24),
                     );
                   }
                 }}
@@ -13801,8 +13878,10 @@ export function App() {
                     </Button>
                     <Button
                       aria-label={t("Close")}
-                      className="mobile-sidebar-close inline-flex size-9 items-center justify-center rounded-lg border border-[var(--border)] bg-[color-mix(in_oklab,var(--surface)_90%,transparent)] text-[var(--muted)] shadow-sm hover:border-[var(--danger)] hover:bg-[var(--danger-soft)] hover:text-[var(--danger)]"
+                      className="mobile-sidebar-close"
+                      isIconOnly
                       onPress={() => setIsMobileWorkspaceOpen(false)}
+                      size="sm"
                       type="button"
                       variant="ghost"
                     >

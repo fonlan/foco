@@ -1101,8 +1101,15 @@ summary {
     top: 0;
     bottom: 0;
     left: 0;
-    width: min(21rem, calc(100vw - 3rem));
-    max-width: 100%;
+    width: min(
+      var(--sidebar-width, 21rem),
+      var(--sidebar-max-width, 26.25rem),
+      calc(100dvw - 3rem - var(--foco-safe-left) - var(--foco-safe-right))
+    );
+    max-width: min(
+      var(--sidebar-max-width, 26.25rem),
+      calc(100dvw - 3rem - var(--foco-safe-left) - var(--foco-safe-right))
+    );
     border-right: 1px solid var(--border);
     transform: translateX(-105%);
     transition: transform 200ms ease;
@@ -1413,7 +1420,7 @@ body,
 
 @media (max-width: 767px) {
   .workspace-sidebar-splitter {
-    display: none;
+    width: 1.5rem;
   }
 }
 
@@ -3302,10 +3309,6 @@ body,
     display: flex;
   }
 
-  .workspace-sidebar {
-    width: min(20rem, calc(100vw - 2rem));
-  }
-
   .context-sidebar {
     position: relative;
     right: auto;
@@ -5094,19 +5097,12 @@ summary:focus-visible {
   }
 
   .workspace-sidebar {
-    width: min(20rem, calc(100vw - 3rem - var(--foco-safe-left) - var(--foco-safe-right)));
     max-height: 100dvh;
     padding-left: var(--foco-safe-left);
   }
 
   .mobile-sidebar-backdrop {
     pointer-events: auto;
-  }
-
-  /* Phone: hide fine side-panel drag handles; keep stacked context/composer splitters for existing behavior. */
-  .workspace-sidebar-splitter,
-  .model-routing-resize-splitter {
-    display: none;
   }
 
   .app-toolbar {

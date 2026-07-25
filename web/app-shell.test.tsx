@@ -2422,6 +2422,7 @@ describe("app-shell verification surfaces", () => {
 
     await waitFor(() => {
       expect(document.body.style.cursor).toBe("col-resize");
+      expect(document.body.style.userSelect).toBe("none");
     });
 
     fireEvent.pointerMove(window, { clientX: 348 });
@@ -2435,7 +2436,153 @@ describe("app-shell verification surfaces", () => {
 
     await waitFor(() => {
       expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
     });
+  });
+
+  it("cancels workspace sidebar resize without leaving selection disabled", async () => {
+    renderApp();
+
+    const splitter = await screen.findByRole("separator", {
+      name: "Resize workspace sidebar",
+    });
+
+    fireEvent.pointerDown(splitter, { clientX: 336, pointerId: 1 });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("col-resize");
+      expect(document.body.style.userSelect).toBe("none");
+    });
+
+    fireEvent.pointerCancel(window, { pointerId: 1 });
+
+    await waitFor(() => {
+      expect(document.body.style.cursor).toBe("");
+      expect(document.body.style.userSelect).toBe("");
+    });
+  });
+
+  it("clamps the mobile workspace sidebar to leave an outside tap target", async () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 390,
+    });
+
+    try {
+      renderApp();
+
+      const splitter = await screen.findByRole("separator", {
+        name: "Resize workspace sidebar",
+      });
+      const sidebar = splitter.closest(".workspace-sidebar") as HTMLElement | null;
+      const appShell = splitter.closest(".app-shell") as HTMLElement | null;
+      if (!sidebar || !appShell) {
+        throw new Error("Expected workspace sidebar splitter inside app shell");
+      }
+
+      vi.spyOn(sidebar, "getBoundingClientRect").mockReturnValue({
+        bottom: 844,
+        height: 844,
+        left: 0,
+        right: 232,
+        toJSON: () => ({}),
+        top: 0,
+        width: 232,
+        x: 0,
+        y: 0,
+      } as DOMRect);
+
+      fireEvent.pointerDown(splitter, { clientX: 232, pointerId: 1 });
+      fireEvent.pointerMove(window, { clientX: 390, pointerId: 1 });
+
+      await waitFor(() => {
+        expect(appShell.style.getPropertyValue("--sidebar-max-width")).toBe("342px");
+        expect(appShell.style.getPropertyValue("--sidebar-width")).toBe("342px");
+        expect(splitter).toHaveAttribute("aria-valuemax", "342");
+        expect(splitter).toHaveAttribute("aria-valuenow", "342");
+      });
+
+      fireEvent.pointerUp(window, { pointerId: 1 });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
+  it("keeps an outside tap target below the desktop sidebar minimum", async () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 240,
+    });
+
+    try {
+      renderApp();
+
+      const splitter = await screen.findByRole("separator", {
+        name: "Resize workspace sidebar",
+      });
+      const appShell = splitter.closest(".app-shell") as HTMLElement | null;
+      if (!appShell) {
+        throw new Error("Expected workspace sidebar splitter inside app shell");
+      }
+
+      await waitFor(() => {
+        expect(appShell.style.getPropertyValue("--sidebar-max-width")).toBe("192px");
+        expect(appShell.style.getPropertyValue("--sidebar-width")).toBe("192px");
+        expect(splitter).toHaveAttribute("aria-valuemin", "192");
+        expect(splitter).toHaveAttribute("aria-valuemax", "192");
+        expect(splitter).toHaveAttribute("aria-valuenow", "192");
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
+  });
+
+  it("closes the mobile workspace sidebar from its backdrop", async () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", {
+      configurable: true,
+      value: 390,
+    });
+
+    try {
+      renderApp();
+      await screen.findByPlaceholderText(defaultComposerPlaceholder);
+
+      await userEvent.click(screen.getByRole("button", { name: "Home" }));
+
+      const backdrop = await waitFor(() => {
+        const element = document.querySelector(".mobile-sidebar-backdrop");
+        if (!(element instanceof HTMLButtonElement)) {
+          throw new Error("Expected mobile workspace sidebar backdrop");
+        }
+        return element;
+      });
+      expect(document.querySelector(".workspace-sidebar")).toHaveClass(
+        "workspace-sidebar-mobile-open",
+      );
+
+      await userEvent.click(backdrop);
+
+      await waitFor(() => {
+        expect(document.querySelector(".mobile-sidebar-backdrop")).toBeNull();
+        expect(document.querySelector(".workspace-sidebar")).not.toHaveClass(
+          "workspace-sidebar-mobile-open",
+        );
+      });
+    } finally {
+      Object.defineProperty(window, "innerWidth", {
+        configurable: true,
+        value: originalInnerWidth,
+      });
+    }
   });
 
   it("keeps context panel resize from selecting panel text", async () => {
