@@ -60,7 +60,7 @@ When a complete-chunk prefix is returned because the response reached the shared
 }
 ```
 
-This requests idempotent managed termination of the entire process tree. Its structured result carries the current process snapshot; it may still be `running` briefly while graceful termination and pipe draining complete. Only a returned `stopped` state confirms managed termination. The result does not replay historic logs. Use `get_command_output` afterwards when retained logs are needed.
+This synchronously requests idempotent managed termination of the entire process tree and waits for the monitor to observe process exit and drain stdout/stderr pipes. A successful structured result is always terminal; it never has `status: "running"`. A naturally completed command is returned idempotently with its existing terminal state. `timeoutMs` is the maximum wait budget: exceeding it is a tool error, not a successful running snapshot. The result does not replay historic logs. Use `get_command_output` afterwards when retained logs are needed.
 
 Unknown, expired, or cross-workspace handles fail with the same stable "managed command was not found" error.
 

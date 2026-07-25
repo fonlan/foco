@@ -1208,7 +1208,7 @@ fn get_command_output_definition() -> ToolDefinition {
 fn stop_command_definition() -> ToolDefinition {
     ToolDefinition {
         name: STOP_COMMAND_TOOL,
-        description: "Request managed termination of a background command process tree. Use this explicitly for long-running processes that are no longer needed; retained output remains readable afterwards through get_command_output until the bounded in-memory record is cleaned up.",
+        description: "Synchronously terminate a managed background command process tree. This tool succeeds only after the process tree has exited and stdout/stderr pipes have been drained; its successful result is always terminal, never running. timeoutMs is the maximum wait budget and a timeout is a tool error. Retained output remains readable afterwards through get_command_output until the bounded in-memory record is cleaned up.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

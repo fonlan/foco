@@ -559,6 +559,7 @@ fn execute_builtin_tool_inner(
         STOP_COMMAND_TOOL => command_tools::stop_command(
             workspace_path,
             arguments,
+            cancellation_token,
             background_commands,
             context.chat_id,
         ),
@@ -5217,6 +5218,8 @@ mod tests {
             json!({ "processId": process_id, "timeoutMs": null }),
         );
         assert!(!first_stop.is_error, "{:?}", first_stop.output);
+        assert_ne!(first_stop.output["status"], json!("running"));
+        assert!(first_stop.output["endedAt"].as_u64().is_some());
         let second_stop = execute_builtin_tool_with_runtime(
             workspace.path(),
             &runtime,
@@ -5224,6 +5227,49 @@ mod tests {
             json!({ "processId": first_stop.output["processId"], "timeoutMs": null }),
         );
         assert!(!second_stop.is_error, "{:?}", second_stop.output);
+        assert_ne!(second_stop.output["status"], json!("running"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_command_stop_timeout_is_a_tool_error_not_a_running_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let runtime = BuiltinToolRuntime::default();
+        let launch = execute_builtin_tool_with_runtime(
+            workspace.path(),
+            &runtime,
+            RUN_COMMAND_TOOL,
+            json!({
+                "command": "sh",
+                "args": ["-c", "trap '' TERM; while :; do sleep 30; done"],
+                "cwd": null,
+                "timeoutMs": null,
+                "background": true,
+                "backgroundTimeoutMs": null
+            }),
+        );
+        assert!(!launch.is_error, "{:?}", launch.output);
+
+        let timed_out = execute_builtin_tool_with_runtime(
+            workspace.path(),
+            &runtime,
+            STOP_COMMAND_TOOL,
+            json!({ "processId": launch.output["processId"], "timeoutMs": 1 }),
+        );
+        let stopped = execute_builtin_tool_with_runtime(
+            workspace.path(),
+            &runtime,
+            STOP_COMMAND_TOOL,
+            json!({ "processId": launch.output["processId"], "timeoutMs": null }),
+        );
+
+        assert!(timed_out.is_error, "{:?}", timed_out.output);
+        assert_eq!(
+            timed_out.output["error"],
+            json!("managed command stop timed out after 1 ms")
+        );
+        assert!(!stopped.is_error, "{:?}", stopped.output);
+        assert_ne!(stopped.output["status"], json!("running"));
     }
 
     #[test]

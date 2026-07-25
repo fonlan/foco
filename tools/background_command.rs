@@ -162,6 +162,13 @@ pub enum BackgroundCommandError {
         source: io::Error,
     },
     CursorExhausted,
+    WaitTimedOut {
+        command_id: String,
+        wait: Duration,
+    },
+    WaitCancelled {
+        command_id: String,
+    },
 }
 
 impl fmt::Display for BackgroundCommandError {
@@ -200,6 +207,14 @@ impl fmt::Display for BackgroundCommandError {
                 )
             }
             Self::CursorExhausted => write!(formatter, "managed command output cursor exhausted"),
+            Self::WaitTimedOut { command_id, wait } => write!(
+                formatter,
+                "managed command stop timed out after {} ms: {command_id}",
+                wait.as_millis()
+            ),
+            Self::WaitCancelled { command_id } => {
+                write!(formatter, "managed command stop cancelled: {command_id}")
+            }
         }
     }
 }
@@ -527,6 +542,22 @@ impl BackgroundCommandRegistry {
         Ok(entry.snapshot())
     }
 
+    /// Requests managed termination and waits for the monitor to record a terminal snapshot.
+    ///
+    /// A successful return guarantees that the process tree has exited and both captured output
+    /// pipes have been drained. Concurrent callers share one termination request but each waits
+    /// independently for the same terminal state.
+    pub fn stop_and_wait(
+        &self,
+        command_id: &str,
+        wait: Duration,
+        is_cancelled: impl Fn() -> bool,
+    ) -> Result<BackgroundCommandSnapshot, BackgroundCommandError> {
+        let entry = self.entry(command_id)?;
+        entry.request_termination(BackgroundCommandTermination::ExplicitStop);
+        wait_for_entry_terminal(&entry, wait, is_cancelled)
+    }
+
     /// Requests termination for every command owned by a workspace.
     ///
     /// The returned count is how many running commands newly received a stop request.
@@ -725,6 +756,26 @@ impl Drop for BackgroundCommandRegistryInner {
 impl BackgroundCommandEntry {
     fn snapshot(&self) -> BackgroundCommandSnapshot {
         let state = lock_recover(&self.state);
+        self.snapshot_from_state(&state)
+    }
+
+    fn terminal_snapshot_before(&self, deadline: Instant) -> Option<BackgroundCommandSnapshot> {
+        let state = lock_recover(&self.state);
+        if state.status.is_terminal()
+            && state
+                .ended_monotonic
+                .is_some_and(|ended_at| ended_at <= deadline)
+        {
+            Some(self.snapshot_from_state(&state))
+        } else {
+            None
+        }
+    }
+
+    fn snapshot_from_state(
+        &self,
+        state: &BackgroundCommandEntryState,
+    ) -> BackgroundCommandSnapshot {
         BackgroundCommandSnapshot {
             command_id: self.command_id.clone(),
             pid: self.pid,
@@ -966,6 +1017,33 @@ fn wait_entry_terminal_or_force(entry: &BackgroundCommandEntry, deadline: Instan
     }
 }
 
+fn wait_for_entry_terminal(
+    entry: &BackgroundCommandEntry,
+    wait: Duration,
+    is_cancelled: impl Fn() -> bool,
+) -> Result<BackgroundCommandSnapshot, BackgroundCommandError> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if is_cancelled() {
+            return Err(BackgroundCommandError::WaitCancelled {
+                command_id: entry.command_id.clone(),
+            });
+        }
+        if let Some(snapshot) = entry.terminal_snapshot_before(deadline) {
+            return Ok(snapshot);
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(BackgroundCommandError::WaitTimedOut {
+                command_id: entry.command_id.clone(),
+                wait,
+            });
+        }
+        thread::sleep(MONITOR_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+    }
+}
+
 fn monitor_background_command(
     entry: Arc<BackgroundCommandEntry>,
     registry: Weak<BackgroundCommandRegistryInner>,
@@ -1162,6 +1240,70 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn registry_stop_and_wait_returns_a_terminal_idempotent_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(workspace.path(), "sleep 30"))
+            .expect("start command");
+
+        let first = registry
+            .stop_and_wait(&command.command_id, Duration::from_secs(3), || false)
+            .expect("stop and wait");
+        let second = registry
+            .stop_and_wait(&command.command_id, Duration::from_secs(3), || false)
+            .expect("idempotent stop and wait");
+
+        assert_eq!(first.status, BackgroundCommandStatus::Stopped);
+        assert_eq!(
+            first.termination,
+            Some(BackgroundCommandTermination::ExplicitStop)
+        );
+        assert!(first.ended_at.is_some());
+        assert_eq!(second.status, BackgroundCommandStatus::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_stop_and_wait_returns_timeout_instead_of_a_running_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(workspace.path(), "sleep 30"))
+            .expect("start command");
+
+        let error = registry
+            .stop_and_wait(&command.command_id, Duration::from_millis(1), || false)
+            .expect_err("short wait must time out before the monitor observes termination");
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert!(matches!(error, BackgroundCommandError::WaitTimedOut { .. }));
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_stop_and_wait_returns_cancellation_instead_of_a_terminal_snapshot() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let registry = BackgroundCommandRegistry::new();
+        let command = registry
+            .start(background_request(workspace.path(), "sleep 30"))
+            .expect("start command");
+
+        let error = registry
+            .stop_and_wait(&command.command_id, Duration::from_secs(3), || true)
+            .expect_err("cancelled wait must not report a successful snapshot");
+        let terminal = wait_for_terminal(&registry, &command.command_id);
+
+        assert!(matches!(
+            error,
+            BackgroundCommandError::WaitCancelled { .. }
+        ));
+        assert_eq!(terminal.status, BackgroundCommandStatus::Stopped);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn registry_shutdown_stops_the_entire_unix_process_group() {
         let workspace = tempfile::tempdir().expect("workspace");
         let registry = BackgroundCommandRegistry::new();
@@ -1326,7 +1468,11 @@ mod tests {
             .map(|_| {
                 let registry = registry.clone();
                 let command_id = command.command_id.clone();
-                thread::spawn(move || registry.stop(&command_id).expect("concurrent stop"))
+                thread::spawn(move || {
+                    registry
+                        .stop_and_wait(&command_id, Duration::from_secs(3), || false)
+                        .expect("concurrent stop and wait")
+                })
             })
             .collect::<Vec<_>>();
 

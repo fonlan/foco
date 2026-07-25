@@ -165,11 +165,12 @@ pub(crate) fn get_command_output(
 pub(crate) fn stop_command(
     workspace_path: &Path,
     arguments: Value,
+    cancellation_token: Option<&ToolCancellationToken>,
     background_commands: &BackgroundCommandRegistry,
     owner_chat_id: Option<&str>,
 ) -> Result<Value, ToolRuntimeError> {
     let request: StopCommandInput = parse_arguments(arguments)?;
-    let _timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
+    let timeout_ms = tool_timeout_ms(request.timeout_ms, DEFAULT_GET_COMMAND_OUTPUT_TIMEOUT_MS)?;
     owned_command_snapshot(
         background_commands,
         workspace_path,
@@ -177,8 +178,12 @@ pub(crate) fn stop_command(
         &request.process_id,
     )?;
     let snapshot = background_commands
-        .stop(&request.process_id)
-        .map_err(background_command_error)?;
+        .stop_and_wait(
+            &request.process_id,
+            Duration::from_millis(timeout_ms),
+            || cancellation_token.is_some_and(ToolCancellationToken::is_cancelled),
+        )
+        .map_err(background_stop_error)?;
     background_command_response(background_commands, snapshot, None, true)
 }
 
@@ -347,6 +352,19 @@ fn background_start_error(error: crate::BackgroundCommandError) -> ToolRuntimeEr
 
 fn background_command_error(_error: crate::BackgroundCommandError) -> ToolRuntimeError {
     managed_command_not_found_error()
+}
+
+fn background_stop_error(error: crate::BackgroundCommandError) -> ToolRuntimeError {
+    match error {
+        crate::BackgroundCommandError::WaitTimedOut { wait, .. } => {
+            ToolRuntimeError::InvalidArguments(format!(
+                "managed command stop timed out after {} ms",
+                wait.as_millis()
+            ))
+        }
+        crate::BackgroundCommandError::WaitCancelled { .. } => ToolRuntimeError::Cancelled,
+        error => background_command_error(error),
+    }
 }
 
 fn managed_command_not_found_error() -> ToolRuntimeError {
