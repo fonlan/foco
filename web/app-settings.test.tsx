@@ -3756,9 +3756,10 @@ describe("app-settings verification surfaces", () => {
       name: "Restore default system prompt",
     });
     expect(restoreButtons).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Delete system prompt/ })).not.toBeInTheDocument();
   });
 
-  it("creates user system prompts from the modal and saves them with the shared draft", async () => {
+  it("creates, switches, and saves user system prompts through the shared draft", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -3784,8 +3785,40 @@ describe("app-settings verification surfaces", () => {
       expect(screen.queryByRole("dialog", { name: "New system prompt" })).not.toBeInTheDocument();
     });
 
-    expect(screen.getByLabelText("Select system prompt")).toHaveTextContent("Reviewer");
-    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
+    const systemPromptSelect = screen.getByLabelText("Select system prompt");
+    const systemPromptInput = screen.getByLabelText("System prompt");
+    expect(systemPromptSelect).toHaveTextContent("Reviewer");
+    expect(systemPromptInput).toHaveValue("");
+    expect(screen.getByRole("button", { name: "Delete system prompt Reviewer" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Restore default system prompt" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "New system prompt" }));
+    const duplicateDialog = await screen.findByRole("dialog", { name: "New system prompt" });
+    const duplicateNameInput = within(duplicateDialog).getByRole("textbox", { name: "Prompt name" });
+    await userEvent.type(duplicateNameInput, "Reviewer");
+    await userEvent.click(
+      within(duplicateDialog).getByRole("button", { name: "Create system prompt" }),
+    );
+    expect(
+      within(duplicateDialog).getByText("A prompt with this name already exists."),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(duplicateDialog).getByRole("button", { name: "Cancel new system prompt" }),
+    );
+
+    await userEvent.type(systemPromptInput, "Review as senior engineer.");
+    await userEvent.click(screen.getByRole("button", { name: "New system prompt" }));
+    const writerDialog = await screen.findByRole("dialog", { name: "New system prompt" });
+    await userEvent.type(within(writerDialog).getByRole("textbox", { name: "Prompt name" }), "Writer");
+    await userEvent.click(within(writerDialog).getByRole("button", { name: "Create system prompt" }));
+    await userEvent.type(systemPromptInput, "Write with concise examples.");
+
+    await userEvent.selectOptions(systemPromptSelect, "Reviewer");
+    expect(systemPromptInput).toHaveValue("Review as senior engineer.");
+    await userEvent.selectOptions(systemPromptSelect, "Writer");
+    expect(systemPromptInput).toHaveValue("Write with concise examples.");
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/settings/prompts"),
     ).toBe(false);
@@ -3820,6 +3853,10 @@ describe("app-settings verification surfaces", () => {
           {
             name: "Reviewer",
             content: "Review as senior engineer.",
+          },
+          {
+            name: "Writer",
+            content: "Write with concise examples.",
           },
         ],
       });
@@ -3858,6 +3895,36 @@ describe("app-settings verification surfaces", () => {
     expect(
       fetchMock.mock.calls.some(([url]) => url === "/api/settings/prompts"),
     ).toBe(false);
+
+    await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
+    await waitFor(() => {
+      const saveCall = fetchMock.mock.calls.find(([url]) => url === "/api/settings/prompts");
+      expect(saveCall).toBeDefined();
+      expect(JSON.parse(String(saveCall?.[1]?.body))).toEqual({
+        contextCompressionSystemPrompt: null,
+        generationSystemPrompt: null,
+        updateSystemPrompt: null,
+        memoryRetrievalSystemPrompt: null,
+        memoryExtractionSystemPrompt: null,
+        memoryDreamSystemPrompt: null,
+        extraText: "",
+        files: [],
+        systemPrompts: [
+          {
+            content: "You are Foco, a local coding agent.",
+            name: "Default",
+          },
+          {
+            content: defaultPlanModeSystemPrompt,
+            name: "Plan Mode",
+          },
+          {
+            content: defaultReviewSystemPrompt,
+            name: "Review",
+          },
+        ],
+      });
+    });
   });
 
   it("restores the default system prompt", async () => {
