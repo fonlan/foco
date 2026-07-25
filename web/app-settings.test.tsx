@@ -3742,11 +3742,14 @@ describe("app-settings verification surfaces", () => {
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
 
-    const defaultPromptButton = screen.getByRole("button", { name: "Default" });
-    expect(defaultPromptButton).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Plan Mode" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Review" })).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Image Generation" })).not.toBeInTheDocument();
+    const systemPromptSelect = screen.getByLabelText("Select system prompt");
+    expect(systemPromptSelect).toHaveTextContent("Default");
+    await userEvent.click(systemPromptSelect);
+    expect(await screen.findByRole("option", { name: "Default" })).toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Plan Mode" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Review" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("option", { name: "Image Generation" })).not.toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
     expect(screen.getByLabelText("Plan Mode prompt")).toBeInTheDocument();
     expect(screen.getByLabelText("Review Agent prompt")).toBeInTheDocument();
     const restoreButtons = screen.getAllByRole("button", {
@@ -3755,7 +3758,7 @@ describe("app-settings verification surfaces", () => {
     expect(restoreButtons).toHaveLength(1);
   });
 
-  it("keeps built-in Review fixed while renaming user system prompts", async () => {
+  it("creates user system prompts from the modal and saves them with the shared draft", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();
 
@@ -3763,30 +3766,29 @@ describe("app-settings verification surfaces", () => {
     const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
     await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
 
-    expect(
-      screen.queryByRole("button", { name: "Rename system prompt Default" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Rename system prompt Plan Mode" }),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Rename system prompt Review" }),
-    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "New system prompt" }));
+    const dialog = await screen.findByRole("dialog", { name: "New system prompt" });
+    const nameInput = within(dialog).getByRole("textbox", { name: "Prompt name" });
 
-    await userEvent.type(screen.getByPlaceholderText("Prompt name"), "Reviewer Draft");
-    await userEvent.click(screen.getByRole("button", { name: "Add system prompt" }));
-    const renameButton = screen.getByRole("button", {
-      name: "Rename system prompt Reviewer Draft",
-    });
-    expect(renameButton).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create system prompt" }));
+    expect(within(dialog).getByText("Prompt name is required.")).toBeInTheDocument();
 
-    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
-    await userEvent.click(renameButton);
-    const nameInput = screen.getByRole("textbox", { name: "System prompt name" });
+    await userEvent.type(nameInput, "Review");
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create system prompt" }));
+    expect(within(dialog).getByText("Prompt name is reserved.")).toBeInTheDocument();
+
     await userEvent.clear(nameInput);
     await userEvent.type(nameInput, "Reviewer");
-    await userEvent.click(screen.getByRole("button", { name: "Save system prompt name" }));
-    expect(screen.getByRole("button", { name: "Reviewer" })).toBeInTheDocument();
+    await userEvent.click(within(dialog).getByRole("button", { name: "Create system prompt" }));
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog", { name: "New system prompt" })).not.toBeInTheDocument();
+    });
+
+    expect(screen.getByLabelText("Select system prompt")).toHaveTextContent("Reviewer");
+    await userEvent.type(screen.getByLabelText("System prompt"), "Review as senior engineer.");
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/settings/prompts"),
+    ).toBe(false);
 
     await userEvent.click(screen.getByRole("button", { name: "Save prompt settings" }));
 
@@ -3822,6 +3824,40 @@ describe("app-settings verification surfaces", () => {
         ],
       });
     });
+  });
+
+  it("confirms deleting user system prompts without saving the draft", async () => {
+    const fetchMock = vi.mocked(fetch);
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Prompts" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "New system prompt" }));
+    const createDialog = await screen.findByRole("dialog", { name: "New system prompt" });
+    await userEvent.type(within(createDialog).getByRole("textbox", { name: "Prompt name" }), "Reviewer");
+    await userEvent.click(within(createDialog).getByRole("button", { name: "Create system prompt" }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete system prompt Reviewer" }));
+    const deleteDialog = await screen.findByRole("dialog", { name: "Delete system prompt?" });
+    expect(
+      within(deleteDialog).getByText("This removes the prompt from your draft. Click Save to apply the change."),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(deleteDialog).getByRole("button", { name: "Cancel system prompt deletion" }));
+    expect(screen.getByLabelText("Select system prompt")).toHaveTextContent("Reviewer");
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete system prompt Reviewer" }));
+    await userEvent.click(
+      within(await screen.findByRole("dialog", { name: "Delete system prompt?" })).getByRole("button", {
+        name: "Confirm delete system prompt",
+      }),
+    );
+    expect(screen.getByLabelText("Select system prompt")).toHaveTextContent("Default");
+    expect(
+      fetchMock.mock.calls.some(([url]) => url === "/api/settings/prompts"),
+    ).toBe(false);
   });
 
   it("restores the default system prompt", async () => {

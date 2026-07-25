@@ -1740,8 +1740,6 @@ export type PromptSettingsFormState = {
   memoryDream: PromptOverrideFieldState;
   pendingFile: string;
   pendingSystemPromptName: string;
-  pendingSystemPromptRename: string;
-  renamingSystemPromptName: string | null;
 };
 
 type SpecSettingsSummary = {
