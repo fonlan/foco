@@ -2339,7 +2339,9 @@ mod tests {
             .map(|file| file.path.as_str())
             .collect::<Vec<_>>();
         assert!(
-            !paths.iter().any(|path| *path == "web/dist" || *path == "plain-dir"),
+            !paths
+                .iter()
+                .any(|path| *path == "web/dist" || *path == "plain-dir"),
             "directory / symlink-to-directory paths must not appear as file status: {paths:?}"
         );
         assert!(

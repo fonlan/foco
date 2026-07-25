@@ -10,6 +10,7 @@ use std::{
     fmt,
     pin::Pin,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use base64::Engine;
@@ -1793,9 +1794,33 @@ pub struct NeutralUsage {
 pub struct ProviderRequestFailure {
     pub error: ProviderConfigError,
     pub request_dump: Option<ProviderAuditRequestDump>,
+    /// Observed `Retry-After` delay from the provider Response head, if any.
+    ///
+    /// Captured for HTTP open failures (and WebSocket upgrade failures when the
+    /// handshake response is available) so production retry paths can prefer it
+    /// over pure exponential backoff.
+    pub retry_after: Option<Duration>,
 }
 
 impl ProviderRequestFailure {
+    pub fn new(error: ProviderConfigError) -> Self {
+        Self {
+            error,
+            request_dump: None,
+            retry_after: None,
+        }
+    }
+
+    pub fn with_request_dump(mut self, request_dump: Option<ProviderAuditRequestDump>) -> Self {
+        self.request_dump = request_dump;
+        self
+    }
+
+    pub fn with_retry_after(mut self, retry_after: Option<Duration>) -> Self {
+        self.retry_after = retry_after;
+        self
+    }
+
     pub fn status_code(&self) -> Option<u16> {
         self.error.status_code()
     }
@@ -1818,6 +1843,8 @@ pub struct NeutralChatStream {
     pub(crate) wire_request_dump: Option<ProviderAuditRequestDump>,
     /// Always captured when a real HTTP Response is observed; independent of detail dumps.
     pub(crate) response_status: Arc<Mutex<Option<u16>>>,
+    /// Always captured when a real HTTP Response includes a parseable Retry-After header.
+    pub(crate) response_retry_after: Arc<Mutex<Option<Duration>>>,
     /// Full head dump (version/headers) only when `capture_details` is enabled.
     pub(crate) response_head: Option<Arc<Mutex<Option<ProviderHttpResponseHeadDump>>>>,
     pub(crate) saw_response_event: bool,
@@ -1852,6 +1879,21 @@ impl NeutralChatStream {
             .ok()
             .and_then(|status| *status)
             .or_else(|| self.response_head_dump().map(|head| head.status))
+    }
+
+    /// Observed `Retry-After` delay from the provider Response head, if any.
+    ///
+    /// Independent of `capture_details`. Only integer-second values are accepted and the
+    /// result is clamped to 30 seconds so callers can feed it into retry backoff safely.
+    pub fn retry_after(&self) -> Option<Duration> {
+        self.response_retry_after
+            .lock()
+            .ok()
+            .and_then(|value| *value)
+            .or_else(|| {
+                self.response_head_dump()
+                    .and_then(|head| retry_after_from_http_headers(&head.headers))
+            })
     }
 
     fn response_head_dump(&self) -> Option<ProviderHttpResponseHeadDump> {
@@ -2068,34 +2110,20 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
 
     let client = config
         .genai_client()
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let error_context = config
         .provider_error_context("opening provider stream", upstream_model_id)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let options = genai_chat_options_with_runtime_options(config, &request, &runtime_options)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     let captured_request = capture_details.then(|| Arc::new(Mutex::new(None)));
     let captured_response_status = Arc::new(Mutex::new(None));
+    let captured_response_retry_after = Arc::new(Mutex::new(None));
     let captured_response_head = capture_details.then(|| Arc::new(Mutex::new(None)));
     let observer = if capture_details || request_observer.is_some() {
         let captured_request = captured_request.clone();
@@ -2115,11 +2143,15 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
     };
     let response_observer = {
         let captured_response_status = captured_response_status.clone();
+        let captured_response_retry_after = captured_response_retry_after.clone();
         let captured_response_head = captured_response_head.clone();
         Some(Arc::new(move |response: &Response| {
             let status = response.status().as_u16();
             if let Ok(mut slot) = captured_response_status.lock() {
                 *slot = Some(status);
+            }
+            if let Ok(mut slot) = captured_response_retry_after.lock() {
+                *slot = retry_after_from_reqwest_headers(response.headers());
             }
             if let Some(captured_response_head) = captured_response_head.as_ref()
                 && let Ok(mut slot) = captured_response_head.lock()
@@ -2139,9 +2171,13 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
                 response_observer,
             )
             .await
-            .map_err(|source| ProviderRequestFailure {
-                error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
-                request_dump: take_captured_request_dump(&captured_request),
+            .map_err(|source| {
+                ProviderRequestFailure::new(ProviderConfigError::from_genai_error_with_context(
+                    source,
+                    &error_context,
+                ))
+                .with_request_dump(take_captured_request_dump(&captured_request))
+                .with_retry_after(take_captured_retry_after(&captured_response_retry_after))
             })?;
         (response.response, Some(response.diagnostics))
     } else {
@@ -2154,9 +2190,13 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
                 response_observer,
             )
             .await
-            .map_err(|source| ProviderRequestFailure {
-                error: ProviderConfigError::from_genai_error_with_context(source, &error_context),
-                request_dump: take_captured_request_dump(&captured_request),
+            .map_err(|source| {
+                ProviderRequestFailure::new(ProviderConfigError::from_genai_error_with_context(
+                    source,
+                    &error_context,
+                ))
+                .with_request_dump(take_captured_request_dump(&captured_request))
+                .with_retry_after(take_captured_retry_after(&captured_response_retry_after))
             })?;
         (response, None)
     };
@@ -2167,6 +2207,7 @@ pub async fn stream_chat_with_capture_observer_runtime_options(
         error_context: error_context.with_phase("reading provider stream"),
         wire_request_dump,
         response_status: captured_response_status,
+        response_retry_after: captured_response_retry_after,
         response_head: captured_response_head,
         saw_response_event: false,
         final_response_dump: None,
@@ -2182,33 +2223,17 @@ async fn stream_chat_with_capture_observer_websocket(
     request_observer: Option<ProviderRequestDumpObserver>,
     session_ctx: Option<ProviderWsSessionContext>,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
-    ensure_proxy_compatible_with_kind(config.kind, config.proxy_url.is_some()).map_err(
-        |error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        },
-    )?;
+    ensure_proxy_compatible_with_kind(config.kind, config.proxy_url.is_some())
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let chat_request = genai_chat_request_for_adapter(&request, config.kind.adapter_kind())
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let upstream_model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let error_context = config
         .provider_error_context("opening provider stream", upstream_model_id)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let options = genai_chat_options_with_runtime_options(config, &request, &runtime_options)
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let model = genai::ModelIden::new(config.kind.adapter_kind(), upstream_model_id.to_string());
     openai_resp_websocket::stream_chat_openai_resp_websocket(
         config,
@@ -2955,6 +2980,15 @@ fn take_captured_request_dump(
         .and_then(|captured_request| captured_request.lock().ok()?.take())
 }
 
+fn take_captured_retry_after(
+    captured_response_retry_after: &Arc<Mutex<Option<Duration>>>,
+) -> Option<Duration> {
+    captured_response_retry_after
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
 fn provider_wire_request_dump(request: &Request) -> ProviderWireRequestDump {
     let (body, body_encoding) = request
         .body()
@@ -2988,6 +3022,36 @@ fn provider_http_response_head_dump(response: &Response) -> ProviderHttpResponse
         version: format!("{:?}", response.version()),
         headers: provider_http_headers_dump(response.headers()),
     }
+}
+
+/// Parse a provider `Retry-After` header into a bounded delay.
+///
+/// Only integer-second values are accepted (HTTP-date forms are ignored). Values are
+/// clamped to 30 seconds so retry storms cannot wait unbounded on a malicious header.
+pub fn parse_retry_after_seconds(raw: &str) -> Option<Duration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let seconds = trimmed.parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds.min(30)))
+}
+
+pub fn retry_after_from_http_headers(headers: &ProviderHttpHeadersDump) -> Option<Duration> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("retry-after"))
+        .and_then(|(_, values)| values.first())
+        .and_then(|value| parse_retry_after_seconds(value))
+}
+
+pub(crate) fn retry_after_from_reqwest_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<Duration> {
+    headers
+        .get_all(reqwest::header::RETRY_AFTER)
+        .iter()
+        .find_map(|value| value.to_str().ok().and_then(parse_retry_after_seconds))
 }
 
 fn provider_http_headers_dump(headers: &reqwest::header::HeaderMap) -> ProviderHttpHeadersDump {
@@ -3401,10 +3465,7 @@ impl ProviderStreamFailureKind {
     }
 
     pub fn is_retryable(self) -> bool {
-        matches!(
-            self,
-            Self::Capacity | Self::RateLimit | Self::ServerError
-        )
+        matches!(self, Self::Capacity | Self::RateLimit | Self::ServerError)
     }
 }
 
@@ -3623,8 +3684,35 @@ fn sanitize_provider_stream_message(message: &str) -> String {
     if trimmed.is_empty() {
         return "provider stream error".to_string();
     }
+    // Redact common credential shapes before the text reaches chat bubbles / broker payloads.
+    // streamDiagnostic already redacts structured JSON; this covers free-text provider messages.
+    let mut redacted = trimmed.to_string();
+    for pattern in [
+        "Bearer ",
+        "bearer ",
+        "api_key=",
+        "api-key=",
+        "apiKey=",
+        "access_token=",
+        "accessToken=",
+        "sk-",
+        "rk-",
+    ] {
+        if let Some(idx) = redacted.find(pattern) {
+            let start = idx + pattern.len();
+            let end = redacted[start..]
+                .find(|ch: char| {
+                    ch.is_whitespace() || ch == '"' || ch == '\'' || ch == ',' || ch == '}'
+                })
+                .map(|offset| start + offset)
+                .unwrap_or(redacted.len());
+            if end > start {
+                redacted.replace_range(start..end, REDACTED_CREDENTIAL_VALUE);
+            }
+        }
+    }
     let mut out = String::new();
-    for (index, ch) in trimmed.chars().enumerate() {
+    for (index, ch) in redacted.chars().enumerate() {
         if index >= PROVIDER_STREAM_MESSAGE_LIMIT_CHARS {
             out.push('…');
             break;
@@ -3634,9 +3722,7 @@ fn sanitize_provider_stream_message(message: &str) -> String {
     out
 }
 
-fn provider_stream_diagnostic_kind_label(
-    kind: genai::OpenAIRespStreamDiagnosticKind,
-) -> String {
+fn provider_stream_diagnostic_kind_label(kind: genai::OpenAIRespStreamDiagnosticKind) -> String {
     match kind {
         genai::OpenAIRespStreamDiagnosticKind::ProviderErrorEvent => {
             "provider_error_event".to_string()
@@ -3724,13 +3810,25 @@ pub fn classify_provider_stream_failure_kind(
     {
         return ProviderStreamFailureKind::RateLimit;
     }
+    // Billing / account quota exhaustion is not a transient capacity blip; do not retry.
+    if contains_any(
+        &haystack,
+        &[
+            "insufficient_quota",
+            "insufficient quota",
+            "billing",
+            "payment required",
+            "quota exceeded",
+            "exceeded your current quota",
+        ],
+    ) {
+        return ProviderStreamFailureKind::InvalidRequest;
+    }
     if contains_any(
         &haystack,
         &[
             "capacity",
             "overloaded",
-            "insufficient_quota",
-            "insufficient quota",
             "model_capacity",
             "no capacity",
             "out of capacity",
@@ -5521,7 +5619,28 @@ mod tests {
                 None => panic!("expected WebSocket stream error"),
             }
         };
-        assert!(stream_error.to_string().contains("retry via websocket"));
+        // HTTP SSE and WebSocket share the same ProviderStream classification path.
+        assert_eq!(
+            stream_error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::RateLimit)
+        );
+        assert!(
+            stream_error.user_message().contains("retry via websocket"),
+            "WebSocket provider errors must keep the provider message: {}",
+            stream_error.user_message()
+        );
+        assert!(
+            !stream_error
+                .user_message()
+                .contains("Failed to parse stream data"),
+            "legal WebSocket provider errors must not look like parse failures"
+        );
+        let detail = stream_error
+            .stream_detail()
+            .expect("structured WebSocket stream detail");
+        assert_eq!(detail.code.as_deref(), Some("rate_limit"));
+        assert_eq!(detail.error_type.as_deref(), Some("rate_limit_error"));
+        assert_eq!(detail.param.as_deref(), Some("model"));
 
         let diagnostic = stream.stream_diagnostic().expect("failed frame diagnostic");
         assert_eq!(
@@ -8803,6 +8922,15 @@ mod tests {
             ),
             ProviderStreamFailureKind::ContextLength
         );
+        assert_eq!(
+            classify_provider_stream_failure_kind(
+                Some("insufficient_quota"),
+                Some("insufficient_quota"),
+                "You exceeded your current quota",
+                None,
+            ),
+            ProviderStreamFailureKind::InvalidRequest
+        );
     }
 
     #[test]
@@ -8829,5 +8957,208 @@ mod tests {
             Some(ProviderStreamFailureKind::Capacity)
         );
         assert!(error.stream_detail().is_some());
+    }
+
+    #[test]
+    fn sanitize_provider_stream_message_redacts_common_credential_shapes() {
+        let redacted = sanitize_provider_stream_message(
+            "auth failed for Bearer sk-live-secret-value and api_key=super-secret-token",
+        );
+        assert!(
+            redacted.contains(REDACTED_CREDENTIAL_VALUE),
+            "credential material must be redacted: {redacted}"
+        );
+        assert!(!redacted.contains("sk-live-secret-value"));
+        assert!(!redacted.contains("super-secret-token"));
+    }
+
+    async fn collect_responses_stream_error(
+        response_body: &'static str,
+    ) -> (
+        ProviderConfigError,
+        Option<genai::OpenAIRespStreamDiagnostic>,
+    ) {
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response_body).await;
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "classify provider stream error",
+        )]);
+        request.model_id = "fixture-responses-model".to_string();
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open responses error fixture stream");
+        let stream_error = loop {
+            match stream.next_event().await {
+                Some(Err(error)) => break error,
+                Some(Ok(_)) => continue,
+                None => panic!("expected a stream error"),
+            }
+        };
+        let diagnostic = stream.stream_diagnostic();
+        assert_eq!(fixture.await.expect("fixture task").len(), 1);
+        (stream_error, diagnostic)
+    }
+
+    #[tokio::test]
+    async fn openai_resp_flat_capacity_error_maps_to_provider_stream_not_parse() {
+        // Grok-style flat envelope: top-level code/message without nested `error`.
+        let (error, diagnostic) = collect_responses_stream_error(concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"code\":\"model_capacity\",\"message\":\"The model is currently overloaded\",\"api_key\":\"capacity-secret\"}\n\n"
+        ))
+        .await;
+
+        assert_eq!(
+            error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::Capacity)
+        );
+        assert!(
+            error.user_message().contains("currently overloaded"),
+            "user message should keep the provider capacity text: {}",
+            error.user_message()
+        );
+        assert!(
+            !error.user_message().contains("Failed to parse stream data"),
+            "legal provider capacity errors must not look like parse failures"
+        );
+        let detail = error.stream_detail().expect("structured stream detail");
+        assert_eq!(detail.code.as_deref(), Some("model_capacity"));
+        assert_eq!(detail.event_type.as_deref(), Some("error"));
+        let diagnostic = diagnostic.expect("capacity diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::ProviderErrorEvent
+        );
+        assert_eq!(
+            diagnostic.provider_error.code.as_deref(),
+            Some("model_capacity")
+        );
+        assert_eq!(
+            diagnostic.provider_error.message.as_deref(),
+            Some("The model is currently overloaded")
+        );
+        let diagnostic_json = serde_json::to_value(&diagnostic).expect("diagnostic json");
+        assert!(
+            !diagnostic_json.to_string().contains("capacity-secret"),
+            "stream diagnostic must redact credentials from the wire frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_resp_nested_server_error_maps_to_provider_stream_not_parse() {
+        // OpenAI/Krill nested envelope under `error`.
+        let (error, diagnostic) = collect_responses_stream_error(concat!(
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"code\":\"server_error\",\"type\":\"server_error\",\"message\":\"The server had an error while processing your request\"}}\n\n"
+        ))
+        .await;
+
+        assert_eq!(
+            error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::ServerError)
+        );
+        assert!(
+            error.user_message().contains("server had an error"),
+            "user message should keep nested provider text: {}",
+            error.user_message()
+        );
+        assert!(!error.user_message().contains("Failed to parse stream data"));
+        let detail = error.stream_detail().expect("structured stream detail");
+        assert_eq!(detail.code.as_deref(), Some("server_error"));
+        assert_eq!(detail.error_type.as_deref(), Some("server_error"));
+        let diagnostic = diagnostic.expect("server_error diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::ProviderErrorEvent
+        );
+        assert_eq!(
+            diagnostic.provider_error.message.as_deref(),
+            Some("The server had an error while processing your request")
+        );
+    }
+
+    #[tokio::test]
+    async fn openai_resp_response_failed_maps_to_provider_stream_not_parse() {
+        let (error, diagnostic) = collect_responses_stream_error(concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{}}\n\n",
+            "event: response.failed\n",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp-failed\",\"status\":\"failed\",\"model\":\"fixture-responses-model\",\"error\":{\"code\":\"server_error\",\"type\":\"server_error\",\"message\":\"upstream failed\"}}}\n\n"
+        ))
+        .await;
+
+        assert_eq!(
+            error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::ServerError)
+        );
+        assert!(error.user_message().contains("upstream failed"));
+        assert!(!error.user_message().contains("Failed to parse stream data"));
+        let diagnostic = diagnostic.expect("response.failed diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::ResponseFailed
+        );
+        assert_eq!(diagnostic.event_type.as_deref(), Some("response.failed"));
+    }
+
+    #[tokio::test]
+    async fn openai_resp_malformed_json_maps_to_protocol_parse() {
+        let (error, diagnostic) = collect_responses_stream_error(concat!(
+            "event: response.output_text.delta\n",
+            "data: {not-valid-json\n\n"
+        ))
+        .await;
+
+        assert_eq!(
+            error.stream_failure_kind(),
+            Some(ProviderStreamFailureKind::ProtocolParse)
+        );
+        assert!(
+            error.user_message().contains("Failed to parse stream data"),
+            "true JSON parse failures keep the parse wording: {}",
+            error.user_message()
+        );
+        let detail = error.stream_detail().expect("parse detail");
+        assert_eq!(detail.diagnostic_kind.as_deref(), Some("invalid_json"));
+        let diagnostic = diagnostic.expect("invalid_json diagnostic");
+        assert_eq!(
+            diagnostic.kind,
+            genai::OpenAIRespStreamDiagnosticKind::InvalidJson
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_seconds_accepts_integer_and_clamps() {
+        assert_eq!(parse_retry_after_seconds("7"), Some(Duration::from_secs(7)));
+        assert_eq!(
+            parse_retry_after_seconds(" 12 "),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(
+            parse_retry_after_seconds("120"),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(parse_retry_after_seconds(""), None);
+        assert_eq!(
+            parse_retry_after_seconds("Wed, 21 Oct 2015 07:28:00 GMT"),
+            None
+        );
+        assert_eq!(
+            retry_after_from_http_headers(&BTreeMap::from([(
+                "Retry-After".to_string(),
+                vec!["9".to_string()]
+            )])),
+            Some(Duration::from_secs(9))
+        );
     }
 }

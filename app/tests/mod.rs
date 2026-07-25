@@ -8968,8 +8968,8 @@ fn provider_stream_retry_skips_non_retryable_errors() {
         message: "connection reset".to_string(),
         status_code: None,
     };
-    let capacity = ProviderConfigError::ProviderStream(Box::new(
-        foco_providers::ProviderStreamErrorDetail {
+    let capacity =
+        ProviderConfigError::ProviderStream(Box::new(foco_providers::ProviderStreamErrorDetail {
             message: "The model is currently overloaded".to_string(),
             status_code: None,
             kind: foco_providers::ProviderStreamFailureKind::Capacity,
@@ -8980,10 +8980,9 @@ fn provider_stream_retry_skips_non_retryable_errors() {
             diagnostic_kind: Some("provider_error_event".to_string()),
             model_id: Some("gpt-test".to_string()),
             adapter: Some("OpenAI Responses".to_string()),
-        },
-    ));
-    let parse = ProviderConfigError::ProviderStream(Box::new(
-        foco_providers::ProviderStreamErrorDetail {
+        }));
+    let parse =
+        ProviderConfigError::ProviderStream(Box::new(foco_providers::ProviderStreamErrorDetail {
             message: "Failed to parse stream data: invalid json".to_string(),
             status_code: None,
             kind: foco_providers::ProviderStreamFailureKind::ProtocolParse,
@@ -8994,8 +8993,7 @@ fn provider_stream_retry_skips_non_retryable_errors() {
             diagnostic_kind: Some("invalid_json".to_string()),
             model_id: Some("gpt-test".to_string()),
             adapter: Some("OpenAI Responses".to_string()),
-        },
-    ));
+        }));
 
     assert!(!should_retry_provider_stream_error(&bad_request, 0, 3));
     assert!(should_retry_provider_stream_error(&rate_limited, 0, 3));
@@ -33166,6 +33164,156 @@ async fn serve_main_chat_responses_retry_failure_fixture() -> (
     (format!("http://{addr}/v1"), attempts, task)
 }
 
+async fn serve_main_chat_responses_capacity_then_success_fixture() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_route = Arc::clone(&attempts);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || {
+            let attempts = Arc::clone(&attempts_for_route);
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                response_headers.insert(
+                    header::HeaderName::from_static("x-cpa-trace-id"),
+                    header::HeaderValue::from_static("trace-main-chat-capacity-retry"),
+                );
+                if attempt == 1 {
+                    // Grok-style flat capacity error on HTTP 200 SSE.
+                    let body = concat!(
+                        "event: response.output_text.delta\n",
+                        "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial capacity text\"}\n\n",
+                        "event: error\n",
+                        "data: {\"type\":\"error\",\"code\":\"model_capacity\",\"message\":\"The model is currently overloaded\"}\n\n"
+                    );
+                    return (response_headers, body.to_string()).into_response();
+                }
+                let body = concat!(
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered after capacity\"}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-capacity-ok\",\"status\":\"completed\",\"model\":\"model\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"recovered after capacity\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
+                );
+                (response_headers, body.to_string()).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat capacity Responses fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("main chat capacity Responses fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), attempts, task)
+}
+
+async fn serve_main_chat_responses_capacity_exhaust_fixture() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_route = Arc::clone(&attempts);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || {
+            let attempts = Arc::clone(&attempts_for_route);
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                let failure = json!({
+                    "type": "error",
+                    "code": "model_capacity",
+                    "message": format!("capacity exhausted attempt {attempt}"),
+                });
+                let body = format!("event: error\ndata: {failure}\n\n");
+                (response_headers, body).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat capacity exhaust fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("main chat capacity exhaust fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), attempts, task)
+}
+
+async fn serve_main_chat_responses_partial_tool_then_capacity_then_success_fixture() -> (
+    String,
+    Arc<std::sync::atomic::AtomicUsize>,
+    tokio::task::JoinHandle<()>,
+) {
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let attempts_for_route = Arc::clone(&attempts);
+    let app = axum::Router::new().route(
+        "/v1/responses",
+        axum::routing::post(move || {
+            let attempts = Arc::clone(&attempts_for_route);
+            async move {
+                let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                let mut response_headers = HeaderMap::new();
+                response_headers.insert(
+                    header::CONTENT_TYPE,
+                    header::HeaderValue::from_static("text/event-stream"),
+                );
+                if attempt == 1 {
+                    // Partial tool item stream, then a legal provider capacity error.
+                    // Tools must not execute or persist from this failed attempt.
+                    let body = concat!(
+                        "event: response.output_item.added\n",
+                        "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"fc_partial\",\"type\":\"function_call\",\"status\":\"in_progress\",\"name\":\"read_file\",\"call_id\":\"call-partial-capacity\",\"arguments\":\"\"}}\n\n",
+                        "event: response.function_call_arguments.delta\n",
+                        "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"item_id\":\"fc_partial\",\"delta\":\"{\\\"path\\\":\\\".\\\"}\"}\n\n",
+                        "event: error\n",
+                        "data: {\"type\":\"error\",\"code\":\"model_capacity\",\"message\":\"The model is currently overloaded after tool item\"}\n\n"
+                    );
+                    return (response_headers, body.to_string()).into_response();
+                }
+                let body = concat!(
+                    "event: response.output_text.delta\n",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered without tools\"}\n\n",
+                    "event: response.completed\n",
+                    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp-tool-capacity-ok\",\"status\":\"completed\",\"model\":\"model\",\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"recovered without tools\",\"annotations\":[]}]}],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
+                );
+                (response_headers, body.to_string()).into_response()
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind main chat partial-tool capacity fixture server");
+    let addr = listener
+        .local_addr()
+        .expect("main chat partial-tool capacity fixture address");
+    let task = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    (format!("http://{addr}/v1"), attempts, task)
+}
+
 async fn serve_main_chat_reasoning_loop_fixture()
 -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     serve_main_chat_reasoning_loop_fixture_with_loop_count(1).await
@@ -34913,6 +35061,458 @@ async fn main_chat_retry_attempts_keep_independent_failed_stream_diagnostics() {
             "trace-main-chat-retry-failure"
         );
     }
+}
+
+#[tokio::test]
+async fn main_chat_capacity_sse_retries_after_wait_and_discards_partial_text() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, attempts, server_task) =
+        serve_main_chat_responses_capacity_then_success_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    // One additional retry is enough for capacity → success.
+    config.app.llm_request_retry_count = 1;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.kind = foco_providers::OPENAI_RESPONSES_KIND.to_string();
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Recover from HTTP 200 capacity SSE".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare capacity retry main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_ids = Vec::new();
+    let mut stream_reset_count = 0usize;
+    let mut complete_text = None;
+    let mut error_message = None;
+    let mut text_after_reset = Vec::new();
+    let mut saw_reset = false;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_ids.push(id),
+            ChatSseEvent::StreamReset { text, .. } => {
+                stream_reset_count += 1;
+                saw_reset = true;
+                text_after_reset.clear();
+                // StreamReset restores the attempt-start snapshot (empty for first-turn retry).
+                assert!(
+                    !text.contains("partial capacity text"),
+                    "streamReset must restore pre-attempt text, not partial failed content: {text}"
+                );
+            }
+            ChatSseEvent::TextDelta { delta, .. } => {
+                if saw_reset {
+                    text_after_reset.push(delta);
+                }
+            }
+            ChatSseEvent::Complete { text, .. } => complete_text = Some(text),
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    // Controllable backoff is unit-tested in provider_retry; here we assert the retry path
+    // actually issued two attempts and discarded partial text from the failed attempt.
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "expected two provider attempts; llm_request_ids={llm_request_ids:?} error={error_message:?} complete={complete_text:?} resets={stream_reset_count}"
+    );
+    assert_eq!(
+        llm_request_ids.len(),
+        2,
+        "expected two audited attempts; attempts={} error={error_message:?} complete={complete_text:?} resets={stream_reset_count}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst)
+    );
+    assert!(
+        stream_reset_count >= 1,
+        "partial capacity attempt must emit streamReset before replay; error={error_message:?} complete={complete_text:?}"
+    );
+    let complete = complete_text.expect(&format!(
+        "capacity retry should eventually complete; error={error_message:?} after_reset={text_after_reset:?} resets={stream_reset_count} attempts={}",
+        attempts.load(std::sync::atomic::Ordering::SeqCst)
+    ));
+    assert!(
+        error_message.is_none(),
+        "recovered run must not end in error: {error_message:?}; complete={complete}"
+    );
+    assert!(
+        complete.contains("recovered after capacity"),
+        "final complete text should come from the successful attempt: {complete}"
+    );
+    assert!(
+        !complete.contains("partial capacity text"),
+        "failed-attempt partial text must not survive into complete: {complete}"
+    );
+    let after_reset = text_after_reset.join("");
+    assert!(
+        !after_reset.contains("partial capacity text"),
+        "text deltas after streamReset must not include the failed attempt: {after_reset}"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let first = database
+        .llm_request(&llm_request_ids[0])
+        .expect("first audit lookup")
+        .expect("first audit");
+    let second = database
+        .llm_request(&llm_request_ids[1])
+        .expect("second audit lookup")
+        .expect("second audit");
+    assert_eq!(first.final_state, "failed");
+    assert_eq!(second.final_state, "succeeded");
+    let first_body: Value = serde_json::from_str(
+        first
+            .response_body_json
+            .as_deref()
+            .expect("first response detail"),
+    )
+    .expect("parse first response detail");
+    assert!(
+        first_body["streamDiagnostic"]["provider_error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("currently overloaded")),
+        "first attempt audit should retain the capacity provider reason: {first_body}"
+    );
+    assert!(
+        !first_body
+            .to_string()
+            .contains("Failed to parse stream data"),
+        "capacity audit must not look like a parse failure"
+    );
+}
+
+#[tokio::test]
+async fn main_chat_capacity_sse_exhausts_budget_with_provider_message() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, attempts, server_task) =
+        serve_main_chat_responses_capacity_exhaust_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 1;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.kind = foco_providers::OPENAI_RESPONSES_KIND.to_string();
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Exhaust capacity retries".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare capacity exhaust main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_ids = Vec::new();
+    let mut failure_message = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_ids.push(id),
+            ChatSseEvent::Error { message } => failure_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(llm_request_ids.len(), 2);
+    let failure = failure_message.expect("capacity exhaust should surface an error");
+    assert!(
+        failure.contains("capacity exhausted attempt 2"),
+        "final user-visible error should keep the provider capacity text: {failure}"
+    );
+    assert!(
+        !failure.contains("Failed to parse stream data"),
+        "capacity exhaust must not be mislabeled as parse failure: {failure}"
+    );
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    for (index, request_id) in llm_request_ids.iter().enumerate() {
+        let request = database
+            .llm_request(request_id)
+            .expect("capacity attempt audit lookup")
+            .expect("capacity attempt audit exists");
+        assert_eq!(request.final_state, "failed");
+        let response_body: Value = serde_json::from_str(
+            request
+                .response_body_json
+                .as_deref()
+                .expect("capacity attempt response detail"),
+        )
+        .expect("parse capacity attempt response detail");
+        assert_eq!(
+            response_body["streamDiagnostic"]["provider_error"]["message"],
+            format!("capacity exhausted attempt {}", index + 1)
+        );
+    }
+
+    // History replay should surface the same primary reason as the live failure bubble.
+    let chat_id = database
+        .chats()
+        .expect("list chats")
+        .into_iter()
+        .next()
+        .expect("chat exists")
+        .id;
+    let messages = database.messages_for_chat(&chat_id).expect("list messages");
+    let summaries =
+        chat_message_summaries(&mut database, workspace.path(), None, &chat_id, messages)
+            .expect("message summaries");
+    let assistant = summaries
+        .iter()
+        .find(|message| message.role == "assistant")
+        .expect("assistant message");
+    assert_eq!(assistant.status.as_deref(), Some("error"));
+    assert!(
+        assistant.parts.iter().any(|part| matches!(
+            part,
+            ChatMessagePart::Error { text }
+                if text.contains("capacity exhausted attempt 2")
+                    && !text.contains("Failed to parse stream data")
+        )),
+        "history should retain the same capacity reason as the live error: {:?}",
+        assistant.parts
+    );
+}
+
+#[tokio::test]
+async fn wait_provider_retry_backoff_cancellable_is_interrupted_by_run_cancel() {
+    let (_app_tx, mut app_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (run_tx, mut run_cancellation_rx) = tokio::sync::watch::channel(false);
+
+    // Controllable wait: no real multi-second sleep; cancel interrupts immediately.
+    let wait = tokio::spawn(async move {
+        wait_provider_retry_backoff_cancellable(
+            &mut app_shutdown_rx,
+            &mut run_cancellation_rx,
+            Duration::from_secs(30),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    assert!(
+        !wait.is_finished(),
+        "retry backoff must wait instead of returning immediately"
+    );
+
+    run_tx.send_replace(true);
+    let interrupted = tokio::time::timeout(Duration::from_secs(1), wait)
+        .await
+        .expect("run cancel should interrupt provider retry backoff")
+        .expect("backoff task should not panic");
+    assert!(interrupted);
+
+    let (_app_tx, mut app_shutdown_rx) = tokio::sync::watch::channel(false);
+    let (_run_tx, mut run_cancellation_rx) = tokio::sync::watch::channel(false);
+    let finished = wait_provider_retry_backoff_cancellable(
+        &mut app_shutdown_rx,
+        &mut run_cancellation_rx,
+        Duration::from_millis(5),
+    )
+    .await;
+    assert!(
+        !finished,
+        "completing the wait without cancel must return false"
+    );
+}
+
+#[tokio::test]
+async fn main_chat_capacity_after_partial_tool_item_does_not_persist_or_execute_tools() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let profile = tempfile::tempdir().expect("profile directory");
+    let (base_url, attempts, server_task) =
+        serve_main_chat_responses_partial_tool_then_capacity_then_success_fixture().await;
+    let mut config = model_test_config(workspace.path().to_path_buf());
+    config.app.api_audit.save_request_response_details = true;
+    config.app.llm_request_retry_count = 1;
+    let workspace_id = config.workspaces[0].id.clone();
+    let provider = config
+        .providers
+        .iter_mut()
+        .find(|provider| provider.id == "provider")
+        .expect("test provider");
+    provider.kind = foco_providers::OPENAI_RESPONSES_KIND.to_string();
+    provider.base_url = Some(base_url);
+    let state = test_app_state(config.clone(), profile.path().to_path_buf());
+    let context = prepare_chat_context(
+        &state,
+        &config,
+        &workspace_id,
+        ChatStreamRequest {
+            queued_user_message_id: None,
+            run_id_override: None,
+            visible_assistant_message_id: None,
+            visible_assistant_sequence: None,
+            chat_id: None,
+            model_id: "model".to_string(),
+            provider_id: None,
+            thinking_level: None,
+            latency_mode: foco_providers::LatencyMode::Standard,
+            skill_ids: None,
+            session_mode: None,
+            message: "Recover after partial tool item capacity error".to_string(),
+            attachments: Vec::new(),
+        },
+    )
+    .await
+    .expect("prepare partial-tool capacity main chat");
+    let (guidance_tx, guidance_rx) = mpsc::unbounded_channel();
+    drop(guidance_tx);
+    let stream = context.into_sse_stream(ChatRunCancellation::new(), guidance_rx);
+    tokio::pin!(stream);
+    let mut llm_request_ids = Vec::new();
+    let mut stream_reset_count = 0usize;
+    let mut tool_call_count = 0usize;
+    let mut tool_result_count = 0usize;
+    let mut complete_text = None;
+    let mut error_message = None;
+    while let Some(event) = stream.next().await {
+        match event {
+            ChatSseEvent::StreamAttemptStart {
+                llm_request_id: id, ..
+            } => llm_request_ids.push(id),
+            ChatSseEvent::StreamReset { tool_calls, .. } => {
+                stream_reset_count += 1;
+                assert!(
+                    tool_calls.is_empty(),
+                    "streamReset after a failed partial tool attempt must not keep partial tools: {tool_calls:?}"
+                );
+            }
+            ChatSseEvent::ToolCall { .. } => tool_call_count += 1,
+            ChatSseEvent::ToolResult { .. } => tool_result_count += 1,
+            ChatSseEvent::Complete { text, .. } => complete_text = Some(text),
+            ChatSseEvent::Error { message } => error_message = Some(message),
+            _ => {}
+        }
+    }
+    server_task.abort();
+
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "expected capacity retry after partial tool item; error={error_message:?} complete={complete_text:?}"
+    );
+    assert_eq!(llm_request_ids.len(), 2);
+    assert!(
+        stream_reset_count >= 1,
+        "partial tool + capacity must emit streamReset before replay"
+    );
+    assert_eq!(
+        tool_call_count, 0,
+        "failed-attempt tool items must not surface as executable ToolCall events"
+    );
+    assert_eq!(
+        tool_result_count, 0,
+        "failed-attempt tool items must not execute"
+    );
+    let complete = complete_text.expect(&format!(
+        "partial-tool capacity retry should complete; error={error_message:?}"
+    ));
+    assert!(
+        complete.contains("recovered without tools"),
+        "final text should come from the successful attempt: {complete}"
+    );
+    assert!(
+        error_message.is_none(),
+        "recovered run must not end in error: {error_message:?}"
+    );
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let chat_id = database
+        .chats()
+        .expect("list chats")
+        .into_iter()
+        .next()
+        .expect("chat exists")
+        .id;
+    let persisted_tool_calls = database
+        .tool_calls_for_chat(&chat_id)
+        .expect("list tool calls");
+    assert!(
+        persisted_tool_calls.is_empty(),
+        "partial tool items from a failed capacity attempt must not be persisted: {persisted_tool_calls:?}"
+    );
+
+    let first = database
+        .llm_request(&llm_request_ids[0])
+        .expect("first audit lookup")
+        .expect("first audit");
+    assert_eq!(first.final_state, "failed");
+    let first_body: Value = serde_json::from_str(
+        first
+            .response_body_json
+            .as_deref()
+            .expect("first response detail"),
+    )
+    .expect("parse first response detail");
+    assert!(
+        first_body["streamDiagnostic"]["provider_error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("overloaded after tool item")),
+        "first attempt audit should retain the capacity reason after partial tool item: {first_body}"
+    );
+    assert!(
+        !first_body
+            .to_string()
+            .contains("Failed to parse stream data"),
+        "partial-tool capacity audit must not look like a parse failure"
+    );
 }
 
 #[tokio::test]

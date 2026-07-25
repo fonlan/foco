@@ -3651,10 +3651,7 @@ impl PreparedChatContext {
                             self.openai_resp_ws_session_context(),
                         ),
                     ) => provider_stream
-                        .unwrap_or_else(|_| Err(ProviderRequestFailure {
-                            error: provider_stream_idle_timeout_error(),
-                            request_dump: None,
-                        })),
+                        .unwrap_or_else(|_| Err(ProviderRequestFailure::new(provider_stream_idle_timeout_error()))),
                 } {
                     Ok(provider_stream) => provider_stream,
                     Err(error) => {
@@ -3709,9 +3706,10 @@ impl PreparedChatContext {
                             events.push(captured_event(&event));
                             yield event;
                             if let Some(delay) =
-                                crate::provider_retry::provider_retry_backoff_for_class(
+                                crate::provider_retry::provider_retry_backoff_for_class_with_retry_after(
                                     retry_decision.class,
                                     turn_retry_count,
+                                    error.retry_after,
                                     None,
                                 )
                             {
@@ -3911,9 +3909,10 @@ impl PreparedChatContext {
                                 events.push(captured_event(&event));
                                 yield event;
                                 if let Some(delay) =
-                                    crate::provider_retry::provider_retry_backoff_for_class(
+                                    crate::provider_retry::provider_retry_backoff_for_class_with_retry_after(
                                         retry_decision.class,
                                         turn_retry_count,
+                                        provider_stream.retry_after(),
                                         None,
                                     )
                                 {
@@ -6718,15 +6717,21 @@ pub(crate) async fn audited_provider_tool_request_with_args_validate(
                             );
                             // Additional provider retries are 1-based for the backoff staircase.
                             rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
-                            let class = match error.status_code.and_then(|code| u16::try_from(code).ok())
+                            let class = match error
+                                .status_code
+                                .and_then(|code| u16::try_from(code).ok())
                             {
                                 Some(429) => crate::provider_retry::ProviderRetryClass::RateLimit,
                                 Some(500..=599) => {
                                     crate::provider_retry::ProviderRetryClass::TransientServer
                                 }
-                                Some(408 | 409) => crate::provider_retry::ProviderRetryClass::Network,
+                                Some(408 | 409) => {
+                                    crate::provider_retry::ProviderRetryClass::Network
+                                }
                                 None => crate::provider_retry::ProviderRetryClass::Network,
-                                Some(_) => crate::provider_retry::ProviderRetryClass::TransientServer,
+                                Some(_) => {
+                                    crate::provider_retry::ProviderRetryClass::TransientServer
+                                }
                             };
                             wait_provider_retry_backoff(class, rate_limit_retry_count).await;
                         }

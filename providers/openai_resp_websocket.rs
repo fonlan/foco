@@ -377,29 +377,24 @@ async fn prepare_request_async(
 ) -> Result<PreparedChatStreamRequest, ProviderRequestFailure> {
     let client = config
         .genai_client()
-        .map_err(|error| ProviderRequestFailure {
-            error,
-            request_dump: None,
-        })?;
+        .map_err(|error| ProviderRequestFailure::new(error))?;
 
     client
         .prepare_chat_stream_request(model, chat_request, Some(options))
         .await
-        .map_err(|source| ProviderRequestFailure {
-            error: ProviderConfigError::from_genai_error_with_context(source, error_context),
-            request_dump: None,
+        .map_err(|source| {
+            ProviderRequestFailure::new(ProviderConfigError::from_genai_error_with_context(
+                source,
+                error_context,
+            ))
         })
 }
 
 fn prepared_wire(
     prepared: &PreparedChatStreamRequest,
 ) -> Result<(String, serde_json::Value), ProviderRequestFailure> {
-    let ws_url = websocket_url_from_responses_http_url(&prepared.url).map_err(|error| {
-        ProviderRequestFailure {
-            error,
-            request_dump: None,
-        }
-    })?;
+    let ws_url = websocket_url_from_responses_http_url(&prepared.url)
+        .map_err(|error| ProviderRequestFailure::new(error))?;
     let create_payload = openai_resp_websocket_create_payload(prepared.payload.clone());
     Ok((ws_url, create_payload))
 }
@@ -445,6 +440,20 @@ fn websocket_connect_status_code(error: &tokio_tungstenite::tungstenite::Error) 
     }
 }
 
+/// Extract a bounded Retry-After delay from a failed WebSocket upgrade response, if present.
+fn websocket_connect_retry_after(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> Option<std::time::Duration> {
+    match error {
+        tokio_tungstenite::tungstenite::Error::Http(response) => response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::parse_retry_after_seconds),
+        _ => None,
+    }
+}
+
 async fn connect_websocket(
     ws_url: &str,
     prepared: &PreparedChatStreamRequest,
@@ -463,15 +472,13 @@ async fn connect_websocket(
     ),
     ProviderRequestFailure,
 > {
-    let mut request = ws_url
-        .into_client_request()
-        .map_err(|source| ProviderRequestFailure {
-            error: ProviderConfigError::Connection {
-                message: format!("{error_context}: invalid WebSocket request: {source}"),
-                status_code: None,
-            },
-            request_dump: wire_request_dump.cloned(),
-        })?;
+    let mut request = ws_url.into_client_request().map_err(|source| {
+        ProviderRequestFailure::new(ProviderConfigError::Connection {
+            message: format!("{error_context}: invalid WebSocket request: {source}"),
+            status_code: None,
+        })
+        .with_request_dump(wire_request_dump.cloned())
+    })?;
 
     let mut has_authorization = false;
     for (name, value) in prepared.headers.iter() {
@@ -486,30 +493,27 @@ async fn connect_websocket(
         if name.eq_ignore_ascii_case("authorization") {
             has_authorization = true;
         }
-        let header_name: HeaderName = name.parse().map_err(|source| ProviderRequestFailure {
-            error: ProviderConfigError::InvalidRequest(format!(
+        let header_name: HeaderName = name.parse().map_err(|source| {
+            ProviderRequestFailure::new(ProviderConfigError::InvalidRequest(format!(
                 "invalid WebSocket header name '{name}': {source}"
-            )),
-            request_dump: wire_request_dump.cloned(),
+            )))
+            .with_request_dump(wire_request_dump.cloned())
         })?;
-        let header_value =
-            HeaderValue::from_str(value).map_err(|source| ProviderRequestFailure {
-                error: ProviderConfigError::InvalidRequest(format!(
-                    "invalid WebSocket header value for '{name}': {source}"
-                )),
-                request_dump: wire_request_dump.cloned(),
-            })?;
+        let header_value = HeaderValue::from_str(value).map_err(|source| {
+            ProviderRequestFailure::new(ProviderConfigError::InvalidRequest(format!(
+                "invalid WebSocket header value for '{name}': {source}"
+            )))
+            .with_request_dump(wire_request_dump.cloned())
+        })?;
         request.headers_mut().insert(header_name, header_value);
     }
     if !has_authorization && let Some(api_key) = api_key.filter(|value| !value.is_empty()) {
         let header_value =
             HeaderValue::from_str(&format!("Bearer {api_key}")).map_err(|source| {
-                ProviderRequestFailure {
-                    error: ProviderConfigError::InvalidRequest(format!(
-                        "invalid WebSocket authorization header: {source}"
-                    )),
-                    request_dump: wire_request_dump.cloned(),
-                }
+                ProviderRequestFailure::new(ProviderConfigError::InvalidRequest(format!(
+                    "invalid WebSocket authorization header: {source}"
+                )))
+                .with_request_dump(wire_request_dump.cloned())
             })?;
         request
             .headers_mut()
@@ -520,13 +524,15 @@ async fn connect_websocket(
         Ok(parts) => parts,
         Err(source) => {
             let status_code = websocket_connect_status_code(&source);
-            return Err(ProviderRequestFailure {
-                error: ProviderConfigError::Connection {
+            let retry_after = websocket_connect_retry_after(&source);
+            return Err(
+                ProviderRequestFailure::new(ProviderConfigError::Connection {
                     message: format!("{error_context}: WebSocket connect failed: {source}"),
                     status_code,
-                },
-                request_dump: wire_request_dump.cloned(),
-            });
+                })
+                .with_request_dump(wire_request_dump.cloned())
+                .with_retry_after(retry_after),
+            );
         }
     };
 
@@ -599,24 +605,23 @@ async fn run_create_stream(
     connected_at: std::time::Instant,
     connection_identity: u64,
 ) -> Result<NeutralChatStream, ProviderRequestFailure> {
-    let create_text =
-        serde_json::to_string(&create_payload).map_err(|source| ProviderRequestFailure {
-            error: ProviderConfigError::InvalidRequest(format!(
-                "failed to serialize response.create: {source}"
-            )),
-            request_dump: build_websocket_request_dump(
-                ws_url,
-                prepared,
-                &create_payload,
-                connection_reused,
-                handshake.clone(),
-                api_key,
-                false,
-                capture_details,
-                request_observer,
-                false,
-            ),
-        })?;
+    let create_text = serde_json::to_string(&create_payload).map_err(|source| {
+        ProviderRequestFailure::new(ProviderConfigError::InvalidRequest(format!(
+            "failed to serialize response.create: {source}"
+        )))
+        .with_request_dump(build_websocket_request_dump(
+            ws_url,
+            prepared,
+            &create_payload,
+            connection_reused,
+            handshake.clone(),
+            api_key,
+            false,
+            capture_details,
+            request_observer,
+            false,
+        ))
+    })?;
 
     if let Err(source) = write.send(Message::Text(create_text.into())).await {
         if let Some(turn) = turn {
@@ -639,13 +644,13 @@ async fn run_create_stream(
         );
         // Only report an HTTP status when this turn actually observed a handshake.
         let status_code = response_status.lock().ok().and_then(|slot| *slot);
-        return Err(ProviderRequestFailure {
-            error: ProviderConfigError::Connection {
+        return Err(
+            ProviderRequestFailure::new(ProviderConfigError::Connection {
                 message: format!("{error_context}: failed to send response.create: {source}"),
                 status_code,
-            },
-            request_dump: wire_request_dump,
-        });
+            })
+            .with_request_dump(wire_request_dump),
+        );
     }
 
     // Real wire: response.create was written successfully.
@@ -820,6 +825,7 @@ async fn run_create_stream(
         error_context: stream_error_context,
         wire_request_dump,
         response_status,
+        response_retry_after: Arc::new(Mutex::new(None)),
         response_head,
         saw_response_event: false,
         final_response_dump: None,

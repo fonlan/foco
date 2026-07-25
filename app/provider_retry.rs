@@ -153,13 +153,8 @@ pub(crate) fn classify_remote_broker_retry_class(
             "rate_limit" => ProviderRetryClass::RateLimit,
             "server_error" | "transient_server" => ProviderRetryClass::TransientServer,
             "network" => ProviderRetryClass::Network,
-            "auth"
-            | "permission"
-            | "invalid_request"
-            | "context_length"
-            | "protocol_parse"
-            | "other"
-            | "non_retryable" => ProviderRetryClass::NonRetryable,
+            "auth" | "permission" | "invalid_request" | "context_length" | "protocol_parse"
+            | "other" | "non_retryable" => ProviderRetryClass::NonRetryable,
             _ => ProviderRetryClass::NonRetryable,
         };
     }
@@ -244,9 +239,10 @@ pub(crate) fn apply_full_jitter(base: Duration, unit_sample: f64) -> Duration {
 /// Compute the wait before the next provider attempt.
 ///
 /// Priority:
-/// 1. `retry_after` when present (clamped to the backoff cap)
-/// 2. exponential base for the retry class
-/// then full jitter, then clamp to `remaining_deadline` when provided.
+/// 1. `retry_after` when present (clamped to the backoff cap) — used as a **minimum** wait
+///    without full jitter, so provider-mandated delays are not shortened toward zero
+/// 2. exponential base for the retry class, then full jitter in `[0, base]`
+/// then clamp to `remaining_deadline` when provided.
 pub(crate) fn provider_retry_backoff(
     class: ProviderRetryClass,
     retry_ordinal: u32,
@@ -257,10 +253,14 @@ pub(crate) fn provider_retry_backoff(
     if !class.is_retryable() || retry_ordinal == 0 {
         return None;
     }
-    let base = retry_after
-        .map(|value| value.min(PROVIDER_RETRY_BACKOFF_CAP))
-        .or_else(|| provider_retry_backoff_base(class, retry_ordinal))?;
-    let mut wait = apply_full_jitter(base, unit_sample);
+    let mut wait = if let Some(retry_after) = retry_after {
+        // Respect provider Retry-After as a floor; do not apply full jitter that can
+        // collapse a mandated delay to near-zero and re-trigger rate limits.
+        retry_after.min(PROVIDER_RETRY_BACKOFF_CAP)
+    } else {
+        let base = provider_retry_backoff_base(class, retry_ordinal)?;
+        apply_full_jitter(base, unit_sample)
+    };
     if let Some(remaining) = remaining_deadline {
         if remaining.is_zero() {
             return None;
@@ -317,10 +317,25 @@ pub(crate) fn provider_retry_backoff_for_class(
     retry_ordinal: u32,
     remaining_deadline: Option<Duration>,
 ) -> Option<Duration> {
-    provider_retry_backoff(
+    provider_retry_backoff_for_class_with_retry_after(
         class,
         retry_ordinal,
         None,
+        remaining_deadline,
+    )
+}
+
+/// Backoff for a classified retry, optionally preferring a provider `Retry-After` delay.
+pub(crate) fn provider_retry_backoff_for_class_with_retry_after(
+    class: ProviderRetryClass,
+    retry_ordinal: u32,
+    retry_after: Option<Duration>,
+    remaining_deadline: Option<Duration>,
+) -> Option<Duration> {
+    provider_retry_backoff(
+        class,
+        retry_ordinal,
+        retry_after,
         remaining_deadline,
         random_unit_sample(),
     )
@@ -454,13 +469,7 @@ mod tests {
             None
         );
         assert_eq!(
-            provider_retry_backoff(
-                ProviderRetryClass::NonRetryable,
-                1,
-                None,
-                None,
-                1.0,
-            ),
+            provider_retry_backoff(ProviderRetryClass::NonRetryable, 1, None, None, 1.0,),
             None
         );
     }
@@ -477,6 +486,17 @@ mod tests {
             ),
             Some(Duration::from_secs(7))
         );
+        // Full jitter must not shorten a provider-mandated Retry-After delay.
+        assert_eq!(
+            provider_retry_backoff(
+                ProviderRetryClass::RateLimit,
+                1,
+                Some(Duration::from_secs(7)),
+                None,
+                0.0,
+            ),
+            Some(Duration::from_secs(7))
+        );
         assert_eq!(
             provider_retry_backoff(
                 ProviderRetryClass::RateLimit,
@@ -487,6 +507,15 @@ mod tests {
             ),
             Some(Duration::from_secs(30))
         );
+        // Production wrapper keeps the Retry-After floor (no jitter reduction).
+        let delayed = provider_retry_backoff_for_class_with_retry_after(
+            ProviderRetryClass::RateLimit,
+            1,
+            Some(Duration::from_secs(5)),
+            None,
+        )
+        .expect("retry-after backoff");
+        assert_eq!(delayed, Duration::from_secs(5));
     }
 
     #[test]
@@ -529,5 +558,134 @@ mod tests {
             ),
             ProviderRetryClass::NonRetryable
         );
+    }
+
+    #[test]
+    fn apply_full_jitter_respects_unit_sample_bounds() {
+        let base = Duration::from_secs(8);
+        assert_eq!(apply_full_jitter(base, 0.0), Duration::ZERO);
+        assert_eq!(apply_full_jitter(base, 1.0), base);
+        assert_eq!(apply_full_jitter(base, -1.0), Duration::ZERO);
+        assert_eq!(apply_full_jitter(base, 2.0), base);
+        let mid = apply_full_jitter(base, 0.5);
+        assert!(mid > Duration::ZERO);
+        assert!(mid < base);
+        assert_eq!(apply_full_jitter(Duration::ZERO, 0.5), Duration::ZERO);
+    }
+
+    #[test]
+    fn provider_retry_decision_tracks_budget_and_class() {
+        let capacity = stream_error(
+            ProviderStreamFailureKind::Capacity,
+            "The model is currently overloaded",
+        );
+        let parse = stream_error(
+            ProviderStreamFailureKind::ProtocolParse,
+            "Failed to parse stream data: invalid json",
+        );
+
+        let first = provider_retry_decision(&capacity, 0, 2);
+        assert_eq!(first.class, ProviderRetryClass::Capacity);
+        assert!(first.retryable);
+
+        let last_budget = provider_retry_decision(&capacity, 1, 2);
+        assert!(last_budget.retryable);
+
+        let exhausted = provider_retry_decision(&capacity, 2, 2);
+        assert_eq!(exhausted.class, ProviderRetryClass::Capacity);
+        assert!(!exhausted.retryable);
+
+        let non_retryable = provider_retry_decision(&parse, 0, 5);
+        assert_eq!(non_retryable.class, ProviderRetryClass::NonRetryable);
+        assert!(!non_retryable.retryable);
+    }
+
+    #[test]
+    fn remote_broker_infers_capacity_from_provider_fields_without_failure_kind() {
+        assert_eq!(
+            classify_remote_broker_retry_class(
+                "provider_stream_error",
+                true,
+                None,
+                None,
+                Some("model_capacity"),
+                None,
+                "The model is currently overloaded",
+            ),
+            ProviderRetryClass::Capacity
+        );
+        assert_eq!(
+            classify_remote_broker_retry_class(
+                "provider_stream_error",
+                true,
+                None,
+                None,
+                Some("invalid_api_key"),
+                Some("invalid_request_error"),
+                "Incorrect API key provided",
+            ),
+            ProviderRetryClass::NonRetryable
+        );
+        // Legacy payloads without structured fields keep the retryable gate + status path.
+        assert_eq!(
+            classify_remote_broker_retry_class(
+                "stream_error",
+                true,
+                None,
+                None,
+                None,
+                None,
+                "temporary upstream failure",
+            ),
+            ProviderRetryClass::Network
+        );
+        assert_eq!(
+            classify_remote_broker_retry_class(
+                "stream_error",
+                false,
+                None,
+                None,
+                None,
+                None,
+                "temporary upstream failure",
+            ),
+            ProviderRetryClass::NonRetryable
+        );
+        // Status-classified server errors remain retryable even without failureKind.
+        assert_eq!(
+            classify_remote_broker_retry_class(
+                "stream_error",
+                true,
+                Some(503),
+                None,
+                None,
+                None,
+                "temporary upstream failure",
+            ),
+            ProviderRetryClass::TransientServer
+        );
+    }
+
+    #[test]
+    fn should_retry_remote_broker_failure_requires_known_code_and_budget() {
+        assert!(should_retry_remote_broker_failure(
+            "provider_error",
+            true,
+            0,
+            1
+        ));
+        assert!(!should_retry_remote_broker_failure(
+            "provider_error",
+            false,
+            0,
+            1
+        ));
+        assert!(!should_retry_remote_broker_failure(
+            "provider_error",
+            true,
+            1,
+            1
+        ));
+        assert!(!should_retry_remote_broker_failure("cancelled", true, 0, 3));
     }
 }

@@ -2953,10 +2953,14 @@ async fn remote_sidecar_wait_provider_retry_backoff_cancellable(
     run_stream: &RemoteActiveRunStream,
     class: crate::provider_retry::ProviderRetryClass,
     retry_ordinal: u32,
+    retry_after: Option<std::time::Duration>,
 ) -> bool {
-    let Some(delay) =
-        crate::provider_retry::provider_retry_backoff_for_class(class, retry_ordinal, None)
-    else {
+    let Some(delay) = crate::provider_retry::provider_retry_backoff_for_class_with_retry_after(
+        class,
+        retry_ordinal,
+        retry_after,
+        None,
+    ) else {
         return false;
     };
     if run_stream.is_cancel_requested() || run_stream.is_finished() {
@@ -7026,13 +7030,10 @@ async fn broker_llm_stream(
                         provider_config.kind.uses_websocket(),
                     ),
                 ),
-            ) => result.unwrap_or_else(|_| Err(ProviderRequestFailure {
-                error: ProviderConfigError::Connection {
+            ) => result.unwrap_or_else(|_| Err(ProviderRequestFailure::new(ProviderConfigError::Connection {
                     message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
                     status_code: None,
-                },
-                request_dump: None,
-            })),
+                }))),
         }
     } else {
         timeout(
@@ -7056,13 +7057,12 @@ async fn broker_llm_stream(
         )
         .await
         .unwrap_or_else(|_| {
-            Err(ProviderRequestFailure {
-                error: ProviderConfigError::Connection {
+            Err(ProviderRequestFailure::new(
+                ProviderConfigError::Connection {
                     message: crate::llm_request_timeout_message(&request_kind, timeout_ms),
                     status_code: None,
                 },
-                request_dump: None,
-            })
+            ))
         })
     } {
         Ok(s) => s,
@@ -7122,6 +7122,7 @@ async fn broker_llm_stream(
                 is_retryable_provider_stream_error(&failure.error),
                 status_code,
                 failure.error.stream_detail(),
+                failure.retry_after,
             )
             .await;
             return;
@@ -7270,6 +7271,7 @@ async fn broker_llm_stream(
                     retryable,
                     error_status,
                     e.stream_detail(),
+                    stream.retry_after(),
                 )
                 .await;
                 return;
@@ -7543,6 +7545,7 @@ async fn broker_llm_stream(
                     true,
                     None,
                     None,
+                    None,
                 )
                 .await;
                 return;
@@ -7648,6 +7651,7 @@ async fn broker_llm_stream(
             broker_llm_audit_status_code(stream.http_status(), None)
                 .and_then(|status| u16::try_from(status).ok()),
             None,
+            None,
         )
         .await;
         return;
@@ -7664,6 +7668,7 @@ async fn broker_llm_stream(
             true,
             broker_llm_audit_status_code(stream.http_status(), None)
                 .and_then(|status| u16::try_from(status).ok()),
+            None,
             None,
         )
         .await;
@@ -8500,6 +8505,7 @@ async fn send_broker_llm_error(
         false,
         None,
         None,
+        None,
     )
     .await
 }
@@ -8514,6 +8520,7 @@ async fn send_broker_llm_error_with_retry(
     retryable: bool,
     status_code: Option<u16>,
     stream_detail: Option<&foco_providers::ProviderStreamErrorDetail>,
+    retry_after: Option<std::time::Duration>,
 ) -> Result<(), ()> {
     let mut payload = json!({
         "code": code.into(),
@@ -8523,8 +8530,8 @@ async fn send_broker_llm_error_with_retry(
         "providerId": provider_id,
         "modelId": model_id,
     });
-    if let Some(detail) = stream_detail {
-        if let Some(object) = payload.as_object_mut() {
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(detail) = stream_detail {
             object.insert(
                 "failureKind".to_string(),
                 Value::String(detail.kind.as_str().to_string()),
@@ -8553,6 +8560,13 @@ async fn send_broker_llm_error_with_retry(
                     Value::String(diagnostic_kind.clone()),
                 );
             }
+        }
+        if let Some(retry_after) = retry_after {
+            // Integer seconds only; already clamped to 30s at the provider boundary.
+            object.insert(
+                "retryAfterSeconds".to_string(),
+                Value::Number(serde_json::Number::from(retry_after.as_secs())),
+            );
         }
     }
     let envelope = ControlEnvelope {
@@ -14829,6 +14843,8 @@ enum RemoteSidecarBrokerLlmTurnOutcome {
         status_code: Option<i64>,
         /// Structured retry class shared with the local provider retry classifier.
         retry_class: crate::provider_retry::ProviderRetryClass,
+        /// Optional provider Retry-After delay (already clamped at the provider boundary).
+        retry_after: Option<std::time::Duration>,
     },
     ReasoningLoopInterrupted {
         message: String,
@@ -14899,6 +14915,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                 message,
                 status_code: None,
                 retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                retry_after: None,
             });
         }
     };
@@ -14964,6 +14981,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     message: message.to_string(),
                     status_code: None,
                     retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                    retry_after: None,
                 });
             }
             Err(_) => {
@@ -14994,6 +15012,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                     message: message.to_string(),
                     status_code: None,
                     retry_class: crate::provider_retry::ProviderRetryClass::Network,
+                    retry_after: None,
                 });
             }
         };
@@ -15394,26 +15413,21 @@ async fn remote_sidecar_run_broker_llm_turn(
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     status_code,
-                    envelope
-                        .payload
-                        .get("failureKind")
-                        .and_then(Value::as_str),
-                    envelope
-                        .payload
-                        .get("providerCode")
-                        .and_then(Value::as_str),
+                    envelope.payload.get("failureKind").and_then(Value::as_str),
+                    envelope.payload.get("providerCode").and_then(Value::as_str),
                     envelope
                         .payload
                         .get("providerErrorType")
                         .and_then(Value::as_str),
                     message,
                 );
-                let retryable = should_retry_remote_broker_failure(
-                    code,
-                    retry_class.is_retryable(),
-                    0,
-                    1,
-                );
+                let retryable =
+                    should_retry_remote_broker_failure(code, retry_class.is_retryable(), 0, 1);
+                let retry_after = envelope
+                    .payload
+                    .get("retryAfterSeconds")
+                    .and_then(Value::as_u64)
+                    .map(|seconds| std::time::Duration::from_secs(seconds.min(30)));
                 let error_provider_id =
                     remote_broker_resolved_provider_id(&envelope.payload, &resolved_provider_id);
                 let audit_outcome =
@@ -15439,6 +15453,7 @@ async fn remote_sidecar_run_broker_llm_turn(
                         message: message.to_string(),
                         status_code,
                         retry_class,
+                        retry_after,
                     });
                 }
                 let _ = with_sidecar_workspace_database(state, |database| {
@@ -17481,6 +17496,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 message,
                 status_code: _,
                 retry_class,
+                retry_after,
             }) if provider_retry_count < max_provider_retries => {
                 provider_retry_count = provider_retry_count.saturating_add(1);
                 rate_limit_retry_count = rate_limit_retry_count.saturating_add(1);
@@ -17505,6 +17521,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                     &run_stream,
                     retry_class,
                     retry_ordinal,
+                    retry_after,
                 )
                 .await
                 {
@@ -32273,6 +32290,7 @@ mod tests {
                 message,
                 status_code: Some(429),
                 retry_class: crate::provider_retry::ProviderRetryClass::RateLimit,
+                retry_after: None,
             }) if message == "rate limited"
         ));
         let audit = database
@@ -32283,6 +32301,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_sidecar_broker_capacity_failure_kind_drives_retry_class() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-capacity".to_string(),
+            "chat-1".to_string(),
+        );
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "code": "provider_stream_error",
+                        "message": "The model is currently overloaded",
+                        "retryable": true,
+                        // HTTP 200 SSE capacity has no transport status.
+                        "statusCode": null,
+                        "failureKind": "capacity",
+                        "providerCode": "model_capacity",
+                        "providerEventType": "error",
+                        "diagnosticKind": "provider_error_event",
+                        "retryAfterSeconds": 7,
+                    }),
+                    timestamp: None,
+                })
+                .expect("send capacity broker error");
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
+        let outcome = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-capacity",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-capacity",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &mut latency_mode,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+            &[],
+            &[],
+            0,
+            0,
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        assert!(matches!(
+            outcome,
+            Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry {
+                message,
+                status_code: None,
+                retry_class: crate::provider_retry::ProviderRetryClass::Capacity,
+                retry_after: Some(delay),
+            }) if message.contains("currently overloaded")
+                && !message.contains("Failed to parse stream data")
+                && delay == Duration::from_secs(7)
+        ));
+        let audit = database
+            .llm_request("broker-request-capacity")
+            .expect("sidecar audit lookup")
+            .expect("sidecar audit exists");
+        assert_eq!(audit.final_state, "failed");
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_protocol_parse_failure_is_not_retryable() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
+        database
+            .insert_chat_with_metadata("chat-1", "Remote chat", "{}")
+            .expect("insert chat");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let run_stream = remote_sidecar_insert_active_run_stream(
+            &state,
+            "remote-run-parse".to_string(),
+            "chat-1".to_string(),
+        );
+
+        let broker_state = state.clone();
+        let broker = tokio::spawn(async move {
+            let request = loop {
+                let envelope = broker_rx.recv().await.expect("broker request");
+                if envelope.message_type == "request" {
+                    break envelope;
+                }
+            };
+            let id = request.id.expect("request id");
+            let pending = broker_state
+                .broker_pending
+                .lock()
+                .await
+                .get(&id)
+                .cloned()
+                .expect("pending response channel");
+            pending
+                .send(ControlEnvelope {
+                    version: 1,
+                    message_type: "error".to_string(),
+                    id: Some(id),
+                    method: None,
+                    payload: json!({
+                        "code": "provider_stream_error",
+                        "message": "Failed to parse stream data: invalid json",
+                        "retryable": true,
+                        "statusCode": null,
+                        "failureKind": "protocol_parse",
+                        "diagnosticKind": "invalid_json",
+                    }),
+                    timestamp: None,
+                })
+                .expect("send protocol parse broker error");
+        });
+
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut run_metrics = RemoteSidecarRunMetrics::new();
+        let mut sequence = 0_i64;
+        let mut latency_mode = foco_providers::LatencyMode::Standard;
+        let outcome = remote_sidecar_run_broker_llm_turn(
+            &state,
+            &run_stream,
+            "broker-request-parse",
+            json!({ "providerId": "provider-1", "modelId": "model-1" }),
+            "remote-run-parse",
+            "chat-1",
+            "msg-assistant-1",
+            "msg-user-1",
+            "provider-1",
+            "model-1",
+            &mut latency_mode,
+            &mut text,
+            &mut reasoning,
+            &mut run_metrics,
+            &mut sequence,
+            &[],
+            &[],
+            0,
+            0,
+        )
+        .await;
+        broker.await.expect("broker task");
+
+        // Non-retryable structured failures should not return Retry even when retryable=true.
+        assert!(
+            !matches!(outcome, Ok(RemoteSidecarBrokerLlmTurnOutcome::Retry { .. })),
+            "protocol_parse must not schedule a broker retry: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn remote_sidecar_retry_backoff_waits_until_cancel_but_skips_non_retryable_errors() {
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         assert!(
@@ -32290,6 +32497,7 @@ mod tests {
                 &run_stream,
                 crate::provider_retry::ProviderRetryClass::NonRetryable,
                 1,
+                None,
             )
             .await
         );
@@ -32300,6 +32508,7 @@ mod tests {
                 &waiting_stream,
                 crate::provider_retry::ProviderRetryClass::RateLimit,
                 1,
+                None,
             )
             .await
         });
@@ -32326,6 +32535,7 @@ mod tests {
                 &waiting_stream,
                 crate::provider_retry::ProviderRetryClass::RateLimit,
                 1,
+                None,
             )
             .await
         });
@@ -34094,6 +34304,9 @@ mod tests {
                 ),
             })
             .expect("insert user message");
+        // Release the seed connection before the background run opens the workspace DB.
+        // Holding an ordinary-gate permit across the full SSE body wait can stall the run.
+        drop(database);
         let (state, broker_rx) =
             test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
         let mut broker_rx = test_sidecar_broker_with_tool_discovery(state.clone(), broker_rx);
