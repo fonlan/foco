@@ -3585,19 +3585,19 @@ function ToolCallBlock({
     toolCall.name === "get_command_output" && managedCommand
       ? managedCommandHeaderDetail(detailText, managedCommand, t)
       : detailText;
-  const completedCommandOutput =
+  const completedManagedCommand =
     !toolCall.isError &&
-    toolCall.name === "get_command_output" &&
+    (toolCall.name === "get_command_output" || toolCall.name === "stop_command") &&
     toolCall.status === "completed";
   const summaryStatusLabel =
-    completedCommandOutput
+    completedManagedCommand
       ? toolStatusText(toolCall, t)
       : !toolCall.isError && managedStatusLabel
       ? managedStatusLabel
       : toolStatusText(toolCall, t);
   const summaryStatusClass = toolCall.isError
     ? "bg-[var(--danger-soft)] text-[var(--danger)]"
-    : !completedCommandOutput && managedCommand && managedStatusLabel
+    : !completedManagedCommand && managedCommand && managedStatusLabel
       ? managedCommandStatusClass(managedCommand)
       : toolCall.status === "completed"
         ? "bg-[var(--success-soft)] text-[var(--success)]"

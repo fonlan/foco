@@ -2023,7 +2023,8 @@ describe("app-shell verification surfaces", () => {
     expect(exitedOutputSummary).toHaveTextContent(
       /process-demo.*Exited · code 17/,
     );
-    expect(stopSummary).toHaveTextContent("Stopped");
+    expect(stopSummary.lastElementChild).toHaveTextContent("completed");
+    expect(stopRequestedSummary.lastElementChild).toHaveTextContent("completed");
 
     await userEvent.click(startSummary);
     expect(await screen.findByText("Background process started, no output yet")).toBeInTheDocument();
@@ -2046,6 +2047,7 @@ describe("app-shell verification surfaces", () => {
     expect(within(outputBubble).getAllByText("2.0s")).not.toHaveLength(0);
 
     await userEvent.click(stopSummary);
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
     expect(await screen.findByText("Entire process tree terminated")).toBeInTheDocument();
 
     await userEvent.click(stopRequestedSummary);

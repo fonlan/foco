@@ -4372,6 +4372,88 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps stop_command running until its synchronous result is received", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "stop background command",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const assistantMessageId = "message-assistant-stop-command";
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          id: "call-stop-command",
+          input: { processId: "process-stop-demo", timeoutMs: 10_000 },
+          isError: false,
+          name: "stop_command",
+          output: null,
+          startedAt: "started-at",
+          status: "running",
+        },
+        type: "toolCall",
+      });
+    });
+
+    const stopSummaries = await screen.findAllByLabelText(
+      "Stop Command (stop_command)",
+    );
+    for (const stopSummary of stopSummaries) {
+      expect(within(stopSummary).getByText("running")).toBeInTheDocument();
+      expect(within(stopSummary).queryByText("completed")).not.toBeInTheDocument();
+    }
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        completedAt: "completed-at",
+        isError: false,
+        output: {
+          endedAt: "2026-07-22T04:00:03.000Z",
+          exitCode: null,
+          pid: 4242,
+          processId: "process-stop-demo",
+          status: "stopped",
+          terminationReason: "explicit_stop",
+        },
+        startedAt: "started-at",
+        toolCallId: "call-stop-command",
+        type: "toolResult",
+      });
+    });
+
+    await waitFor(() => {
+      for (const stopSummary of stopSummaries) {
+        expect(within(stopSummary).getByText("completed")).toBeInTheDocument();
+        expect(within(stopSummary).queryByText("running")).not.toBeInTheDocument();
+      }
+    });
+
+    const stopBlock = stopSummaries[0]?.closest(
+      ".tool-call-block",
+    ) as HTMLElement | null;
+    if (!stopBlock) {
+      throw new Error("Expected stop command tool block");
+    }
+    await userEvent.click(stopSummaries[0]!);
+    expect(within(stopBlock).getByText("Stopped")).toBeInTheDocument();
+    expect(within(stopBlock).getByText("explicit_stop")).toBeInTheDocument();
+    expect(
+      within(stopBlock).getByText("Entire process tree terminated"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   // Regression: bubble-visible stream events must paint on the active tab without a
   // tab switch (cache write alone is not enough when setMessages was deferred).
   // Hold deferStreamAuxiliaryUpdate so a mistaken re-wrap of bubble updates via that
