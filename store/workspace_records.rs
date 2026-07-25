@@ -189,6 +189,11 @@ pub struct PreStreamChatFailureClosure<'a> {
     pub assistant_message_id: &'a str,
     pub assistant_sequence: i64,
     pub error_json: &'a str,
+    /// Recovery closures use this to preserve the durable recovery diagnostics
+    /// on their `attempt_interrupted` event. Ordinary pre-stream failures leave
+    /// it unset and retain their existing `task_failed` event shape.
+    pub interruption_event_payload_json: Option<&'a str>,
+    pub interruption_reason: Option<&'a str>,
     pub assistant_content: &'a str,
     pub assistant_metadata_json: &'a str,
     /// Optional CAS snapshot for recovery paths. When provided, the active

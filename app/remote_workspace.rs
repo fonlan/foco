@@ -4377,6 +4377,11 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
                 assistant_message_id: &assistant_message_id,
                 assistant_sequence,
                 error_json: &error_json,
+                interruption_event_payload_json: None,
+                // This is recovery, not an ordinary pre-stream failure. Keep
+                // the task and attempt terminal state coherent in the same
+                // transaction so wait recovery can identify the interruption.
+                interruption_reason: Some("remote sidecar lost the Agent attempt owner lease"),
                 assistant_content: "remote sidecar lost the Agent attempt owner lease",
                 assistant_metadata_json: &assistant_metadata_json,
                 expected_attempt_owner_incarnation: record.attempt.owner_incarnation.as_deref(),

@@ -25,6 +25,7 @@ pub(crate) use agent_scheduler::{
 };
 #[cfg(test)]
 pub(crate) use agent_scheduler::{
+    ActiveAgentAttemptIdentity, AgentAttemptRecoveryContext,
     agent_lifecycle_retry_until_shutdown_for_test, agent_wait_resume_messages,
     fail_claimed_task_with_retry, reconcile_agent_attempt_leases,
     recover_panicked_coordinator_for_test, retain_agent_snapshot_tools,

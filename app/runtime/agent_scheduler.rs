@@ -60,8 +60,12 @@ const AGENT_ATTEMPT_LEASE_TIMEOUT: Duration = Duration::from_secs(30);
 const AGENT_ATTEMPT_LEASE_HEARTBEAT: Duration = Duration::from_secs(5);
 const AGENT_GLOBAL_MAX_CONCURRENT_RUNS: usize = 10;
 const RESTART_INTERRUPTION_REASON: &str = "backend restarted while Agent attempt was active";
-const LEASE_EXPIRED_INTERRUPTION_REASON: &str =
-    "Agent attempt lease expired while its owner was unavailable";
+const RUNTIME_ORPHANED_INTERRUPTION_REASON: &str =
+    "Agent attempt was orphaned by its current runtime after its lease expired";
+const LEGACY_OWNER_UNKNOWN_INTERRUPTION_REASON: &str =
+    "Agent attempt owner is unknown in a legacy record";
+const INVALID_OWNER_OR_LEASE_INTERRUPTION_REASON: &str =
+    "Agent attempt owner or lease data is invalid";
 const AGENT_TEAM_PROTOCOL_VERSION: u32 = 2;
 const AGENT_CONTEXT_SNAPSHOT_VERSION: u32 = 1;
 const AGENT_CONTEXT_RECENT_MESSAGE_LIMIT: usize = 8;
@@ -106,6 +110,7 @@ const PRE_STREAM_USER_MESSAGE_GENERIC: &str =
 #[derive(Clone)]
 pub(crate) struct AgentScheduler {
     wake_tx: mpsc::Sender<()>,
+    owner_incarnation: Arc<str>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -145,9 +150,40 @@ fn default_collaboration_tools_enabled() -> bool {
 }
 
 impl AgentScheduler {
+    pub(crate) fn new_runtime() -> Result<(Self, mpsc::Receiver<()>), ApiError> {
+        let mut entropy = [0_u8; 32];
+        getrandom::fill(&mut entropy).map_err(|source| {
+            ApiError::internal(format!(
+                "failed to generate Agent scheduler owner incarnation: {source}"
+            ))
+        })?;
+        let owner_incarnation = entropy
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        Ok(Self::new_with_owner(Arc::from(format!(
+            "agent-owner-{owner_incarnation}"
+        ))))
+    }
+
+    #[cfg(test)]
     pub(crate) fn new() -> (Self, mpsc::Receiver<()>) {
+        Self::new_with_owner(Arc::from(unique_id("agent-owner-test")))
+    }
+
+    fn new_with_owner(owner_incarnation: Arc<str>) -> (Self, mpsc::Receiver<()>) {
         let (wake_tx, wake_rx) = mpsc::channel(AGENT_SCHEDULER_WAKE_CAPACITY);
-        (Self { wake_tx }, wake_rx)
+        (
+            Self {
+                wake_tx,
+                owner_incarnation,
+            },
+            wake_rx,
+        )
+    }
+
+    pub(crate) fn owner_incarnation(&self) -> &str {
+        &self.owner_incarnation
     }
 
     pub(crate) fn wake(&self) -> Result<(), ApiError> {
@@ -160,31 +196,39 @@ impl AgentScheduler {
     }
 
     pub(crate) fn spawn(&self, state: AppState, wake_rx: mpsc::Receiver<()>) -> JoinHandle<()> {
-        tokio::spawn(run_agent_scheduler(state, wake_rx))
+        tokio::spawn(run_agent_scheduler(
+            state,
+            wake_rx,
+            self.owner_incarnation.clone(),
+        ))
     }
 }
 
-async fn run_agent_scheduler(state: AppState, mut wake_rx: mpsc::Receiver<()>) {
+async fn run_agent_scheduler(
+    state: AppState,
+    mut wake_rx: mpsc::Receiver<()>,
+    owner_incarnation: Arc<str>,
+) {
     let permits = Arc::new(Semaphore::new(AGENT_GLOBAL_MAX_CONCURRENT_RUNS));
     let mut runs = JoinSet::new();
     let mut run_identities: HashMap<TokioTaskId, AgentCoordinatorRunIdentity> = HashMap::new();
     let mut shutdown_rx = state.app_shutdown_rx.clone();
-    let owner_incarnation = unique_id("agent-owner");
     let mut scan = true;
     let mut next_deadline_at: Option<DateTime<Utc>> = None;
 
     loop {
         if scan {
             scan = false;
-            let active_attempt_ids = run_identities
+            let active_runs = run_identities
                 .values()
-                .map(|identity| identity.attempt_id.clone())
+                .map(ActiveAgentAttemptIdentity::from_run)
                 .collect::<HashSet<_>>();
             if let Err(error) = reconcile_agent_attempt_leases(
                 &state,
-                None,
-                Some(&owner_incarnation),
-                Some(&active_attempt_ids),
+                AgentAttemptRecoveryContext::RuntimeScan {
+                    scheduler_owner_incarnation: &owner_incarnation,
+                    active_runs: &active_runs,
+                },
             ) {
                 tracing::error!(
                     error = %error.message,
@@ -368,27 +412,99 @@ pub(crate) fn reconcile_running_llm_request_audits_on_startup(state: &AppState) 
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AgentAttemptRecoveryContext<'a> {
+    Startup {
+        plan_dispatch_owner_incarnation: &'a str,
+        scheduler_owner_incarnation: &'a str,
+    },
+    RuntimeScan {
+        scheduler_owner_incarnation: &'a str,
+        active_runs: &'a HashSet<ActiveAgentAttemptIdentity>,
+    },
+}
+
+impl AgentAttemptRecoveryContext<'_> {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Startup { .. } => "startup",
+            Self::RuntimeScan { .. } => "runtime_scan",
+        }
+    }
+
+    fn scheduler_owner_incarnation(&self) -> &str {
+        match self {
+            Self::Startup {
+                scheduler_owner_incarnation,
+                ..
+            }
+            | Self::RuntimeScan {
+                scheduler_owner_incarnation,
+                ..
+            } => scheduler_owner_incarnation,
+        }
+    }
+
+    fn plan_dispatch_owner_incarnation(&self) -> Option<&str> {
+        match self {
+            Self::Startup {
+                plan_dispatch_owner_incarnation,
+                ..
+            } => Some(plan_dispatch_owner_incarnation),
+            Self::RuntimeScan { .. } => None,
+        }
+    }
+
+    fn is_startup(self) -> bool {
+        matches!(self, Self::Startup { .. })
+    }
+
+    fn active_runner_present(self, task: &AgentTaskRecord, attempt: &AgentAttemptRecord) -> bool {
+        match self {
+            Self::Startup { .. } => false,
+            Self::RuntimeScan { active_runs, .. } => active_runs.iter().any(|identity| {
+                identity.matches(&task.id, &attempt.id, attempt.owner_incarnation.as_deref())
+            }),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AgentAttemptRecoveryAction {
+    Deferred { cause: &'static str },
+    Interrupt(AgentAttemptInterruption),
+}
+
+impl AgentAttemptRecoveryAction {
+    fn cause(self) -> &'static str {
+        match self {
+            Self::Deferred { cause } => cause,
+            Self::Interrupt(interruption) => interruption.code(),
+        }
+    }
+}
+
 pub(crate) fn reconcile_agent_runtime(
     state: &AppState,
     plan_dispatch_owner_incarnation: &str,
 ) -> Result<(), ApiError> {
     reconcile_running_llm_request_audits_on_startup(state);
-    reconcile_agent_attempt_leases(state, Some(plan_dispatch_owner_incarnation), None, None)
+    reconcile_agent_attempt_leases(
+        state,
+        AgentAttemptRecoveryContext::Startup {
+            plan_dispatch_owner_incarnation,
+            scheduler_owner_incarnation: state.agent_scheduler.owner_incarnation(),
+        },
+    )
 }
 
-/// Reconcile Agent lifecycle state during ordinary scheduler scans. Plan
-/// dispatch-window recovery runs only from the ordered startup bootstrap.
+/// Reconcile Agent lifecycle state using an explicit startup or runtime-scan
+/// context. Startup recovery owns old runtime cleanup; runtime scans defer to
+/// JoinSet evidence before declaring a same-runtime attempt orphaned.
 pub(crate) fn reconcile_agent_attempt_leases(
     state: &AppState,
-    plan_dispatch_owner_incarnation: Option<&str>,
-    current_scheduler_owner_incarnation: Option<&str>,
-    active_scheduler_attempt_ids: Option<&HashSet<AgentAttemptId>>,
+    context: AgentAttemptRecoveryContext<'_>,
 ) -> Result<(), ApiError> {
-    let interruption = if plan_dispatch_owner_incarnation.is_some() {
-        AgentAttemptInterruption::BackendRestarted
-    } else {
-        AgentAttemptInterruption::LeaseExpired
-    };
     let config = config_snapshot(state)?;
     for workspace in config.local_workspaces() {
         let reconciliation = (|| -> Result<(), ApiError> {
@@ -405,153 +521,183 @@ pub(crate) fn reconcile_agent_attempt_leases(
                     &record.attempt,
                     AGENT_ATTEMPT_LEASE_TIMEOUT,
                 );
-                if recovery == AgentAttemptRecoveryDisposition::LeaseActive {
-                    insert_agent_event(
-                        &mut database,
-                        &record.task.team_id,
-                        "attempt_recovery_deferred",
-                        Some(&record.task.owner_instance_id),
-                        Some(&record.task.id),
-                        Some(&record.attempt.id),
-                        json!({ "reason": "lease_active" }),
-                    )?;
-                    continue;
-                }
-                if current_scheduler_owner_incarnation
-                    .is_some_and(|owner| record.attempt.owner_incarnation.as_deref() == Some(owner))
-                    && active_scheduler_attempt_ids
-                        .is_some_and(|attempt_ids| attempt_ids.contains(&record.attempt.id))
-                {
-                    // A current scheduler is actively tracking this attempt in its JoinSet and
-                    // will close it through that lifecycle. A delayed heartbeat alone is not
-                    // evidence that the backend restarted, especially while an implicit wait is
-                    // being persisted. Ownership alone is insufficient: a post-claim failure can
-                    // leave a same-owner attempt without a coordinator future to close it.
-                    insert_agent_event(
-                        &mut database,
-                        &record.task.team_id,
-                        "attempt_recovery_skipped",
-                        Some(&record.task.owner_instance_id),
-                        Some(&record.task.id),
-                        Some(&record.attempt.id),
-                        json!({ "reason": "current_scheduler_owner" }),
-                    )?;
-                    continue;
-                }
-                if database
-                    .suspend_running_agent_task_with_wait_dependencies(
-                        &record.task.team_id,
-                        &record.task.id,
-                    )
-                    .map_err(ApiError::from_workspace_error)?
-                {
-                    insert_agent_event(
-                        &mut database,
-                        &record.task.team_id,
-                        "task_suspended",
-                        Some(&record.task.owner_instance_id),
-                        Some(&record.task.id),
-                        Some(&record.attempt.id),
-                        json!({ "reason": "startup_wait_dependency_recovery" }),
-                    )?;
-                    crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
-                    &mut database,
-                    &record.task.id,
-                )?;
-                    continue;
-                }
-                match close_interrupted_coordinator_chat_run(
-                    &mut database,
-                    &record.task,
-                    &record.attempt,
-                    interruption,
-                )? {
-                    InterruptedCoordinatorChatClosure::Applied => {
+                let owner_match = record.attempt.owner_incarnation.as_deref()
+                    == Some(context.scheduler_owner_incarnation());
+                let legacy_attempt_owner =
+                    record.attempt.owner_incarnation.as_deref() == Some(record.attempt.id.as_str());
+                let active_runner_present =
+                    context.active_runner_present(&record.task, &record.attempt);
+                let action = agent_attempt_recovery_action(
+                    context,
+                    &recovery,
+                    owner_match,
+                    legacy_attempt_owner,
+                    active_runner_present,
+                );
+                let diagnostics = recovery_diagnostics(
+                    context,
+                    &recovery,
+                    action.cause(),
+                    owner_match,
+                    active_runner_present,
+                );
+                match action {
+                    AgentAttemptRecoveryAction::Deferred { cause } => {
+                        insert_agent_event(
+                            &mut database,
+                            &record.task.team_id,
+                            "attempt_recovery_deferred",
+                            Some(&record.task.owner_instance_id),
+                            Some(&record.task.id),
+                            Some(&record.attempt.id),
+                            diagnostics,
+                        )?;
+                        tracing::info!(
+                            workspace_id = %workspace.id,
+                            task_id = %record.task.id,
+                            attempt_id = %record.attempt.id,
+                            recovery_source = context.source(),
+                            recovery_cause = cause,
+                            owner_match,
+                            lease_renewed_at = ?record.attempt.lease_renewed_at,
+                            recovery = recovery_diagnostic_code(&recovery),
+                            active_runner_present,
+                            "deferred Agent attempt recovery"
+                        );
+                        continue;
+                    }
+                    AgentAttemptRecoveryAction::Interrupt(interruption) => {
+                        tracing::warn!(
+                            workspace_id = %workspace.id,
+                            task_id = %record.task.id,
+                            attempt_id = %record.attempt.id,
+                            recovery_source = context.source(),
+                            recovery_cause = interruption.code(),
+                            owner_match,
+                            lease_renewed_at = ?record.attempt.lease_renewed_at,
+                            recovery = recovery_diagnostic_code(&recovery),
+                            active_runner_present,
+                            "reconciling interrupted Agent attempt"
+                        );
+                        if database
+                            .suspend_running_agent_task_with_wait_dependencies(
+                                &record.task.team_id,
+                                &record.task.id,
+                            )
+                            .map_err(ApiError::from_workspace_error)?
+                        {
+                            insert_agent_event(
+                                &mut database,
+                                &record.task.team_id,
+                                "task_suspended",
+                                Some(&record.task.owner_instance_id),
+                                Some(&record.task.id),
+                                Some(&record.attempt.id),
+                                diagnostics,
+                            )?;
+                            crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                                &mut database,
+                                &record.task.id,
+                            )?;
+                            continue;
+                        }
+                        match close_interrupted_coordinator_chat_run(
+                            &mut database,
+                            &record.task,
+                            &record.attempt,
+                            interruption,
+                            &diagnostics,
+                        )? {
+                            InterruptedCoordinatorChatClosure::Applied => {
+                                crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
+                                    &mut database,
+                                    &record.task.id,
+                                )?;
+                                continue;
+                            }
+                            InterruptedCoordinatorChatClosure::OwnerChanged => {
+                                insert_agent_event(
+                                    &mut database,
+                                    &record.task.team_id,
+                                    "attempt_recovery_skipped",
+                                    Some(&record.task.owner_instance_id),
+                                    Some(&record.task.id),
+                                    Some(&record.attempt.id),
+                                    json!({
+                                        "recoverySource": context.source(),
+                                        "recoveryCause": interruption.code(),
+                                        "reason": "owner_changed",
+                                    }),
+                                )?;
+                                continue;
+                            }
+                            InterruptedCoordinatorChatClosure::NotApplicable => {}
+                        }
+                        let updated = database
+                            .update_agent_task_state_for_attempt_lease(
+                                AgentTaskStateUpdate {
+                                    team_id: &record.task.team_id,
+                                    task_id: &record.task.id,
+                                    expected_status,
+                                    transition: AgentTaskTransition::Interrupt,
+                                    result_json: None,
+                                    error_json: Some(
+                                        &json!({
+                                            "message": interruption.reason(),
+                                            "code": interruption.code(),
+                                            "stage": interruption.stage(),
+                                        })
+                                        .to_string(),
+                                    ),
+                                    interruption_reason: Some(interruption.reason()),
+                                },
+                                &record.attempt.id,
+                                record.attempt.owner_incarnation.as_deref(),
+                                record.attempt.lease_renewed_at.as_deref(),
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        if !updated {
+                            insert_agent_event(
+                                &mut database,
+                                &record.task.team_id,
+                                "attempt_recovery_skipped",
+                                Some(&record.task.owner_instance_id),
+                                Some(&record.task.id),
+                                Some(&record.attempt.id),
+                                json!({
+                                    "recoverySource": context.source(),
+                                    "recoveryCause": interruption.code(),
+                                    "reason": "owner_changed",
+                                }),
+                            )?;
+                            continue;
+                        }
+                        database
+                            .transition_agent_instance_status(
+                                &record.task.owner_instance_id,
+                                AgentInstanceStatus::Paused,
+                            )
+                            .map_err(ApiError::from_workspace_error)?;
+                        insert_agent_event(
+                            &mut database,
+                            &record.task.team_id,
+                            "attempt_interrupted",
+                            Some(&record.task.owner_instance_id),
+                            Some(&record.task.id),
+                            Some(&record.attempt.id),
+                            diagnostics,
+                        )?;
+                        database
+                            .fail_plan_phase_run(&record.task.id, interruption.reason())
+                            .map_err(ApiError::from_workspace_error)?;
                         crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
                             &mut database,
                             &record.task.id,
                         )?;
-                        continue;
                     }
-                    InterruptedCoordinatorChatClosure::OwnerChanged => {
-                        insert_agent_event(
-                            &mut database,
-                            &record.task.team_id,
-                            "attempt_recovery_skipped",
-                            Some(&record.task.owner_instance_id),
-                            Some(&record.task.id),
-                            Some(&record.attempt.id),
-                            json!({ "reason": "owner_changed" }),
-                        )?;
-                        continue;
-                    }
-                    InterruptedCoordinatorChatClosure::NotApplicable => {}
                 }
-                let updated = database
-                    .update_agent_task_state_for_attempt_lease(
-                        AgentTaskStateUpdate {
-                            team_id: &record.task.team_id,
-                            task_id: &record.task.id,
-                            expected_status,
-                            transition: AgentTaskTransition::Interrupt,
-                            result_json: None,
-                            error_json: Some(
-                                &json!({
-                                    "message": interruption.reason(),
-                                    "code": interruption.code(),
-                                })
-                                .to_string(),
-                            ),
-                            interruption_reason: Some(interruption.reason()),
-                        },
-                        &record.attempt.id,
-                        record.attempt.owner_incarnation.as_deref(),
-                        record.attempt.lease_renewed_at.as_deref(),
-                    )
-                    .map_err(ApiError::from_workspace_error)?;
-                if !updated {
-                    // The owner renewed after this recovery pass took its
-                    // snapshot. It is still live, so this scheduler must not
-                    // pause its instance or terminalize its Plan phase.
-                    insert_agent_event(
-                        &mut database,
-                        &record.task.team_id,
-                        "attempt_recovery_skipped",
-                        Some(&record.task.owner_instance_id),
-                        Some(&record.task.id),
-                        Some(&record.attempt.id),
-                        json!({ "reason": "owner_changed" }),
-                    )?;
-                    continue;
-                }
-                database
-                    .transition_agent_instance_status(
-                        &record.task.owner_instance_id,
-                        AgentInstanceStatus::Paused,
-                    )
-                    .map_err(ApiError::from_workspace_error)?;
-                insert_agent_event(
-                    &mut database,
-                    &record.task.team_id,
-                    "attempt_interrupted",
-                    Some(&record.task.owner_instance_id),
-                    Some(&record.task.id),
-                    Some(&record.attempt.id),
-                    json!({
-                        "reason": interruption.reason(),
-                        "code": interruption.code(),
-                        "recovery": recovery_diagnostic_code(&recovery),
-                    }),
-                )?;
-                database
-                    .fail_plan_phase_run(&record.task.id, interruption.reason())
-                    .map_err(ApiError::from_workspace_error)?;
-                crate::scheduled_tasks::scheduler::sync_scheduled_task_runs_for_agent_task_with_database(
-                &mut database,
-                &record.task.id,
-            )?;
             }
-            if let Some(dispatch_owner_incarnation) = plan_dispatch_owner_incarnation {
+            if let Some(dispatch_owner_incarnation) = context.plan_dispatch_owner_incarnation() {
                 database
                     .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
                     .map_err(ApiError::from_workspace_error)?;
@@ -607,18 +753,70 @@ pub(crate) fn reconcile_agent_attempt_leases(
         if let Err(error) = reconciliation {
             tracing::error!(
                 workspace_id = %workspace.id,
-                error_category = "agent_startup_reconciliation_failed",
+                recovery_source = context.source(),
+                error_category = "agent_attempt_reconciliation_failed",
                 error = %error.message,
-                "failed to reconcile Agent runtime at startup for workspace"
+                "failed to reconcile Agent runtime for workspace"
             );
         }
     }
-    if plan_dispatch_owner_incarnation.is_some()
+    if context.is_startup()
         && let Err(error) = crate::plan_runtime::reconcile_plan_derived_effects(state)
     {
         tracing::warn!(error = %error.message, "failed to reconcile integrated plan derived effects");
     }
     Ok(())
+}
+
+fn agent_attempt_recovery_action(
+    context: AgentAttemptRecoveryContext<'_>,
+    recovery: &AgentAttemptRecoveryDisposition,
+    owner_match: bool,
+    legacy_attempt_owner: bool,
+    active_runner_present: bool,
+) -> AgentAttemptRecoveryAction {
+    match recovery {
+        AgentAttemptRecoveryDisposition::LeaseActive => AgentAttemptRecoveryAction::Deferred {
+            cause: "lease_active",
+        },
+        _ if active_runner_present => AgentAttemptRecoveryAction::Deferred {
+            cause: "current_runtime_runner",
+        },
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLegacy => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::LegacyOwnerUnknown)
+        }
+        _ if legacy_attempt_owner => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::LegacyOwnerUnknown)
+        }
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedInvalidLease => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::InvalidOwnerOrLease)
+        }
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired if context.is_startup() => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::BackendRestarted)
+        }
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired if owner_match => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::RuntimeOrphaned)
+        }
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired => {
+            AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::BackendRestarted)
+        }
+    }
+}
+
+fn recovery_diagnostics(
+    context: AgentAttemptRecoveryContext<'_>,
+    recovery: &AgentAttemptRecoveryDisposition,
+    cause: &str,
+    owner_match: bool,
+    active_runner_present: bool,
+) -> Value {
+    json!({
+        "recoverySource": context.source(),
+        "recoveryCause": cause,
+        "recovery": recovery_diagnostic_code(recovery),
+        "ownerMatch": owner_match,
+        "activeRunnerPresent": active_runner_present,
+    })
 }
 
 fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'static str {
@@ -637,28 +835,35 @@ fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'sta
 #[derive(Clone, Copy)]
 enum AgentAttemptInterruption {
     BackendRestarted,
-    LeaseExpired,
+    RuntimeOrphaned,
+    LegacyOwnerUnknown,
+    InvalidOwnerOrLease,
 }
 
 impl AgentAttemptInterruption {
     fn reason(self) -> &'static str {
         match self {
             Self::BackendRestarted => RESTART_INTERRUPTION_REASON,
-            Self::LeaseExpired => LEASE_EXPIRED_INTERRUPTION_REASON,
+            Self::RuntimeOrphaned => RUNTIME_ORPHANED_INTERRUPTION_REASON,
+            Self::LegacyOwnerUnknown => LEGACY_OWNER_UNKNOWN_INTERRUPTION_REASON,
+            Self::InvalidOwnerOrLease => INVALID_OWNER_OR_LEASE_INTERRUPTION_REASON,
         }
     }
 
     fn code(self) -> &'static str {
         match self {
             Self::BackendRestarted => "backend_restart_interrupted",
-            Self::LeaseExpired => "agent_attempt_lease_expired",
+            Self::RuntimeOrphaned => "agent_attempt_runtime_orphaned",
+            Self::LegacyOwnerUnknown => "agent_attempt_owner_unknown",
+            Self::InvalidOwnerOrLease => "agent_attempt_owner_invalid",
         }
     }
 
     fn stage(self) -> &'static str {
         match self {
             Self::BackendRestarted => "startup_reconciliation",
-            Self::LeaseExpired => "lease_reconciliation",
+            Self::RuntimeOrphaned => "runtime_reconciliation",
+            Self::LegacyOwnerUnknown | Self::InvalidOwnerOrLease => "owner_reconciliation",
         }
     }
 }
@@ -679,6 +884,7 @@ fn close_interrupted_coordinator_chat_run(
     task: &AgentTaskRecord,
     attempt: &AgentAttemptRecord,
     interruption: AgentAttemptInterruption,
+    diagnostics: &Value,
 ) -> Result<InterruptedCoordinatorChatClosure, ApiError> {
     let Ok(input) = serde_json::from_str::<CoordinatorTaskInput>(&task.input_json) else {
         return Ok(InterruptedCoordinatorChatClosure::NotApplicable);
@@ -729,6 +935,7 @@ fn close_interrupted_coordinator_chat_run(
         "partsSource": interruption.stage(),
     })
     .to_string();
+    let interruption_event_payload_json = diagnostics.to_string();
     let result = database
         .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
             task_id: &task.id,
@@ -738,6 +945,8 @@ fn close_interrupted_coordinator_chat_run(
             assistant_message_id,
             assistant_sequence,
             error_json: &error_json,
+            interruption_event_payload_json: Some(&interruption_event_payload_json),
+            interruption_reason: Some(interruption.reason()),
             assistant_content: interruption.reason(),
             assistant_metadata_json: &assistant_metadata_json,
             expected_attempt_owner_incarnation: attempt.owner_incarnation.as_deref(),
@@ -756,7 +965,7 @@ fn close_interrupted_coordinator_chat_run(
                 task_id = %task.id,
                 attempt_id = %attempt.id,
                 reason = %reason,
-                "startup Coordinator chat closure skipped because the durable owner changed"
+                "Coordinator chat closure skipped because the durable owner changed"
             );
             Ok(InterruptedCoordinatorChatClosure::OwnerChanged)
         }
@@ -769,6 +978,47 @@ struct AgentCoordinatorRunIdentity {
     task_id: AgentTaskId,
     attempt_id: AgentAttemptId,
     owner_incarnation: String,
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub(crate) struct ActiveAgentAttemptIdentity {
+    task_id: AgentTaskId,
+    attempt_id: AgentAttemptId,
+    owner_incarnation: String,
+}
+
+impl ActiveAgentAttemptIdentity {
+    fn from_run(identity: &AgentCoordinatorRunIdentity) -> Self {
+        Self {
+            task_id: identity.task_id.clone(),
+            attempt_id: identity.attempt_id.clone(),
+            owner_incarnation: identity.owner_incarnation.clone(),
+        }
+    }
+
+    fn matches(
+        &self,
+        task_id: &AgentTaskId,
+        attempt_id: &AgentAttemptId,
+        owner_incarnation: Option<&str>,
+    ) -> bool {
+        self.task_id == *task_id
+            && self.attempt_id == *attempt_id
+            && owner_incarnation == Some(self.owner_incarnation.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        task_id: AgentTaskId,
+        attempt_id: AgentAttemptId,
+        owner_incarnation: impl Into<String>,
+    ) -> Self {
+        Self {
+            task_id,
+            attempt_id,
+            owner_incarnation: owner_incarnation.into(),
+        }
+    }
 }
 
 enum AgentCoordinatorRunExit {
@@ -1840,6 +2090,8 @@ fn fail_claimed_task_with_pre_stream_closure(
                                 assistant_message_id: assistant_id,
                                 assistant_sequence,
                                 error_json: &error_json,
+                                interruption_event_payload_json: None,
+                                interruption_reason: None,
                                 assistant_content: &failure.user_message,
                                 assistant_metadata_json: &assistant_metadata,
                                 expected_attempt_owner_incarnation: None,
@@ -2117,7 +2369,8 @@ fn apply_agent_prompt_layers(
     let wait_resume_landing = if wait_dependencies.is_empty() || wait_resume_already_landed {
         None
     } else {
-        let landing_output = agent_wait_resume_tool_result(&wait_dependencies, &wait_dependency_tasks)?;
+        let landing_output =
+            agent_wait_resume_tool_result(&wait_dependencies, &wait_dependency_tasks)?;
         let pending_tool_call_id = wait_dependencies
             .iter()
             .find_map(|dependency| dependency.pending_tool_call_id.clone())

@@ -7971,9 +7971,11 @@ impl WorkspaceDatabase {
         Ok(AgentQueuedRunClearOutcome::Cleared)
     }
 
-    /// Atomic pre-stream coordinator failure: fail running task/attempt, write
-    /// durable assistant Error bubble, clear matching queuedRun, and append
-    /// task_failed event. Idempotent when run identity no longer matches.
+    /// Atomic pre-stream coordinator failure: close a running task/attempt,
+    /// write a durable assistant Error bubble, clear the matching queuedRun,
+    /// and append a terminal event. Recovery callers pass an interruption
+    /// reason to atomically preserve `interrupted` semantics; ordinary
+    /// pre-stream failures retain their `failed` semantics.
     pub fn close_pre_stream_chat_failure(
         &mut self,
         closure: PreStreamChatFailureClosure<'_>,
@@ -7983,6 +7985,24 @@ impl WorkspaceDatabase {
             closure.assistant_metadata_json,
             "assistant message metadata",
         )?;
+        if let Some(interruption_event_payload_json) = closure.interruption_event_payload_json {
+            validate_agent_json(
+                interruption_event_payload_json,
+                "interruption_event_payload_json",
+            )?;
+        }
+        let is_interruption = closure.interruption_reason.is_some();
+        let terminal_task_status = if is_interruption {
+            AgentTaskStatus::Interrupted.as_str()
+        } else {
+            AgentTaskStatus::Failed.as_str()
+        };
+        let terminal_attempt_status = if is_interruption {
+            "interrupted"
+        } else {
+            "failed"
+        };
+        let terminal_instance_status = if is_interruption { "paused" } else { "idle" };
 
         let database_path = self.database_path.clone();
         let transaction = self
@@ -8115,7 +8135,7 @@ impl WorkspaceDatabase {
                     closure.task_id.as_str(),
                     team_id,
                     AgentTaskStatus::Running.as_str(),
-                    AgentTaskStatus::Failed.as_str(),
+                    terminal_task_status,
                     closure.error_json,
                     now
                 ],
@@ -8132,13 +8152,15 @@ impl WorkspaceDatabase {
         let attempt_updated = transaction
             .execute(
                 "UPDATE agent_attempts
-                 SET status = 'failed', completed_at = ?3
+                 SET status = ?3, interruption_reason = ?4, completed_at = ?5
                  WHERE id = ?1 AND task_id = ?2 AND status = 'running'
-                   AND (?4 IS NULL OR owner_incarnation = ?4)
-                   AND (?5 IS NULL OR lease_renewed_at = ?5)",
+                   AND (?6 IS NULL OR owner_incarnation = ?6)
+                   AND (?7 IS NULL OR lease_renewed_at = ?7)",
                 params![
                     closure.attempt_id.as_str(),
                     closure.task_id.as_str(),
+                    terminal_attempt_status,
+                    closure.interruption_reason,
                     now,
                     closure.expected_attempt_owner_incarnation,
                     closure.expected_attempt_lease_renewed_at,
@@ -8158,11 +8180,11 @@ impl WorkspaceDatabase {
                 "UPDATE agent_instances
                  SET status = CASE
                          WHEN status = 'draining' THEN 'draining'
-                         ELSE 'idle'
+                         ELSE ?3
                      END,
-                     updated_at = ?3
+                     updated_at = ?4
                  WHERE id = ?1 AND team_id = ?2",
-                params![owner_instance_id, team_id, now],
+                params![owner_instance_id, team_id, terminal_instance_status, now],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
 
@@ -8326,13 +8348,24 @@ impl WorkspaceDatabase {
             }
         }
 
-        // task_failed event (same payload shape as fail_claimed_task).
-        let payload_value = json!({
+        // Preserve the ordinary failure event shape, but carry recovery cause
+        // and interruption semantics through the same transaction when this
+        // closure is used by lease reconciliation.
+        let mut payload_value = json!({
             "outcome": serde_json::from_str::<Value>(closure.error_json)
                 .unwrap_or_else(|_| json!({ "message": closure.error_json })),
             "recoveryReason": "pre_stream_failure_closure",
         });
+        if let Some(interruption_event_payload_json) = closure.interruption_event_payload_json {
+            payload_value["recovery"] = serde_json::from_str(interruption_event_payload_json)
+                .unwrap_or_else(|_| json!({ "message": interruption_event_payload_json }));
+        }
         let payload_json = redact_agent_json(&payload_value.to_string(), "payload_json")?;
+        let event_type = if is_interruption {
+            "attempt_interrupted"
+        } else {
+            "task_failed"
+        };
         let event_sequence: i64 = transaction
             .query_row(
                 "SELECT next_event_sequence FROM agent_teams WHERE id = ?1",
@@ -8353,10 +8386,11 @@ impl WorkspaceDatabase {
                 "INSERT INTO agent_events
                     (team_id, sequence, event_type, instance_id, task_id, attempt_id,
                      message_id, payload_json, created_at)
-                 VALUES (?1, ?2, 'task_failed', ?3, ?4, ?5, NULL, ?6, ?7)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
                 params![
                     team_id,
                     event_sequence,
+                    event_type,
                     owner_instance_id,
                     closure.task_id.as_str(),
                     closure.attempt_id.as_str(),

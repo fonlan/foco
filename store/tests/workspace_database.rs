@@ -11,10 +11,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use foco_agent::{
-    AgentAttemptId, AgentDefinitionId, AgentDomainErrorCode, AgentExecutionWorkspaceMode,
-    AgentInstanceId, AgentInstanceStatus, AgentMessageId, AgentMessageKind, AgentPermissions,
-    AgentRole, AgentTaskId, AgentTaskStatus, AgentTaskTransition, AgentTaskWaitMode, AgentTeamId,
-    AgentTeamStatus,
+    AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentDomainErrorCode,
+    AgentExecutionWorkspaceMode, AgentInstanceId, AgentInstanceStatus, AgentMessageId,
+    AgentMessageKind, AgentPermissions, AgentRole, AgentTaskId, AgentTaskStatus,
+    AgentTaskTransition, AgentTaskWaitMode, AgentTeamId, AgentTeamStatus,
 };
 use foco_store::{
     config::{AgentDefinitionSettings, AgentModelOptions, WorkspaceConfig},
@@ -17121,6 +17121,8 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
             assistant_message_id: assistant_id,
             assistant_sequence: 1,
             error_json: &error_json,
+            interruption_event_payload_json: None,
+            interruption_reason: None,
             assistant_content: "Reply has not started: workspace database is busy. Please retry.",
             assistant_metadata_json: &assistant_metadata,
             expected_attempt_owner_incarnation: None,
@@ -17134,6 +17136,10 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
 
     let task = database.agent_task(&task_id).expect("task").expect("task");
     assert_eq!(task.status, AgentTaskStatus::Failed);
+    let attempts = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts");
+    assert_eq!(attempts[0].interruption_reason, None);
 
     let assistant = database
         .message(assistant_id)
@@ -17163,6 +17169,116 @@ fn close_pre_stream_chat_failure_writes_assistant_error_and_clears_queued_run() 
         events.iter().any(|event| event.event_type == "task_failed"
             && event.attempt_id.as_ref() == Some(&attempt_id)),
         "task_failed event for attempt"
+    );
+}
+
+#[test]
+fn close_pre_stream_chat_failure_records_recovery_interruption_atomically() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-prestream-interruption",
+        "prestream-interruption",
+    );
+    let task_id = AgentTaskId::new("agent-task-prestream-interruption").expect("task id");
+    let attempt_id =
+        AgentAttemptId::new("agent-attempt-prestream-interruption").expect("attempt id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue");
+    database
+        .claim_runnable_agent_task_with_owner(
+            &team_id,
+            &task_id,
+            &attempt_id,
+            Some("agent-owner-previous-runtime"),
+        )
+        .expect("claim")
+        .expect("claimed");
+    let attempt = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts")
+        .pop()
+        .expect("attempt snapshot");
+    let error_json = json!({
+        "message": "backend restarted while Agent attempt was active",
+        "code": "backend_restart_interrupted",
+        "stage": "startup_reconciliation",
+    })
+    .to_string();
+    let recovery_diagnostics = json!({
+        "recoverySource": "startup",
+        "recoveryCause": "backend_restart_interrupted",
+        "ownerMatch": false,
+        "activeRunnerPresent": false,
+    })
+    .to_string();
+
+    let result = database
+        .close_pre_stream_chat_failure(PreStreamChatFailureClosure {
+            task_id: &task_id,
+            attempt_id: &attempt_id,
+            chat_id: "chat-prestream-interruption",
+            user_message_id: "user-prestream-interruption",
+            assistant_message_id: "assistant-prestream-interruption",
+            assistant_sequence: 1,
+            error_json: &error_json,
+            interruption_event_payload_json: Some(&recovery_diagnostics),
+            interruption_reason: Some("backend restarted while Agent attempt was active"),
+            assistant_content: "backend restarted while Agent attempt was active",
+            assistant_metadata_json: r#"{"streamingState":"failed"}"#,
+            expected_attempt_owner_incarnation: attempt.owner_incarnation.as_deref(),
+            expected_attempt_lease_renewed_at: attempt.lease_renewed_at.as_deref(),
+            expected_queued_run_agent_task_id: None,
+            expected_queued_run_id: None,
+            materialize_assistant: false,
+        })
+        .expect("closure");
+
+    assert_eq!(result, PreStreamChatFailureClosureResult::Applied);
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        AgentTaskStatus::Interrupted
+    );
+    let attempts = database
+        .agent_attempts_for_task(&task_id)
+        .expect("attempts");
+    assert_eq!(attempts[0].status, AgentAttemptStatus::Interrupted);
+    assert_eq!(
+        attempts[0].interruption_reason.as_deref(),
+        Some("backend restarted while Agent attempt was active")
+    );
+    assert_eq!(
+        database
+            .agent_instance(&instance_id)
+            .expect("instance")
+            .expect("instance")
+            .status,
+        AgentInstanceStatus::Paused
+    );
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    let interruption = events
+        .iter()
+        .find(|event| event.event_type == "attempt_interrupted")
+        .expect("interruption event");
+    let payload: Value = serde_json::from_str(&interruption.payload_json).expect("event payload");
+    assert_eq!(payload["outcome"]["code"], "backend_restart_interrupted");
+    assert_eq!(
+        payload["recovery"]["recoveryCause"],
+        "backend_restart_interrupted"
     );
 }
 
@@ -17244,6 +17360,8 @@ fn close_pre_stream_chat_failure_skips_when_queued_run_replaced() {
             assistant_message_id: assistant_id,
             assistant_sequence: 1,
             error_json: r#"{"message":"stale"}"#,
+            interruption_event_payload_json: None,
+            interruption_reason: None,
             assistant_content: "stale",
             assistant_metadata_json: r#"{"streamingState":"failed"}"#,
             expected_attempt_owner_incarnation: None,
@@ -17321,6 +17439,8 @@ fn close_pre_stream_chat_failure_skips_when_attempt_lease_snapshot_changed() {
             assistant_message_id: "assistant-prestream-lease",
             assistant_sequence: 1,
             error_json: r#"{"message":"stale recovery"}"#,
+            interruption_event_payload_json: None,
+            interruption_reason: None,
             assistant_content: "stale recovery",
             assistant_metadata_json: r#"{"streamingState":"failed"}"#,
             expected_attempt_owner_incarnation: snapshot.owner_incarnation.as_deref(),
@@ -17414,6 +17534,8 @@ fn close_pre_stream_chat_failure_skips_when_remote_plan_queued_run_owner_is_repl
             assistant_message_id,
             assistant_sequence: 1,
             error_json: r#"{"message":"stale remote recovery"}"#,
+            interruption_event_payload_json: None,
+            interruption_reason: None,
             assistant_content: "stale remote recovery",
             assistant_metadata_json: r#"{"streamingState":"failed"}"#,
             expected_attempt_owner_incarnation: attempt.owner_incarnation.as_deref(),

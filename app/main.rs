@@ -792,7 +792,8 @@ async fn run_server_until_shutdown(
     };
     let plan_dispatch_owner_incarnation = new_plan_dispatch_owner_incarnation()
         .map_err(|error| std::io::Error::other(error.message))?;
-    let (agent_scheduler, agent_scheduler_wake_rx) = AgentScheduler::new();
+    let (agent_scheduler, agent_scheduler_wake_rx) =
+        AgentScheduler::new_runtime().map_err(|error| std::io::Error::other(error.message))?;
     let (scheduled_task_scheduler, scheduled_task_scheduler_wake_rx) =
         ScheduledTaskScheduler::new();
     let (plan_auto_run_scheduler, plan_auto_run_scheduler_wake_rx) = PlanAutoRunScheduler::new();
