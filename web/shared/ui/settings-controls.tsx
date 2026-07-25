@@ -249,6 +249,7 @@ export function SettingsTextField({
     <TextField
       autoComplete={autoComplete}
       className="block"
+      fullWidth
       isDisabled={disabled}
       name={String(label).toLowerCase().replace(/\s+/g, "-")}
       type={type}
@@ -256,7 +257,7 @@ export function SettingsTextField({
       onChange={onChange}
     >
       <Label className="mb-1.5 block text-xs font-semibold text-muted">{label}</Label>
-      <Input inputMode={inputMode} placeholder={placeholder} />
+      <Input className="rounded-lg" inputMode={inputMode} placeholder={placeholder} />
     </TextField>
   );
 }

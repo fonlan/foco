@@ -1745,6 +1745,24 @@ describe("app-settings verification surfaces", () => {
     expect(screen.getByLabelText("Base URL")).toHaveValue("https://api.deepseek.com/v1");
   });
 
+  it("uses full-width rounded text fields in the provider configuration dialog", async () => {
+    renderApp();
+
+    await userEvent.click((await screen.findAllByRole("button", { name: "Settings" }))[0]);
+    const settingsNav = await screen.findByRole("navigation", { name: "Settings" });
+    await userEvent.click(within(settingsNav).getByRole("button", { name: "Providers" }));
+    await userEvent.click(screen.getByRole("button", { name: "Edit provider OpenAI" }));
+
+    const providerDialog = screen.getByRole("form", { name: "Provider configuration" });
+    const nameInput = within(providerDialog).getByLabelText("Name");
+    const baseUrlInput = within(providerDialog).getByLabelText("Base URL");
+
+    for (const input of [nameInput, baseUrlInput]) {
+      expect(input).toHaveClass("rounded-lg");
+      expect(input.closest(".textfield")).toHaveClass("textfield--full-width");
+    }
+  });
+
   it("keeps a single base URL and disables proxy for OpenAI Responses WebSocket", async () => {
     renderApp();
 
