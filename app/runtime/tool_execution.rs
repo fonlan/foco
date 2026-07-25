@@ -2107,26 +2107,24 @@ fn execute_agent_wait_tasks(
             event_instance_id: Some(actor_instance_id),
         })
         .map_err(agent_store_error)?;
-    Ok(json!({
-        "waiting": true,
-        "taskId": current_task_id.to_string(),
-        "mode": AgentTaskWaitMode::All.as_str(),
-        "taskIds": dependency_task_ids
-            .iter()
-            .map(|task_id| task_id.to_string())
-            .collect::<Vec<_>>(),
-        "deadlineAt": deadline_at,
-        "suspend": {
-            "kind": "agent_wait_tasks",
-            "pendingToolCallId": tool_call_id,
-            "taskIds": dependency_task_ids
-                .iter()
-                .map(|task_id| task_id.to_string())
-                .collect::<Vec<_>>(),
-            "mode": AgentTaskWaitMode::All.as_str(),
-            "deadlineAt": deadline_at,
-        }
-    }))
+
+    // Explicit waits may read already-terminal tasks immediately. Only suspend when at
+    // least one dependency is still outstanding so the same tool_call_id can complete later.
+    if dependencies.iter().all(|task| task.status.is_terminal()) {
+        return Ok(agent_wait_terminal_tool_result(
+            &dependencies,
+            AgentTaskWaitMode::All,
+            deadline_at.as_deref(),
+        ));
+    }
+
+    Ok(agent_wait_suspend_tool_output(
+        current_task_id,
+        tool_call_id,
+        &dependency_task_ids,
+        deadline_at.as_deref(),
+        false,
+    ))
 }
 
 /// Outcome of an implicit wait registered when a parent run would otherwise finalize.
@@ -2135,14 +2133,18 @@ pub(crate) struct ImplicitAgentWait {
     pub(crate) tool_call_id: String,
     pub(crate) task_ids: Vec<String>,
     pub(crate) output: Value,
+    /// When true, all undelivered children were already terminal and the output is the
+    /// final wait result (no suspend). The parent turn should continue in-process.
+    pub(crate) immediate: bool,
 }
 
 /// If the current agent task still has child tasks whose results were never delivered via a wait
-/// round, register an implicit `agent_wait_tasks` dependency set and return a suspend payload.
+/// round, register an implicit `agent_wait_tasks` dependency set and return a wait payload.
 ///
-/// "Delivered" means the child id is present in the current wait-dependency rows for this parent.
-/// Already-terminal undelivered children are included so finalize can suspend and immediately
-/// resume with their results instead of completing blind.
+/// "Delivered" means the child was already covered by a wait round for this parent: either the
+/// current dependency rows or a historical `task_waiting_requested` event. Sequential wait-round
+/// replacement deletes current rows, so history keeps already-landed children from re-entering
+/// finalize waits. Explicit waits may still re-read terminal tasks on demand.
 pub(crate) fn try_register_implicit_wait_for_undelivered_children(
     context: &AgentToolContext,
 ) -> Result<Option<ImplicitAgentWait>, String> {
@@ -2166,12 +2168,9 @@ pub(crate) fn try_register_implicit_wait_for_undelivered_children(
     if children.is_empty() {
         return Ok(None);
     }
-    let delivered: HashSet<AgentTaskId> = database
-        .agent_task_dependencies(current_task_id)
-        .map_err(agent_store_error)?
-        .into_iter()
-        .map(|dependency| dependency.dependency_task_id)
-        .collect();
+    let delivered = database
+        .agent_wait_covered_dependency_task_ids(team_id, current_task_id)
+        .map_err(agent_store_error)?;
     let undelivered: Vec<AgentTaskRecord> = children
         .into_iter()
         .filter(|task| !delivered.contains(&task.id))
@@ -2219,25 +2218,105 @@ pub(crate) fn try_register_implicit_wait_for_undelivered_children(
         .iter()
         .map(|task_id| task_id.to_string())
         .collect();
+    let all_terminal = undelivered.iter().all(|task| task.status.is_terminal());
+    if all_terminal {
+        return Ok(Some(ImplicitAgentWait {
+            tool_call_id,
+            task_ids,
+            output: agent_wait_terminal_tool_result(
+                &undelivered,
+                AgentTaskWaitMode::All,
+                None,
+            ),
+            immediate: true,
+        }));
+    }
     Ok(Some(ImplicitAgentWait {
         tool_call_id: tool_call_id.clone(),
         task_ids: task_ids.clone(),
-        output: json!({
-            "waiting": true,
-            "implicit": true,
-            "taskId": current_task_id.to_string(),
-            "mode": AgentTaskWaitMode::All.as_str(),
-            "taskIds": task_ids.clone(),
-            "deadlineAt": Value::Null,
-            "suspend": {
-                "kind": "agent_wait_tasks",
-                "pendingToolCallId": tool_call_id,
-                "taskIds": task_ids,
-                "mode": AgentTaskWaitMode::All.as_str(),
-                "deadlineAt": Value::Null,
-            }
-        }),
+        output: agent_wait_suspend_tool_output(
+            current_task_id,
+            &tool_call_id,
+            &dependency_task_ids,
+            None,
+            true,
+        ),
+        immediate: false,
     }))
+}
+
+/// True when a tool output is the non-terminal suspend control for `agent_wait_tasks`.
+///
+/// Suspend outputs must not complete the tool call; the matching terminal resume result
+/// reuses the same `tool_call_id`.
+pub(crate) fn is_agent_wait_suspend_output(output: &Value) -> bool {
+    output
+        .get("suspend")
+        .and_then(|control| control.get("kind"))
+        .and_then(Value::as_str)
+        == Some("agent_wait_tasks")
+}
+
+fn agent_wait_suspend_tool_output(
+    current_task_id: &AgentTaskId,
+    tool_call_id: &str,
+    dependency_task_ids: &[AgentTaskId],
+    deadline_at: Option<&str>,
+    implicit: bool,
+) -> Value {
+    let task_ids: Vec<String> = dependency_task_ids
+        .iter()
+        .map(|task_id| task_id.to_string())
+        .collect();
+    let mut output = json!({
+        "waiting": true,
+        "taskId": current_task_id.to_string(),
+        "mode": AgentTaskWaitMode::All.as_str(),
+        "taskIds": task_ids.clone(),
+        "deadlineAt": deadline_at,
+        "suspend": {
+            "kind": "agent_wait_tasks",
+            "pendingToolCallId": tool_call_id,
+            "taskIds": task_ids,
+            "mode": AgentTaskWaitMode::All.as_str(),
+            "deadlineAt": deadline_at,
+        }
+    });
+    if implicit {
+        output["implicit"] = Value::Bool(true);
+    }
+    output
+}
+
+fn agent_wait_terminal_tool_result(
+    dependencies: &[AgentTaskRecord],
+    wait_mode: AgentTaskWaitMode,
+    deadline_at: Option<&str>,
+) -> Value {
+    let dependency_values = dependencies
+        .iter()
+        .map(|task| {
+            json!({
+                "taskId": task.id.to_string(),
+                "status": task.status.as_str(),
+                "result": task
+                    .result_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+                "error": task
+                    .error_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+                "completedAt": task.completed_at,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "waiting": false,
+        "mode": wait_mode.as_str(),
+        "deadlineAt": deadline_at,
+        "dependencies": dependency_values,
+    })
 }
 
 fn execute_agent_transfer_task(
@@ -9025,6 +9104,10 @@ mod tests {
         assert_eq!(first["waiting"], true);
         assert_eq!(first["suspend"]["kind"], "agent_wait_tasks");
         assert_eq!(first["suspend"]["pendingToolCallId"], "call-wait-round-1");
+        assert!(
+            is_agent_wait_suspend_output(&first),
+            "outstanding children must produce a non-terminal suspend control"
+        );
         assert_eq!(
             first["taskIds"].as_array().map(|items| items.len()),
             Some(2)
@@ -9040,6 +9123,7 @@ mod tests {
         .expect("identical wait round must replay");
         assert_eq!(replay["waiting"], true);
         assert_eq!(replay["suspend"]["pendingToolCallId"], "call-wait-round-1");
+        assert!(is_agent_wait_suspend_output(&replay));
 
         let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
         let deps = database
@@ -9452,12 +9536,14 @@ mod tests {
         let first = try_register_implicit_wait_for_undelivered_children(&context)
             .expect("implicit wait with undelivered children")
             .expect("must register wait");
+        assert!(!first.immediate, "queued children require suspend");
         assert_eq!(first.output["implicit"], true);
         assert_eq!(first.output["suspend"]["kind"], "agent_wait_tasks");
         assert_eq!(
             first.output["suspend"]["pendingToolCallId"],
             first.tool_call_id
         );
+        assert!(is_agent_wait_suspend_output(&first.output));
         let mut registered = first.task_ids.clone();
         registered.sort();
         let mut expected = vec![child_a.to_string(), child_b.to_string()];
@@ -9532,7 +9618,7 @@ mod tests {
 
         // Create and finish a new child while the parent is still queued so the team
         // concurrent-run slot is free, then claim the parent and confirm implicit wait
-        // picks up this undelivered (already terminal) child.
+        // picks up this undelivered (already terminal) child with an immediate final result.
         let child_c = create_worker_child(
             workspace.path(),
             &team_id,
@@ -9570,7 +9656,143 @@ mod tests {
             .expect("implicit wait for terminal undelivered child")
             .expect("must register wait for undelivered terminal child");
         assert_eq!(late.task_ids, vec![child_c.to_string()]);
-        assert_eq!(late.output["implicit"], true);
+        assert!(
+            late.immediate,
+            "already-terminal undelivered children land immediately without suspend"
+        );
+        assert_eq!(late.output["waiting"], false);
+        assert!(!is_agent_wait_suspend_output(&late.output));
+        assert!(
+            late.output["dependencies"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item.get("taskId").and_then(Value::as_str) == Some(child_c.as_str())
+                        && item.get("result").and_then(|result| result.get("text"))
+                            == Some(&json!("late child done"))
+                })),
+            "immediate implicit wait must include the terminal child result once"
+        );
+
+        // After a sequential wait-round replacement, previously covered children must not
+        // re-enter implicit finalize waits even though current dependency rows changed.
+        execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-replace-covered",
+            json!({
+                "taskIds": [child_a.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect("explicit wait replaces prior terminal round with historically covered child");
+        assert!(
+            try_register_implicit_wait_for_undelivered_children(&context)
+                .expect("implicit wait after sequential replacement")
+                .is_none(),
+            "historically covered children must stay delivered across wait-round replacement"
+        );
+    }
+
+    #[test]
+    fn agent_wait_tasks_returns_terminal_result_when_all_dependencies_finished() {
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(AgentPermissions {
+                can_create_instances: true,
+                can_delegate: true,
+                allowed_agent_definition_ids: Vec::new(),
+            });
+        claim_parent_running(
+            workspace.path(),
+            &team_id,
+            &parent_task_id,
+            "wait-terminal-parent",
+        );
+        let child = create_worker_child(
+            workspace.path(),
+            &team_id,
+            &instance_id,
+            &parent_task_id,
+            "wait-terminal-child",
+        );
+
+        // Register a first wait round, suspend, complete the child, resume, then claim the
+        // parent again so an explicit wait can re-read the already-terminal child.
+        execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-first-round",
+            json!({
+                "taskIds": [child.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect("first wait registers outstanding child");
+        let mut database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &parent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(
+                    r#"{"control":{"kind":"agent_wait_tasks","pendingToolCallId":"call-wait-first-round"}}"#,
+                ),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend parent");
+        let child_attempt =
+            AgentAttemptId::new("agent-attempt-wait-terminal-child").expect("child attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &child, &child_attempt)
+            .expect("claim child")
+            .expect("child claimed");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child,
+                expected_status: AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"already done"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete child");
+        database
+            .resume_satisfied_agent_tasks(10)
+            .expect("resume parent after child completion");
+        let parent_attempt =
+            AgentAttemptId::new("agent-attempt-wait-terminal-parent-resume").expect("parent attempt");
+        database
+            .claim_runnable_agent_task(&team_id, &parent_task_id, &parent_attempt)
+            .expect("claim parent")
+            .expect("parent claimed");
+        drop(database);
+
+        // Explicit wait may re-read the terminal child and must complete in one terminal result.
+        let output = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_WAIT_TASKS_TOOL,
+            "call-wait-already-terminal",
+            json!({
+                "taskIds": [child.to_string()],
+                "mode": "all",
+                "deadlineMs": null,
+            }),
+        )
+        .expect("explicit wait on terminal child");
+        assert_eq!(output["waiting"], false);
+        assert!(output.get("suspend").is_none());
+        assert!(!is_agent_wait_suspend_output(&output));
+        assert_eq!(
+            output["dependencies"][0]["result"]["text"],
+            json!("already done")
+        );
     }
 
     #[test]

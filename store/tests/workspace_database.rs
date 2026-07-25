@@ -19455,6 +19455,96 @@ fn register_agent_wait_dependencies_replaces_terminal_round_and_allows_same_chil
         })
         .count();
     assert_eq!(waiting_events, 2);
+
+    // Historical wait rounds keep previously covered children visible after replacement.
+    let covered = database
+        .agent_wait_covered_dependency_task_ids(&team_id, &waiting)
+        .expect("covered dependency ids");
+    assert!(
+        covered.contains(&child),
+        "replaced wait rounds must still report historically covered children"
+    );
+}
+
+#[test]
+fn agent_wait_covered_dependency_task_ids_retains_prior_round_after_replace() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-wait-covered", "wait-covered");
+    let worker_id = create_test_agent_worker(&database, &team_id, "wait-covered-worker");
+    let waiting = AgentTaskId::new("agent-task-wait-covered-parent").expect("task id");
+    let child_a = AgentTaskId::new("agent-task-wait-covered-a").expect("task id");
+    let child_b = AgentTaskId::new("agent-task-wait-covered-b").expect("task id");
+    for (id, owner) in [
+        (&waiting, &coordinator_id),
+        (&child_a, &worker_id),
+        (&child_b, &worker_id),
+    ] {
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id,
+                team_id: &team_id,
+                owner_instance_id: owner,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue");
+    }
+
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &[child_a.clone()],
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-covered-1"),
+            deadline_at: None,
+            event_instance_id: Some(&coordinator_id),
+        })
+        .expect("first wait");
+    let attempt_a = AgentAttemptId::new("agent-attempt-wait-covered-a").expect("attempt");
+    database
+        .claim_runnable_agent_task(&team_id, &child_a, &attempt_a)
+        .expect("claim a")
+        .expect("a claimed");
+    assert!(database
+        .update_agent_task_state(AgentTaskStateUpdate {
+            team_id: &team_id,
+            task_id: &child_a,
+            expected_status: AgentTaskStatus::Running,
+            transition: AgentTaskTransition::Complete,
+            result_json: Some(r#"{"text":"a"}"#),
+            error_json: None,
+            interruption_reason: None,
+        })
+        .expect("complete a"));
+
+    database
+        .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
+            team_id: &team_id,
+            waiting_task_id: &waiting,
+            dependency_task_ids: &[child_b.clone()],
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("call-wait-covered-2"),
+            deadline_at: None,
+            event_instance_id: Some(&coordinator_id),
+        })
+        .expect("second wait replaces first");
+
+    let current = database
+        .agent_task_dependencies(&waiting)
+        .expect("current deps");
+    assert_eq!(current.len(), 1);
+    assert_eq!(current[0].dependency_task_id, child_b);
+
+    let covered = database
+        .agent_wait_covered_dependency_task_ids(&team_id, &waiting)
+        .expect("covered ids");
+    assert!(covered.contains(&child_a), "first-round child must stay covered");
+    assert!(covered.contains(&child_b), "current-round child must be covered");
 }
 
 #[test]

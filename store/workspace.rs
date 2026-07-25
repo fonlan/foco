@@ -15883,6 +15883,116 @@ impl WorkspaceDatabase {
         collect_rows(rows, &self.database_path)
     }
 
+    /// Child task ids already covered by a wait round for `waiting_task_id`.
+    ///
+    /// Includes the current dependency rows and every historical
+    /// `task_waiting_requested` event for this parent. Sequential wait-round
+    /// replacement deletes current rows, so history is required to keep
+    /// already-delivered children from re-entering implicit finalize waits.
+    pub fn agent_wait_covered_dependency_task_ids(
+        &self,
+        team_id: &AgentTeamId,
+        waiting_task_id: &AgentTaskId,
+    ) -> Result<HashSet<AgentTaskId>, WorkspaceDatabaseError> {
+        let mut covered = HashSet::new();
+        for dependency in self.agent_task_dependencies(waiting_task_id)? {
+            covered.insert(dependency.dependency_task_id);
+        }
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT payload_json FROM agent_events
+                 WHERE team_id = ?1
+                   AND task_id = ?2
+                   AND event_type = 'task_waiting_requested'",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map(
+                params![team_id.as_str(), waiting_task_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        for payload_json in rows {
+            let payload_json = payload_json.map_err(|source| self.sqlite_error(source))?;
+            let payload: Value = serde_json::from_str(&payload_json).map_err(|source| {
+                WorkspaceDatabaseError::AgentRuntimeJson {
+                    field: "payload_json",
+                    source,
+                }
+            })?;
+            let Some(dependency_task_ids) = payload
+                .get("dependencyTaskIds")
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for dependency_task_id in dependency_task_ids {
+                let Some(dependency_task_id) = dependency_task_id.as_str() else {
+                    continue;
+                };
+                if let Ok(task_id) = AgentTaskId::new(dependency_task_id.to_string()) {
+                    covered.insert(task_id);
+                }
+            }
+        }
+        Ok(covered)
+    }
+
+    pub fn tool_call_with_result(
+        &self,
+        tool_call_id: &str,
+    ) -> Result<Option<ToolCallWithResultRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT
+                    tool_calls.id,
+                    tool_calls.chat_id,
+                    tool_calls.run_id,
+                    tool_calls.message_id,
+                    tool_calls.tool_name,
+                    tool_calls.input_json,
+                    tool_calls.status,
+                    tool_calls.started_at,
+                    tool_calls.completed_at,
+                    tool_results.id,
+                    tool_results.output_json,
+                    tool_results.is_error,
+                    tool_results.created_at
+                 FROM tool_calls
+                 LEFT JOIN tool_results ON tool_results.tool_call_id = tool_calls.id
+                 WHERE tool_calls.id = ?1",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        statement
+            .query_row(params![tool_call_id], |row| {
+                Ok(ToolCallWithResultRecord {
+                    id: row.get(0)?,
+                    chat_id: row.get(1)?,
+                    run_id: row.get(2)?,
+                    message_id: row.get(3)?,
+                    tool_name: row.get(4)?,
+                    input_json: row.get(5)?,
+                    status: row.get(6)?,
+                    started_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                    result: match row.get::<_, Option<String>>(9)? {
+                        Some(id) => Some(ToolResultRecord {
+                            id,
+                            tool_call_id: tool_call_id.to_string(),
+                            output_json: row.get(10)?,
+                            is_error: row.get::<_, i64>(11)? != 0,
+                            created_at: row.get(12)?,
+                        }),
+                        None => None,
+                    },
+                })
+            })
+            .optional()
+            .map_err(|source| self.sqlite_error(source))
+    }
+
     pub fn agent_task_dependencies_satisfied(
         &self,
         waiting_task_id: &AgentTaskId,

@@ -14092,6 +14092,12 @@ fn remote_sidecar_record_tool_result(
     started_at: &str,
     completed_at: &str,
 ) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    // Keep agent_wait_tasks suspend non-terminal so the same tool_call_id can complete
+    // on resume. Matches local ActiveChatRunRegistration persistence.
+    if !is_error && crate::runtime::is_agent_wait_suspend_output(output) {
+        let _ = started_at;
+        return Ok(());
+    }
     let output_json = serde_json::to_string(output).unwrap_or_else(|_| "null".to_string());
     let result_id = format!("{}-result", tool_call.call_id);
     database.upsert_tool_result(foco_store::workspace::NewToolResult {

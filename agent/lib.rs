@@ -1080,7 +1080,7 @@ pub fn build_subagents_prompt_section() -> String {
 - Before delegating, give each subagent a focused task, the necessary context, expected output, and any constraints about reading, editing, commands, tests, or workspace isolation.
 - Treat subagent output as advisory evidence, not as automatically correct. Reconcile it with current workspace state before acting on it or presenting it to the user.
 - Coordinate concurrent work so agents do not overwrite each other. If multiple agents can edit files, prefer isolated workspaces when available or clearly separate file ownership.
-- After agent_delegate_task, continue useful parent work in parallel. Use agent_wait_tasks only when you need specific child results before continuing. If you would otherwise finish while undelivered child tasks remain, the runtime suspends the parent run and later resumes with those child results—do not assume the session can end with outstanding children."#,
+- After agent_delegate_task, continue useful parent work in parallel. Use agent_wait_tasks only when you need specific child results before continuing. If you would otherwise finish while undelivered child tasks remain, the runtime waits for them (immediate terminal landing or suspend/resume on one tool_call_id)—do not assume the session can end with outstanding children."#,
     )
 }
 

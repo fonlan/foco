@@ -797,6 +797,11 @@ impl ActiveChatRunRegistration {
                 is_error,
                 ..
             } if assistant_message_id == &self.assistant_message_id => {
+                // Non-terminal agent_wait_tasks suspend keeps the same tool_call_id open
+                // until the matching terminal resume result arrives.
+                if !*is_error && crate::runtime::is_agent_wait_suspend_output(output) {
+                    return Ok(());
+                }
                 let output_json = serde_json::to_string(output).map_err(|source| {
                     ApiError::internal(format!("failed to serialize tool output: {source}"))
                 })?;

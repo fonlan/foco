@@ -184,12 +184,10 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
 }
 
 fn agent_suspend_control(output: &Value) -> Option<Value> {
-    let control = output.get("suspend")?;
-    if control.get("kind").and_then(Value::as_str) == Some("agent_wait_tasks") {
-        Some(control.clone())
-    } else {
-        None
+    if !super::is_agent_wait_suspend_output(output) {
+        return None;
     }
+    output.get("suspend").cloned()
 }
 
 pub(crate) fn agent_run_event_kind(event: &ChatSseEvent) -> AgentRunEventKind {

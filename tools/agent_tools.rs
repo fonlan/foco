@@ -146,7 +146,7 @@ fn agent_send_message_definition() -> ToolDefinition {
 fn agent_delegate_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_DELEGATE_TASK_TOOL,
-        description: "Create an asynchronous child task for an existing target in the current Agent team. Returns immediately with the task id and selected instance id. The parent may continue other work in parallel. If the parent would finish while this child (or other undelivered children) still has no delivered wait result, the runtime implicitly waits and later resumes with child results. Copy targetId exactly from agent_list.instances[].id when targetKind is instance (for example, agent-instance-review), or from agent_list.definitions[].id when targetKind is definition (for example, agent-definition-review); never use display names, role names, or hand-constructed IDs. A definition only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
+        description: "Create an asynchronous child task for an existing target in the current Agent team. Returns immediately with the task id and selected instance id. The parent may continue other work in parallel. If the parent would finish while this child (or other undelivered children) still has no delivered wait result, the runtime implicitly waits—landing already-terminal children once in-process, or suspending and later resuming outstanding children on the same wait tool_call_id. Copy targetId exactly from agent_list.instances[].id when targetKind is instance (for example, agent-instance-review), or from agent_list.definitions[].id when targetKind is definition (for example, agent-definition-review); never use display names, role names, or hand-constructed IDs. A definition only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -214,7 +214,7 @@ fn agent_cancel_task_definition() -> ToolDefinition {
 fn agent_wait_tasks_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_WAIT_TASKS_TOOL,
-        description: "Explicitly wait for the specified Agent tasks in the current team before continuing. Suspends the current run and resumes later with a paired tool result. Use this to sync on specific taskIds early; if you omit it and would otherwise finish with undelivered child tasks, the runtime still registers an implicit wait for those children.",
+        description: "Explicitly wait for the specified Agent tasks in the current team before continuing. Uses one tool_call_id for a non-terminal suspend while work is outstanding, then a terminal resume result with the same id. Already-terminal tasks return their results immediately without suspending. Use this to sync on specific taskIds early; if you omit it and would otherwise finish with undelivered child tasks, the runtime still registers an implicit wait for those children.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,

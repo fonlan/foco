@@ -1297,7 +1297,7 @@ async fn run_coordinator_task_inner(
             next_run_event_sequence,
             guidance_tx,
         )?;
-    let registration = match registration {
+    let mut registration = match registration {
         ActiveChatRunRegistrationResult::Registered(registration) => registration,
         ActiveChatRunRegistrationResult::Existing => {
             tracing::debug!(
@@ -1308,18 +1308,19 @@ async fn run_coordinator_task_inner(
             return Ok(());
         }
     };
-    let (agent_unread_messages, consumed_agent_message_ids) = apply_agent_prompt_layers(
-        &workspace.path,
-        &mut chat_context,
-        &team,
-        &instance,
-        &task,
-        attempt_id,
-        &allowed_tools,
-        task_input.collaboration_tools_enabled,
-        &collaboration_permissions,
-        &config.agent_definitions,
-    )?;
+    let (agent_unread_messages, consumed_agent_message_ids, wait_resume_landing) =
+        apply_agent_prompt_layers(
+            &workspace.path,
+            &mut chat_context,
+            &team,
+            &instance,
+            &task,
+            attempt_id,
+            &allowed_tools,
+            task_input.collaboration_tools_enabled,
+            &collaboration_permissions,
+            &config.agent_definitions,
+        )?;
     chat_context.agent_unread_messages = agent_unread_messages;
     if chat_context.pending_memory_retrieval.is_none() {
         chat_context.provider_request.prompt_cache_key = Some(prompt_cache_key(
@@ -1374,6 +1375,26 @@ async fn run_coordinator_task_inner(
         active_chat_runs: state.active_chat_runs.clone(),
     });
     chat_context.session_upload_paths = Some(session_upload_paths);
+
+    // Land the terminal wait tool result on the same tool_call_id before the resumed
+    // stream runs, so live UI, reconnect, and history replay share one final result.
+    if let Some(landing) = wait_resume_landing.as_ref()
+        && chat_context.agent_primary_chat_output
+    {
+        let landed_at = utc_timestamp();
+        registration.record_event(
+            &workspace.path,
+            &team.chat_id,
+            &ChatSseEvent::ToolResult {
+                assistant_message_id: chat_context.assistant_message_id.clone(),
+                tool_call_id: landing.tool_call_id.clone(),
+                output: landing.output.clone(),
+                is_error: false,
+                started_at: landed_at.clone(),
+                completed_at: landed_at,
+            },
+        )?;
+    }
 
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
     let lifecycle_context =
@@ -1957,6 +1978,11 @@ fn agent_task_model_selection(
     })
 }
 
+struct AgentWaitResumeLanding {
+    tool_call_id: String,
+    output: Value,
+}
+
 fn apply_agent_prompt_layers(
     workspace_path: &Path,
     chat_context: &mut PreparedChatContext,
@@ -1968,7 +1994,14 @@ fn apply_agent_prompt_layers(
     collaboration_tools_enabled: bool,
     collaboration_permissions: &AgentPermissions,
     agent_definitions: &[AgentDefinitionSettings],
-) -> Result<(Vec<Value>, Vec<foco_agent::AgentMessageId>), ApiError> {
+) -> Result<
+    (
+        Vec<Value>,
+        Vec<foco_agent::AgentMessageId>,
+        Option<AgentWaitResumeLanding>,
+    ),
+    ApiError,
+> {
     validate_agent_definition_system_prompt(instance)?;
 
     let database = open_workspace_database_critical(workspace_path)?;
@@ -2012,6 +2045,8 @@ fn apply_agent_prompt_layers(
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let wait_resume_already_landed =
+        agent_wait_terminal_result_already_landed(&database, &wait_dependencies)?;
     drop(database);
 
     let agent_prompt_role = agent_prompt_role(collaboration_tools_enabled);
@@ -2079,18 +2114,33 @@ fn apply_agent_prompt_layers(
         },
     );
 
-    for message in agent_wait_resume_messages(&wait_dependencies, &wait_dependency_tasks)? {
-        let index = agent_current_task_insert_index(chat_context);
-        insert_agent_prompt_message(
-            chat_context,
-            index,
-            message,
-            Some(task.sequence),
-            PromptContextSource::AgentCurrentTask {
-                sequence: task.sequence,
-            },
-        );
-    }
+    let wait_resume_landing = if wait_dependencies.is_empty() || wait_resume_already_landed {
+        None
+    } else {
+        let landing_output = agent_wait_resume_tool_result(&wait_dependencies, &wait_dependency_tasks)?;
+        let pending_tool_call_id = wait_dependencies
+            .iter()
+            .find_map(|dependency| dependency.pending_tool_call_id.clone())
+            .ok_or_else(|| {
+                ApiError::internal("Agent wait dependency is missing pending tool call id")
+            })?;
+        for message in agent_wait_resume_messages(&wait_dependencies, &wait_dependency_tasks)? {
+            let index = agent_current_task_insert_index(chat_context);
+            insert_agent_prompt_message(
+                chat_context,
+                index,
+                message,
+                Some(task.sequence),
+                PromptContextSource::AgentCurrentTask {
+                    sequence: task.sequence,
+                },
+            );
+        }
+        Some(AgentWaitResumeLanding {
+            tool_call_id: pending_tool_call_id,
+            output: landing_output,
+        })
+    };
 
     let mut run_unread_messages = Vec::with_capacity(unread_messages.len());
     let mut consumed_message_ids = Vec::with_capacity(unread_messages.len());
@@ -2114,7 +2164,38 @@ fn apply_agent_prompt_layers(
         run_unread_messages.push(payload);
     }
 
-    Ok((run_unread_messages, consumed_message_ids))
+    Ok((
+        run_unread_messages,
+        consumed_message_ids,
+        wait_resume_landing,
+    ))
+}
+
+fn agent_wait_terminal_result_already_landed(
+    database: &WorkspaceDatabase,
+    dependencies: &[AgentTaskDependencyRecord],
+) -> Result<bool, ApiError> {
+    let Some(pending_tool_call_id) = dependencies
+        .iter()
+        .find_map(|dependency| dependency.pending_tool_call_id.as_deref())
+    else {
+        return Ok(false);
+    };
+    let Some(tool_call) = database
+        .tool_call_with_result(pending_tool_call_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    let Some(result) = tool_call.result.as_ref() else {
+        return Ok(false);
+    };
+    let output = serde_json::from_str::<Value>(&result.output_json).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to parse agent_wait_tasks tool result: {source}"
+        ))
+    })?;
+    Ok(output.get("waiting") == Some(&Value::Bool(false)))
 }
 
 fn validate_agent_definition_system_prompt(instance: &AgentInstanceRecord) -> Result<(), ApiError> {

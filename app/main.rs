@@ -4416,6 +4416,12 @@ impl PreparedChatContext {
                                     ) {
                                         Ok(Some(implicit_wait)) => {
                                             let wait_started_at = utc_timestamp();
+                                            let wait_input = json!({
+                                                "taskIds": implicit_wait.task_ids,
+                                                "mode": "all",
+                                                "deadlineMs": null,
+                                                "timeoutMs": null,
+                                            });
                                             let tool_call_event = ChatSseEvent::ToolCall {
                                                 assistant_message_id: self
                                                     .assistant_message_id
@@ -4424,17 +4430,24 @@ impl PreparedChatContext {
                                                 tool_call: ChatToolCallSummary {
                                                     id: implicit_wait.tool_call_id.clone(),
                                                     name: AGENT_WAIT_TASKS_TOOL.to_string(),
-                                                    status: "completed".to_string(),
-                                                    input: json!({
-                                                        "taskIds": implicit_wait.task_ids,
-                                                        "mode": "all",
-                                                        "deadlineMs": null,
-                                                        "timeoutMs": null,
-                                                    }),
-                                                    output: Some(implicit_wait.output.clone()),
+                                                    status: if implicit_wait.immediate {
+                                                        "completed".to_string()
+                                                    } else {
+                                                        "running".to_string()
+                                                    },
+                                                    input: wait_input.clone(),
+                                                    output: if implicit_wait.immediate {
+                                                        Some(implicit_wait.output.clone())
+                                                    } else {
+                                                        None
+                                                    },
                                                     is_error: false,
                                                     started_at: Some(wait_started_at.clone()),
-                                                    completed_at: Some(wait_started_at.clone()),
+                                                    completed_at: if implicit_wait.immediate {
+                                                        Some(wait_started_at.clone())
+                                                    } else {
+                                                        None
+                                                    },
                                                     live_output: None,
                                                 },
                                             };
@@ -4444,11 +4457,11 @@ impl PreparedChatContext {
                                                 assistant_message_id: self
                                                     .assistant_message_id
                                                     .clone(),
-                                                tool_call_id: implicit_wait.tool_call_id,
-                                                output: implicit_wait.output,
+                                                tool_call_id: implicit_wait.tool_call_id.clone(),
+                                                output: implicit_wait.output.clone(),
                                                 is_error: false,
                                                 started_at: wait_started_at.clone(),
-                                                completed_at: wait_started_at,
+                                                completed_at: wait_started_at.clone(),
                                             };
                                             events.push(captured_event(&result_event));
                                             yield result_event;
@@ -4461,6 +4474,44 @@ impl PreparedChatContext {
                                                 events.push(captured_event(&event));
                                                 yield event;
                                             }
+                                            if implicit_wait.immediate {
+                                                // Terminal children already finished: land the
+                                                // final wait result once and continue so the
+                                                // parent can synthesize without a suspend hop.
+                                                let turn_assistant_text =
+                                                    assistant_message_text(&turn_text, &[]);
+                                                let executed = ExecutedToolCall {
+                                                    id: implicit_wait.tool_call_id.clone(),
+                                                    name: AGENT_WAIT_TASKS_TOOL.to_string(),
+                                                    input: wait_input,
+                                                    output: implicit_wait.output.clone(),
+                                                    is_error: false,
+                                                    started_at: wait_started_at.clone(),
+                                                    completed_at: wait_started_at,
+                                                };
+                                                append_tool_state_messages(
+                                                    &mut self.provider_request.messages,
+                                                    &mut self.message_source_sequences,
+                                                    &mut self.message_context_sources,
+                                                    &mut self.next_runtime_tool_batch_index,
+                                                    vec![NeutralToolCall {
+                                                        call_id: implicit_wait.tool_call_id,
+                                                        name: AGENT_WAIT_TASKS_TOOL.to_string(),
+                                                        arguments: executed.input.clone(),
+                                                        thought_signatures: None,
+                                                    }],
+                                                    &[executed.clone()],
+                                                    turn_assistant_text,
+                                                    non_empty_string(&turn_reasoning),
+                                                );
+                                                executed_tool_calls.push(executed);
+                                                turn_retry_count = 0;
+                                                rate_limit_retry_count = 0;
+                                                turn_index = turn_index.saturating_add(1);
+                                                continue 'agent_turns;
+                                            }
+                                            // Outstanding children: non-terminal suspend keeps
+                                            // the tool_call_id open until resume completes it.
                                             return;
                                         }
                                         Ok(None) => {}
