@@ -402,9 +402,12 @@ describe("app-panels-stats verification surfaces", () => {
     const appRow = await screen.findByRole("button", {
       name: /web\/App\.tsx M/,
     });
+    const changesButton = screen.getByRole("button", { name: /Changes/ });
     const appFileName = within(appRow).getByText("App.tsx");
     const appDirectory = within(appRow).getByText("web");
 
+    expect(changesButton).toHaveClass("button--ghost");
+    expect(appRow).toHaveClass("button--ghost");
     expect(appFileName.compareDocumentPosition(appDirectory)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING,
     );

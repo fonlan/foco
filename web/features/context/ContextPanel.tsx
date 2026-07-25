@@ -2811,6 +2811,7 @@ function SourceControlPanel({
             className={diffFileButtonClass(selectedPath === null)}
             onPress={() => onSelectFile(null)}
             type="button"
+            variant="ghost"
           >
             <span className="truncate text-[11px] font-semibold uppercase tracking-wide">
               {t("Changes")}
@@ -2883,6 +2884,7 @@ function GitFileRow({
           className="flex min-w-0 flex-1 items-center gap-1.5 py-0.5 text-left"
           onPress={() => onSelectFile(isExpanded ? null : file.path)}
           type="button"
+          variant="ghost"
         >
           {isExpanded ? (
             <ChevronDown aria-hidden="true" className="size-3.5 shrink-0" />
