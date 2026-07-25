@@ -2407,6 +2407,9 @@ describe("app-panels-stats verification surfaces", () => {
       "article",
     ) as HTMLElement;
     expect(within(activeMergeCard).getAllByText("Merging")).toHaveLength(2);
+    expect(
+      within(activeMergeCard).getByRole("button", { name: "Open merge chat" }),
+    ).toHaveClass("h-auto", "min-h-0");
     const fallbackMergeCard = screen.getByText("Merge fallback plan").closest("article") as HTMLElement;
     expect(within(fallbackMergeCard).getAllByText("Merging")).toHaveLength(2);
     expect(

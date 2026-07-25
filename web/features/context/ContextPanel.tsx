@@ -1057,7 +1057,7 @@ function ContextPlanTab({
                               <Button
                                 aria-describedby={`plan-merge-in-progress-status-${plan.id}`}
                                 aria-label={t("Open merge chat")}
-                                className="context-memory-pin inline-flex items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
+                                className="context-memory-pin inline-flex h-auto min-h-0 items-center gap-1 hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
                                 onPress={() => onOpenPhaseChat(mergeChatId)}
                                 type="button"
                                 variant="ghost"
