@@ -2195,8 +2195,27 @@ fn append_agent_collaboration_tools(
     chat_context: &mut PreparedChatContext,
     permissions: &AgentPermissions,
 ) {
-    for definition in foco_tools::agent_tool_definitions() {
-        let include = match definition.name {
+    for definition in agent_collaboration_tool_definitions(permissions) {
+        if !chat_context
+            .provider_request
+            .tools
+            .iter()
+            .any(|tool| tool.name == definition.name)
+        {
+            chat_context
+                .provider_request
+                .tools
+                .push(neutral_tool_definition(definition));
+        }
+    }
+}
+
+fn agent_collaboration_tool_definitions(
+    permissions: &AgentPermissions,
+) -> Vec<foco_tools::ToolDefinition> {
+    foco_tools::agent_tool_definitions()
+        .into_iter()
+        .filter(|definition| match definition.name {
             foco_tools::AGENT_LIST_TOOL
             | foco_tools::AGENT_GET_TASK_TOOL
             | foco_tools::AGENT_SEND_MESSAGE_TOOL => true,
@@ -2210,20 +2229,8 @@ fn append_agent_collaboration_tools(
                 permissions.collaboration_tool_allowed(AgentCollaborationTool::CreateInstance)
             }
             _ => false,
-        };
-        if include
-            && !chat_context
-                .provider_request
-                .tools
-                .iter()
-                .any(|tool| tool.name == definition.name)
-        {
-            chat_context
-                .provider_request
-                .tools
-                .push(neutral_tool_definition(definition));
-        }
-    }
+        })
+        .collect()
 }
 
 fn agent_team_protocol_prompt(
@@ -3349,6 +3356,26 @@ pub(crate) fn insert_agent_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_and_sidecar_agent_schedulers_share_delegate_tool_definition() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
+        };
+        let shared = foco_tools::agent_tool_definitions()
+            .into_iter()
+            .find(|definition| definition.name == foco_tools::AGENT_DELEGATE_TASK_TOOL)
+            .expect("shared delegate tool definition");
+        let injected = agent_collaboration_tool_definitions(&permissions)
+            .into_iter()
+            .find(|definition| definition.name == foco_tools::AGENT_DELEGATE_TASK_TOOL)
+            .expect("scheduler delegate tool definition");
+
+        assert_eq!(injected.description, shared.description);
+        assert_eq!(injected.input_schema, shared.input_schema);
+        assert_eq!(injected.strict, shared.strict);
+    }
 
     #[tokio::test]
     async fn wake_signal_is_coalesced_without_blocking() {

@@ -18,6 +18,7 @@ const AGENT_INSTANCE_ID_PREFIX: &str = "agent-instance-";
 /// Suffix must be non-empty ascii lowercase / digit / hyphen (same as runtime).
 const AGENT_DEFINITION_ID_PATTERN: &str = "^agent-definition-[a-z0-9-]+$";
 const AGENT_INSTANCE_ID_PATTERN: &str = "^agent-instance-[a-z0-9-]+$";
+const AGENT_DELEGATE_TARGET_ID_PATTERN: &str = "^agent-(?:instance|definition)-[a-z0-9-]+$";
 
 pub(crate) fn agent_tool_definitions() -> Vec<ToolDefinition> {
     vec![
@@ -145,18 +146,20 @@ fn agent_send_message_definition() -> ToolDefinition {
 fn agent_delegate_task_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_DELEGATE_TASK_TOOL,
-        description: "Create an asynchronous child task for an existing instance in the current Agent team. Returns immediately with the task id and selected instance id. The parent may continue other work in parallel. If the parent would finish while this child (or other undelivered children) still has no delivered wait result, the runtime implicitly waits and later resumes with child results. Copy IDs exactly from agent_list.definitions[].id or agent_list.instances[].id; never use display names, role names, or hand-constructed IDs. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null). targetDefinitionId only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
+        description: "Create an asynchronous child task for an existing target in the current Agent team. Returns immediately with the task id and selected instance id. The parent may continue other work in parallel. If the parent would finish while this child (or other undelivered children) still has no delivered wait result, the runtime implicitly waits and later resumes with child results. Copy targetId exactly from agent_list.instances[].id when targetKind is instance (for example, agent-instance-review), or from agent_list.definitions[].id when targetKind is definition (for example, agent-definition-review); never use display names, role names, or hand-constructed IDs. A definition only routes to an existing runnable instance in the current team and never auto-creates instances. If no suitable instance exists: call agent_list, then agent_create_instances when allowed, then delegate with a returned instance id.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
-                "targetInstanceId": agent_instance_id_schema(
-                    "Exact target Agent instance id. Must use the agent-instance- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.instances[].id. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null).",
-                    true,
-                ),
-                "targetDefinitionId": agent_definition_id_schema(
-                    "Target Agent definition id. Must use the agent-definition- prefix with a non-empty lowercase/digit/hyphen suffix (max 128 chars total). Copy from agent_list.definitions[].id. Routes only to an existing runnable instance in the current team; does not auto-create instances. Provide exactly one of targetInstanceId or targetDefinitionId (set the unused field to null).",
-                    true,
+                "targetKind": {
+                    "type": "string",
+                    "enum": ["instance", "definition"],
+                    "description": "How to interpret targetId: use instance for an id such as agent-instance-review, or definition for an id such as agent-definition-review."
+                },
+                "targetId": agent_id_schema(
+                    AGENT_DELEGATE_TARGET_ID_PATTERN,
+                    "Target id selected by targetKind. For instance, copy an id such as agent-instance-review from agent_list.instances[].id. For definition, copy an id such as agent-definition-review from agent_list.definitions[].id; a definition only routes to an existing runnable instance and never auto-creates one.",
+                    false,
                 ),
                 "input": {
                     "type": "object",
@@ -179,7 +182,7 @@ fn agent_delegate_task_definition() -> ToolDefinition {
                     "description": "Optional tool timeout in milliseconds. Defaults to 10000."
                 }
             },
-            "required": ["targetInstanceId", "targetDefinitionId", "input", "correlationId", "timeoutMs"]
+            "required": ["targetKind", "targetId", "input", "correlationId", "timeoutMs"]
         }),
         strict: true,
     }
@@ -379,16 +382,16 @@ mod tests {
 
         let delegate = by_name(AGENT_DELEGATE_TASK_TOOL);
         assert_agent_id_property(
-            &delegate.input_schema["properties"]["targetDefinitionId"],
-            AGENT_DEFINITION_ID_PATTERN,
-            true,
-            &["agent_list.definitions[].id", "does not auto-create"],
-        );
-        assert_agent_id_property(
-            &delegate.input_schema["properties"]["targetInstanceId"],
-            AGENT_INSTANCE_ID_PATTERN,
-            true,
-            &["agent_list.instances[].id", "exactly one of"],
+            &delegate.input_schema["properties"]["targetId"],
+            AGENT_DELEGATE_TARGET_ID_PATTERN,
+            false,
+            &[
+                "agent-instance-review",
+                "agent-definition-review",
+                "agent_list.instances[].id",
+                "agent_list.definitions[].id",
+                "never auto-creates",
+            ],
         );
 
         let transfer = by_name(AGENT_TRANSFER_TASK_TOOL);
@@ -411,8 +414,7 @@ mod tests {
         // constraints (same family as existing `minimum` on integer fields). Do not drop
         // either without updating this test and provider strict-schema guidance.
         for schema in [
-            &delegate.input_schema["properties"]["targetDefinitionId"],
-            &delegate.input_schema["properties"]["targetInstanceId"],
+            &delegate.input_schema["properties"]["targetId"],
             &transfer.input_schema["properties"]["targetInstanceId"],
             &create.input_schema["properties"]["definitionId"],
         ] {
@@ -430,6 +432,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_delegate_task_schema_uses_one_discriminated_target() {
+        let schema = agent_delegate_task_definition().input_schema;
+        let properties = schema["properties"].as_object().expect("properties object");
+        let property_names = properties
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            property_names,
+            BTreeSet::from([
+                "correlationId",
+                "input",
+                "targetId",
+                "targetKind",
+                "timeoutMs",
+            ])
+        );
+        let required = schema["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|value| value.as_str().expect("required name"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(required, property_names);
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["targetKind"]["type"], "string");
+        assert_eq!(
+            schema["properties"]["targetKind"]["enum"],
+            json!(["instance", "definition"])
+        );
+        assert_eq!(
+            schema["properties"]["targetId"]["pattern"],
+            AGENT_DELEGATE_TARGET_ID_PATTERN
+        );
+        assert_eq!(
+            schema["properties"]["targetId"]["maxLength"],
+            AGENT_ID_MAX_LENGTH
+        );
+        assert!(schema.get("oneOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+    }
+
+    #[test]
     fn agent_id_schema_patterns_accept_runtime_valid_ids_and_reject_invalid() {
         // Compile the published schema pattern strings with a real regex engine so a
         // typo or over-broad pattern cannot pass by mapping to parallel hand logic.
@@ -437,6 +482,24 @@ mod tests {
             Regex::new(AGENT_DEFINITION_ID_PATTERN).expect("definition id pattern compiles");
         let instance_re =
             Regex::new(AGENT_INSTANCE_ID_PATTERN).expect("instance id pattern compiles");
+        let delegate_target_re = Regex::new(AGENT_DELEGATE_TARGET_ID_PATTERN)
+            .expect("delegate target id pattern compiles");
+        for valid in ["agent-instance-review", "agent-definition-review"] {
+            assert!(
+                delegate_target_re.is_match(valid),
+                "delegate target pattern must accept {valid}"
+            );
+        }
+        for invalid in [
+            "agent-agent-instance-review",
+            "agent-instance-",
+            "Review Worker",
+        ] {
+            assert!(
+                !delegate_target_re.is_match(invalid),
+                "delegate target pattern must reject {invalid}"
+            );
+        }
 
         // Valid ids: short, multi-segment, timestamp-style, hyphenated suffix.
         for valid in [
@@ -550,12 +613,15 @@ mod tests {
     }
 
     #[test]
-    fn agent_delegate_task_description_documents_id_source_and_no_auto_create() {
+    fn agent_delegate_task_description_documents_target_examples_and_no_auto_create() {
         let description = agent_delegate_task_definition().description;
         for fragment in [
             "agent_list.definitions[].id",
             "agent_list.instances[].id",
-            "exactly one of targetInstanceId or targetDefinitionId",
+            "targetKind is instance",
+            "targetKind is definition",
+            "agent-instance-review",
+            "agent-definition-review",
             "never auto-creates",
             "agent_create_instances",
             "display names",
@@ -576,19 +642,17 @@ mod tests {
         }
 
         let schema = agent_delegate_task_definition().input_schema;
-        let target_instance = schema["properties"]["targetInstanceId"]["description"]
+        let target_kind = schema["properties"]["targetKind"]["description"]
             .as_str()
-            .expect("targetInstanceId description");
-        let target_definition = schema["properties"]["targetDefinitionId"]["description"]
+            .expect("targetKind description");
+        let target_id = schema["properties"]["targetId"]["description"]
             .as_str()
-            .expect("targetDefinitionId description");
-        assert!(target_instance.contains("exactly one of targetInstanceId or targetDefinitionId"));
-        assert!(
-            target_definition.contains("exactly one of targetInstanceId or targetDefinitionId")
-        );
-        assert!(target_definition.contains("does not auto-create"));
-        assert!(target_instance.contains("agent_list.instances[].id"));
-        assert!(target_definition.contains("agent_list.definitions[].id"));
+            .expect("targetId description");
+        assert!(target_kind.contains("agent-instance-review"));
+        assert!(target_kind.contains("agent-definition-review"));
+        assert!(target_id.contains("agent_list.instances[].id"));
+        assert!(target_id.contains("agent_list.definitions[].id"));
+        assert!(target_id.contains("never auto-creates"));
 
         let create_description = agent_create_instances_definition().description;
         assert!(create_description.contains("agent_list.definitions[].id"));

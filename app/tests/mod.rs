@@ -2882,8 +2882,8 @@ fn repeated_tool_call_detector_rejects_third_identical_batch() {
 fn repeated_tool_call_detector_names_agent_delegate_task_in_recovery_message() {
     let mut detector = RepeatedToolCallDetector::default();
     let arguments = json!({
-        "targetInstanceId": "agent-instance-1",
-        "targetDefinitionId": null,
+        "targetKind": "instance",
+        "targetId": "agent-instance-1",
         "input": { "message": "do work" },
         "correlationId": null,
         "timeoutMs": null

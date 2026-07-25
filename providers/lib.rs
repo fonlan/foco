@@ -4810,6 +4810,37 @@ mod tests {
     }
 
     #[test]
+    fn function_tool_adapter_preserves_delegate_target_constraints_and_strictness() {
+        let input_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "targetKind": { "type": "string", "enum": ["instance", "definition"] },
+                "targetId": {
+                    "type": "string",
+                    "pattern": "^agent-(?:instance|definition)-[a-z0-9-]+$",
+                    "maxLength": 128
+                }
+            },
+            "required": ["targetKind", "targetId"]
+        });
+        let definition = NeutralToolDefinition {
+            name: "agent_delegate_task".to_string(),
+            description: "delegate".to_string(),
+            input_schema: input_schema.clone(),
+            strict: true,
+            kind: NeutralToolKind::Function,
+        };
+
+        let tool = genai_tool(&definition);
+        assert_eq!(tool.schema, Some(input_schema));
+        assert_eq!(
+            serde_json::to_value(tool).expect("function tool JSON")["strict"],
+            true
+        );
+    }
+
+    #[test]
     fn neutral_tool_kind_defaults_to_function_and_is_not_inferred_from_name() {
         let legacy = serde_json::json!({
             "name": "web_search",

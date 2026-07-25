@@ -1505,22 +1505,37 @@ struct AgentSendMessageInput {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentDelegateTargetKind {
+    Instance,
+    Definition,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentDelegateTaskInput {
+    target_kind: AgentDelegateTargetKind,
     /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
-    target_instance_id: Option<String>,
-    /// Raw string so illegal ids map to recoverable `invalid_arguments` before strong typing.
-    target_definition_id: Option<String>,
+    target_id: String,
     input: Value,
     correlation_id: Option<String>,
     #[serde(rename = "timeoutMs")]
     _timeout_ms: Option<u64>,
 }
 
-/// Strongly typed targets after field-level id validation.
-struct ResolvedAgentDelegateTargets {
-    target_instance_id: Option<AgentInstanceId>,
-    target_definition_id: Option<AgentDefinitionId>,
+/// Strongly typed target after `targetKind` selects the corresponding id contract.
+enum ResolvedAgentDelegateTarget {
+    Instance(AgentInstanceId),
+    Definition(AgentDefinitionId),
+}
+
+impl ResolvedAgentDelegateTarget {
+    fn target_definition_id(&self) -> Option<&AgentDefinitionId> {
+        match self {
+            Self::Instance(_) => None,
+            Self::Definition(definition_id) => Some(definition_id),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1807,7 +1822,7 @@ fn execute_agent_delegate_task(
             format!("agent_delegate_task arguments do not match schema: {source}"),
         )
     })?;
-    let targets = resolve_agent_delegate_targets(&input)?;
+    let target = resolve_agent_delegate_target(&input)?;
     context
         .permissions
         .authorize_collaboration_tool(
@@ -1815,7 +1830,7 @@ fn execute_agent_delegate_task(
             agent_tool_instance_id(context)?.clone(),
         )
         .map_err(|source| agent_tool_error("permission_denied", source.to_string()))?;
-    let target_instance_id = select_delegate_target_instance(context, workspace_path, &targets)?;
+    let target_instance_id = select_delegate_target_instance(context, workspace_path, &target)?;
     let team_id = agent_tool_team_id(context)?;
     let origin_instance_id = agent_tool_instance_id(context)?;
     let parent_task_id = agent_tool_task_id(context)?;
@@ -1858,7 +1873,7 @@ fn execute_agent_delegate_task(
         json!({
             "childTaskId": child.id.to_string(),
             "targetInstanceId": child.owner_instance_id.to_string(),
-            "targetDefinitionId": targets.target_definition_id.as_ref().map(ToString::to_string),
+            "targetDefinitionId": target.target_definition_id().map(ToString::to_string),
             "correlationId": input.correlation_id,
         }),
     )?;
@@ -2566,42 +2581,20 @@ fn agent_tool_task_id(context: &AgentToolContext) -> Result<&AgentTaskId, String
         .ok_or_else(|| "Agent tool requires a task association".to_string())
 }
 
-fn resolve_agent_delegate_targets(
+fn resolve_agent_delegate_target(
     input: &AgentDelegateTaskInput,
-) -> Result<ResolvedAgentDelegateTargets, String> {
-    Ok(ResolvedAgentDelegateTargets {
-        target_instance_id: parse_optional_agent_instance_id(
+) -> Result<ResolvedAgentDelegateTarget, String> {
+    match input.target_kind {
+        AgentDelegateTargetKind::Instance => {
+            parse_required_agent_instance_id(AGENT_DELEGATE_TASK_TOOL, "targetId", &input.target_id)
+                .map(ResolvedAgentDelegateTarget::Instance)
+        }
+        AgentDelegateTargetKind::Definition => parse_required_agent_definition_id(
             AGENT_DELEGATE_TASK_TOOL,
-            "targetInstanceId",
-            input.target_instance_id.as_deref(),
-        )?,
-        target_definition_id: parse_optional_agent_definition_id(
-            AGENT_DELEGATE_TASK_TOOL,
-            "targetDefinitionId",
-            input.target_definition_id.as_deref(),
-        )?,
-    })
-}
-
-fn parse_optional_agent_definition_id(
-    tool: &str,
-    field: &str,
-    value: Option<&str>,
-) -> Result<Option<AgentDefinitionId>, String> {
-    match value {
-        None => Ok(None),
-        Some(value) => parse_required_agent_definition_id(tool, field, value).map(Some),
-    }
-}
-
-fn parse_optional_agent_instance_id(
-    tool: &str,
-    field: &str,
-    value: Option<&str>,
-) -> Result<Option<AgentInstanceId>, String> {
-    match value {
-        None => Ok(None),
-        Some(value) => parse_required_agent_instance_id(tool, field, value).map(Some),
+            "targetId",
+            &input.target_id,
+        )
+        .map(ResolvedAgentDelegateTarget::Definition),
     }
 }
 
@@ -2659,16 +2652,10 @@ Copy the exact id from agent_list.{agent_list_path}; do not invent ids or use di
 fn select_delegate_target_instance(
     context: &AgentToolContext,
     workspace_path: &Path,
-    targets: &ResolvedAgentDelegateTargets,
+    target: &ResolvedAgentDelegateTarget,
 ) -> Result<AgentInstanceId, String> {
-    match (&targets.target_instance_id, &targets.target_definition_id) {
-        (Some(_), Some(_)) | (None, None) => {
-            return Err(agent_tool_error(
-                "invalid_arguments",
-                "provide exactly one of targetInstanceId or targetDefinitionId",
-            ));
-        }
-        (Some(instance_id), None) => {
+    match target {
+        ResolvedAgentDelegateTarget::Instance(instance_id) => {
             let database =
                 WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
             let instance = database
@@ -2691,7 +2678,7 @@ fn select_delegate_target_instance(
             }
             Ok(instance.id)
         }
-        (None, Some(definition_id)) => {
+        ResolvedAgentDelegateTarget::Definition(definition_id) => {
             if !context
                 .permissions
                 .allowed_agent_definition_ids
@@ -2716,8 +2703,8 @@ fn select_delegate_target_instance(
                     format!(
                         "Agent definition '{definition_id}' has no existing runnable instance in team '{}'. \
 Call agent_list, then agent_create_instances when allowed, then agent_delegate_task \
-with a returned instance id (or a definition that already has an instance). \
-targetDefinitionId never auto-creates instances.",
+with targetKind instance and a returned targetId (or a definition that already has an instance). \
+targetKind definition never auto-creates instances.",
                         agent_tool_team_id(context)
                             .map(ToString::to_string)
                             .unwrap_or_default()
@@ -7868,8 +7855,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-no-delegate",
             json!({
-                "targetInstanceId": instance_id.to_string(),
-                "targetDefinitionId": null,
+                "targetKind": "instance",
+                "targetId": instance_id.to_string(),
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8277,8 +8264,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-no-instance",
             json!({
-                "targetInstanceId": null,
-                "targetDefinitionId": missing_definition_id.to_string(),
+                "targetKind": "definition",
+                "targetId": missing_definition_id.to_string(),
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8304,8 +8291,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-oversized-input",
             json!({
-                "targetInstanceId": instance_id.to_string(),
-                "targetDefinitionId": null,
+                "targetKind": "instance",
+                "targetId": instance_id.to_string(),
                 "input": { "message": "x".repeat(AGENT_MAX_TASK_INPUT_BYTES + 1) },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8340,8 +8327,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-child-limit",
             json!({
-                "targetInstanceId": instance_id.to_string(),
-                "targetDefinitionId": null,
+                "targetKind": "instance",
+                "targetId": instance_id.to_string(),
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8375,27 +8362,35 @@ mod tests {
 
         // Cover the same illegal shapes the public schema pattern rejects so runtime
         // recovery stays aligned when a provider bypasses tool schema constraints.
-        for (call_id, target_definition_id, target_instance_id) in [
-            ("call-illegal-display-name", Some("Review"), None),
-            ("call-illegal-missing-prefix", Some("definition-1"), None),
-            ("call-illegal-empty-suffix", Some("agent-definition-"), None),
+        for (call_id, target_kind, target_id) in [
+            ("call-illegal-display-name", "definition", "Review"),
+            ("call-illegal-missing-prefix", "definition", "definition-1"),
+            (
+                "call-illegal-empty-suffix",
+                "definition",
+                "agent-definition-",
+            ),
             (
                 "call-illegal-uppercase",
-                Some("agent-definition-UPPER"),
-                None,
+                "definition",
+                "agent-definition-UPPER",
             ),
             (
                 "call-illegal-underscore",
-                Some("agent-definition-with_underscore"),
-                None,
+                "definition",
+                "agent-definition-with_underscore",
             ),
-            ("call-illegal-wrong-prefix", Some("agent-instance-1"), None),
-            ("call-illegal-instance-name", None, Some("worker-1")),
-            ("call-illegal-instance-empty", None, Some("agent-instance-")),
+            (
+                "call-illegal-wrong-prefix",
+                "definition",
+                "agent-instance-1",
+            ),
+            ("call-illegal-instance-name", "instance", "worker-1"),
+            ("call-illegal-instance-empty", "instance", "agent-instance-"),
             (
                 "call-illegal-instance-upper",
-                None,
-                Some("agent-instance-UPPER"),
+                "instance",
+                "agent-instance-UPPER",
             ),
         ] {
             let error = execute_agent_tool(
@@ -8404,8 +8399,8 @@ mod tests {
                 AGENT_DELEGATE_TASK_TOOL,
                 call_id,
                 json!({
-                    "targetInstanceId": target_instance_id,
-                    "targetDefinitionId": target_definition_id,
+                    "targetKind": target_kind,
+                    "targetId": target_id,
                     "input": { "message": "child" },
                     "correlationId": null,
                     "timeoutMs": null,
@@ -8421,8 +8416,7 @@ mod tests {
             assert!(
                 message.contains("agent_list")
                     && message.contains("do not invent ids")
-                    && (message.contains("targetDefinitionId")
-                        || message.contains("targetInstanceId")),
+                    && message.contains("targetId"),
                 "expected recoverable id guidance for {call_id}, got {message}"
             );
             assert_eq!(
@@ -8440,8 +8434,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-illegal-oversized",
             json!({
-                "targetInstanceId": null,
-                "targetDefinitionId": too_long_definition,
+                "targetKind": "definition",
+                "targetId": too_long_definition,
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8512,8 +8506,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-missing-well-formed",
             json!({
-                "targetInstanceId": "agent-instance-does-not-exist",
-                "targetDefinitionId": null,
+                "targetKind": "instance",
+                "targetId": "agent-instance-does-not-exist",
                 "input": { "message": "child" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8558,49 +8552,43 @@ mod tests {
                 .len()
         };
 
-        // Exactly one target field.
-        let both_targets = execute_agent_tool(
+        // The discriminant must agree with the selected id type, and old aliases are rejected.
+        let mismatched_target_kind = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
-            "call-both-targets",
+            "call-mismatched-target-kind",
             json!({
-                "targetInstanceId": coordinator_instance_id.to_string(),
-                "targetDefinitionId": worker_definition.id.to_string(),
-                "input": { "message": "both" },
+                "targetKind": "instance",
+                "targetId": worker_definition.id.to_string(),
+                "input": { "message": "mismatched" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("both targets must fail");
+        .expect_err("instance targetKind must reject definition ids");
         assert_eq!(
-            agent_tool_error_output(&both_targets)["code"],
+            agent_tool_error_output(&mismatched_target_kind)["code"],
             "invalid_arguments"
-        );
-        assert!(
-            agent_tool_error_output(&both_targets)["error"]
-                .as_str()
-                .expect("error text")
-                .contains("exactly one of targetInstanceId or targetDefinitionId")
         );
         assert_eq!(child_count(), 0);
 
-        let neither_target = execute_agent_tool(
+        let legacy_target_fields = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
-            "call-neither-target",
+            "call-legacy-target-fields",
             json!({
-                "targetInstanceId": null,
+                "targetInstanceId": coordinator_instance_id.to_string(),
                 "targetDefinitionId": null,
-                "input": { "message": "neither" },
+                "input": { "message": "legacy" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("neither target must fail");
+        .expect_err("legacy target fields must not be accepted");
         assert_eq!(
-            agent_tool_error_output(&neither_target)["code"],
+            agent_tool_error_output(&legacy_target_fields)["code"],
             "invalid_arguments"
         );
         assert_eq!(child_count(), 0);
@@ -8612,8 +8600,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-disallowed-definition",
             json!({
-                "targetInstanceId": null,
-                "targetDefinitionId": disallowed_definition_id.to_string(),
+                "targetKind": "definition",
+                "targetId": disallowed_definition_id.to_string(),
                 "input": { "message": "denied" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8633,8 +8621,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-definition-no-instance",
             json!({
-                "targetInstanceId": null,
-                "targetDefinitionId": missing_definition_id.to_string(),
+                "targetKind": "definition",
+                "targetId": missing_definition_id.to_string(),
                 "input": { "message": "no-instance" },
                 "correlationId": null,
                 "timeoutMs": null,
@@ -8658,8 +8646,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-legal-instance",
             json!({
-                "targetInstanceId": coordinator_instance_id.to_string(),
-                "targetDefinitionId": null,
+                "targetKind": "instance",
+                "targetId": coordinator_instance_id.to_string(),
                 "input": { "message": "instance-ok" },
                 "correlationId": "corr-instance",
                 "timeoutMs": null,
@@ -8699,8 +8687,8 @@ mod tests {
             AGENT_DELEGATE_TASK_TOOL,
             "call-legal-definition",
             json!({
-                "targetInstanceId": null,
-                "targetDefinitionId": worker_definition.id.to_string(),
+                "targetKind": "definition",
+                "targetId": worker_definition.id.to_string(),
                 "input": { "message": "definition-ok" },
                 "correlationId": "corr-definition",
                 "timeoutMs": null,
