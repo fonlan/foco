@@ -1252,6 +1252,13 @@ export type UpdateModelRouteResponse = {
   configuredModels: ConfiguredModelSummary[];
 };
 
+/** Lightweight success body for POST /api/models/fast-mode. */
+export type UpdateModelFastModeResponse = {
+  modelId: string;
+  fastModeEnabled: boolean;
+  configuredModels: ConfiguredModelSummary[];
+};
+
 export type ModelFormState = {
   displayName: string;
   enabled: boolean;

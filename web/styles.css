@@ -110,7 +110,6 @@ summary {
   button.chat-toolbar-profile,
   button.composer-run-button,
   button.composer-team-toggle,
-  button.composer-fast-toggle,
   button.composer-tool-button,
   button.context-memory-delete-button,
   button.diff-file-button,
@@ -139,7 +138,6 @@ summary {
     button.chat-toolbar-profile,
     button.composer-run-button,
     button.composer-team-toggle,
-    button.composer-fast-toggle,
     button.composer-tool-button,
     button.context-memory-delete-button,
     button.diff-file-button,
@@ -1581,6 +1579,14 @@ body,
   gap: 0.125rem;
 }
 
+.model-routing-model-main {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: stretch;
+  gap: 0.125rem;
+}
+
 .model-routing-model-toggle,
 .model-routing-model-button,
 .model-routing-provider-button {
@@ -1615,6 +1621,13 @@ body,
   border-radius: 0.45rem;
   font-size: 0.8rem;
   text-align: left;
+}
+
+/* Keep the Fast preference beside its model instead of competing with the
+   provider summary or expand control. HeroUI owns ghost/tertiary colors. */
+.model-routing-fast-toggle {
+  flex: 0 0 auto;
+  align-self: center;
 }
 
 .model-routing-model-button:hover,
@@ -3667,7 +3680,6 @@ body,
 }
 
 .message-composer-control-row .composer-team-toggle,
-.message-composer-control-row .composer-fast-toggle,
 .message-composer-control-row .composer-select-summary {
   border-radius: 0.4375rem;
 }
@@ -3680,8 +3692,7 @@ body,
 /* Control-row button labels: normal weight for visual consistency.
    Scoped to the control row so popover option emphasis (e.g. font-semibold) is unchanged. */
 .message-composer-control-row .composer-team-toggle,
-.message-composer-control-row .composer-select-summary,
-.message-composer-control-row .composer-fast-toggle {
+.message-composer-control-row .composer-select-summary {
   font-weight: 400;
   font-size: var(--foco-font-micro);
   line-height: 1;
@@ -3702,8 +3713,7 @@ body,
 }
 
 .message-composer-control-row .composer-select-label,
-.message-composer-control-row .composer-team-toggle-label,
-.message-composer-control-row .composer-fast-toggle-label {
+.message-composer-control-row .composer-team-toggle-label {
   display: inline-flex;
   align-items: center;
   line-height: 1;
@@ -3760,23 +3770,11 @@ body,
   flex: 0 1 auto;
 }
 
-.composer-fast-toggle {
-  display: inline-flex;
-  width: 4.25rem;
-  min-width: 4.25rem;
-  height: 1.75rem;
-  flex: 0 0 4.25rem;
-  align-items: center;
-  justify-content: center;
-  gap: 0.25rem;
-}
-
-/* Composer controls remain individually bounded. The selected plan/fast
-   states use the neutral semantic surface, visibly distinct from ghost. */
+/* Composer controls remain individually bounded. The selected plan state uses
+   the neutral semantic surface, visibly distinct from ghost. */
 .message-composer-control-row :is(
   .composer-tool-button,
   .composer-team-toggle,
-  .composer-fast-toggle,
   .composer-select-summary,
   .composer-run-button
 ) {
@@ -3790,7 +3788,6 @@ body,
 .message-composer-control-row :is(
   .composer-tool-button,
   .composer-team-toggle,
-  .composer-fast-toggle,
   .composer-select-summary,
   .composer-run-button
 ) svg {
@@ -3807,79 +3804,11 @@ body,
 }
 
 .message-composer-control-row :is(
-  .composer-team-toggle,
-  .composer-fast-toggle
+  .composer-team-toggle
 )[aria-pressed="true"] {
   border-color: var(--accent);
   background: var(--accent-soft);
   color: var(--accent-soft-foreground);
-}
-
-.fast-mode-confirmation-backdrop {
-  position: fixed;
-  z-index: 70;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  background: rgb(28 25 23 / 0.38);
-  padding: 1rem;
-}
-
-.fast-mode-confirmation-card {
-  width: min(100%, 25rem);
-  border: 1px solid rgb(231 229 228);
-  border-radius: 0.75rem;
-  background: white;
-  box-shadow: 0 24px 64px rgb(28 25 23 / 0.2);
-  padding: 1rem;
-}
-
-.fast-mode-confirmation-card h2 {
-  margin: 0.75rem 0 0;
-  color: rgb(41 37 36);
-  font-size: 0.9375rem;
-  font-weight: 700;
-}
-
-.fast-mode-confirmation-card p {
-  margin: 0.5rem 0 0;
-  color: rgb(87 83 78);
-  font-size: var(--foco-font-ui);
-  line-height: 1.5;
-}
-
-.fast-mode-confirmation-icon {
-  display: inline-flex;
-  border-radius: 999px;
-  background: rgb(255 251 235);
-  color: rgb(180 83 9);
-  padding: 0.5rem;
-}
-
-.fast-mode-confirmation-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 0.5rem;
-  margin-top: 1rem;
-}
-
-.composer-dialog-button {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.375rem;
-  border: 1px solid rgb(214 211 209);
-  border-radius: 0.5rem;
-  background: white;
-  color: rgb(68 64 60);
-  padding: 0.4375rem 0.625rem;
-  font-size: var(--foco-font-ui);
-  font-weight: 600;
-}
-
-.composer-dialog-button-primary {
-  border-color: rgb(217 119 6);
-  background: rgb(217 119 6);
-  color: white;
 }
 
 .settings-layout {
@@ -4029,7 +3958,6 @@ body,
   .message-composer-control-row .composer-run-button,
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
-  .composer-fast-toggle,
   .composer-model-provider-select,
   .composer-model-select,
   .composer-provider-select,
@@ -4042,8 +3970,7 @@ body,
   }
 
   .message-composer-control-row .composer-select-summary,
-  .composer-team-toggle,
-  .composer-fast-toggle {
+  .composer-team-toggle {
     width: 1.75rem;
     min-width: 1.75rem;
     max-width: 1.75rem;
@@ -4056,8 +3983,7 @@ body,
 
   .message-composer-control-row .composer-select-label,
   .message-composer-control-row .composer-select-summary > svg:last-child,
-  .composer-team-toggle-label,
-  .composer-fast-toggle-label {
+  .composer-team-toggle-label {
     display: none;
   }
 
@@ -4571,7 +4497,6 @@ summary:focus-visible {
 .message-composer-control-row :is(
   .composer-tool-button,
   .composer-team-toggle,
-  .composer-fast-toggle,
   .composer-select-summary,
   .composer-run-button
 ) svg {
@@ -5087,7 +5012,6 @@ summary:focus-visible {
   .message-composer-control-row .composer-run-button,
   .message-composer-control-row .context-usage-circle,
   .composer-team-toggle,
-  .composer-fast-toggle,
   .message-composer-control-row .composer-select-summary {
     width: 1.75rem;
     min-width: 1.75rem;

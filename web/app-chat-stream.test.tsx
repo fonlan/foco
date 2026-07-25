@@ -1232,78 +1232,34 @@ describe("app-chat-stream verification surfaces", () => {
     );
   });
 
-  it("compacts the Plan and Fast toggles to 1.75rem icon buttons under the phone breakpoint", () => {
+  it("keeps the Plan toggle compact on phones after Fast moves to model routing", () => {
     const stylesCss = readFileSync("styles.css", "utf8");
     const chatPanelSource = readFileSync("features/chat/ChatPanel.tsx", "utf8");
 
-    expect(chatPanelSource).toMatch(
-      /className=["']composer-fast-toggle-label["']/,
-    );
-    expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Fast mode["']\)\}/);
+    expect(chatPanelSource).not.toMatch(/composer-fast-toggle/);
+    expect(chatPanelSource).not.toMatch(/FastConfirmation|Fast mode/);
     expect(chatPanelSource).toMatch(
       /className=["']composer-team-toggle-label["']/,
     );
     expect(chatPanelSource).toMatch(/aria-label=\{t\(["']Plan mode["']\)\}/);
 
     expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?width:\s*1\.75rem[\s\S]*?min-width:\s*1\.75rem[\s\S]*?max-width:\s*1\.75rem[\s\S]*?height:\s*1\.75rem[\s\S]*?flex:\s*0 0 1\.75rem/,
-    );
-    expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle[\s\S]*?padding-inline:\s*0/,
-    );
-    expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/,
-    );
-    expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle[\s\S]*?width:\s*1\.75rem[\s\S]*?min-width:\s*1\.75rem[\s\S]*?max-width:\s*1\.75rem[\s\S]*?height:\s*1\.75rem[\s\S]*?flex:\s*0 0 1\.75rem/,
     );
     expect(stylesCss).toMatch(
       /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle[\s\S]*?padding-inline:\s*0/,
     );
-    expect(stylesCss).toMatch(
-      /@media \(max-width: 767px\)[\s\S]*?\.composer-team-toggle-label,\s*\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/,
-    );
-    // Visible Fast label must remain shown outside the phone breakpoint.
-    expect(stylesCss).not.toMatch(
-      /^\.composer-fast-toggle-label\s*\{[\s\S]*?display:\s*none/m,
-    );
+    expect(stylesCss).not.toMatch(/composer-fast-toggle|fast-mode-confirmation/);
   });
 
-  it("does not mark Fast-capable models in the composer model picker", async () => {
+  it("derives the chat request latency hint from the active model preference", async () => {
     appTestState.settingsResponse = {
       ...settings,
       configuredModels: [
-        { ...settings.configuredModels[0]!, supportsFast: true },
-      ],
-    } as typeof settings;
-
-    renderApp();
-    await userEvent.click(await screen.findByText("Tool run"));
-
-    expect(
-      await screen.findByRole("button", { name: "Fast mode" }),
-    ).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    const modelOption = screen.getByRole("option", {
-      name: "GPT Test",
-    });
-    expect(within(modelOption).queryByText("Fast")).not.toBeInTheDocument();
-  });
-
-  it("confirms Fast once, keeps preference across unsupported models, and snapshots Fast on send", async () => {
-    const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
-    appTestState.settingsResponse = {
-      ...settings,
-      configuredModels: [
-        fastModel,
         {
-          ...fastModel,
-          activeProviderId: "anthropic",
-          displayName: "GPT Standard",
-          id: "gpt-standard",
-          providerIds: ["anthropic"],
-          supportsFast: false,
+          ...settings.configuredModels[0]!,
+          fastModeEnabled: true,
+          supportsFast: true,
         },
       ],
     } as typeof settings;
@@ -1311,43 +1267,6 @@ describe("app-chat-stream verification surfaces", () => {
 
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
-
-    const fastToggle = await screen.findByRole("button", { name: "Fast mode" });
-    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
-    await userEvent.click(fastToggle);
-    const confirmation = await screen.findByRole("dialog", {
-      name: "Enable Fast mode?",
-    });
-    await userEvent.click(
-      within(confirmation).getByRole("button", { name: "Enable Fast" }),
-    );
-    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
-
-    await userEvent.click(fastToggle);
-    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
-    await userEvent.click(fastToggle);
-    expect(
-      screen.queryByRole("dialog", { name: "Enable Fast mode?" }),
-    ).not.toBeInTheDocument();
-    expect(fastToggle).toHaveAttribute("aria-pressed", "true");
-
-    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(screen.getByRole("option", { name: "GPT Standard" }));
-    expect(
-      screen.queryByText("Fast mode is not available for the selected model."),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Fast mode" }),
-    ).not.toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(screen.getByRole("option", { name: "GPT Test" }));
-    const restoredFastToggle = await screen.findByRole("button", {
-      name: "Fast mode",
-    });
-    // Preference is kept while the model temporarily cannot use Fast; UI and
-    // send path clamp via selectedRequestLatencyMode, so no error is shown.
-    expect(restoredFastToggle).toHaveAttribute("aria-pressed", "true");
 
     await userEvent.type(
       screen.getByPlaceholderText(defaultComposerPlaceholder),
@@ -1372,74 +1291,15 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("sends Standard while Fast preference is inactive for an unsupported model", async () => {
-    const fastModel = { ...settings.configuredModels[0]!, supportsFast: true };
+  it("does not restore a historical Fast mode when retrying", async () => {
     appTestState.settingsResponse = {
       ...settings,
       configuredModels: [
-        fastModel,
         {
-          ...fastModel,
-          activeProviderId: "anthropic",
-          displayName: "Anthropic Standard",
-          id: "anthropic-standard",
-          providerIds: ["anthropic"],
-          supportsFast: false,
+          ...settings.configuredModels[0]!,
+          fastModeEnabled: false,
+          supportsFast: true,
         },
-      ],
-    } as typeof settings;
-    const fetchMock = vi.mocked(fetch);
-
-    renderApp();
-    await userEvent.click(await screen.findByText("Tool run"));
-    await userEvent.click(
-      await screen.findByRole("button", { name: "Fast mode" }),
-    );
-    await userEvent.click(
-      within(
-        await screen.findByRole("dialog", { name: "Enable Fast mode?" }),
-      ).getByRole("button", { name: "Enable Fast" }),
-    );
-
-    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
-    await userEvent.click(
-      screen.getByRole("option", { name: "Anthropic Standard" }),
-    );
-    expect(
-      screen.queryByText("Fast mode is not available for the selected model."),
-    ).not.toBeInTheDocument();
-    expect(
-      screen.queryByRole("button", { name: "Fast mode" }),
-    ).not.toBeInTheDocument();
-    await userEvent.type(
-      screen.getByPlaceholderText(defaultComposerPlaceholder),
-      "Use the standard provider route.",
-    );
-    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
-    await waitFor(() =>
-      expect(appTestState.activeChatStreamController).not.toBeNull(),
-    );
-    const streamCall = fetchMock.mock.calls.find(
-      ([url]) =>
-        typeof url === "string" &&
-        url === "/api/workspaces/workspace-1/chat/stream",
-    );
-    expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
-      latencyMode: "standard",
-      modelId: "anthropic-standard",
-      providerId: "anthropic",
-    });
-
-    await act(async () => {
-      appTestState.activeChatStreamController?.close();
-    });
-  });
-
-  it("restores Fast from a failed run and retries with the committed latency mode", async () => {
-    appTestState.settingsResponse = {
-      ...settings,
-      configuredModels: [
-        { ...settings.configuredModels[0]!, supportsFast: true },
       ],
     } as typeof settings;
     appTestState.chatMessagesResponsesByChatKey = {
@@ -1475,11 +1335,6 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await screen.findByRole("button", { name: "Retry last run" }),
     ).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Fast mode" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-
     await userEvent.click(
       screen.getByRole("button", { name: "Retry last run" }),
     );
@@ -1492,7 +1347,7 @@ describe("app-chat-stream verification surfaces", () => {
         url === "/api/workspaces/workspace-1/chat/stream",
     );
     expect(JSON.parse(String(streamCall?.[1]?.body))).toMatchObject({
-      latencyMode: "fast",
+      latencyMode: "standard",
       thinkingLevel: "high",
     });
 

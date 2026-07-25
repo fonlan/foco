@@ -113,6 +113,7 @@ import type {
   MemoryFactRecord,
   MemoryListResponse,
   MemoryMutationResponse,
+  UpdateModelFastModeResponse,
   UpdateModelRouteResponse,
   OpenChatTab,
   Plan,
@@ -1374,6 +1375,14 @@ function latencyModeFromValue(value: unknown): "standard" | "fast" {
   return value === "fast" ? "fast" : "standard";
 }
 
+function latencyModeForModel(
+  model: ConfiguredModelSummary | null | undefined,
+): "standard" | "fast" {
+  return model?.supportsFast === true && model.fastModeEnabled === true
+    ? "fast"
+    : "standard";
+}
+
 function useStableCallback<T extends (...args: any[]) => unknown>(
   callback: T,
 ): T {
@@ -1791,12 +1800,6 @@ export function App() {
   const [agentTeamError, setAgentTeamError] = useState<string | null>(null);
   const [selectedModelId, setSelectedModelId] = useState("");
   const [selectedThinkingLevel, setSelectedThinkingLevel] = useState("");
-  const [selectedLatencyMode, setSelectedLatencyMode] = useState<
-    "standard" | "fast"
-  >("standard");
-  const latencyModeByChatKeyRef = useRef<Record<string, "standard" | "fast">>(
-    {},
-  );
   const [selectedSkillIds, setSelectedSkillIds] = useState<string[]>([]);
   const [gitBranches, setGitBranches] = useState<GitBranchesResponse | null>(
     null,
@@ -2617,8 +2620,7 @@ export function App() {
   )
     ? selectedThinkingLevel
     : "";
-  const selectedRequestLatencyMode =
-    selectedModel?.supportsFast === true ? selectedLatencyMode : "standard";
+  const selectedRequestLatencyMode = latencyModeForModel(selectedModel);
   const isTerminalOpen = activeWorkspace
     ? terminalOpenWorkspaceIds.has(activeWorkspace.id)
     : false;
@@ -3390,7 +3392,18 @@ export function App() {
                 // response (may lack catalog-derived metadata).
                 configuredModels: current.configuredModels.map((model) =>
                   model.id === data.modelId
-                    ? { ...model, activeProviderId: data.activeProviderId }
+                    ? {
+                        ...model,
+                        activeProviderId: data.activeProviderId,
+                        fastModeEnabled:
+                          data.configuredModels.find(
+                            (updated) => updated.id === data.modelId,
+                          )?.fastModeEnabled ?? false,
+                        supportsFast:
+                          data.configuredModels.find(
+                            (updated) => updated.id === data.modelId,
+                          )?.supportsFast ?? false,
+                      }
                     : model,
                 ),
               }
@@ -3418,6 +3431,83 @@ export function App() {
           ok: false as const,
           error:
             errorMessage(requestError) || t("Failed to update model route"),
+        };
+      }
+    },
+    [t],
+  );
+
+  const updateModelFastMode = useCallback(
+    async (modelId: string, fastModeEnabled: boolean) => {
+      let previousFastModeEnabled: boolean | undefined;
+      setSettings((current) => {
+        if (!current) {
+          return current;
+        }
+        const existing = current.configuredModels.find(
+          (model) => model.id === modelId,
+        );
+        if (previousFastModeEnabled === undefined) {
+          previousFastModeEnabled = existing?.fastModeEnabled ?? false;
+        }
+        if (!existing || existing.fastModeEnabled === fastModeEnabled) {
+          return current;
+        }
+        return {
+          ...current,
+          configuredModels: current.configuredModels.map((model) =>
+            model.id === modelId ? { ...model, fastModeEnabled } : model,
+          ),
+        };
+      });
+
+      try {
+        const data = await requestJson<UpdateModelFastModeResponse>(
+          "/api/models/fast-mode",
+          {
+            body: JSON.stringify({ modelId, fastModeEnabled }),
+            headers: { "Content-Type": "application/json" },
+            method: "POST",
+          },
+        );
+        setSettings((current) =>
+          current
+            ? {
+                ...current,
+                configuredModels: current.configuredModels.map((model) =>
+                  model.id === data.modelId
+                    ? {
+                        ...model,
+                        fastModeEnabled: data.fastModeEnabled,
+                        supportsFast:
+                          data.configuredModels.find(
+                            (updated) => updated.id === data.modelId,
+                          )?.supportsFast ?? model.supportsFast,
+                      }
+                    : model,
+                ),
+              }
+            : current,
+        );
+        return { ok: true as const };
+      } catch (requestError) {
+        setSettings((current) => {
+          if (!current || previousFastModeEnabled === undefined) {
+            return current;
+          }
+          return {
+            ...current,
+            configuredModels: current.configuredModels.map((model) =>
+              model.id === modelId
+                ? { ...model, fastModeEnabled: previousFastModeEnabled }
+                : model,
+            ),
+          };
+        });
+        return {
+          ok: false as const,
+          error:
+            errorMessage(requestError) || t("Failed to update Fast mode"),
         };
       }
     },
@@ -6927,29 +7017,10 @@ export function App() {
     return planModeByChatKeyRef.current[chatKey] === true;
   }
 
-  function resolveCommittedLatencyModeForChatKey(
-    chatKey: string | null,
-  ): "standard" | "fast" {
-    if (!chatKey) {
-      return "standard";
-    }
-    const messages = chatMessagesByKeyRef.current[chatKey];
-    if (messages !== undefined) {
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
-        if (message.role === "user" && message.runConfig) {
-          return latencyModeFromValue(message.runConfig.latencyMode);
-        }
-      }
-    }
-    return latencyModeByChatKeyRef.current[chatKey] ?? "standard";
-  }
-
   function restorePlanModeForChatKey(chatKey: string | null) {
     const enabled = resolveCommittedPlanModeForChatKey(chatKey);
     setIsPlanModeEnabled(enabled);
     applyComposerModelForPlanMode(enabled);
-    setSelectedLatencyMode(resolveCommittedLatencyModeForChatKey(chatKey));
   }
 
   function applyComposerModelForPlanMode(enabled: boolean) {
@@ -7020,9 +7091,6 @@ export function App() {
     chatKey: string,
   ) {
     rememberPlanModeForChatKey(chatKey, request.sessionMode === "plan");
-    latencyModeByChatKeyRef.current[chatKey] = latencyModeFromValue(
-      request.latencyMode,
-    );
   }
 
   function workspaceHasRunningOrStartingRun(workspaceId: string) {
@@ -7288,9 +7356,6 @@ export function App() {
         if (!hadCachedMessagesBeforeLoad) {
           setIsPlanModeEnabled(planModeFromMessages);
           applyComposerModelForPlanMode(planModeFromMessages);
-          setSelectedLatencyMode(
-            resolveCommittedLatencyModeForChatKey(chatKey),
-          );
         }
       }
       const expectedSessionOwnsActiveRun =
@@ -9536,6 +9601,9 @@ export function App() {
       setError(t("This message does not have a reusable model configuration."));
       return false;
     }
+    const requestLatencyMode = latencyModeForModel(
+      availableModels.find((model) => model.id === modelId),
+    );
     const chatKey = chatRunKey(workspaceId, chatId);
     const previousMessages = [...(chatMessagesByKeyRef.current[chatKey] ?? [])];
     setError(null);
@@ -9554,7 +9622,7 @@ export function App() {
             modelId,
             providerId,
             thinkingLevel: runConfig?.thinkingLevel || null,
-            latencyMode: latencyModeFromValue(runConfig?.latencyMode),
+            latencyMode: requestLatencyMode,
             selectedSkillIds: editedSkillIds,
             sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
             teamModeEnabled: runConfig?.teamModeEnabled ?? false,
@@ -9580,7 +9648,7 @@ export function App() {
             modelId,
             providerId,
             thinkingLevel: runConfig?.thinkingLevel ?? null,
-            latencyMode: latencyModeFromValue(runConfig?.latencyMode),
+            latencyMode: requestLatencyMode,
             selectedSkillIds: editedSkillIds,
             sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? null,
             teamModeEnabled: runConfig?.teamModeEnabled ?? false,
@@ -9599,7 +9667,7 @@ export function App() {
             runConfig?.sessionMode ?? message.sessionMode ?? undefined,
           teamModeEnabled: runConfig?.teamModeEnabled ?? false,
           thinkingLevel: runConfig?.thinkingLevel ?? "",
-          latencyMode: latencyModeFromValue(runConfig?.latencyMode),
+          latencyMode: requestLatencyMode,
           workspaceId,
         },
         chatKey,
@@ -9640,7 +9708,7 @@ export function App() {
         sessionMode: runConfig?.sessionMode ?? message.sessionMode ?? undefined,
         teamModeEnabled: runConfig?.teamModeEnabled ?? false,
         thinkingLevel: runConfig?.thinkingLevel ?? "",
-        latencyMode: latencyModeFromValue(runConfig?.latencyMode),
+        latencyMode: requestLatencyMode,
         workspaceId,
         localChatKey: chatKey,
         pendingUserMessageId: edited.userMessageId,
@@ -9999,7 +10067,6 @@ export function App() {
     setSelectedModelId(retryRequest.modelId);
     setSelectedSkillIds(retryRequest.skillIds);
     setSelectedThinkingLevel(retryRequest.thinkingLevel);
-    setSelectedLatencyMode(retryRequest.latencyMode ?? "standard");
     await runChatMessage(retryRequest);
   }
 
@@ -10014,14 +10081,6 @@ export function App() {
     setSelectedThinkingLevel(thinkingLevel);
   }
 
-  function handleChatLatencyModeChange(latencyMode: "standard" | "fast") {
-    if (latencyMode === "fast" && selectedModel?.supportsFast !== true) {
-      // Toggle is hidden for unsupported models; keep a silent defensive clamp.
-      setSelectedLatencyMode("standard");
-      return;
-    }
-    setSelectedLatencyMode(latencyMode);
-  }
   const {
     applyBrowserRoute,
     openCurrentChatView,
@@ -11666,6 +11725,7 @@ export function App() {
     );
     let request = {
       ...initialRequest,
+      latencyMode: latencyModeForModel(requestModel),
       thinkingLevel: isModelThinkingLevelSupported(
         requestModel,
         initialRequest.thinkingLevel,
@@ -14299,6 +14359,7 @@ export function App() {
                 </nav>
                 <ModelRoutingPanel
                   models={settings?.configuredModels ?? []}
+                  onFastModeChange={updateModelFastMode}
                   onRouteChange={updateModelRoute}
                   providers={settings?.providers ?? EMPTY_CONFIGURED_PROVIDERS}
                 />
@@ -14670,7 +14731,6 @@ export function App() {
                   onSubmit={handleSubmitForChatPanel}
                   onPlanModeEnabledChange={handlePlanModeEnabledChange}
                   onThinkingLevelChange={handleThinkingLevelChangeForChatPanel}
-                  onLatencyModeChange={handleChatLatencyModeChange}
                   onToggleSkill={handleToggleSkillForChatPanel}
                   onWithdrawQueuedMessage={
                     handleWithdrawQueuedMessageForChatPanel
@@ -14681,7 +14741,6 @@ export function App() {
                   selectedModelId={selectedModelId}
                   selectedSkillIds={selectedSkillIds}
                   selectedThinkingLevel={selectedThinkingLevel}
-                  selectedLatencyMode={selectedRequestLatencyMode}
                   settings={settings}
                   skillCatalogError={skillCatalogError}
                   skillCatalogRefreshError={skillCatalogRefreshError}

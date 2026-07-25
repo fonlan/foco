@@ -1,4 +1,11 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -189,9 +196,14 @@ function mockFlexibleStackLayout(
 function renderPanel(
   onRouteChange = vi.fn(async () => ({ ok: true as const })),
   {
+    onFastModeChange = vi.fn(async () => ({ ok: true as const })),
     panelModels = models,
     panelProviders = providers,
   }: {
+    onFastModeChange?: (
+      modelId: string,
+      fastModeEnabled: boolean,
+    ) => Promise<{ ok: true } | { ok: false; error: string }>;
     panelModels?: ConfiguredModelSummary[];
     panelProviders?: ConfiguredProviderSummary[];
   } = {},
@@ -200,7 +212,10 @@ function renderPanel(
     <I18nContext.Provider
       value={{
         language: "en",
-        t: (key) => key,
+        t: (key, variables) =>
+          key.startsWith("Enable Fast mode") || key.startsWith("Disable Fast mode")
+            ? key.replace("{name}", String(variables?.name ?? "{name}"))
+            : key,
       }}
     >
       <div className="flex h-full min-h-0 flex-col" style={{ height: 600 }}>
@@ -210,6 +225,7 @@ function renderPanel(
         />
         <ModelRoutingPanel
           models={panelModels}
+          onFastModeChange={onFastModeChange}
           onRouteChange={onRouteChange}
           providers={panelProviders}
         />
@@ -317,6 +333,85 @@ describe("ModelRoutingPanel", () => {
       expect(onRouteChange).toHaveBeenCalledWith("gpt-4.1", "azure");
     });
     expect(await screen.findByRole("alert")).toHaveTextContent("route failed");
+  });
+
+  it("shows an accessible Fast icon button only for eligible models", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const onFastModeChange = vi.fn(async () => ({ ok: true as const }));
+    renderPanel(undefined, {
+      onFastModeChange,
+      panelModels: [
+        { ...models[0]!, fastModeEnabled: false, supportsFast: true },
+        { ...models[1]!, fastModeEnabled: true, supportsFast: false },
+      ],
+    });
+
+    const fastToggle = screen.getByRole("button", {
+      name: "Enable Fast mode for GPT-4.1",
+    });
+    expect(fastToggle).toHaveAttribute("aria-pressed", "false");
+    expect(fastToggle).toHaveAttribute(
+      "title",
+      "Enable Fast mode for GPT-4.1",
+    );
+    expect(
+      screen.queryByRole("button", { name: /Fast mode.*Claude/ }),
+    ).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(fastToggle);
+    });
+    await waitFor(() => {
+      expect(onFastModeChange).toHaveBeenCalledWith("gpt-4.1", true);
+    });
+    expect(screen.queryByRole("group")).toBeNull();
+  });
+
+  it("disables Fast for unavailable eligible models", () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const onFastModeChange = vi.fn(async () => ({ ok: true as const }));
+    renderPanel(undefined, {
+      onFastModeChange,
+      panelModels: [
+        { ...models[0]!, enabled: false, fastModeEnabled: false, supportsFast: true },
+      ],
+    });
+
+    const fastToggle = screen.getByRole("button", {
+      name: "Enable Fast mode for GPT-4.1",
+    });
+    expect(fastToggle).toBeDisabled();
+    fireEvent.click(fastToggle);
+    expect(onFastModeChange).not.toHaveBeenCalled();
+  });
+
+  it("rolls back a failed Fast preference update and exposes the panel error", async () => {
+    window.localStorage.setItem(MODEL_ROUTING_EXPANDED_STORAGE_KEY, "1");
+    const onFastModeChange = vi.fn(async () => ({
+      ok: false as const,
+      error: "Fast preference failed",
+    }));
+    renderPanel(undefined, {
+      onFastModeChange,
+      panelModels: [{ ...models[0]!, fastModeEnabled: false, supportsFast: true }],
+    });
+
+    const fastToggle = screen.getByRole("button", {
+      name: "Enable Fast mode for GPT-4.1",
+    });
+    fireEvent.click(fastToggle);
+    expect(fastToggle).toBeDisabled();
+
+    await waitFor(() => {
+      expect(
+        screen.getByRole("button", {
+          name: "Enable Fast mode for GPT-4.1",
+        }),
+      ).toHaveAttribute("aria-pressed", "false");
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Fast preference failed",
+    );
   });
 
   it("optimistically selects the provider before the request settles", async () => {

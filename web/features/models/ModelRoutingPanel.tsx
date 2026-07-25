@@ -7,6 +7,7 @@ import {
   LoaderCircle,
   Route,
   Server,
+  Zap,
 } from "lucide-react";
 import {
   useCallback,
@@ -28,7 +29,7 @@ import type {
   ConfiguredProviderSummary,
 } from "../../api/types";
 import { useI18n } from "../../shared/i18n";
-import { SettingsButton } from "../../shared/ui";
+import { Button, SettingsButton } from "../../shared/ui";
 import {
   clampModelRoutingPanelHeight,
   modelRoutingPanelHeightBounds,
@@ -82,10 +83,15 @@ function measureFlexibleStack(panel: HTMLElement | null): {
 }
 
 export function ModelRoutingPanel({
+  onFastModeChange,
   models,
   onRouteChange,
   providers,
 }: {
+  onFastModeChange: (
+    modelId: string,
+    fastModeEnabled: boolean,
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   models: ConfiguredModelSummary[];
   onRouteChange: (
     modelId: string,
@@ -111,6 +117,13 @@ export function ModelRoutingPanel({
   const [optimisticRoutes, setOptimisticRoutes] = useState<
     Record<string, string>
   >({});
+  /** Pending Fast preference overrides applied before the network returns. */
+  const [optimisticFastModes, setOptimisticFastModes] = useState<
+    Record<string, boolean>
+  >({});
+  const [pendingFastModeModelIds, setPendingFastModeModelIds] = useState<
+    Set<string>
+  >(() => new Set());
   const [error, setError] = useState<string | null>(null);
 
   heightRatioRef.current = heightRatio;
@@ -244,6 +257,24 @@ export function ModelRoutingPanel({
     });
   }
 
+  function effectiveFastModeEnabled(model: ConfiguredModelSummary) {
+    return (
+      optimisticFastModes[model.id] ??
+      (model.supportsFast === true && model.fastModeEnabled === true)
+    );
+  }
+
+  function clearOptimisticFastMode(modelId: string) {
+    setOptimisticFastModes((current) => {
+      if (!(modelId in current)) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[modelId];
+      return next;
+    });
+  }
+
   function toggleExpanded() {
     setExpanded((current) => {
       const next = !current;
@@ -285,6 +316,37 @@ export function ModelRoutingPanel({
     // Success: parent settings are the source of truth. Failure: drop the
     // pending override so the UI rolls back to the previous route.
     clearOptimisticRoute(model.id);
+    if (!result.ok) {
+      setError(result.error);
+    }
+  }
+
+  async function toggleFastMode(model: ConfiguredModelSummary) {
+    const modelDisabled = !model.enabled || !model.canEnable;
+    if (
+      modelDisabled ||
+      routingModelId === model.id ||
+      pendingFastModeModelIds.has(model.id)
+    ) {
+      return;
+    }
+
+    const fastModeEnabled = !effectiveFastModeEnabled(model);
+    setError(null);
+    setPendingFastModeModelIds((current) => new Set(current).add(model.id));
+    setOptimisticFastModes((current) => ({
+      ...current,
+      [model.id]: fastModeEnabled,
+    }));
+    const result = await onFastModeChange(model.id, fastModeEnabled);
+    setPendingFastModeModelIds((current) => {
+      const next = new Set(current);
+      next.delete(model.id);
+      return next;
+    });
+    // Success: parent settings are the source of truth. Failure: drop the
+    // pending override so the UI rolls back to the previous preference.
+    clearOptimisticFastMode(model.id);
     if (!result.ok) {
       setError(result.error);
     }
@@ -413,8 +475,18 @@ export function ModelRoutingPanel({
             <ul className="model-routing-tree" role="tree">
               {sortedModels.map((model) => {
                 const isModelExpanded = expandedModelIds.has(model.id);
-                const isModelBusy = routingModelId === model.id;
+                const isFastModePending = pendingFastModeModelIds.has(model.id);
+                const isModelBusy =
+                  routingModelId === model.id || isFastModePending;
                 const modelDisabled = !model.enabled || !model.canEnable;
+                const fastModeEnabled = effectiveFastModeEnabled(model);
+                const fastModeLabel = fastModeEnabled
+                  ? t("Disable Fast mode for {name}", {
+                      name: model.displayName,
+                    })
+                  : t("Enable Fast mode for {name}", {
+                      name: model.displayName,
+                    });
                 const activeProviderId = effectiveActiveProviderId(model);
                 const activeProvider = activeProviderId
                   ? providerById.get(activeProviderId)
@@ -456,41 +528,64 @@ export function ModelRoutingPanel({
                           />
                         )}
                       </SettingsButton>
-                      <SettingsButton
-                        className="model-routing-model-button"
-                        disabled={isModelBusy}
-                        onClick={() => toggleModel(model.id)}
-                        title={
-                          modelDisabled
-                            ? t("Model unavailable: {name}", {
-                                name: model.displayName,
-                              })
-                            : `${model.displayName} · ${activeProviderLabel}`
-                        }
-                        type="button"
-                      >
-                        <span
-                          aria-hidden="true"
-                          className={`model-routing-route-dot ${
-                            activeProviderId ? "model-routing-route-dot-active" : ""
-                          }`}
-                        />
-                        <Bot aria-hidden="true" className="size-3.5 shrink-0" />
-                        <span className="min-w-0 flex-1 truncate text-left">
-                          <span className="block truncate font-medium">
-                            {model.displayName}
-                          </span>
-                          <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
-                            {activeProviderLabel}
-                          </span>
-                        </span>
-                        {isModelBusy ? (
-                          <LoaderCircle
+                      <div className="model-routing-model-main">
+                        <SettingsButton
+                          className="model-routing-model-button"
+                          disabled={isModelBusy}
+                          onClick={() => toggleModel(model.id)}
+                          title={
+                            modelDisabled
+                              ? t("Model unavailable: {name}", {
+                                  name: model.displayName,
+                                })
+                              : `${model.displayName} · ${activeProviderLabel}`
+                          }
+                          type="button"
+                        >
+                          <span
                             aria-hidden="true"
-                            className="size-3.5 shrink-0 animate-spin text-[var(--accent-soft-foreground)]"
+                            className={`model-routing-route-dot ${
+                              activeProviderId ? "model-routing-route-dot-active" : ""
+                            }`}
                           />
+                          <Bot aria-hidden="true" className="size-3.5 shrink-0" />
+                          <span className="min-w-0 flex-1 truncate text-left">
+                            <span className="block truncate font-medium">
+                              {model.displayName}
+                            </span>
+                            <span className="block truncate text-[10px] font-medium leading-3 text-[var(--muted)]">
+                              {activeProviderLabel}
+                            </span>
+                          </span>
+                          {isModelBusy ? (
+                            <LoaderCircle
+                              aria-hidden="true"
+                              className="size-3.5 shrink-0 animate-spin text-[var(--accent-soft-foreground)]"
+                            />
+                          ) : null}
+                        </SettingsButton>
+                        {model.supportsFast === true ? (
+                          // HeroUI's Button API omits `title`; the forwarded ref
+                          // keeps the native hover title on the actual control.
+                          <Button
+                            aria-label={fastModeLabel}
+                            aria-pressed={fastModeEnabled}
+                            className="model-routing-fast-toggle"
+                            isDisabled={modelDisabled || isModelBusy}
+                            isIconOnly
+                            isPending={isFastModePending}
+                            onPress={() => void toggleFastMode(model)}
+                            ref={(element) => {
+                              element?.setAttribute("title", fastModeLabel);
+                            }}
+                            size="sm"
+                            type="button"
+                            variant={fastModeEnabled ? "tertiary" : "ghost"}
+                          >
+                            <Zap aria-hidden="true" className="size-3.5" />
+                          </Button>
                         ) : null}
-                      </SettingsButton>
+                      </div>
                     </div>
 
                     {isModelExpanded ? (

@@ -576,15 +576,9 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     Model: "模型",
     "No enabled models": "没有已启用模型",
     Thinking: "思考",
-    Fast: "快速",
-    "Fast mode": "快速模式",
-    "Fast mode enabled": "快速模式已开启",
-    "Enable Fast mode?": "开启快速模式？",
-    "Enable Fast": "开启快速模式",
-    "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.":
-      "快速模式会以更高费率请求更快处理，仅作用于当前会话，可随时关闭。",
-    "Fast mode is not available for the selected model.":
-      "当前所选模型不支持快速模式。",
+    "Enable Fast mode for {name}": "为 {name} 开启快速模式",
+    "Disable Fast mode for {name}": "为 {name} 关闭快速模式",
+    "Failed to update Fast mode": "更新快速模式失败",
     "Collapse thinking": "收起思考",
     "Expand thinking": "展开思考",
     "Thinking duration {duration}": "思考时长 {duration}",

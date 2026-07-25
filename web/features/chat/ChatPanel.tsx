@@ -24,7 +24,6 @@ import {
   User,
   Wrench,
   X,
-  Zap,
   type LucideIcon,
 } from "lucide-react";
 import {
@@ -73,7 +72,6 @@ import {
   Description,
   Label,
   ListBox,
-  Modal,
   Select,
   TextArea,
   TextField,
@@ -241,13 +239,11 @@ function ChatPanelComponent({
   onSubmit,
   onPlanModeEnabledChange,
   onThinkingLevelChange,
-  onLatencyModeChange,
   onToggleSkill,
   onWithdrawQueuedMessage,
   selectedModelId,
   selectedSkillIds,
   selectedThinkingLevel,
-  selectedLatencyMode,
   settings,
   skillCatalogError,
   skillCatalogRefreshError,
@@ -309,13 +305,11 @@ function ChatPanelComponent({
   ) => void;
   onPlanModeEnabledChange: (value: boolean) => void;
   onThinkingLevelChange: (value: string) => void;
-  onLatencyModeChange: (value: "standard" | "fast") => void;
   onToggleSkill: (skillId: string) => void;
   onWithdrawQueuedMessage: (messageId: string) => void;
   selectedModelId: string;
   selectedSkillIds: string[];
   selectedThinkingLevel: string;
-  selectedLatencyMode: "standard" | "fast";
   settings: SettingsResponse | null;
   skillCatalogError: string | null;
   skillCatalogRefreshError: string | null;
@@ -359,8 +353,6 @@ function ChatPanelComponent({
   const [isCtrlKeyPressed, setIsCtrlKeyPressed] = useState(false);
   const [isResizingComposer, setIsResizingComposer] = useState(false);
   const [isSendButtonTooltipOpen, setIsSendButtonTooltipOpen] = useState(false);
-  const [isFastConfirmationOpen, setIsFastConfirmationOpen] = useState(false);
-  const confirmedFastChatKeysRef = useRef(new Set<string>());
   const [composerEditorHeight, setComposerEditorHeight] = useState(
     COMPOSER_EDITOR_MIN_HEIGHT_PX,
   );
@@ -448,27 +440,6 @@ function ChatPanelComponent({
       ? t("Send to queue")
       : t("Send");
   const showSendButtonTooltip = isSendButtonTooltipOpen && !isSendingMessage;
-  const supportsFast = selectedModel?.supportsFast === true;
-
-  function handleFastToggle() {
-    if (selectedLatencyMode === "fast") {
-      onLatencyModeChange("standard");
-      return;
-    }
-
-    if (!confirmedFastChatKeysRef.current.has(chatScrollKey)) {
-      setIsFastConfirmationOpen(true);
-      return;
-    }
-
-    onLatencyModeChange("fast");
-  }
-
-  function confirmFastMode() {
-    confirmedFastChatKeysRef.current.add(chatScrollKey);
-    setIsFastConfirmationOpen(false);
-    onLatencyModeChange("fast");
-  }
 
   function scrollMessageListToBottom() {
     const element = messageScrollRef.current;
@@ -1363,27 +1334,6 @@ function ChatPanelComponent({
                     options={thinkingOptions}
                     selectedValue={selectedThinkingLevel}
                   />
-                  {supportsFast ? (
-                    <Button
-                      aria-label={t("Fast mode")}
-                      aria-pressed={selectedLatencyMode === "fast"}
-                      className="composer-fast-toggle"
-                      onPress={handleFastToggle}
-                      size="sm"
-                      type="button"
-                      variant={selectedLatencyMode === "fast" ? "tertiary" : "ghost"}
-                    >
-                      <Zap aria-hidden="true" className="size-3.5 shrink-0" />
-                      <span className="composer-fast-toggle-label">
-                        {t("Fast")}
-                      </span>
-                      <span className="sr-only">
-                        {selectedLatencyMode === "fast"
-                          ? t("enabled")
-                          : t("disabled")}
-                      </span>
-                    </Button>
-                  ) : null}
                   {canRetryRun ? (
                     <Button
                       aria-label={t("Retry last run")}
@@ -1487,44 +1437,6 @@ function ChatPanelComponent({
                 </div>
               </div>
             </form>
-            {isFastConfirmationOpen ? (
-              <Modal.Backdrop
-              isDismissable
-              isOpen={isFastConfirmationOpen}
-              onOpenChange={(open) => !open && setIsFastConfirmationOpen(false)}
-            >
-              <Modal.Container placement="center" size="sm">
-                <Modal.Dialog aria-label={t("Enable Fast mode?")}>
-                  <Modal.Header>
-                    <Modal.Icon className="bg-warning-soft text-warning-soft-foreground">
-                      <Zap aria-hidden="true" className="size-4" />
-                    </Modal.Icon>
-                    <Modal.Heading>{t("Enable Fast mode?")}</Modal.Heading>
-                  </Modal.Header>
-                  <Modal.Body>
-                    <p>
-                      {t(
-                        "Fast mode requests faster processing at higher rates. It applies only to this chat session and can be turned off at any time.",
-                      )}
-                    </p>
-                  </Modal.Body>
-                  <Modal.Footer>
-                    <Button
-                      slot="close"
-                      variant="tertiary"
-                      onPress={() => setIsFastConfirmationOpen(false)}
-                    >
-                      {t("Cancel")}
-                    </Button>
-                    <Button onPress={confirmFastMode}>
-                      <Zap aria-hidden="true" className="size-3.5" />
-                      {t("Enable Fast")}
-                    </Button>
-                  </Modal.Footer>
-                </Modal.Dialog>
-              </Modal.Container>
-              </Modal.Backdrop>
-            ) : null}
           </div>
         </>
       ) : null}
