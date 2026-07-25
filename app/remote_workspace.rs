@@ -2807,6 +2807,7 @@ impl Drop for BrokerArtifactTransferDirectory {
 #[derive(Clone)]
 struct RemoteActiveRunStream {
     chat_id: String,
+    subscription_context: Arc<Mutex<Option<RemoteRunSubscriptionContext>>>,
     broker_request_id: Arc<Mutex<Option<String>>>,
     events: Arc<Mutex<Vec<(i64, Value)>>>,
     tx: tokio::sync::broadcast::Sender<(i64, Value)>,
@@ -2827,6 +2828,12 @@ struct RemoteActiveRunStream {
     cleanup_committed: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct RemoteRunSubscriptionContext {
+    workspace_id: String,
+    run_id: String,
+}
+
 impl RemoteActiveRunStream {
     fn new(chat_id: String) -> Self {
         let (tx, _) = tokio::sync::broadcast::channel(512);
@@ -2834,6 +2841,7 @@ impl RemoteActiveRunStream {
         let (finished_tx, _) = watch::channel(false);
         Self {
             chat_id,
+            subscription_context: Arc::new(Mutex::new(None)),
             broker_request_id: Arc::new(Mutex::new(None)),
             events: Arc::new(Mutex::new(Vec::new())),
             tx,
@@ -2872,6 +2880,10 @@ impl RemoteActiveRunStream {
     }
 
     fn snapshot_after(&self, sequence: i64) -> Vec<(i64, Value)> {
+        self.try_snapshot_after(sequence).unwrap_or_default()
+    }
+
+    fn try_snapshot_after(&self, sequence: i64) -> Result<Vec<(i64, Value)>, ()> {
         self.events
             .lock()
             .map(|events| {
@@ -2881,7 +2893,23 @@ impl RemoteActiveRunStream {
                     .cloned()
                     .collect()
             })
-            .unwrap_or_default()
+            .map_err(|_| ())
+    }
+
+    fn set_subscription_context(&self, workspace_id: String, run_id: String) {
+        if let Ok(mut context) = self.subscription_context.lock() {
+            *context = Some(RemoteRunSubscriptionContext {
+                workspace_id,
+                run_id,
+            });
+        }
+    }
+
+    fn subscription_context(&self) -> Option<RemoteRunSubscriptionContext> {
+        self.subscription_context
+            .lock()
+            .ok()
+            .and_then(|context| context.clone())
     }
 
     fn last_sequence(&self) -> i64 {
@@ -16601,7 +16629,18 @@ fn remote_sidecar_subscribe_run_stream(
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> + Send {
     async_stream::stream! {
         let mut rx = run_stream.tx.subscribe();
-        let replay = run_stream.snapshot_after(after_sequence);
+        let replay = match run_stream.try_snapshot_after(after_sequence) {
+            Ok(replay) => replay,
+            Err(()) => {
+                remote_sidecar_log_run_stream_recovery_failure(
+                    &run_stream,
+                    after_sequence,
+                    0,
+                    "snapshot_unavailable",
+                );
+                return;
+            }
+        };
         let mut last_sent_sequence = after_sequence;
         for (sequence, event) in replay {
             if sequence <= last_sent_sequence {
@@ -16629,14 +16668,38 @@ fn remote_sidecar_subscribe_run_stream(
                                 return;
                             }
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            let sequence = last_sent_sequence.saturating_add(1);
-                            yield Ok(remote_sse_json_event(sequence, json!({
-                                "type": "error",
-                                "message": "remote run stream history was truncated; reload chat messages to recover persisted state",
-                            })));
-                            yield Ok(remote_sse_json_event(sequence.saturating_add(1), json!({ "type": "streamEnd" })));
-                            return;
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped_count)) => {
+                            match run_stream.try_snapshot_after(last_sent_sequence) {
+                                Ok(replay) => {
+                                    remote_sidecar_log_run_stream_lag_recovery(
+                                        &run_stream,
+                                        last_sent_sequence,
+                                        skipped_count,
+                                        replay.len(),
+                                        "recovered",
+                                    );
+                                    for (sequence, event) in replay {
+                                        if sequence <= last_sent_sequence {
+                                            continue;
+                                        }
+                                        let terminal = remote_stream_event_is_terminal(&event);
+                                        yield Ok(remote_sse_json_event(sequence, event));
+                                        last_sent_sequence = sequence;
+                                        if terminal {
+                                            return;
+                                        }
+                                    }
+                                }
+                                Err(()) => {
+                                    remote_sidecar_log_run_stream_recovery_failure(
+                                        &run_stream,
+                                        last_sent_sequence,
+                                        skipped_count,
+                                        "snapshot_unavailable",
+                                    );
+                                    return;
+                                }
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     }
@@ -16646,7 +16709,19 @@ fn remote_sidecar_subscribe_run_stream(
             }
         }
         // Drain any events recorded between the finished check and loop exit.
-        for (sequence, event) in run_stream.snapshot_after(last_sent_sequence) {
+        let replay = match run_stream.try_snapshot_after(last_sent_sequence) {
+            Ok(replay) => replay,
+            Err(()) => {
+                remote_sidecar_log_run_stream_recovery_failure(
+                    &run_stream,
+                    last_sent_sequence,
+                    0,
+                    "snapshot_unavailable",
+                );
+                return;
+            }
+        };
+        for (sequence, event) in replay {
             if sequence <= last_sent_sequence {
                 continue;
             }
@@ -16658,6 +16733,45 @@ fn remote_sidecar_subscribe_run_stream(
             }
         }
     }
+}
+
+fn remote_sidecar_log_run_stream_lag_recovery(
+    run_stream: &RemoteActiveRunStream,
+    last_sequence: i64,
+    skipped_count: u64,
+    replayed_count: usize,
+    recovery_result: &'static str,
+) {
+    let context = run_stream.subscription_context();
+    tracing::info!(
+        workspace_id = %context.as_ref().map(|context| context.workspace_id.as_str()).unwrap_or("unknown"),
+        chat_id = %run_stream.chat_id,
+        run_id = %context.as_ref().map(|context| context.run_id.as_str()).unwrap_or("unknown"),
+        last_sequence,
+        skipped_count,
+        replayed_count,
+        recovery_result,
+        "recovered remote chat run subscription after broadcast lag"
+    );
+}
+
+fn remote_sidecar_log_run_stream_recovery_failure(
+    run_stream: &RemoteActiveRunStream,
+    last_sequence: i64,
+    skipped_count: u64,
+    recovery_result: &'static str,
+) {
+    let context = run_stream.subscription_context();
+    tracing::error!(
+        workspace_id = %context.as_ref().map(|context| context.workspace_id.as_str()).unwrap_or("unknown"),
+        chat_id = %run_stream.chat_id,
+        run_id = %context.as_ref().map(|context| context.run_id.as_str()).unwrap_or("unknown"),
+        last_sequence,
+        skipped_count,
+        replayed_count = 0_usize,
+        recovery_result,
+        "remote chat run subscription recovery failed"
+    );
 }
 
 #[derive(Clone, Debug)]
@@ -19485,6 +19599,7 @@ async fn remote_sidecar_start_chat_run(
         }
         RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
     };
+    run_stream.set_subscription_context(state.workspace_id.clone(), run_id.clone());
 
     let claim_result = async {
         let mut database = open_workspace_database_ordinary_with_pre_stream_retry(
@@ -23178,7 +23293,51 @@ async fn remote_sidecar_plans_worktree_cleanup(
 
 #[cfg(test)]
 mod tests {
+    use axum::response::{IntoResponse, Sse};
+
     use super::*;
+
+    #[tokio::test]
+    async fn remote_run_subscription_recovers_all_events_after_broadcast_lag() {
+        let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
+        run_stream.set_subscription_context("workspace-1".to_string(), "run-1".to_string());
+        run_stream.record(0, json!({ "type": "start" }));
+        let mut stream = Box::pin(remote_sidecar_subscribe_run_stream(run_stream.clone(), -1));
+
+        assert!(stream.next().await.is_some());
+        for sequence in 1..=513 {
+            run_stream.record(
+                sequence,
+                if sequence == 513 {
+                    json!({ "type": "streamEnd" })
+                } else {
+                    json!({ "type": "textDelta", "delta": sequence.to_string() })
+                },
+            );
+        }
+
+        // `mark_finished` remains false here, forcing the next poll through
+        // `rx.recv()` and therefore through the broadcast-lag recovery branch.
+        let recovered_event = stream.next().await.expect("lag recovery event");
+        run_stream.mark_finished();
+
+        let stream = futures_util::stream::once(async move { recovered_event }).chain(stream);
+        let body = Sse::new(stream).into_response().into_body();
+        let bytes = axum::body::to_bytes(body, usize::MAX)
+            .await
+            .expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        for sequence in 1..=513 {
+            assert_eq!(
+                text.matches(&format!("id: {sequence}\ndata:")).count(),
+                1,
+                "sequence {sequence} must be replayed exactly once: {text}"
+            );
+        }
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
 
     fn test_sidecar_identity(version: &str, build_id: &str) -> RemoteSidecarIdentity {
         RemoteSidecarIdentity {

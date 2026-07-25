@@ -18149,6 +18149,137 @@ async fn team_chat_task_sse_replays_persisted_run_events_while_task_is_waiting()
 }
 
 #[tokio::test]
+async fn team_chat_task_sse_recovers_active_run_events_after_broadcast_lag() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-team-stream-lag-recovery-test"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-team-stream-lag-recovery-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace = config.workspaces[0].clone();
+    let chat_id = "chat-team-stream-lag-recovery";
+    let user_message_id = "user-team-stream-lag-recovery";
+    let assistant_message_id = "assistant-team-stream-lag-recovery";
+    let task_id = {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat(chat_id, "Team stream lag recovery")
+            .expect("chat insert");
+        insert_waiting_coordinator_task(
+            &mut database,
+            chat_id,
+            user_message_id,
+            "team-stream-lag-recovery",
+        )
+    };
+
+    let state = test_app_state(config, profile_dir.clone());
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = state
+        .active_chat_runs
+        .register(
+            task_id.to_string(),
+            workspace.id.clone(),
+            chat_id.to_string(),
+            assistant_message_id.to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active team run");
+    registration
+        .record_event(
+            &workspace_dir,
+            chat_id,
+            &ChatSseEvent::Start {
+                chat_id: chat_id.to_string(),
+                user_message_id: user_message_id.to_string(),
+                assistant_message_id: assistant_message_id.to_string(),
+                llm_request_id: task_id.to_string(),
+                memories_used: Vec::new(),
+            },
+        )
+        .expect("record team start");
+
+    let response = crate::http::chat::team_chat_task_sse(&state, &workspace, &task_id, -1)
+        .await
+        .expect("team stream response");
+    let mut stream = response.into_response().into_body().into_data_stream();
+    timeout(Duration::from_millis(500), stream.next())
+        .await
+        .expect("team start should establish the active subscription")
+        .expect("team start chunk")
+        .expect("team start body");
+
+    for sequence in 1..=513 {
+        registration
+            .record_event(
+                &workspace_dir,
+                chat_id,
+                &ChatSseEvent::TextDelta {
+                    assistant_message_id: assistant_message_id.to_string(),
+                    delta: format!("team-sequence-{sequence}"),
+                    reasoning_duration_ms: None,
+                },
+            )
+            .expect("record team event");
+    }
+
+    // The active run remains unfinished, so this read can only advance through the
+    // broadcast receiver. It deterministically exercises `RecvError::Lagged`.
+    let mut body = String::new();
+    let recovered_event = timeout(Duration::from_millis(500), stream.next())
+        .await
+        .expect("team stream should recover broadcast lag")
+        .expect("team lag recovery chunk")
+        .expect("team lag recovery body");
+    body.push_str(&String::from_utf8_lossy(&recovered_event));
+
+    registration.finish();
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        let task = database
+            .agent_task(&task_id)
+            .expect("task read")
+            .expect("task");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: &task_id,
+                expected_status: foco_agent::AgentTaskStatus::Waiting,
+                transition: foco_agent::AgentTaskTransition::Fail,
+                result_json: None,
+                error_json: Some(r#"{"message":"test terminal"}"#),
+                interruption_reason: None,
+            })
+            .expect("settle team task");
+    }
+
+    while let Some(chunk) = timeout(Duration::from_secs(2), stream.next())
+        .await
+        .expect("team stream should settle after the active run completes")
+    {
+        let chunk = chunk.expect("team event chunk");
+        body.push_str(&String::from_utf8_lossy(&chunk));
+    }
+
+    for sequence in 1..=513 {
+        assert_eq!(
+            body.matches(&format!("id: {sequence}\n\n")).count(),
+            1,
+            "team sequence {sequence} must be replayed exactly once: {body}"
+        );
+    }
+    assert_eq!(body.matches("\"type\":\"streamEnd\"").count(), 1, "{body}");
+    assert!(!body.contains("\"type\":\"error\""), "{body}");
+
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn team_chat_task_sse_releases_database_before_yielding() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-team-stream-gate-release-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-team-stream-gate-release-profile"));

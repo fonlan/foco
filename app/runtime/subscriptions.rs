@@ -468,6 +468,9 @@ impl ActiveChatRunRegistry {
         }
 
         let after_sequence = after_sequence.unwrap_or(-1);
+        // Subscribe before reading the snapshot. Broadcast is only a wake-up path, so
+        // sequence de-duplication below closes the interval between these two operations.
+        let event_rx = active_run.event_tx.subscribe();
         let replay = active_run
             .events
             .lock()
@@ -479,9 +482,13 @@ impl ActiveChatRunRegistry {
 
         Ok(ActiveChatRunSubscription {
             replay,
-            event_rx: active_run.event_tx.subscribe(),
+            event_rx,
             completed_rx: active_run.completed_rx.clone(),
             after_sequence,
+            workspace_id: active_run.workspace_id,
+            chat_id: active_run.chat_id,
+            run_id: run_id.to_string(),
+            events: active_run.events,
         })
     }
 
@@ -943,6 +950,64 @@ pub(crate) struct ActiveChatRunSubscription {
     pub(crate) event_rx: broadcast::Receiver<ChatRunEventFrame>,
     pub(crate) completed_rx: watch::Receiver<bool>,
     pub(crate) after_sequence: i64,
+    workspace_id: String,
+    chat_id: String,
+    run_id: String,
+    events: Arc<Mutex<Vec<ChatRunEventFrame>>>,
+}
+
+impl ActiveChatRunSubscription {
+    pub(crate) fn snapshot_after(&self, sequence: i64) -> Result<Vec<ChatRunEventFrame>, ApiError> {
+        self.events
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| event.sequence > sequence)
+                    .cloned()
+                    .collect()
+            })
+    }
+
+    pub(crate) fn log_lag_recovery(
+        &self,
+        last_sequence: i64,
+        skipped_count: u64,
+        replayed_count: usize,
+        recovery_result: &'static str,
+    ) {
+        tracing::info!(
+            workspace_id = %self.workspace_id,
+            chat_id = %self.chat_id,
+            run_id = %self.run_id,
+            last_sequence,
+            skipped_count,
+            replayed_count,
+            recovery_result,
+            "recovered chat run subscription after broadcast lag"
+        );
+    }
+
+    pub(crate) fn log_recovery_failure(
+        &self,
+        last_sequence: i64,
+        skipped_count: u64,
+        recovery_result: &'static str,
+        error: &ApiError,
+    ) {
+        tracing::error!(
+            workspace_id = %self.workspace_id,
+            chat_id = %self.chat_id,
+            run_id = %self.run_id,
+            last_sequence,
+            skipped_count,
+            replayed_count = 0,
+            recovery_result,
+            error = %error.message,
+            "chat run subscription recovery failed"
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -965,7 +1030,7 @@ pub(crate) fn chat_run_subscription_stream(
 ) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
     async_stream::stream! {
         let mut last_sequence = subscription.after_sequence;
-        for event in subscription.replay {
+        for event in std::mem::take(&mut subscription.replay) {
             if event.sequence > last_sequence {
                 last_sequence = event.sequence;
                 yield Ok(sse_event_frame(&event));
@@ -974,6 +1039,20 @@ pub(crate) fn chat_run_subscription_stream(
 
 
         if *subscription.completed_rx.borrow() {
+            match subscription.snapshot_after(last_sequence) {
+                Ok(replay) => {
+                    for event in replay {
+                        if event.sequence > last_sequence {
+                            last_sequence = event.sequence;
+                            yield Ok(sse_event_frame(&event));
+                        }
+                    }
+                }
+                Err(error) => {
+                    subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
+                    return;
+                }
+            }
             yield Ok(sse_event(&ChatSseEvent::StreamEnd));
             return;
         }
@@ -982,10 +1061,18 @@ pub(crate) fn chat_run_subscription_stream(
             tokio::select! {
                 changed = subscription.completed_rx.changed() => {
                     if changed.is_err() || *subscription.completed_rx.borrow() {
-                        while let Ok(event) = subscription.event_rx.try_recv() {
-                            if event.sequence > last_sequence {
-                                last_sequence = event.sequence;
-                                yield Ok(sse_event_frame(&event));
+                        match subscription.snapshot_after(last_sequence) {
+                            Ok(replay) => {
+                                for event in replay {
+                                    if event.sequence > last_sequence {
+                                        last_sequence = event.sequence;
+                                        yield Ok(sse_event_frame(&event));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
+                                return;
                             }
                         }
                         yield Ok(sse_event(&ChatSseEvent::StreamEnd));
@@ -1000,14 +1087,52 @@ pub(crate) fn chat_run_subscription_stream(
                                 yield Ok(sse_event_frame(&event));
                             }
                         }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            let event = ChatSseEvent::Error {
-                                message: "chat run event subscriber lagged behind; refresh to replay the run".to_string(),
-                            };
-                            yield Ok(sse_event(&event));
-                            return;
+                        Err(broadcast::error::RecvError::Lagged(skipped_count)) => {
+                            match subscription.snapshot_after(last_sequence) {
+                                Ok(replay) => {
+                                    let replayed_count = replay.len();
+                                    subscription.log_lag_recovery(
+                                        last_sequence,
+                                        skipped_count,
+                                        replayed_count,
+                                        "recovered",
+                                    );
+                                    for event in replay {
+                                        if event.sequence > last_sequence {
+                                            last_sequence = event.sequence;
+                                            yield Ok(sse_event_frame(&event));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    subscription.log_recovery_failure(
+                                        last_sequence,
+                                        skipped_count,
+                                        "snapshot_unavailable",
+                                        &error,
+                                    );
+                                    return;
+                                }
+                            }
                         }
-                        Err(broadcast::error::RecvError::Closed) => return,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            match subscription.snapshot_after(last_sequence) {
+                                Ok(replay) => {
+                                    for event in replay {
+                                        if event.sequence > last_sequence {
+                                            last_sequence = event.sequence;
+                                            yield Ok(sse_event_frame(&event));
+                                        }
+                                    }
+                                }
+                                Err(error) => {
+                                    subscription.log_recovery_failure(last_sequence, 0, "snapshot_unavailable", &error);
+                                    return;
+                                }
+                            }
+                            yield Ok(sse_event(&ChatSseEvent::StreamEnd));
+                            return;
+                        },
                     }
                 }
             }
@@ -1026,6 +1151,7 @@ mod tests {
         http::StatusCode,
         response::{IntoResponse, Sse},
     };
+    use futures_util::StreamExt;
     use tokio::sync::{broadcast, mpsc, watch};
 
     use super::*;
@@ -1034,22 +1160,27 @@ mod tests {
     async fn chat_run_subscription_stream_replays_after_sequence_with_sse_ids() {
         let (_event_tx, event_rx) = broadcast::channel(1);
         let (_completed_tx, completed_rx) = watch::channel(true);
+        let replay = vec![
+            ChatRunEventFrame {
+                sequence: 1,
+                event_type: "textDelta".to_string(),
+                payload_json: r#"{"type":"textDelta","delta":"old"}"#.to_string(),
+            },
+            ChatRunEventFrame {
+                sequence: 2,
+                event_type: "textDelta".to_string(),
+                payload_json: r#"{"type":"textDelta","delta":"new"}"#.to_string(),
+            },
+        ];
         let subscription = ActiveChatRunSubscription {
-            replay: vec![
-                ChatRunEventFrame {
-                    sequence: 1,
-                    event_type: "textDelta".to_string(),
-                    payload_json: r#"{"type":"textDelta","delta":"old"}"#.to_string(),
-                },
-                ChatRunEventFrame {
-                    sequence: 2,
-                    event_type: "textDelta".to_string(),
-                    payload_json: r#"{"type":"textDelta","delta":"new"}"#.to_string(),
-                },
-            ],
+            replay: replay.clone(),
             event_rx,
             completed_rx,
             after_sequence: 1,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: Arc::new(Mutex::new(replay)),
         };
 
         let body = Sse::new(chat_run_subscription_stream(subscription))
@@ -1062,6 +1193,58 @@ mod tests {
         assert!(!text.contains("old"));
         assert!(text.contains("id: 2"));
         assert!(text.contains("new"));
+    }
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_recovers_all_events_after_broadcast_lag() {
+        let (event_tx, event_rx) = broadcast::channel(1);
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let events = Arc::new(Mutex::new(vec![ChatRunEventFrame {
+            sequence: 0,
+            event_type: "start".to_string(),
+            payload_json: r#"{"type":"start"}"#.to_string(),
+        }]));
+        let subscription = ActiveChatRunSubscription {
+            replay: events.lock().expect("event cache").clone(),
+            event_rx,
+            completed_rx,
+            after_sequence: -1,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: events.clone(),
+        };
+        let mut stream = Box::pin(chat_run_subscription_stream(subscription));
+
+        assert!(stream.next().await.is_some());
+        for sequence in 1..=513 {
+            let event = ChatRunEventFrame {
+                sequence,
+                event_type: "textDelta".to_string(),
+                payload_json: format!(r#"{{"type":"textDelta","delta":"{sequence}"}}"#),
+            };
+            events.lock().expect("event cache").push(event.clone());
+            event_tx.send(event).expect("subscription receiver");
+        }
+
+        // Completion is still false, so this poll must receive the lag notification
+        // and recover from the active-run snapshot rather than take the completion path.
+        let recovered_event = stream.next().await.expect("lag recovery event");
+        completed_tx.send(true).expect("complete subscription");
+        let stream = futures_util::stream::once(async move { recovered_event }).chain(stream);
+        let body = Sse::new(stream).into_response().into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        for sequence in 1..=513 {
+            assert_eq!(
+                text.matches(&format!("id: {sequence}\n\n")).count(),
+                1,
+                "sequence {sequence} must be replayed exactly once: {text}"
+            );
+        }
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
     }
 
     #[tokio::test]

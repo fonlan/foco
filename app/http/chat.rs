@@ -1601,11 +1601,15 @@ pub(crate) async fn team_chat_task_sse(
     task_id: &foco_agent::AgentTaskId,
     after_sequence: i64,
 ) -> Result<BoxedChatSse, ApiError> {
+    // Resolve the team chat before the stream starts so recovery logging never needs
+    // a second database read while handling the failure that triggered the log.
+    let team_chat_id = load_team_chat_id_for_task(&workspace.path, task_id)?;
     let stream = team_chat_task_event_stream(
         state.clone(),
         workspace.clone(),
         task_id.clone(),
         after_sequence,
+        team_chat_id,
     );
     Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
@@ -1619,6 +1623,7 @@ fn team_chat_task_event_stream(
     workspace: WorkspaceConfig,
     task_id: foco_agent::AgentTaskId,
     after_sequence: i64,
+    team_chat_id: String,
 ) -> BoxedChatEventStream {
     let stream = async_stream::stream! {
         // ponytail: polling avoids a new task-status broadcast; switch to notifications if queued streams become numerous.
@@ -1634,7 +1639,7 @@ fn team_chat_task_event_stream(
                 streamed_active_run = true;
                 let mut subscription = subscription;
                 let mut last_sequence = last_run_event_sequence.max(subscription.after_sequence);
-                for event in subscription.replay {
+                for event in std::mem::take(&mut subscription.replay) {
                     if event.sequence > last_sequence {
                         last_sequence = event.sequence;
                         yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
@@ -1646,10 +1651,22 @@ fn team_chat_task_event_stream(
                         tokio::select! {
                             changed = subscription.completed_rx.changed() => {
                                 if changed.is_err() || *subscription.completed_rx.borrow() {
-                                    while let Ok(event) = subscription.event_rx.try_recv() {
-                                        if event.sequence > last_sequence {
-                                            last_sequence = event.sequence;
-                                            yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
+                                    match subscription.snapshot_after(last_sequence) {
+                                        Ok(replay) => {
+                                            for event in replay {
+                                                if event.sequence > last_sequence {
+                                                    last_sequence = event.sequence;
+                                                    yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
+                                                }
+                                            }
+                                        }
+                                        Err(error) => {
+                                            subscription.log_recovery_failure(
+                                                last_sequence,
+                                                0,
+                                                "snapshot_unavailable",
+                                                &error,
+                                            );
                                         }
                                     }
                                     break;
@@ -1663,13 +1680,53 @@ fn team_chat_task_event_stream(
                                             yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
                                         }
                                     }
-                                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                                        yield Ok(sse_event(&ChatSseEvent::Error {
-                                            message: "chat run event subscriber lagged behind; refresh to replay the run".to_string(),
-                                        }));
-                                        return;
+                                    Err(broadcast::error::RecvError::Lagged(skipped_count)) => {
+                                        match subscription.snapshot_after(last_sequence) {
+                                            Ok(replay) => {
+                                                let replayed_count = replay.len();
+                                                subscription.log_lag_recovery(
+                                                    last_sequence,
+                                                    skipped_count,
+                                                    replayed_count,
+                                                    "recovered",
+                                                );
+                                                for event in replay {
+                                                    if event.sequence > last_sequence {
+                                                        last_sequence = event.sequence;
+                                                        yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => {
+                                                subscription.log_recovery_failure(
+                                                    last_sequence,
+                                                    skipped_count,
+                                                    "snapshot_unavailable",
+                                                    &error,
+                                                );
+                                                break;
+                                            }
+                                        }
                                     }
-                                    Err(broadcast::error::RecvError::Closed) => break,
+                                    Err(broadcast::error::RecvError::Closed) => {
+                                        match subscription.snapshot_after(last_sequence) {
+                                            Ok(replay) => {
+                                                for event in replay {
+                                                    if event.sequence > last_sequence {
+                                                        last_sequence = event.sequence;
+                                                        yield Ok(sequenced_sse_event_payload(event.sequence, &event.payload_json));
+                                                    }
+                                                }
+                                            }
+                                            Err(error) => subscription.log_recovery_failure(
+                                                last_sequence,
+                                                0,
+                                                "snapshot_unavailable",
+                                                &error,
+                                            ),
+                                        }
+                                        break;
+                                    },
                                 }
                             }
                         }
@@ -1686,6 +1743,17 @@ fn team_chat_task_event_stream(
             ) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
+                    tracing::error!(
+                        workspace_id = %workspace.id,
+                        chat_id = %team_chat_id,
+                        run_id = %task_id,
+                        last_sequence = last_run_event_sequence,
+                        skipped_count = 0_u64,
+                        replayed_count = 0_usize,
+                        recovery_result = "persistence_failure",
+                        error = %error.message,
+                        "failed to load team chat run events after subscription recovery"
+                    );
                     yield Ok(sse_event(&ChatSseEvent::Error { message: error.message }));
                     yield Ok(sse_event(&ChatSseEvent::StreamEnd));
                     return;
@@ -1735,6 +1803,22 @@ fn team_chat_task_event_stream(
         }
     };
     Box::pin(stream)
+}
+
+fn load_team_chat_id_for_task(
+    workspace_path: &Path,
+    task_id: &foco_agent::AgentTaskId,
+) -> Result<String, ApiError> {
+    let database = open_workspace_database(workspace_path)?;
+    let task = database
+        .agent_task(task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal(format!("Agent task '{task_id}' was not found")))?;
+    database
+        .agent_team(&task.team_id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal(format!("Agent team '{}' was not found", task.team_id)))
+        .map(|team| team.chat_id)
 }
 
 struct TeamChatTaskPollSnapshot {
