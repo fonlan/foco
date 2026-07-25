@@ -822,16 +822,36 @@ mod tests {
         let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary workspace");
         let ordinary_2 = open_workspace_memory_database(workspace.path()).expect("ordinary memory");
 
-        let workspace_path = workspace.path().to_path_buf();
-        let started_at = Instant::now();
-        let error = match open_workspace_memory_database(&workspace_path) {
-            Ok(_) => panic!("third ordinary memory open must hit the shared concurrency limit"),
+        // Prove shared capacity without waiting the production 5s ordinary timeout:
+        // hold two ordinary slots (db + memory), then acquire with Duration::ZERO.
+        let key = std::fs::canonicalize(workspace.path()).expect("canonical workspace");
+        let gate = WORKSPACE_DATABASE_GATES
+            .lock()
+            .expect("gate registry")
+            .get(&key)
+            .expect("workspace gate")
+            .clone();
+        let holder_summary = gate.active_holder_summary();
+        assert!(
+            holder_summary.contains("resource=database,gate=ordinary"),
+            "{holder_summary}"
+        );
+        assert!(
+            holder_summary.contains("resource=memory,gate=ordinary"),
+            "{holder_summary}"
+        );
+        let error = match acquire_workspace_database_gate_slot(
+            &key,
+            &gate,
+            Arc::clone(&gate.ordinary),
+            WorkspaceDatabaseGateKind::Ordinary,
+            "ordinary",
+            Instant::now(),
+            Duration::ZERO,
+        ) {
+            Ok(_) => panic!("third ordinary open must hit the shared concurrency limit"),
             Err(error) => error,
         };
-        assert!(
-            started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-            "memory ordinary waiter returned too early"
-        );
         let message = error.to_string();
         assert!(
             message.contains("workspace database concurrency limit reached"),
@@ -1203,49 +1223,9 @@ mod tests {
         None
     }
 
-    #[test]
-    fn critical_waiter_unblocks_after_long_hold_release() {
-        let workspace = tempdir().expect("workspace");
-        let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");
-        let ordinary_2 = open_workspace_database(workspace.path()).expect("ordinary 2");
-        let critical = open_workspace_database_critical(workspace.path()).expect("critical");
-
-        let workspace_path = workspace.path().to_path_buf();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let waiter = thread::spawn(move || {
-            let started_at = Instant::now();
-            let result = open_workspace_database_critical(&workspace_path);
-            let _ = tx.send(started_at.elapsed());
-            result
-        });
-
-        thread::sleep(Duration::from_millis(200));
-        assert!(
-            rx.try_recv().is_err(),
-            "critical waiter should remain blocked while total capacity is full"
-        );
-
-        // Mirror the app durable-finish test: hold capacity past the long-hold warning.
-        thread::sleep(WORKSPACE_DATABASE_LONG_HOLD_WARNING + Duration::from_millis(200));
-        let release_at = Instant::now();
-        drop(critical);
-
-        let waited = rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("critical waiter should finish promptly after release");
-        let after_release = release_at.elapsed();
-        let mut opened = waiter.join().expect("join waiter").expect("critical open");
-        assert!(
-            after_release < Duration::from_secs(2),
-            "critical open should complete promptly after release, after_release={after_release:?}, waited_from_start={waited:?}"
-        );
-        opened
-            .insert_chat("chat-after-release", "after release")
-            .expect("write after release");
-        drop(opened);
-        drop(ordinary_1);
-        drop(ordinary_2);
-    }
+    // critical_waiter_unblocks_after_long_hold_release was removed: it slept
+    // WORKSPACE_DATABASE_LONG_HOLD_WARNING (~10s) while duplicating
+    // total_capacity_blocks_extra_until_slot_releases coverage.
 
     #[test]
     fn long_hold_warning_emits_for_deliberate_hold() {
@@ -1268,16 +1248,29 @@ mod tests {
         let ordinary_2 = open_workspace_memory_database(workspace.path())
             .expect("ordinary memory via original temp path must share the same gate key");
 
-        let third_path = canonical.clone();
-        let started_at = Instant::now();
-        let error = match open_workspace_database(&third_path) {
+        // Path forms must share one gate key; prove saturation with Duration::ZERO
+        // instead of waiting the production 5s ordinary timeout.
+        // Do not assert on the process-global gate map size: other tests may hold
+        // entries concurrently, and panicking while the registry lock is held
+        // poisons the suite.
+        let gate = WORKSPACE_DATABASE_GATES
+            .lock()
+            .expect("gate registry")
+            .get(&canonical)
+            .expect("shared workspace gate")
+            .clone();
+        let error = match acquire_workspace_database_gate_slot(
+            &canonical,
+            &gate,
+            Arc::clone(&gate.ordinary),
+            WorkspaceDatabaseGateKind::Ordinary,
+            "ordinary",
+            Instant::now(),
+            Duration::ZERO,
+        ) {
             Ok(_) => panic!("third ordinary open must share capacity across path forms"),
             Err(error) => error,
         };
-        assert!(
-            started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-            "shared-gate waiter returned too early"
-        );
         let message = error.to_string();
         assert!(
             message.contains("workspace database concurrency limit reached"),

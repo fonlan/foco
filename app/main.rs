@@ -441,7 +441,6 @@ pub(crate) struct AppState {
     tray_menu_update_notifier: TrayMenuUpdateNotifier,
 }
 
-pub(crate) use foco_store::workspace::WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT;
 pub(crate) use foco_store::workspace::WorkspaceDatabaseHandle;
 
 #[track_caller]

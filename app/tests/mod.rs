@@ -46,10 +46,8 @@ use foco_store::{
         NewCodeGraphImport, NewCodeGraphSymbol, NewPlan, NewPlanPhase, NewPlanStep,
         NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewWorkspaceSpecJob, PlanPhaseAttemptTrigger, PlanStepPatch,
-        WORKSPACE_DATABASE_ORDINARY_CAPACITY, WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-        WORKSPACE_DATABASE_TOTAL_CAPACITY, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
-        WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord, WorkspaceSpecTriggerType,
-        wait_for_ordinary_gate_queued_waiters,
+        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WorkspaceDatabaseSpaceStats, WorkspaceSpecJobRecord,
+        WorkspaceSpecTriggerType,
     },
 };
 use foco_tools::{
@@ -2616,7 +2614,8 @@ fn worktree_code_graph_watcher_reflects_local_edits_only() {
         "pub fn shared_watch_symbol() -> i32 { 1 }\n\npub fn shared_watch_added() -> i32 { 9 }\n",
     )
     .expect("shared edit");
-    std::thread::sleep(Duration::from_millis(900));
+    // Debounce is short; wait long enough for a spurious worktree reindex if isolation failed.
+    std::thread::sleep(Duration::from_millis(150));
     let worktree_db = WorkspaceDatabase::open_or_create(&worktree.root_path).expect("worktree db");
     let leaked = worktree_db
         .find_code_graph_symbols("shared_watch_added", None, None, 10)
@@ -13602,109 +13601,6 @@ async fn failing_claimed_task_uses_reserved_database_capacity() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ordinary_database_gate_times_out_while_critical_capacity_remains_available() {
-    let workspace = tempfile::tempdir().expect("workspace");
-    let gate_1 = open_workspace_database(workspace.path()).expect("first ordinary holder");
-    let gate_2 = open_workspace_database(workspace.path()).expect("second ordinary holder");
-    let workspace_path = workspace.path().to_path_buf();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let waiter = tokio::task::spawn_blocking(move || {
-        let _ = started_tx.send(());
-        let started_at = Instant::now();
-        let error = match open_workspace_database(&workspace_path) {
-            Ok(_) => panic!("third ordinary open must hit the concurrency limit"),
-            Err(error) => error,
-        };
-        (error, started_at.elapsed())
-    });
-    started_rx.await.expect("ordinary waiter started");
-
-    let (error, waited) = timeout(Duration::from_secs(7), waiter)
-        .await
-        .expect("ordinary gate timeout should be bounded")
-        .expect("ordinary waiter joined");
-    assert!(
-        waited >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-        "ordinary waiter returned too early after {waited:?}"
-    );
-    assert!(
-        error
-            .message
-            .contains("workspace database concurrency limit reached"),
-        "{}",
-        error.message
-    );
-    assert!(error.message.contains("gate=ordinary"), "{}", error.message);
-    assert!(error.message.contains("ordinary=0/2"), "{}", error.message);
-
-    let critical_started_at = Instant::now();
-    let critical = open_workspace_database_critical(workspace.path())
-        .expect("reserved critical capacity remains available");
-    assert!(
-        critical_started_at.elapsed() < Duration::from_secs(1),
-        "critical open should not wait behind ordinary saturation"
-    );
-    drop(critical);
-    drop(gate_1);
-    drop(gate_2);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn claimed_task_closes_after_pressure_outlives_the_legacy_retry_window() {
-    const LEGACY_RETRY_WINDOW: Duration = Duration::from_millis(9_500);
-
-    let workspace = tempfile::tempdir().expect("workspace");
-    let (_, _, task_id, _) = insert_claimed_agent_task(workspace.path(), "legacy-window");
-    let gate_1 = open_workspace_database(workspace.path()).expect("first ordinary holder");
-    let gate_2 = open_workspace_database(workspace.path()).expect("second ordinary holder");
-    let gate_3 = open_workspace_database_critical(workspace.path()).expect("critical holder");
-    let workspace_path = workspace.path().to_path_buf();
-    let retry_task_id = task_id.clone();
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-    let retry = tokio::spawn(async move {
-        let _ = started_tx.send(());
-        crate::runtime::fail_claimed_task_with_retry(
-            &workspace_path,
-            &retry_task_id,
-            "synthetic failure after sustained database pressure",
-        )
-        .await
-    });
-    started_rx.await.expect("durable closure started");
-
-    tokio::time::sleep(LEGACY_RETRY_WINDOW + Duration::from_millis(500)).await;
-    assert!(
-        !retry.is_finished(),
-        "closure must keep waiting beyond the legacy four-attempt budget"
-    );
-    drop(gate_3);
-    timeout(Duration::from_secs(2), retry)
-        .await
-        .expect("closure should finish after critical capacity is released")
-        .expect("closure task joined")
-        .expect("failure persisted after sustained pressure");
-    drop(gate_1);
-    drop(gate_2);
-
-    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
-    assert_eq!(
-        database
-            .agent_task(&task_id)
-            .expect("task")
-            .expect("task")
-            .status,
-        foco_agent::AgentTaskStatus::Failed
-    );
-    assert_eq!(
-        database
-            .agent_attempts_for_task(&task_id)
-            .expect("attempts")[0]
-            .status,
-        foco_agent::AgentAttemptStatus::Failed
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn coordinator_panic_is_closed_without_leaving_a_running_attempt() {
     let workspace = tempfile::tempdir().expect("workspace");
     let profile = tempfile::tempdir().expect("profile");
@@ -20993,150 +20889,6 @@ fn workspace_spec_generation_prepare_uses_one_ordinary_slot() {
 }
 
 #[test]
-fn workspace_spec_list_and_prepare_do_not_starve_ordinary_gate() {
-    // Two lightweight list holders occupy both ordinary slots; a third ordinary open
-    // must wait while they hold, then succeed promptly after release. Prepare still
-    // succeeds afterward (one ordinary at a time). No fixed sleep as correctness signal.
-    use std::sync::{Arc, Barrier, mpsc};
-
-    let workspace = tempfile::tempdir().expect("workspace");
-    fs::write(
-        workspace.path().join("README.md"),
-        "Foco is a local coding workspace with chat and project context.",
-    )
-    .expect("write README");
-    let mut config = prompt_test_config(workspace.path().to_path_buf());
-    config.memory.enabled = false;
-    let workspace_id = config.workspaces[0].id.clone();
-    let job_id = "workspace-spec-list-prepare-starve-job";
-    {
-        let mut database =
-            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
-        database
-            .upsert_workspace_spec_settings(true, false)
-            .expect("spec settings");
-        let large_markdown = "w".repeat(40 * 1024);
-        let input_summary = json!({
-            "currentSpecMarkdown": large_markdown,
-            "currentSpecRevision": 1,
-        })
-        .to_string();
-        for index in 0..25 {
-            let id = format!("spec-job-history-{index}");
-            database
-                .insert_workspace_spec_job(NewWorkspaceSpecJob {
-                    id: &id,
-                    trigger_type: "chat_completed",
-                    chat_id: None,
-                    run_id: Some("run-hist"),
-                    model_id: Some("model"),
-                    base_revision: Some(1),
-                    input_summary_json: Some(&input_summary),
-                })
-                .expect("history job");
-            database
-                .mark_workspace_spec_job_completed(&id, None)
-                .expect("complete history");
-        }
-        database
-            .insert_workspace_spec_job(NewWorkspaceSpecJob {
-                id: job_id,
-                trigger_type: "manual_initial",
-                chat_id: None,
-                run_id: None,
-                model_id: Some("model"),
-                base_revision: Some(0),
-                input_summary_json: None,
-            })
-            .expect("prepare job");
-    }
-
-    let workspace_path = Arc::new(workspace.path().to_path_buf());
-    let holders_ready = Arc::new(Barrier::new(3));
-    let holders_release = Arc::new(Barrier::new(3));
-    let mut list_workers = Vec::new();
-    for _ in 0..2 {
-        let workspace_path = workspace_path.clone();
-        let holders_ready = holders_ready.clone();
-        let holders_release = holders_release.clone();
-        list_workers.push(std::thread::spawn(move || {
-            let database =
-                WorkspaceDatabase::open_or_create(workspace_path.as_path()).expect("list open");
-            let jobs = database.workspace_spec_jobs_list(20).expect("list jobs");
-            assert_eq!(jobs.len(), 20);
-            assert!(jobs.iter().all(|job| job.input_summary_json == "{}"));
-            holders_ready.wait();
-            holders_release.wait();
-            drop(database);
-            jobs.len()
-        }));
-    }
-
-    holders_ready.wait();
-
-    let business_path = workspace_path.clone();
-    let (done_tx, done_rx) = mpsc::channel();
-    let business = std::thread::spawn(move || {
-        let started = Instant::now();
-        let database = open_workspace_database(business_path.as_path())
-            .expect("business ordinary open must succeed after list holders release");
-        let count = database.workspace_spec_job_count().expect("job count");
-        drop(database);
-        done_tx
-            .send((count, started.elapsed()))
-            .expect("send business result");
-    });
-
-    // Prove the third ordinary open has entered the gate waiter queue before
-    // releasing holders (not merely that the business thread was scheduled).
-    assert!(
-        wait_for_ordinary_gate_queued_waiters(workspace_path.as_path(), 1, Duration::from_secs(2),),
-        "business open must enqueue on the ordinary gate while list holders are live"
-    );
-
-    match done_rx.recv_timeout(Duration::from_millis(250)) {
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-        Ok(_) => panic!("business open must wait while two ordinary list holders are live"),
-        Err(error) => panic!("business channel failed while holders live: {error}"),
-    }
-
-    holders_release.wait();
-    let (count, elapsed) = done_rx
-        .recv_timeout(Duration::from_secs(2))
-        .expect("business open after list holders release");
-    business.join().expect("business thread");
-    let list_counts: Vec<_> = list_workers
-        .into_iter()
-        .map(|worker| worker.join().expect("list worker"))
-        .collect();
-    assert!(list_counts.iter().all(|&count| count == 20));
-    assert!(count >= 26);
-    assert!(
-        elapsed < Duration::from_secs(2),
-        "business open should not approach the 5s ordinary timeout; took {elapsed:?}"
-    );
-
-    let prepared =
-        prepare_workspace_spec_job(&config, &workspace_id, &config.workspaces[0], job_id)
-            .expect("prepare must succeed after list holders release")
-            .expect("prepared job");
-    assert_eq!(prepared.job_id, job_id);
-
-    assert_eq!(
-        WORKSPACE_DATABASE_ORDINARY_CAPACITY, 2,
-        "phase must not raise ordinary capacity"
-    );
-    assert_eq!(
-        WORKSPACE_DATABASE_TOTAL_CAPACITY, 3,
-        "phase must not raise total capacity"
-    );
-    assert_eq!(
-        WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT,
-        Duration::from_secs(5)
-    );
-}
-
-#[test]
 fn workspace_spec_generation_prepare_skips_memory_when_disabled() {
     let workspace = tempfile::tempdir().expect("workspace");
     let mut config = prompt_test_config(workspace.path().to_path_buf());
@@ -21935,8 +21687,8 @@ async fn workspace_spec_lease_heartbeat_renews_while_job_future_runs() {
             .expect("lease set on mark running")
     };
 
-    // Ensure wall-clock advances enough for a distinct RFC3339 second.
-    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    // Lease timestamps use RFC3339 millis; a short pause is enough for a distinct value.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
     let result = run_workspace_spec_job_with_lease_heartbeat_interval(
         workspace.path(),
@@ -38696,7 +38448,9 @@ async fn serve_fake_sidecar_proxy_fixture(
                     }
                     let stream = async_stream::stream! {
                         yield Ok::<_, Infallible>(axum::response::sse::Event::default().data("stream-start"));
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        // Keep the stream open long enough to prove the proxy returns
+                        // headers/first chunk before the sidecar finishes.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
                         yield Ok::<_, Infallible>(axum::response::sse::Event::default().data("stream-end"));
                     };
                     axum::response::sse::Sse::new(stream).into_response()

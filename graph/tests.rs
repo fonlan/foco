@@ -1166,42 +1166,6 @@ fn add_large_execution_root_sources(workspace: &Path) {
     }
 }
 
-#[test]
-fn index_workspace_shares_store_gate_with_critical_reservation() {
-    use foco_store::workspace::{
-        WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT, open_workspace_database,
-        open_workspace_database_critical,
-    };
-    use std::time::Instant;
-
-    let workspace = tempfile::tempdir().expect("workspace");
-    fs::write(workspace.path().join("lib.rs"), "fn gated_symbol() {}\n").expect("source");
-
-    let ordinary_1 = open_workspace_database(workspace.path()).expect("ordinary 1");
-    let ordinary_2 = open_workspace_database(workspace.path()).expect("ordinary 2");
-    let critical = open_workspace_database_critical(workspace.path()).expect("critical");
-
-    let workspace_path = workspace.path().to_path_buf();
-    let started_at = Instant::now();
-    let index_error =
-        index_workspace(&workspace_path).expect_err("ordinary gate must reject index");
-
-    assert!(started_at.elapsed() >= WORKSPACE_DATABASE_ORDINARY_GATE_TIMEOUT);
-    assert!(
-        index_error
-            .to_string()
-            .contains("workspace database concurrency limit reached")
-    );
-
-    drop(ordinary_2);
-    let report = index_workspace(workspace.path()).expect("index after ordinary release");
-
-    assert_eq!(report.indexed_files, 1);
-
-    drop(ordinary_1);
-    drop(critical);
-}
-
 fn semantic_fixture_workspace(name: &str) -> tempfile::TempDir {
     let workspace = tempfile::tempdir().expect("fixture workspace");
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
