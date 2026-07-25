@@ -84,6 +84,7 @@ import { preloadOptionalMonaco } from "../files/WorkspaceFileEditorPanel";
 import { useI18n } from "../../shared/i18n";
 import {
   Button,
+  ButtonGroup,
   Card,
   Checkbox,
   Dropdown,
@@ -1233,10 +1234,13 @@ function ContextPlanTab({
                                 </Button>
                               ) : null}
                               {canRetryPhase ? (
-                                <div className="relative inline-flex h-7 shrink-0 rounded-md shadow-sm">
+                                <ButtonGroup
+                                  className="h-7 shrink-0 shadow-sm"
+                                  variant="ghost"
+                                >
                                   <Button
                                     aria-label={t("Retry plan phase")}
-                                    className="inline-flex h-7 max-w-[7rem] items-center justify-center gap-1 rounded-l-md border border-[var(--border)] bg-[var(--surface)] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                                    className="h-7 max-w-[7rem] px-2 text-xs font-semibold text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                     isDisabled={operationKey !== null}
                                     onPress={() => {
                                       onPhaseRetry(
@@ -1260,11 +1264,13 @@ function ContextPlanTab({
                                   <Dropdown>
                                     <Button
                                       aria-label={t("Retry phase options")}
-                                      className="inline-flex h-7 w-7 items-center justify-center rounded-r-md border border-l-0 border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
+                                      className="h-7 text-[var(--muted)] hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)] disabled:cursor-not-allowed disabled:bg-[var(--surface-secondary)] disabled:text-[var(--muted)]"
                                       isDisabled={operationKey !== null}
+                                      isIconOnly
                                       type="button"
                                       variant="ghost"
                                     >
+                                      <ButtonGroup.Separator />
                                       <ChevronDown aria-hidden="true" className="size-3.5" />
                                     </Button>
                                     <Dropdown.Popover className="min-w-40">
@@ -1282,7 +1288,7 @@ function ContextPlanTab({
                                       </Dropdown.Menu>
                                     </Dropdown.Popover>
                                   </Dropdown>
-                                </div>
+                                </ButtonGroup>
                               ) : null}
                             </div>
                           </div>

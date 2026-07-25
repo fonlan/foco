@@ -8,6 +8,7 @@
  * Docs (fetch before implementing new usage):
  * - Accordion: https://heroui.com/docs/react/components/accordion.mdx
  * - Button: https://heroui.com/docs/react/components/button.mdx
+ * - ButtonGroup: https://heroui.com/docs/react/components/button-group.mdx
  * - Modal: https://heroui.com/docs/react/components/modal.mdx
  * - TextField: https://heroui.com/docs/react/components/text-field.mdx
  * - Select: https://heroui.com/docs/react/components/select.mdx
@@ -29,6 +30,7 @@ export {
   Alert,
   Badge,
   Button,
+  ButtonGroup,
   Card,
   Checkbox,
   Chip,

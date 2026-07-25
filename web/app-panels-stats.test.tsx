@@ -1193,9 +1193,25 @@ describe("app-panels-stats verification surfaces", () => {
         await screen.findByText("Retry failed plan phase"),
       ).toBeInTheDocument();
 
-      await user.click(
-        screen.getByRole("button", { name: "Retry plan phase" }),
-      );
+      const retryButton = screen.getByRole("button", {
+        name: "Retry plan phase",
+      });
+      const retryOptionsButton = screen.getByRole("button", {
+        name: "Retry phase options",
+      });
+      const retryButtonGroup = retryButton.closest('[data-slot="button-group"]');
+      expect(retryButtonGroup).not.toBeNull();
+      if (!retryButtonGroup) {
+        throw new Error("Retry controls must be wrapped by a ButtonGroup.");
+      }
+      expect(
+        retryOptionsButton.closest('[data-slot="button-group"]'),
+      ).toBe(retryButtonGroup);
+      expect(
+        retryButtonGroup.querySelector('[data-slot="button-group-separator"]'),
+      ).toBeInTheDocument();
+
+      await user.click(retryButton);
 
       await waitFor(() => {
         expect(fetchMock).toHaveBeenCalledWith(
