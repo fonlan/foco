@@ -8514,6 +8514,11 @@ describe("app-chat-stream verification surfaces", () => {
                 label: "Proceed",
                 value: "proceed",
               },
+              {
+                description: "Keep the run paused until you are ready to continue.",
+                label: "Wait for a later review before continuing this background run",
+                value: "wait",
+              },
             ],
             question: "Should the background run continue?",
           },
@@ -8553,6 +8558,15 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(dialog).getByText("Should the background run continue?"),
     ).toBeInTheDocument();
+    const radioOptions = within(dialog).getAllByRole("radio");
+    const optionContents = [
+      within(dialog).getByText("Proceed").closest(".w-full"),
+      within(dialog)
+        .getByText("Wait for a later review before continuing this background run")
+        .closest(".w-full"),
+    ];
+    expect(radioOptions).toHaveLength(optionContents.length);
+    optionContents.forEach((content) => expect(content).toHaveClass("w-full"));
 
     await userEvent.click(within(dialog).getByText("Proceed"));
     await userEvent.click(

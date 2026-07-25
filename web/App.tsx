@@ -15080,7 +15080,7 @@ function QuestionDialog({
                       >
                         {item.options.map((option) => (
                           <Radio key={option.value} value={option.value}>
-                            <Radio.Content className="flex cursor-pointer gap-3 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground transition hover:border-accent/40 hover:bg-accent-soft/40 data-[selected=true]:border-accent data-[selected=true]:bg-accent-soft data-[selected=true]:text-accent-soft-foreground">
+                            <Radio.Content className="flex w-full cursor-pointer gap-3 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground transition hover:border-accent/40 hover:bg-accent-soft/40 data-[selected=true]:border-accent data-[selected=true]:bg-accent-soft data-[selected=true]:text-accent-soft-foreground">
                               <Radio.Control className="mt-1 size-4 shrink-0">
                                 <Radio.Indicator />
                               </Radio.Control>
