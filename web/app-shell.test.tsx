@@ -2147,6 +2147,115 @@ describe("app-shell verification surfaces", () => {
     ).toBeInTheDocument();
   });
 
+  it("marks only the selected nav page as current and keeps other rail actions neutral", async () => {
+    renderApp();
+
+    const navRail = await screen.findByRole("navigation", { name: "Foco" });
+    const homeButton = within(navRail).getByRole("button", { name: "Home" });
+    const apiDetailsButton = within(navRail).getByRole("button", {
+      name: "API details",
+    });
+    const themeButton = within(navRail).getByRole("button", {
+      name: "Switch to dark theme",
+    });
+
+    expect(homeButton).toHaveAttribute("aria-current", "page");
+    expect(homeButton).toHaveClass(
+      "button--tertiary",
+      "button--icon-only",
+      "foco-nav-rail-button-active",
+    );
+    expect(apiDetailsButton).not.toHaveAttribute("aria-current");
+    expect(apiDetailsButton).toHaveClass("button--ghost", "button--icon-only");
+    expect(themeButton).not.toHaveAttribute("aria-current");
+    expect(themeButton).not.toHaveAttribute("aria-pressed");
+    expect(themeButton).toHaveClass("button--ghost");
+
+    await userEvent.click(apiDetailsButton);
+
+    await waitFor(() => {
+      const currentNavRail = screen.getByRole("navigation", { name: "Foco" });
+      const currentApiDetailsButton = within(currentNavRail).getByRole("button", {
+        name: "API details",
+      });
+
+      expect(currentApiDetailsButton).toHaveAttribute("aria-current", "page");
+      expect(currentApiDetailsButton).toHaveClass(
+        "button--tertiary",
+        "foco-nav-rail-button-active",
+      );
+      expect(within(currentNavRail).getByRole("button", { name: "Home" })).toHaveClass(
+        "button--ghost",
+      );
+      expect(currentNavRail.querySelectorAll('[aria-current="page"]')).toHaveLength(1);
+    });
+  });
+
+  it("exposes terminal and context panel state as independent pressed toggles", async () => {
+    renderApp();
+
+    const navRail = await screen.findByRole("navigation", { name: "Foco" });
+    let contextPanelButton = within(navRail).getByRole("button", {
+      name: /context panel/,
+    });
+    if (contextPanelButton.getAttribute("aria-pressed") === "true") {
+      await userEvent.click(contextPanelButton);
+      contextPanelButton = await screen.findByRole("button", {
+        name: "Open context panel",
+      });
+    }
+    let terminalButton = within(navRail).getByRole("button", { name: /terminal/ });
+    if (terminalButton.getAttribute("aria-pressed") === "true") {
+      await userEvent.click(terminalButton);
+      terminalButton = await screen.findByRole("button", { name: "Open terminal" });
+    }
+
+    expect(contextPanelButton).toHaveAttribute("aria-pressed", "false");
+    expect(contextPanelButton).toHaveClass("button--ghost");
+    expect(terminalButton).toHaveAttribute("aria-pressed", "false");
+    expect(terminalButton).toHaveClass("button--ghost");
+
+    await userEvent.click(contextPanelButton);
+    const closeContextPanelButton = await screen.findByRole("button", {
+      name: "Close context panel",
+    });
+    expect(closeContextPanelButton).toHaveAttribute("aria-pressed", "true");
+    expect(closeContextPanelButton).toHaveClass(
+      "button--tertiary",
+      "foco-nav-rail-button-active",
+    );
+
+    await userEvent.click(closeContextPanelButton);
+    const openContextPanelButton = await screen.findByRole("button", {
+      name: "Open context panel",
+    });
+    expect(openContextPanelButton).toHaveAttribute("aria-pressed", "false");
+    expect(openContextPanelButton).toHaveClass("button--ghost");
+    expect(openContextPanelButton).not.toHaveClass(
+      "button--tertiary",
+      "foco-nav-rail-button-active",
+    );
+
+    await userEvent.click(terminalButton);
+    const closeTerminalButton = await screen.findByRole("button", { name: "Close terminal" });
+    expect(closeTerminalButton).toHaveAttribute("aria-pressed", "true");
+    expect(closeTerminalButton).toHaveClass(
+      "button--tertiary",
+      "foco-nav-rail-button-active",
+    );
+
+    await userEvent.click(closeTerminalButton);
+    const openTerminalButton = await screen.findByRole("button", {
+      name: "Open terminal",
+    });
+    expect(openTerminalButton).toHaveAttribute("aria-pressed", "false");
+    expect(openTerminalButton).toHaveClass("button--ghost");
+    expect(openTerminalButton).not.toHaveClass(
+      "button--tertiary",
+      "foco-nav-rail-button-active",
+    );
+  });
+
   it("opens scheduled tasks from the nav and URL", async () => {
     const fetchMock = vi.mocked(fetch);
     renderApp();

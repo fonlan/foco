@@ -13701,6 +13701,7 @@ export function App() {
                   ? t("Close context panel")
                   : t("Open context panel"),
                 onClick: () => setIsContextPanelOpen((current) => !current),
+                selection: "toggle",
               }}
               terminalButton={{
                 active: isTerminalOpen,
@@ -13710,6 +13711,7 @@ export function App() {
                   ? t("Close terminal")
                   : t("Open terminal"),
                 onClick: toggleWorkspaceTerminal,
+                selection: "toggle",
               }}
               onLogout={handleLogout}
               onOpenScheduledTasks={openScheduledTasksView}
@@ -15620,6 +15622,7 @@ type NavRailAction = {
   }) => ReactNode;
   label: string;
   onClick: () => void;
+  selection?: "action" | "page" | "toggle";
 };
 
 function FocoNavRail({
@@ -15676,30 +15679,35 @@ function FocoNavRail({
           icon={Home}
           label={t("Home")}
           onClick={onHomeClick}
+          selection="page"
         />
         <NavRailButton
           active={activeMode === "stats"}
           icon={Activity}
           label={t("API details")}
           onClick={onOpenStats}
+          selection="page"
         />
         <NavRailButton
           active={activeMode === "scheduled"}
           icon={CalendarClock}
           label={t("Scheduled tasks")}
           onClick={onOpenScheduledTasks}
+          selection="page"
         />
         <NavRailButton
           active={activeMode === "skill-store"}
           icon={ShoppingBag}
           label={t("Skill Store")}
           onClick={onOpenSkillStore}
+          selection="page"
         />
         <NavRailButton
           active={activeMode === "settings"}
           icon={Settings}
           label={t("Settings")}
           onClick={onOpenSettings}
+          selection="page"
         />
       </div>
       <div className="foco-nav-rail-bottom">
@@ -15713,7 +15721,7 @@ function FocoNavRail({
           onClick={onAddWorkspace}
         />
         <NavRailButton
-          active={theme === "dark"}
+          active={false}
           icon={SunMoon}
           label={themeLabel}
           onClick={onToggleTheme}
@@ -15737,15 +15745,19 @@ function NavRailButton({
   icon: Icon,
   label,
   onClick,
+  selection = "action",
 }: NavRailAction) {
   return (
     <Button
+      aria-current={selection === "page" && active ? "page" : undefined}
       aria-label={label}
+      aria-pressed={selection === "toggle" ? active : undefined}
       className={`foco-nav-rail-button ${active ? "foco-nav-rail-button-active" : ""}`}
       isDisabled={disabled}
+      isIconOnly
       onPress={onClick}
       type="button"
-      variant="tertiary"
+      variant={active ? "tertiary" : "ghost"}
     >
       <Icon aria-hidden="true" className="size-4" />
     </Button>

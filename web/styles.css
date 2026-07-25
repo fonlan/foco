@@ -5193,15 +5193,23 @@ summary:focus-visible {
 /* Final neutral-state overrides. These deliberately follow the legacy Foco
    visual refresh rules above so navigation and disclosure surfaces never
    inherit the primary accent treatment. */
-.foco-nav-rail-button:hover,
-.foco-nav-rail-button-active {
-  background: var(--default) !important;
+.foco-nav-rail-button:hover {
+  background: color-mix(in oklab, var(--default) 58%, transparent) !important;
   color: var(--foreground) !important;
   box-shadow: none;
 }
 
+.foco-nav-rail-button-active,
+.foco-nav-rail-button-active:hover {
+  background: var(--default) !important;
+  color: var(--foreground) !important;
+  box-shadow: inset 0 0 0 1px var(--border) !important;
+}
+
 .foco-nav-rail-button-active::before {
-  display: none;
+  display: block;
+  background: var(--default-foreground);
+  pointer-events: none;
 }
 
 .reasoning-block {
