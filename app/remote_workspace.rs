@@ -220,6 +220,9 @@ const CONTROL_WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const FORWARD_SSH_CHECK_INTERVAL: Duration = Duration::from_secs(2);
 const BROKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 const BROKER_OFFLINE_RUN_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Allows the host to return a completed `web.fetch` result after its HTTP deadline.
+/// This is transport time only and is never passed to reqwest.
+const BROKER_WEB_FETCH_RESPONSE_GRACE: Duration = Duration::from_millis(500);
 const MAX_BROKER_REQUEST_ID_BYTES: usize =
     foco_tools::output_budget::TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT;
 const MAX_BROKER_ERROR_CODE_BYTES: usize = 128;
@@ -14967,6 +14970,10 @@ async fn remote_sidecar_execute_memory_tool(
     }
 }
 
+fn broker_web_fetch_wait_timeout(http_timeout_ms: u64) -> Duration {
+    Duration::from_millis(http_timeout_ms).saturating_add(BROKER_WEB_FETCH_RESPONSE_GRACE)
+}
+
 async fn remote_sidecar_execute_broker_tool(
     state: &RemoteSidecarState,
     tool_workspace_path: &Path,
@@ -14988,7 +14995,8 @@ async fn remote_sidecar_execute_broker_tool(
         "memory.global.search" | "memory.global.write" => {
             Duration::from_millis(memory_tool_timeout_ms(&arguments)?)
         }
-        "web.search" | "web.fetch" => Duration::from_millis(web_tool_timeout_ms(&arguments)?),
+        "web.search" => Duration::from_millis(web_tool_timeout_ms(&arguments)?),
+        "web.fetch" => broker_web_fetch_wait_timeout(web_tool_timeout_ms(&arguments)?),
         "ui.askQuestion" => BROKER_OFFLINE_RUN_TIMEOUT,
         _ => BROKER_REQUEST_TIMEOUT,
     };
@@ -43521,6 +43529,86 @@ mod tests {
         assert!(
             text.contains("isolated cache line 2"),
             "read_file should open fullResultPath from tool workspace: {read_output}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_broker_web_fetch_preserves_host_diagnostic_within_response_grace() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, mut broker_rx) =
+            test_sidecar_state(workspace.path().to_string_lossy().to_string(), 1);
+        let catalog = build_remote_tool_catalog(
+            None,
+            None,
+            RemoteBrokerToolDiscovery::default(),
+            Arc::new(McpRegistry::default()),
+            &state.workspace_id,
+            false,
+            None,
+        )
+        .await;
+        let execution_state = state.clone();
+        let execution = tokio::spawn(async move {
+            test_execute_remote_sidecar_local_tool(
+                &execution_state,
+                &catalog,
+                "call-web-diagnostic",
+                "web_fetch",
+                json!({ "url": "https://example.test", "timeoutMs": 1 }),
+                None,
+            )
+            .await
+        });
+        let request = timeout(Duration::from_secs(1), broker_rx.recv())
+            .await
+            .expect("broker request timeout")
+            .expect("broker request");
+        assert_eq!(request.method.as_deref(), Some("web.fetch"));
+
+        // A host HTTP deadline of 1 ms has elapsed, but its broker response still has a
+        // bounded transport grace period in which to deliver the actionable diagnostic.
+        sleep(Duration::from_millis(10)).await;
+        let request_id = request.id.clone().expect("broker request id");
+        let pending = state
+            .broker_pending
+            .lock()
+            .await
+            .get(&request_id)
+            .cloned()
+            .expect("broker pending response channel");
+        let diagnostic = "web_fetch timeout during response-body after 1ms for https://example.test: cause: deadline elapsed. Action: retry with a larger timeoutMs or use a smaller, more direct URL.";
+        pending
+            .send(ControlEnvelope {
+                version: 1,
+                message_type: "response".to_string(),
+                id: Some(request_id),
+                method: None,
+                payload: json!({
+                    "status": "ok",
+                    "isError": true,
+                    "result": { "error": diagnostic },
+                }),
+                timestamp: None,
+            })
+            .expect("send diagnostic broker response");
+
+        let (output, is_error, _, _) = timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("broker tool execution timeout")
+            .expect("broker tool execution task");
+        assert!(is_error, "{output}");
+        assert_eq!(output["error"], diagnostic);
+    }
+
+    #[test]
+    fn broker_web_fetch_wait_timeout_adds_only_the_bounded_response_grace() {
+        assert_eq!(
+            broker_web_fetch_wait_timeout(1),
+            Duration::from_millis(1) + BROKER_WEB_FETCH_RESPONSE_GRACE
+        );
+        assert_eq!(
+            broker_web_fetch_wait_timeout(120_000),
+            Duration::from_millis(120_000) + BROKER_WEB_FETCH_RESPONSE_GRACE
         );
     }
 
