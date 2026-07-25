@@ -1196,7 +1196,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_run_subscription_stream_recovers_all_events_after_broadcast_lag() {
+    async fn chat_run_subscription_stream_recovers_events_produced_after_broadcast_lag() {
         let (event_tx, event_rx) = broadcast::channel(1);
         let (completed_tx, completed_rx) = watch::channel(false);
         let events = Arc::new(Mutex::new(vec![ChatRunEventFrame {
@@ -1230,8 +1230,80 @@ mod tests {
         // Completion is still false, so this poll must receive the lag notification
         // and recover from the active-run snapshot rather than take the completion path.
         let recovered_event = stream.next().await.expect("lag recovery event");
+        let post_lag_event = ChatRunEventFrame {
+            sequence: 514,
+            event_type: "textDelta".to_string(),
+            payload_json: r#"{"type":"textDelta","delta":"post-lag"}"#.to_string(),
+        };
+        events
+            .lock()
+            .expect("event cache")
+            .push(post_lag_event.clone());
+        event_tx
+            .send(post_lag_event)
+            .expect("subscription receiver");
         completed_tx.send(true).expect("complete subscription");
         let stream = futures_util::stream::once(async move { recovered_event }).chain(stream);
+        let body = Sse::new(stream).into_response().into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        for sequence in 1..=514 {
+            assert_eq!(
+                text.matches(&format!("id: {sequence}\n\n")).count(),
+                1,
+                "sequence {sequence} must be replayed exactly once: {text}"
+            );
+        }
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_drains_lagged_events_when_completion_races() {
+        let (event_tx, event_rx) = broadcast::channel(1);
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let events = Arc::new(Mutex::new(vec![ChatRunEventFrame {
+            sequence: 0,
+            event_type: "start".to_string(),
+            payload_json: r#"{"type":"start"}"#.to_string(),
+        }]));
+        let subscription = ActiveChatRunSubscription {
+            replay: events.lock().expect("event cache").clone(),
+            event_rx,
+            completed_rx,
+            after_sequence: -1,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: events.clone(),
+        };
+        let mut stream = Box::pin(chat_run_subscription_stream(subscription));
+
+        assert!(stream.next().await.is_some());
+        for sequence in 1..=513 {
+            let event = ChatRunEventFrame {
+                sequence,
+                event_type: if sequence == 513 {
+                    "complete"
+                } else {
+                    "textDelta"
+                }
+                .to_string(),
+                payload_json: format!(
+                    r#"{{"type":"{}","sequence":{sequence}}}"#,
+                    if sequence == 513 {
+                        "complete"
+                    } else {
+                        "textDelta"
+                    }
+                ),
+            };
+            events.lock().expect("event cache").push(event.clone());
+            event_tx.send(event).expect("subscription receiver");
+        }
+        completed_tx.send(true).expect("complete subscription");
+
         let body = Sse::new(stream).into_response().into_body();
         let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
         let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
@@ -1240,9 +1312,57 @@ mod tests {
             assert_eq!(
                 text.matches(&format!("id: {sequence}\n\n")).count(),
                 1,
-                "sequence {sequence} must be replayed exactly once: {text}"
+                "sequence {sequence} must be drained exactly once: {text}"
             );
         }
+        assert!(text.contains("\"type\":\"complete\""), "{text}");
+        assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
+        assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn chat_run_subscription_stream_keeps_event_recorded_after_subscription_snapshot() {
+        let (event_tx, event_rx) = broadcast::channel(1);
+        let (completed_tx, completed_rx) = watch::channel(false);
+        let events = Arc::new(Mutex::new(vec![ChatRunEventFrame {
+            sequence: 0,
+            event_type: "start".to_string(),
+            payload_json: r#"{"type":"start"}"#.to_string(),
+        }]));
+        let subscription = ActiveChatRunSubscription {
+            // The receiver is created before the replay snapshot, matching the production
+            // subscription order that closes the initialization event window.
+            replay: events.lock().expect("event cache").clone(),
+            event_rx,
+            completed_rx,
+            after_sequence: -1,
+            workspace_id: "workspace-1".to_string(),
+            chat_id: "chat-1".to_string(),
+            run_id: "run-1".to_string(),
+            events: events.clone(),
+        };
+        let hook_notification = ChatRunEventFrame {
+            sequence: 1,
+            event_type: "hookNotification".to_string(),
+            payload_json: r#"{"type":"hookNotification","notification":{"message":"logged during subscribe"}}"#.to_string(),
+        };
+        events
+            .lock()
+            .expect("event cache")
+            .push(hook_notification.clone());
+        event_tx
+            .send(hook_notification)
+            .expect("subscription receiver");
+        completed_tx.send(true).expect("complete subscription");
+
+        let body = Sse::new(chat_run_subscription_stream(subscription))
+            .into_response()
+            .into_body();
+        let bytes = to_bytes(body, usize::MAX).await.expect("SSE body reads");
+        let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
+
+        assert_eq!(text.matches("id: 1\n\n").count(), 1, "{text}");
+        assert!(text.contains("logged during subscribe"), "{text}");
         assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
         assert!(!text.contains("\"type\":\"error\""), "{text}");
     }

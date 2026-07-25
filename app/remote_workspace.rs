@@ -23298,7 +23298,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn remote_run_subscription_recovers_all_events_after_broadcast_lag() {
+    async fn remote_run_subscription_recovers_events_produced_after_broadcast_lag() {
         let run_stream = RemoteActiveRunStream::new("chat-1".to_string());
         run_stream.set_subscription_context("workspace-1".to_string(), "run-1".to_string());
         run_stream.record(0, json!({ "type": "start" }));
@@ -23308,17 +23308,14 @@ mod tests {
         for sequence in 1..=513 {
             run_stream.record(
                 sequence,
-                if sequence == 513 {
-                    json!({ "type": "streamEnd" })
-                } else {
-                    json!({ "type": "textDelta", "delta": sequence.to_string() })
-                },
+                json!({ "type": "textDelta", "delta": sequence.to_string() }),
             );
         }
 
         // `mark_finished` remains false here, forcing the next poll through
         // `rx.recv()` and therefore through the broadcast-lag recovery branch.
         let recovered_event = stream.next().await.expect("lag recovery event");
+        run_stream.record(514, json!({ "type": "streamEnd" }));
         run_stream.mark_finished();
 
         let stream = futures_util::stream::once(async move { recovered_event }).chain(stream);
@@ -23328,7 +23325,7 @@ mod tests {
             .expect("SSE body reads");
         let text = String::from_utf8(bytes.to_vec()).expect("SSE is utf-8");
 
-        for sequence in 1..=513 {
+        for sequence in 1..=514 {
             assert_eq!(
                 text.matches(&format!("id: {sequence}\ndata:")).count(),
                 1,

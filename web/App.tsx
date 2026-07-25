@@ -10856,7 +10856,12 @@ export function App() {
           if (!ownsSession()) {
             return;
           }
-          const eventSequence = meta.id === null ? null : Number(meta.id);
+          const eventSequence = meta.id === null ? Number.NaN : Number(meta.id);
+          const isReplay =
+            Number.isFinite(eventSequence) && eventSequence <= lastProcessedSequence;
+          if (isReplay) {
+            return;
+          }
           updateLastProcessedSequence(
             Number.isFinite(eventSequence) ? eventSequence : null,
           );

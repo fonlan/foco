@@ -6957,6 +6957,111 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBe("STRONG");
   });
 
+  it("keeps reattached replayed sequence events idempotent and completes without a false error", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/messages") {
+          return jsonResponse({
+            messages: [
+              chatMessages.messages[0],
+              {
+                ...chatMessages.messages[1],
+                content: "",
+                id: "message-assistant-stream",
+                metrics: null,
+                parts: [],
+                reasoning: null,
+                status: "streaming",
+                toolCalls: [],
+              },
+            ],
+            activeRun: {
+              assistantMessageId: "message-assistant-stream",
+              chatId: "chat-1",
+              lastSequence: 0,
+              runId: "request-stream",
+              workspaceId: "workspace-1",
+            },
+          });
+        }
+
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.replaceState(null, "", "/workspace-1/chat-1");
+    renderApp();
+
+    await waitFor(() =>
+      expect(appTestState.chatStreamControllers.has("request-stream")).toBe(
+        true,
+      ),
+    );
+
+    const controller = appTestState.chatStreamControllers.get("request-stream");
+    if (!controller) {
+      throw new Error("Expected reattached chat stream controller");
+    }
+    const encoder = new TextEncoder();
+    const frame = (sequence: number | null, event: Record<string, unknown>) =>
+      `${sequence === null ? "" : `id: ${sequence}\n`}data: ${JSON.stringify(event)}\n\n`;
+
+    await act(async () => {
+      controller.enqueue(
+        encoder.encode(
+          frame(1, {
+            assistantMessageId: "message-assistant-stream",
+            chatId: "chat-1",
+            llmRequestId: "request-stream",
+            memoriesUsed: [],
+            type: "start",
+            userMessageId: "message-user-stream",
+          }) +
+            frame(2, {
+              assistantMessageId: "message-assistant-stream",
+              delta: "Recovered exactly once.",
+              type: "textDelta",
+            }) +
+            frame(2, {
+              assistantMessageId: "message-assistant-stream",
+              delta: "Recovered exactly once.",
+              type: "textDelta",
+            }) +
+            frame(3, {
+              assistantMessageId: "message-assistant-stream",
+              chatId: "chat-1",
+              memoriesUsed: [],
+              metrics: {
+                firstTokenLatencyMs: 1,
+                modelId: "gpt-test",
+                outputTokens: 1,
+                providerId: "openai",
+                totalLatencyMs: 2,
+              },
+              reasoning: null,
+              stopReason: "completed",
+              text: "Recovered exactly once.",
+              type: "complete",
+              usage: null,
+            }) + frame(null, { type: "streamEnd" }),
+        ),
+      );
+      controller.close();
+    });
+
+    expect(await screen.findByText("Recovered exactly once.")).toBeInTheDocument();
+    expect(screen.getAllByText("Recovered exactly once.")).toHaveLength(1);
+    expect(screen.queryByText(/lagged behind/i)).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("status", { name: "Chat failed" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("shows retrieved memories as soon as the chat stream starts", async () => {
     renderApp();
 
