@@ -9,7 +9,7 @@ use std::{
 use crate::runtime::{
     MAX_REASONING_LOOP_RECOVERIES_PER_RUN, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
     REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, TOOL_CALL_LOOP_GUARD_SOURCE,
-    ToolLoopBeforeExecutionAction, agent_run_event_kind,
+    ToolLoopBeforeExecutionAction, agent_run_event_kind, reconcile_agent_attempt_leases,
 };
 use axum::{
     Json, Router,
@@ -12820,6 +12820,85 @@ fn startup_reconciliation_preserves_attempt_with_active_durable_lease() {
             && event.payload_json.contains("lease_active")
             && event.attempt_id.as_ref() == Some(&attempt_id)
     }));
+}
+
+#[test]
+fn scheduler_reconciliation_keeps_its_own_expired_attempt_running() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let profile = tempfile::tempdir().expect("profile");
+    let scheduler_owner = "agent-owner-current-scheduler";
+    let (team_id, _, task_id, attempt_id) = insert_claimed_agent_task_with_input_and_owner(
+        workspace.path(),
+        "current-scheduler-expired-lease",
+        "{}",
+        Some(scheduler_owner),
+    );
+    let database_path = {
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        database.database_path().to_path_buf()
+    };
+    Connection::open(&database_path)
+        .expect("open lease fixture")
+        .execute(
+            "UPDATE agent_attempts
+             SET lease_renewed_at = '2000-01-01T00:00:00Z'
+             WHERE id = ?1",
+            params![attempt_id.as_str()],
+        )
+        .expect("expire lease fixture");
+
+    let state = test_app_state(
+        prompt_test_config(workspace.path().to_path_buf()),
+        profile.path().to_path_buf(),
+    );
+    let active_attempt_ids = HashSet::from([attempt_id.clone()]);
+    reconcile_agent_attempt_leases(
+        &state,
+        None,
+        Some(scheduler_owner),
+        Some(&active_attempt_ids),
+    )
+    .expect("scheduler reconciliation");
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&task_id)
+            .expect("task")
+            .expect("task")
+            .status,
+        foco_agent::AgentTaskStatus::Running,
+        "the current scheduler must not mistake its own stale heartbeat for a restart"
+    );
+    let events = database.agent_events_after(&team_id, -1).expect("events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "attempt_recovery_skipped"
+            && event.payload_json.contains("current_scheduler_owner")
+            && event.attempt_id.as_ref() == Some(&attempt_id)
+    }));
+
+    let no_active_attempts = HashSet::new();
+    reconcile_agent_attempt_leases(
+        &state,
+        None,
+        Some(scheduler_owner),
+        Some(&no_active_attempts),
+    )
+    .expect("untracked attempt reconciliation");
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+    let recovered_task = database.agent_task(&task_id).expect("task").expect("task");
+    assert_eq!(
+        recovered_task.status,
+        foco_agent::AgentTaskStatus::Interrupted,
+        "a same-owner attempt without a tracked coordinator must still be recovered"
+    );
+    assert!(
+        recovered_task
+            .error_json
+            .as_deref()
+            .is_some_and(|error| error.contains("agent_attempt_lease_expired")),
+        "ordinary lease expiry must not be labeled as a backend restart"
+    );
 }
 
 #[test]
