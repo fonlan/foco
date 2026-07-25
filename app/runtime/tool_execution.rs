@@ -1511,6 +1511,15 @@ enum AgentDelegateTargetKind {
     Definition,
 }
 
+impl AgentDelegateTargetKind {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Instance => "instance",
+            Self::Definition => "definition",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AgentDelegateTaskInput {
@@ -1524,12 +1533,12 @@ struct AgentDelegateTaskInput {
 }
 
 /// Strongly typed target after `targetKind` selects the corresponding id contract.
-enum ResolvedAgentDelegateTarget {
+enum AgentDelegateTarget {
     Instance(AgentInstanceId),
     Definition(AgentDefinitionId),
 }
 
-impl ResolvedAgentDelegateTarget {
+impl AgentDelegateTarget {
     fn target_definition_id(&self) -> Option<&AgentDefinitionId> {
         match self {
             Self::Instance(_) => None,
@@ -2583,19 +2592,45 @@ fn agent_tool_task_id(context: &AgentToolContext) -> Result<&AgentTaskId, String
 
 fn resolve_agent_delegate_target(
     input: &AgentDelegateTaskInput,
-) -> Result<ResolvedAgentDelegateTarget, String> {
-    match input.target_kind {
-        AgentDelegateTargetKind::Instance => {
-            parse_required_agent_instance_id(AGENT_DELEGATE_TASK_TOOL, "targetId", &input.target_id)
-                .map(ResolvedAgentDelegateTarget::Instance)
-        }
-        AgentDelegateTargetKind::Definition => parse_required_agent_definition_id(
-            AGENT_DELEGATE_TASK_TOOL,
-            "targetId",
-            &input.target_id,
-        )
-        .map(ResolvedAgentDelegateTarget::Definition),
+) -> Result<AgentDelegateTarget, String> {
+    match &input.target_kind {
+        AgentDelegateTargetKind::Instance => AgentInstanceId::new(&input.target_id)
+            .map(AgentDelegateTarget::Instance)
+            .map_err(|_| {
+                agent_delegate_target_id_error(
+                    input.target_kind.as_str(),
+                    AgentInstanceId::PREFIX,
+                    "instances[].id",
+                    &input.target_id,
+                )
+            }),
+        AgentDelegateTargetKind::Definition => AgentDefinitionId::new(&input.target_id)
+            .map(AgentDelegateTarget::Definition)
+            .map_err(|_| {
+                agent_delegate_target_id_error(
+                    input.target_kind.as_str(),
+                    AgentDefinitionId::PREFIX,
+                    "definitions[].id",
+                    &input.target_id,
+                )
+            }),
     }
+}
+
+fn agent_delegate_target_id_error(
+    target_kind: &str,
+    prefix: &str,
+    agent_list_path: &str,
+    value: &str,
+) -> String {
+    agent_tool_error(
+        "invalid_arguments",
+        format!(
+            "agent_delegate_task targetKind {target_kind:?} requires a targetId starting with \
+'{prefix}' (got {value:?}). Copy the exact id from agent_list.{agent_list_path}; \
+do not invent ids or use display names."
+        ),
+    )
 }
 
 fn parse_required_agent_definition_id(
@@ -2652,10 +2687,11 @@ Copy the exact id from agent_list.{agent_list_path}; do not invent ids or use di
 fn select_delegate_target_instance(
     context: &AgentToolContext,
     workspace_path: &Path,
-    target: &ResolvedAgentDelegateTarget,
+    target: &AgentDelegateTarget,
 ) -> Result<AgentInstanceId, String> {
     match target {
-        ResolvedAgentDelegateTarget::Instance(instance_id) => {
+        AgentDelegateTarget::Instance(instance_id) => {
+            let team_id = agent_tool_team_id(context)?;
             let database =
                 WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
             let instance = database
@@ -2667,18 +2703,15 @@ fn select_delegate_target_instance(
                         format!("Agent instance '{instance_id}' was not found"),
                     )
                 })?;
-            if instance.team_id != *agent_tool_team_id(context)? {
+            if instance.team_id != *team_id {
                 return Err(agent_tool_error(
                     "cross_team_reference",
-                    format!(
-                        "Agent instance '{instance_id}' does not belong to team '{}'",
-                        agent_tool_team_id(context)?
-                    ),
+                    format!("Agent instance '{instance_id}' does not belong to team '{team_id}'"),
                 ));
             }
             Ok(instance.id)
         }
-        ResolvedAgentDelegateTarget::Definition(definition_id) => {
+        AgentDelegateTarget::Definition(definition_id) => {
             if !context
                 .permissions
                 .allowed_agent_definition_ids
@@ -2692,22 +2725,20 @@ fn select_delegate_target_instance(
                     ),
                 ));
             }
+            let team_id = agent_tool_team_id(context)?;
             let database =
                 WorkspaceDatabase::open_or_create(workspace_path).map_err(agent_store_error)?;
             let instance = database
-                .route_agent_instance_for_definition(agent_tool_team_id(context)?, definition_id)
+                .route_agent_instance_for_definition(team_id, definition_id)
                 .map_err(agent_store_error)?;
             let instance = instance.ok_or_else(|| {
                 agent_tool_error(
                     "not_found",
                     format!(
-                        "Agent definition '{definition_id}' has no existing runnable instance in team '{}'. \
+                        "Agent definition '{definition_id}' has no existing runnable instance in team '{team_id}'. \
 Call agent_list, then agent_create_instances when allowed, then agent_delegate_task \
 with targetKind instance and a returned targetId (or a definition that already has an instance). \
 targetKind definition never auto-creates instances.",
-                        agent_tool_team_id(context)
-                            .map(ToString::to_string)
-                            .unwrap_or_default()
                     ),
                 )
             })?;
@@ -8567,30 +8598,73 @@ mod tests {
             }),
         )
         .expect_err("instance targetKind must reject definition ids");
-        assert_eq!(
-            agent_tool_error_output(&mismatched_target_kind)["code"],
-            "invalid_arguments"
+        let mismatched_output = agent_tool_error_output(&mismatched_target_kind);
+        assert_eq!(mismatched_output["code"], "invalid_arguments");
+        let mismatched_message = mismatched_output["error"].as_str().expect("error text");
+        assert!(
+            mismatched_message.contains("targetKind \"instance\"")
+                && mismatched_message.contains("agent-instance-")
+                && mismatched_message.contains("agent_list.instances[].id"),
+            "expected target-kind-specific id guidance, got {mismatched_message}"
         );
         assert_eq!(child_count(), 0);
 
-        let legacy_target_fields = execute_agent_tool(
-            &context,
-            workspace.path(),
-            AGENT_DELEGATE_TASK_TOOL,
-            "call-legacy-target-fields",
-            json!({
-                "targetInstanceId": coordinator_instance_id.to_string(),
-                "targetDefinitionId": null,
-                "input": { "message": "legacy" },
-                "correlationId": null,
-                "timeoutMs": null,
-            }),
-        )
-        .expect_err("legacy target fields must not be accepted");
-        assert_eq!(
-            agent_tool_error_output(&legacy_target_fields)["code"],
-            "invalid_arguments"
-        );
+        for (call_id, arguments) in [
+            (
+                "call-unknown-target-kind",
+                json!({
+                    "targetKind": "queue",
+                    "targetId": coordinator_instance_id.to_string(),
+                    "input": { "message": "unknown kind" },
+                    "correlationId": null,
+                    "timeoutMs": null,
+                }),
+            ),
+            (
+                "call-missing-target-kind",
+                json!({
+                    "targetId": coordinator_instance_id.to_string(),
+                    "input": { "message": "missing kind" },
+                    "correlationId": null,
+                    "timeoutMs": null,
+                }),
+            ),
+            (
+                "call-missing-target-id",
+                json!({
+                    "targetKind": "instance",
+                    "input": { "message": "missing id" },
+                    "correlationId": null,
+                    "timeoutMs": null,
+                }),
+            ),
+            (
+                "call-legacy-target-fields",
+                json!({
+                    "targetKind": "instance",
+                    "targetId": coordinator_instance_id.to_string(),
+                    "targetInstanceId": coordinator_instance_id.to_string(),
+                    "targetDefinitionId": null,
+                    "input": { "message": "legacy" },
+                    "correlationId": null,
+                    "timeoutMs": null,
+                }),
+            ),
+        ] {
+            let error = execute_agent_tool(
+                &context,
+                workspace.path(),
+                AGENT_DELEGATE_TASK_TOOL,
+                call_id,
+                arguments,
+            )
+            .expect_err("invalid delegate target arguments must not be accepted");
+            assert_eq!(
+                agent_tool_error_output(&error)["code"],
+                "invalid_arguments",
+                "{call_id} must be rejected as invalid arguments"
+            );
+        }
         assert_eq!(child_count(), 0);
 
         // Permission denial for a well-formed but disallowed definition.
@@ -8700,14 +8774,42 @@ mod tests {
         assert_eq!(definition_delegate["correlationId"], "corr-definition");
         assert_eq!(child_count(), 2);
 
-        let children = WorkspaceDatabase::open_or_create(workspace.path())
-            .expect("database")
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let children = database
             .agent_tasks_for_parent(&team_id, &parent_task_id)
             .expect("child tasks");
         assert!(
             children
                 .iter()
                 .any(|task| task.owner_instance_id.to_string() == worker_instance_id)
+        );
+        let delegated_payloads = database
+            .agent_events_after(&team_id, -1)
+            .expect("Agent events")
+            .into_iter()
+            .filter(|event| event.event_type == "task_delegated")
+            .map(|event| {
+                serde_json::from_str::<Value>(&event.payload_json)
+                    .expect("task_delegated payload must remain JSON")
+            })
+            .collect::<Vec<_>>();
+        let instance_payload = delegated_payloads
+            .iter()
+            .find(|payload| payload["correlationId"] == "corr-instance")
+            .expect("instance delegation event");
+        assert_eq!(
+            instance_payload["targetInstanceId"],
+            coordinator_instance_id.to_string()
+        );
+        assert!(instance_payload["targetDefinitionId"].is_null());
+        let definition_payload = delegated_payloads
+            .iter()
+            .find(|payload| payload["correlationId"] == "corr-definition")
+            .expect("definition delegation event");
+        assert_eq!(definition_payload["targetInstanceId"], worker_instance_id);
+        assert_eq!(
+            definition_payload["targetDefinitionId"],
+            worker_definition.id.to_string()
         );
     }
 
