@@ -748,7 +748,19 @@ pub(super) fn merge_agent_worktree(
                     ))
                 })?;
             }
-            None => remove_worktree_path(&target_path)?,
+            None => {
+                // Missing worktree blobs mean deletions. Directory / symlink-to-dir
+                // noise must not wipe the shared path (blob_from_worktree returns
+                // None for those too).
+                if let Some(source_path) =
+                    worktree_repo.workdir_path(entry.repo_path.as_bytes().as_bstr())
+                {
+                    if worktree_path_is_directory(&source_path) {
+                        continue;
+                    }
+                }
+                remove_worktree_path(&target_path)?;
+            }
         }
     }
 
@@ -1045,6 +1057,15 @@ fn status_entries_for_repo(
                 let repo_path = bstr_to_path_string(item.rela_path());
                 if is_foco_reserved_repo_path(&repo_path) {
                     continue;
+                }
+                // Directories (and symlinks-to-directories) are not blob paths.
+                // gix may still surface them as untracked when ignore rules use
+                // trailing-slash directory patterns (e.g. `web/dist/`). Diff,
+                // stage, merge, and plan phase commit all assume file blobs.
+                if let Some(absolute_path) = repo.workdir_path(repo_path.as_bytes().as_bstr()) {
+                    if worktree_path_is_directory(&absolute_path) {
+                        continue;
+                    }
                 }
                 if let Some(workspace_path_string) =
                     workspace_relative_path(&workspace_root, &worktree_root, &repo_path)
@@ -1360,13 +1381,27 @@ fn blob_from_worktree(
     let Some(path) = repo.workdir_path(repo_path.as_bytes().as_bstr()) else {
         return Ok(None);
     };
-    match std::fs::read(path) {
+    // Safety net for callers that did not filter status first: directories and
+    // symlinks-to-directories are not file blobs. Returning None keeps diff /
+    // stage / merge from hard-failing plan phase completion.
+    if worktree_path_is_directory(&path) {
+        return Ok(None);
+    }
+    match std::fs::read(&path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) if source.kind() == std::io::ErrorKind::IsADirectory => Ok(None),
         Err(source) => Err(ApiError::internal(format!(
             "failed to read git worktree file: {source}"
         ))),
     }
+}
+
+/// True when `path` exists and resolves to a directory (symlink targets included).
+fn worktree_path_is_directory(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_dir())
+        .unwrap_or(false)
 }
 
 fn mutable_index(repo: &gix::Repository) -> Result<gix::index::File, ApiError> {
@@ -2263,5 +2298,57 @@ mod tests {
         assert!(response.diff.contains("--- /dev/null"));
         assert!(response.diff.contains("+++ b/note.txt"));
         assert!(response.diff.contains("+new note"));
+    }
+
+    #[test]
+    fn diff_skips_untracked_directory_and_symlink_to_directory() {
+        let temp = tempfile::tempdir().expect("temp repo");
+        let workspace = temp.path();
+        gix::init(workspace).expect("init git repo");
+        // Trailing-slash ignore matches real directories but often not a symlink
+        // that points at a directory — the production failure mode for plan phase
+        // worktree commit / agent task worktree snapshot.
+        fs::write(workspace.join(".gitignore"), "web/dist/\n").expect("gitignore");
+        fs::write(workspace.join("changed.txt"), "work\n").expect("changed file");
+
+        let plain_dir = workspace.join("plain-dir");
+        fs::create_dir_all(&plain_dir).expect("plain directory");
+        fs::write(plain_dir.join("nested.txt"), "nested\n").expect("nested file");
+
+        let web = workspace.join("web");
+        fs::create_dir_all(&web).expect("web dir");
+        let dist_target = workspace.join("real-dist-target");
+        fs::create_dir_all(&dist_target).expect("real dist dir");
+        fs::write(dist_target.join("index.html"), "<html></html>\n").expect("dist file");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&dist_target, web.join("dist"))
+                .expect("symlink web/dist -> directory");
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(web.join("dist")).expect("web/dist directory");
+        }
+
+        let response = git_diff_response(workspace, None)
+            .expect("git diff must not fail on directory / symlink-to-directory noise");
+
+        let paths = response
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !paths.iter().any(|path| *path == "web/dist" || *path == "plain-dir"),
+            "directory / symlink-to-directory paths must not appear as file status: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|path| *path == "changed.txt"),
+            "expected changed.txt in files: {paths:?}"
+        );
+        assert!(
+            response.diff.contains("changed.txt"),
+            "diff should include real file changes"
+        );
     }
 }
