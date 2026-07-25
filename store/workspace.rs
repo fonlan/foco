@@ -15942,10 +15942,9 @@ impl WorkspaceDatabase {
             )
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
-            .query_map(
-                params![team_id.as_str(), waiting_task_id.as_str()],
-                |row| row.get::<_, String>(0),
-            )
+            .query_map(params![team_id.as_str(), waiting_task_id.as_str()], |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|source| self.sqlite_error(source))?;
         for payload_json in rows {
             let payload_json = payload_json.map_err(|source| self.sqlite_error(source))?;
@@ -15955,9 +15954,8 @@ impl WorkspaceDatabase {
                     source,
                 }
             })?;
-            let Some(dependency_task_ids) = payload
-                .get("dependencyTaskIds")
-                .and_then(Value::as_array)
+            let Some(dependency_task_ids) =
+                payload.get("dependencyTaskIds").and_then(Value::as_array)
             else {
                 continue;
             };

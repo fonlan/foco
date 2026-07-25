@@ -769,6 +769,8 @@ export type ChatStreamEvent =
       toolCallId: string;
       output: JsonValue;
       isError: boolean;
+      /** Missing on historical events and therefore treated as terminal. */
+      terminal?: boolean;
       startedAt?: string | null;
       completedAt?: string | null;
     }

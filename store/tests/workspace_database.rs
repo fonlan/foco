@@ -19632,17 +19632,19 @@ fn agent_wait_covered_dependency_task_ids_retains_prior_round_after_replace() {
         .claim_runnable_agent_task(&team_id, &child_a, &attempt_a)
         .expect("claim a")
         .expect("a claimed");
-    assert!(database
-        .update_agent_task_state(AgentTaskStateUpdate {
-            team_id: &team_id,
-            task_id: &child_a,
-            expected_status: AgentTaskStatus::Running,
-            transition: AgentTaskTransition::Complete,
-            result_json: Some(r#"{"text":"a"}"#),
-            error_json: None,
-            interruption_reason: None,
-        })
-        .expect("complete a"));
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &child_a,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"a"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete a")
+    );
 
     database
         .register_agent_task_wait_dependencies(RegisterAgentTaskWaitDependencies {
@@ -19665,8 +19667,14 @@ fn agent_wait_covered_dependency_task_ids_retains_prior_round_after_replace() {
     let covered = database
         .agent_wait_covered_dependency_task_ids(&team_id, &waiting)
         .expect("covered ids");
-    assert!(covered.contains(&child_a), "first-round child must stay covered");
-    assert!(covered.contains(&child_b), "current-round child must be covered");
+    assert!(
+        covered.contains(&child_a),
+        "first-round child must stay covered"
+    );
+    assert!(
+        covered.contains(&child_b),
+        "current-round child must be covered"
+    );
 }
 
 #[test]

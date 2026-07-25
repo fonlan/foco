@@ -1662,25 +1662,10 @@ async fn run_coordinator_task_inner(
     });
     chat_context.session_upload_paths = Some(session_upload_paths);
 
-    // Land the terminal wait tool result on the same tool_call_id before the resumed
-    // stream runs, so live UI, reconnect, and history replay share one final result.
-    if let Some(landing) = wait_resume_landing.as_ref()
-        && chat_context.agent_primary_chat_output
-    {
-        let landed_at = utc_timestamp();
-        registration.record_event(
-            &workspace.path,
-            &team.chat_id,
-            &ChatSseEvent::ToolResult {
-                assistant_message_id: chat_context.assistant_message_id.clone(),
-                tool_call_id: landing.tool_call_id.clone(),
-                output: landing.output.clone(),
-                is_error: false,
-                started_at: landed_at.clone(),
-                completed_at: landed_at,
-            },
-        )?;
-    }
+    // The resume result belongs to the resumed attempt. `into_sse_stream` emits it
+    // immediately after Start so persistence and live delivery share the same path.
+    chat_context.pending_agent_wait_resume =
+        wait_resume_landing.map(|landing| (landing.tool_call_id, landing.output));
 
     let outcome = run_chat_context_in_background(chat_context, registration, guidance_rx).await;
     let lifecycle_context =
@@ -2402,7 +2387,7 @@ fn apply_agent_prompt_layers(
         },
     );
 
-    let wait_resume_landing = if wait_dependencies.is_empty() || wait_resume_already_landed {
+    let wait_resume_landing = if wait_dependencies.is_empty() {
         None
     } else {
         let landing_output =
@@ -2425,7 +2410,11 @@ fn apply_agent_prompt_layers(
                 },
             );
         }
-        Some(AgentWaitResumeLanding {
+        // A persisted terminal result only proves the UI event was landed. A
+        // crash before the first provider request still needs the paired tool
+        // call/result in the retried model context, so suppress only the
+        // duplicate SSE landing here.
+        (!wait_resume_already_landed).then_some(AgentWaitResumeLanding {
             tool_call_id: pending_tool_call_id,
             output: landing_output,
         })

@@ -5197,6 +5197,7 @@ describe("app-chat-stream verification surfaces", () => {
         assistantMessageId,
         isError: false,
         output: { waiting: true, suspend: true },
+        terminal: false,
         toolCallId: "call-wait",
         type: "toolResult",
       });
@@ -5213,6 +5214,9 @@ describe("app-chat-stream verification surfaces", () => {
       within(waitingRow as HTMLElement).getAllByText("Waiting for worker.")
         .length,
     ).toBeGreaterThan(0);
+    expect(
+      within(waitingRow as HTMLElement).getByText("running"),
+    ).toBeInTheDocument();
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -5222,6 +5226,23 @@ describe("app-chat-stream verification surfaces", () => {
         memoriesUsed: [],
         type: "start",
         userMessageId: "message-user-stream",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        isError: false,
+        output: {
+          dependencies: [
+            {
+              result: { text: "worker completed" },
+              status: "completed",
+              taskId: "agent-task-worker-1",
+            },
+          ],
+          waiting: false,
+        },
+        terminal: true,
+        toolCallId: "call-wait",
+        type: "toolResult",
       });
       enqueueChatStreamEvent({
         assistantMessageId,

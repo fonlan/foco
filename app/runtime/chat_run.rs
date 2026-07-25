@@ -133,6 +133,7 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
                     ChatSseEvent::ToolResult {
                         output,
                         is_error: false,
+                        terminal: false,
                         ..
                     } => agent_suspend_control(output),
                     _ => None,

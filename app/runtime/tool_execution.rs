@@ -2223,11 +2223,7 @@ pub(crate) fn try_register_implicit_wait_for_undelivered_children(
         return Ok(Some(ImplicitAgentWait {
             tool_call_id,
             task_ids,
-            output: agent_wait_terminal_tool_result(
-                &undelivered,
-                AgentTaskWaitMode::All,
-                None,
-            ),
+            output: agent_wait_terminal_tool_result(&undelivered, AgentTaskWaitMode::All, None),
             immediate: true,
         }));
     }
@@ -9765,8 +9761,8 @@ mod tests {
         database
             .resume_satisfied_agent_tasks(10)
             .expect("resume parent after child completion");
-        let parent_attempt =
-            AgentAttemptId::new("agent-attempt-wait-terminal-parent-resume").expect("parent attempt");
+        let parent_attempt = AgentAttemptId::new("agent-attempt-wait-terminal-parent-resume")
+            .expect("parent attempt");
         database
             .claim_runnable_agent_task(&team_id, &parent_task_id, &parent_attempt)
             .expect("claim parent")

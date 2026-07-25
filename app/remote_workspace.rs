@@ -14557,6 +14557,7 @@ fn remote_sidecar_reject_tool_batch(
             "toolCallId": rejection.call_id,
             "output": output,
             "isError": is_error,
+            "terminal": true,
             "startedAt": timestamp,
             "completedAt": timestamp,
         }));
@@ -14664,6 +14665,7 @@ fn remote_sidecar_close_unexecuted_tool_calls(
                 "toolCallId": tool_call.call_id,
                 "output": output,
                 "isError": is_error,
+                "terminal": true,
                 "startedAt": timestamp,
                 "completedAt": timestamp,
             })
@@ -18811,6 +18813,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                                 "toolCallId": tool_call.call_id,
                                 "output": output,
                                 "isError": is_error,
+                                "terminal": true,
                                 "startedAt": started_at,
                                 "completedAt": completed_at,
                             }));
@@ -18880,6 +18883,8 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             normalize_broker_tool_execution(&tool_call.name, output, is_error);
                         let output = execution.output;
                         let is_error = execution.is_error;
+                        let terminal =
+                            is_error || !crate::runtime::is_agent_wait_suspend_output(&output);
                         if run_stream.is_cancel_requested() || run_stream.is_finished() {
                             let _ = with_sidecar_workspace_database(&stream_state, |database| {
                                 remote_sidecar_close_cancelled_tool_batch(
@@ -18915,9 +18920,50 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                             "toolCallId": tool_call.call_id,
                             "output": output,
                             "isError": is_error,
+                            "terminal": terminal,
                             "startedAt": started_at,
                             "completedAt": completed_at,
                         }));
+                        if !terminal {
+                            if let Some(plan_task) = plan_task.as_ref() {
+                                let wait_result =
+                                    with_sidecar_workspace_database(&stream_state, |database| {
+                                        let Some(task) = database.agent_task(&plan_task.task_id)?
+                                        else {
+                                            return Ok(());
+                                        };
+                                        if task.status == AgentTaskStatus::Running {
+                                            database.update_agent_task_state(
+                                                AgentTaskStateUpdate {
+                                                    team_id: &task.team_id,
+                                                    task_id: &task.id,
+                                                    expected_status: AgentTaskStatus::Running,
+                                                    transition: AgentTaskTransition::Wait,
+                                                    result_json: None,
+                                                    error_json: None,
+                                                    interruption_reason: None,
+                                                },
+                                            )?;
+                                        }
+                                        Ok(())
+                                    });
+                                if let Err(error) = wait_result {
+                                    tracing::error!(
+                                        task_id = %plan_task.task_id,
+                                        error = %error,
+                                        "failed to suspend remote Plan Agent task after agent_wait_tasks"
+                                    );
+                                }
+                            }
+                            // The wait control result is deliberately not a
+                            // provider tool message: the scheduler resumes this
+                            // same tool_call_id after its dependencies settle.
+                            for event in events {
+                                sequence += 1;
+                                remote_sidecar_record_run_event(&run_stream, sequence, event);
+                            }
+                            break 'run;
+                        }
                         batch_messages.push(NeutralChatMessage {
                             role: NeutralChatRole::Tool,
                             content: serde_json::to_string(&output)

@@ -2161,6 +2161,10 @@ pub(crate) enum ChatSpecUpdateDiffLineKind {
     Removed,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase", tag = "type")]
 enum ChatSseEvent {
@@ -2214,6 +2218,9 @@ enum ChatSseEvent {
         tool_call_id: String,
         output: Value,
         is_error: bool,
+        /// `false` keeps the existing tool call open; omitted historical events are terminal.
+        #[serde(default = "default_true")]
+        terminal: bool,
         started_at: String,
         completed_at: String,
     },
@@ -2351,6 +2358,8 @@ struct PreparedChatContext {
     agent_allowed_tools: Option<HashSet<String>>,
     agent_tool_context: Option<AgentToolContext>,
     agent_primary_chat_output: bool,
+    /// Terminal result for a durable `agent_wait_tasks` round, emitted after Start.
+    pending_agent_wait_resume: Option<(String, Value)>,
     session_mode: Option<String>,
     session_upload_paths: Option<Vec<String>>,
     provider_config: ProviderConnectionConfig,
@@ -3215,6 +3224,20 @@ impl PreparedChatContext {
             let mut app_shutdown_rx = self.app_shutdown_rx.clone();
 
             yield start_event;
+            if let Some((tool_call_id, output)) = self.pending_agent_wait_resume.take() {
+                let landed_at = utc_timestamp();
+                let event = ChatSseEvent::ToolResult {
+                    assistant_message_id: self.assistant_message_id.clone(),
+                    tool_call_id,
+                    output,
+                    is_error: false,
+                    terminal: true,
+                    started_at: landed_at.clone(),
+                    completed_at: landed_at,
+                };
+                events.push(captured_event(&event));
+                yield event;
+            }
             if let Err(error) = self.refresh_model_route() {
                 let message = error.message;
                 let event = ChatSseEvent::Error {
@@ -4510,6 +4533,7 @@ impl PreparedChatContext {
                                                 tool_call_id: implicit_wait.tool_call_id.clone(),
                                                 output: implicit_wait.output.clone(),
                                                 is_error: false,
+                                                terminal: implicit_wait.immediate,
                                                 started_at: wait_started_at.clone(),
                                                 completed_at: wait_started_at.clone(),
                                             };
@@ -5232,6 +5256,10 @@ impl PreparedChatContext {
                                     tool_call_id: executed_tool_call.id.clone(),
                                     output: executed_tool_call.output.clone(),
                                     is_error: executed_tool_call.is_error,
+                                    terminal: executed_tool_call.is_error
+                                        || !crate::runtime::is_agent_wait_suspend_output(
+                                            &executed_tool_call.output,
+                                        ),
                                     started_at: executed_tool_call.started_at.clone(),
                                     completed_at: executed_tool_call.completed_at.clone(),
                                 };
@@ -5805,6 +5833,7 @@ async fn prepare_chat_context_for_output(
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output,
+        pending_agent_wait_resume: None,
         session_mode: prompt_context.session_mode,
         session_upload_paths: None,
         provider_config: prompt_context.provider_config,

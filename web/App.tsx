@@ -11274,6 +11274,7 @@ export function App() {
                         streamEvent.isError,
                         streamEvent.startedAt,
                         streamEvent.completedAt,
+                        streamEvent.terminal !== false,
                       ),
                       toolCalls: applyToolResult(
                         message.toolCalls,
@@ -11282,6 +11283,7 @@ export function App() {
                         streamEvent.isError,
                         streamEvent.startedAt,
                         streamEvent.completedAt,
+                        streamEvent.terminal !== false,
                       ),
                     }
                   : message,
@@ -12616,6 +12618,7 @@ export function App() {
                       streamEvent.isError,
                       streamEvent.startedAt,
                       streamEvent.completedAt,
+                      streamEvent.terminal !== false,
                     ),
                     parts: applyToolResultToParts(
                       message.parts,
@@ -12624,6 +12627,7 @@ export function App() {
                       streamEvent.isError,
                       streamEvent.startedAt,
                       streamEvent.completedAt,
+                      streamEvent.terminal !== false,
                     ),
                   }
                 : message,
@@ -16330,20 +16334,30 @@ function applyToolResult(
   isError: boolean,
   startedAt?: string | null,
   completedAt?: string | null,
+  terminal = true,
 ) {
-  return toolCalls.map((toolCall) =>
-    toolCall.id === toolCallId
-      ? {
-          ...toolCall,
-          output,
-          isError,
-          status: isError ? "error" : "completed",
-          startedAt: startedAt ?? toolCall.startedAt ?? null,
-          completedAt: completedAt ?? toolCall.completedAt ?? null,
-          liveOutput: undefined,
-        }
-      : toolCall,
-  );
+  return toolCalls.map((toolCall) => {
+    if (toolCall.id !== toolCallId) {
+      return toolCall;
+    }
+    if (
+      !terminal &&
+      (toolCall.status === "completed" ||
+        toolCall.status === "error" ||
+        toolCall.status === "cancelled")
+    ) {
+      return toolCall;
+    }
+    return {
+      ...toolCall,
+      output,
+      isError,
+      status: terminal ? (isError ? "error" : "completed") : "running",
+      startedAt: startedAt ?? toolCall.startedAt ?? null,
+      completedAt: terminal ? (completedAt ?? toolCall.completedAt ?? null) : null,
+      liveOutput: undefined,
+    };
+  });
 }
 
 function applyToolOutputDelta(
@@ -17178,23 +17192,35 @@ function applyToolResultToParts(
   isError: boolean,
   startedAt?: string | null,
   completedAt?: string | null,
+  terminal = true,
 ): ChatMessagePart[] {
-  return parts.map((part) =>
-    part.type === "toolCall" && part.toolCall.id === toolCallId
-      ? ({
-          type: "toolCall",
-          toolCall: {
-            ...part.toolCall,
-            output,
-            isError,
-            status: isError ? "error" : "completed",
-            startedAt: startedAt ?? part.toolCall.startedAt ?? null,
-            completedAt: completedAt ?? part.toolCall.completedAt ?? null,
-            liveOutput: undefined,
-          },
-        } satisfies ChatMessagePart)
-      : part,
-  );
+  return parts.map((part) => {
+    if (part.type !== "toolCall" || part.toolCall.id !== toolCallId) {
+      return part;
+    }
+    if (
+      !terminal &&
+      (part.toolCall.status === "completed" ||
+        part.toolCall.status === "error" ||
+        part.toolCall.status === "cancelled")
+    ) {
+      return part;
+    }
+    return {
+      type: "toolCall",
+      toolCall: {
+        ...part.toolCall,
+        output,
+        isError,
+        status: terminal ? (isError ? "error" : "completed") : "running",
+        startedAt: startedAt ?? part.toolCall.startedAt ?? null,
+        completedAt: terminal
+          ? (completedAt ?? part.toolCall.completedAt ?? null)
+          : null,
+        liveOutput: undefined,
+      },
+    } satisfies ChatMessagePart;
+  });
 }
 
 function applyToolOutputDeltaToParts(
@@ -18631,6 +18657,7 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
     const toolCallId = stringField(value, "toolCallId", "tool_call_id");
     const output = fieldValue(value, "output");
     const isError = fieldValue(value, "isError", "is_error");
+    const terminal = fieldValue(value, "terminal");
     const startedAt = optionalNullableStringField(
       value,
       "startedAt",
@@ -18647,6 +18674,7 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       !toolCallId ||
       !isJsonValue(output) ||
       typeof isError !== "boolean" ||
+      (terminal !== undefined && typeof terminal !== "boolean") ||
       startedAt === false ||
       completedAt === false
     ) {
@@ -18659,6 +18687,7 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       toolCallId,
       output,
       isError,
+      terminal: terminal !== false,
       startedAt: startedAt ?? null,
       completedAt: completedAt ?? null,
     };

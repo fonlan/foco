@@ -214,7 +214,7 @@ fn agent_cancel_task_definition() -> ToolDefinition {
 fn agent_wait_tasks_definition() -> ToolDefinition {
     ToolDefinition {
         name: AGENT_WAIT_TASKS_TOOL,
-        description: "Explicitly wait for the specified Agent tasks in the current team before continuing. Uses one tool_call_id for a non-terminal suspend while work is outstanding, then a terminal resume result with the same id. Already-terminal tasks return their results immediately without suspending. Use this to sync on specific taskIds early; if you omit it and would otherwise finish with undelivered child tasks, the runtime still registers an implicit wait for those children.",
+        description: "Explicitly wait for the specified Agent tasks in the current team before continuing. Uses one tool_call_id for a non-terminal suspend while work is outstanding, then a terminal resume result with the same id. Already-terminal tasks return their results immediately without suspending. deadlineMs controls the durable wait deadline; timeoutMs applies only to the immediate registration call and never synchronously waits for child tasks. Use this to sync on specific taskIds early; if you omit it and would otherwise finish with undelivered child tasks, the runtime still registers an implicit wait for those children.",
         input_schema: json!({
             "type": "object",
             "additionalProperties": false,
@@ -236,7 +236,7 @@ fn agent_wait_tasks_definition() -> ToolDefinition {
                 },
                 "timeoutMs": {
                     "type": ["integer", "null"],
-                    "description": "Optional tool timeout in milliseconds. Defaults to 10000."
+                    "description": "Optional deadline for the immediate registration call in milliseconds. It does not synchronously wait for child tasks; use deadlineMs for the durable wait deadline. Defaults to 10000."
                 }
             },
             "required": ["taskIds", "mode", "deadlineMs", "timeoutMs"]
@@ -634,7 +634,12 @@ mod tests {
         }
 
         let wait_description = agent_wait_tasks_definition().description;
-        for fragment in ["Explicitly wait", "implicit wait"] {
+        for fragment in [
+            "Explicitly wait",
+            "implicit wait",
+            "deadlineMs controls the durable wait deadline",
+            "never synchronously waits for child tasks",
+        ] {
             assert!(
                 wait_description.contains(fragment),
                 "wait description missing `{fragment}`: {wait_description}"

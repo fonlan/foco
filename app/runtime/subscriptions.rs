@@ -795,11 +795,10 @@ impl ActiveChatRunRegistration {
                 tool_call_id,
                 output,
                 is_error,
+                terminal,
                 ..
             } if assistant_message_id == &self.assistant_message_id => {
-                // Non-terminal agent_wait_tasks suspend keeps the same tool_call_id open
-                // until the matching terminal resume result arrives.
-                if !*is_error && crate::runtime::is_agent_wait_suspend_output(output) {
+                if !*terminal {
                     return Ok(());
                 }
                 let output_json = serde_json::to_string(output).map_err(|source| {

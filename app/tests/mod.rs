@@ -1229,6 +1229,7 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
             tool_call_id: "call-1".to_string(),
             output: json!({ "content": "ok" }),
             is_error: false,
+            terminal: true,
             started_at: "2026-06-29T08:00:00Z".to_string(),
             completed_at: "2026-06-29T08:00:01Z".to_string(),
         },
@@ -1336,6 +1337,7 @@ fn test_prepared_chat_context(
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        pending_agent_wait_resume: None,
         session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -3044,6 +3046,7 @@ fn rejected_tool_batch_results_budget_each_oversized_failure_independently() {
             tool_call_id: result.id,
             output: result.output,
             is_error: result.is_error,
+            terminal: true,
             started_at: "2026-07-16T00:00:00Z".to_string(),
             completed_at: "2026-07-16T00:00:01Z".to_string(),
         };
@@ -9710,6 +9713,7 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
             tool_call_id: "tool-1".to_string(),
             output: json!({ "content": "hello" }),
             is_error: false,
+            terminal: true,
             started_at: "2026-06-20T08:00:01Z".to_string(),
             completed_at: "2026-06-20T08:00:02Z".to_string(),
         },
@@ -9865,6 +9869,7 @@ async fn team_run_id_override_keeps_tool_finalization_idempotent() {
         tool_call_id: "call-team-tool".to_string(),
         output: json!({ "content": "hello" }),
         is_error: false,
+        terminal: true,
         started_at: "2026-06-20T08:00:01Z".to_string(),
         completed_at: "2026-06-20T08:00:02Z".to_string(),
     };
@@ -16974,6 +16979,7 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        pending_agent_wait_resume: None,
         session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -19048,6 +19054,7 @@ fn persist_chat_result_writes_each_captured_llm_request() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        pending_agent_wait_resume: None,
         session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -19470,6 +19477,7 @@ fn persist_failed_chat_result_keeps_tool_calls_linked_to_assistant_message() {
         agent_allowed_tools: None,
         agent_tool_context: None,
         agent_primary_chat_output: true,
+        pending_agent_wait_resume: None,
         session_mode: None,
         session_upload_paths: None,
         provider_config: ProviderConnectionConfig {
@@ -19683,6 +19691,7 @@ fn persist_chat_result_accepts_complete_input_after_partial_stream_stub() {
                 tool_call_id: "call-partial".to_string(),
                 output: json!({ "stdout": " M README.md", "success": true }),
                 is_error: false,
+                terminal: true,
                 started_at: "2026-07-11T15:00:00Z".to_string(),
                 completed_at: "2026-07-11T15:00:01Z".to_string(),
             },
