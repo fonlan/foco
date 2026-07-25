@@ -55,15 +55,14 @@ use foco_store::{
         MemoryKind, MemoryScope, MemorySourceType, MemoryStatus, NewMemoryFact, NewMemorySource,
     },
     workspace::{
-        AgentAttemptRecoveryDisposition, AgentTaskStateUpdate,
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION, LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION,
-        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION,
-        LlmRequestAuditFilters, MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation,
-        NewAgentInstance, NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent,
-        NewMessage, NewRunEvent, PlanPhaseAttemptTrigger, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RemotePreStreamFailureClosureOutcome,
-        RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
-        UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
+        AgentTaskStateUpdate, LLM_REQUEST_KIND_WORKSPACE_SPEC_COMPACTION,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_GENERATION, LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE,
+        LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
+        MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
+        NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
+        PlanPhaseAttemptTrigger, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+        RemotePreStreamFailureClosureOutcome, RewriteChatFromUserMessage, TerminalSessionRecord,
+        TodoGraphFilter, UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
         WorkspaceSpecSettings, WorkspaceSpecTriggerType,
     },
@@ -147,18 +146,19 @@ use crate::{
     runtime::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
-        AGENT_MAX_QUEUED_TASKS_PER_TEAM, BrokeredImageFile, BrokeredTransferFile,
-        CodeGraphIndexState, CodeGraphReadinessError, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
-        MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionRegistry,
-        REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
-        ReasoningLoopDetector, SidecarRuntimeConfigBundle, TOOL_CALL_LOOP_GUARD_SOURCE,
-        ToolLoopBeforeExecutionAction, ToolLoopGuard, ToolOutputDeltaEvent,
-        ToolResourceLockRegistry, build_sidecar_runtime_config_bundle, execute_image_tool,
-        execute_tool_with_runtime, execute_web_tool, image_tool_timeout_ms,
-        materialize_brokered_image_result, materialize_brokered_web_result,
-        open_workspace_database_ordinary_with_pre_stream_retry, package_brokered_web_result_files,
-        pre_stream_failure_user_message, reasoning_loop_guard_message,
-        release_code_graph_then_delete_worktree, run_post_tool_hooks,
+        AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentAttemptInterruption, AgentAttemptRecoveryAction,
+        BrokeredImageFile, BrokeredTransferFile, CodeGraphIndexState, CodeGraphReadinessError,
+        MAX_REASONING_LOOP_RECOVERIES_PER_RUN, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
+        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
+        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
+        SidecarRuntimeConfigBundle, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
+        ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
+        agent_attempt_recovery_action_for_evidence, agent_attempt_recovery_diagnostics,
+        build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
+        execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
+        materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
+        package_brokered_web_result_files, pre_stream_failure_user_message,
+        reasoning_loop_guard_message, release_code_graph_then_delete_worktree, run_post_tool_hooks,
         spawn_code_graph_execution_root_initialization_if_needed, wait_for_code_graph_ready,
         web_tool_timeout_ms,
     },
@@ -3416,8 +3416,10 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Err(error) = reconcile_remote_sidecar_agent_attempt_leases(&reconciliation_state)
-            {
+            if let Err(error) = reconcile_remote_sidecar_agent_attempt_leases_with_context(
+                &reconciliation_state,
+                RemoteSidecarAgentAttemptRecoveryContext::RuntimeScan,
+            ) {
                 tracing::warn!(
                     workspace_id = %reconciliation_state.workspace_id,
                     error = %error,
@@ -4305,18 +4307,120 @@ impl Drop for RemoteRunCleanupGuard {
     }
 }
 
-fn reconcile_remote_sidecar_agent_attempt_leases(
+#[derive(Clone, Copy)]
+enum RemoteSidecarAgentAttemptRecoveryContext {
+    Startup,
+    RuntimeScan,
+}
+
+impl RemoteSidecarAgentAttemptRecoveryContext {
+    fn source(self) -> &'static str {
+        match self {
+            Self::Startup => "sidecar_startup",
+            Self::RuntimeScan => "sidecar_runtime_scan",
+        }
+    }
+
+    fn is_startup(self) -> bool {
+        matches!(self, Self::Startup)
+    }
+}
+
+fn remote_sidecar_has_active_plan_task_runner(
     state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+) -> bool {
+    state
+        .active_run_streams
+        .lock()
+        .ok()
+        .is_some_and(|registry| {
+            registry.by_run_id.values().any(|registration| {
+                registration.plan_task_id.as_ref() == Some(task_id)
+                    && !registration.run_stream.is_cancel_requested()
+                    && !registration.run_stream.is_finished()
+            })
+        })
+}
+
+fn remote_sidecar_interruption_for_recovery_action(
+    action: AgentAttemptRecoveryAction,
+) -> Option<AgentAttemptInterruption> {
+    match action {
+        AgentAttemptRecoveryAction::Deferred { .. } => None,
+        // The shared policy labels a startup-owned old runtime as a restart.
+        // On the remote boundary retain that fact but name the sidecar, not the
+        // local backend process.
+        AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::BackendRestarted) => {
+            Some(AgentAttemptInterruption::SidecarRestarted)
+        }
+        AgentAttemptRecoveryAction::Interrupt(interruption) => Some(interruption),
+    }
+}
+
+fn remote_sidecar_recovery_stage(
+    context: RemoteSidecarAgentAttemptRecoveryContext,
+    interruption: AgentAttemptInterruption,
+) -> &'static str {
+    match (context, interruption) {
+        // A previous owner can first become overdue after startup. Preserve the
+        // restart classification while accurately recording where it was found.
+        (
+            RemoteSidecarAgentAttemptRecoveryContext::RuntimeScan,
+            AgentAttemptInterruption::SidecarRestarted,
+        ) => "sidecar_runtime_reconciliation",
+        _ => interruption.stage(),
+    }
+}
+
+fn reconcile_remote_sidecar_agent_attempt_leases_with_context(
+    state: &RemoteSidecarState,
+    context: RemoteSidecarAgentAttemptRecoveryContext,
 ) -> Result<usize, WorkspaceDatabaseError> {
     let mut database = WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))?;
     let mut interrupted = 0;
     for record in database.startup_agent_reconciliation()? {
-        if record.task.status != AgentTaskStatus::Running
-            || database.agent_attempt_recovery_disposition(&record.attempt, Duration::from_secs(30))
-                == AgentAttemptRecoveryDisposition::LeaseActive
-        {
+        if record.task.status != AgentTaskStatus::Running {
             continue;
         }
+        let recovery =
+            database.agent_attempt_recovery_disposition(&record.attempt, Duration::from_secs(30));
+        let owner_match =
+            record.attempt.owner_incarnation.as_deref() == Some(state.agent_owner_incarnation());
+        let legacy_attempt_owner =
+            record.attempt.owner_incarnation.as_deref() == Some(record.attempt.id.as_str());
+        // A registry entry is evidence only for an attempt claimed by this
+        // sidecar incarnation. An old owner must be allowed to reach the
+        // restart policy even if a stale task-id registration remains.
+        let active_runner_present =
+            owner_match && remote_sidecar_has_active_plan_task_runner(state, &record.task.id);
+        let action = agent_attempt_recovery_action_for_evidence(
+            &recovery,
+            context.is_startup(),
+            owner_match,
+            legacy_attempt_owner,
+            active_runner_present,
+        );
+        let diagnostics = agent_attempt_recovery_diagnostics(
+            context.source(),
+            &recovery,
+            action.cause(),
+            owner_match,
+            active_runner_present,
+        );
+        let Some(interruption) = remote_sidecar_interruption_for_recovery_action(action) else {
+            tracing::info!(
+                task_id = %record.task.id,
+                attempt_id = %record.attempt.id,
+                recovery_source = context.source(),
+                recovery_cause = action.cause(),
+                owner_match,
+                active_runner_present,
+                "deferred remote Agent attempt recovery"
+            );
+            continue;
+        };
+        let interruption_stage = remote_sidecar_recovery_stage(context, interruption);
         if let Some((user_message_id, assistant_message_id)) =
             remote_plan_task_message_identity_from_input(&record.task.input_json)
                 .ok()
@@ -4333,28 +4437,28 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
                 })
                 .unwrap_or_else(|| user_message.sequence.saturating_add(1));
             let error_json = json!({
-                "message": "remote sidecar lost the Agent attempt owner lease",
-                "code": "remote_sidecar_owner_lease_lost",
-                "stage": "startup_reconciliation",
+                "message": interruption.reason(),
+                "code": interruption.code(),
+                "stage": interruption_stage,
                 "retryable": false,
             })
             .to_string();
             let assistant_metadata_json = json!({
                 "streamingState": "failed",
                 "runFailure": {
-                    "code": "remote_sidecar_owner_lease_lost",
-                    "stage": "startup_reconciliation",
+                    "code": interruption.code(),
+                    "stage": interruption_stage,
                     "retryable": false,
                     "taskId": record.task.id.as_str(),
                     "attemptId": record.attempt.id.as_str(),
-                    "message": "remote sidecar lost the Agent attempt owner lease",
+                    "message": interruption.reason(),
                 },
                 "parts": [{
                     "type": "error",
-                    "text": "remote sidecar lost the Agent attempt owner lease",
+                    "text": interruption.reason(),
                 }],
                 "partsVersion": 6,
-                "partsSource": "startup_reconciliation",
+                "partsSource": interruption_stage,
             })
             .to_string();
             let Some(run_id) = remote_plan_queued_run_id_from_message(
@@ -4377,12 +4481,12 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
                 assistant_message_id: &assistant_message_id,
                 assistant_sequence,
                 error_json: &error_json,
-                interruption_event_payload_json: None,
+                interruption_event_payload_json: Some(&diagnostics.to_string()),
                 // This is recovery, not an ordinary pre-stream failure. Keep
                 // the task and attempt terminal state coherent in the same
                 // transaction so wait recovery can identify the interruption.
-                interruption_reason: Some("remote sidecar lost the Agent attempt owner lease"),
-                assistant_content: "remote sidecar lost the Agent attempt owner lease",
+                interruption_reason: Some(interruption.reason()),
+                assistant_content: interruption.reason(),
                 assistant_metadata_json: &assistant_metadata_json,
                 expected_attempt_owner_incarnation: record.attempt.owner_incarnation.as_deref(),
                 expected_attempt_lease_renewed_at: record.attempt.lease_renewed_at.as_deref(),
@@ -4414,35 +4518,48 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
                 transition: AgentTaskTransition::Interrupt,
                 result_json: None,
                 error_json: Some(
-                    r#"{"message":"remote sidecar lost the Agent attempt owner lease"}"#,
+                    &json!({
+                        "message": interruption.reason(),
+                        "code": interruption.code(),
+                        "stage": interruption_stage,
+                    })
+                    .to_string(),
                 ),
-                interruption_reason: Some("remote sidecar lost the Agent attempt owner lease"),
+                interruption_reason: Some(interruption.reason()),
             },
             &record.attempt.id,
             record.attempt.owner_incarnation.as_deref(),
             record.attempt.lease_renewed_at.as_deref(),
         )?;
         if updated {
-            database.fail_plan_phase_run(
-                &record.task.id,
-                "remote sidecar lost the Agent attempt owner lease",
-            )?;
+            database.fail_plan_phase_run(&record.task.id, interruption.reason())?;
             interrupted += 1;
         }
     }
-    database.fail_running_plan_phases_for_terminal_agent_tasks(
-        "remote sidecar lost the Agent attempt owner lease",
-    )?;
-    database.fail_running_plan_phases_without_agent_runs(
-        "Plan phase start did not create an implementation chat or Agent task",
-        state.plan_dispatch_owner_incarnation.as_str(),
-    )?;
-    database.reconcile_prematurely_completed_plan_phases_with_active_tasks()?;
-    database.reconcile_plan_phase_attempts_for_terminal_phases()?;
-    database.discard_terminal_plan_phase_derived_effects(
-        "remote sidecar lost the Agent attempt owner lease",
-    )?;
+    if context.is_startup() {
+        database.fail_running_plan_phases_for_terminal_agent_tasks(
+            "remote sidecar restarted while Agent attempt was active",
+        )?;
+        database.fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            state.plan_dispatch_owner_incarnation.as_str(),
+        )?;
+        database.reconcile_prematurely_completed_plan_phases_with_active_tasks()?;
+        database.reconcile_plan_phase_attempts_for_terminal_phases()?;
+        database.discard_terminal_plan_phase_derived_effects(
+            "remote sidecar restarted while Agent attempt was active",
+        )?;
+    }
     Ok(interrupted)
+}
+
+fn reconcile_remote_sidecar_agent_attempt_leases(
+    state: &RemoteSidecarState,
+) -> Result<usize, WorkspaceDatabaseError> {
+    reconcile_remote_sidecar_agent_attempt_leases_with_context(
+        state,
+        RemoteSidecarAgentAttemptRecoveryContext::Startup,
+    )
 }
 
 fn remote_sidecar_cancel_active_run_for_plan_task(
@@ -4510,6 +4627,15 @@ pub(crate) struct RemoteSidecarState {
     /// profile or guessed from the workspace parent. `None` when HOME is missing
     /// or not absolute; workspace Skills still work.
     user_profile_dir: Option<PathBuf>,
+}
+
+impl RemoteSidecarState {
+    /// A sidecar process has one durable runtime identity. It intentionally also
+    /// owns Plan dispatch so the begin→attach window and Agent attempt claims
+    /// cannot disagree about which sidecar is still alive.
+    fn agent_owner_incarnation(&self) -> &str {
+        &self.plan_dispatch_owner_incarnation
+    }
 }
 
 /// Resolve the remote process profile directory for global Skill discovery.
@@ -17497,6 +17623,7 @@ fn remote_sidecar_resolve_tool_workspace_path(
 
 fn remote_sidecar_validate_plan_task_binding(
     database: &WorkspaceDatabase,
+    expected_agent_owner_incarnation: Option<&str>,
     plan_task_id: Option<&AgentTaskId>,
     chat_id: &str,
     queued_user_message_id: &str,
@@ -17540,6 +17667,14 @@ fn remote_sidecar_validate_plan_task_binding(
             task.id
         ))
     })?;
+    if let Some(expected_agent_owner_incarnation) = expected_agent_owner_incarnation
+        && owner_incarnation != expected_agent_owner_incarnation
+    {
+        return Err(ApiError::bad_request(format!(
+            "remote Plan Agent task '{}' belongs to a previous sidecar runtime",
+            task.id
+        )));
+    }
     let task_kind = remote_plan_task_kind_from_input(&task.input_json)?;
     if let Some((expected_queued_user_message_id, expected_assistant_message_id)) =
         remote_plan_task_message_identity_from_input(&task.input_json)?
@@ -19757,7 +19892,7 @@ async fn remote_sidecar_dispatch_plan_merge(
                 &team_id,
                 &task_id,
                 &agent_attempt_id,
-                Some(agent_attempt_id.as_str()),
+                Some(state.agent_owner_incarnation()),
             )
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| {
@@ -20129,6 +20264,7 @@ async fn remote_sidecar_start_chat_run(
             )?;
         let plan_task = remote_sidecar_validate_plan_task_binding(
             &database,
+            Some(state.agent_owner_incarnation()),
             plan_task_id.as_ref(),
             &chat_id,
             &queued_user_message_id,
@@ -23511,7 +23647,7 @@ async fn remote_sidecar_dispatch_plan_phase(
                 &team_id,
                 &task_id,
                 &agent_attempt_id,
-                Some(agent_attempt_id.as_str()),
+                Some(state.agent_owner_incarnation()),
             )
             .map_err(ApiError::from_workspace_error)?
             .ok_or_else(|| {
@@ -25033,6 +25169,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remote_sidecar_startup_recovery_labels_expired_previous_owner_as_sidecar_restart() {
+        let action = agent_attempt_recovery_action_for_evidence(
+            &foco_store::workspace::AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired,
+            true,
+            false,
+            false,
+            false,
+        );
+
+        let interruption = remote_sidecar_interruption_for_recovery_action(action)
+            .expect("previous sidecar owner should be interrupted");
+
+        assert_eq!(interruption.code(), "remote_sidecar_restart_interrupted");
+        assert_eq!(
+            remote_sidecar_recovery_stage(
+                RemoteSidecarAgentAttemptRecoveryContext::Startup,
+                interruption,
+            ),
+            "sidecar_startup_reconciliation"
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_runtime_scan_records_previous_owner_restart_at_runtime_stage() {
+        let action = agent_attempt_recovery_action_for_evidence(
+            &foco_store::workspace::AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired,
+            false,
+            false,
+            false,
+            false,
+        );
+
+        let interruption = remote_sidecar_interruption_for_recovery_action(action)
+            .expect("previous sidecar owner should be interrupted");
+
+        assert_eq!(interruption.code(), "remote_sidecar_restart_interrupted");
+        assert_eq!(
+            remote_sidecar_recovery_stage(
+                RemoteSidecarAgentAttemptRecoveryContext::RuntimeScan,
+                interruption,
+            ),
+            "sidecar_runtime_reconciliation"
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_runtime_scan_defers_expired_current_owner_with_active_runner() {
+        let action = agent_attempt_recovery_action_for_evidence(
+            &foco_store::workspace::AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired,
+            false,
+            true,
+            false,
+            true,
+        );
+
+        assert!(
+            remote_sidecar_interruption_for_recovery_action(action).is_none(),
+            "an active remote run registry entry is stronger evidence than a stale lease"
+        );
+    }
+
+    #[test]
+    fn remote_sidecar_runtime_scan_labels_expired_current_owner_without_runner_as_orphan() {
+        let action = agent_attempt_recovery_action_for_evidence(
+            &foco_store::workspace::AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired,
+            false,
+            true,
+            false,
+            false,
+        );
+
+        let interruption = remote_sidecar_interruption_for_recovery_action(action)
+            .expect("missing current sidecar runner should be interrupted");
+
+        assert_eq!(interruption.code(), "agent_attempt_runtime_orphaned");
+    }
+
+    #[test]
+    fn remote_sidecar_recovery_labels_legacy_attempt_owner_without_a_restart_claim() {
+        let action = agent_attempt_recovery_action_for_evidence(
+            &foco_store::workspace::AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired,
+            false,
+            false,
+            true,
+            false,
+        );
+
+        let interruption = remote_sidecar_interruption_for_recovery_action(action)
+            .expect("legacy owner must be recovered");
+
+        assert_eq!(interruption.code(), "agent_attempt_owner_unknown");
+    }
+
     /// Current sidecar owner queued attempt must survive recovery so attach can complete.
     /// Asserts sidecar DB state that the proxy/main UI snapshot would surface.
     #[test]
@@ -25486,6 +25716,7 @@ mod tests {
 
         remote_sidecar_validate_plan_task_binding(
             &database,
+            None,
             Some(&task_id),
             "chat-remote-direct-merge",
             "queued-user-remote-direct-merge",
@@ -25495,12 +25726,30 @@ mod tests {
         )
         .expect("direct merge coordinator may use the shared workspace");
 
+        let previous_owner_error = remote_sidecar_validate_plan_task_binding(
+            &database,
+            Some("agent-owner-new-sidecar"),
+            Some(&task_id),
+            "chat-remote-direct-merge",
+            "queued-user-remote-direct-merge",
+            "assistant-remote-direct-merge",
+            &shared_workspace_path,
+            workspace.path(),
+        )
+        .expect_err("a new sidecar must not resume a previous owner attempt");
+        assert!(
+            previous_owner_error
+                .message
+                .contains("previous sidecar runtime")
+        );
+
         let other_worktree = workspace.path().join(".foco/agent-worktrees/other");
         fs::create_dir_all(&other_worktree).expect("create unrelated worktree");
         let other_worktree =
             fs::canonicalize(other_worktree).expect("canonical unrelated worktree");
         let error = remote_sidecar_validate_plan_task_binding(
             &database,
+            None,
             Some(&task_id),
             "chat-remote-direct-merge",
             "queued-user-remote-direct-merge",
@@ -25637,6 +25886,7 @@ mod tests {
                 .expect("canonical remote Coordinator worktree");
         remote_sidecar_validate_plan_task_binding(
             &database,
+            None,
             Some(&task_id),
             "chat-remote-cancel",
             "queued-user-remote-cancel",
@@ -25647,6 +25897,7 @@ mod tests {
         .expect("valid remote Plan task binding");
         let identity_error = remote_sidecar_validate_plan_task_binding(
             &database,
+            None,
             Some(&task_id),
             "chat-remote-cancel",
             "queued-user-other",
@@ -25662,6 +25913,7 @@ mod tests {
         );
         let error = remote_sidecar_validate_plan_task_binding(
             &database,
+            None,
             Some(&task_id),
             "chat-other",
             "queued-user-remote-cancel",

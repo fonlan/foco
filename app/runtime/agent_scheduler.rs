@@ -470,13 +470,13 @@ impl AgentAttemptRecoveryContext<'_> {
 }
 
 #[derive(Clone, Copy)]
-enum AgentAttemptRecoveryAction {
+pub(crate) enum AgentAttemptRecoveryAction {
     Deferred { cause: &'static str },
     Interrupt(AgentAttemptInterruption),
 }
 
 impl AgentAttemptRecoveryAction {
-    fn cause(self) -> &'static str {
+    pub(crate) fn cause(self) -> &'static str {
         match self {
             Self::Deferred { cause } => cause,
             Self::Interrupt(interruption) => interruption.code(),
@@ -768,9 +768,9 @@ pub(crate) fn reconcile_agent_attempt_leases(
     Ok(())
 }
 
-fn agent_attempt_recovery_action(
-    context: AgentAttemptRecoveryContext<'_>,
+pub(crate) fn agent_attempt_recovery_action_for_evidence(
     recovery: &AgentAttemptRecoveryDisposition,
+    is_startup: bool,
     owner_match: bool,
     legacy_attempt_owner: bool,
     active_runner_present: bool,
@@ -791,7 +791,7 @@ fn agent_attempt_recovery_action(
         AgentAttemptRecoveryDisposition::VerifiedAbandonedInvalidLease => {
             AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::InvalidOwnerOrLease)
         }
-        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired if context.is_startup() => {
+        AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired if is_startup => {
             AgentAttemptRecoveryAction::Interrupt(AgentAttemptInterruption::BackendRestarted)
         }
         AgentAttemptRecoveryDisposition::VerifiedAbandonedLeaseExpired if owner_match => {
@@ -803,6 +803,38 @@ fn agent_attempt_recovery_action(
     }
 }
 
+fn agent_attempt_recovery_action(
+    context: AgentAttemptRecoveryContext<'_>,
+    recovery: &AgentAttemptRecoveryDisposition,
+    owner_match: bool,
+    legacy_attempt_owner: bool,
+    active_runner_present: bool,
+) -> AgentAttemptRecoveryAction {
+    agent_attempt_recovery_action_for_evidence(
+        recovery,
+        context.is_startup(),
+        owner_match,
+        legacy_attempt_owner,
+        active_runner_present,
+    )
+}
+
+pub(crate) fn agent_attempt_recovery_diagnostics(
+    source: &str,
+    recovery: &AgentAttemptRecoveryDisposition,
+    cause: &str,
+    owner_match: bool,
+    active_runner_present: bool,
+) -> Value {
+    json!({
+        "recoverySource": source,
+        "recoveryCause": cause,
+        "recovery": recovery_diagnostic_code(recovery),
+        "ownerMatch": owner_match,
+        "activeRunnerPresent": active_runner_present,
+    })
+}
+
 fn recovery_diagnostics(
     context: AgentAttemptRecoveryContext<'_>,
     recovery: &AgentAttemptRecoveryDisposition,
@@ -810,13 +842,13 @@ fn recovery_diagnostics(
     owner_match: bool,
     active_runner_present: bool,
 ) -> Value {
-    json!({
-        "recoverySource": context.source(),
-        "recoveryCause": cause,
-        "recovery": recovery_diagnostic_code(recovery),
-        "ownerMatch": owner_match,
-        "activeRunnerPresent": active_runner_present,
-    })
+    agent_attempt_recovery_diagnostics(
+        context.source(),
+        recovery,
+        cause,
+        owner_match,
+        active_runner_present,
+    )
 }
 
 fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'static str {
@@ -833,35 +865,39 @@ fn recovery_diagnostic_code(recovery: &AgentAttemptRecoveryDisposition) -> &'sta
 }
 
 #[derive(Clone, Copy)]
-enum AgentAttemptInterruption {
+pub(crate) enum AgentAttemptInterruption {
     BackendRestarted,
+    SidecarRestarted,
     RuntimeOrphaned,
     LegacyOwnerUnknown,
     InvalidOwnerOrLease,
 }
 
 impl AgentAttemptInterruption {
-    fn reason(self) -> &'static str {
+    pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::BackendRestarted => RESTART_INTERRUPTION_REASON,
+            Self::SidecarRestarted => "remote sidecar restarted while Agent attempt was active",
             Self::RuntimeOrphaned => RUNTIME_ORPHANED_INTERRUPTION_REASON,
             Self::LegacyOwnerUnknown => LEGACY_OWNER_UNKNOWN_INTERRUPTION_REASON,
             Self::InvalidOwnerOrLease => INVALID_OWNER_OR_LEASE_INTERRUPTION_REASON,
         }
     }
 
-    fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             Self::BackendRestarted => "backend_restart_interrupted",
+            Self::SidecarRestarted => "remote_sidecar_restart_interrupted",
             Self::RuntimeOrphaned => "agent_attempt_runtime_orphaned",
             Self::LegacyOwnerUnknown => "agent_attempt_owner_unknown",
             Self::InvalidOwnerOrLease => "agent_attempt_owner_invalid",
         }
     }
 
-    fn stage(self) -> &'static str {
+    pub(crate) fn stage(self) -> &'static str {
         match self {
             Self::BackendRestarted => "startup_reconciliation",
+            Self::SidecarRestarted => "sidecar_startup_reconciliation",
             Self::RuntimeOrphaned => "runtime_reconciliation",
             Self::LegacyOwnerUnknown | Self::InvalidOwnerOrLease => "owner_reconciliation",
         }

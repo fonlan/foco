@@ -19,7 +19,9 @@ mod web_tools;
 pub(crate) use agent_scheduler::{
     AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
     AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
-    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentScheduler, CoordinatorTaskInput, insert_agent_event,
+    AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentAttemptInterruption, AgentAttemptRecoveryAction,
+    AgentScheduler, CoordinatorTaskInput, agent_attempt_recovery_action_for_evidence,
+    agent_attempt_recovery_diagnostics, insert_agent_event,
     open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
     reconcile_agent_runtime, validate_agent_snapshot_for_workspace,
 };
