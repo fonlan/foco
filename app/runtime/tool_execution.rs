@@ -7875,6 +7875,18 @@ mod tests {
         (workspace, context, team_id, instance_id, task_id, wake_rx)
     }
 
+    fn delegated_child_task_count(
+        workspace_path: &std::path::Path,
+        team_id: &AgentTeamId,
+        parent_task_id: &AgentTaskId,
+    ) -> usize {
+        WorkspaceDatabase::open_or_create(workspace_path)
+            .expect("database")
+            .agent_tasks_for_parent(team_id, parent_task_id)
+            .expect("child tasks")
+            .len()
+    }
+
     #[test]
     fn phase6_agent_tool_permission_and_payload_errors_have_codes() {
         let (workspace, context, _team_id, instance_id, _task_id, _wake_rx) =
@@ -8553,195 +8565,301 @@ mod tests {
     }
 
     #[test]
-    fn agent_delegate_task_id_contract_regression() {
-        let mut worker_definition =
-            test_agent_definition("tool-test-delegate-worker", AgentPermissions::default());
-        worker_definition.max_instances = 2;
-        let disallowed_definition_id =
-            AgentDefinitionId::new("agent-definition-tool-test-disallowed")
-                .expect("disallowed definition id");
-        let missing_definition_id =
-            AgentDefinitionId::new("agent-definition-tool-test-missing-instance")
-                .expect("missing-instance definition id");
+    fn agent_delegate_task_rejects_unknown_target_kind_without_enqueuing() {
         let permissions = AgentPermissions {
-            can_create_instances: true,
             can_delegate: true,
-            allowed_agent_definition_ids: vec![
-                worker_definition.id.clone(),
-                missing_definition_id.clone(),
-            ],
+            ..AgentPermissions::default()
         };
-        let (workspace, mut context, team_id, coordinator_instance_id, parent_task_id, _wake_rx) =
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
             create_agent_tool_fixture(permissions);
-        context.agent_definitions = vec![worker_definition.clone()];
 
-        let child_count = || {
-            WorkspaceDatabase::open_or_create(workspace.path())
-                .expect("database")
-                .agent_tasks_for_parent(&team_id, &parent_task_id)
-                .expect("child tasks")
-                .len()
+        let error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-unknown-target-kind",
+            json!({
+                "targetKind": "queue",
+                "targetId": instance_id.to_string(),
+                "input": { "message": "unknown kind" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("unknown target kind must be rejected");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "invalid_arguments");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("unknown variant")
+        );
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_delegate_task_rejects_target_kind_and_id_prefix_mismatch_without_enqueuing() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
         };
+        let (workspace, context, team_id, _instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+        let definition_id = "agent-definition-tool-test-worker";
 
-        // The discriminant must agree with the selected id type, and old aliases are rejected.
-        let mismatched_target_kind = execute_agent_tool(
+        let error = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
             "call-mismatched-target-kind",
             json!({
                 "targetKind": "instance",
-                "targetId": worker_definition.id.to_string(),
+                "targetId": definition_id,
                 "input": { "message": "mismatched" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("instance targetKind must reject definition ids");
-        let mismatched_output = agent_tool_error_output(&mismatched_target_kind);
-        assert_eq!(mismatched_output["code"], "invalid_arguments");
-        let mismatched_message = mismatched_output["error"].as_str().expect("error text");
+        .expect_err("instance target kind must reject a definition id");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "invalid_arguments");
+        let message = output["error"].as_str().expect("error text");
         assert!(
-            mismatched_message.contains("targetKind \"instance\"")
-                && mismatched_message.contains("agent-instance-")
-                && mismatched_message.contains("agent_list.instances[].id"),
-            "expected target-kind-specific id guidance, got {mismatched_message}"
+            message.contains("targetKind \"instance\"")
+                && message.contains("agent-instance-")
+                && message.contains("agent_list.instances[].id"),
+            "expected target-kind-specific recovery guidance, got {message}"
         );
-        assert_eq!(child_count(), 0);
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
 
-        for (call_id, arguments) in [
-            (
-                "call-unknown-target-kind",
-                json!({
-                    "targetKind": "queue",
-                    "targetId": coordinator_instance_id.to_string(),
-                    "input": { "message": "unknown kind" },
-                    "correlationId": null,
-                    "timeoutMs": null,
-                }),
-            ),
-            (
-                "call-missing-target-kind",
-                json!({
-                    "targetId": coordinator_instance_id.to_string(),
-                    "input": { "message": "missing kind" },
-                    "correlationId": null,
-                    "timeoutMs": null,
-                }),
-            ),
-            (
-                "call-missing-target-id",
-                json!({
-                    "targetKind": "instance",
-                    "input": { "message": "missing id" },
-                    "correlationId": null,
-                    "timeoutMs": null,
-                }),
-            ),
-            (
-                "call-legacy-target-fields",
-                json!({
-                    "targetKind": "instance",
-                    "targetId": coordinator_instance_id.to_string(),
-                    "targetInstanceId": coordinator_instance_id.to_string(),
-                    "targetDefinitionId": null,
-                    "input": { "message": "legacy" },
-                    "correlationId": null,
-                    "timeoutMs": null,
-                }),
-            ),
-        ] {
-            let error = execute_agent_tool(
-                &context,
-                workspace.path(),
-                AGENT_DELEGATE_TASK_TOOL,
-                call_id,
-                arguments,
-            )
-            .expect_err("invalid delegate target arguments must not be accepted");
-            assert_eq!(
-                agent_tool_error_output(&error)["code"],
-                "invalid_arguments",
-                "{call_id} must be rejected as invalid arguments"
-            );
-        }
-        assert_eq!(child_count(), 0);
+    #[test]
+    fn agent_delegate_task_rejects_missing_instance_without_enqueuing() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, _instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
 
-        // Permission denial for a well-formed but disallowed definition.
-        let permission_denied = execute_agent_tool(
+        let error = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-missing-instance",
+            json!({
+                "targetKind": "instance",
+                "targetId": "agent-instance-does-not-exist",
+                "input": { "message": "missing" },
+                "correlationId": null,
+                "timeoutMs": null,
+            }),
+        )
+        .expect_err("missing instance must be rejected");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "not_found");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("was not found")
+        );
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_delegate_task_rejects_disallowed_definition_without_enqueuing() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, _instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+        let definition_id = "agent-definition-tool-test-disallowed";
+
+        let error = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
             "call-disallowed-definition",
             json!({
                 "targetKind": "definition",
-                "targetId": disallowed_definition_id.to_string(),
+                "targetId": definition_id,
                 "input": { "message": "denied" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("disallowed definition must fail");
-        assert_eq!(
-            agent_tool_error_output(&permission_denied)["code"],
-            "permission_denied"
+        .expect_err("disallowed definition must be rejected");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "permission_denied");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("is not allowed for delegation")
         );
-        assert_eq!(child_count(), 0);
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
 
-        // Definition with no existing runnable instance: not_found + recovery path.
-        let no_instance = execute_agent_tool(
+    #[test]
+    fn agent_delegate_task_rejects_definition_without_runnable_instance_without_enqueuing() {
+        let definition_id = AgentDefinitionId::new("agent-definition-tool-test-no-instance")
+            .expect("definition id");
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            allowed_agent_definition_ids: vec![definition_id.clone()],
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, _instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+
+        let error = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
             "call-definition-no-instance",
             json!({
                 "targetKind": "definition",
-                "targetId": missing_definition_id.to_string(),
-                "input": { "message": "no-instance" },
+                "targetId": definition_id.to_string(),
+                "input": { "message": "no instance" },
                 "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect_err("definition without instance must fail");
-        let no_instance_output = agent_tool_error_output(&no_instance);
-        assert_eq!(no_instance_output["code"], "not_found");
-        let no_instance_message = no_instance_output["error"].as_str().expect("error text");
+        .expect_err("definition without a runnable instance must be rejected");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "not_found");
+        let message = output["error"].as_str().expect("error text");
         assert!(
-            no_instance_message.contains("never auto-creates")
-                && no_instance_message.contains("agent_create_instances"),
-            "expected create recovery path, got {no_instance_message}"
+            message.contains("no existing runnable instance")
+                && message.contains("agent_create_instances")
+                && message.contains("never auto-creates"),
+            "expected creation recovery guidance, got {message}"
         );
-        assert_eq!(child_count(), 0);
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
 
-        // Legal instance delegate.
-        let instance_delegate = execute_agent_tool(
+    #[test]
+    fn agent_delegate_task_rejects_legacy_target_fields_without_enqueuing() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+
+        let error = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
-            "call-legal-instance",
+            "call-legacy-target-fields",
             json!({
                 "targetKind": "instance",
-                "targetId": coordinator_instance_id.to_string(),
-                "input": { "message": "instance-ok" },
-                "correlationId": "corr-instance",
+                "targetId": instance_id.to_string(),
+                "targetInstanceId": instance_id.to_string(),
+                "targetDefinitionId": null,
+                "input": { "message": "legacy" },
+                "correlationId": null,
                 "timeoutMs": null,
             }),
         )
-        .expect("legal instance delegate must succeed");
-        assert_eq!(instance_delegate["status"], "queued");
-        assert_eq!(
-            instance_delegate["targetInstanceId"],
-            coordinator_instance_id.to_string()
+        .expect_err("legacy target fields must be rejected");
+        let output = agent_tool_error_output(&error);
+        assert_eq!(output["code"], "invalid_arguments");
+        assert!(
+            output["error"]
+                .as_str()
+                .expect("error text")
+                .contains("unknown field")
         );
-        assert_eq!(instance_delegate["correlationId"], "corr-instance");
-        assert_eq!(child_count(), 1);
 
-        // Create a worker instance, then legal definition routing.
+        assert_eq!(
+            delegated_child_task_count(workspace.path(), &team_id, &parent_task_id),
+            0
+        );
+    }
+
+    #[test]
+    fn agent_delegate_task_routes_instance_with_stable_output_and_event_payload() {
+        let permissions = AgentPermissions {
+            can_delegate: true,
+            ..AgentPermissions::default()
+        };
+        let (workspace, context, team_id, instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+
+        let output = execute_agent_tool(
+            &context,
+            workspace.path(),
+            AGENT_DELEGATE_TASK_TOOL,
+            "call-instance-target",
+            json!({
+                "targetKind": "instance",
+                "targetId": instance_id.to_string(),
+                "input": { "message": "instance child" },
+                "correlationId": "instance-correlation",
+                "timeoutMs": null,
+            }),
+        )
+        .expect("instance target must enqueue a child task");
+        assert_eq!(output["targetInstanceId"], instance_id.to_string());
+        assert_eq!(output["status"], "queued");
+        assert_eq!(output["correlationId"], "instance-correlation");
+
+        let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
+        let child_tasks = database
+            .agent_tasks_for_parent(&team_id, &parent_task_id)
+            .expect("child tasks");
+        assert_eq!(child_tasks.len(), 1);
+        assert_eq!(child_tasks[0].owner_instance_id, instance_id);
+        let delegated_event = database
+            .agent_events_after(&team_id, -1)
+            .expect("Agent events")
+            .into_iter()
+            .find(|event| event.event_type == "task_delegated")
+            .expect("task delegated event");
+        let payload = serde_json::from_str::<Value>(&delegated_event.payload_json)
+            .expect("task_delegated payload JSON");
+        assert_eq!(payload["targetInstanceId"], output["targetInstanceId"]);
+        assert!(payload["targetDefinitionId"].is_null());
+    }
+
+    #[test]
+    fn agent_delegate_task_routes_definition_with_stable_event_payload() {
+        let mut worker_definition =
+            test_agent_definition("tool-test-definition-route", AgentPermissions::default());
+        worker_definition.max_instances = 2;
+        let permissions = AgentPermissions {
+            can_create_instances: true,
+            can_delegate: true,
+            allowed_agent_definition_ids: vec![worker_definition.id.clone()],
+        };
+        let (workspace, mut context, team_id, _instance_id, parent_task_id, _wake_rx) =
+            create_agent_tool_fixture(permissions);
+        context.agent_definitions = vec![worker_definition.clone()];
+
         let created = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_CREATE_INSTANCES_TOOL,
-            "call-create-for-delegate",
+            "call-create-definition-target",
             json!({
                 "definitionId": worker_definition.id.to_string(),
                 "count": 1,
@@ -8749,66 +8867,50 @@ mod tests {
                 "timeoutMs": null,
             }),
         )
-        .expect("create worker for definition routing");
+        .expect("worker instance creation");
         let worker_instance_id = created["instances"][0]["id"]
             .as_str()
-            .expect("created instance id")
-            .to_string();
+            .expect("created worker id")
+            .to_owned();
 
-        let definition_delegate = execute_agent_tool(
+        let output = execute_agent_tool(
             &context,
             workspace.path(),
             AGENT_DELEGATE_TASK_TOOL,
-            "call-legal-definition",
+            "call-definition-target",
             json!({
                 "targetKind": "definition",
                 "targetId": worker_definition.id.to_string(),
-                "input": { "message": "definition-ok" },
-                "correlationId": "corr-definition",
+                "input": { "message": "definition child" },
+                "correlationId": "definition-correlation",
                 "timeoutMs": null,
             }),
         )
-        .expect("legal definition routing must succeed");
-        assert_eq!(definition_delegate["status"], "queued");
-        assert_eq!(definition_delegate["targetInstanceId"], worker_instance_id);
-        assert_eq!(definition_delegate["correlationId"], "corr-definition");
-        assert_eq!(child_count(), 2);
+        .expect("definition target must route to its worker");
+        assert_eq!(output["targetInstanceId"], worker_instance_id);
+        assert_eq!(output["status"], "queued");
+        assert_eq!(output["correlationId"], "definition-correlation");
 
         let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("database");
-        let children = database
+        let child_tasks = database
             .agent_tasks_for_parent(&team_id, &parent_task_id)
             .expect("child tasks");
-        assert!(
-            children
-                .iter()
-                .any(|task| task.owner_instance_id.to_string() == worker_instance_id)
+        assert_eq!(child_tasks.len(), 1);
+        assert_eq!(
+            child_tasks[0].owner_instance_id.to_string(),
+            worker_instance_id
         );
-        let delegated_payloads = database
+        let delegated_event = database
             .agent_events_after(&team_id, -1)
             .expect("Agent events")
             .into_iter()
-            .filter(|event| event.event_type == "task_delegated")
-            .map(|event| {
-                serde_json::from_str::<Value>(&event.payload_json)
-                    .expect("task_delegated payload must remain JSON")
-            })
-            .collect::<Vec<_>>();
-        let instance_payload = delegated_payloads
-            .iter()
-            .find(|payload| payload["correlationId"] == "corr-instance")
-            .expect("instance delegation event");
+            .find(|event| event.event_type == "task_delegated")
+            .expect("task delegated event");
+        let payload = serde_json::from_str::<Value>(&delegated_event.payload_json)
+            .expect("task_delegated payload JSON");
+        assert_eq!(payload["targetInstanceId"], output["targetInstanceId"]);
         assert_eq!(
-            instance_payload["targetInstanceId"],
-            coordinator_instance_id.to_string()
-        );
-        assert!(instance_payload["targetDefinitionId"].is_null());
-        let definition_payload = delegated_payloads
-            .iter()
-            .find(|payload| payload["correlationId"] == "corr-definition")
-            .expect("definition delegation event");
-        assert_eq!(definition_payload["targetInstanceId"], worker_instance_id);
-        assert_eq!(
-            definition_payload["targetDefinitionId"],
+            payload["targetDefinitionId"],
             worker_definition.id.to_string()
         );
     }

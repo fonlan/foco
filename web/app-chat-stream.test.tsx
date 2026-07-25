@@ -4907,7 +4907,8 @@ describe("app-chat-stream verification surfaces", () => {
         toolCall: {
           id: "call-delegate",
           input: {
-            targetInstanceId: "agent-instance-worker-1",
+            targetKind: "instance",
+            targetId: "agent-instance-worker-1",
             input: { message: "do work" },
           },
           isError: false,
@@ -5058,7 +5059,10 @@ describe("app-chat-stream verification surfaces", () => {
                   {
                     toolCall: {
                       id: "call-delegate-reattach",
-                      input: { targetInstanceId: "agent-instance-worker-2" },
+                      input: {
+                        targetInstanceId: "agent-instance-worker-2",
+                        targetDefinitionId: null,
+                      },
                       isError: false,
                       name: "agent_delegate_task",
                       output: { taskId: "agent-task-worker-2" },
@@ -5087,7 +5091,10 @@ describe("app-chat-stream verification surfaces", () => {
                 toolCalls: [
                   {
                     id: "call-delegate-reattach",
-                    input: { targetInstanceId: "agent-instance-worker-2" },
+                    input: {
+                        targetInstanceId: "agent-instance-worker-2",
+                        targetDefinitionId: null,
+                      },
                     isError: false,
                     name: "agent_delegate_task",
                     output: { taskId: "agent-task-worker-2" },
@@ -5181,7 +5188,10 @@ describe("app-chat-stream verification surfaces", () => {
         assistantMessageId,
         toolCall: {
           id: "call-delegate-reattach",
-          input: { targetInstanceId: "agent-instance-worker-2" },
+          input: {
+            targetKind: "instance",
+            targetId: "agent-instance-worker-2",
+          },
           isError: false,
           name: "agent_delegate_task",
           output: null,
