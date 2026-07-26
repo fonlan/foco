@@ -168,6 +168,18 @@ pub struct AgentTaskRecord {
     pub completed_at: Option<String>,
 }
 
+/// The durable and runtime-facing effects of cancelling an Agent task subtree.
+///
+/// Running tasks remain owned by their active runs so their normal cancellation
+/// path can close them without replacing a more specific terminal cause.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentTaskSubtreeCancellation {
+    /// Running tasks whose active-run cancellation token must be notified.
+    pub running_task_ids: Vec<AgentTaskId>,
+    /// Queued or waiting tasks transitioned to `cancelled` by this transaction.
+    pub cancelled_tasks: Vec<AgentTaskRecord>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentTaskStateUpdate<'a> {
     pub team_id: &'a AgentTeamId,

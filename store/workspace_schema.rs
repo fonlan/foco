@@ -1581,6 +1581,21 @@ CHECK (
 );
 "#;
 
+// A running task remains running until its active run observes cancellation and
+// closes through the normal terminal path. This durable barrier prevents that
+// short interval from admitting a late delegated descendant after a subtree
+// cancellation has already traversed the task graph.
+pub(crate) const MIGRATION_048: &str = r#"
+CREATE TABLE agent_task_subtree_cancellations (
+    team_id TEXT NOT NULL REFERENCES agent_teams(id) ON DELETE CASCADE,
+    root_task_id TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    PRIMARY KEY (team_id, root_task_id),
+    FOREIGN KEY (team_id, root_task_id)
+        REFERENCES agent_tasks(team_id, id) ON DELETE CASCADE
+);
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

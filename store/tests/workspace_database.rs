@@ -21345,6 +21345,428 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
 }
 
 #[test]
+fn cancel_agent_task_subtree_cancels_queued_and_waiting_descendants_without_touching_siblings() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-subtree-cancel", "subtree-cancel");
+    let workers = [
+        create_test_agent_worker(&database, &team_id, "subtree-cancel-queued"),
+        create_test_agent_worker(&database, &team_id, "subtree-cancel-waiting"),
+        create_test_agent_worker(&database, &team_id, "subtree-cancel-running"),
+        create_test_agent_worker(&database, &team_id, "subtree-cancel-completed"),
+        create_test_agent_worker(&database, &team_id, "subtree-cancel-sibling"),
+    ];
+    Connection::open(database.database_path())
+        .expect("database connection")
+        .execute(
+            "UPDATE agent_teams SET max_concurrent_runs = 8 WHERE id = ?1",
+            params![team_id.as_str()],
+        )
+        .expect("increase team concurrency");
+
+    let root_task_id = AgentTaskId::new("agent-task-subtree-cancel-root").expect("root task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &root_task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue root");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &root_task_id,
+            &AgentAttemptId::new("agent-attempt-subtree-cancel-root").expect("root attempt id"),
+        )
+        .expect("claim root")
+        .expect("claimed root");
+
+    let queued_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-queued").expect("queued task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &queued_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[0],
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue queued descendant");
+
+    let waiting_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-waiting").expect("waiting task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &waiting_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[1],
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue waiting descendant");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &waiting_task_id,
+            &AgentAttemptId::new("agent-attempt-subtree-cancel-waiting")
+                .expect("waiting attempt id"),
+        )
+        .expect("claim waiting descendant")
+        .expect("claimed waiting descendant");
+    assert!(
+        database
+            .update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Wait,
+                result_json: None,
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend waiting descendant")
+    );
+
+    let queued_grandchild_id =
+        AgentTaskId::new("agent-task-subtree-cancel-grandchild").expect("grandchild task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &queued_grandchild_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[0],
+            origin_instance_id: Some(&workers[1]),
+            parent_task_id: Some(&waiting_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue queued grandchild");
+    database
+        .insert_agent_task_dependency(NewAgentTaskDependency {
+            team_id: &team_id,
+            waiting_task_id: &waiting_task_id,
+            dependency_task_id: &queued_grandchild_id,
+            wait_mode: AgentTaskWaitMode::All,
+            pending_tool_call_id: Some("tool-call-subtree-cancel"),
+            deadline_at: None,
+        })
+        .expect("insert waiting dependency");
+
+    let running_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-running").expect("running task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &running_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[2],
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue running descendant");
+    database
+        .claim_runnable_agent_task(
+            &team_id,
+            &running_task_id,
+            &AgentAttemptId::new("agent-attempt-subtree-cancel-running")
+                .expect("running attempt id"),
+        )
+        .expect("claim running descendant")
+        .expect("claimed running descendant");
+
+    let completed_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-completed").expect("completed task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &completed_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[3],
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue completed descendant");
+    complete_test_agent_task(
+        &mut database,
+        &team_id,
+        &completed_task_id,
+        "agent-attempt-subtree-cancel-completed",
+    );
+
+    let sibling_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-sibling").expect("sibling task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &sibling_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[4],
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue sibling");
+
+    let cancellation = database
+        .cancel_agent_task_subtree(
+            &team_id,
+            &root_task_id,
+            r#"{"code":"cancelled_by_parent"}"#,
+            Some("parent task cancelled"),
+        )
+        .expect("cancel subtree");
+    assert_eq!(
+        cancellation.running_task_ids,
+        vec![root_task_id.clone(), running_task_id.clone()]
+    );
+    let cancelled_task_ids = cancellation
+        .cancelled_tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(cancelled_task_ids.len(), 3);
+    assert!(cancelled_task_ids.contains(&queued_task_id));
+    assert!(cancelled_task_ids.contains(&waiting_task_id));
+    assert!(cancelled_task_ids.contains(&queued_grandchild_id));
+    assert_eq!(
+        database
+            .agent_task(&queued_task_id)
+            .expect("queued task")
+            .expect("queued task")
+            .status,
+        AgentTaskStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_task(&waiting_task_id)
+            .expect("waiting task")
+            .expect("waiting task")
+            .status,
+        AgentTaskStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&waiting_task_id)
+            .expect("waiting attempts")[0]
+            .status,
+        AgentAttemptStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_instance(&workers[1])
+            .expect("waiting owner")
+            .expect("waiting owner")
+            .status,
+        AgentInstanceStatus::Idle
+    );
+    assert!(
+        database
+            .agent_task_dependencies(&waiting_task_id)
+            .expect("waiting dependencies")
+            .is_empty()
+    );
+    assert_eq!(
+        database
+            .agent_task(&running_task_id)
+            .expect("running task")
+            .expect("running task")
+            .status,
+        AgentTaskStatus::Running
+    );
+    assert_eq!(
+        database
+            .agent_task(&completed_task_id)
+            .expect("completed task")
+            .expect("completed task")
+            .status,
+        AgentTaskStatus::Completed
+    );
+    assert_json_eq(
+        database
+            .agent_task(&completed_task_id)
+            .expect("completed task")
+            .expect("completed task")
+            .result_json
+            .as_deref()
+            .expect("completed result"),
+        r#"{"ok":true}"#,
+    );
+    assert_eq!(
+        database
+            .agent_task(&sibling_task_id)
+            .expect("sibling task")
+            .expect("sibling task")
+            .status,
+        AgentTaskStatus::Queued
+    );
+    let late_child_task_id =
+        AgentTaskId::new("agent-task-subtree-cancel-late-child").expect("late child task id");
+    let late_child_error = database
+        .enqueue_agent_task(NewAgentTask {
+            id: &late_child_task_id,
+            team_id: &team_id,
+            owner_instance_id: &workers[0],
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect_err("a running root with a cancellation barrier must reject late children");
+    assert!(matches!(
+        late_child_error,
+        WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+    ));
+}
+
+#[test]
+fn cancel_agent_task_subtree_is_idempotent_after_queued_descendants_are_closed() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) =
+        create_test_agent_team(&mut database, "chat-agent-subtree-repeat", "subtree-repeat");
+    let worker_id = create_test_agent_worker(&database, &team_id, "subtree-repeat-worker");
+    let root_task_id = AgentTaskId::new("agent-task-subtree-repeat-root").expect("root task id");
+    let child_task_id = AgentTaskId::new("agent-task-subtree-repeat-child").expect("child task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &root_task_id,
+            team_id: &team_id,
+            owner_instance_id: &coordinator_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue root");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &child_task_id,
+            team_id: &team_id,
+            owner_instance_id: &worker_id,
+            origin_instance_id: Some(&coordinator_id),
+            parent_task_id: Some(&root_task_id),
+            input_json: "{}",
+        })
+        .expect("enqueue child");
+
+    let first = database
+        .cancel_agent_task_subtree(&team_id, &root_task_id, r#"{"code":"first"}"#, None)
+        .expect("first cancellation");
+    assert_eq!(first.cancelled_tasks.len(), 2);
+    let repeated = database
+        .cancel_agent_task_subtree(&team_id, &root_task_id, r#"{"code":"second"}"#, None)
+        .expect("repeat cancellation");
+    assert!(repeated.running_task_ids.is_empty());
+    assert!(repeated.cancelled_tasks.is_empty());
+    assert_json_eq(
+        database
+            .agent_task(&root_task_id)
+            .expect("root task")
+            .expect("root task")
+            .error_json
+            .as_deref()
+            .expect("root cancellation error"),
+        r#"{"code":"first"}"#,
+    );
+}
+
+#[test]
+fn enqueue_agent_task_rejects_children_of_terminal_parents() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("database");
+    let (team_id, coordinator_id) = create_test_agent_team(
+        &mut database,
+        "chat-agent-terminal-parent",
+        "terminal-parent",
+    );
+    let worker_id = create_test_agent_worker(&database, &team_id, "terminal-parent-worker");
+
+    for (suffix, terminal_status) in [
+        ("cancelled", AgentTaskStatus::Cancelled),
+        ("completed", AgentTaskStatus::Completed),
+        ("failed", AgentTaskStatus::Failed),
+        ("interrupted", AgentTaskStatus::Interrupted),
+    ] {
+        let parent_task_id = AgentTaskId::new(format!("agent-task-terminal-parent-{suffix}"))
+            .expect("parent task id");
+        database
+            .enqueue_agent_task(NewAgentTask {
+                id: &parent_task_id,
+                team_id: &team_id,
+                owner_instance_id: &coordinator_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            })
+            .expect("enqueue parent");
+        match terminal_status {
+            AgentTaskStatus::Cancelled => {
+                assert!(
+                    database
+                        .cancel_queued_agent_task(
+                            &team_id,
+                            &parent_task_id,
+                            r#"{"code":"cancelled"}"#,
+                        )
+                        .expect("cancel queued parent")
+                );
+            }
+            AgentTaskStatus::Completed | AgentTaskStatus::Failed | AgentTaskStatus::Interrupted => {
+                let attempt_id =
+                    AgentAttemptId::new(format!("agent-attempt-terminal-parent-{suffix}"))
+                        .expect("parent attempt id");
+                database
+                    .claim_runnable_agent_task(&team_id, &parent_task_id, &attempt_id)
+                    .expect("claim parent")
+                    .expect("claimed parent");
+                let transition = match terminal_status {
+                    AgentTaskStatus::Completed => AgentTaskTransition::Complete,
+                    AgentTaskStatus::Failed => AgentTaskTransition::Fail,
+                    AgentTaskStatus::Interrupted => AgentTaskTransition::Interrupt,
+                    _ => unreachable!("cancelled parent is handled before claiming"),
+                };
+                assert!(
+                    database
+                        .update_agent_task_state(AgentTaskStateUpdate {
+                            team_id: &team_id,
+                            task_id: &parent_task_id,
+                            expected_status: AgentTaskStatus::Running,
+                            transition,
+                            result_json: (terminal_status == AgentTaskStatus::Completed)
+                                .then_some(r#"{"ok":true}"#),
+                            error_json: (terminal_status != AgentTaskStatus::Completed)
+                                .then_some(r#"{"code":"terminal"}"#),
+                            interruption_reason: None,
+                        })
+                        .expect("close parent")
+                );
+            }
+            _ => unreachable!("only terminal statuses are covered"),
+        }
+        let child_task_id =
+            AgentTaskId::new(format!("agent-task-terminal-child-{suffix}")).expect("child task id");
+        let error = database
+            .enqueue_agent_task(NewAgentTask {
+                id: &child_task_id,
+                team_id: &team_id,
+                owner_instance_id: &worker_id,
+                origin_instance_id: Some(&coordinator_id),
+                parent_task_id: Some(&parent_task_id),
+                input_json: "{}",
+            })
+            .expect_err("terminal parent must reject a new delegated child");
+        assert!(matches!(
+            error,
+            WorkspaceDatabaseError::InvalidAgentRuntimeData { .. }
+        ));
+    }
+}
+
+#[test]
 fn phase6_agent_child_tasks_are_team_scoped_and_queued_only_cancellable() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

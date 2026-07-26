@@ -48,20 +48,21 @@ pub use workspace_records::{
     AgentAttemptRecord, AgentAttemptRecoveryDisposition, AgentContextEntryRecord,
     AgentContextSnapshotRecord, AgentEventRecord, AgentInstanceRecord, AgentMessageRecord,
     AgentReconciliationRecord, AgentTaskDependencyRecord, AgentTaskRecord, AgentTaskStateUpdate,
-    AgentTaskWaitRegistrationOutcome, AgentTeamRecord, ChatPage, ChatPageCursor, ChatRecord,
-    ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord, CodeGraphFileSummaryRecord,
-    CodeGraphImportRecord, CodeGraphReferenceRecord, CodeGraphRelatedFileRecord,
-    CodeGraphResolverFileRecord, CodeGraphResolverImportRecord, CodeGraphResolverReferenceRecord,
-    CodeGraphResolverSnapshot, CodeGraphResolverSymbolRecord, CodeGraphSymbolRecord,
-    CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord, HookRunRecord,
-    LlmRequestAuditFilters, LlmRequestAuditModelBreakdown, LlmRequestAuditProviderBreakdown,
-    LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow, LlmRequestAuditSummaryRow,
-    LlmRequestAuditTrendPoint, LlmRequestEventRecord, LlmRequestMetricsForAssistantRecord,
-    LlmRequestMetricsRecord, LlmRequestRecord, LlmRequestTransport, LlmRequestUsageRecord,
-    LlmRequestUsageRollupFilters, MessageMetadataMutation, MessageRecord, MessageRoleCountRecord,
-    NewAgentContextEntry, NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance,
-    NewAgentMessage, NewAgentTask, NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot,
-    NewCodeGraphEdge, NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
+    AgentTaskSubtreeCancellation, AgentTaskWaitRegistrationOutcome, AgentTeamRecord, ChatPage,
+    ChatPageCursor, ChatRecord, ChatSpecSnapshotRecord, CodeChangeStats, CodeGraphContextRecord,
+    CodeGraphFileSummaryRecord, CodeGraphImportRecord, CodeGraphReferenceRecord,
+    CodeGraphRelatedFileRecord, CodeGraphResolverFileRecord, CodeGraphResolverImportRecord,
+    CodeGraphResolverReferenceRecord, CodeGraphResolverSnapshot, CodeGraphResolverSymbolRecord,
+    CodeGraphSymbolRecord, CodeGraphSymbolRelationRecord, ContextCompressionSnapshotRecord,
+    HookRunRecord, LlmRequestAuditFilters, LlmRequestAuditModelBreakdown,
+    LlmRequestAuditProviderBreakdown, LlmRequestAuditRequestKindBreakdown, LlmRequestAuditRow,
+    LlmRequestAuditSummaryRow, LlmRequestAuditTrendPoint, LlmRequestEventRecord,
+    LlmRequestMetricsForAssistantRecord, LlmRequestMetricsRecord, LlmRequestRecord,
+    LlmRequestTransport, LlmRequestUsageRecord, LlmRequestUsageRollupFilters,
+    MessageMetadataMutation, MessageRecord, MessageRoleCountRecord, NewAgentContextEntry,
+    NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
+    NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot, NewCodeGraphEdge,
+    NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
     NewCodeGraphImportResolutionCandidate, NewCodeGraphReference, NewCodeGraphResolvedCall,
     NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
     NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
@@ -96,13 +97,13 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    MIGRATION_045, MIGRATION_046, MIGRATION_047, Migration,
+    MIGRATION_045, MIGRATION_046, MIGRATION_047, MIGRATION_048, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 47;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 48;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -466,6 +467,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 47,
         sql: MIGRATION_047,
+    },
+    Migration {
+        version: 48,
+        sql: MIGRATION_048,
     },
 ];
 
@@ -14875,6 +14880,49 @@ impl WorkspaceDatabase {
                 AgentEntityKind::Task,
                 &database_path,
             )?;
+            let parent_status = transaction
+                .query_row(
+                    "SELECT status FROM agent_tasks WHERE team_id = ?1 AND id = ?2",
+                    params![task.team_id.as_str(), parent_task_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if !matches!(parent_status.as_str(), "queued" | "running" | "waiting") {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "Agent parent task '{parent_task_id}' does not accept delegated tasks while {parent_status}"
+                    ),
+                });
+            }
+            let parent_subtree_cancellation_requested: bool = transaction
+                .query_row(
+                    "WITH RECURSIVE ancestors(id) AS (
+                         SELECT id
+                         FROM agent_tasks
+                         WHERE team_id = ?1 AND id = ?2
+                         UNION
+                         SELECT ancestor.parent_task_id
+                         FROM agent_tasks AS ancestor
+                         JOIN ancestors AS descendant ON ancestor.id = descendant.id
+                         WHERE ancestor.team_id = ?1 AND ancestor.parent_task_id IS NOT NULL
+                     )
+                     SELECT EXISTS (
+                         SELECT 1
+                         FROM agent_task_subtree_cancellations AS cancellation
+                         JOIN ancestors ON ancestors.id = cancellation.root_task_id
+                         WHERE cancellation.team_id = ?1
+                     )",
+                    params![task.team_id.as_str(), parent_task_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if parent_subtree_cancellation_requested {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "Agent parent task '{parent_task_id}' is within a cancelled task subtree"
+                    ),
+                });
+            }
         }
 
         let (team_status, instance_status) = transaction
@@ -15094,6 +15142,160 @@ impl WorkspaceDatabase {
             )
             .map(|updated| updated == 1)
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Atomically cancel queued and waiting tasks in a root task's complete subtree.
+    ///
+    /// Running tasks deliberately retain their current durable state. The caller
+    /// receives their ids and must signal each active run's cancellation token;
+    /// that run then owns its normal terminal transition and preserves its first
+    /// terminal cause. The Immediate transaction serializes this traversal with
+    /// child enqueue validation, so no delegated descendant can arrive after the
+    /// subtree has been inspected.
+    pub fn cancel_agent_task_subtree(
+        &mut self,
+        team_id: &AgentTeamId,
+        root_task_id: &AgentTaskId,
+        error_json: &str,
+        interruption_reason: Option<&str>,
+    ) -> Result<AgentTaskSubtreeCancellation, WorkspaceDatabaseError> {
+        validate_agent_json(error_json, "error_json")?;
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let subtree_tasks = {
+            let mut statement = transaction
+                .prepare(
+                    "WITH RECURSIVE subtree(id) AS (
+                         SELECT id
+                         FROM agent_tasks
+                         WHERE team_id = ?1 AND id = ?2
+                         UNION
+                         SELECT child.id
+                         FROM agent_tasks AS child
+                         JOIN subtree ON child.parent_task_id = subtree.id
+                         WHERE child.team_id = ?1
+                     )
+                     SELECT task.id, task.team_id, task.owner_instance_id, task.origin_instance_id,
+                            task.parent_task_id, task.sequence, task.status, task.input_json,
+                            task.result_json, task.error_json, task.created_at, task.updated_at,
+                            task.started_at, task.completed_at
+                     FROM agent_tasks AS task
+                     JOIN subtree ON subtree.id = task.id
+                     WHERE task.team_id = ?1
+                     ORDER BY task.created_at, task.id",
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            let rows = statement
+                .query_map(
+                    params![team_id.as_str(), root_task_id.as_str()],
+                    agent_task_from_row,
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            collect_rows(rows, &database_path)?
+        };
+        if !subtree_tasks.is_empty() {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO agent_task_subtree_cancellations
+                         (team_id, root_task_id, requested_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![team_id.as_str(), root_task_id.as_str(), now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        let running_task_ids = subtree_tasks
+            .iter()
+            .filter(|task| task.status == AgentTaskStatus::Running)
+            .map(|task| task.id.clone())
+            .collect();
+        let cancellable_tasks = subtree_tasks
+            .iter()
+            .filter(|task| {
+                matches!(
+                    task.status,
+                    AgentTaskStatus::Queued | AgentTaskStatus::Waiting
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        for task in &cancellable_tasks {
+            let updated = transaction
+                .execute(
+                    "UPDATE agent_tasks
+                     SET status = 'cancelled', error_json = ?3, completed_at = ?4, updated_at = ?4
+                     WHERE team_id = ?1 AND id = ?2 AND status IN ('queued', 'waiting')",
+                    params![team_id.as_str(), task.id.as_str(), error_json, now],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if updated != 1 {
+                return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!(
+                        "Agent task '{}' changed state while its subtree cancellation was in progress",
+                        task.id
+                    ),
+                });
+            }
+
+            if task.status == AgentTaskStatus::Waiting {
+                let attempts_updated = transaction
+                    .execute(
+                        "UPDATE agent_attempts
+                         SET status = 'cancelled', completed_at = ?3, interruption_reason = ?4
+                         WHERE task_id = ?1 AND team_id = ?2 AND status = 'suspended'",
+                        params![task.id.as_str(), team_id.as_str(), now, interruption_reason,],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+                if attempts_updated != 1 {
+                    return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                        message: format!(
+                            "waiting Agent task '{}' has no suspended attempt to cancel",
+                            task.id
+                        ),
+                    });
+                }
+                transaction
+                    .execute(
+                        "UPDATE agent_instances
+                         SET status = CASE WHEN status = 'draining' THEN 'draining' ELSE 'idle' END,
+                             updated_at = ?3
+                         WHERE id = ?1 AND team_id = ?2 AND status IN ('waiting', 'draining')",
+                        params![task.owner_instance_id.as_str(), team_id.as_str(), now],
+                    )
+                    .map_err(|source| sqlite_error(&database_path, source))?;
+            }
+
+            transaction
+                .execute(
+                    "DELETE FROM agent_task_dependencies WHERE waiting_task_id = ?1",
+                    params![task.id.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        let cancelled_tasks = cancellable_tasks
+            .into_iter()
+            .map(|mut task| {
+                task.status = AgentTaskStatus::Cancelled;
+                task.error_json = Some(error_json.to_string());
+                task.updated_at = now.clone();
+                task.completed_at = Some(now.clone());
+                task
+            })
+            .collect();
+        Ok(AgentTaskSubtreeCancellation {
+            running_task_ids,
+            cancelled_tasks,
+        })
     }
 
     pub fn transfer_queued_agent_task_with_limits(
@@ -15821,6 +16023,15 @@ impl WorkspaceDatabase {
                 .execute(
                     "DELETE FROM agent_task_dependencies WHERE waiting_task_id = ?1",
                     params![update.task_id.as_str()],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        if update.transition == AgentTaskTransition::Retry {
+            transaction
+                .execute(
+                    "DELETE FROM agent_task_subtree_cancellations
+                     WHERE team_id = ?1 AND root_task_id = ?2",
+                    params![update.team_id.as_str(), update.task_id.as_str()],
                 )
                 .map_err(|source| sqlite_error(&database_path, source))?;
         }
@@ -21384,6 +21595,11 @@ fn run_migrations(
                         "dispatch_owner_incarnation",
                     )?
             }
+            48 => table_exists(
+                &transaction,
+                database_path,
+                "agent_task_subtree_cancellations",
+            )?,
             _ => false,
         };
         if skip_migration {
