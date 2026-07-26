@@ -10603,6 +10603,10 @@ export function App() {
     // from this same run only; otherwise context usage remains the backend
     // estimate until an identity-bearing terminal metric arrives.
     const existingRunInfo = activeRunInfoByChatKeyRef.current[chatKey];
+    const runMessageContextUsageInput = contextUsageInputFromRunMessage(
+      activeRun,
+      chatMessagesByKeyRef.current[chatKey] ?? [],
+    );
     const runModelIdentity =
       existingRunInfo?.runId === activeRun.runId &&
       existingRunInfo.modelId &&
@@ -10611,6 +10615,21 @@ export function App() {
             modelId: existingRunInfo.modelId,
             providerId: existingRunInfo.providerId,
           }
+        : runMessageContextUsageInput
+          ? {
+              modelId: runMessageContextUsageInput.modelId,
+              providerId: runMessageContextUsageInput.providerId,
+            }
+          : null;
+    // Active-run reconnect summaries omit parts of the immutable request
+    // configuration. Recover them only from this run's durable queued-user
+    // message; never fill gaps from the mutable composer selection.
+    const runContextUsageConfig =
+      runModelIdentity &&
+      runMessageContextUsageInput &&
+      runModelIdentity.modelId === runMessageContextUsageInput.modelId &&
+      runModelIdentity.providerId === runMessageContextUsageInput.providerId
+        ? runMessageContextUsageInput
         : null;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
@@ -10666,13 +10685,16 @@ export function App() {
       if (!modelIdentity) {
         return false;
       }
+      if (!runContextUsageConfig) {
+        return false;
+      }
 
       void refreshContextUsage({
         chatId: activeRun.chatId,
         modelId: modelIdentity.modelId,
         providerId: modelIdentity.providerId,
-        skillIds: [],
-        thinkingLevel: selectedThinkingLevelRef.current,
+        skillIds: runContextUsageConfig.skillIds,
+        thinkingLevel: runContextUsageConfig.thinkingLevel,
         workspaceId: activeRun.workspaceId,
       });
       return true;
@@ -10695,7 +10717,7 @@ export function App() {
       ) {
         return;
       }
-      if (!runModelIdentity) {
+      if (!runModelIdentity || !runContextUsageConfig) {
         return;
       }
 
@@ -10706,8 +10728,8 @@ export function App() {
         chatId: activeRun.chatId,
         modelId: runModelIdentity.modelId,
         providerId: runModelIdentity.providerId,
-        skillIds: [],
-        thinkingLevel: selectedThinkingLevelRef.current,
+        skillIds: runContextUsageConfig.skillIds,
+        thinkingLevel: runContextUsageConfig.thinkingLevel,
         workspaceId: activeRun.workspaceId,
       });
     };
@@ -19645,6 +19667,35 @@ function mergeAssistantMessageOnStreamStart(
     metrics: null,
     memoriesUsed: memoriesUsed.length ? memoriesUsed : message.memoriesUsed,
     status: "streaming",
+  };
+}
+
+function contextUsageInputFromRunMessage(
+  activeRun: ActiveChatRunSummary,
+  messages: ShellMessage[],
+): {
+  modelId: string;
+  providerId: string;
+  thinkingLevel: string;
+  skillIds: string[];
+} | null {
+  const queuedUserMessageId = activeRun.queuedUserMessageId;
+  const runConfig = queuedUserMessageId
+    ? messages.find((message) => message.id === queuedUserMessageId)?.runConfig
+    : null;
+  if (
+    !runConfig ||
+    !runConfig.modelId ||
+    !runConfig.providerId
+  ) {
+    return null;
+  }
+
+  return {
+    modelId: runConfig.modelId,
+    providerId: runConfig.providerId,
+    thinkingLevel: runConfig.thinkingLevel ?? "",
+    skillIds: normalizeStringArray(runConfig.selectedSkillIds),
   };
 }
 
