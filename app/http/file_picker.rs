@@ -1169,6 +1169,24 @@ mod tests {
         assert!(is_home_shorthand("~/a"));
     }
 
+    #[test]
+    fn selected_svg_file_includes_content_for_workspace_icon_uploads() {
+        let root = temp_picker_dir("selected-svg");
+        let svg_path = root.join("workspace-icon.svg");
+        let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"/>"#;
+        fs::write(&svg_path, svg).unwrap();
+
+        let files = selected_files_from_paths(vec![svg_path]).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content_type, "image/svg+xml");
+        assert_eq!(
+            files[0].content_base64.as_deref(),
+            Some(general_purpose::STANDARD.encode(svg).as_str())
+        );
+    }
+
     fn temp_picker_dir(label: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
             "foco-file-picker-test-{}-{}-{}",

@@ -9297,6 +9297,7 @@ fn attachment_content_type_for_path(path: &Path) -> String {
         "py" => "text/x-python",
         "rs" => "text/plain",
         "sh" => "text/x-shellscript",
+        "svg" => "image/svg+xml",
         "toml" => "application/toml",
         "ts" => "text/typescript",
         "tsx" => "text/typescript",
