@@ -325,13 +325,15 @@ describe("deriveChatSessionStatus", () => {
     expect(chatSessionStatusDotClass("failed")).toBe("session-status-dot-error");
   });
 
-  it("treats persisted queuedRun running as visual running without inventing activeRun", () => {
+  it("keeps durable waiting visually running without inventing cancellation state", () => {
     const result = status({
       openChatKeySet: new Set(["workspace-1:chat-1"]),
       persistedRunning: true,
     });
     expect(result.kind).toBe("running");
     expect(result.activeRun).toBeNull();
+    // Composer cancel/guidance require a live run identity, not only durable waiting.
+    expect(isGuidableActiveRun(null, result.kind === "running")).toBe(false);
   });
 
   it("does not treat queued or missing persisted run as visual running", () => {
@@ -341,6 +343,41 @@ describe("deriveChatSessionStatus", () => {
     expect(isPersistedQueuedRunRunning(null)).toBe(false);
     expect(isPersistedQueuedRunRunning(undefined)).toBe(false);
     expect(isPersistedQueuedRunRunning({ status: "completed" })).toBe(false);
+  });
+
+  it("ignores a terminal workspace activeRun so lagging snapshots cannot resurrect running", () => {
+    const terminalWorkspaceRun = {
+      acceptingGuidance: true,
+      chatId: "chat-1",
+      lastSequence: 1,
+      runId: "run-terminal",
+      workspaceId: "workspace-1",
+    };
+    const result = status({
+      openChatKeySet: new Set(["workspace-1:chat-1"]),
+      terminalRunId: "run-terminal",
+      workspaceActiveRun: terminalWorkspaceRun,
+    });
+    expect(result.kind).toBe("open");
+    expect(result.activeRun).toBeNull();
+  });
+
+  it("stops durable waiting when backend clears the orphan queuedRun and surfaces failure", () => {
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: false,
+      }).kind,
+    ).toBe("failed");
+    // Durable waiting still outranks failed while the backend keeps queuedRun.running.
+    expect(
+      status({
+        failedChatKeySet: new Set(["workspace-1:chat-1"]),
+        openChatKeySet: new Set(["workspace-1:chat-1"]),
+        persistedRunning: true,
+      }).kind,
+    ).toBe("running");
   });
 
   it("keeps local running, scheduled, failed, open, idle priority with persistedRunning", () => {

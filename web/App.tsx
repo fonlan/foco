@@ -1090,7 +1090,7 @@ type ChatSessionStatusInput = {
   chatKey: string;
   failedChatKeySet: Set<string>;
   openChatKeySet: Set<string>;
-  /** Visual-only: durable queuedRun.status === "running" (e.g. coordinator waiting). */
+  /** Durable queuedRun.status === "running" (for example, coordinator waiting). */
   persistedRunning?: boolean;
   runningChatKeys: Set<string>;
   scheduledChatKey?: string | null;
@@ -1143,7 +1143,8 @@ export function deriveChatSessionStatus({
       .map((statusChatKey) => activeRunInfoByChatKey[statusChatKey] ?? null)
       .find((runInfo): runInfo is ActiveRunInfo => runInfo !== null) ??
     operationalWorkspaceActiveRun;
-  // persistedRunning is tab/sidebar lifecycle only — never invents activeRun for cancel/guidance.
+  // A durable queued run is a visual running state, but never invents an active
+  // run identity for cancellation or guidance.
   const isRunning =
     statusChatKeys.some((statusChatKey) =>
       runningChatKeys.has(statusChatKey),
@@ -2377,36 +2378,6 @@ export function App() {
         scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
         workspaceActiveRun?: ActiveChatRunSummary | null;
       } = {},
-    ) =>
-      deriveChatSessionStatus({
-        activeChatKey,
-        activeRunInfoByChatKey,
-        chatKey,
-        failedChatKeySet,
-        openChatKeySet,
-        runningChatKeys,
-        scheduledChatKey: options.scheduledChatKey,
-        scheduledStatus: options.scheduledStatus,
-        terminalRunId: terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
-        workspaceActiveRun: options.workspaceActiveRun ?? null,
-      }),
-    [
-      activeChatKey,
-      activeRunInfoByChatKey,
-      failedChatKeySet,
-      openChatKeySet,
-      runningChatKeys,
-    ],
-  );
-  // Tab/sidebar lifecycle only. Composer cancel/guidance keep chatSessionStatusFor (operational).
-  const chatSessionVisualStatusFor = useCallback(
-    (
-      chatKey: string,
-      options: {
-        scheduledChatKey?: string | null;
-        scheduledStatus?: ScheduledWorkspaceRun["status"] | null;
-        workspaceActiveRun?: ActiveChatRunSummary | null;
-      } = {},
     ) => {
       const statusChatKeys =
         options.scheduledChatKey && options.scheduledChatKey !== chatKey
@@ -2468,7 +2439,13 @@ export function App() {
     ? readOnlyChatKeys[activeChatKey] === true
     : false;
   const canUseTeamMode = agentDefinitions.length > 1;
-  const isSendingMessage = activeChatSessionStatus.kind === "running";
+  const isActiveChatSessionRunning =
+    activeChatSessionStatus.kind === "running";
+  // All chat surfaces share the same durable session status. A suspended
+  // coordinator remains visually running, but it has no live run identity to
+  // cancel or guide until the scheduler reattaches a fresh attempt.
+  const isSendingMessage =
+    isActiveChatSessionRunning && activeChatSessionStatus.activeRun !== null;
   const queuedRunRequests = activeChatKey
     ? (queuedRunRequestsByChatKey[activeChatKey] ?? [])
     : [];
@@ -2905,12 +2882,12 @@ export function App() {
       contextUsageIdentityByChatKeyRef.current.get(chatKey) === identity;
 
     const composerRefreshAction = composerContextUsageRefreshAction({
-      hasPendingSkip: isSendingMessage
+      hasPendingSkip: isActiveChatSessionRunning
         ? false
         : skipComposerContextUsageRefreshAfterRunByChatKeyRef.current.delete(
             chatKey,
           ),
-      isSendingMessage,
+      isSendingMessage: isActiveChatSessionRunning,
       matchesCurrentIdentity,
     });
     if (composerRefreshAction === "record-skip") {
@@ -2959,7 +2936,7 @@ export function App() {
     activeChatId,
     activeWorkspaceId,
     effectiveSelectedSkillIds,
-    isSendingMessage,
+    isActiveChatSessionRunning,
     selectedModelId,
     selectedProviderId,
     selectedRequestThinkingLevel,
@@ -14372,7 +14349,7 @@ export function App() {
                                           const scheduledChatKey =
                                             chat.scheduledChatKey ?? null;
                                           const sessionStatus =
-                                            chatSessionVisualStatusFor(
+                                            chatSessionStatusFor(
                                               chatKey,
                                               {
                                                 scheduledChatKey,
@@ -14767,7 +14744,7 @@ export function App() {
                   <MainTabBar
                     activeTab={activeMainTab}
                     agentInstanceIsRunning={agentInstanceIsRunning}
-                    chatSessionStatusFor={chatSessionVisualStatusFor}
+                    chatSessionStatusFor={chatSessionStatusFor}
                     onCloseTab={closeMainTab}
                     onCloseTabs={closeMainTabs}
                     onSelectTab={selectMainTab}

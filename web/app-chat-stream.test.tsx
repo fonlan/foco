@@ -8366,6 +8366,32 @@ describe("app-chat-stream verification surfaces", () => {
       screen.getByRole("button", { name: "Cancel run" }),
     ).toBeInTheDocument();
 
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        lifecycle: {
+          completedAt: "2026-07-27T00:00:00Z",
+          durationMs: 1_000,
+          errorPreview: null,
+          eventId: "agent-task-lifecycle:worker-waiting:completed",
+          instanceId: "agent-instance-worker-waiting",
+          parentTaskId: "agent-task-coordinator-waiting",
+          resultPreview: "Worker completed while the coordinator is suspended.",
+          startedAt: "2026-07-26T23:59:59Z",
+          status: "completed",
+          taskId: "agent-task-worker-waiting",
+          teamId: "agent-team-waiting",
+        },
+        type: "agentTaskLifecycle",
+      });
+    });
+    expect(
+      await screen.findByText("Unknown agent subagent Completed"),
+    ).toBeInTheDocument();
+    expect(
+      within(tabList).getByRole("status", { name: "Chat is running" }),
+    ).toBeInTheDocument();
+
     appTestState.workspaceResponseWorkspaces = [
       {
         ...workspace,
@@ -8482,6 +8508,110 @@ describe("app-chat-stream verification surfaces", () => {
     await waitFor(() =>
       expect(statusDot()).not.toHaveClass("session-status-dot-running"),
     );
+    expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Cancel run" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("clears tab, sidebar, and composer running state when an orphan queuedRun is finalized as failed", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "wait then fail resume",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const tabList = await screen.findByRole("tablist", { name: "Chat" });
+    const workspaceList = await screen.findByRole("navigation", {
+      name: "Workspace list",
+    });
+    const historyButton = within(workspaceList)
+      .getByText("Tool run")
+      .closest("button");
+    if (!historyButton) {
+      throw new Error("Expected Tool run history item button");
+    }
+    const statusDot = () => historyButton.querySelector(".session-status-dot");
+
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats.map((chat) =>
+          chat.id === "chat-1"
+            ? {
+                ...chat,
+                activeRun: null,
+                queuedRun: {
+                  assistantMessageId: "message-assistant-stream",
+                  content: "wait then fail resume",
+                  modelId: "gpt-test",
+                  providerId: "openai",
+                  skillIds: [],
+                  status: "running",
+                  thinkingLevel: null,
+                  userMessageId: "message-user-stream",
+                },
+              }
+            : chat,
+        ),
+      },
+      secondaryWorkspace,
+    ];
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        within(tabList).getByRole("status", { name: "Chat is running" }),
+      ).toBeInTheDocument(),
+    );
+    expect(statusDot()).toHaveClass("session-status-dot-running");
+    expect(
+      screen.queryByRole("button", { name: "Cancel run" }),
+    ).not.toBeInTheDocument();
+
+    // Backend proves the handoff is unrecoverable: clear durable queuedRun and
+    // surface a terminal stream error so all three visual entries leave running.
+    appTestState.workspaceResponseWorkspaces = [
+      {
+        ...workspace,
+        chats: workspace.chats.map((chat) =>
+          chat.id === "chat-1"
+            ? {
+                ...chat,
+                activeRun: null,
+                queuedRun: null,
+              }
+            : chat,
+        ),
+      },
+      secondaryWorkspace,
+    ];
+    await userEvent.click(
+      screen.getByRole("button", { name: "Refresh workspaces" }),
+    );
+
+    await waitFor(() =>
+      expect(
+        within(tabList).queryByRole("status", { name: "Chat is running" }),
+      ).not.toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(statusDot()).not.toHaveClass("session-status-dot-running"),
+    );
+    expect(screen.getByRole("button", { name: "Send message" })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Cancel run" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the tab context menu open when the active stream scrolls messages", async () => {
