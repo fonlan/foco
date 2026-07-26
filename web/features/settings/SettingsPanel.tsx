@@ -6186,23 +6186,6 @@ export function SettingsPanel({
                   <PromptOverrideEditor
                     actions={(
                       <div className="flex flex-wrap items-center justify-end gap-2">
-                        <SettingsSelect
-                          aria-label={t("Select system prompt")}
-                          className="h-9 min-w-40 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
-                          onChange={(event) =>
-                            setPromptSettingsForm((current) => ({
-                              ...current,
-                              activeSystemPromptName: event.target.value,
-                            }))
-                          }
-                          value={activeSystemPrompt?.name ?? DEFAULT_SYSTEM_PROMPT_NAME}
-                        >
-                          {listSystemPrompts.map((prompt) => (
-                            <option key={prompt.name} value={prompt.name}>
-                              {prompt.name}
-                            </option>
-                          ))}
-                        </SettingsSelect>
                         {isDefaultSystemPromptActive ? (
                           <SettingsButton
                             aria-label={t("Restore default system prompt")}
@@ -6239,6 +6222,23 @@ export function SettingsPanel({
                           <Plus aria-hidden="true" className="size-3.5" />
                           {t("New prompt")}
                         </SettingsButton>
+                        <SettingsSelect
+                          aria-label={t("Select system prompt")}
+                          className="h-9 min-w-40 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2.5 text-sm text-[var(--foreground)] outline-none transition focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent)]"
+                          onChange={(event) =>
+                            setPromptSettingsForm((current) => ({
+                              ...current,
+                              activeSystemPromptName: event.target.value,
+                            }))
+                          }
+                          value={activeSystemPrompt?.name ?? DEFAULT_SYSTEM_PROMPT_NAME}
+                        >
+                          {listSystemPrompts.map((prompt) => (
+                            <option key={prompt.name} value={prompt.name}>
+                              {prompt.name}
+                            </option>
+                          ))}
+                        </SettingsSelect>
                       </div>
                     )}
                     description={t(
