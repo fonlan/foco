@@ -1989,6 +1989,9 @@ export function App() {
   const contextUsageIdentityByChatKeyRef = useRef<Map<string, string>>(
     new Map(),
   );
+  const skipComposerContextUsageRefreshAfterRunByChatKeyRef = useRef<
+    Set<string>
+  >(new Set());
   const contextUsageRequestIdByChatKeyRef = useRef<Map<string, number>>(
     new Map(),
   );
@@ -2825,11 +2828,27 @@ export function App() {
       return;
     }
 
-    if (contextUsageIdentityByChatKeyRef.current.get(chatKey) === identity) {
+    const matchesCurrentIdentity =
+      contextUsageIdentityByChatKeyRef.current.get(chatKey) === identity;
+
+    const composerRefreshAction = composerContextUsageRefreshAction({
+      hasPendingSkip: isSendingMessage
+        ? false
+        : skipComposerContextUsageRefreshAfterRunByChatKeyRef.current.delete(
+            chatKey,
+          ),
+      isSendingMessage,
+      matchesCurrentIdentity,
+    });
+    if (composerRefreshAction === "record-skip") {
+      // A model selection made while a run is active must not be replayed as a
+      // composer context-usage request immediately after the run finishes. The
+      // terminal refresh belongs to the run's immutable route instead.
+      skipComposerContextUsageRefreshAfterRunByChatKeyRef.current.add(chatKey);
       return;
     }
 
-    if (isSendingMessage) {
+    if (composerRefreshAction !== "refresh") {
       return;
     }
 
@@ -17894,6 +17913,29 @@ export function contextUsageWithLatestProviderUsage(
     totalUsedContextTokens: inputTokens,
     usagePercent: Math.ceil((inputTokens * 100) / usage.contextWindow),
   };
+}
+
+export function composerContextUsageRefreshAction({
+  hasPendingSkip,
+  isSendingMessage,
+  matchesCurrentIdentity,
+}: {
+  hasPendingSkip: boolean;
+  isSendingMessage: boolean;
+  matchesCurrentIdentity: boolean;
+}): "record-skip" | "refresh" | "unchanged" {
+  if (isSendingMessage) {
+    return matchesCurrentIdentity ? "unchanged" : "record-skip";
+  }
+
+  // Consume an old skip marker before checking identity. A switch away from
+  // and back to the run route can otherwise leave the marker behind and
+  // suppress a later, unrelated composer refresh.
+  if (hasPendingSkip || matchesCurrentIdentity) {
+    return "unchanged";
+  }
+
+  return "refresh";
 }
 
 function sameModelRoute(

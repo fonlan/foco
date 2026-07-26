@@ -1490,6 +1490,137 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("keeps the active Grok route for live and terminal context usage after the composer switches", async () => {
+    const grokContextUsage = {
+      ...contextUsage,
+      availableMessageTokens: 107_559,
+      assembledMessageTokens: 342_441,
+      assembledUsagePercent: 77,
+      compressionTriggerTokens: 360_000,
+      contextWindow: 450_000,
+      llmCompressionTriggerTokens: 427_500,
+      totalUsedContextTokens: 342_441,
+      usagePercent: 77,
+      usedMessageTokens: 342_441,
+    };
+    appTestState.settingsResponse = {
+      ...settings,
+      configuredModels: [
+        {
+          ...settings.configuredModels[0]!,
+          activeProviderId: "xai",
+          contextWindow: 450_000,
+          displayName: "Grok 4",
+          id: "grok-4",
+          providerIds: ["xai"],
+        },
+        {
+          ...settings.configuredModels[0]!,
+          displayName: "Other Test",
+          id: "other-model",
+          providerIds: ["openai"],
+        },
+      ],
+      providers: [
+        ...settings.providers,
+        {
+          ...settings.providers[0]!,
+          baseUrl: "https://api.x.ai/v1",
+          id: "xai",
+          kind: "xai",
+          kindLabel: "xAI",
+          name: "xAI",
+        },
+      ],
+    } as typeof settings;
+    appTestState.contextUsageResponseQueuesByChatKey["workspace-1/chat-1"] =
+      Array.from({ length: 4 }, () => ({ ...grokContextUsage }));
+    const fetchMock = vi.mocked(fetch);
+
+    renderApp();
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "keep the Grok route",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /Model:/ }));
+    await userEvent.click(screen.getByRole("option", { name: "Other Test" }));
+    expect(screen.getByRole("button", { name: /Model:/ })).toHaveTextContent(
+      "Other Test",
+    );
+    const usageCallCountBeforeComplete = fetchMock.mock.calls.filter(
+      ([url]) =>
+        typeof url === "string" &&
+        url === "/api/workspaces/workspace-1/context-usage",
+    ).length;
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        type: "usage",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 342_441,
+          outputTokens: 1,
+        },
+      });
+    });
+
+    expect(
+      await screen.findByRole("status", { name: "Context usage 77%" }),
+    ).toHaveTextContent("77%");
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        chatId: "chat-1",
+        memoriesUsed: [],
+        metrics: {
+          firstTokenLatencyMs: 10,
+          modelId: "grok-4",
+          outputTokens: 1,
+          providerId: "xai",
+          totalLatencyMs: 1000,
+        },
+        reasoning: null,
+        stopReason: "completed",
+        text: "Grok answer.",
+        type: "complete",
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 342_441,
+          outputTokens: 1,
+        },
+      });
+    });
+
+    await waitFor(() => {
+      const usageCalls = fetchMock.mock.calls.filter(
+        ([url]) =>
+          typeof url === "string" &&
+          url === "/api/workspaces/workspace-1/context-usage",
+      );
+      const terminalRefreshes = usageCalls.slice(usageCallCountBeforeComplete);
+      expect(terminalRefreshes.length).toBeGreaterThan(0);
+      for (const usageCall of terminalRefreshes) {
+        expect(JSON.parse(String(usageCall[1]?.body))).toMatchObject({
+          modelId: "grok-4",
+          providerId: "xai",
+        });
+      }
+    });
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("uses a terminal remote context usage refresh after streamEnd", async () => {
     const { chatKey } = configureRemoteChat();
     window.history.replaceState(

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, composerContextUsageRefreshAction, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ContextUsageResponse, ShellMessage } from "./api/types";
 import { translate } from "./shared/i18n";
 
@@ -72,7 +72,7 @@ describe("live context usage identity", () => {
     willCompressOnNextSend: false,
   };
 
-  it("does not combine a provider token count with another model's window", () => {
+  it("does not combine provider token counts when the route identity is unknown or mismatched", () => {
     const unknown = contextUsageWithLatestProviderUsage(estimate, {
       modelId: "",
       providerId: "",
@@ -86,6 +86,28 @@ describe("live context usage identity", () => {
     });
     const mismatched = contextUsageWithLatestProviderUsage(estimate, {
       modelId: "model-b",
+      providerId: "provider-b",
+      startedAtMs: 0,
+      usage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 1_500,
+        outputTokens: 1,
+      },
+    });
+    const mismatchedModel = contextUsageWithLatestProviderUsage(estimate, {
+      modelId: "model-b",
+      providerId: "provider-a",
+      startedAtMs: 0,
+      usage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 1_500,
+        outputTokens: 1,
+      },
+    });
+    const mismatchedProvider = contextUsageWithLatestProviderUsage(estimate, {
+      modelId: "model-a",
       providerId: "provider-b",
       startedAtMs: 0,
       usage: {
@@ -109,8 +131,83 @@ describe("live context usage identity", () => {
 
     expect(unknown).toEqual(estimate);
     expect(mismatched).toEqual(estimate);
+    expect(mismatchedModel).toEqual(estimate);
+    expect(mismatchedProvider).toEqual(estimate);
     expect(matching.totalUsedContextTokens).toBe(700);
     expect(matching.usagePercent).toBe(70);
+  });
+
+  it("keeps the running Grok window after the composer switches models", () => {
+    const grokRunEstimate: ContextUsageResponse = {
+      ...estimate,
+      contextWindow: 450_000,
+      modelId: "grok-4",
+      providerId: "xai",
+      totalUsedContextTokens: 300_000,
+      usagePercent: 67,
+    };
+
+    // The composer may now point at another route. The live usage belongs to
+    // the active Grok run, so it must be measured against Grok's 450k window.
+    const usageFromRunningGrok = contextUsageWithLatestProviderUsage(
+      grokRunEstimate,
+      {
+        modelId: "grok-4",
+        providerId: "xai",
+        startedAtMs: 0,
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 342_441,
+          outputTokens: 1,
+        },
+      },
+    );
+    const usageFromSwitchedComposer = contextUsageWithLatestProviderUsage(
+      grokRunEstimate,
+      {
+        modelId: "another-model",
+        providerId: "another-provider",
+        startedAtMs: 0,
+        usage: {
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          inputTokens: 342_441,
+          outputTokens: 1,
+        },
+      },
+    );
+
+    expect(usageFromRunningGrok.totalUsedContextTokens).toBe(342_441);
+    expect(usageFromRunningGrok.usagePercent).toBe(77);
+    expect(usageFromSwitchedComposer).toEqual(grokRunEstimate);
+  });
+
+  it("does not let an active-run composer skip suppress a later model refresh", () => {
+    // Model switches while the run is active are skipped once after the run so
+    // the terminal refresh can retain the immutable run route. If the user
+    // switches back before completion, the marker must still be consumed.
+    expect(
+      composerContextUsageRefreshAction({
+        hasPendingSkip: false,
+        isSendingMessage: true,
+        matchesCurrentIdentity: false,
+      }),
+    ).toBe("record-skip");
+    expect(
+      composerContextUsageRefreshAction({
+        hasPendingSkip: true,
+        isSendingMessage: false,
+        matchesCurrentIdentity: true,
+      }),
+    ).toBe("unchanged");
+    expect(
+      composerContextUsageRefreshAction({
+        hasPendingSkip: false,
+        isSendingMessage: false,
+        matchesCurrentIdentity: false,
+      }),
+    ).toBe("refresh");
   });
 });
 
