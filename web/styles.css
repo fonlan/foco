@@ -3785,6 +3785,15 @@ body,
   line-height: 1;
 }
 
+/* Keep the attachment and Plan controls on the same base surface as the
+   model selector; Plan's pressed state below intentionally remains accented. */
+.message-composer-control-row :is(
+  .composer-tool-button,
+  .composer-team-toggle
+) {
+  background: var(--surface);
+}
+
 .message-composer-control-row :is(
   .composer-tool-button,
   .composer-team-toggle,
@@ -4062,6 +4071,22 @@ body,
     flex: 1 1 0;
     /* Match composer-shell: keep only a thin phone horizontal inset. */
     padding: 0.75rem 0.25rem;
+  }
+}
+
+/* The portrait composer has less horizontal room even when its CSS viewport is
+   wider than the phone breakpoint. Keep Plan icon-only in every portrait view. */
+@media (orientation: portrait) {
+  .message-composer-control-row .composer-team-toggle {
+    width: 1.75rem;
+    min-width: 1.75rem;
+    max-width: 1.75rem;
+    flex: 0 0 1.75rem;
+    padding-inline: 0;
+  }
+
+  .message-composer-control-row .composer-team-toggle-label {
+    display: none;
   }
 }
 
