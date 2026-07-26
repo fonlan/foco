@@ -455,6 +455,41 @@ export type ChatToolLiveOutput = {
   stderr: string;
 };
 
+/**
+ * Terminal observation emitted when the repeated tool-call guard blocks a
+ * provider call. This is deliberately distinct from a tool execution error:
+ * the tool was never sent to the executor.
+ */
+export type ToolCallLoopGuardBlockedPayload = {
+  source: "toolCallLoopGuard";
+  executed: false;
+  originalCallId: string;
+  blockedBatchIndex: number;
+  recoveryIndex: number;
+  recoveryLimit: number;
+  recoveryAvailable: boolean;
+  reason: string;
+};
+
+export function isToolCallLoopGuardBlockedPayload(
+  value: JsonValue | null | undefined,
+): value is ToolCallLoopGuardBlockedPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+
+  return (
+    value.source === "toolCallLoopGuard" &&
+    value.executed === false &&
+    typeof value.originalCallId === "string" &&
+    typeof value.blockedBatchIndex === "number" &&
+    typeof value.recoveryIndex === "number" &&
+    typeof value.recoveryLimit === "number" &&
+    typeof value.recoveryAvailable === "boolean" &&
+    typeof value.reason === "string"
+  );
+}
+
 export type ChatToolCallSummary = {
   id: string;
   name: string;

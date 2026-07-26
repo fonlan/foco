@@ -1793,6 +1793,15 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Listen port must be a positive whole number": "监听端口必须是正整数",
     Unknown: "未知错误",
     "Unknown error": "未知错误",
+    "Tool call blocked": "已拦截",
+    Execution: "执行",
+    "Not executed at runtime": "运行时未执行",
+    Reason: "原因",
+    "Blocked batch": "拦截批次",
+    Recovery: "恢复",
+    "Automatic recovery": "自动恢复",
+    "Will continue": "将继续",
+    "Limit exhausted": "额度已耗尽",
   },
 };
 

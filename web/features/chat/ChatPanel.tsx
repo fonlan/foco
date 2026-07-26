@@ -44,6 +44,10 @@ import {
   type ReactNode,
 } from "react";
 
+import {
+  isToolCallLoopGuardBlockedPayload,
+  type ToolCallLoopGuardBlockedPayload,
+} from "../../api/types";
 import type {
   ChatAttachmentPartSummary,
   ChatExtractedMemorySummary,
@@ -3291,6 +3295,55 @@ function CompactToolCallView({
   );
 }
 
+function BlockedToolCallDetails({
+  formatJsonValue,
+  input,
+  payload,
+  t,
+}: {
+  formatJsonValue: (value: JsonValue) => string;
+  input: JsonValue;
+  payload: ToolCallLoopGuardBlockedPayload;
+  t: Translate;
+}) {
+  const fields = [
+    [t("Execution"), t("Not executed at runtime")],
+    [t("Reason"), payload.reason],
+    [t("Blocked batch"), String(payload.blockedBatchIndex)],
+    [
+      t("Recovery"),
+      t("{current}/{limit}", {
+        current: payload.recoveryIndex,
+        limit: payload.recoveryLimit,
+      }),
+    ],
+    [
+      t("Automatic recovery"),
+      payload.recoveryAvailable ? t("Will continue") : t("Limit exhausted"),
+    ],
+  ];
+
+  return (
+    <div className="grid gap-2 rounded-md border border-[var(--warning)] bg-[var(--warning-soft)] px-2.5 py-2 text-[11px] text-[var(--warning)]">
+      <div className="font-semibold">{t("Not executed at runtime")}</div>
+      <div className="grid gap-1.5 border-l border-[var(--warning)] pl-2.5">
+        {fields.map(([label, value]) => (
+          <div className="flex min-w-0 gap-2" key={label}>
+            <span className="w-28 shrink-0 font-semibold">{label}</span>
+            <span className="min-w-0 break-words font-mono">{value}</span>
+          </div>
+        ))}
+      </div>
+      <div className="min-w-0">
+        <div className="mb-1 font-semibold">{t("Input")}</div>
+        <pre className={`${TOOL_CALL_SCROLL_CLASS} max-h-48 overflow-auto whitespace-pre-wrap break-words border-l border-[var(--warning)] pl-3 font-mono text-[11px] leading-5`}>
+          {formatJsonValue(input)}
+        </pre>
+      </div>
+    </div>
+  );
+}
+
 function contextCompressionKindLabel(
   kind: "rule" | "llm" | "runtimeToolState",
   t: Translate,
@@ -3482,6 +3535,10 @@ function ToolCallBlock({
   const [viewMode, setViewMode] = useState<ToolCallViewMode>("compact");
   const toolCallRootRef = useRef<HTMLDivElement>(null);
   const input = normalizedToolInput(toolCall.input);
+  const blockedPayload = isToolCallLoopGuardBlockedPayload(toolCall.output)
+    ? toolCall.output
+    : null;
+  const isBlocked = blockedPayload !== null;
   const compactReplacementDiff = successfulCompactReplacementDiff(
     toolCall,
     input,
@@ -3502,12 +3559,16 @@ function ToolCallBlock({
     (toolCall.name === "get_command_output" || toolCall.name === "stop_command") &&
     toolCall.status === "completed";
   const summaryStatusLabel =
-    completedManagedCommand
+    isBlocked
+      ? t("Tool call blocked")
+      : completedManagedCommand
       ? toolStatusText(toolCall, t)
       : !toolCall.isError && managedStatusLabel
       ? managedStatusLabel
       : toolStatusText(toolCall, t);
-  const summaryStatusClass = toolCall.isError
+  const summaryStatusClass = isBlocked
+    ? "bg-[var(--warning-soft)] text-[var(--warning)]"
+    : toolCall.isError
     ? "bg-[var(--danger-soft)] text-[var(--danger)]"
     : !completedManagedCommand && managedCommand && managedStatusLabel
       ? managedCommandStatusClass(managedCommand)
@@ -3554,7 +3615,11 @@ function ToolCallBlock({
       />
       <details className="tool-call-block group min-w-0">
         <summary
-          aria-label={`${displayName} (${toolCall.name})`}
+          aria-label={
+            isBlocked
+              ? `${displayName} (${toolCall.name}) · ${summaryStatusLabel}`
+              : `${displayName} (${toolCall.name})`
+          }
           className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-[var(--muted)] marker:hidden"
           title={toolCall.name}
         >
@@ -3612,19 +3677,28 @@ function ToolCallBlock({
                 </span>
               </span>
             </div>
-            <Button
-              aria-label={toggleLabel}
-              className="h-5 min-h-0 shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0 text-[11px] leading-4 font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
-              onPress={() =>
-                setViewMode(viewMode === "compact" ? "raw" : "compact")
-              }
-              type="button"
-              variant="ghost"
-            >
-              {toggleLabel}
-            </Button>
+            {!isBlocked ? (
+              <Button
+                aria-label={toggleLabel}
+                className="h-5 min-h-0 shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0 text-[11px] leading-4 font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+                onPress={() =>
+                  setViewMode(viewMode === "compact" ? "raw" : "compact")
+                }
+                type="button"
+                variant="ghost"
+              >
+                {toggleLabel}
+              </Button>
+            ) : null}
           </div>
-          {viewMode === "compact" ? (
+          {isBlocked ? (
+            <BlockedToolCallDetails
+              formatJsonValue={formatJsonValue}
+              input={input}
+              payload={blockedPayload}
+              t={t}
+            />
+          ) : viewMode === "compact" ? (
             <CompactToolCallView
               compactJson={compactToolJson}
               diff={compactReplacementDiff}

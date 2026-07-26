@@ -50,6 +50,7 @@ import {
   type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
+import { isToolCallLoopGuardBlockedPayload } from "./api/types";
 import type {
   ActiveChatRunSummary,
   ActiveRunInfo,
@@ -17460,8 +17461,11 @@ function normalizedToolCallSummary(
   return {
     ...toolCall,
     input: normalizedToolInput(toolCall.input),
-    output:
-      toolCall.output === null ? null : normalizedJsonValue(toolCall.output),
+    // This is a UI protocol rather than an ordinary tool error. Keep its
+    // structured marker intact across live updates and history normalization.
+    output: isToolCallLoopGuardBlockedPayload(toolCall.output)
+      ? toolCall.output
+      : (toolCall.output === null ? null : normalizedJsonValue(toolCall.output)),
     startedAt: toolCall.startedAt ?? null,
     completedAt: toolCall.completedAt ?? null,
   };

@@ -3709,6 +3709,120 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("renders each repeated tool-call guard recovery and exhaustion batch as a distinct blocked card", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "start guarded work",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const assistantMessageId = "message-assistant-stream";
+    const input = { path: "src/guarded.ts" };
+    const blockedOutput = ({
+      blockedBatchIndex,
+      recoveryAvailable,
+      recoveryIndex,
+    }: {
+      blockedBatchIndex: number;
+      recoveryAvailable: boolean;
+      recoveryIndex: number;
+    }) => ({
+      blockedBatchIndex,
+      executed: false as const,
+      originalCallId: "provider-reused-call-id",
+      reason: `Repeated batch ${blockedBatchIndex} was not executed.`,
+      recoveryAvailable,
+      recoveryIndex,
+      recoveryLimit: 3,
+      source: "toolCallLoopGuard" as const,
+    });
+    const blockedBatches = [
+      { blockedBatchIndex: 1, recoveryAvailable: true, recoveryIndex: 1 },
+      { blockedBatchIndex: 2, recoveryAvailable: true, recoveryIndex: 2 },
+      { blockedBatchIndex: 3, recoveryAvailable: true, recoveryIndex: 3 },
+      // The detector keeps its state after all three recoveries, so the next
+      // repeated batch is visible too, but ends the run without another recovery.
+      { blockedBatchIndex: 4, recoveryAvailable: false, recoveryIndex: 3 },
+    ];
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        toolCall: {
+          completedAt: "2026-06-10T08:00:00.000Z",
+          id: "ordinary-tool-error",
+          input: { command: "false" },
+          isError: true,
+          name: "run_command",
+          output: { error: "command failed" },
+          startedAt: "2026-06-10T08:00:00.000Z",
+          status: "error",
+        },
+        type: "toolCall",
+      });
+      for (const batch of blockedBatches) {
+        const output = blockedOutput(batch);
+        const toolCallId = `blocked-read-${batch.blockedBatchIndex}`;
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          toolCall: {
+            completedAt: "2026-06-10T08:00:00.000Z",
+            id: toolCallId,
+            input,
+            isError: true,
+            name: "read_file",
+            output,
+            startedAt: "2026-06-10T08:00:00.000Z",
+            status: "error",
+          },
+          type: "toolCall",
+        });
+        enqueueChatStreamEvent({
+          assistantMessageId,
+          completedAt: "2026-06-10T08:00:00.000Z",
+          isError: true,
+          output,
+          startedAt: "2026-06-10T08:00:00.000Z",
+          terminal: true,
+          toolCallId,
+          type: "toolResult",
+        });
+      }
+    });
+
+    const blockedCards = await screen.findAllByLabelText(
+      /Read \(read_file\) · Tool call blocked/,
+    );
+    expect(blockedCards).toHaveLength(4);
+
+    for (const card of blockedCards) {
+      await userEvent.click(card);
+    }
+
+    // Every card contains a headline and an execution field with this text.
+    expect(screen.getAllByText("Not executed at runtime")).toHaveLength(8);
+    // The existing summary and the expanded raw input both retain the path.
+    expect(screen.getAllByText(/src\/guarded\.ts/)).toHaveLength(8);
+    expect(screen.getByText("1/3")).toBeInTheDocument();
+    expect(screen.getByText("2/3")).toBeInTheDocument();
+    expect(screen.getAllByText("3/3")).toHaveLength(2);
+    expect(screen.getAllByText("Will continue")).toHaveLength(3);
+    expect(screen.getByText("Limit exhausted")).toBeInTheDocument();
+    expect(screen.getByLabelText("Run (run_command)")).toHaveTextContent(
+      "error",
+    );
+
+    await act(async () => {
+      appTestState.activeChatStreamController?.close();
+    });
+  });
+
   it("routes consecutive tool-call-loop recoveries to the latest assistant bubble", async () => {
     renderApp();
 
@@ -3878,6 +3992,16 @@ describe("app-chat-stream verification surfaces", () => {
   it("expands history toolCallLoopGuard interruptions into non-editable user bubbles", async () => {
     const loopError =
       "Runtime progress guard stopped the provider stream after detecting a repeated tool-call batch (read_file). The repeated batch was not executed.";
+    const blockedOutput = {
+      blockedBatchIndex: 2,
+      executed: false as const,
+      originalCallId: "provider-reused-call-id",
+      reason: "Repeated batch 2 was not executed.",
+      recoveryAvailable: true,
+      recoveryIndex: 2,
+      recoveryLimit: 3,
+      source: "toolCallLoopGuard" as const,
+    };
     appTestState.chatMessagesResponsesByChatKey = {
       "workspace-1/chat-1": {
         ...chatMessages,
@@ -3910,6 +4034,19 @@ describe("app-chat-stream verification surfaces", () => {
             },
             parts: [
               { text: "before recovery", type: "text" },
+              {
+                toolCall: {
+                  completedAt: "2026-06-10T08:00:01.000Z",
+                  id: "blocked-history-read",
+                  input: { path: "src/history-guarded.ts" },
+                  isError: true,
+                  name: "read_file",
+                  output: blockedOutput,
+                  startedAt: "2026-06-10T08:00:01.000Z",
+                  status: "error",
+                },
+                type: "toolCall",
+              },
               {
                 content: loopError,
                 id: "tool-loop-hist-1",
@@ -3957,6 +4094,14 @@ describe("app-chat-stream verification surfaces", () => {
         name: "Edit message",
       }),
     ).toBeInTheDocument();
+
+    const blockedHistoryCard = screen.getByLabelText(
+      "Read (read_file) · Tool call blocked",
+    );
+    await userEvent.click(blockedHistoryCard);
+    expect(screen.getByText("Repeated batch 2 was not executed.")).toBeInTheDocument();
+    expect(screen.getByText("2/3")).toBeInTheDocument();
+    expect(screen.getAllByText(/src\/history-guarded\.ts/)).toHaveLength(2);
 
     const beforeAnswer = screen.getByText("before recovery");
     const afterAnswer = screen.getByText("after recovery");

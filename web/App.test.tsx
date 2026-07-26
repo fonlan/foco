@@ -2,6 +2,17 @@ import { describe, expect, it } from "vitest";
 
 import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
+import { translate } from "./shared/i18n";
+
+describe("blocked tool-call translations", () => {
+  it("provides Chinese labels for the accessible blocked-card state", () => {
+    expect(translate("Tool call blocked", {}, "zh-CN")).toBe("已拦截");
+    expect(translate("Not executed at runtime", {}, "zh-CN")).toBe(
+      "运行时未执行",
+    );
+    expect(translate("Input", {}, "zh-CN")).toBe("输入");
+  });
+});
 
 describe("remote start run identity", () => {
   it("prefers the stable remote runId over a provider request id", () => {
