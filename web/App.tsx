@@ -7368,8 +7368,15 @@ export function App() {
           // but only while the active run proves this is still the same thread.
           preserveLiveContextCompressionParts:
             staleAfterLiveMessageRevision && sameContinuousLocalRun,
+          // A resumed Agent attempt receives a new run id but continues writing
+          // the same visible assistant turn. The overlay itself only merges
+          // matching assistant ids. Terminal lifecycle entries are immutable
+          // once emitted, so an authoritative active run is enough to retain
+          // them when a later attempt reattaches before its history snapshot
+          // has caught up; unlike transient compression progress, this does
+          // not require the load to overlap a local live revision.
           preserveLiveAgentTaskLifecycleParts:
-            staleAfterLiveMessageRevision && sameContinuousLocalRun,
+            (sameContinuousLocalRun || Boolean(activeRun)),
           preserveStreamingPlaceholders,
         },
       );

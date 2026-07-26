@@ -321,7 +321,7 @@ const AGENT_TASK_LIFECYCLE_PREVIEW_CHARS: usize = 1_024;
 /// Projects durable child-task terminal states into their root coordinator's
 /// visible assistant turn. Failure is intentionally isolated from task closure:
 /// a later scheduler scan retries the same deterministic event id.
-fn project_terminal_agent_task_lifecycles(state: &AppState) {
+pub(crate) fn project_terminal_agent_task_lifecycles(state: &AppState) {
     let Ok(config) = config_snapshot(state) else {
         tracing::error!("failed to load configuration for Agent lifecycle projection");
         return;

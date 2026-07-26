@@ -5452,6 +5452,22 @@ describe("app-chat-stream verification surfaces", () => {
       taskId: "agent-task-worker-1",
       teamId: "agent-team-1",
     };
+    const failedLifecycle = {
+      ...lifecycle,
+      errorPreview: "Tool execution failed.",
+      eventId: "agent-task-lifecycle:worker-2:failed",
+      instanceId: "agent-instance-worker-2",
+      status: "failed" as const,
+      taskId: "agent-task-worker-2",
+    };
+    const cancelledLifecycle = {
+      ...lifecycle,
+      errorPreview: "Cancelled by the coordinator.",
+      eventId: "agent-task-lifecycle:worker-3:cancelled",
+      instanceId: "agent-instance-worker-3",
+      status: "cancelled" as const,
+      taskId: "agent-task-worker-3",
+    };
 
     await act(async () => {
       enqueueChatStreamEvent({
@@ -5464,18 +5480,61 @@ describe("app-chat-stream verification surfaces", () => {
         lifecycle,
         type: "agentTaskLifecycle",
       });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        lifecycle: failedLifecycle,
+        type: "agentTaskLifecycle",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        lifecycle: cancelledLifecycle,
+        type: "agentTaskLifecycle",
+      });
     });
 
     expect(
       await screen.findByText("Unknown agent subagent Completed"),
     ).toBeInTheDocument();
     expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
-    expect(screen.getByText("Duration 1.3 s")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Expand task details" })).toBeInTheDocument();
+    const completedBlock = screen
+      .getByText("Unknown agent subagent Completed")
+      .closest("section");
+    expect(within(completedBlock as HTMLElement).getByText("Duration 1.3 s")).toBeInTheDocument();
+    expect(completedBlock).toHaveClass("grid", "min-w-0");
+    expect(completedBlock).toHaveClass("grid-cols-[1.25rem_minmax(0,1fr)]");
+    const failedBlock = (await screen.findByText("Unknown agent subagent Failed")).closest(
+      "section",
+    ) as HTMLElement | null;
+    expect(failedBlock).not.toBeNull();
+    expect(
+      screen.getByText("Unknown agent subagent Cancelled"),
+    ).toBeInTheDocument();
+    await userEvent.click(
+      within(failedBlock as HTMLElement).getByRole("button", {
+        name: "Expand task details",
+      }),
+    );
+    expect(
+      within(failedBlock as HTMLElement).getByText("Tool execution failed."),
+    ).toBeInTheDocument();
   });
 
-  it("preserves pre-delegate history across GET active-run reattach and start", async () => {
+  it("preserves a lifecycle block across waiting reattach and resumed output", async () => {
     const assistantMessageId = "message-assistant-stream";
+    const historyUserMessageId = "message-user-waiting-history";
+    const lifecycle = {
+      completedAt: "2026-07-26T03:30:00Z",
+      durationMs: 1_250,
+      errorPreview: null,
+      eventId: "agent-task-lifecycle:worker-2:completed",
+      instanceId: "agent-instance-worker-2",
+      parentTaskId: "agent-task-coordinator-2",
+      resultPreview: "Nested subagent proof.",
+      startedAt: "2026-07-26T03:29:58.750Z",
+      status: "completed" as const,
+      taskId: "agent-task-worker-2",
+      teamId: "agent-team-1",
+    };
     const fetchMock = vi.mocked(fetch);
     let reattachActiveRun = false;
     fetchMock.mockImplementation((input, init) => {
@@ -5494,7 +5553,7 @@ describe("app-chat-stream verification surfaces", () => {
                 content: "delegate then wait",
                 createdAt: "2026-06-10T08:00:00.000Z",
                 extractedMemories: [],
-                id: "message-user-stream",
+                id: historyUserMessageId,
                 memoriesUsed: [],
                 metrics: null,
                 parts: [{ text: "delegate then wait", type: "text" }],
@@ -5681,6 +5740,11 @@ describe("app-chat-stream verification surfaces", () => {
         toolCallId: "call-wait-reattach",
         type: "toolResult",
       });
+      enqueueChatStreamEvent({
+        assistantMessageId,
+        lifecycle,
+        type: "agentTaskLifecycle",
+      });
     });
 
     const historyRows = await screen.findAllByText("Before handoff.");
@@ -5695,6 +5759,11 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(historyRow as HTMLElement).getByText("Wait Tasks"),
     ).toBeInTheDocument();
+    expect(
+      within(historyRow as HTMLElement).getByText(
+        "Unknown agent subagent Completed",
+      ),
+    ).toBeInTheDocument();
     // Content may appear in both summary and body nodes inside one bubble.
     expect(
       new Set(
@@ -5704,44 +5773,9 @@ describe("app-chat-stream verification surfaces", () => {
       ).size,
     ).toBe(1);
 
-    // Wait gap: activeRun temporarily null while durable run remains running.
-    appTestState.workspaceResponseWorkspaces = [
-      {
-        ...workspace,
-        chats: workspace.chats.map((chat) =>
-          chat.id === "chat-1"
-            ? {
-                ...chat,
-                activeRun: null,
-                queuedRun: {
-                  assistantMessageId,
-                  content: "delegate then wait",
-                  modelId: "gpt-test",
-                  providerId: "openai",
-                  skillIds: [],
-                  status: "running",
-                  thinkingLevel: null,
-                  userMessageId: "message-user-stream",
-                },
-              }
-            : chat,
-        ),
-      },
-      secondaryWorkspace,
-    ];
-
-    await act(async () => {
-      enqueueChatStreamEvent({ type: "streamEnd" });
-      appTestState.activeChatStreamController?.close();
-    });
-
-    await waitFor(() =>
-      expect(
-        screen.queryByRole("button", { name: "Cancel run" }),
-      ).not.toBeInTheDocument(),
-    );
-
-    // Later attempt appears under a new runId; reopen chat to take GET reattach path.
+    // The provider turn ends while the coordinator remains durably waiting; the
+    // next attempt receives a distinct run id for the same assistant turn.
+    reattachActiveRun = true;
     appTestState.workspaceResponseWorkspaces = [
       {
         ...workspace,
@@ -5772,7 +5806,19 @@ describe("app-chat-stream verification surfaces", () => {
       },
       secondaryWorkspace,
     ];
-    reattachActiveRun = true;
+
+    await act(async () => {
+      enqueueChatStreamEvent({ type: "streamEnd" });
+      appTestState.activeChatStreamController?.close();
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Cancel run" }),
+      ).not.toBeInTheDocument(),
+    );
+
+    // Reopen the chat and take the GET reattach path for that later attempt.
 
     await userEvent.click(await screen.findByText("Second chat"));
     expect(await screen.findByText("Second answer.")).toBeInTheDocument();
@@ -5796,7 +5842,8 @@ describe("app-chat-stream verification surfaces", () => {
       ).toBe(true);
     });
 
-    // History must survive the reattach `start` before later deltas arrive.
+    // The durable history response intentionally predates the lifecycle event.
+    // The live-only block must survive the reattach `start` and stale history load.
     const historyAfterStart = await screen.findAllByText("Before handoff.");
     expect(
       new Set(historyAfterStart.map((node) => node.closest(".message-row")))
@@ -5805,8 +5852,14 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.getByText("Pre-delegate reasoning.")).toBeInTheDocument();
     expect(screen.getByText("Delegate Task")).toBeInTheDocument();
     expect(screen.getByText("Wait Tasks")).toBeInTheDocument();
+    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
 
     await act(async () => {
+      enqueueChatStreamEventForRun("request-stream-resumed", {
+        assistantMessageId,
+        lifecycle,
+        type: "agentTaskLifecycle",
+      });
       enqueueChatStreamEventForRun("request-stream-resumed", {
         assistantMessageId,
         delta: "Post-wait summary.",
@@ -5834,6 +5887,7 @@ describe("app-chat-stream verification surfaces", () => {
       ).size,
     ).toBe(1);
     expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
+    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream-resumed")?.close();

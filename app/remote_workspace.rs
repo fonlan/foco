@@ -24947,7 +24947,11 @@ async fn remote_sidecar_plans_worktree_cleanup(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use axum::response::{IntoResponse, Sse};
+    use foco_agent::AgentPermissions;
+    use foco_store::config::AgentModelOptions;
 
     use super::*;
 
@@ -24988,6 +24992,248 @@ mod tests {
         }
         assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
         assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn remote_terminal_delegated_tasks_project_once_to_live_stream_and_history() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
+        let chat_id = "chat-remote-lifecycle";
+        let assistant_message_id = "assistant-remote-lifecycle";
+        let team_id = AgentTeamId::new("agent-team-remote-lifecycle").expect("team id");
+        let coordinator_id = AgentInstanceId::new("agent-instance-remote-lifecycle-coordinator")
+            .expect("coordinator id");
+        let worker_id =
+            AgentInstanceId::new("agent-instance-remote-lifecycle-worker").expect("worker id");
+        let root_task_id =
+            AgentTaskId::new("agent-task-remote-lifecycle-root").expect("root task id");
+        let completed_task_id =
+            AgentTaskId::new("agent-task-remote-lifecycle-completed").expect("completed task");
+        let failed_task_id =
+            AgentTaskId::new("agent-task-remote-lifecycle-failed").expect("failed task");
+        let cancelled_task_id =
+            AgentTaskId::new("agent-task-remote-lifecycle-cancelled").expect("cancelled task");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-remote-lifecycle").expect("definition id"),
+            revision: 1,
+            name: "Remote lifecycle coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Coordinate.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 2,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+
+        {
+            let mut database =
+                WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+            database
+                .insert_chat(chat_id, "Remote lifecycle")
+                .expect("chat insert");
+            database
+                .insert_message(NewMessage {
+                    id: assistant_message_id,
+                    chat_id,
+                    role: "assistant",
+                    content: "Coordinator remains active.",
+                    sequence: 1,
+                    metadata_json: None,
+                })
+                .expect("assistant message insert");
+            database
+                .create_agent_team(NewAgentTeam {
+                    id: &team_id,
+                    chat_id,
+                    coordinator_instance_id: &coordinator_id,
+                    coordinator_definition: &definition,
+                    coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                    coordinator_execution_root_path: None,
+                    coordinator_worktree_base_revision: None,
+                    coordinator_worktree_branch: None,
+                    coordinator_worktree_status: None,
+                    max_concurrent_runs: 2,
+                })
+                .expect("team create");
+            database
+                .create_agent_instances_with_limits(
+                    &[NewAgentInstance {
+                        id: &worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: AgentRole::Worker,
+                        execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    }],
+                    2,
+                    2,
+                )
+                .expect("worker create");
+            let root_input = json!({
+                "visibleAssistantMessageId": assistant_message_id,
+                "message": "Delegate remote checks.",
+            })
+            .to_string();
+            let delegated_input = json!({ "message": "Inspect remote behavior." }).to_string();
+            for (id, owner_instance_id, parent_task_id, input_json) in [
+                (&root_task_id, &coordinator_id, None, root_input.as_str()),
+                (
+                    &completed_task_id,
+                    &worker_id,
+                    Some(&root_task_id),
+                    delegated_input.as_str(),
+                ),
+                (
+                    &failed_task_id,
+                    &worker_id,
+                    Some(&completed_task_id),
+                    delegated_input.as_str(),
+                ),
+                (
+                    &cancelled_task_id,
+                    &worker_id,
+                    Some(&root_task_id),
+                    delegated_input.as_str(),
+                ),
+            ] {
+                database
+                    .enqueue_agent_task(NewAgentTask {
+                        id,
+                        team_id: &team_id,
+                        owner_instance_id,
+                        origin_instance_id: parent_task_id.map(|_| &coordinator_id),
+                        parent_task_id,
+                        input_json,
+                    })
+                    .expect("task enqueue");
+            }
+            let completed_attempt = AgentAttemptId::new("agent-attempt-remote-lifecycle-completed")
+                .expect("completed attempt");
+            database
+                .claim_runnable_agent_task(&team_id, &completed_task_id, &completed_attempt)
+                .expect("completed task claim")
+                .expect("completed task claimed");
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &completed_task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Complete,
+                    result_json: Some(r#"{"text":"remote completed"}"#),
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("complete direct remote worker");
+
+            let failed_attempt = AgentAttemptId::new("agent-attempt-remote-lifecycle-failed")
+                .expect("failed attempt");
+            database
+                .claim_runnable_agent_task(&team_id, &failed_task_id, &failed_attempt)
+                .expect("nested failed task claim")
+                .expect("nested failed task claimed");
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &failed_task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Fail,
+                    result_json: None,
+                    error_json: Some(r#"{"message":"remote nested failure"}"#),
+                    interruption_reason: None,
+                })
+                .expect("fail nested remote worker");
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &cancelled_task_id,
+                    expected_status: AgentTaskStatus::Queued,
+                    transition: AgentTaskTransition::Cancel,
+                    result_json: None,
+                    error_json: Some(r#"{"message":"remote cancellation"}"#),
+                    interruption_reason: None,
+                })
+                .expect("cancel direct remote worker");
+        }
+
+        let (run_id, run_stream) = remote_sidecar_reserve_active_run_for_agent_task(
+            &state,
+            chat_id.to_string(),
+            root_task_id.clone(),
+        );
+        project_remote_sidecar_terminal_agent_task_lifecycles(&state);
+        project_remote_sidecar_terminal_agent_task_lifecycles(&state);
+
+        let live_events = run_stream.snapshot_after(-1);
+        assert_eq!(
+            live_events.len(),
+            3,
+            "repeat scans must not duplicate live events"
+        );
+        assert_eq!(
+            live_events
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "sidecar assigns one replay sequence per terminal child"
+        );
+        assert_eq!(
+            live_events
+                .iter()
+                .map(|(_, event)| event["lifecycle"]["status"].as_str().expect("status"))
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["cancelled", "completed", "failed"]),
+            "direct, nested, and cancelled remote tasks share the local lifecycle contract"
+        );
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        let events = database
+            .run_events_for_run(&run_id)
+            .expect("remote run events");
+        assert_eq!(events.len(), 3, "all live events are durable for reconnect");
+        let assistant = database
+            .message(assistant_message_id)
+            .expect("assistant lookup")
+            .expect("assistant message");
+        let metadata = serde_json::from_str::<Value>(&assistant.metadata_json)
+            .expect("assistant metadata JSON");
+        assert_eq!(
+            metadata["parts"].as_array().expect("assistant parts").len(),
+            3,
+            "history materializes each remote lifecycle exactly once"
+        );
+        drop(database);
+
+        let history = remote_sidecar_chat_messages(
+            State(state.clone()),
+            AxumPath(chat_id.to_string()),
+            Query(HashMap::new()),
+        )
+        .await
+        .expect("remote history response")
+        .0;
+        let history_parts = history["messages"]
+            .as_array()
+            .expect("history messages")
+            .iter()
+            .find(|message| message["id"] == assistant_message_id)
+            .and_then(|message| message["parts"].as_array())
+            .expect("assistant history parts");
+        assert_eq!(
+            history_parts
+                .iter()
+                .filter(|part| part["type"] == "agentTaskLifecycle")
+                .count(),
+            3,
+            "remote history transport replays the lifecycle parts emitted on the live stream"
+        );
     }
 
     fn test_sidecar_identity(version: &str, build_id: &str) -> RemoteSidecarIdentity {

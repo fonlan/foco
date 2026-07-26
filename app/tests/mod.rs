@@ -14527,6 +14527,429 @@ async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
 }
 
 #[tokio::test]
+async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_active_coordinator()
+{
+    let workspace_dir = env::temp_dir().join(unique_id("foco-agent-lifecycle-projection"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-agent-lifecycle-projection-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let state = test_app_state(config, profile_dir.clone());
+    let team_id = AgentTeamId::new("agent-team-lifecycle-projection").expect("team id");
+    let coordinator_id =
+        AgentInstanceId::new("agent-instance-lifecycle-coordinator").expect("coordinator id");
+    let completed_worker_id =
+        AgentInstanceId::new("agent-instance-lifecycle-completed-worker").expect("worker id");
+    let waiting_worker_id =
+        AgentInstanceId::new("agent-instance-lifecycle-waiting-worker").expect("worker id");
+    let failed_worker_id =
+        AgentInstanceId::new("agent-instance-lifecycle-failed-worker").expect("worker id");
+    let root_task_id = AgentTaskId::new("agent-task-lifecycle-root").expect("root task id");
+    let completed_task_id =
+        AgentTaskId::new("agent-task-lifecycle-completed").expect("completed task id");
+    let waiting_task_id =
+        AgentTaskId::new("agent-task-lifecycle-waiting").expect("waiting task id");
+    let failed_task_id = AgentTaskId::new("agent-task-lifecycle-failed").expect("failed task id");
+    let cancelled_task_id =
+        AgentTaskId::new("agent-task-lifecycle-cancelled").expect("cancelled task id");
+    let root_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-root").expect("root attempt");
+    let completed_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-completed")
+        .expect("completed attempt");
+    let waiting_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-waiting")
+        .expect("waiting attempt");
+    let failed_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-failed").expect("failed attempt");
+    let assistant_message_id = "message-agent-lifecycle-root";
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat("chat-agent-lifecycle", "Agent lifecycle projection")
+            .expect("chat insert");
+        database
+            .insert_message(foco_store::workspace::NewMessage {
+                id: assistant_message_id,
+                chat_id: "chat-agent-lifecycle",
+                role: "assistant",
+                content: "Coordinator is waiting for delegated work.",
+                sequence: 1,
+                metadata_json: None,
+            })
+            .expect("assistant message insert");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-lifecycle-projection")
+                .expect("definition id"),
+            revision: 1,
+            name: "Lifecycle coordinator".to_string(),
+            description: String::new(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            model_options: AgentModelOptions::default(),
+            system_prompt: "Coordinate.".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 4,
+            allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+            permissions: AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-agent-lifecycle",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 4,
+            })
+            .expect("team create");
+        database
+            .create_agent_instances_with_limits(
+                &[
+                    foco_store::workspace::NewAgentInstance {
+                        id: &completed_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                    foco_store::workspace::NewAgentInstance {
+                        id: &waiting_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                    foco_store::workspace::NewAgentInstance {
+                        id: &failed_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                ],
+                4,
+                4,
+            )
+            .expect("worker instance create");
+        let root_input = json!({
+            "queuedUserMessageId": "message-agent-lifecycle-user",
+            "visibleAssistantMessageId": assistant_message_id,
+            "message": "Delegate the checks.",
+            "attachments": [],
+            "collaborationToolsEnabled": true,
+        })
+        .to_string();
+        let delegated_input = json!({ "message": "Inspect the requested area." }).to_string();
+        let enqueue = |database: &mut WorkspaceDatabase,
+                       id: &AgentTaskId,
+                       owner_instance_id: &AgentInstanceId,
+                       parent_task_id: Option<&AgentTaskId>,
+                       input_json: &str| {
+            database
+                .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                    id,
+                    team_id: &team_id,
+                    owner_instance_id,
+                    origin_instance_id: Some(&coordinator_id),
+                    parent_task_id,
+                    input_json,
+                })
+                .expect("task enqueue");
+        };
+        enqueue(
+            &mut database,
+            &root_task_id,
+            &coordinator_id,
+            None,
+            &root_input,
+        );
+        enqueue(
+            &mut database,
+            &completed_task_id,
+            &completed_worker_id,
+            Some(&root_task_id),
+            &delegated_input,
+        );
+        enqueue(
+            &mut database,
+            &waiting_task_id,
+            &waiting_worker_id,
+            Some(&root_task_id),
+            &delegated_input,
+        );
+        enqueue(
+            &mut database,
+            &failed_task_id,
+            &failed_worker_id,
+            Some(&waiting_task_id),
+            &delegated_input,
+        );
+        enqueue(
+            &mut database,
+            &cancelled_task_id,
+            &completed_worker_id,
+            Some(&root_task_id),
+            &delegated_input,
+        );
+
+        for (task_id, attempt_id) in [
+            (&root_task_id, &root_attempt_id),
+            (&completed_task_id, &completed_attempt_id),
+            (&waiting_task_id, &waiting_attempt_id),
+            (&failed_task_id, &failed_attempt_id),
+        ] {
+            database
+                .claim_runnable_agent_task(&team_id, task_id, attempt_id)
+                .expect("task claim")
+                .expect("task claimed");
+        }
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &root_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(r#"{"waiting":true}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("wait coordinator");
+        database
+            .insert_run_event(NewRunEvent {
+                id: "agent-lifecycle-wait-tool-result",
+                chat_id: "chat-agent-lifecycle",
+                run_id: root_task_id.as_str(),
+                sequence: 0,
+                event_type: "tool_result",
+                payload_json: r#"{"type":"toolResult","terminal":true}"#,
+            })
+            .expect("terminal wait result event");
+        for (task_id, transition, result_json, error_json) in [
+            (
+                &completed_task_id,
+                foco_agent::AgentTaskTransition::Complete,
+                Some(r#"{"text":"completed output"}"#),
+                None,
+            ),
+            (
+                &failed_task_id,
+                foco_agent::AgentTaskTransition::Fail,
+                None,
+                Some(r#"{"message":"failed output"}"#),
+            ),
+            (
+                &cancelled_task_id,
+                foco_agent::AgentTaskTransition::Cancel,
+                None,
+                Some(r#"{"message":"cancelled output"}"#),
+            ),
+        ] {
+            let expected_status = if task_id == &cancelled_task_id {
+                foco_agent::AgentTaskStatus::Queued
+            } else {
+                foco_agent::AgentTaskStatus::Running
+            };
+            database
+                .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id,
+                    expected_status,
+                    transition,
+                    result_json,
+                    error_json,
+                    interruption_reason: None,
+                })
+                .expect("terminal delegated task");
+        }
+    }
+
+    // The first scan runs while the coordinator is waiting without an in-memory
+    // subscriber. Terminal worker state alone must still produce durable UI events.
+    crate::runtime::project_terminal_agent_task_lifecycles(&state);
+    crate::runtime::project_terminal_agent_task_lifecycles(&state);
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let events = database
+        .run_events_for_run(root_task_id.as_str())
+        .expect("root run events");
+    assert_eq!(
+        events.len(),
+        4,
+        "the wait ToolResult and three subscriber-free lifecycles coexist"
+    );
+    assert_eq!(events[0].event_type, "tool_result");
+    let lifecycle_events = events
+        .iter()
+        .skip(1)
+        .map(|event| serde_json::from_str::<Value>(&event.payload_json).expect("lifecycle payload"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lifecycle_events
+            .iter()
+            .map(|event| event["type"].as_str().expect("event type"))
+            .collect::<Vec<_>>(),
+        vec![
+            "agentTaskLifecycle",
+            "agentTaskLifecycle",
+            "agentTaskLifecycle",
+        ]
+    );
+    assert_eq!(
+        lifecycle_events
+            .iter()
+            .map(|event| event["lifecycle"]["status"].as_str().expect("status"))
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["cancelled", "completed", "failed"])
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "each projection receives a stable replay sequence after the ToolResult"
+    );
+    let message = database
+        .message(assistant_message_id)
+        .expect("assistant message lookup")
+        .expect("assistant message");
+    let metadata =
+        parse_json_value(&message.metadata_json, "assistant metadata").expect("metadata");
+    let parts = metadata["parts"].as_array().expect("lifecycle parts");
+    assert_eq!(
+        parts.len(),
+        3,
+        "repeat scans do not duplicate assistant parts before a subscriber exists"
+    );
+    assert!(
+        parts
+            .iter()
+            .all(|part| part["type"] == "agentTaskLifecycle")
+    );
+    drop(database);
+
+    // A worker can finish after the primary coordinator has suspended. Registering
+    // an active parent after the earlier offline projection exercises the runtime's
+    // publish path independently of agent_get_task/agent_list/agent_wait_tasks.
+    let (guidance_tx, _guidance_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut registration = state
+        .active_chat_runs
+        .register(
+            root_task_id.to_string(),
+            workspace_id.clone(),
+            "chat-agent-lifecycle".to_string(),
+            assistant_message_id.to_string(),
+            1,
+            Vec::new(),
+            true,
+            4,
+            guidance_tx,
+        )
+        .expect("register active waiting coordinator");
+    let mut live_subscription = state
+        .active_chat_runs
+        .subscribe(&workspace_id, root_task_id.as_str(), Some(3))
+        .expect("subscribe after offline lifecycle events");
+    assert!(
+        live_subscription.replay.is_empty(),
+        "the active subscriber starts after the first three persisted lifecycle events"
+    );
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Complete,
+                result_json: Some(r#"{"text":"completed after coordinator suspended"}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("complete worker after coordinator suspended");
+    }
+    crate::runtime::project_terminal_agent_task_lifecycles(&state);
+
+    let live_frame = tokio::time::timeout(
+        Duration::from_millis(200),
+        live_subscription.event_rx.recv(),
+    )
+    .await
+    .expect("active subscriber receives terminal child lifecycle")
+    .expect("active lifecycle event channel remains open");
+    assert_eq!(live_frame.sequence, 4);
+    let live_event =
+        serde_json::from_str::<Value>(&live_frame.payload_json).expect("live lifecycle payload");
+    assert_eq!(live_event["type"], "agentTaskLifecycle");
+    assert_eq!(
+        live_event["lifecycle"]["taskId"],
+        Value::String(waiting_task_id.to_string())
+    );
+    assert_eq!(live_event["lifecycle"]["status"], "completed");
+    let reconnected = state
+        .active_chat_runs
+        .subscribe(
+            &workspace_id,
+            root_task_id.as_str(),
+            Some(live_frame.sequence),
+        )
+        .expect("reattach after lifecycle sequence");
+    assert!(
+        reconnected.replay.is_empty(),
+        "reconnection does not replay an already acknowledged lifecycle sequence"
+    );
+    registration.finish();
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let events = database
+        .run_events_for_run(root_task_id.as_str())
+        .expect("root run events after active projection");
+    assert_eq!(events.len(), 5, "each terminal task has one durable event");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4],
+        "the live event continues the durable ToolResult and lifecycle sequence"
+    );
+    let message = database
+        .message(assistant_message_id)
+        .expect("assistant message lookup")
+        .expect("assistant message");
+    let metadata =
+        parse_json_value(&message.metadata_json, "assistant metadata").expect("metadata");
+    assert_eq!(
+        metadata["parts"].as_array().expect("lifecycle parts").len(),
+        4,
+        "the live lifecycle is materialized once beside the terminal ToolResult"
+    );
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_creates_default_team_for_normal_send() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-normal-queue-profile"));
