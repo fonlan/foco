@@ -3755,12 +3755,12 @@ body,
 }
 
 .composer-model-select-compact {
-  /* Preserve the compact layout while giving model names roughly 30% more
-     room before they truncate. Mobile retains its icon-only control layout. */
-  width: clamp(4.7rem, 9.4vw, 7.3rem);
-  min-width: 4.7rem;
-  max-width: min(9.4rem, 16.6vw);
-  flex: 0 1 5.7rem;
+  /* Give model names another 30% of desktop room before they truncate.
+     Mobile retains its icon-only control layout. */
+  width: clamp(6.1rem, 12.2vw, 9.5rem);
+  min-width: 6.1rem;
+  max-width: min(12.2rem, 21.6vw);
+  flex: 0 1 7.4rem;
 }
 
 .composer-thinking-select {

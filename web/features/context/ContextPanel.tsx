@@ -2676,7 +2676,7 @@ function SourceControlPanel({
   const isCommitMessageInputDisabled = isCommitting || isGeneratingCommitMessage;
 
   return (
-    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-[var(--background-secondary)]">
+    <div className="relative flex h-full min-h-0 min-w-0 flex-col bg-white">
       <div className="context-panel-page-header flex items-center justify-between gap-3">
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <span className="inline-flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]">
@@ -2768,9 +2768,10 @@ function SourceControlPanel({
             </Button>
           </div>
           <Button
-            className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-[var(--accent)] px-3 py-2 text-sm font-semibold text-white shadow-sm hover:bg-[var(--accent)] disabled:cursor-not-allowed disabled:bg-[var(--default)] disabled:text-[var(--muted)]"
+            className="w-full"
             isDisabled={isCommitMessageInputDisabled || !gitCommitMessage.trim() || stagedFiles.length === 0}
             type="submit"
+            variant="primary"
           >
             {isCommitting ? <LoaderCircle aria-hidden="true" className="size-4 animate-spin" /> : null}
             {t("Commit")}
