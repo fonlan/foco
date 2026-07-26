@@ -558,9 +558,12 @@ function EditorToolbarButton({
     <Button
       aria-label={label}
       aria-pressed={isActive || undefined}
-      className={`workspace-file-editor-toolbar-button ${isActive ? "workspace-file-editor-toolbar-button-active" : ""}`}
+      className="workspace-file-editor-toolbar-button size-7 min-w-7"
       isDisabled={disabled}
+      isIconOnly
       onPress={onClick}
+      size="sm"
+      variant={isActive ? "tertiary" : "ghost"}
     >
       <Icon aria-hidden="true" className="size-4" />
     </Button>

@@ -188,9 +188,12 @@ export function WorkspaceHtmlPreviewPanel({
       >
         <Button
           aria-label={t("Refresh HTML preview")}
-          className="workspace-file-editor-toolbar-button"
+          className="workspace-file-editor-toolbar-button size-7 min-w-7"
           isDisabled={isLoading}
+          isIconOnly
           onPress={handleRefresh}
+          size="sm"
+          variant="ghost"
         >
           <RefreshCw
             aria-hidden="true"

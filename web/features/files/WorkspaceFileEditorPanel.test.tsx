@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkspaceFileEditorPanel } from "./WorkspaceFileEditorPanel";
 import type { WorkspaceFileEditorState } from "./WorkspaceFileEditorPanel";
@@ -59,6 +59,10 @@ const editorState: WorkspaceFileEditorState = {
 };
 
 describe("WorkspaceFileEditorPanel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("disposes Monaco while markdown preview is active and recreates it for editing", async () => {
     render(
       <WorkspaceFileEditorPanel
@@ -80,11 +84,75 @@ describe("WorkspaceFileEditorPanel", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Preview markdown" }));
 
+    const editMarkdownButton = screen.getByRole("button", { name: "Edit markdown" });
+    expect(editMarkdownButton).toHaveAttribute("aria-pressed", "true");
+    expect(editMarkdownButton).toHaveClass("button--tertiary");
+
     expect(monacoMock.editorDispose).toHaveBeenCalledTimes(1);
     expect(monacoMock.modelDispose).toHaveBeenCalledTimes(1);
 
-    await userEvent.click(screen.getByRole("button", { name: "Edit markdown" }));
+    await userEvent.click(editMarkdownButton);
 
     await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps the toolbar ordered, accessible, and neutral across active states", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn();
+
+    render(
+      <WorkspaceFileEditorPanel
+        editor={{ ...editorState, isDirty: true }}
+        file={{
+          name: "README.md",
+          path: "README.md",
+          workspaceId: "workspace-1",
+          workspaceLogoUrl: null,
+          workspaceName: "Default",
+        }}
+        onChangeContent={vi.fn()}
+        onReload={vi.fn(async () => undefined)}
+        onSave={onSave}
+      />,
+    );
+
+    await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(1));
+
+    const toolbar = screen.getByRole("toolbar", { name: "Editor toolbar" });
+    const buttons = within(toolbar).getAllByRole("button");
+    expect(buttons.map((button) => button.getAttribute("aria-label"))).toEqual([
+      "Reload file",
+      "Save",
+      "Cut",
+      "Copy",
+      "Paste",
+      "Undo",
+      "Redo",
+      "Find",
+      "Word wrap",
+      "Preview markdown",
+    ]);
+
+    const reloadButton = within(toolbar).getByRole("button", { name: "Reload file" });
+    const saveButton = within(toolbar).getByRole("button", { name: "Save" });
+    const wordWrapButton = within(toolbar).getByRole("button", { name: "Word wrap" });
+
+    expect(reloadButton).toHaveClass(
+      "workspace-file-editor-toolbar-button",
+      "size-7",
+      "min-w-7",
+      "button--ghost",
+      "button--icon-only",
+      "button--sm",
+    );
+    expect(saveButton).toHaveAttribute("aria-pressed", "true");
+    expect(saveButton).toHaveClass("button--tertiary");
+
+    await user.click(saveButton);
+    expect(onSave).toHaveBeenCalledWith(expect.objectContaining({ path: "README.md" }), "");
+
+    await user.click(wordWrapButton);
+    expect(wordWrapButton).toHaveAttribute("aria-pressed", "true");
+    expect(wordWrapButton).toHaveClass("button--tertiary");
   });
 });

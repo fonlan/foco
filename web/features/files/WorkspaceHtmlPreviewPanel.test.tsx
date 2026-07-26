@@ -161,7 +161,19 @@ describe("WorkspaceHtmlPreviewPanel", () => {
 
     render(<WorkspaceHtmlPreviewPanel tab={tab} />);
 
+    const refreshButton = screen.getByRole("button", { name: "Refresh HTML preview" });
+    expect(refreshButton).toBeDisabled();
+    expect(refreshButton).toHaveClass(
+      "workspace-file-editor-toolbar-button",
+      "size-7",
+      "min-w-7",
+      "button--ghost",
+      "button--icon-only",
+      "button--sm",
+    );
+
     expect(await screen.findByTitle("HTML preview for index.html")).toBeInTheDocument();
+    expect(refreshButton).toBeEnabled();
     const iframe = screen.getByTitle("HTML preview for index.html");
     expect(iframe).toHaveAttribute(
       "src",
