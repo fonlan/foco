@@ -164,7 +164,9 @@ impl AgentRunTask<ChatSseEvent> for FocoAgentRunTask {
 
             if context.cancellation.is_cancelled() {
                 AgentRunOutcome::Cancelled {
-                    message: last_error.unwrap_or_else(|| "agent run cancelled".to_string()),
+                    message: self.cancellation.reason().unwrap_or_else(|| {
+                        last_error.unwrap_or_else(|| "agent run cancelled".to_string())
+                    }),
                 }
             } else if let Some((text, reasoning, usage)) = completion {
                 AgentRunOutcome::Completed {

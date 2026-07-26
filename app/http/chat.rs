@@ -1977,7 +1977,49 @@ pub(crate) async fn cancel_chat_run(
     State(state): State<AppState>,
     AxumPath((workspace_id, run_id)): AxumPath<(String, String)>,
 ) -> Result<Json<CancelChatRunResponse>, ApiError> {
-    state.active_chat_runs.cancel(&workspace_id, &run_id)?;
+    let cancellation = state
+        .active_chat_runs
+        .cancellation_snapshot(&workspace_id, &run_id)?;
+    let Some(identity) = cancellation.agent_identity.as_ref() else {
+        cancellation.cancel();
+        return Ok(Json(CancelChatRunResponse { ok: true, run_id }));
+    };
+
+    if !cancellation.primary_chat_output {
+        cancellation.cancel();
+        return Ok(Json(CancelChatRunResponse { ok: true, run_id }));
+    }
+
+    let config = config_snapshot(&state)?;
+    let workspace = workspace_by_id(&config, &workspace_id)?;
+    let mut database = WorkspaceDatabase::open_or_create(&workspace.path)
+        .map_err(ApiError::from_workspace_error)?;
+    let is_coordinator_primary_output = database
+        .agent_task(&identity.task_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_some_and(|task| {
+            task.team_id == identity.team_id && task.owner_instance_id == identity.instance_id
+        })
+        && database
+            .agent_instance(&identity.instance_id)
+            .map_err(ApiError::from_workspace_error)?
+            .is_some_and(|instance| instance.role == foco_agent::AgentRole::Coordinator);
+
+    if is_coordinator_primary_output {
+        crate::runtime::cancel_agent_task_subtree_runtime(
+            &mut database,
+            &workspace_id,
+            &state.active_chat_runs,
+            &state.agent_scheduler,
+            &identity.team_id,
+            &identity.task_id,
+            r#"{"message":"cancelled by user while cancelling the coordinator chat run"}"#,
+            Some("user_root_cancel"),
+        )?;
+        cancellation.cancel_with_reason("user_root_cancel");
+    } else {
+        cancellation.cancel();
+    }
 
     Ok(Json(CancelChatRunResponse { ok: true, run_id }))
 }

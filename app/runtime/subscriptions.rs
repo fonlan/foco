@@ -34,6 +34,23 @@ pub(crate) struct ActiveAgentRunIdentity {
 }
 
 #[derive(Clone)]
+pub(crate) struct ActiveChatRunCancellationSnapshot {
+    pub(crate) agent_identity: Option<ActiveAgentRunIdentity>,
+    pub(crate) primary_chat_output: bool,
+    cancellation: ChatRunCancellation,
+}
+
+impl ActiveChatRunCancellationSnapshot {
+    pub(crate) fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    pub(crate) fn cancel_with_reason(&self, reason: &str) {
+        self.cancellation.cancel_with_reason(reason);
+    }
+}
+
+#[derive(Clone)]
 struct ActiveChatRun {
     workspace_id: String,
     chat_id: String,
@@ -97,6 +114,7 @@ impl StreamingAssistantStatus {
 #[derive(Clone)]
 pub(crate) struct ChatRunCancellation {
     tx: watch::Sender<bool>,
+    reason: Arc<Mutex<Option<String>>>,
     tool_token: ToolCancellationToken,
     agent_token: AgentRunCancellation,
 }
@@ -106,6 +124,7 @@ impl ChatRunCancellation {
         let (tx, _rx) = watch::channel(false);
         Self {
             tx,
+            reason: Arc::new(Mutex::new(None)),
             tool_token: ToolCancellationToken::default(),
             agent_token: AgentRunCancellation::default(),
         }
@@ -124,9 +143,30 @@ impl ChatRunCancellation {
     }
 
     pub(crate) fn cancel(&self) {
+        self.cancel_with_reason("agent run cancelled");
+    }
+
+    /// Stores the first safe, machine-readable cancellation reason before signalling every
+    /// cancellation primitive. The token signal remains idempotent when duplicate requests race.
+    pub(crate) fn cancel_with_reason(&self, reason: &str) {
+        if let Ok(mut cancellation_reason) = self.reason.lock() {
+            cancellation_reason.get_or_insert_with(|| reason.to_string());
+        } else {
+            tracing::warn!("chat run cancellation reason lock is poisoned");
+        }
         self.tool_token.cancel();
         self.agent_token.cancel();
         self.tx.send_replace(true);
+    }
+
+    pub(crate) fn reason(&self) -> Option<String> {
+        self.reason
+            .lock()
+            .map(|reason| reason.clone())
+            .unwrap_or_else(|_| {
+                tracing::warn!("chat run cancellation reason lock is poisoned");
+                None
+            })
     }
 }
 
@@ -492,7 +532,11 @@ impl ActiveChatRunRegistry {
         })
     }
 
-    pub(crate) fn cancel(&self, workspace_id: &str, run_id: &str) -> Result<(), ApiError> {
+    pub(crate) fn cancellation_snapshot(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+    ) -> Result<ActiveChatRunCancellationSnapshot, ApiError> {
         let active_run = {
             let runs = self
                 .runs
@@ -510,7 +554,40 @@ impl ActiveChatRunRegistry {
             )));
         }
 
-        active_run.cancellation.cancel();
+        Ok(ActiveChatRunCancellationSnapshot {
+            agent_identity: active_run.agent_identity,
+            primary_chat_output: active_run.primary_chat_output,
+            cancellation: active_run.cancellation,
+        })
+    }
+
+    /// Clones only cancellation handles while holding the registry lock. The caller must signal
+    /// the returned handles after releasing the lock.
+    pub(crate) fn cancellation_handles_for_agent_tasks(
+        &self,
+        workspace_id: &str,
+        task_ids: &[AgentTaskId],
+    ) -> Result<Vec<(AgentTaskId, ChatRunCancellation)>, ApiError> {
+        let task_ids = task_ids.iter().collect::<std::collections::HashSet<_>>();
+        let runs = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?;
+
+        Ok(runs
+            .values()
+            .filter_map(|run| {
+                let identity = run.agent_identity.as_ref()?;
+                (run.workspace_id == workspace_id
+                    && !*run.completed_rx.borrow()
+                    && task_ids.contains(&identity.task_id))
+                .then(|| (identity.task_id.clone(), run.cancellation.clone()))
+            })
+            .collect())
+    }
+
+    pub(crate) fn cancel(&self, workspace_id: &str, run_id: &str) -> Result<(), ApiError> {
+        self.cancellation_snapshot(workspace_id, run_id)?.cancel();
         Ok(())
     }
 
@@ -1447,6 +1524,64 @@ mod tests {
         assert!(text.contains("logged during subscribe"), "{text}");
         assert_eq!(text.matches("\"type\":\"streamEnd\"").count(), 1, "{text}");
         assert!(!text.contains("\"type\":\"error\""), "{text}");
+    }
+
+    #[tokio::test]
+    async fn agent_task_cancellation_handles_signal_only_matching_active_runs() {
+        let registry = ActiveChatRunRegistry::default();
+        let team_id = AgentTeamId::new("agent-team-cancellation").expect("team id");
+        let instance_id = AgentInstanceId::new("agent-instance-cancellation").expect("instance id");
+        let task_id = AgentTaskId::new("agent-task-cancellation").expect("task id");
+        let other_task_id = AgentTaskId::new("agent-task-cancellation-other").expect("task id");
+        let attempt_id = AgentAttemptId::new("agent-attempt-cancellation").expect("attempt id");
+        let (guidance_tx, _guidance_rx) = tokio::sync::mpsc::unbounded_channel();
+        let registration = registry
+            .register_agent(
+                task_id.to_string(),
+                "workspace-cancellation".to_string(),
+                "chat-cancellation".to_string(),
+                "assistant-cancellation".to_string(),
+                1,
+                Vec::new(),
+                false,
+                ActiveAgentRunIdentity {
+                    team_id: team_id.clone(),
+                    instance_id: instance_id.clone(),
+                    task_id: task_id.clone(),
+                    _attempt_id: attempt_id,
+                },
+                0,
+                guidance_tx,
+            )
+            .expect("register active Agent task");
+        let mut cancellation_rx = registration.cancellation().subscribe();
+
+        assert!(
+            registry
+                .cancellation_handles_for_agent_tasks(
+                    "workspace-cancellation",
+                    std::slice::from_ref(&other_task_id),
+                )
+                .expect("snapshot non-matching handle")
+                .is_empty()
+        );
+
+        let handles = registry
+            .cancellation_handles_for_agent_tasks(
+                "workspace-cancellation",
+                std::slice::from_ref(&task_id),
+            )
+            .expect("snapshot matching handle");
+        assert_eq!(handles.len(), 1);
+        handles[0].1.cancel_with_reason("parent_cascade");
+        handles[0].1.cancel_with_reason("later_duplicate_cancel");
+        assert_eq!(handles[0].1.reason().as_deref(), Some("parent_cascade"));
+
+        cancellation_rx
+            .changed()
+            .await
+            .expect("cancellation update");
+        assert!(*cancellation_rx.borrow());
     }
 
     #[tokio::test]

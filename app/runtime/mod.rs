@@ -22,9 +22,9 @@ pub(crate) use agent_scheduler::{
     AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentAttemptInterruption, AgentAttemptRecoveryAction,
     AgentScheduler, CoordinatorTaskInput, agent_attempt_recovery_action_for_evidence,
     agent_attempt_recovery_diagnostics, agent_wait_resume_messages, agent_wait_resume_tool_result,
-    insert_agent_event, open_workspace_database_ordinary_with_pre_stream_retry,
-    pre_stream_failure_user_message, reconcile_agent_runtime,
-    validate_agent_snapshot_for_workspace,
+    cancel_agent_task_subtree_runtime, insert_agent_event,
+    open_workspace_database_ordinary_with_pre_stream_retry, pre_stream_failure_user_message,
+    reconcile_agent_runtime, validate_agent_snapshot_for_workspace,
 };
 #[cfg(test)]
 pub(crate) use agent_scheduler::{

@@ -3368,6 +3368,10 @@ fn finish_claimed_task(
                 task.owner_instance_id
             ))
         })?;
+    let cancellation_reason = match &outcome {
+        AgentRunOutcome::Cancelled { message } => Some(message.clone()),
+        _ => None,
+    };
     let (transition, result, error, event_type) = match outcome {
         AgentRunOutcome::Completed {
             text,
@@ -3442,6 +3446,7 @@ fn finish_claimed_task(
         "outcome": payload,
         "originInstanceId": task.origin_instance_id.as_ref().map(ToString::to_string),
         "parentTaskId": task.parent_task_id.as_ref().map(ToString::to_string),
+        "reason": cancellation_reason,
         "runTimeMs": completed_task
             .completed_at
             .as_ref()
@@ -3789,6 +3794,124 @@ pub(crate) fn insert_agent_event(
             payload_json: &payload_json,
         })
         .map_err(ApiError::from_workspace_error)?;
+    Ok(())
+}
+
+/// Applies the durable subtree cancellation before signalling any active descendants.
+///
+/// The registry is only used to clone handles while locked; all cancellation signals, event
+/// writes, and scheduler wake-up happen after that snapshot has been released.
+pub(crate) fn cancel_agent_task_subtree_runtime(
+    database: &mut WorkspaceDatabase,
+    workspace_id: &str,
+    active_chat_runs: &ActiveChatRunRegistry,
+    scheduler: &AgentScheduler,
+    team_id: &foco_agent::AgentTeamId,
+    root_task_id: &AgentTaskId,
+    error_json: &str,
+    interruption_reason: Option<&str>,
+) -> Result<(), ApiError> {
+    let cancellation = database
+        .cancel_agent_task_subtree(team_id, root_task_id, error_json, interruption_reason)
+        .map_err(ApiError::from_workspace_error)?;
+    let running_descendant_task_ids = cancellation
+        .running_task_ids
+        .iter()
+        .filter(|task_id| *task_id != root_task_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let active_descendants = match active_chat_runs
+        .cancellation_handles_for_agent_tasks(workspace_id, &running_descendant_task_ids)
+    {
+        Ok(handles) => handles,
+        Err(error) => {
+            tracing::warn!(
+                workspace_id,
+                team_id = %team_id,
+                root_task_id = %root_task_id,
+                error = %error.message,
+                "Agent subtree cancellation could not snapshot active descendant run handles"
+            );
+            Vec::new()
+        }
+    };
+    let signalled_task_ids = active_descendants
+        .iter()
+        .map(|(task_id, _)| task_id)
+        .collect::<HashSet<_>>();
+    for task_id in &running_descendant_task_ids {
+        if !signalled_task_ids.contains(task_id) {
+            tracing::warn!(
+                workspace_id,
+                team_id = %team_id,
+                task_id = %task_id,
+                root_task_id = %root_task_id,
+                "Agent subtree cancellation found no active run handle; durable state remains authoritative"
+            );
+        }
+    }
+
+    // The durable transaction above is the cancellation boundary. Signal every cloned handle and
+    // wake the scheduler before best-effort observability writes so neither can delay a running
+    // descendant until lease recovery.
+    for (_, handle) in active_descendants {
+        handle.cancel_with_reason("parent_cascade");
+    }
+    if let Err(error) = scheduler.wake() {
+        tracing::warn!(
+            workspace_id,
+            team_id = %team_id,
+            root_task_id = %root_task_id,
+            error = %error.message,
+            "Agent subtree cancellation could not wake the scheduler after signalling active descendants"
+        );
+    }
+
+    for task_id in &cancellation.running_task_ids {
+        let reason = if task_id == root_task_id {
+            "user_root_cancel"
+        } else {
+            "parent_cascade"
+        };
+        if let Err(error) = insert_agent_event(
+            database,
+            team_id,
+            "task_cancel_requested",
+            None,
+            Some(task_id),
+            None,
+            serde_json::json!({ "reason": reason, "rootTaskId": root_task_id }),
+        ) {
+            tracing::warn!(
+                workspace_id,
+                team_id = %team_id,
+                task_id = %task_id,
+                root_task_id = %root_task_id,
+                error = %error.message,
+                "Agent subtree cancellation could not persist task_cancel_requested event"
+            );
+        }
+    }
+    for task in &cancellation.cancelled_tasks {
+        if let Err(error) = insert_agent_event(
+            database,
+            team_id,
+            "task_cancelled",
+            Some(&task.owner_instance_id),
+            Some(&task.id),
+            None,
+            serde_json::json!({ "reason": "parent_cascade", "rootTaskId": root_task_id }),
+        ) {
+            tracing::warn!(
+                workspace_id,
+                team_id = %team_id,
+                task_id = %task.id,
+                root_task_id = %root_task_id,
+                error = %error.message,
+                "Agent subtree cancellation could not persist task_cancelled event"
+            );
+        }
+    }
     Ok(())
 }
 

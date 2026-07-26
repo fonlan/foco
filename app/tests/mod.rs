@@ -16956,6 +16956,314 @@ async fn scheduled_task_run_cancel_signals_running_active_run() {
 }
 
 #[tokio::test]
+async fn coordinator_primary_chat_cancel_cascades_to_active_descendants_before_returning() {
+    let workspace_dir =
+        env::temp_dir().join(unique_id("foco-coordinator-cascade-cancel-workspace"));
+    let profile_dir = env::temp_dir().join(unique_id("foco-coordinator-cascade-cancel-profile"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    fs::create_dir_all(&profile_dir).expect("profile directory");
+
+    let config = prompt_test_config(workspace_dir.clone());
+    let workspace_id = config.workspaces[0].id.clone();
+    let mut state = test_app_state(config, profile_dir.clone());
+    let (scheduler, mut scheduler_wake_rx) = AgentScheduler::new();
+    state.agent_scheduler = scheduler;
+
+    let team_id =
+        foco_agent::AgentTeamId::new("agent-team-coordinator-cascade-cancel").expect("team id");
+    let coordinator_id =
+        foco_agent::AgentInstanceId::new("agent-instance-coordinator-cascade-cancel")
+            .expect("coordinator id");
+    let running_worker_id =
+        foco_agent::AgentInstanceId::new("agent-instance-running-cascade-cancel")
+            .expect("running worker id");
+    let waiting_worker_id =
+        foco_agent::AgentInstanceId::new("agent-instance-waiting-cascade-cancel")
+            .expect("waiting worker id");
+    let sibling_worker_id =
+        foco_agent::AgentInstanceId::new("agent-instance-sibling-cascade-cancel")
+            .expect("sibling worker id");
+    let root_task_id = foco_agent::AgentTaskId::new("agent-task-coordinator-cascade-cancel")
+        .expect("root task id");
+    let running_child_task_id = foco_agent::AgentTaskId::new("agent-task-running-cascade-cancel")
+        .expect("running child task id");
+    let queued_grandchild_task_id =
+        foco_agent::AgentTaskId::new("agent-task-queued-grandchild-cascade-cancel")
+            .expect("queued grandchild task id");
+    let waiting_descendant_task_id =
+        foco_agent::AgentTaskId::new("agent-task-waiting-descendant-cascade-cancel")
+            .expect("waiting descendant task id");
+    let sibling_task_id =
+        foco_agent::AgentTaskId::new("agent-task-sibling-cascade-cancel").expect("sibling task id");
+    let root_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-root-cascade-cancel")
+        .expect("root attempt id");
+    let child_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-child-cascade-cancel")
+        .expect("child attempt id");
+    let waiting_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-waiting-cascade-cancel")
+            .expect("waiting attempt id");
+    let definition = AgentDefinitionSettings {
+        id: AgentDefinitionId::new("agent-definition-coordinator-cascade-cancel")
+            .expect("definition id"),
+        revision: 1,
+        name: "Cascade cancellation fixture".to_string(),
+        description: String::new(),
+        provider_id: "provider".to_string(),
+        model_id: "model".to_string(),
+        model_options: AgentModelOptions::default(),
+        system_prompt: "Coordinate work.".to_string(),
+        allowed_tools: Vec::new(),
+        max_instances: 4,
+        allowed_execution_workspace_modes: foco_agent::AgentExecutionWorkspaceMode::all(),
+        permissions: AgentPermissions::default(),
+    };
+    let input_json = json!({ "message": "Cancel the coordinator." }).to_string();
+
+    {
+        let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+        database
+            .insert_chat("chat-coordinator-cascade-cancel", "Cascade cancellation")
+            .expect("chat insert");
+        database
+            .create_agent_team(foco_store::workspace::NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-coordinator-cascade-cancel",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode:
+                    foco_agent::AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 4,
+            })
+            .expect("team create");
+        database
+            .create_agent_instances_with_limits(
+                &[
+                    foco_store::workspace::NewAgentInstance {
+                        id: &running_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                    foco_store::workspace::NewAgentInstance {
+                        id: &waiting_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                    foco_store::workspace::NewAgentInstance {
+                        id: &sibling_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: foco_agent::AgentRole::Worker,
+                        execution_workspace_mode: foco_agent::AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                ],
+                4,
+                4,
+            )
+            .expect("worker instances create");
+        let enqueue_task =
+            |database: &mut WorkspaceDatabase,
+             id: &foco_agent::AgentTaskId,
+             owner_instance_id: &foco_agent::AgentInstanceId,
+             parent_task_id: Option<&foco_agent::AgentTaskId>| {
+                database
+                    .enqueue_agent_task(foco_store::workspace::NewAgentTask {
+                        id,
+                        team_id: &team_id,
+                        owner_instance_id,
+                        origin_instance_id: Some(&coordinator_id),
+                        parent_task_id,
+                        input_json: &input_json,
+                    })
+                    .expect("enqueue task");
+            };
+        enqueue_task(&mut database, &root_task_id, &coordinator_id, None);
+        enqueue_task(
+            &mut database,
+            &running_child_task_id,
+            &running_worker_id,
+            Some(&root_task_id),
+        );
+        enqueue_task(
+            &mut database,
+            &queued_grandchild_task_id,
+            &running_worker_id,
+            Some(&running_child_task_id),
+        );
+        enqueue_task(
+            &mut database,
+            &waiting_descendant_task_id,
+            &waiting_worker_id,
+            Some(&running_child_task_id),
+        );
+        enqueue_task(&mut database, &sibling_task_id, &sibling_worker_id, None);
+
+        for (task_id, attempt_id) in [
+            (&root_task_id, &root_attempt_id),
+            (&running_child_task_id, &child_attempt_id),
+            (&waiting_descendant_task_id, &waiting_attempt_id),
+        ] {
+            database
+                .claim_runnable_agent_task(&team_id, task_id, attempt_id)
+                .expect("claim task")
+                .expect("task claimed");
+        }
+        database
+            .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
+                team_id: &team_id,
+                task_id: &waiting_descendant_task_id,
+                expected_status: foco_agent::AgentTaskStatus::Running,
+                transition: foco_agent::AgentTaskTransition::Wait,
+                result_json: Some(r#"{"control":{"kind":"agent_wait_tasks"}}"#),
+                error_json: None,
+                interruption_reason: None,
+            })
+            .expect("suspend waiting descendant");
+    }
+
+    let (root_guidance_tx, _root_guidance_rx) = mpsc::unbounded_channel();
+    let root_registration = state
+        .active_chat_runs
+        .register_agent(
+            root_task_id.to_string(),
+            workspace_id.clone(),
+            "chat-coordinator-cascade-cancel".to_string(),
+            "assistant-coordinator-cascade-cancel".to_string(),
+            1,
+            Vec::new(),
+            true,
+            crate::runtime::ActiveAgentRunIdentity {
+                team_id: team_id.clone(),
+                instance_id: coordinator_id.clone(),
+                task_id: root_task_id.clone(),
+                _attempt_id: root_attempt_id,
+            },
+            0,
+            root_guidance_tx,
+        )
+        .expect("register coordinator run");
+    let (child_guidance_tx, _child_guidance_rx) = mpsc::unbounded_channel();
+    let child_registration = state
+        .active_chat_runs
+        .register_agent(
+            running_child_task_id.to_string(),
+            workspace_id.clone(),
+            "chat-coordinator-cascade-cancel".to_string(),
+            "assistant-running-cascade-cancel".to_string(),
+            2,
+            Vec::new(),
+            false,
+            crate::runtime::ActiveAgentRunIdentity {
+                team_id: team_id.clone(),
+                instance_id: running_worker_id.clone(),
+                task_id: running_child_task_id.clone(),
+                _attempt_id: child_attempt_id,
+            },
+            0,
+            child_guidance_tx,
+        )
+        .expect("register child run");
+    let child_cancellation_rx = child_registration.cancellation().subscribe();
+
+    crate::http::chat::cancel_chat_run(
+        State(state.clone()),
+        AxumPath((workspace_id.clone(), root_task_id.to_string())),
+    )
+    .await
+    .expect("cancel coordinator chat run");
+
+    assert!(
+        *child_cancellation_rx.borrow(),
+        "the active descendant must receive its cancellation token before the HTTP handler returns"
+    );
+    assert!(
+        *root_registration.cancellation().subscribe().borrow(),
+        "the coordinator run must still receive its ordinary root cancellation"
+    );
+    scheduler_wake_rx
+        .try_recv()
+        .expect("subtree cancellation wakes the scheduler");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    assert_eq!(
+        database
+            .agent_task(&running_child_task_id)
+            .expect("running child lookup")
+            .expect("running child")
+            .status,
+        foco_agent::AgentTaskStatus::Running
+    );
+    assert_eq!(
+        database
+            .agent_task(&queued_grandchild_task_id)
+            .expect("queued grandchild lookup")
+            .expect("queued grandchild")
+            .status,
+        foco_agent::AgentTaskStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_task(&waiting_descendant_task_id)
+            .expect("waiting descendant lookup")
+            .expect("waiting descendant")
+            .status,
+        foco_agent::AgentTaskStatus::Cancelled
+    );
+    assert_eq!(
+        database
+            .agent_task(&sibling_task_id)
+            .expect("sibling lookup")
+            .expect("sibling task")
+            .status,
+        foco_agent::AgentTaskStatus::Queued
+    );
+    let events = database
+        .agent_events_after(&team_id, -1)
+        .expect("cancellation events");
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_cancel_requested"
+            && event.task_id.as_ref() == Some(&root_task_id)
+            && event.payload_json.contains("user_root_cancel")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_cancel_requested"
+            && event.task_id.as_ref() == Some(&running_child_task_id)
+            && event.payload_json.contains("parent_cascade")
+    }));
+    assert!(events.iter().any(|event| {
+        event.event_type == "task_cancelled"
+            && event.task_id.as_ref() == Some(&queued_grandchild_task_id)
+            && event.payload_json.contains("parent_cascade")
+    }));
+
+    drop(database);
+    drop(child_registration);
+    drop(root_registration);
+    drop(state);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+    remove_dir_if_exists(&profile_dir);
+}
+
+#[tokio::test]
 async fn queue_chat_message_resumes_paused_coordinator_without_active_work() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-test"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-resume-queue-profile"));
