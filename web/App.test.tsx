@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ActiveRunInfo, ChatMessageSummary, ShellMessage } from "./api/types";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import type { ActiveRunInfo, ChatMessageSummary, ContextUsageResponse, ShellMessage } from "./api/types";
 import { translate } from "./shared/i18n";
 
 describe("blocked tool-call translations", () => {
@@ -28,6 +28,89 @@ describe("remote start run identity", () => {
 
     expect(event).toMatchObject({ type: "start", runId: "remote-run-1" });
     expect(activeRunIdFromStartEvent(event ?? {})).toBe("remote-run-1");
+  });
+});
+
+describe("live context usage identity", () => {
+  const estimate: ContextUsageResponse = {
+    assembledMessageTokens: 100,
+    assembledUsagePercent: 10,
+    availableMessageTokens: 900,
+    compressionSnapshotTokens: 0,
+    compressionTriggerPercent: 80,
+    compressionTriggerTokens: 800,
+    contextWindow: 1_000,
+    hasLlmCompressionPlan: true,
+    historyTokens: 100,
+    llmCompressionTriggerPercent: 95,
+    llmCompressionTriggerTokens: 950,
+    maxOutputTokens: 100,
+    memoryBudgetTokens: 0,
+    memoryContextTokens: 0,
+    modelId: "model-a",
+    packedMessageTokens: 100,
+    postCompressionMessageTokens: 100,
+    providerId: "provider-a",
+    segments: {
+      compressionSnapshot: 0,
+      history: 100,
+      reservedOutput: 100,
+      systemPrompt: 0,
+      toolSchema: 0,
+    },
+    systemPromptTokens: 0,
+    tokenBreakdown: {
+      bySource: [],
+      compressibleTokens: 100,
+      optionalTokens: 0,
+      requiredTokens: 0,
+    },
+    toolSchemaTokens: 0,
+    totalUsedContextTokens: 100,
+    usagePercent: 10,
+    usedMessageTokens: 100,
+    willCompressOnNextSend: false,
+  };
+
+  it("does not combine a provider token count with another model's window", () => {
+    const unknown = contextUsageWithLatestProviderUsage(estimate, {
+      modelId: "",
+      providerId: "",
+      startedAtMs: 0,
+      usage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 1_500,
+        outputTokens: 1,
+      },
+    });
+    const mismatched = contextUsageWithLatestProviderUsage(estimate, {
+      modelId: "model-b",
+      providerId: "provider-b",
+      startedAtMs: 0,
+      usage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 1_500,
+        outputTokens: 1,
+      },
+    });
+    const matching = contextUsageWithLatestProviderUsage(estimate, {
+      modelId: "model-a",
+      providerId: "provider-a",
+      startedAtMs: 0,
+      usage: {
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        inputTokens: 700,
+        outputTokens: 1,
+      },
+    });
+
+    expect(unknown).toEqual(estimate);
+    expect(mismatched).toEqual(estimate);
+    expect(matching.totalUsedContextTokens).toBe(700);
+    expect(matching.usagePercent).toBe(70);
   });
 });
 

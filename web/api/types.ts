@@ -405,6 +405,9 @@ export type ChatUsage = {
   outputTokens: number | null;
   cacheReadTokens: number | null;
   cacheWriteTokens: number | null;
+  /** Optional on legacy SSE/history payloads; required before comparing usage to a context window. */
+  modelId?: string | null;
+  providerId?: string | null;
 };
 
 export type ChatReplyMetrics = {
@@ -975,6 +978,12 @@ type ContextSourceTokenBreakdown = {
 };
 
 export type ContextUsageResponse = {
+  /**
+   * Client-side binding for the request that produced this estimate. The
+   * context-usage endpoint remains backward-compatible and need not echo it.
+   */
+  modelId?: string;
+  providerId?: string;
   usedMessageTokens: number;
   assembledMessageTokens: number;
   assembledUsagePercent: number;
@@ -2791,6 +2800,9 @@ export type ActiveRunInfo = {
   assistantSequence?: number | null;
   queuedUserMessageId?: string | null;
   lastSequence?: number | null;
+  /** The immutable model route selected for this active run, when known. */
+  modelId?: string | null;
+  providerId?: string | null;
   acceptingGuidance: boolean;
 };
 

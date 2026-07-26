@@ -2200,7 +2200,7 @@ export function App() {
     : null;
   const latestProviderUsage =
     activeChatKey !== null && runningChatKeys.has(activeChatKey)
-      ? (liveChatStatistics?.usage ?? null)
+      ? liveChatStatistics
       : null;
   const displayedContextUsage = contextUsage
     ? contextUsageWithLatestProviderUsage(contextUsage, latestProviderUsage)
@@ -10226,8 +10226,8 @@ export function App() {
       }
     }
 
-    const modelId = selectedModelIdRef.current;
-    const providerId = selectedProviderIdRef.current;
+    const modelId = runInfo?.modelId ?? "";
+    const providerId = runInfo?.providerId ?? "";
     if (runInfo?.chatId && modelId && providerId) {
       void refreshContextUsage({
         chatId: runInfo.chatId,
@@ -10318,7 +10318,14 @@ export function App() {
         deferStreamAuxiliaryUpdate(() => {
           setContextUsageByChatKey((current) => ({
             ...current,
-            [chatKey]: data,
+            // The endpoint returns an estimate only. Retain the exact request
+            // route locally so live provider input tokens can never be paired
+            // with a context window from another model/provider.
+            [chatKey]: {
+              ...data,
+              modelId: request.modelId,
+              providerId: request.providerId,
+            },
           }));
         });
       }
@@ -10592,6 +10599,19 @@ export function App() {
     // interrupted assistant id. Map that id to the latest visible bubble so
     // consecutive recoveries do not re-route to an earlier segment.
     let interruptedAssistantMessageId: string | null = null;
+    // A reconnect has no composer request to trust. Preserve a route learned
+    // from this same run only; otherwise context usage remains the backend
+    // estimate until an identity-bearing terminal metric arrives.
+    const existingRunInfo = activeRunInfoByChatKeyRef.current[chatKey];
+    const runModelIdentity =
+      existingRunInfo?.runId === activeRun.runId &&
+      existingRunInfo.modelId &&
+      existingRunInfo.providerId
+        ? {
+            modelId: existingRunInfo.modelId,
+            providerId: existingRunInfo.providerId,
+          }
+        : null;
     let latestResponseUsage: ChatUsage | null = null;
     let liveStartedAtMs = Date.now();
     let liveAssistantDraft = "";
@@ -10636,20 +10656,21 @@ export function App() {
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
-    const refreshRunContextUsage = (): boolean => {
+    const refreshRunContextUsage = (
+      modelIdentity: { modelId: string; providerId: string } | null =
+        runModelIdentity,
+    ): boolean => {
       if (!ownsSession()) {
         return false;
       }
-      const modelId = selectedModelIdRef.current;
-      const providerId = selectedProviderIdRef.current;
-      if (!modelId || !providerId) {
+      if (!modelIdentity) {
         return false;
       }
 
       void refreshContextUsage({
         chatId: activeRun.chatId,
-        modelId,
-        providerId,
+        modelId: modelIdentity.modelId,
+        providerId: modelIdentity.providerId,
         skillIds: [],
         thinkingLevel: selectedThinkingLevelRef.current,
         workspaceId: activeRun.workspaceId,
@@ -10674,9 +10695,7 @@ export function App() {
       ) {
         return;
       }
-      const modelId = selectedModelIdRef.current;
-      const providerId = selectedProviderIdRef.current;
-      if (!modelId || !providerId) {
+      if (!runModelIdentity) {
         return;
       }
 
@@ -10685,8 +10704,8 @@ export function App() {
         assistantDraft: liveAssistantDraft,
         assistantDraftReasoning: liveAssistantDraftReasoning,
         chatId: activeRun.chatId,
-        modelId,
-        providerId,
+        modelId: runModelIdentity.modelId,
+        providerId: runModelIdentity.providerId,
         skillIds: [],
         thinkingLevel: selectedThinkingLevelRef.current,
         workspaceId: activeRun.workspaceId,
@@ -10931,6 +10950,8 @@ export function App() {
       lastSequence: lastSequenceForState(),
       queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
       runId: activeRun.runId,
+      modelId: runModelIdentity?.modelId,
+      providerId: runModelIdentity?.providerId,
       workspaceId: activeRun.workspaceId,
     });
     activeRunAbortByChatKeyRef.current.set(chatKey, abortController);
@@ -11088,6 +11109,8 @@ export function App() {
               chatId: streamEvent.chatId,
               chatKey,
               lastSequence: lastSequenceForState(),
+              modelId: runModelIdentity?.modelId,
+              providerId: runModelIdentity?.providerId,
               queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
               runId: activeRun.runId,
               workspaceId: activeRun.workspaceId,
@@ -11096,12 +11119,13 @@ export function App() {
             liveAssistantDraft = "";
             liveAssistantDraftReasoning = "";
             lastLiveContextUsageRefreshAtMs = Date.now();
-            updateLiveChatStatistics(chatKey, {
-              modelId: selectedModelIdRef.current,
-              providerId: selectedProviderIdRef.current,
-              startedAtMs: liveStartedAtMs,
-              usage: null,
-            });
+            if (runModelIdentity) {
+              updateLiveChatStatistics(chatKey, {
+                ...runModelIdentity,
+                startedAtMs: liveStartedAtMs,
+                usage: null,
+              });
+            }
             refreshActiveAgentTeamSnapshot(
               activeRun.workspaceId,
               streamEvent.chatId,
@@ -11184,6 +11208,8 @@ export function App() {
               chatId: activeRun.chatId,
               chatKey,
               lastSequence: lastSequenceForState(),
+              modelId: runModelIdentity?.modelId,
+              providerId: runModelIdentity?.providerId,
               queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
               runId: activeRun.runId,
               workspaceId: activeRun.workspaceId,
@@ -11197,12 +11223,13 @@ export function App() {
             liveAssistantDraft = "";
             liveAssistantDraftReasoning = "";
             lastLiveContextUsageRefreshAtMs = Date.now();
-            updateLiveChatStatistics(chatKey, {
-              modelId: selectedModelIdRef.current,
-              providerId: selectedProviderIdRef.current,
-              startedAtMs: liveStartedAtMs,
-              usage: null,
-            });
+            if (runModelIdentity) {
+              updateLiveChatStatistics(chatKey, {
+                ...runModelIdentity,
+                startedAtMs: liveStartedAtMs,
+                usage: null,
+              });
+            }
             setMessagesForChatKey(chatKey, (current) =>
               current.map((message) =>
                 isCurrentAssistantMessage(
@@ -11253,12 +11280,13 @@ export function App() {
               if (!ownsSession()) {
                 return;
               }
-              updateLiveChatStatistics(chatKey, {
-                modelId: selectedModelIdRef.current,
-                providerId: selectedProviderIdRef.current,
-                startedAtMs: liveStartedAtMs,
-                usage: latestResponseUsage,
-              });
+              if (runModelIdentity) {
+                updateLiveChatStatistics(chatKey, {
+                  ...runModelIdentity,
+                  startedAtMs: liveStartedAtMs,
+                  usage: latestResponseUsage,
+                });
+              }
             });
             return;
           }
@@ -11302,7 +11330,10 @@ export function App() {
             if (!latestResponseUsage && liveStatisticsUsage) {
               latestResponseUsage = liveStatisticsUsage;
             }
-            refreshRunContextUsage();
+            refreshRunContextUsage({
+              modelId: streamEvent.metrics.modelId,
+              providerId: streamEvent.metrics.providerId,
+            });
             updateLiveChatStatistics(chatKey, {
               modelId: streamEvent.metrics.modelId,
               providerId: streamEvent.metrics.providerId,
@@ -11481,13 +11512,12 @@ export function App() {
               );
             }
             deferStreamAuxiliaryUpdate(() => {
-              if (!ownsSession()) {
+              if (!ownsSession() || !runModelIdentity) {
                 return;
               }
               updateLiveChatStatistics(chatKey, {
                 codeChangeStats: streamEvent.codeChangeStats,
-                modelId: selectedModelIdRef.current,
-                providerId: selectedProviderIdRef.current,
+                ...runModelIdentity,
                 startedAtMs: liveStartedAtMs,
                 usage: latestResponseUsage,
               });
@@ -11700,6 +11730,8 @@ export function App() {
             chatId: activeRun.chatId,
             chatKey,
             lastSequence: lastSequenceForState(),
+            modelId: runModelIdentity?.modelId,
+            providerId: runModelIdentity?.providerId,
             queuedUserMessageId: activeRun.queuedUserMessageId ?? null,
             runId: activeRun.runId,
             workspaceId: activeRun.workspaceId,
@@ -11870,15 +11902,20 @@ export function App() {
       reasoningDeltaBuffer.flush();
       toolOutputDeltaBuffer.flush();
     };
-    const refreshRunContextUsage = (): boolean => {
+    const refreshRunContextUsage = (
+      modelIdentity: { modelId: string; providerId: string } = {
+        modelId: request.modelId,
+        providerId: request.providerId,
+      },
+    ): boolean => {
       if (!ownsSession() || !requestChatId) {
         return false;
       }
 
       void refreshContextUsage({
         chatId: requestChatId,
-        modelId: request.modelId,
-        providerId: request.providerId,
+        modelId: modelIdentity.modelId,
+        providerId: modelIdentity.providerId,
         skillIds: request.skillIds,
         thinkingLevel: request.thinkingLevel,
         workspaceId: request.workspaceId,
@@ -12014,6 +12051,8 @@ export function App() {
       acceptingGuidance: false,
       chatId: requestChatId,
       chatKey: currentRunningChatKey,
+      modelId: request.modelId,
+      providerId: request.providerId,
       runId: null,
       workspaceId: request.workspaceId,
     });
@@ -12420,6 +12459,8 @@ export function App() {
             assistantMessageId: streamEvent.assistantMessageId,
             chatId: streamEvent.chatId,
             chatKey: currentRunningChatKey,
+            modelId: request.modelId,
+            providerId: request.providerId,
             queuedUserMessageId: request.queuedUserMessageId ?? null,
             runId: activeRunId,
             workspaceId: request.workspaceId,
@@ -12531,6 +12572,8 @@ export function App() {
             assistantMessageId: session.assistantMessageId,
             chatId: requestChatId,
             chatKey: runMessagesKey,
+            modelId: request.modelId,
+            providerId: request.providerId,
             queuedUserMessageId: request.queuedUserMessageId ?? null,
             runId: activeRunId,
             workspaceId: request.workspaceId,
@@ -12645,7 +12688,10 @@ export function App() {
           if (!latestResponseUsage && liveStatisticsUsage) {
             latestResponseUsage = liveStatisticsUsage;
           }
-          refreshRunContextUsage();
+          refreshRunContextUsage({
+            modelId: streamEvent.metrics.modelId,
+            providerId: streamEvent.metrics.providerId,
+          });
           updateLiveChatStatistics(runMessagesKey, {
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,
@@ -17801,15 +17847,16 @@ function withLiveChatStatistics(
   };
 }
 
-function contextUsageWithLatestProviderUsage(
+export function contextUsageWithLatestProviderUsage(
   usage: ContextUsageResponse,
-  latestProviderUsage: ChatUsage | null,
+  latestProviderUsage: LiveChatStatistics | null,
 ): ContextUsageResponse {
-  const inputTokens = latestProviderUsage?.inputTokens;
+  const inputTokens = latestProviderUsage?.usage?.inputTokens;
   if (
     typeof inputTokens !== "number" ||
     inputTokens < 0 ||
-    usage.contextWindow <= 0
+    usage.contextWindow <= 0 ||
+    !sameModelRoute(usage, latestProviderUsage)
   ) {
     return usage;
   }
@@ -17825,6 +17872,20 @@ function contextUsageWithLatestProviderUsage(
     totalUsedContextTokens: inputTokens,
     usagePercent: Math.ceil((inputTokens * 100) / usage.contextWindow),
   };
+}
+
+function sameModelRoute(
+  usage: Pick<ContextUsageResponse, "modelId" | "providerId">,
+  live: Pick<LiveChatStatistics, "modelId" | "providerId"> | null,
+): boolean {
+  return Boolean(
+    usage.modelId &&
+      usage.providerId &&
+      live?.modelId &&
+      live.providerId &&
+      usage.modelId === live.modelId &&
+      usage.providerId === live.providerId,
+  );
 }
 
 function contextUsageSegmentsForProviderInput(
@@ -20094,7 +20155,20 @@ function parseChatUsage(value: unknown): ChatUsage | undefined | false {
     return false;
   }
 
-  return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+  const modelId = optionalStringField(value, "modelId", "model_id");
+  const providerId = optionalStringField(value, "providerId", "provider_id");
+  if (modelId === null || providerId === null) {
+    return false;
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    ...(modelId === undefined ? {} : { modelId }),
+    ...(providerId === undefined ? {} : { providerId }),
+  };
 }
 
 function isNullableNumber(value: unknown) {
