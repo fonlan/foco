@@ -14527,8 +14527,7 @@ async fn team_chat_task_sse_returns_while_coordinator_task_is_still_queued() {
 }
 
 #[tokio::test]
-async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_active_coordinator()
-{
+async fn terminal_delegated_tasks_project_then_resume_the_coordinator_with_a_fresh_active_run() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-agent-lifecycle-projection"));
     let profile_dir = env::temp_dir().join(unique_id("foco-agent-lifecycle-projection-profile"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");
@@ -14556,6 +14555,9 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
         AgentTaskId::new("agent-task-lifecycle-cancelled").expect("cancelled task id");
     let root_attempt_id =
         foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-root").expect("root attempt");
+    let resumed_root_attempt_id =
+        foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-root-resumed")
+            .expect("resumed root attempt");
     let completed_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-completed")
         .expect("completed attempt");
     let waiting_attempt_id = foco_agent::AgentAttemptId::new("agent-attempt-lifecycle-waiting")
@@ -14567,8 +14569,40 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
     {
         let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
         database
-            .insert_chat("chat-agent-lifecycle", "Agent lifecycle projection")
+            .insert_chat_with_metadata(
+                "chat-agent-lifecycle",
+                "Agent lifecycle projection",
+                &json!({
+                    "queuedRun": {
+                        "status": "queued",
+                        "userMessageId": "message-agent-lifecycle-user",
+                        "assistantMessageId": assistant_message_id,
+                        "assistantSequence": 1,
+                    }
+                })
+                .to_string(),
+            )
             .expect("chat insert");
+        database
+            .insert_message(foco_store::workspace::NewMessage {
+                id: "message-agent-lifecycle-user",
+                chat_id: "chat-agent-lifecycle",
+                role: "user",
+                content: "Delegate the checks.",
+                sequence: 0,
+                metadata_json: Some(
+                    &json!({
+                        "queuedRun": {
+                            "status": "queued",
+                            "userMessageId": "message-agent-lifecycle-user",
+                            "assistantMessageId": assistant_message_id,
+                            "assistantSequence": 1,
+                        }
+                    })
+                    .to_string(),
+                ),
+            })
+            .expect("queued user message insert");
         database
             .insert_message(foco_store::workspace::NewMessage {
                 id: assistant_message_id,
@@ -14653,6 +14687,7 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
         let root_input = json!({
             "queuedUserMessageId": "message-agent-lifecycle-user",
             "visibleAssistantMessageId": assistant_message_id,
+            "visibleAssistantSequence": 1,
             "message": "Delegate the checks.",
             "attachments": [],
             "collaborationToolsEnabled": true,
@@ -14723,6 +14758,24 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
                 .expect("task claimed");
         }
         database
+            .mark_chat_queued_run_started(
+                "chat-agent-lifecycle",
+                "message-agent-lifecycle-user",
+                assistant_message_id,
+                1,
+            )
+            .expect("mark initial Coordinator queued run");
+        database
+            .claim_agent_chat_queued_run(
+                "chat-agent-lifecycle",
+                "message-agent-lifecycle-user",
+                assistant_message_id,
+                1,
+                root_task_id.as_str(),
+                "run-agent-lifecycle-suspended",
+            )
+            .expect("claim initial Coordinator queued run");
+        database
             .update_agent_task_state(foco_store::workspace::AgentTaskStateUpdate {
                 team_id: &team_id,
                 task_id: &root_task_id,
@@ -14734,15 +14787,32 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
             })
             .expect("wait coordinator");
         database
+            .register_agent_task_wait_dependencies(
+                foco_store::workspace::RegisterAgentTaskWaitDependencies {
+                    team_id: &team_id,
+                    waiting_task_id: &root_task_id,
+                    dependency_task_ids: &[
+                        completed_task_id.clone(),
+                        failed_task_id.clone(),
+                        cancelled_task_id.clone(),
+                    ],
+                    wait_mode: foco_agent::AgentTaskWaitMode::All,
+                    pending_tool_call_id: Some("call-agent-lifecycle-wait"),
+                    deadline_at: None,
+                    event_instance_id: None,
+                },
+            )
+            .expect("register satisfied wait dependencies");
+        database
             .insert_run_event(NewRunEvent {
                 id: "agent-lifecycle-wait-tool-result",
                 chat_id: "chat-agent-lifecycle",
                 run_id: root_task_id.as_str(),
                 sequence: 0,
                 event_type: "tool_result",
-                payload_json: r#"{"type":"toolResult","terminal":true}"#,
+                payload_json: r#"{"type":"toolResult","toolCallId":"call-agent-lifecycle-wait","terminal":false,"waiting":true}"#,
             })
-            .expect("terminal wait result event");
+            .expect("suspended wait result event");
         for (task_id, transition, result_json, error_json) in [
             (
                 &completed_task_id,
@@ -14794,9 +14864,14 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
     assert_eq!(
         events.len(),
         4,
-        "the wait ToolResult and three subscriber-free lifecycles coexist"
+        "the suspended wait ToolResult and three subscriber-free lifecycles coexist"
     );
     assert_eq!(events[0].event_type, "tool_result");
+    let wait_event =
+        serde_json::from_str::<Value>(&events[0].payload_json).expect("suspended wait payload");
+    assert_eq!(wait_event["terminal"], false);
+    assert_eq!(wait_event["waiting"], true);
+    assert_eq!(wait_event["toolCallId"], "call-agent-lifecycle-wait");
     let lifecycle_events = events
         .iter()
         .skip(1)
@@ -14845,26 +14920,155 @@ async fn terminal_delegated_tasks_project_once_while_waiting_then_publish_to_an_
             .iter()
             .all(|part| part["type"] == "agentTaskLifecycle")
     );
+    assert_eq!(
+        database
+            .agent_task(&root_task_id)
+            .expect("waiting root task")
+            .expect("root task")
+            .status,
+        foco_agent::AgentTaskStatus::Waiting,
+        "lifecycle projection is visible but must not itself resume the Coordinator"
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&root_task_id)
+            .expect("root attempts while waiting")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
     drop(database);
 
-    // A worker can finish after the primary coordinator has suspended. Registering
-    // an active parent after the earlier offline projection exercises the runtime's
-    // publish path independently of agent_get_task/agent_list/agent_wait_tasks.
+    let mut database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("database");
+    let resumed_tasks = database
+        .resume_satisfied_agent_tasks(1)
+        .expect("resume Coordinator after lifecycle projection");
+    assert_eq!(
+        resumed_tasks
+            .iter()
+            .map(|task| &task.id)
+            .collect::<Vec<_>>(),
+        vec![&root_task_id],
+        "terminal child tasks make the suspended Coordinator runnable independently of lifecycle delivery"
+    );
+    assert_eq!(
+        database
+            .agent_task(&root_task_id)
+            .expect("resumed root task")
+            .expect("root task")
+            .status,
+        foco_agent::AgentTaskStatus::Queued
+    );
+    assert_eq!(
+        database
+            .agent_attempts_for_task(&root_task_id)
+            .expect("root attempts")[0]
+            .status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("Coordinator instance")
+            .expect("Coordinator instance")
+            .status,
+        foco_agent::AgentInstanceStatus::Idle,
+        "Idle is only the bounded hand-off state before the resumed task is claimed"
+    );
+    let chat = database
+        .chat("chat-agent-lifecycle")
+        .expect("chat")
+        .expect("chat");
+    let chat_metadata = parse_json_value(&chat.metadata_json, "chat metadata").expect("metadata");
+    assert_eq!(
+        chat_metadata["queuedRun"]["status"], "queued",
+        "a suspended Coordinator must release its old running queuedRun before its instance becomes Idle"
+    );
+    assert!(
+        chat_metadata["queuedRun"].get("runId").is_none(),
+        "the resumed Coordinator must acquire a fresh active run identity"
+    );
+    database
+        .claim_runnable_agent_task(&team_id, &root_task_id, &resumed_root_attempt_id)
+        .expect("claim resumed Coordinator")
+        .expect("resumed Coordinator claimed");
+    database
+        .claim_agent_chat_queued_run(
+            "chat-agent-lifecycle",
+            "message-agent-lifecycle-user",
+            assistant_message_id,
+            1,
+            root_task_id.as_str(),
+            "run-agent-lifecycle-resumed",
+        )
+        .expect("claim resumed Coordinator queued run");
+    assert_eq!(
+        database
+            .agent_task(&root_task_id)
+            .expect("running root task")
+            .expect("root task")
+            .status,
+        foco_agent::AgentTaskStatus::Running
+    );
+    let attempts = database
+        .agent_attempts_for_task(&root_task_id)
+        .expect("root attempts after resume");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].id, root_attempt_id);
+    assert_eq!(
+        attempts[0].status,
+        foco_agent::AgentAttemptStatus::Suspended
+    );
+    assert_eq!(attempts[1].id, resumed_root_attempt_id);
+    assert_eq!(attempts[1].status, foco_agent::AgentAttemptStatus::Running);
+    assert_eq!(
+        database
+            .agent_instance(&coordinator_id)
+            .expect("running Coordinator instance")
+            .expect("Coordinator instance")
+            .status,
+        foco_agent::AgentInstanceStatus::Running
+    );
+    drop(database);
+
+    // A worker can finish after the primary coordinator has suspended. Reattach the
+    // fresh Coordinator with its durable Agent identity, rather than registering a
+    // generic chat run that could hide a task/attempt mismatch.
     let (guidance_tx, _guidance_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mut registration = state
+    let mut registration = match state
         .active_chat_runs
-        .register(
+        .register_agent_with_queued_user_message(
             root_task_id.to_string(),
             workspace_id.clone(),
             "chat-agent-lifecycle".to_string(),
             assistant_message_id.to_string(),
             1,
+            Some("message-agent-lifecycle-user".to_string()),
             Vec::new(),
             true,
+            crate::runtime::ActiveAgentRunIdentity {
+                team_id: team_id.clone(),
+                instance_id: coordinator_id.clone(),
+                task_id: root_task_id.clone(),
+                _attempt_id: resumed_root_attempt_id.clone(),
+            },
             4,
             guidance_tx,
         )
-        .expect("register active waiting coordinator");
+        .expect("register active resumed Coordinator")
+    {
+        crate::runtime::ActiveChatRunRegistrationResult::Registered(registration) => registration,
+        crate::runtime::ActiveChatRunRegistrationResult::Existing => {
+            panic!("fresh resumed Coordinator must register a new active run")
+        }
+    };
+    assert_eq!(
+        state
+            .active_chat_runs
+            .active_run_count()
+            .expect("active Coordinator run count"),
+        1,
+        "the resumed Coordinator is re-registered before it publishes further child lifecycle events"
+    );
     let mut live_subscription = state
         .active_chat_runs
         .subscribe(&workspace_id, root_task_id.as_str(), Some(3))
