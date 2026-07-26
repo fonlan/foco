@@ -31,10 +31,16 @@ use crate::memory::{
 use crate::private_fs::{
     create_private_dir_all, prepare_private_file, restrict_private_file, restrict_sqlite_files,
 };
+#[path = "llm_audit_segments.rs"]
+mod llm_audit_segments;
 #[path = "workspace_records.rs"]
 mod workspace_records;
 #[path = "workspace_schema.rs"]
 mod workspace_schema;
+
+use llm_audit_segments::{
+    LlmAuditDetailKind, LlmAuditDetailLocator, LlmAuditSegmentError, LlmAuditSegmentStore,
+};
 
 pub use crate::workspace_gate::{
     OpenedMemoryDatabase, WORKSPACE_DATABASE_CRITICAL_GATE_TIMEOUT,
@@ -97,13 +103,13 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    MIGRATION_045, MIGRATION_046, MIGRATION_047, MIGRATION_048, Migration,
+    MIGRATION_045, MIGRATION_046, MIGRATION_047, MIGRATION_048, MIGRATION_049, Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 48;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 49;
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -224,6 +230,9 @@ const PLAN_AUTO_RUN_BLOCKED_PLAN_ID_KEY: &str = "plan_auto_run_blocked_plan_id";
 const PLAN_AUTO_RUN_BLOCKED_PHASE_ID_KEY: &str = "plan_auto_run_blocked_phase_id";
 const LLM_AUDIT_DETAIL_V1_PRUNED_KEY: &str = "llm_audit_detail_v1_pruned";
 const LLM_AUDIT_STATUS_CODE_V1_REPAIRED_KEY: &str = "llm_audit_status_code_v1_repaired";
+const LLM_AUDIT_DETAIL_SEGMENTS_MIGRATED_KEY: &str = "llm_audit_detail_segments_migrated";
+/// Max legacy TEXT dump rows to offload per maintenance tick.
+pub const LLM_AUDIT_DETAIL_SEGMENT_MIGRATE_BATCH: usize = 64;
 const SQLITE_PRAGMA_OPTIMIZE_LAST_AT_KEY: &str = "sqlite_pragma_optimize_last_at";
 /// Minimum gap between successful `PRAGMA optimize` runs for the same database path.
 pub const SQLITE_PRAGMA_OPTIMIZE_MIN_INTERVAL_SECS: u64 = 24 * 60 * 60;
@@ -472,6 +481,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 48,
         sql: MIGRATION_048,
     },
+    Migration {
+        version: 49,
+        sql: MIGRATION_049,
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -584,6 +597,7 @@ fn parse_workspace_backup_timestamp(value: &str) -> Option<SystemTime> {
 pub struct WorkspaceDatabase {
     database_path: PathBuf,
     connection: Connection,
+    audit_segments: LlmAuditSegmentStore,
 }
 
 /// Result of atomically claiming a queued remote chat run.
@@ -1090,10 +1104,13 @@ impl WorkspaceDatabase {
             path: database_path.clone(),
             source,
         })?;
+        let audit_segments =
+            LlmAuditSegmentStore::open(&foco_dir).map_err(segment_error_to_workspace)?;
 
         Ok(Self {
             database_path,
             connection,
+            audit_segments,
         })
     }
 
@@ -1144,7 +1161,123 @@ impl WorkspaceDatabase {
     /// request-time database opening.
     pub fn run_pending_one_time_maintenance(&mut self) -> Result<(), WorkspaceDatabaseError> {
         prune_non_v1_llm_audit_details_once(&mut self.connection, &self.database_path)?;
-        repair_llm_request_status_codes_from_v1_once(&mut self.connection, &self.database_path)
+        repair_llm_request_status_codes_from_v1_once(&mut self.connection, &self.database_path)?;
+        // Offload a batch of legacy TEXT dumps per tick (multi-GB workspaces need many ticks).
+        self.migrate_llm_audit_details_to_segments_batch(LLM_AUDIT_DETAIL_SEGMENT_MIGRATE_BATCH)?;
+        Ok(())
+    }
+
+    /// Offload up to `limit` legacy `request_body_json` / `response_body_json` rows
+    /// into append-only Zstd segments. Safe to call repeatedly.
+    pub fn migrate_llm_audit_details_to_segments_batch(
+        &mut self,
+        limit: usize,
+    ) -> Result<usize, WorkspaceDatabaseError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows: Vec<(String, Option<String>, Option<String>)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT id, request_body_json, response_body_json
+                     FROM llm_requests
+                     WHERE request_body_json IS NOT NULL
+                        OR response_body_json IS NOT NULL
+                     ORDER BY request_started_at ASC, id ASC
+                     LIMIT ?1",
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            let mapped = statement
+                .query_map(params![limit_i64], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .map_err(|source| self.sqlite_error(source))?;
+            collect_rows(mapped, &self.database_path)?
+        };
+
+        let mut migrated = 0usize;
+        for (id, request_body, response_body) in rows {
+            let request_locator = match request_body.as_deref() {
+                Some(body) if !body.trim().is_empty() => Some(self.audit_segments.append_detail(
+                    &self.connection,
+                    LlmAuditDetailKind::Request,
+                    body,
+                ).map_err(segment_error_to_workspace)?),
+                _ => None,
+            };
+            let response_locator = match response_body.as_deref() {
+                Some(body) if !body.trim().is_empty() => Some(self.audit_segments.append_detail(
+                    &self.connection,
+                    LlmAuditDetailKind::Response,
+                    body,
+                ).map_err(segment_error_to_workspace)?),
+                _ => None,
+            };
+            let transport = LlmRequestTransport::from_request_body_json(request_body.as_deref());
+            self.connection
+                .execute(
+                    "UPDATE llm_requests
+                     SET transport = ?2,
+                         request_detail_segment_id = COALESCE(?3, request_detail_segment_id),
+                         request_detail_offset = COALESCE(?4, request_detail_offset),
+                         request_detail_compressed_len = COALESCE(?5, request_detail_compressed_len),
+                         request_detail_uncompressed_len = COALESCE(?6, request_detail_uncompressed_len),
+                         request_detail_sha256 = COALESCE(?7, request_detail_sha256),
+                         response_detail_segment_id = COALESCE(?8, response_detail_segment_id),
+                         response_detail_offset = COALESCE(?9, response_detail_offset),
+                         response_detail_compressed_len = COALESCE(?10, response_detail_compressed_len),
+                         response_detail_uncompressed_len = COALESCE(?11, response_detail_uncompressed_len),
+                         response_detail_sha256 = COALESCE(?12, response_detail_sha256),
+                         request_body_json = NULL,
+                         response_body_json = NULL
+                     WHERE id = ?1",
+                    params![
+                        id,
+                        transport.as_str(),
+                        request_locator.as_ref().map(|l| l.segment_id),
+                        request_locator.as_ref().map(|l| l.offset as i64),
+                        request_locator.as_ref().map(|l| l.compressed_len as i64),
+                        request_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                        request_locator.as_ref().map(|l| l.sha256_hex.as_str()),
+                        response_locator.as_ref().map(|l| l.segment_id),
+                        response_locator.as_ref().map(|l| l.offset as i64),
+                        response_locator.as_ref().map(|l| l.compressed_len as i64),
+                        response_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                        response_locator.as_ref().map(|l| l.sha256_hex.as_str()),
+                    ],
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            migrated += 1;
+        }
+
+        if migrated == 0 {
+            let remaining: i64 = self
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM llm_requests
+                     WHERE request_body_json IS NOT NULL OR response_body_json IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|source| self.sqlite_error(source))?;
+            if remaining == 0 {
+                let updated_at = now_timestamp();
+                self.connection
+                    .execute(
+                        "INSERT INTO workspace_metadata (key, value, updated_at)
+                         VALUES (?1, '1', ?2)
+                         ON CONFLICT(key) DO UPDATE SET
+                            value = excluded.value,
+                            updated_at = excluded.updated_at",
+                        params![LLM_AUDIT_DETAIL_SEGMENTS_MIGRATED_KEY, updated_at],
+                    )
+                    .map_err(|source| self.sqlite_error(source))?;
+            }
+        }
+
+        Ok(migrated)
     }
 
     pub fn schema_version(&self) -> Result<u32, WorkspaceDatabaseError> {
@@ -11395,6 +11528,21 @@ impl WorkspaceDatabase {
             normalize_audit_detail_for_write(request.request_body_json, "request_body_json")?;
         let response_body_json =
             normalize_audit_detail_for_write(request.response_body_json, "response_body_json")?;
+        let transport = LlmRequestTransport::from_request_body_json(request_body_json.as_deref());
+        // Append segment payloads before the SQLite transaction so a crash never
+        // leaves a locator without durable bytes (orphaned bytes are acceptable).
+        let request_locator = store_optional_audit_detail(
+            &self.audit_segments,
+            &self.connection,
+            LlmAuditDetailKind::Request,
+            request_body_json.as_deref(),
+        )?;
+        let response_locator = store_optional_audit_detail(
+            &self.audit_segments,
+            &self.connection,
+            LlmAuditDetailKind::Response,
+            response_body_json.as_deref(),
+        )?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -11410,10 +11558,16 @@ impl WorkspaceDatabase {
                         request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                         first_token_latency_ms, total_latency_ms, status_code, final_state,
-                        request_body_json, response_body_json
+                        request_body_json, response_body_json, transport,
+                        request_detail_segment_id, request_detail_offset,
+                        request_detail_compressed_len, request_detail_uncompressed_len,
+                        request_detail_sha256,
+                        response_detail_segment_id, response_detail_offset,
+                        response_detail_compressed_len, response_detail_uncompressed_len,
+                        response_detail_sha256
                     )
                  VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, NULL, NULL, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
                 params![
                     request.id,
                     request.workspace_id,
@@ -11439,8 +11593,17 @@ impl WorkspaceDatabase {
                     request.total_latency_ms,
                     request.status_code,
                     request.final_state,
-                    request_body_json,
-                    response_body_json
+                    transport.as_str(),
+                    request_locator.as_ref().map(|l| l.segment_id),
+                    request_locator.as_ref().map(|l| l.offset as i64),
+                    request_locator.as_ref().map(|l| l.compressed_len as i64),
+                    request_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                    request_locator.as_ref().map(|l| l.sha256_hex.as_str()),
+                    response_locator.as_ref().map(|l| l.segment_id),
+                    response_locator.as_ref().map(|l| l.offset as i64),
+                    response_locator.as_ref().map(|l| l.compressed_len as i64),
+                    response_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                    response_locator.as_ref().map(|l| l.sha256_hex.as_str()),
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -11493,6 +11656,19 @@ impl WorkspaceDatabase {
             normalize_audit_detail_for_write(request.request_body_json, "request_body_json")?;
         let response_body_json =
             normalize_audit_detail_for_write(request.response_body_json, "response_body_json")?;
+        let transport = LlmRequestTransport::from_request_body_json(request_body_json.as_deref());
+        let request_locator = store_optional_audit_detail(
+            &self.audit_segments,
+            &self.connection,
+            LlmAuditDetailKind::Request,
+            request_body_json.as_deref(),
+        )?;
+        let response_locator = store_optional_audit_detail(
+            &self.audit_segments,
+            &self.connection,
+            LlmAuditDetailKind::Response,
+            response_body_json.as_deref(),
+        )?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -11522,9 +11698,15 @@ impl WorkspaceDatabase {
                         request_started_at, first_token_at, completed_at, input_tokens, output_tokens,
                         cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                         first_token_latency_ms, total_latency_ms, status_code, final_state,
-                        request_body_json, response_body_json
+                        request_body_json, response_body_json, transport,
+                        request_detail_segment_id, request_detail_offset,
+                        request_detail_compressed_len, request_detail_uncompressed_len,
+                        request_detail_sha256,
+                        response_detail_segment_id, response_detail_offset,
+                        response_detail_compressed_len, response_detail_uncompressed_len,
+                        response_detail_sha256
                     ) VALUES
-                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)",
+                    (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, NULL, NULL, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)",
                 params![
                     request.id, request.workspace_id, request.chat_id, request.request_kind,
                     request.agent_team_id.map(AgentTeamId::as_str),
@@ -11536,7 +11718,17 @@ impl WorkspaceDatabase {
                     request.output_tokens, request.cache_read_tokens, request.cache_write_tokens,
                     request.reasoning_tokens, cache_ratio, request.first_token_latency_ms,
                     request.total_latency_ms, request.status_code, request.final_state,
-                    request_body_json, response_body_json
+                    transport.as_str(),
+                    request_locator.as_ref().map(|l| l.segment_id),
+                    request_locator.as_ref().map(|l| l.offset as i64),
+                    request_locator.as_ref().map(|l| l.compressed_len as i64),
+                    request_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                    request_locator.as_ref().map(|l| l.sha256_hex.as_str()),
+                    response_locator.as_ref().map(|l| l.segment_id),
+                    response_locator.as_ref().map(|l| l.offset as i64),
+                    response_locator.as_ref().map(|l| l.compressed_len as i64),
+                    response_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                    response_locator.as_ref().map(|l| l.sha256_hex.as_str()),
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -11571,22 +11763,45 @@ impl WorkspaceDatabase {
         request_body_json: Option<&str>,
     ) -> Result<(), WorkspaceDatabaseError> {
         let database_path = self.database_path.clone();
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|source| sqlite_error(&database_path, source))?;
-        let existing = select_llm_request_record(&transaction, id)
-            .map_err(|source| sqlite_error(&database_path, source))?
+        let existing = self
+            .llm_request(id)?
             .ok_or_else(|| WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() })?;
         let request_body_json = merge_audit_detail_for_update(
             existing.request_body_json.as_deref(),
             request_body_json,
             "request_body_json",
         )?;
+        let transport = LlmRequestTransport::from_request_body_json(request_body_json.as_deref());
+        let request_locator = store_optional_audit_detail(
+            &self.audit_segments,
+            &self.connection,
+            LlmAuditDetailKind::Request,
+            request_body_json.as_deref(),
+        )?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
         let updated = transaction
             .execute(
-                "UPDATE llm_requests SET request_body_json = ?2 WHERE id = ?1",
-                params![id, request_body_json],
+                "UPDATE llm_requests
+                 SET request_body_json = NULL,
+                     transport = ?2,
+                     request_detail_segment_id = ?3,
+                     request_detail_offset = ?4,
+                     request_detail_compressed_len = ?5,
+                     request_detail_uncompressed_len = ?6,
+                     request_detail_sha256 = ?7
+                 WHERE id = ?1",
+                params![
+                    id,
+                    transport.as_str(),
+                    request_locator.as_ref().map(|l| l.segment_id),
+                    request_locator.as_ref().map(|l| l.offset as i64),
+                    request_locator.as_ref().map(|l| l.compressed_len as i64),
+                    request_locator.as_ref().map(|l| l.uncompressed_len as i64),
+                    request_locator.as_ref().map(|l| l.sha256_hex.as_str()),
+                ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
 
@@ -11607,6 +11822,12 @@ impl WorkspaceDatabase {
         outcome: UpdateLlmRequestOutcome<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
         let cache_ratio = validate_llm_request_outcome(&outcome)?;
+        let response_locator = prepare_outcome_response_locator(
+            &self.audit_segments,
+            &self.connection,
+            id,
+            &outcome,
+        )?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -11618,6 +11839,7 @@ impl WorkspaceDatabase {
             id,
             &outcome,
             cache_ratio,
+            response_locator.as_ref(),
         )?;
 
         transaction
@@ -11638,6 +11860,12 @@ impl WorkspaceDatabase {
             .iter()
             .map(prepare_llm_request_event)
             .collect::<Result<Vec<_>, _>>()?;
+        let response_locator = prepare_outcome_response_locator(
+            &self.audit_segments,
+            &self.connection,
+            id,
+            &outcome,
+        )?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -11649,6 +11877,7 @@ impl WorkspaceDatabase {
             id,
             &outcome,
             cache_ratio,
+            response_locator.as_ref(),
         )?;
         for event in &prepared_events {
             insert_prepared_llm_request_event(&transaction, &database_path, event)?;
@@ -11674,6 +11903,12 @@ impl WorkspaceDatabase {
             .iter()
             .map(prepare_llm_request_event)
             .collect::<Result<Vec<_>, _>>()?;
+        let response_locator = prepare_outcome_response_locator(
+            &self.audit_segments,
+            &self.connection,
+            id,
+            &outcome,
+        )?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -11685,6 +11920,7 @@ impl WorkspaceDatabase {
             id,
             &outcome,
             cache_ratio,
+            response_locator.as_ref(),
         )?;
         for event in &prepared_events {
             insert_prepared_llm_request_event(&transaction, &database_path, event)?;
@@ -11771,6 +12007,7 @@ impl WorkspaceDatabase {
                 request_id,
                 &outcome,
                 cache_ratio,
+                None,
             )?;
             let prepared_event = prepare_llm_request_event(&event)?;
             insert_prepared_llm_request_event(&transaction, &database_path, &prepared_event)?;
@@ -11832,7 +12069,8 @@ impl WorkspaceDatabase {
         &self,
         id: &str,
     ) -> Result<Option<LlmRequestRecord>, WorkspaceDatabaseError> {
-        self.connection
+        let loaded = self
+            .connection
             .query_row(
                 "SELECT
                     id, workspace_id, chat_id, request_kind, agent_team_id, agent_instance_id,
@@ -11841,14 +12079,31 @@ impl WorkspaceDatabase {
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                     first_token_latency_ms, total_latency_ms, status_code, final_state,
                     structured_outcome, recovery_source, attempt_index, structured_call_id,
-                    request_body_json, response_body_json, invalidated_at, invalidated_reason
+                    request_body_json, response_body_json, invalidated_at, invalidated_reason,
+                    request_detail_segment_id, request_detail_offset,
+                    request_detail_compressed_len, request_detail_uncompressed_len,
+                    request_detail_sha256,
+                    response_detail_segment_id, response_detail_offset,
+                    response_detail_compressed_len, response_detail_uncompressed_len,
+                    response_detail_sha256
                  FROM llm_requests
                  WHERE id = ?1",
                 params![id],
-                llm_request_record_from_row,
+                llm_request_row_with_locators,
             )
             .optional()
-            .map_err(|source| self.sqlite_error(source))
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some((mut record, request_locator, response_locator)) = loaded else {
+            return Ok(None);
+        };
+        apply_detail_locators(
+            &self.audit_segments,
+            &self.connection,
+            &mut record,
+            request_locator.as_ref(),
+            response_locator.as_ref(),
+        )?;
+        Ok(Some(record))
     }
 
     /// Persist structured single-tool outcome classification without sensitive body text.
@@ -12582,9 +12837,24 @@ impl WorkspaceDatabase {
             .execute(
                 "UPDATE llm_requests
                  SET request_body_json = NULL,
-                     response_body_json = NULL
+                     response_body_json = NULL,
+                     request_detail_segment_id = NULL,
+                     request_detail_offset = NULL,
+                     request_detail_compressed_len = NULL,
+                     request_detail_uncompressed_len = NULL,
+                     request_detail_sha256 = NULL,
+                     response_detail_segment_id = NULL,
+                     response_detail_offset = NULL,
+                     response_detail_compressed_len = NULL,
+                     response_detail_uncompressed_len = NULL,
+                     response_detail_sha256 = NULL
                  WHERE request_started_at < ?1
-                   AND (request_body_json IS NOT NULL OR response_body_json IS NOT NULL)",
+                   AND (
+                        request_body_json IS NOT NULL
+                        OR response_body_json IS NOT NULL
+                        OR request_detail_segment_id IS NOT NULL
+                        OR response_detail_segment_id IS NOT NULL
+                   )",
                 params![cutoff_started_at],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -20547,6 +20817,8 @@ fn select_llm_request_record(
     transaction: &Transaction<'_>,
     id: &str,
 ) -> rusqlite::Result<Option<LlmRequestRecord>> {
+    // Body columns may still hold legacy TEXT; segment locators are hydrated by callers
+    // that need full detail (see hydrate_llm_request_detail_bodies).
     transaction
         .query_row(
             "SELECT
@@ -20556,17 +20828,36 @@ fn select_llm_request_record(
                 cache_read_tokens, cache_write_tokens, reasoning_tokens, cache_ratio,
                 first_token_latency_ms, total_latency_ms, status_code, final_state,
                 structured_outcome, recovery_source, attempt_index, structured_call_id,
-                request_body_json, response_body_json, invalidated_at, invalidated_reason
+                request_body_json, response_body_json, invalidated_at, invalidated_reason,
+                request_detail_segment_id, request_detail_offset,
+                request_detail_compressed_len, request_detail_uncompressed_len,
+                request_detail_sha256,
+                response_detail_segment_id, response_detail_offset,
+                response_detail_compressed_len, response_detail_uncompressed_len,
+                response_detail_sha256
              FROM llm_requests
              WHERE id = ?1",
             params![id],
-            llm_request_record_from_row,
+            llm_request_record_from_row_with_locators,
         )
         .optional()
 }
 
-fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestRecord> {
-    Ok(LlmRequestRecord {
+fn llm_request_record_from_row_with_locators(row: &Row<'_>) -> rusqlite::Result<LlmRequestRecord> {
+    Ok(llm_request_row_with_locators(row)?.0)
+}
+
+/// Row mapper that also returns locators for hydration.
+fn llm_request_row_with_locators(
+    row: &Row<'_>,
+) -> rusqlite::Result<(
+    LlmRequestRecord,
+    Option<LlmAuditDetailLocator>,
+    Option<LlmAuditDetailLocator>,
+)> {
+    let request_locator = optional_detail_locator_from_row(row, 32)?;
+    let response_locator = optional_detail_locator_from_row(row, 37)?;
+    let record = LlmRequestRecord {
         id: row.get(0)?,
         workspace_id: row.get(1)?,
         chat_id: row.get(2)?,
@@ -20599,7 +20890,97 @@ fn llm_request_record_from_row(row: &Row<'_>) -> rusqlite::Result<LlmRequestReco
         response_body_json: row.get(29)?,
         invalidated_at: row.get(30)?,
         invalidated_reason: row.get(31)?,
-    })
+    };
+    Ok((record, request_locator, response_locator))
+}
+
+fn optional_detail_locator_from_row(
+    row: &Row<'_>,
+    start: usize,
+) -> rusqlite::Result<Option<LlmAuditDetailLocator>> {
+    let segment_id: Option<i64> = row.get(start)?;
+    let offset: Option<i64> = row.get(start + 1)?;
+    let compressed_len: Option<i64> = row.get(start + 2)?;
+    let uncompressed_len: Option<i64> = row.get(start + 3)?;
+    let sha256_hex: Option<String> = row.get(start + 4)?;
+    match (
+        segment_id,
+        offset,
+        compressed_len,
+        uncompressed_len,
+        sha256_hex,
+    ) {
+        (
+            Some(segment_id),
+            Some(offset),
+            Some(compressed_len),
+            Some(uncompressed_len),
+            Some(sha256_hex),
+        ) if offset >= 0 && compressed_len >= 0 && uncompressed_len >= 0 => {
+            Ok(Some(LlmAuditDetailLocator {
+                segment_id,
+                offset: offset as u64,
+                compressed_len: compressed_len as u32,
+                uncompressed_len: uncompressed_len as u32,
+                sha256_hex,
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_detail_locators(
+    store: &LlmAuditSegmentStore,
+    connection: &Connection,
+    record: &mut LlmRequestRecord,
+    request_locator: Option<&LlmAuditDetailLocator>,
+    response_locator: Option<&LlmAuditDetailLocator>,
+) -> Result<(), WorkspaceDatabaseError> {
+    if let Some(locator) = request_locator {
+        record.request_body_json = Some(
+            store
+                .read_detail(connection, locator)
+                .map_err(segment_error_to_workspace)?,
+        );
+    }
+    if let Some(locator) = response_locator {
+        record.response_body_json = Some(
+            store
+                .read_detail(connection, locator)
+                .map_err(segment_error_to_workspace)?,
+        );
+    }
+    Ok(())
+}
+
+fn store_optional_audit_detail(
+    store: &LlmAuditSegmentStore,
+    connection: &Connection,
+    kind: LlmAuditDetailKind,
+    body: Option<&str>,
+) -> Result<Option<LlmAuditDetailLocator>, WorkspaceDatabaseError> {
+    let Some(body) = body.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    store
+        .append_detail(connection, kind, body)
+        .map(Some)
+        .map_err(segment_error_to_workspace)
+}
+
+fn segment_error_to_workspace(error: LlmAuditSegmentError) -> WorkspaceDatabaseError {
+    match error {
+        LlmAuditSegmentError::Io { path, source } => WorkspaceDatabaseError::Io { path, source },
+        LlmAuditSegmentError::Sqlite { source } => WorkspaceDatabaseError::Sqlite {
+            path: PathBuf::from("llm_audit_segments"),
+            source,
+        },
+        LlmAuditSegmentError::Corrupt { path, message } => {
+            WorkspaceDatabaseError::InvalidAuditData {
+                message: format!("LLM audit segment {}: {message}", path.display()),
+            }
+        }
+    }
 }
 
 fn llm_request_record_rollup_source(request: &LlmRequestRecord) -> LlmRequestUsageRollupSource<'_> {
@@ -21277,13 +21658,11 @@ fn append_llm_request_audit_where_clause(
     );
 }
 
-/// Read-only CASE that classifies transport from versioned request wire only.
+/// Structured transport column (schema v49+). Prefer this over parsing wire dumps.
+/// Falls back to legacy request_body_json CASE for unmigrated rows.
 /// Must stay aligned with [`LlmRequestTransport::from_request_body_json`].
-/// Does not select or return detail body content.
-///
-/// `json_type(..., '$.version') = 'integer'` is required so SQLite does not treat JSON
-/// `true` / `1.0` as version 1 (those must stay `unknown`, matching Rust `as_u64()`).
 const LLM_REQUEST_TRANSPORT_SQL: &str = "CASE
+                WHEN transport IN ('http', 'websocket') THEN transport
                 WHEN request_body_json IS NULL OR TRIM(request_body_json) = '' THEN 'unknown'
                 WHEN json_valid(request_body_json) = 0 THEN 'unknown'
                 WHEN json_type(request_body_json, '$.version') = 'integer'
@@ -21299,7 +21678,7 @@ const LLM_REQUEST_TRANSPORT_SQL: &str = "CASE
                      AND json_extract(request_body_json, '$.version') = 1
                      AND json_extract(request_body_json, '$.format') = 'provider_request_v1'
                   THEN 'http'
-                ELSE 'unknown'
+                ELSE COALESCE(NULLIF(transport, ''), 'unknown')
              END";
 
 fn llm_request_audit_rows_select_sql() -> String {
@@ -22696,12 +23075,55 @@ fn validate_llm_request_outcome(
     calculate_cache_ratio(outcome.input_tokens, outcome.cache_read_tokens)
 }
 
+fn prepare_outcome_response_locator(
+    store: &LlmAuditSegmentStore,
+    connection: &Connection,
+    id: &str,
+    outcome: &UpdateLlmRequestOutcome<'_>,
+) -> Result<Option<LlmAuditDetailLocator>, WorkspaceDatabaseError> {
+    if outcome.response_body_json.is_none() {
+        return Ok(None);
+    }
+    let (existing_text, has_segment): (Option<String>, bool) = connection
+        .query_row(
+            "SELECT response_body_json, response_detail_segment_id IS NOT NULL
+             FROM llm_requests
+             WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(|source| WorkspaceDatabaseError::Sqlite {
+            path: PathBuf::from("llm_requests"),
+            source,
+        })?
+        .unwrap_or((None, false));
+    // First capture wins: segment-backed response already present.
+    if has_segment {
+        return Ok(None);
+    }
+    let merged = merge_audit_detail_for_update(
+        existing_text.as_deref(),
+        outcome.response_body_json,
+        "response_body_json",
+    )?;
+    // Only append when merge produced a body that is not already stored as TEXT
+    // that we are about to clear — always append merged content when Some.
+    store_optional_audit_detail(
+        store,
+        connection,
+        LlmAuditDetailKind::Response,
+        merged.as_deref(),
+    )
+}
+
 fn update_llm_request_outcome_in_transaction(
     transaction: &Transaction<'_>,
     database_path: &Path,
     id: &str,
     outcome: &UpdateLlmRequestOutcome<'_>,
     cache_ratio: Option<f64>,
+    response_locator: Option<&LlmAuditDetailLocator>,
 ) -> Result<(), WorkspaceDatabaseError> {
     update_llm_request_outcome_in_transaction_with_mode(
         transaction,
@@ -22710,6 +23132,7 @@ fn update_llm_request_outcome_in_transaction(
         outcome,
         cache_ratio,
         false,
+        response_locator,
     )
 }
 
@@ -22719,6 +23142,7 @@ fn finalize_llm_request_outcome_in_transaction(
     id: &str,
     outcome: &UpdateLlmRequestOutcome<'_>,
     cache_ratio: Option<f64>,
+    response_locator: Option<&LlmAuditDetailLocator>,
 ) -> Result<(), WorkspaceDatabaseError> {
     update_llm_request_outcome_in_transaction_with_mode(
         transaction,
@@ -22727,6 +23151,7 @@ fn finalize_llm_request_outcome_in_transaction(
         outcome,
         cache_ratio,
         true,
+        response_locator,
     )
 }
 
@@ -22737,6 +23162,7 @@ fn update_llm_request_outcome_in_transaction_with_mode(
     outcome: &UpdateLlmRequestOutcome<'_>,
     cache_ratio: Option<f64>,
     only_if_running: bool,
+    response_locator: Option<&LlmAuditDetailLocator>,
 ) -> Result<(), WorkspaceDatabaseError> {
     let old_request = select_llm_request_record(transaction, id)
         .map_err(|source| sqlite_error(database_path, source))?
@@ -22744,47 +23170,98 @@ fn update_llm_request_outcome_in_transaction_with_mode(
     if only_if_running && old_request.final_state != "running" {
         return Ok(());
     }
-    let response_body_json = merge_audit_detail_for_update(
-        old_request.response_body_json.as_deref(),
-        outcome.response_body_json,
-        "response_body_json",
-    )?;
 
-    let updated = transaction
-        .execute(
-            "UPDATE llm_requests
-             SET first_token_at = ?2,
-                 completed_at = ?3,
-                 input_tokens = ?4,
-                 output_tokens = ?5,
-                 cache_read_tokens = ?6,
-                 cache_write_tokens = ?7,
-                 reasoning_tokens = ?8,
-                 cache_ratio = ?9,
-                 first_token_latency_ms = ?10,
-                 total_latency_ms = ?11,
-                 status_code = ?12,
-                 final_state = ?13,
-                 response_body_json = ?14
-             WHERE id = ?1",
-            params![
-                id,
-                outcome.first_token_at,
-                outcome.completed_at,
-                outcome.input_tokens,
-                outcome.output_tokens,
-                outcome.cache_read_tokens,
-                outcome.cache_write_tokens,
-                outcome.reasoning_tokens,
-                cache_ratio,
-                outcome.first_token_latency_ms,
-                outcome.total_latency_ms,
-                outcome.status_code,
-                outcome.final_state,
-                response_body_json
-            ],
-        )
-        .map_err(|source| sqlite_error(database_path, source))?;
+    // Validate merge rules against legacy TEXT (if any). Segment-backed existing
+    // responses are treated as already-captured v1 when outcome also supplies a body
+    // only if TEXT is present; first-write of response dump is the common path.
+    if outcome.response_body_json.is_some() {
+        let _ = merge_audit_detail_for_update(
+            old_request.response_body_json.as_deref(),
+            outcome.response_body_json,
+            "response_body_json",
+        )?;
+    }
+
+    let updated = if let Some(locator) = response_locator {
+        transaction
+            .execute(
+                "UPDATE llm_requests
+                 SET first_token_at = ?2,
+                     completed_at = ?3,
+                     input_tokens = ?4,
+                     output_tokens = ?5,
+                     cache_read_tokens = ?6,
+                     cache_write_tokens = ?7,
+                     reasoning_tokens = ?8,
+                     cache_ratio = ?9,
+                     first_token_latency_ms = ?10,
+                     total_latency_ms = ?11,
+                     status_code = ?12,
+                     final_state = ?13,
+                     response_body_json = NULL,
+                     response_detail_segment_id = ?14,
+                     response_detail_offset = ?15,
+                     response_detail_compressed_len = ?16,
+                     response_detail_uncompressed_len = ?17,
+                     response_detail_sha256 = ?18
+                 WHERE id = ?1",
+                params![
+                    id,
+                    outcome.first_token_at,
+                    outcome.completed_at,
+                    outcome.input_tokens,
+                    outcome.output_tokens,
+                    outcome.cache_read_tokens,
+                    outcome.cache_write_tokens,
+                    outcome.reasoning_tokens,
+                    cache_ratio,
+                    outcome.first_token_latency_ms,
+                    outcome.total_latency_ms,
+                    outcome.status_code,
+                    outcome.final_state,
+                    locator.segment_id,
+                    locator.offset as i64,
+                    locator.compressed_len as i64,
+                    locator.uncompressed_len as i64,
+                    locator.sha256_hex.as_str(),
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?
+    } else {
+        transaction
+            .execute(
+                "UPDATE llm_requests
+                 SET first_token_at = ?2,
+                     completed_at = ?3,
+                     input_tokens = ?4,
+                     output_tokens = ?5,
+                     cache_read_tokens = ?6,
+                     cache_write_tokens = ?7,
+                     reasoning_tokens = ?8,
+                     cache_ratio = ?9,
+                     first_token_latency_ms = ?10,
+                     total_latency_ms = ?11,
+                     status_code = ?12,
+                     final_state = ?13
+                 WHERE id = ?1",
+                params![
+                    id,
+                    outcome.first_token_at,
+                    outcome.completed_at,
+                    outcome.input_tokens,
+                    outcome.output_tokens,
+                    outcome.cache_read_tokens,
+                    outcome.cache_write_tokens,
+                    outcome.reasoning_tokens,
+                    cache_ratio,
+                    outcome.first_token_latency_ms,
+                    outcome.total_latency_ms,
+                    outcome.status_code,
+                    outcome.final_state,
+                ],
+            )
+            .map_err(|source| sqlite_error(database_path, source))?
+    };
 
     if updated == 0 {
         return Err(WorkspaceDatabaseError::MissingLlmRequest { id: id.to_string() });

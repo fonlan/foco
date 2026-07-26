@@ -1596,6 +1596,56 @@ CREATE TABLE agent_task_subtree_cancellations (
 );
 "#;
 
+// Move raw LLM wire dumps out of SQLite TEXT columns into append-only Zstd
+// segment files. SQLite keeps structured metrics, event indexes, transport,
+// and segment locators. Pre-aggregated usage stays in llm_request_usage_rollups.
+pub(crate) const MIGRATION_049: &str = r#"
+CREATE TABLE llm_audit_segments (
+    id INTEGER PRIMARY KEY,
+    file_name TEXT NOT NULL UNIQUE CHECK (length(file_name) > 0),
+    created_at TEXT NOT NULL,
+    closed_at TEXT,
+    byte_size INTEGER NOT NULL DEFAULT 0 CHECK (byte_size >= 0),
+    record_count INTEGER NOT NULL DEFAULT 0 CHECK (record_count >= 0)
+);
+
+ALTER TABLE llm_requests
+    ADD COLUMN transport TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (transport IN ('http', 'websocket', 'unknown'));
+
+ALTER TABLE llm_requests ADD COLUMN request_detail_segment_id INTEGER;
+ALTER TABLE llm_requests ADD COLUMN request_detail_offset INTEGER;
+ALTER TABLE llm_requests ADD COLUMN request_detail_compressed_len INTEGER;
+ALTER TABLE llm_requests ADD COLUMN request_detail_uncompressed_len INTEGER;
+ALTER TABLE llm_requests ADD COLUMN request_detail_sha256 TEXT;
+
+ALTER TABLE llm_requests ADD COLUMN response_detail_segment_id INTEGER;
+ALTER TABLE llm_requests ADD COLUMN response_detail_offset INTEGER;
+ALTER TABLE llm_requests ADD COLUMN response_detail_compressed_len INTEGER;
+ALTER TABLE llm_requests ADD COLUMN response_detail_uncompressed_len INTEGER;
+ALTER TABLE llm_requests ADD COLUMN response_detail_sha256 TEXT;
+
+UPDATE llm_requests
+SET transport = CASE
+    WHEN request_body_json IS NULL OR TRIM(request_body_json) = '' THEN 'unknown'
+    WHEN json_valid(request_body_json) = 0 THEN 'unknown'
+    WHEN json_type(request_body_json, '$.version') = 'integer'
+         AND json_extract(request_body_json, '$.version') = 1
+         AND json_extract(request_body_json, '$.format') = 'provider_websocket_request_v1'
+      THEN 'websocket'
+    WHEN json_type(request_body_json, '$.version') = 'integer'
+         AND json_extract(request_body_json, '$.version') = 1
+         AND json_extract(request_body_json, '$.format') = 'provider_request_v1'
+         AND upper(COALESCE(json_extract(request_body_json, '$.method'), '')) = 'WEBSOCKET'
+      THEN 'websocket'
+    WHEN json_type(request_body_json, '$.version') = 'integer'
+         AND json_extract(request_body_json, '$.version') = 1
+         AND json_extract(request_body_json, '$.format') = 'provider_request_v1'
+      THEN 'http'
+    ELSE 'unknown'
+END;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

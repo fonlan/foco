@@ -182,10 +182,13 @@ Foco 会把全局配置和应用级数据存放在配置根目录下。默认路
 
 ```text
 <workspace>/.foco/
-├── foco.sqlite          # 会话、消息、工具调用、代码图谱、LLM 审计、Specs、定时任务
+├── foco.sqlite          # 会话、消息、工具调用、代码图谱、LLM 审计索引/指标、Specs、定时任务
+├── llm-audit/segments/  # Zstd 追加式原始 HTTP wire dump（请求/响应详情）
 ├── hooks.json           # 工作区 Hooks
 └── backups/             # 迁移前创建的 SQLite 备份
 ```
+
+原始 LLM wire dump 不再写入 SQLite（见 `docs/llm-audit-segment-store.md`）。SQLite 只保留结构化指标、事件索引与预聚合 usage rollup。
 
 环境变量：
 

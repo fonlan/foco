@@ -13914,6 +13914,45 @@ fn audits_mocked_llm_request_response_and_stream_events() {
     // Non-Authorization headers on the HTTP head keep their values for v1 dumps.
     assert!(response_body.contains("response-key"));
 
+    // Wire dumps live in Zstd segments; SQLite keeps locators only.
+    let connection = Connection::open(database.database_path()).expect("raw connection");
+    let (
+        stored_request_text,
+        stored_response_text,
+        request_segment_id,
+        response_segment_id,
+        transport,
+    ): (
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<i64>,
+        String,
+    ) = connection
+        .query_row(
+            "SELECT request_body_json, response_body_json,
+                    request_detail_segment_id, response_detail_segment_id, transport
+             FROM llm_requests WHERE id = 'request-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .expect("locator row");
+    assert!(stored_request_text.is_none(), "request dump must not stay in SQLite TEXT");
+    assert!(stored_response_text.is_none(), "response dump must not stay in SQLite TEXT");
+    assert!(request_segment_id.is_some(), "request segment locator required");
+    assert!(response_segment_id.is_some(), "response segment locator required");
+    assert_eq!(transport, "http");
+    let segment_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM llm_audit_segments", [], |row| row.get(0))
+        .expect("segment count");
+    assert!(segment_count >= 1);
+    let segment_files = std::fs::read_dir(workspace.path().join(".foco/llm-audit/segments"))
+        .expect("segments dir")
+        .filter_map(Result::ok)
+        .count();
+    assert!(segment_files >= 1, "segment file should exist on disk");
+    drop(connection);
+
     let events = database
         .llm_request_events("request-1")
         .expect("llm request events");
@@ -23977,8 +24016,10 @@ fn llm_request_audit_query_plans_cover_rows_count_summary_and_breakdown() {
     );
     assert!(
         plan_uses_index(&kind_rows_plan, "llm_requests_request_kind_idx")
-            || plan_uses_index(&kind_rows_plan, "llm_requests_started_at_idx"),
-        "explicit requestKind filter should use kind or started_at index, plan:\n{kind_rows_plan}"
+            || plan_uses_index(&kind_rows_plan, "llm_requests_started_at_idx")
+            // Composite indexes that lead with request_kind are also valid.
+            || plan_uses_index(&kind_rows_plan, "llm_requests_structured_outcome_idx"),
+        "explicit requestKind filter should use kind/started_at/structured_outcome index, plan:\n{kind_rows_plan}"
     );
     assert_no_unconstrained_table_scan(&kind_rows_plan, "llm_requests");
 

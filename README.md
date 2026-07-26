@@ -182,10 +182,13 @@ Each project workspace can also contain workspace-local Foco data:
 
 ```text
 <workspace>/.foco/
-├── foco.sqlite          # Chats, messages, tool calls, code graph, LLM audit, specs, scheduled tasks
+├── foco.sqlite          # Chats, messages, tool calls, code graph, LLM audit index/metrics, specs, scheduled tasks
+├── llm-audit/segments/  # Zstd append-only raw HTTP wire dumps (request/response detail)
 ├── hooks.json           # Workspace hooks
 └── backups/             # SQLite backups created before migrations
 ```
+
+Raw LLM wire dumps are stored outside SQLite (see `docs/llm-audit-segment-store.md`). SQLite keeps structured metrics, event indexes, and pre-aggregated usage rollups.
 
 Environment variables:
 
