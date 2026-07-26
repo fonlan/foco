@@ -34976,14 +34976,18 @@ async fn main_chat_tool_loop_guard_auto_recovers_without_third_execution() {
         "final content must include recovery completion text: {completed_text}"
     );
     assert_eq!(
-        tool_call_ids,
-        vec!["call-loop-1".to_string(), "call-loop-2".to_string()],
-        "third identical batch must not emit ToolCall"
+        &tool_call_ids[..2],
+        ["call-loop-1".to_string(), "call-loop-2".to_string()],
+        "only the first two batches may use provider call ids as executable cards"
+    );
+    assert_eq!(tool_call_ids.len(), 3, "blocked batch must be visible");
+    assert!(
+        tool_call_ids[2].contains(":1:0:call-loop-3"),
+        "blocked card must have a stable distinct display id: {tool_call_ids:?}"
     );
     assert_eq!(
-        tool_result_ids,
-        vec!["call-loop-1".to_string(), "call-loop-2".to_string()],
-        "third identical batch must not emit ToolResult"
+        tool_result_ids, tool_call_ids,
+        "every blocked card is terminal"
     );
     assert_eq!(
         guidance_applied
@@ -35040,20 +35044,14 @@ async fn main_chat_tool_loop_guard_auto_recovers_without_third_execution() {
         .expect("persisted tool calls");
     assert_eq!(
         persisted_tool_calls.len(),
-        2,
-        "third batch must not be persisted: {persisted_tool_calls:?}"
+        3,
+        "blocked batch must persist as observation"
     );
-    assert!(
-        persisted_tool_calls
-            .iter()
-            .all(|tool_call| tool_call.id == "call-loop-1" || tool_call.id == "call-loop-2")
-    );
-    assert!(
-        !persisted_tool_calls
-            .iter()
-            .any(|tool_call| tool_call.id == "call-loop-3"),
-        "intercepted call-loop-3 must not appear in tool_calls table"
-    );
+    let blocked_call = persisted_tool_calls
+        .iter()
+        .find(|tool_call| tool_call.id.contains(":1:0:call-loop-3"))
+        .expect("blocked observation call");
+    assert_eq!(blocked_call.status, "error");
 
     let assistant = database
         .message(&assistant_message_id)
@@ -35161,9 +35159,8 @@ async fn main_chat_tool_loop_guard_fails_after_max_recoveries() {
 
     assert_eq!(guidance_count, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN);
     assert_eq!(
-        tool_call_count,
-        crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
-        "only the first two batches may execute"
+        tool_call_count, loop_tool_request_count,
+        "every provider attempt must be visible, including blocked batches"
     );
     assert!(!completed);
     let error_message = error_message.expect("max recovery exhausted error");
@@ -35187,8 +35184,16 @@ async fn main_chat_tool_loop_guard_fails_after_max_recoveries() {
         .expect("persisted tool calls");
     assert_eq!(
         persisted_tool_calls.len(),
+        loop_tool_request_count,
+        "recovered and exhausted batches persist terminal observation calls: {persisted_tool_calls:?}"
+    );
+    assert_eq!(
+        persisted_tool_calls
+            .iter()
+            .filter(|tool_call| tool_call.status == "completed")
+            .count(),
         crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
-        "recovered/failed batches must not persist tool calls: {persisted_tool_calls:?}"
+        "only the first two batches execute successfully"
     );
 }
 

@@ -4939,7 +4939,40 @@ impl PreparedChatContext {
                                 Ok(ToolLoopBeforeExecutionAction::RecoverRepeatedBatch {
                                     message,
                                     tool_names: _,
-                                }) => {
+                            }) => {
+                                    let blocked_batch_index = tool_call_loop_recovery_count
+                                        .saturating_add(1);
+                                    let blocked_calls = crate::runtime::blocked_tool_calls(
+                                        &self.llm_request_id,
+                                        &self.assistant_message_id,
+                                        &tool_calls,
+                                        blocked_batch_index,
+                                        MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
+                                        tool_call_loop_recovery_count
+                                            < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
+                                    );
+                                    let blocked_timestamp = utc_timestamp();
+                                    if let Err(error) = persist_blocked_tool_call_observations(
+                                        &self,
+                                        &blocked_calls,
+                                        &blocked_timestamp,
+                                    ) {
+                                        let event = ChatSseEvent::Error {
+                                            message: error.message,
+                                        };
+                                        events.push(captured_event(&event));
+                                        yield event;
+                                        return;
+                                    }
+                                    let blocked_events = blocked_tool_call_events(
+                                        &self.assistant_message_id,
+                                        &blocked_calls,
+                                        &blocked_timestamp,
+                                    );
+                                    for event in blocked_events {
+                                        events.push(captured_event(&event));
+                                        yield event;
+                                    }
                                     if tool_call_loop_recovery_count
                                         < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN
                                     {
@@ -7895,6 +7928,98 @@ fn append_automatic_loop_recovery(
         Some(turn_metrics),
         attachment_read_allowlist,
     )
+}
+
+/// Emits an immediately terminal, observation-only tool card for every call the repeated-call
+/// guard blocks. These events are never added to the provider conversation or executor queue.
+fn blocked_tool_call_events(
+    assistant_message_id: &str,
+    blocked_calls: &[crate::runtime::BlockedToolCall],
+    timestamp: &str,
+) -> Vec<ChatSseEvent> {
+    blocked_calls
+        .iter()
+        .cloned()
+        .flat_map(|blocked| {
+            let tool_call = ChatToolCallSummary {
+                id: blocked.display_id.clone(),
+                name: blocked.name,
+                status: "error".to_string(),
+                input: blocked.input,
+                output: Some(blocked.output.clone()),
+                is_error: true,
+                started_at: Some(timestamp.to_string()),
+                completed_at: Some(timestamp.to_string()),
+                live_output: None,
+            };
+            [
+                ChatSseEvent::ToolCall {
+                    assistant_message_id: assistant_message_id.to_string(),
+                    reasoning_duration_ms: None,
+                    tool_call,
+                },
+                ChatSseEvent::ToolResult {
+                    assistant_message_id: assistant_message_id.to_string(),
+                    tool_call_id: blocked.display_id,
+                    output: blocked.output,
+                    is_error: true,
+                    terminal: true,
+                    started_at: timestamp.to_string(),
+                    completed_at: timestamp.to_string(),
+                },
+            ]
+        })
+        .collect()
+}
+
+fn persist_blocked_tool_call_observations(
+    context: &PreparedChatContext,
+    blocked_calls: &[crate::runtime::BlockedToolCall],
+    timestamp: &str,
+) -> Result<(), ApiError> {
+    let mut database = WorkspaceDatabase::open_or_create_critical(&context.workspace_path)
+        .map_err(ApiError::from_workspace_error)?;
+    database
+        .upsert_message_content(NewMessage {
+            id: &context.assistant_message_id,
+            chat_id: &context.chat_id,
+            role: "assistant",
+            content: "",
+            sequence: context.assistant_sequence,
+            metadata_json: None,
+        })
+        .map_err(ApiError::from_workspace_error)?;
+    for blocked in blocked_calls {
+        let input_json = serde_json::to_string(&blocked.input).map_err(|source| {
+            ApiError::internal(format!("failed to serialize blocked tool input: {source}"))
+        })?;
+        let output_json = serde_json::to_string(&blocked.output).map_err(|source| {
+            ApiError::internal(format!("failed to serialize blocked tool output: {source}"))
+        })?;
+        database
+            .upsert_tool_call(NewToolCall {
+                id: &blocked.display_id,
+                chat_id: &context.chat_id,
+                run_id: &context.llm_request_id,
+                message_id: Some(&context.assistant_message_id),
+                tool_name: &blocked.name,
+                input_json: &input_json,
+                status: "error",
+                started_at: timestamp,
+                completed_at: Some(timestamp),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .upsert_tool_result(NewToolResult {
+                id: &format!("{}-result", blocked.display_id),
+                tool_call_id: &blocked.display_id,
+                output_json: &output_json,
+                is_error: true,
+                created_at: timestamp,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
+    Ok(())
 }
 
 fn turn_reply_metrics(

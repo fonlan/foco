@@ -3249,6 +3249,7 @@ pub(crate) fn persist_chat_result(
     } else {
         None
     };
+    let blocked_tool_calls = blocked_tool_calls_from_events(events)?;
 
     // Final assistant parts must include durable stream events (especially context_compression
     // start/completed) for success, tool-only, failure, and cancel paths. Relying on browser
@@ -3260,10 +3261,40 @@ pub(crate) fn persist_chat_result(
         || events_contain_assistant_history_parts(events)
     {
         let content = assistant_text.unwrap_or("");
-        let tool_call_summaries = tool_calls
+        let mut tool_call_summaries = database
+            .tool_calls_for_chat(&context.chat_id)
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .filter(|tool_call| {
+                tool_call.message_id.as_deref() == Some(context.assistant_message_id.as_str())
+            })
+            .map(chat_tool_call_summary)
+            .collect::<Result<Vec<_>, _>>()?;
+        let executed_tool_call_summaries = tool_calls
             .iter()
             .map(executed_tool_call_summary)
             .collect::<Vec<_>>();
+        for tool_call in executed_tool_call_summaries {
+            if !tool_call_summaries
+                .iter()
+                .any(|persisted| persisted.id == tool_call.id)
+            {
+                tool_call_summaries.push(tool_call);
+            }
+        }
+        tool_call_summaries.extend(blocked_tool_calls.iter().map(|tool_call| {
+            ChatToolCallSummary {
+                id: tool_call.id.clone(),
+                name: tool_call.name.clone(),
+                status: "error".to_string(),
+                input: tool_call.input.clone(),
+                output: Some(tool_call.output.clone()),
+                is_error: true,
+                started_at: Some(tool_call.started_at.clone()),
+                completed_at: Some(tool_call.completed_at.clone()),
+                live_output: None,
+            }
+        }));
         let parts = finalized_assistant_message_parts(
             &context.assistant_message_id,
             events,
@@ -3299,6 +3330,37 @@ pub(crate) fn persist_chat_result(
     } else {
         None
     };
+
+    for tool_call in &blocked_tool_calls {
+        let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
+            ApiError::internal(format!("failed to serialize blocked tool input: {source}"))
+        })?;
+        let output_json = serde_json::to_string(&tool_call.output).map_err(|source| {
+            ApiError::internal(format!("failed to serialize blocked tool output: {source}"))
+        })?;
+        database
+            .upsert_tool_call(NewToolCall {
+                id: &tool_call.id,
+                chat_id: &context.chat_id,
+                run_id: &context.llm_request_id,
+                message_id: assistant_message_id,
+                tool_name: &tool_call.name,
+                input_json: &input_json,
+                status: "error",
+                started_at: &tool_call.started_at,
+                completed_at: Some(&tool_call.completed_at),
+            })
+            .map_err(ApiError::from_workspace_error)?;
+        database
+            .upsert_tool_result(NewToolResult {
+                id: &format!("{}-result", tool_call.id),
+                tool_call_id: &tool_call.id,
+                output_json: &output_json,
+                is_error: true,
+                created_at: &tool_call.completed_at,
+            })
+            .map_err(ApiError::from_workspace_error)?;
+    }
 
     for tool_call in tool_calls {
         let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
@@ -3368,6 +3430,81 @@ pub(crate) fn persist_chat_result(
     }
 
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct BlockedToolCallObservation {
+    id: String,
+    name: String,
+    input: Value,
+    output: Value,
+    started_at: String,
+    completed_at: String,
+}
+
+/// Extracts only the explicit guard marker. No user-facing error text is interpreted here.
+fn blocked_tool_calls_from_events(
+    events: &[CapturedAuditEvent],
+) -> Result<Vec<BlockedToolCallObservation>, ApiError> {
+    let blocked_outputs = events
+        .iter()
+        .filter(|event| event.event_type == "tool_result")
+        .filter_map(|event| {
+            let payload = serde_json::from_str::<Value>(&event.normalized_event_json).ok()?;
+            let id = payload.get("toolCallId")?.as_str()?.to_string();
+            let output = payload.get("output")?.clone();
+            (output.get("source").and_then(Value::as_str)
+                == Some(crate::runtime::TOOL_CALL_LOOP_GUARD_SOURCE)
+                && output.get("executed").and_then(Value::as_bool) == Some(false))
+            .then_some((id, output))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut observations = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.event_type == "tool_call")
+    {
+        let Ok(payload) = serde_json::from_str::<Value>(&event.normalized_event_json) else {
+            continue;
+        };
+        let Some(tool_call) = payload.get("toolCall") else {
+            continue;
+        };
+        let Some(id) = tool_call.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(output) = blocked_outputs.get(id).cloned() else {
+            continue;
+        };
+        let string = |field: &str| {
+            tool_call
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    ApiError::internal(format!("blocked tool call event is missing {field}"))
+                })
+        };
+        let started_at = tool_call
+            .get("startedAt")
+            .and_then(Value::as_str)
+            .unwrap_or(&event.event_at)
+            .to_string();
+        let completed_at = tool_call
+            .get("completedAt")
+            .and_then(Value::as_str)
+            .unwrap_or(&started_at)
+            .to_string();
+        observations.push(BlockedToolCallObservation {
+            id: string("id")?,
+            name: string("name")?,
+            input: tool_call.get("input").cloned().unwrap_or(Value::Null),
+            output,
+            started_at,
+            completed_at,
+        });
+    }
+    Ok(observations)
 }
 
 /// True when the captured stream has part-bearing history events that must land in

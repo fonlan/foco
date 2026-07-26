@@ -148,13 +148,14 @@ use crate::{
         AGENT_MAX_CREATE_INSTANCES_PER_REQUEST, AGENT_MAX_INSTANCES_PER_TEAM,
         AGENT_MAX_QUEUED_TASKS_PER_CHAT, AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
         AGENT_MAX_QUEUED_TASKS_PER_TEAM, AgentAttemptInterruption, AgentAttemptRecoveryAction,
-        BrokeredImageFile, BrokeredTransferFile, CodeGraphIndexState, CodeGraphReadinessError,
-        MAX_REASONING_LOOP_RECOVERIES_PER_RUN, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
-        ProviderAuditCapture, QuestionRegistry, REASONING_LOOP_GUARD_SOURCE,
-        REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction, ReasoningLoopDetector,
-        SidecarRuntimeConfigBundle, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopBeforeExecutionAction,
-        ToolLoopGuard, ToolOutputDeltaEvent, ToolResourceLockRegistry,
-        agent_attempt_recovery_action_for_evidence, agent_attempt_recovery_diagnostics,
+        BlockedToolCall, BrokeredImageFile, BrokeredTransferFile, CodeGraphIndexState,
+        CodeGraphReadinessError, MAX_REASONING_LOOP_RECOVERIES_PER_RUN,
+        MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, ProviderAuditCapture, QuestionRegistry,
+        REASONING_LOOP_GUARD_SOURCE, REASONING_LOOP_RECOVERY_USER_TEXT, ReadOnlyToolProgressAction,
+        ReasoningLoopDetector, SidecarRuntimeConfigBundle, TOOL_CALL_LOOP_GUARD_SOURCE,
+        ToolLoopBeforeExecutionAction, ToolLoopGuard, ToolOutputDeltaEvent,
+        ToolResourceLockRegistry, agent_attempt_recovery_action_for_evidence,
+        agent_attempt_recovery_diagnostics, blocked_tool_calls,
         build_sidecar_runtime_config_bundle, execute_image_tool, execute_tool_with_runtime,
         execute_web_tool, image_tool_timeout_ms, materialize_brokered_image_result,
         materialize_brokered_web_result, open_workspace_database_ordinary_with_pre_stream_retry,
@@ -14482,6 +14483,81 @@ fn remote_sidecar_capture_tool_calls(
     events
 }
 
+/// Records guard-blocked calls as terminal errors before their observation events are streamed.
+/// They intentionally bypass pending-tool state and never produce provider tool messages.
+fn remote_sidecar_record_blocked_tool_calls(
+    database: &mut WorkspaceDatabase,
+    chat_id: &str,
+    run_id: &str,
+    assistant_message_id: &str,
+    blocked_calls: &[BlockedToolCall],
+    timestamp: &str,
+) -> Result<(), foco_store::workspace::WorkspaceDatabaseError> {
+    for blocked in blocked_calls {
+        let input_json =
+            serde_json::to_string(&blocked.input).unwrap_or_else(|_| "null".to_string());
+        let output_json =
+            serde_json::to_string(&blocked.output).unwrap_or_else(|_| "null".to_string());
+        database.upsert_tool_call(foco_store::workspace::NewToolCall {
+            id: &blocked.display_id,
+            chat_id,
+            run_id,
+            message_id: Some(assistant_message_id),
+            tool_name: &blocked.name,
+            input_json: &input_json,
+            status: "error",
+            started_at: timestamp,
+            completed_at: Some(timestamp),
+        })?;
+        database.upsert_tool_result(foco_store::workspace::NewToolResult {
+            id: &format!("{}-result", blocked.display_id),
+            tool_call_id: &blocked.display_id,
+            output_json: &output_json,
+            is_error: true,
+            created_at: timestamp,
+        })?;
+    }
+    Ok(())
+}
+
+fn remote_sidecar_blocked_tool_call_events(
+    assistant_message_id: &str,
+    blocked_calls: &[BlockedToolCall],
+    timestamp: &str,
+) -> Vec<Value> {
+    blocked_calls
+        .iter()
+        .flat_map(|blocked| {
+            [
+                json!({
+                    "type": "toolCall",
+                    "assistantMessageId": assistant_message_id,
+                    "toolCall": {
+                        "id": blocked.display_id,
+                        "name": blocked.name,
+                        "status": "error",
+                        "input": blocked.input,
+                        "output": blocked.output,
+                        "isError": true,
+                        "startedAt": timestamp,
+                        "completedAt": timestamp,
+                    },
+                }),
+                json!({
+                    "type": "toolResult",
+                    "assistantMessageId": assistant_message_id,
+                    "toolCallId": blocked.display_id,
+                    "output": blocked.output,
+                    "isError": true,
+                    "terminal": true,
+                    "startedAt": timestamp,
+                    "completedAt": timestamp,
+                }),
+            ]
+        })
+        .collect()
+}
+
 fn remote_sidecar_record_pending_tool_calls(
     database: &mut WorkspaceDatabase,
     chat_id: &str,
@@ -18651,6 +18727,54 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                         message,
                         tool_names: _,
                     }) => {
+                        let blocked_batch_index = tool_call_loop_recovery_count.saturating_add(1);
+                        let recovery_available =
+                            tool_call_loop_recovery_count < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN;
+                        let blocked_calls = blocked_tool_calls(
+                            &run_id,
+                            &assistant_message_id,
+                            &tool_calls,
+                            blocked_batch_index,
+                            MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN,
+                            recovery_available,
+                        );
+                        let blocked_timestamp =
+                            Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+                        if let Err(error) =
+                            with_sidecar_workspace_database(&stream_state, |database| {
+                                remote_sidecar_record_blocked_tool_calls(
+                                    database,
+                                    &chat_id,
+                                    &run_id,
+                                    &assistant_message_id,
+                                    &blocked_calls,
+                                    &blocked_timestamp,
+                                )
+                            })
+                        {
+                            tracing::warn!(
+                                chat_id,
+                                run_id,
+                                error = %error,
+                                "failed to persist blocked repeated remote tool calls"
+                            );
+                        }
+                        for event in remote_sidecar_blocked_tool_call_events(
+                            &assistant_message_id,
+                            &blocked_calls,
+                            &blocked_timestamp,
+                        ) {
+                            sequence += 1;
+                            remote_sidecar_record_durable_run_event(
+                                &stream_state,
+                                &run_stream,
+                                &chat_id,
+                                &run_id,
+                                sequence,
+                                event,
+                            );
+                            last_yielded_sequence = sequence;
+                        }
                         if tool_call_loop_recovery_count < MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN {
                             tool_call_loop_recovery_count =
                                 tool_call_loop_recovery_count.saturating_add(1);
@@ -37397,17 +37521,17 @@ mod tests {
         assert!(!text.contains("\"type\":\"error\""));
         assert_eq!(
             text.matches("\"type\":\"toolCall\"").count(),
-            2,
-            "third batch must not emit toolCall SSE: {text}"
+            3,
+            "third batch must emit a blocked observation toolCall SSE: {text}"
         );
         assert_eq!(
             text.matches("\"type\":\"toolResult\"").count(),
-            2,
-            "third batch must not emit toolResult SSE: {text}"
+            3,
+            "third batch must emit a terminal blocked toolResult SSE: {text}"
         );
         assert!(
-            !text.contains("call-loop-3"),
-            "intercepted call id must not appear in SSE: {text}"
+            text.contains("\"executed\":false") && text.contains("call-loop-3"),
+            "blocked SSE must retain the original id in its structured payload: {text}"
         );
 
         let recovery_messages = recovery_messages
@@ -37460,13 +37584,14 @@ mod tests {
             .expect("tool calls for chat");
         assert_eq!(
             tool_calls.len(),
-            2,
-            "third batch must not be persisted: {tool_calls:?}"
+            3,
+            "third batch must persist as observation"
         );
         assert!(
-            tool_calls
-                .iter()
-                .all(|tool_call| tool_call.id == "call-loop-1" || tool_call.id == "call-loop-2")
+            tool_calls.iter().any(|tool_call| {
+                tool_call.id.contains(":1:0:call-loop-3") && tool_call.status == "error"
+            }),
+            "blocked call must be terminal and distinct: {tool_calls:?}"
         );
 
         let assistant = database
@@ -37574,8 +37699,8 @@ mod tests {
         assert!(!text.contains("\"type\":\"complete\""));
         assert_eq!(
             text.matches("\"type\":\"toolCall\"").count(),
-            crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
-            "only the first two batches may execute: {text}"
+            looping_batches,
+            "every blocked batch, including exhaustion, must remain visible: {text}"
         );
 
         let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace db");
@@ -37602,8 +37727,8 @@ mod tests {
             .expect("tool calls for chat");
         assert_eq!(
             tool_calls.len(),
-            crate::MAX_REPEATED_TOOL_CALL_BATCHES - 1,
-            "failed recoveries must not persist extra tool calls: {tool_calls:?}"
+            looping_batches,
+            "failed recoveries persist terminal observation calls: {tool_calls:?}"
         );
         assert!(
             metadata

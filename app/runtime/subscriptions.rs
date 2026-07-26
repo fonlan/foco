@@ -775,7 +775,14 @@ impl ActiveChatRunRegistration {
                 let input_json = serde_json::to_string(&tool_call.input).map_err(|source| {
                     ApiError::internal(format!("failed to serialize tool input: {source}"))
                 })?;
-                let started_at = utc_timestamp();
+                let started_at = tool_call.started_at.clone().unwrap_or_else(utc_timestamp);
+                let terminal_observation = tool_call.is_error && tool_call.output.is_some();
+                let completed_at = terminal_observation.then(|| {
+                    tool_call
+                        .completed_at
+                        .clone()
+                        .unwrap_or_else(|| started_at.clone())
+                });
                 database
                     .upsert_tool_call(NewToolCall {
                         id: &tool_call.id,
@@ -784,11 +791,36 @@ impl ActiveChatRunRegistration {
                         message_id: Some(&self.assistant_message_id),
                         tool_name: &tool_call.name,
                         input_json: &input_json,
-                        status: "running",
+                        status: if terminal_observation {
+                            "error"
+                        } else {
+                            "running"
+                        },
                         started_at: &started_at,
-                        completed_at: None,
+                        completed_at: completed_at.as_deref(),
                     })
                     .map_err(ApiError::from_workspace_error)?;
+                if let Some(output) = tool_call.output.as_ref() {
+                    let output_json = serde_json::to_string(output).map_err(|source| {
+                        ApiError::internal(format!(
+                            "failed to serialize terminal tool output: {source}"
+                        ))
+                    })?;
+                    let completed_at = completed_at.as_deref().ok_or_else(|| {
+                        ApiError::internal(
+                            "terminal observation is missing its completion timestamp",
+                        )
+                    })?;
+                    database
+                        .upsert_tool_result(NewToolResult {
+                            id: &format!("{}-result", tool_call.id),
+                            tool_call_id: &tool_call.id,
+                            output_json: &output_json,
+                            is_error: true,
+                            created_at: completed_at,
+                        })
+                        .map_err(ApiError::from_workspace_error)?;
+                }
             }
             ChatSseEvent::ToolResult {
                 assistant_message_id,

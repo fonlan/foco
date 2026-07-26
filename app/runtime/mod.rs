@@ -103,7 +103,8 @@ pub(crate) use tool_locks::{
     ToolResourceLockRegistry,
 };
 pub(crate) use tool_loop::{
-    MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, TOOL_CALL_LOOP_GUARD_SOURCE, ToolLoopGuard,
+    BlockedToolCall, MAX_TOOL_CALL_LOOP_RECOVERIES_PER_RUN, TOOL_CALL_LOOP_GUARD_SOURCE,
+    ToolLoopGuard, blocked_tool_calls,
 };
 pub(crate) use web_tools::{
     execute_web_tool, is_web_tool_name, materialize_brokered_web_result,
