@@ -3097,6 +3097,9 @@ struct RemoteActiveRunStream {
     /// Explicit cancel / edit-delete invalidation / abnormal runner abort.
     /// Independent of SSE subscription Drop: subscribers never set this flag.
     cancel_requested: Arc<AtomicBool>,
+    /// The first cancellation cause wins so a descendant runner can persist the
+    /// root-cancel provenance while it performs its normal task cleanup.
+    cancel_reason: Arc<Mutex<Option<String>>>,
     cancel_tx: watch::Sender<bool>,
     cancel_rx: watch::Receiver<bool>,
     /// Normal terminal completion is distinct from cancellation, but retry waits
@@ -3129,6 +3132,7 @@ impl RemoteActiveRunStream {
             pending_hook_notifications: Arc::new(Mutex::new(Vec::new())),
             finished: Arc::new(AtomicBool::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
+            cancel_reason: Arc::new(Mutex::new(None)),
             cancel_tx,
             cancel_rx,
             finished_tx,
@@ -3228,10 +3232,23 @@ impl RemoteActiveRunStream {
         self.finished.load(Ordering::Acquire)
     }
 
-    fn request_cancel(&self) {
+    fn request_cancel_with_reason(&self, reason: Option<&str>) {
+        if let Some(reason) = reason
+            && let Ok(mut cancel_reason) = self.cancel_reason.lock()
+            && cancel_reason.is_none()
+        {
+            *cancel_reason = Some(reason.to_string());
+        }
         self.cancel_requested.store(true, Ordering::Release);
         self.tool_token.cancel();
         let _ = self.cancel_tx.send(true);
+    }
+
+    fn cancel_reason(&self) -> Option<String> {
+        self.cancel_reason
+            .lock()
+            .ok()
+            .and_then(|reason| reason.clone())
     }
 
     fn is_cancel_requested(&self) -> bool {
@@ -3317,7 +3334,7 @@ async fn remote_sidecar_wait_context_compression_backoff(
 struct RemoteActiveRunRegistration {
     queued_user_message_id: String,
     assistant_message_id: String,
-    plan_task_id: Option<AgentTaskId>,
+    agent_task_id: Option<AgentTaskId>,
     run_stream: RemoteActiveRunStream,
 }
 
@@ -3915,7 +3932,7 @@ fn remote_sidecar_reserve_active_run(
     chat_id: String,
     queued_user_message_id: String,
     assistant_message_id: String,
-    plan_task_id: Option<AgentTaskId>,
+    agent_task_id: Option<AgentTaskId>,
 ) -> Result<RemoteRunReservation, ApiError> {
     let mut registry = state
         .active_run_streams
@@ -3945,7 +3962,7 @@ fn remote_sidecar_reserve_active_run(
         RemoteActiveRunRegistration {
             queued_user_message_id,
             assistant_message_id,
-            plan_task_id,
+            agent_task_id,
             run_stream: run_stream.clone(),
         },
     );
@@ -3970,12 +3987,32 @@ fn remote_sidecar_insert_active_run_stream(
             RemoteActiveRunRegistration {
                 queued_user_message_id: String::new(),
                 assistant_message_id: String::new(),
-                plan_task_id: None,
+                agent_task_id: None,
                 run_stream: run_stream.clone(),
             },
         );
     }
     run_stream
+}
+
+#[cfg(test)]
+fn remote_sidecar_reserve_active_run_for_agent_task(
+    state: &RemoteSidecarState,
+    chat_id: String,
+    task_id: AgentTaskId,
+) -> (String, RemoteActiveRunStream) {
+    match remote_sidecar_reserve_active_run(
+        state,
+        chat_id,
+        format!("test-user:{task_id}"),
+        format!("test-assistant:{task_id}"),
+        Some(task_id),
+    )
+    .expect("test Agent task reservation")
+    {
+        RemoteRunReservation::Started { run_id, run_stream } => (run_id, run_stream),
+        RemoteRunReservation::Existing { .. } => panic!("test Agent task reservation must start"),
+    }
 }
 
 fn remote_sidecar_existing_active_run(
@@ -4046,6 +4083,47 @@ fn remote_sidecar_active_run_stream(
         .by_run_id
         .get(run_id)
         .map(|registration| registration.run_stream.clone())
+}
+
+/// Snapshots only task/run identities while holding the registry lock. Durable
+/// cancellation and cancellation signals happen after this lock is released.
+fn remote_sidecar_active_run_ids_for_agent_tasks(
+    state: &RemoteSidecarState,
+    task_ids: &[AgentTaskId],
+) -> Vec<String> {
+    let task_ids = task_ids.iter().collect::<HashSet<_>>();
+    state
+        .active_run_streams
+        .lock()
+        .ok()
+        .map(|registry| {
+            registry
+                .by_run_id
+                .iter()
+                .filter(|(_, registration)| {
+                    registration
+                        .agent_task_id
+                        .as_ref()
+                        .is_some_and(|task_id| task_ids.contains(task_id))
+                })
+                .map(|(run_id, _)| run_id.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn remote_sidecar_agent_task_id_for_active_run(
+    state: &RemoteSidecarState,
+    run_id: &str,
+) -> Option<AgentTaskId> {
+    state
+        .active_run_streams
+        .lock()
+        .ok()?
+        .by_run_id
+        .get(run_id)?
+        .agent_task_id
+        .clone()
 }
 
 fn remote_sidecar_record_run_event(
@@ -4166,7 +4244,24 @@ fn remote_sidecar_cancel_active_run(
     emit_events: bool,
     remove_pending: bool,
 ) {
-    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, true);
+    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, true, None);
+}
+
+fn remote_sidecar_cancel_active_run_with_reason(
+    state: &RemoteSidecarState,
+    run_id: &str,
+    emit_events: bool,
+    remove_pending: bool,
+    cancellation_reason: &str,
+) {
+    remote_sidecar_cancel_active_run_inner(
+        state,
+        run_id,
+        emit_events,
+        remove_pending,
+        true,
+        Some(cancellation_reason),
+    );
 }
 
 /// End an in-memory run after its task, queuedRun, and assistant were already
@@ -4178,7 +4273,7 @@ fn remote_sidecar_cancel_active_run_after_durable_closure(
     emit_events: bool,
     remove_pending: bool,
 ) {
-    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, false);
+    remote_sidecar_cancel_active_run_inner(state, run_id, emit_events, remove_pending, false, None);
 }
 
 fn remote_sidecar_cancel_active_run_inner(
@@ -4187,6 +4282,7 @@ fn remote_sidecar_cancel_active_run_inner(
     emit_events: bool,
     remove_pending: bool,
     clear_durable_queued_run: bool,
+    cancellation_reason: Option<&str>,
 ) {
     let Some(registration) = remote_sidecar_deactivate_active_run(state, run_id) else {
         return;
@@ -4217,7 +4313,7 @@ fn remote_sidecar_cancel_active_run_inner(
     }
 
     // Wake the background runner even if another path already cleaned up.
-    run_stream.request_cancel();
+    run_stream.request_cancel_with_reason(cancellation_reason);
     let first_cleanup = run_stream.try_commit_cleanup();
     let broker_request_id = run_stream.broker_request_id();
 
@@ -4365,7 +4461,7 @@ fn remote_sidecar_has_active_plan_task_runner(
         .ok()
         .is_some_and(|registry| {
             registry.by_run_id.values().any(|registration| {
-                registration.plan_task_id.as_ref() == Some(task_id)
+                registration.agent_task_id.as_ref() == Some(task_id)
                     && !registration.run_stream.is_cancel_requested()
                     && !registration.run_stream.is_finished()
             })
@@ -4604,7 +4700,7 @@ fn remote_sidecar_cancel_active_run_for_plan_task(
             registry
                 .by_run_id
                 .get(run_id)
-                .is_some_and(|registration| registration.plan_task_id.as_ref() == Some(task_id))
+                .is_some_and(|registration| registration.agent_task_id.as_ref() == Some(task_id))
         });
     if owns_run {
         // The database transaction has already emitted the durable terminal
@@ -18041,6 +18137,7 @@ struct RemoteSidecarChatRunContext {
     /// equals the canonical workspace for normal remote chats.
     tool_workspace_path: PathBuf,
     plan_task: Option<RemotePlanTaskBinding>,
+    agent_task_id: Option<AgentTaskId>,
     run_id: String,
     chat_id: String,
     chat_title: String,
@@ -18135,6 +18232,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
         workspace_state: stream_state,
         tool_workspace_path,
         plan_task,
+        agent_task_id,
         run_id,
         chat_id,
         chat_title,
@@ -19506,12 +19604,14 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
     });
     // Git operations must not retain a workspace DB permit. The Plan task
     // lifecycle is persisted in short transactions around the worktree commit.
+    let cancellation_reason = run_stream.cancel_reason();
     if let Some(plan_task) = plan_task.as_ref() {
         match remote_sidecar_sync_plan_task_after_chat_with_retry(
             &stream_state,
             &plan_task.task_id,
             &assistant_message_id,
             run_stream.is_cancel_requested(),
+            cancellation_reason.as_deref(),
         )
         .await
         {
@@ -19522,6 +19622,33 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
                 error = %error.message,
                 "failed to synchronize remote Plan phase after Coordinator chat completion"
             ),
+        }
+    } else if run_stream.is_cancel_requested()
+        && let Some(agent_task_id) = agent_task_id.as_ref()
+    {
+        let cancellation_message = cancellation_reason
+            .as_deref()
+            .unwrap_or("cancelled explicitly");
+        if let Err(error) = with_sidecar_workspace_database(&stream_state, |database| {
+            let Some(task) = database.agent_task(agent_task_id)? else {
+                return Ok(false);
+            };
+            let error_json = json!({ "message": cancellation_message }).to_string();
+            database.update_agent_task_state(AgentTaskStateUpdate {
+                team_id: &task.team_id,
+                task_id: agent_task_id,
+                expected_status: AgentTaskStatus::Running,
+                transition: AgentTaskTransition::Cancel,
+                result_json: None,
+                error_json: Some(&error_json),
+                interruption_reason: cancellation_reason.as_deref(),
+            })
+        }) {
+            tracing::warn!(
+                task_id = %agent_task_id,
+                error = %error,
+                "failed to persist remote Agent task cancellation after run cleanup"
+            );
         }
     }
     remote_sidecar_finish_active_run(&stream_state, &run_id);
@@ -19619,6 +19746,7 @@ fn remote_sidecar_cancel_plan_task(
     state: &RemoteSidecarState,
     task_id: &AgentTaskId,
     message: &str,
+    interruption_reason: Option<&str>,
 ) -> Result<(), ApiError> {
     let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
         .map_err(ApiError::from_workspace_error)?;
@@ -19646,7 +19774,7 @@ fn remote_sidecar_cancel_plan_task(
                 transition: AgentTaskTransition::Cancel,
                 result_json: None,
                 error_json: Some(&json!({ "message": message }).to_string()),
-                interruption_reason: None,
+                interruption_reason,
             })
             .map_err(ApiError::from_workspace_error)?;
     }
@@ -19764,6 +19892,7 @@ fn remote_sidecar_sync_plan_task_after_chat(
     task_id: &AgentTaskId,
     assistant_message_id: &str,
     cancelled: bool,
+    cancellation_reason: Option<&str>,
 ) -> Result<Option<foco_store::workspace::PlanRecord>, ApiError> {
     let (task, task_kind, assistant_terminal_state, phase, worktree) = {
         let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
@@ -19868,6 +19997,7 @@ fn remote_sidecar_sync_plan_task_after_chat(
             state,
             task_id,
             "remote Plan Coordinator chat was cancelled",
+            cancellation_reason,
         )?;
         return Ok(None);
     }
@@ -19925,6 +20055,7 @@ async fn remote_sidecar_sync_plan_task_after_chat_with_retry(
     task_id: &AgentTaskId,
     assistant_message_id: &str,
     cancelled: bool,
+    cancellation_reason: Option<&str>,
 ) -> Result<Option<foco_store::workspace::PlanRecord>, ApiError> {
     let mut last_error = None;
     for delay in [
@@ -19940,6 +20071,7 @@ async fn remote_sidecar_sync_plan_task_after_chat_with_retry(
             task_id,
             assistant_message_id,
             cancelled,
+            cancellation_reason,
         ) {
             Ok(plan) => return Ok(plan),
             Err(error) => last_error = Some(error),
@@ -20718,6 +20850,7 @@ async fn remote_sidecar_start_chat_run(
         assistant_sequence,
         session_mode,
         plan_task,
+        agent_task_id,
         wait_resume,
     ) = {
         let (_startup_cancel_tx, startup_cancel_rx) = watch::channel(false);
@@ -20771,6 +20904,25 @@ async fn remote_sidecar_start_chat_run(
             &tool_workspace_path,
             &shared_workspace_path,
         )?;
+        // Plan runs carry an explicit binding. Other Agent runs carry their
+        // durable task identity in queuedRun metadata, which is the same
+        // server-written identity used to recover an Agent run after a
+        // reconnect. Register both forms so a root cancellation can locate
+        // active remote worker runs without reaching across the SSH boundary.
+        let agent_task_id = plan_task
+            .as_ref()
+            .map(|binding| binding.task_id.clone())
+            .or_else(|| {
+                let metadata = serde_json::from_str::<Value>(&user_message.metadata_json).ok()?;
+                let raw_task_id = metadata.get("queuedRun")?.get("agentTaskId")?.as_str()?;
+                let task_id = AgentTaskId::new(raw_task_id).ok()?;
+                database
+                    .agent_task(&task_id)
+                    .ok()
+                    .flatten()
+                    .filter(|task| task.status == AgentTaskStatus::Running)
+                    .map(|_| task_id)
+            });
         let wait_resume = match plan_task.as_ref() {
             Some(binding) => remote_sidecar_plan_wait_resume(&database, &binding.task_id)?,
             None => None,
@@ -20781,6 +20933,7 @@ async fn remote_sidecar_start_chat_run(
             assistant_sequence,
             session_mode,
             plan_task,
+            agent_task_id,
             wait_resume,
         )
     };
@@ -20808,7 +20961,7 @@ async fn remote_sidecar_start_chat_run(
         chat_id.clone(),
         queued_user_message_id.clone(),
         assistant_message_id.clone(),
-        plan_task.as_ref().map(|binding| binding.task_id.clone()),
+        agent_task_id.clone(),
     )? {
         RemoteRunReservation::Existing { run_id, run_stream } => {
             tracing::debug!(
@@ -20975,6 +21128,7 @@ async fn remote_sidecar_start_chat_run(
             workspace_state: state.clone(),
             tool_workspace_path,
             plan_task,
+            agent_task_id,
             run_id,
             chat_id,
             chat_title,
@@ -21052,7 +21206,85 @@ async fn remote_sidecar_chat_run_cancel(
     State(state): State<RemoteSidecarState>,
     AxumPath(run_id): AxumPath<String>,
 ) -> Result<Json<Value>, axum::response::Response> {
-    remote_sidecar_cancel_active_run(&state, &run_id, true, false);
+    let Some(root_task_id) = remote_sidecar_agent_task_id_for_active_run(&state, &run_id) else {
+        remote_sidecar_cancel_active_run(&state, &run_id, true, false);
+        return Ok(Json(json!({ "ok": true, "runId": run_id })));
+    };
+    let mut database = WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(&state))
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    let root_task = database
+        .agent_task(&root_task_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("active Agent task was not found: {root_task_id}"))
+                .into_response()
+        })?;
+    let is_coordinator_primary_output = database
+        .agent_team(&root_task.team_id)
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+        .is_some_and(|team| team.coordinator_instance_id == root_task.owner_instance_id)
+        && database
+            .agent_instance(&root_task.owner_instance_id)
+            .map_err(|error| ApiError::from_workspace_error(error).into_response())?
+            .is_some_and(|instance| instance.role == AgentRole::Coordinator);
+    if !is_coordinator_primary_output {
+        drop(database);
+        remote_sidecar_cancel_active_run(&state, &run_id, true, false);
+        return Ok(Json(json!({ "ok": true, "runId": run_id })));
+    }
+
+    let cancellation = database
+        .cancel_agent_task_subtree(
+            &root_task.team_id,
+            &root_task_id,
+            r#"{"message":"cancelled by user while cancelling the Coordinator chat run"}"#,
+            Some("user_root_cancel"),
+        )
+        .map_err(|error| ApiError::from_workspace_error(error).into_response())?;
+    drop(database);
+
+    let mut active_run_ids =
+        remote_sidecar_active_run_ids_for_agent_tasks(&state, &cancellation.running_task_ids);
+    if !active_run_ids
+        .iter()
+        .any(|active_run_id| active_run_id == &run_id)
+    {
+        active_run_ids.push(run_id.clone());
+    }
+    let running_descendant_count = cancellation
+        .running_task_ids
+        .iter()
+        .filter(|task_id| *task_id != &root_task_id)
+        .count();
+    tracing::info!(
+        workspace_id = %state.workspace_id,
+        root_task_id = %root_task_id,
+        running_descendant_count,
+        cancelled_descendant_count = cancellation.cancelled_tasks.len(),
+        signalled_run_count = active_run_ids.len(),
+        transition = "user_root_cancel",
+        "remote Coordinator cancellation propagated to Agent task subtree"
+    );
+    for active_run_id in active_run_ids {
+        // Each call removes its registry entry first. Repeated HTTP cancellation
+        // or a runner racing its own completion therefore cannot duplicate its
+        // broker cancel or terminal SSE events.
+        let cancellation_reason =
+            if remote_sidecar_agent_task_id_for_active_run(&state, &active_run_id).as_ref()
+                == Some(&root_task_id)
+            {
+                "user_root_cancel"
+            } else {
+                "parent_cascade"
+            };
+        remote_sidecar_cancel_active_run_with_reason(
+            &state,
+            &active_run_id,
+            true,
+            false,
+            cancellation_reason,
+        );
+    }
     Ok(Json(json!({ "ok": true, "runId": run_id })))
 }
 
@@ -26444,7 +26676,7 @@ mod tests {
         assert!(error.message.contains("is not bound to chat"));
         drop(database);
 
-        remote_sidecar_cancel_plan_task(&state, &task_id, "remote run was cancelled")
+        remote_sidecar_cancel_plan_task(&state, &task_id, "remote run was cancelled", None)
             .expect("cancel remote Plan task");
 
         let database =
@@ -34019,7 +34251,7 @@ mod tests {
             "a retryable provider failure must not immediately start the next broker request"
         );
 
-        run_stream.request_cancel();
+        run_stream.request_cancel_with_reason(None);
         let interrupted = timeout(Duration::from_secs(1), wait)
             .await
             .expect("cancel should interrupt a pending provider retry backoff")
@@ -35389,6 +35621,230 @@ mod tests {
         assert!(
             metadata.get("queuedRun").is_none(),
             "cleanup guard should clear queuedRun after cancel stops the runner"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_sidecar_coordinator_cancel_cascades_to_active_descendant_runs() {
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let (state, _) = test_sidecar_state(workspace.path().to_string_lossy().to_string(), 0);
+        let mut database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+        database
+            .insert_chat("chat-remote-cascade", "Remote cascade")
+            .expect("insert chat");
+        let team_id = AgentTeamId::new("agent-team-remote-cascade").expect("team id");
+        let coordinator_id =
+            AgentInstanceId::new("agent-instance-remote-cascade-coordinator").expect("coordinator");
+        let worker_id =
+            AgentInstanceId::new("agent-instance-remote-cascade-worker").expect("worker");
+        let waiting_worker_id =
+            AgentInstanceId::new("agent-instance-remote-cascade-waiting-worker")
+                .expect("waiting worker");
+        let definition = AgentDefinitionSettings {
+            id: AgentDefinitionId::new("agent-definition-remote-cascade").expect("definition"),
+            revision: 1,
+            name: "Remote cascade".to_string(),
+            description: String::new(),
+            provider_id: "provider-test".to_string(),
+            model_id: "model-test".to_string(),
+            model_options: foco_store::config::AgentModelOptions::default(),
+            system_prompt: "test".to_string(),
+            allowed_tools: Vec::new(),
+            max_instances: 3,
+            allowed_execution_workspace_modes: AgentExecutionWorkspaceMode::all(),
+            permissions: foco_agent::AgentPermissions::default(),
+        };
+        database
+            .create_agent_team(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-remote-cascade",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 3,
+            })
+            .expect("create team");
+        database
+            .create_agent_instances_with_limits(
+                &[
+                    NewAgentInstance {
+                        id: &worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: AgentRole::Worker,
+                        execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                    NewAgentInstance {
+                        id: &waiting_worker_id,
+                        team_id: &team_id,
+                        definition: &definition,
+                        role: AgentRole::Worker,
+                        execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                        execution_root_path: None,
+                        worktree_base_revision: None,
+                        worktree_branch: None,
+                        worktree_status: None,
+                    },
+                ],
+                3,
+                3,
+            )
+            .expect("create worker");
+        let root_task_id = AgentTaskId::new("agent-task-remote-cascade-root").expect("root task");
+        let child_task_id =
+            AgentTaskId::new("agent-task-remote-cascade-child").expect("child task");
+        let queued_task_id =
+            AgentTaskId::new("agent-task-remote-cascade-queued").expect("queued task");
+        let waiting_task_id =
+            AgentTaskId::new("agent-task-remote-cascade-waiting").expect("waiting task");
+        for (task_id, owner_instance_id, parent_task_id) in [
+            (&root_task_id, &coordinator_id, None),
+            (&child_task_id, &worker_id, Some(&root_task_id)),
+            (&queued_task_id, &worker_id, Some(&child_task_id)),
+            (&waiting_task_id, &waiting_worker_id, Some(&root_task_id)),
+        ] {
+            database
+                .enqueue_agent_task(NewAgentTask {
+                    id: task_id,
+                    team_id: &team_id,
+                    owner_instance_id,
+                    origin_instance_id: None,
+                    parent_task_id,
+                    input_json: "{}",
+                })
+                .expect("enqueue task");
+        }
+        for (task_id, attempt_id) in [
+            (
+                &root_task_id,
+                AgentAttemptId::new("agent-attempt-remote-cascade-root").expect("root attempt"),
+            ),
+            (
+                &child_task_id,
+                AgentAttemptId::new("agent-attempt-remote-cascade-child").expect("child attempt"),
+            ),
+        ] {
+            database
+                .claim_runnable_agent_task_with_owner(
+                    &team_id,
+                    task_id,
+                    &attempt_id,
+                    Some(state.agent_owner_incarnation()),
+                )
+                .expect("claim task")
+                .expect("task claimed");
+        }
+        database
+            .claim_runnable_agent_task_with_owner(
+                &team_id,
+                &waiting_task_id,
+                &AgentAttemptId::new("agent-attempt-remote-cascade-waiting")
+                    .expect("waiting attempt"),
+                Some(state.agent_owner_incarnation()),
+            )
+            .expect("claim waiting task")
+            .expect("waiting task claimed");
+        assert!(
+            database
+                .update_agent_task_state(AgentTaskStateUpdate {
+                    team_id: &team_id,
+                    task_id: &waiting_task_id,
+                    expected_status: AgentTaskStatus::Running,
+                    transition: AgentTaskTransition::Wait,
+                    result_json: None,
+                    error_json: None,
+                    interruption_reason: None,
+                })
+                .expect("suspend waiting task")
+        );
+        drop(database);
+
+        let (root_run_id, root_stream) = remote_sidecar_reserve_active_run_for_agent_task(
+            &state,
+            "chat-remote-cascade-root".to_string(),
+            root_task_id.clone(),
+        );
+        root_stream.set_broker_request_id("broker-cascade-root".to_string());
+        let (_, child_stream) = remote_sidecar_reserve_active_run_for_agent_task(
+            &state,
+            "chat-remote-cascade-child".to_string(),
+            child_task_id.clone(),
+        );
+        child_stream.set_broker_request_id("broker-cascade-child".to_string());
+        let mut broker_rx = state.broker_tx.subscribe();
+
+        let _ = remote_sidecar_chat_run_cancel(State(state.clone()), AxumPath(root_run_id.clone()))
+            .await
+            .expect("cascade cancel");
+
+        assert!(root_stream.is_cancel_requested());
+        assert!(child_stream.is_cancel_requested());
+        assert_eq!(
+            root_stream.cancel_reason().as_deref(),
+            Some("user_root_cancel")
+        );
+        assert_eq!(
+            child_stream.cancel_reason().as_deref(),
+            Some("parent_cascade")
+        );
+        assert!(root_stream.tool_token.is_cancelled());
+        assert!(child_stream.tool_token.is_cancelled());
+        let mut cancelled_broker_ids = HashSet::new();
+        while cancelled_broker_ids.len() < 2 {
+            let envelope = broker_rx.recv().await.expect("broker envelope");
+            if envelope.message_type == "cancel" {
+                cancelled_broker_ids.insert(envelope.id.expect("broker request id"));
+            }
+        }
+        assert_eq!(
+            cancelled_broker_ids,
+            HashSet::from([
+                "broker-cascade-root".to_string(),
+                "broker-cascade-child".to_string(),
+            ])
+        );
+
+        let _ = remote_sidecar_chat_run_cancel(State(state.clone()), AxumPath(root_run_id.clone()))
+            .await
+            .expect("repeat cancel");
+        assert_eq!(root_stream.snapshot_after(-1).len(), 2);
+        assert_eq!(child_stream.snapshot_after(-1).len(), 2);
+
+        let database =
+            WorkspaceDatabase::open_or_create(workspace.path()).expect("reload database");
+        assert_eq!(
+            database
+                .agent_task(&queued_task_id)
+                .expect("queued task lookup")
+                .expect("queued task")
+                .status,
+            AgentTaskStatus::Cancelled
+        );
+        assert_eq!(
+            database
+                .agent_task(&waiting_task_id)
+                .expect("waiting task lookup")
+                .expect("waiting task")
+                .status,
+            AgentTaskStatus::Cancelled
+        );
+        assert_eq!(
+            database
+                .agent_task(&child_task_id)
+                .expect("child task lookup")
+                .expect("child task")
+                .status,
+            AgentTaskStatus::Running,
+            "running tasks remain owned by their active run cleanup"
         );
     }
 
