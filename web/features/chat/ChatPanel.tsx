@@ -1,8 +1,10 @@
 import {
   ArrowUp,
+  Ban,
   Bot,
   Brain,
   CheckCircle2,
+  CircleAlert,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -50,6 +52,7 @@ import {
 } from "../../api/types";
 import type {
   ChatAttachmentPartSummary,
+  ChatAgentTaskLifecycle,
   ChatExtractedMemorySummary,
   ChatMemoryUsedSummary,
   ChatMessagePart,
@@ -224,6 +227,8 @@ function ChatPanelComponent({
   isSelectingAttachments,
   isPlanModeEnabled,
   messages,
+  agentNameForInstance,
+  canOpenAgentTranscript,
   onAddPastedImageAttachments,
   overviewRenderer,
   onCancelRun,
@@ -235,6 +240,7 @@ function ChatPanelComponent({
   onLoadMoreMessages,
   onModelChange,
   onOpenMessageApiRequests,
+  onOpenAgentTranscript,
   onQueueActiveRun,
   onRemoveAttachment,
   onRemoveSkill,
@@ -279,6 +285,8 @@ function ChatPanelComponent({
   isSelectingAttachments: boolean;
   isPlanModeEnabled: boolean;
   messages: ShellMessage[];
+  agentNameForInstance: (instanceId: string) => string | null;
+  canOpenAgentTranscript: (instanceId: string) => boolean;
   onAddPastedImageAttachments: (files: File[]) => void;
   overviewRenderer: () => ReactNode;
   onCancelRun: () => void;
@@ -298,6 +306,7 @@ function ChatPanelComponent({
   onLoadMoreMessages: () => Promise<void>;
   onModelChange: (value: string) => void;
   onOpenMessageApiRequests: (message: ShellMessage) => void;
+  onOpenAgentTranscript: (instanceId: string) => void;
   onQueueActiveRun: () => void;
   onRemoveAttachment: (attachmentId: string) => void;
   onRemoveSkill: (skillId: string) => void;
@@ -1041,6 +1050,8 @@ function ChatPanelComponent({
               ) : null}
               {messages.map((message) => (
                 <MessageRow
+                  agentNameForInstance={agentNameForInstance}
+                  canOpenAgentTranscript={canOpenAgentTranscript}
                   canEdit={
                     !readOnly &&
                     !isSendingMessage &&
@@ -1066,6 +1077,7 @@ function ChatPanelComponent({
                   onEditingSkillIdsChange={setEditingSkillIds}
                   onEditingTextChange={setEditingMessageText}
                   onGuideQueuedMessage={onGuideQueuedMessage}
+                  onOpenAgentTranscript={onOpenAgentTranscript}
                   onOpenMessageApiRequests={onOpenMessageApiRequests}
                   onSaveEdit={saveEditedMessage}
                   onSelectEditAttachments={onSelectEditAttachments}
@@ -1456,6 +1468,8 @@ const MessageRow = memo(function MessageRow({
   editingSkillIds,
   editingText,
   helpers,
+  agentNameForInstance,
+  canOpenAgentTranscript,
   isCopied,
   isEditing,
   isSavingEdit,
@@ -1467,6 +1481,7 @@ const MessageRow = memo(function MessageRow({
   onEditingSkillIdsChange,
   onEditingTextChange,
   onGuideQueuedMessage,
+  onOpenAgentTranscript,
   onOpenMessageApiRequests,
   onSaveEdit,
   onSelectEditAttachments,
@@ -1480,6 +1495,8 @@ const MessageRow = memo(function MessageRow({
   editingSkillIds: string[];
   editingText: string;
   helpers: ChatPanelHelpers;
+  agentNameForInstance: (instanceId: string) => string | null;
+  canOpenAgentTranscript: (instanceId: string) => boolean;
   isCopied: boolean;
   isEditing: boolean;
   isSavingEdit: boolean;
@@ -1491,6 +1508,7 @@ const MessageRow = memo(function MessageRow({
   onEditingSkillIdsChange: (skillIds: string[]) => void;
   onEditingTextChange: (value: string) => void;
   onGuideQueuedMessage: (messageId: string) => void;
+  onOpenAgentTranscript: (instanceId: string) => void;
   onOpenMessageApiRequests: (message: ShellMessage) => void;
   onSaveEdit: (message: ShellMessage) => void;
   onSelectEditAttachments: (
@@ -1848,6 +1866,17 @@ const MessageRow = memo(function MessageRow({
             {!isEditing && parts.length ? (
               parts.map((part, partIndex) => (
                 <MessagePartBlock
+                  onOpenAgentTranscript={onOpenAgentTranscript}
+                  agentName={agentNameForInstance(
+                    part.type === "agentTaskLifecycle"
+                      ? part.lifecycle.instanceId
+                      : "",
+                  )}
+                  canOpenAgentTranscript={
+                    part.type === "agentTaskLifecycle"
+                      ? canOpenAgentTranscript(part.lifecycle.instanceId)
+                      : false
+                  }
                   helpers={helpers}
                   isError={message.status === "error"}
                   isStreaming={message.status === "streaming"}
@@ -2103,13 +2132,153 @@ function ReasoningBlock({
   );
 }
 
+function AgentTaskLifecycleBlock({
+  agentName,
+  canOpenTranscript,
+  lifecycle,
+  onOpenTranscript,
+}: {
+  agentName: string | null;
+  canOpenTranscript: boolean;
+  lifecycle: ChatAgentTaskLifecycle;
+  onOpenTranscript?: (instanceId: string) => void;
+}) {
+  const { language, t } = useI18n();
+  const [isExpanded, setIsExpanded] = useState(false);
+  const status = lifecycle.status;
+  const statusLabel =
+    status === "completed"
+      ? t("Completed")
+      : status === "failed"
+        ? t("Failed")
+        : status === "cancelled"
+          ? t("Cancelled")
+          : t("Finished");
+  const statusIcon =
+    status === "completed" ? (
+      <CheckCircle2 aria-hidden="true" className="size-4" />
+    ) : status === "failed" ? (
+      <CircleAlert aria-hidden="true" className="size-4" />
+    ) : (
+      <Ban aria-hidden="true" className="size-4" />
+    );
+  const statusTone =
+    status === "completed"
+      ? "text-[var(--success)]"
+      : status === "failed"
+        ? "text-[var(--danger)]"
+        : "text-[var(--muted)]";
+  const displayName = agentName?.trim() || t("Unknown agent");
+  const completedAt = formatLifecycleDateTime(lifecycle.completedAt, language);
+  const duration = formatLifecycleDuration(lifecycle.durationMs, language, t);
+  const detail = lifecycle.errorPreview ?? lifecycle.resultPreview ?? null;
+  const hasTranscript = Boolean(
+    lifecycle.instanceId && onOpenTranscript && canOpenTranscript,
+  );
+  const toggleLabel = isExpanded ? t("Collapse task details") : t("Expand task details");
+
+  return (
+    <section
+      aria-live="polite"
+      className="my-2 grid min-w-0 grid-cols-[1.25rem_minmax(0,1fr)] gap-x-2.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2.5 text-sm"
+    >
+      <div className="flex min-h-10 flex-col items-center" aria-hidden="true">
+        <span className={`mt-0.5 ${statusTone}`}>{statusIcon}</span>
+        <span className="mt-1 w-px flex-1 bg-[var(--border)]" />
+      </div>
+      <div className="min-w-0">
+        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
+          <span className="truncate font-medium text-[var(--foreground)]">
+            {t("{agent} subagent {status}", {
+              agent: displayName,
+              status: statusLabel,
+            })}
+          </span>
+          <span className={`shrink-0 text-xs font-medium ${statusTone}`}>
+            {statusLabel}
+          </span>
+          <time
+            className="ml-auto shrink-0 text-xs tabular-nums text-[var(--muted)]"
+            dateTime={lifecycle.completedAt}
+            title={lifecycle.completedAt}
+          >
+            {completedAt}
+          </time>
+        </div>
+        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--muted)]">
+          <span>{duration}</span>
+          {detail ? (
+            <Button
+              aria-expanded={isExpanded}
+              aria-label={toggleLabel}
+              className="h-auto min-h-0 p-0 text-xs font-medium text-[var(--muted)] underline-offset-2 hover:underline"
+              onPress={() => setIsExpanded((current) => !current)}
+              type="button"
+              variant="ghost"
+            >
+              {isExpanded ? t("Hide details") : t("Show details")}
+            </Button>
+          ) : null}
+          {hasTranscript ? (
+            <Button
+              className="h-auto min-h-0 p-0 text-xs font-medium text-[var(--muted)] underline-offset-2 hover:underline"
+              onPress={() => onOpenTranscript?.(lifecycle.instanceId)}
+              type="button"
+              variant="ghost"
+            >
+              {t("View full record")}
+            </Button>
+          ) : null}
+        </div>
+        {isExpanded && detail ? (
+          <p className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs leading-5 text-[var(--muted)]">
+            {detail}
+          </p>
+        ) : null}
+      </div>
+    </section>
+  );
+}
+
+function formatLifecycleDateTime(value: string, language: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value || "—";
+  }
+  return new Intl.DateTimeFormat(language, {
+    hour: "2-digit",
+    minute: "2-digit",
+    month: "short",
+    day: "numeric",
+  }).format(date);
+}
+
+function formatLifecycleDuration(
+  durationMs: number | null,
+  language: string,
+  t: Translate,
+) {
+  if (durationMs === null || !Number.isFinite(durationMs) || durationMs < 0) {
+    return t("Duration unavailable");
+  }
+  if (durationMs < 1_000) {
+    return t("Duration {duration}", { duration: `${Math.round(durationMs)} ms` });
+  }
+  return t("Duration {duration}", {
+    duration: `${new Intl.NumberFormat(language, { maximumFractionDigits: 1 }).format(durationMs / 1_000)} s`,
+  });
+}
+
 function MessagePartBlockComponent({
   helpers,
   isError,
   isStreaming,
   isStreamingTail,
   isUser,
+  agentName,
+  canOpenAgentTranscript,
   part,
+  onOpenAgentTranscript,
   reasoningDurationFallbackMs,
   workspaceId,
 }: {
@@ -2118,7 +2287,10 @@ function MessagePartBlockComponent({
   isStreaming: boolean;
   isStreamingTail: boolean;
   isUser: boolean;
+  agentName?: string | null;
+  canOpenAgentTranscript?: boolean;
   part: ChatMessagePart;
+  onOpenAgentTranscript?: (instanceId: string) => void;
   reasoningDurationFallbackMs: number | null;
   workspaceId: string | null;
 }) {
@@ -2147,6 +2319,17 @@ function MessagePartBlockComponent({
 
   if (part.type === "contextCompression") {
     return <ContextCompressionBlock compression={part} helpers={helpers} />;
+  }
+
+  if (part.type === "agentTaskLifecycle") {
+    return (
+      <AgentTaskLifecycleBlock
+        lifecycle={part.lifecycle}
+        agentName={agentName ?? null}
+        canOpenTranscript={canOpenAgentTranscript === true}
+        onOpenTranscript={onOpenAgentTranscript}
+      />
+    );
   }
 
   if (part.type === "attachment") {

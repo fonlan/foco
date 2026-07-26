@@ -5426,6 +5426,54 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
+  it("upserts a terminal subagent timeline block without duplicating replayed events", async () => {
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "show delegated task completion",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    const lifecycle = {
+      completedAt: "2026-07-26T03:30:00Z",
+      durationMs: 1_250,
+      errorPreview: null,
+      eventId: "agent-task-lifecycle:worker-1:completed",
+      instanceId: "agent-instance-worker-1",
+      parentTaskId: "agent-task-coordinator-1",
+      resultPreview: "The review is complete.",
+      startedAt: "2026-07-26T03:29:58.750Z",
+      status: "completed" as const,
+      taskId: "agent-task-worker-1",
+      teamId: "agent-team-1",
+    };
+
+    await act(async () => {
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        lifecycle,
+        type: "agentTaskLifecycle",
+      });
+      enqueueChatStreamEvent({
+        assistantMessageId: "message-assistant-stream",
+        lifecycle,
+        type: "agentTaskLifecycle",
+      });
+    });
+
+    expect(
+      await screen.findByText("Unknown agent subagent Completed"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
+    expect(screen.getByText("Duration 1.3 s")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Expand task details" })).toBeInTheDocument();
+  });
+
   it("preserves pre-delegate history across GET active-run reattach and start", async () => {
     const assistantMessageId = "message-assistant-stream";
     const fetchMock = vi.mocked(fetch);

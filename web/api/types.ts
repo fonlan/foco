@@ -543,6 +543,30 @@ export type ChatContextCompressionPart = {
   detail: ChatContextCompressionDetail;
 };
 
+/**
+ * A terminal delegated-Agent update projected by the runtime into its
+ * coordinator's assistant turn. The full output continues to live in the
+ * Agent transcript; this is deliberately only a bounded timeline summary.
+ */
+export type ChatAgentTaskLifecycle = {
+  eventId: string;
+  teamId: string;
+  taskId: string;
+  parentTaskId: string;
+  instanceId: string;
+  status: "completed" | "failed" | "cancelled" | string;
+  startedAt: string | null;
+  completedAt: string;
+  durationMs: number | null;
+  resultPreview?: string | null;
+  errorPreview?: string | null;
+};
+
+export type ChatAgentTaskLifecyclePart = {
+  type: "agentTaskLifecycle";
+  lifecycle: ChatAgentTaskLifecycle;
+};
+
 export type ChatMessagePart =
   | { type: "text"; text: string }
   | { type: "error"; text: string }
@@ -556,6 +580,7 @@ export type ChatMessagePart =
   | { type: "attachment"; attachment: ChatAttachmentPartSummary }
   | { type: "toolCall"; toolCall: ChatToolCallSummary }
   | ChatContextCompressionPart
+  | ChatAgentTaskLifecyclePart
   | {
       type: "userInterruption";
       id: string;
@@ -780,6 +805,11 @@ export type ChatStreamEvent =
       kind: ChatContextCompressionKind;
       status: string;
       detail?: ChatContextCompressionDetail | null;
+    }
+  | {
+      type: "agentTaskLifecycle";
+      assistantMessageId: string;
+      lifecycle: ChatAgentTaskLifecycle;
     }
   | { type: "usage"; usage?: ChatUsage }
   | {

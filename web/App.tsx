@@ -72,6 +72,7 @@ import type {
   BrowserRouteHtmlPreviewTab,
   ChatAttachmentPartSummary,
   ChatAttachmentPayload,
+  ChatAgentTaskLifecycle,
   ChatCompressionStatistics,
   ChatContextCompressionDetail,
   ChatContextCompressionKind,
@@ -482,6 +483,12 @@ export type MergeLoadedMessagesOptions = {
    * know about; this is deliberately narrower than general message merging.
    */
   preserveLiveContextCompressionParts?: boolean;
+  /**
+   * The messages request began before this chat received a runtime-projected
+   * delegated-Agent terminal event. Keep those idempotent timeline parts from
+   * the live cache so an older server snapshot cannot erase them.
+   */
+  preserveLiveAgentTaskLifecycleParts?: boolean;
 };
 
 export type ContinuousActiveRunMatchInput = {
@@ -542,6 +549,7 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
     preserveStreamingPlaceholders = false,
     preserveDisjointActiveRunCache = false,
     preserveLiveContextCompressionParts = false,
+    preserveLiveAgentTaskLifecycleParts = false,
   } =
     typeof options === "boolean"
       ? {
@@ -593,6 +601,13 @@ export function mergeLoadedMessagesWithStreamingPlaceholders(
 
   if (preserveLiveContextCompressionParts) {
     nextMessages = overlayStaleLoadedContextCompressionParts(
+      nextMessages,
+      cachedMessages,
+    );
+  }
+
+  if (preserveLiveAgentTaskLifecycleParts) {
+    nextMessages = overlayStaleLoadedAgentTaskLifecycleParts(
       nextMessages,
       cachedMessages,
     );
@@ -708,6 +723,64 @@ export function overlayStaleLoadedContextCompressionParts(
       }
     }
 
+    return changed ? { ...loadedMessage, parts } : loadedMessage;
+  });
+}
+
+/**
+ * Preserve runtime-projected subagent terminal events from an older messages
+ * response. Unlike a streaming placeholder, a lifecycle part belongs to an
+ * existing assistant message and is keyed by its stable event id.
+ */
+export function overlayStaleLoadedAgentTaskLifecycleParts(
+  loadedMessages: ShellMessage[],
+  cachedMessages: ShellMessage[],
+): ShellMessage[] {
+  const cachedAssistantsById = new Map(
+    cachedMessages
+      .filter((message) => message.role === "assistant")
+      .map((message) => [message.id, message]),
+  );
+
+  return loadedMessages.map((loadedMessage) => {
+    if (loadedMessage.role !== "assistant") {
+      return loadedMessage;
+    }
+    const cachedMessage = cachedAssistantsById.get(loadedMessage.id);
+    if (!cachedMessage) {
+      return loadedMessage;
+    }
+
+    const liveParts = cachedMessage.parts
+      .map((part, index) => ({ index, part }))
+      .filter(
+        (entry): entry is {
+          index: number;
+          part: Extract<ChatMessagePart, { type: "agentTaskLifecycle" }>;
+        } => entry.part.type === "agentTaskLifecycle",
+      );
+    if (!liveParts.length) {
+      return loadedMessage;
+    }
+
+    let parts = [...loadedMessage.parts];
+    let changed = false;
+    for (const { index, part } of liveParts) {
+      if (
+        parts.some(
+          (candidate) =>
+            candidate.type === "agentTaskLifecycle" &&
+            candidate.lifecycle.eventId === part.lifecycle.eventId,
+        )
+      ) {
+        continue;
+      }
+      // The cached part order is the event order. Its index preserves the
+      // position before later tool output or the recovered assistant summary
+      // when a stale history response did not yet include this terminal event.
+      parts.splice(Math.min(index, parts.length), 0, part);
+      changed = true;
+    }
     return changed ? { ...loadedMessage, parts } : loadedMessage;
   });
 }
@@ -7295,6 +7368,8 @@ export function App() {
           // but only while the active run proves this is still the same thread.
           preserveLiveContextCompressionParts:
             staleAfterLiveMessageRevision && sameContinuousLocalRun,
+          preserveLiveAgentTaskLifecycleParts:
+            staleAfterLiveMessageRevision && sameContinuousLocalRun,
           preserveStreamingPlaceholders,
         },
       );
@@ -11310,6 +11385,25 @@ export function App() {
             return;
           }
 
+          if (streamEvent.type === "agentTaskLifecycle") {
+            advanceLiveMessageRevision(chatKey);
+            setMessagesForChatKey(chatKey, (current) =>
+              current.map((message) =>
+                message.role === "assistant" &&
+                message.id === streamEvent.assistantMessageId
+                  ? {
+                      ...message,
+                      parts: upsertAgentTaskLifecyclePart(
+                        message.parts,
+                        streamEvent.lifecycle,
+                      ),
+                    }
+                  : message,
+              ),
+            );
+            return;
+          }
+
           if (streamEvent.type === "usage") {
             latestResponseUsage =
               streamEvent.usage &&
@@ -12664,6 +12758,28 @@ export function App() {
           if (streamEvent.status === "completed") {
             refreshRunContextUsage();
           }
+          return;
+        }
+
+        if (streamEvent.type === "agentTaskLifecycle") {
+          ensureStreamingAssistantMessage(
+            resolvedAssistantMessageId(streamEvent.assistantMessageId),
+          );
+          advanceLiveMessageRevision(runMessagesKey);
+          setMessagesForChatKey(runMessagesKey, (current) =>
+            current.map((message) =>
+              message.role === "assistant" &&
+              message.id === streamEvent.assistantMessageId
+                ? {
+                    ...message,
+                    parts: upsertAgentTaskLifecyclePart(
+                      message.parts,
+                      streamEvent.lifecycle,
+                    ),
+                  }
+                : message,
+            ),
+          );
           return;
         }
 
@@ -14758,6 +14874,30 @@ export function App() {
                 activeMainTab.type !== "htmlPreview" ? (
                 <ChatPanel
                   activeWorkspaceName={activeWorkspace?.name ?? null}
+                  canOpenAgentTranscript={(instanceId) => {
+                    const snapshot =
+                      agentTeamSnapshot?.team.chatId === activeChatId
+                        ? agentTeamSnapshot
+                        : activeChatKey
+                          ? (agentTeamSnapshotCacheRef.current.get(activeChatKey) ?? null)
+                          : null;
+                    return snapshot?.instances.some(
+                      (candidate) => candidate.id === instanceId,
+                    ) ?? false;
+                  }}
+                  agentNameForInstance={(instanceId) => {
+                    const snapshot =
+                      agentTeamSnapshot?.team.chatId === activeChatId
+                        ? agentTeamSnapshot
+                        : activeChatKey
+                          ? (agentTeamSnapshotCacheRef.current.get(activeChatKey) ?? null)
+                          : null;
+                    return (
+                      snapshot?.instances.find(
+                        (candidate) => candidate.id === instanceId,
+                      )?.definitionSnapshot.name ?? null
+                    );
+                  }}
                   helpers={chatPanelHelpers}
                   availableModels={availableModels}
                   chatScrollKey={`${activeWorkspaceId}:${activeChatId ?? ""}`}
@@ -14813,6 +14953,20 @@ export function App() {
                   onQueueActiveRun={handleQueueActiveRunForChatPanel}
                   onModelChange={handleModelChangeForChatPanel}
                   onOpenMessageApiRequests={handleOpenMessageApiRequests}
+                  onOpenAgentTranscript={(instanceId) => {
+                    const snapshot =
+                      agentTeamSnapshot?.team.chatId === activeChatId
+                        ? agentTeamSnapshot
+                        : activeChatKey
+                          ? (agentTeamSnapshotCacheRef.current.get(activeChatKey) ?? null)
+                          : null;
+                    const instance = snapshot?.instances.find(
+                      (candidate) => candidate.id === instanceId,
+                    );
+                    if (instance) {
+                      openAgentInstanceTab(instance);
+                    }
+                  }}
                   onRemoveAttachment={handleRemoveAttachmentForChatPanel}
                   onRemoveSkill={handleRemoveSkillForChatPanel}
                   onRetryRun={handleRetryRunForChatPanel}
@@ -17423,6 +17577,68 @@ function upsertToolCallPart(
   );
 }
 
+function upsertAgentTaskLifecyclePart(
+  parts: ChatMessagePart[],
+  lifecycle: ChatAgentTaskLifecycle,
+): ChatMessagePart[] {
+  const existingIndex = parts.findIndex(
+    (part) =>
+      part.type === "agentTaskLifecycle" &&
+      part.lifecycle.eventId === lifecycle.eventId,
+  );
+  const nextPart: ChatMessagePart = { type: "agentTaskLifecycle", lifecycle };
+
+  if (existingIndex === -1) {
+    return [...parts, nextPart];
+  }
+
+  return parts.map((part, index) => (index === existingIndex ? nextPart : part));
+}
+
+function parseChatAgentTaskLifecycle(
+  value: unknown,
+): ChatAgentTaskLifecycle | null {
+  if (!isObjectRecord(value)) {
+    return null;
+  }
+  const eventId = stringField(value, "eventId", "event_id");
+  const teamId = stringField(value, "teamId", "team_id");
+  const taskId = stringField(value, "taskId", "task_id");
+  const parentTaskId = stringField(value, "parentTaskId", "parent_task_id");
+  const instanceId = stringField(value, "instanceId", "instance_id");
+  const status = stringField(value, "status");
+  const completedAt = stringField(value, "completedAt", "completed_at");
+  const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
+  const durationMs = fieldValue(value, "durationMs", "duration_ms");
+  const resultPreview = optionalNullableStringField(
+    value,
+    "resultPreview",
+    "result_preview",
+  );
+  const errorPreview = optionalNullableStringField(
+    value,
+    "errorPreview",
+    "error_preview",
+  );
+  if (
+    !eventId || !teamId || !taskId || !parentTaskId || !instanceId || !status ||
+    !completedAt || startedAt === false || resultPreview === false ||
+    errorPreview === false ||
+    (durationMs !== undefined &&
+      durationMs !== null &&
+      typeof durationMs !== "number")
+  ) {
+    return null;
+  }
+  return {
+    eventId, teamId, taskId, parentTaskId, instanceId, status, completedAt,
+    startedAt: startedAt ?? null,
+    durationMs: typeof durationMs === "number" ? durationMs : null,
+    resultPreview: resultPreview ?? null,
+    errorPreview: errorPreview ?? null,
+  };
+}
+
 function applyToolResultToParts(
   parts: ChatMessagePart[],
   toolCallId: string,
@@ -17531,6 +17747,9 @@ function messageCopyText(
       }
       if (part.type === "contextCompression") {
         return `context compression ${part.kind} ${part.status}`.trim();
+      }
+      if (part.type === "agentTaskLifecycle") {
+        return `agent task ${part.lifecycle.status}`.trim();
       }
       if (part.type === "toolCall") {
         return `${part.toolCall.name} ${part.toolCall.status}`.trim();
@@ -18808,6 +19027,23 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       detail: detail ?? null,
     };
   }
+
+  if (
+    value.type === "agentTaskLifecycle" ||
+    value.type === "agent_task_lifecycle"
+  ) {
+    const assistantMessageId = stringField(
+      value,
+      "assistantMessageId",
+      "assistant_message_id",
+    );
+    const lifecycle = parseChatAgentTaskLifecycle(fieldValue(value, "lifecycle"));
+    if (!assistantMessageId || !lifecycle) {
+      return null;
+    }
+    return { type: "agentTaskLifecycle", assistantMessageId, lifecycle };
+  }
+
   if (value.type === "toolOutputDelta" || value.type === "tool_output_delta") {
     const assistantMessageId = stringField(
       value,
@@ -20066,6 +20302,14 @@ function normalizeChatMessagePart(part: unknown): ChatMessagePart | null {
       kind,
       detail: normalizedDetail,
     };
+  }
+
+  if (
+    part.type === "agentTaskLifecycle" ||
+    part.type === "agent_task_lifecycle"
+  ) {
+    const lifecycle = parseChatAgentTaskLifecycle(fieldValue(part, "lifecycle"));
+    return lifecycle ? { type: "agentTaskLifecycle", lifecycle } : null;
   }
 
   if (part.type === "userInterruption" || part.type === "user_interruption") {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, composerContextUsageRefreshAction, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, composerContextUsageRefreshAction, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedAgentTaskLifecycleParts, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
 import type { ActiveRunInfo, ChatMessageSummary, ContextUsageResponse, ShellMessage } from "./api/types";
 import { translate } from "./shared/i18n";
 
@@ -685,6 +685,51 @@ describe("mergeLoadedMessagesWithStreamingPlaceholders", () => {
       expect(result[0]?.parts).toHaveLength(2);
     },
   );
+
+  it("keeps a live subagent terminal event in its event position", () => {
+    const serverAssistant = {
+      ...message("assistant-lifecycle"),
+      parts: [
+        { text: "Delegated review.", type: "text" as const },
+        { text: "The coordinator summary.", type: "text" as const },
+      ],
+    };
+    const lifecyclePart = {
+      lifecycle: {
+        completedAt: "2026-07-26T03:30:00Z",
+        durationMs: 1_250,
+        errorPreview: null,
+        eventId: "agent-task-lifecycle:worker-1:completed",
+        instanceId: "agent-instance-worker-1",
+        parentTaskId: "agent-task-coordinator-1",
+        resultPreview: "Review completed.",
+        startedAt: "2026-07-26T03:29:58.750Z",
+        status: "completed",
+        taskId: "agent-task-worker-1",
+        teamId: "agent-team-1",
+      },
+      type: "agentTaskLifecycle" as const,
+    };
+    const cachedAssistant = {
+      ...serverAssistant,
+      parts: [
+        serverAssistant.parts[0]!,
+        lifecyclePart,
+        serverAssistant.parts[1]!,
+      ],
+    };
+
+    const result = overlayStaleLoadedAgentTaskLifecycleParts(
+      [serverAssistant],
+      [cachedAssistant],
+    );
+
+    expect(result[0]?.parts).toEqual(cachedAssistant.parts);
+    expect(
+      overlayStaleLoadedAgentTaskLifecycleParts(result, [cachedAssistant])[0]
+        ?.parts,
+    ).toHaveLength(3);
+  });
 
   it("uses a persisted completed server part to upgrade a local start", () => {
     const loadedAssistant = {
