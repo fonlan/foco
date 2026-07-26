@@ -214,6 +214,7 @@ pub(crate) fn agent_run_event_kind(event: &ChatSseEvent) -> AgentRunEventKind {
         | ChatSseEvent::TodoGraphRefresh { .. }
         | ChatSseEvent::PlanRefresh { .. }
         | ChatSseEvent::AgentTeamRefresh { .. }
+        | ChatSseEvent::AgentTaskLifecycle { .. }
         | ChatSseEvent::MemoryExtractionComplete { .. }
         | ChatSseEvent::MemoryResolved { .. }
         | ChatSseEvent::StreamEnd => AgentRunEventKind::ControlOutcome,

@@ -3432,6 +3432,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
             "failed to reconcile remote Agent attempt leases at sidecar startup"
         );
     }
+    project_remote_sidecar_terminal_agent_task_lifecycles(&reconciliation_state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(5));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3448,6 +3449,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
                     "failed to recheck remote Agent attempt leases"
                 );
             }
+            project_remote_sidecar_terminal_agent_task_lifecycles(&reconciliation_state);
             let resume_state = reconciliation_state.clone();
             match tokio::task::spawn_blocking(move || {
                 tokio::runtime::Handle::current()
@@ -4685,6 +4687,196 @@ fn reconcile_remote_sidecar_agent_attempt_leases(
         state,
         RemoteSidecarAgentAttemptRecoveryContext::Startup,
     )
+}
+
+const REMOTE_AGENT_TASK_LIFECYCLE_PREVIEW_CHARS: usize = 1_024;
+
+/// The sidecar owns remote Agent task execution, so it also owns the durable,
+/// user-visible projection of delegated task terminal states. A later scan
+/// retries metadata materialization without changing the already-final task.
+fn project_remote_sidecar_terminal_agent_task_lifecycles(state: &RemoteSidecarState) {
+    let result = (|| -> Result<(), WorkspaceDatabaseError> {
+        let mut database =
+            WorkspaceDatabase::open_or_create_critical(sidecar_workspace_path(state))?;
+        for task in database.terminal_delegated_agent_tasks()? {
+            project_remote_sidecar_terminal_agent_task_lifecycle(&mut database, state, &task)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        tracing::error!(
+            workspace_id = %state.workspace_id,
+            error = %error,
+            error_category = "agent_task_lifecycle_projection_failed",
+            "failed to project terminal remote Agent task lifecycle"
+        );
+    }
+}
+
+fn project_remote_sidecar_terminal_agent_task_lifecycle(
+    database: &mut WorkspaceDatabase,
+    state: &RemoteSidecarState,
+    task: &foco_store::workspace::AgentTaskRecord,
+) -> Result<(), WorkspaceDatabaseError> {
+    let Some(parent_task_id) = task.parent_task_id.as_ref() else {
+        return Ok(());
+    };
+    let mut root = task.clone();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = root.parent_task_id.as_ref() {
+        if !seen.insert(root.id.clone()) {
+            tracing::warn!(task_id = %task.id, "skipped remote Agent lifecycle projection for cyclic parent chain");
+            return Ok(());
+        }
+        let Some(parent) = database.agent_task(parent_id)? else {
+            return Ok(());
+        };
+        root = parent;
+    }
+    if root.id == task.id {
+        return Ok(());
+    }
+    let Some(instance) = database.agent_instance(&root.owner_instance_id)? else {
+        return Ok(());
+    };
+    if instance.role != AgentRole::Coordinator {
+        return Ok(());
+    }
+    let Some(assistant_message_id) = serde_json::from_str::<Value>(&root.input_json)
+        .ok()
+        .and_then(|input| {
+            input
+                .get("visibleAssistantMessageId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    else {
+        return Ok(());
+    };
+    let Some(team) = database.agent_team(&root.team_id)? else {
+        return Ok(());
+    };
+    let completed_at = task
+        .completed_at
+        .clone()
+        .unwrap_or_else(|| Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true));
+    let lifecycle = crate::ChatAgentTaskLifecycle {
+        event_id: format!("agent-task-lifecycle:{}:{}", task.id, task.status.as_str()),
+        team_id: task.team_id.to_string(),
+        task_id: task.id.to_string(),
+        parent_task_id: parent_task_id.to_string(),
+        instance_id: task.owner_instance_id.to_string(),
+        status: task.status.as_str().to_string(),
+        started_at: task.started_at.clone(),
+        completed_at,
+        duration_ms: remote_agent_task_lifecycle_duration_ms(
+            task.started_at.as_deref(),
+            task.completed_at.as_deref(),
+        ),
+        result_preview: remote_agent_task_lifecycle_preview(task.result_json.as_deref()),
+        error_preview: remote_agent_task_lifecycle_preview(task.error_json.as_deref()),
+    };
+    let (run_id, active_stream) = remote_sidecar_active_run_for_agent_task(state, &root.id)
+        .map_or_else(
+            || (root.id.to_string(), None),
+            |(run_id, stream)| (run_id, Some(stream)),
+        );
+    let payload = json!({
+        "type": "agentTaskLifecycle",
+        "assistantMessageId": assistant_message_id,
+        "lifecycle": lifecycle,
+    });
+    let sequence = database.append_run_event_if_absent(
+        &lifecycle.event_id,
+        &team.chat_id,
+        &run_id,
+        "agent_task_lifecycle",
+        &payload.to_string(),
+    )?;
+    let part_materialized =
+        persist_remote_agent_task_lifecycle_part(database, &assistant_message_id, &lifecycle)?;
+    if let (Some(sequence), Some(stream)) = (sequence, active_stream) {
+        stream.record(sequence, payload);
+    } else if part_materialized {
+        // The event is already durable and history can replay it; the next
+        // sidecar connection will observe the repaired assistant part.
+    }
+    Ok(())
+}
+
+fn remote_sidecar_active_run_for_agent_task(
+    state: &RemoteSidecarState,
+    task_id: &AgentTaskId,
+) -> Option<(String, RemoteActiveRunStream)> {
+    state
+        .active_run_streams
+        .lock()
+        .ok()?
+        .by_run_id
+        .iter()
+        .find_map(|(run_id, registration)| {
+            (registration.agent_task_id.as_ref() == Some(task_id))
+                .then(|| (run_id.clone(), registration.run_stream.clone()))
+        })
+}
+
+fn persist_remote_agent_task_lifecycle_part(
+    database: &mut WorkspaceDatabase,
+    assistant_message_id: &str,
+    lifecycle: &crate::ChatAgentTaskLifecycle,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let Some(message) = database.message(assistant_message_id)? else {
+        return Ok(false);
+    };
+    let mut parts = serde_json::from_str::<Value>(&message.metadata_json)
+        .ok()
+        .and_then(|metadata| metadata.get("parts").cloned())
+        .and_then(|parts| serde_json::from_value::<Vec<crate::StoredChatMessagePart>>(parts).ok())
+        .unwrap_or_default();
+    if parts.iter().any(|part| {
+        matches!(part, crate::StoredChatMessagePart::AgentTaskLifecycle { lifecycle: existing } if existing.event_id == lifecycle.event_id)
+    }) {
+        return Ok(false);
+    }
+    parts.push(crate::StoredChatMessagePart::AgentTaskLifecycle {
+        lifecycle: lifecycle.clone(),
+    });
+    database.mutate_message_metadata(
+        assistant_message_id,
+        MessageMetadataMutation::SetParts {
+            parts: serde_json::to_value(parts).map_err(|error| {
+                WorkspaceDatabaseError::InvalidAgentRuntimeData {
+                    message: format!("failed to serialize remote Agent lifecycle parts: {error}"),
+                }
+            })?,
+            parts_version: crate::STORED_CHAT_PARTS_VERSION,
+            parts_source: "agent_task_lifecycle".to_string(),
+        },
+    )?;
+    Ok(true)
+}
+
+fn remote_agent_task_lifecycle_preview(json: Option<&str>) -> Option<String> {
+    let value = json.and_then(|json| serde_json::from_str::<Value>(json).ok())?;
+    let text = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| json.unwrap_or_default());
+    (!text.trim().is_empty()).then(|| {
+        text.chars()
+            .take(REMOTE_AGENT_TASK_LIFECYCLE_PREVIEW_CHARS)
+            .collect()
+    })
+}
+
+fn remote_agent_task_lifecycle_duration_ms(
+    started_at: Option<&str>,
+    completed_at: Option<&str>,
+) -> Option<i64> {
+    let started_at = chrono::DateTime::parse_from_rfc3339(started_at?).ok()?;
+    let completed_at = chrono::DateTime::parse_from_rfc3339(completed_at?).ok()?;
+    Some((completed_at - started_at).num_milliseconds().max(0))
 }
 
 fn remote_sidecar_cancel_active_run_for_plan_task(
@@ -14405,6 +14597,8 @@ fn remote_sidecar_chat_messages_for_request(
                             sequences.push(sequence);
                         }
                         crate::StoredChatMessagePart::ContextCompression { .. } => {}
+                        // Visible lifecycle projections are not provider context.
+                        crate::StoredChatMessagePart::AgentTaskLifecycle { .. } => {}
                         crate::StoredChatMessagePart::UserInterruption {
                             content, source, ..
                         } => {

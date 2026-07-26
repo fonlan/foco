@@ -10038,6 +10038,55 @@ fn run_events_for_run_after_returns_only_later_sequences() {
 }
 
 #[test]
+fn append_run_event_if_absent_is_idempotent_and_allocates_the_next_sequence() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Idempotent lifecycle projection")
+        .expect("chat insert");
+    database
+        .insert_run_event(NewRunEvent {
+            id: "existing-event",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            sequence: 0,
+            event_type: "start",
+            payload_json: r#"{"type":"start"}"#,
+        })
+        .expect("existing event insert");
+
+    let sequence = database
+        .append_run_event_if_absent(
+            "agent-task-lifecycle:task-1:completed",
+            "chat-1",
+            "run-1",
+            "agent_task_lifecycle",
+            r#"{"type":"agentTaskLifecycle"}"#,
+        )
+        .expect("first lifecycle append");
+    let repeated = database
+        .append_run_event_if_absent(
+            "agent-task-lifecycle:task-1:completed",
+            "chat-1",
+            "run-1",
+            "agent_task_lifecycle",
+            r#"{"type":"agentTaskLifecycle"}"#,
+        )
+        .expect("repeated lifecycle append");
+
+    assert_eq!(sequence, Some(1));
+    assert_eq!(repeated, None);
+    assert_eq!(
+        database
+            .run_events_for_run("run-1")
+            .expect("run events")
+            .len(),
+        2
+    );
+}
+
+#[test]
 fn run_events_for_run_after_respects_batch_limit() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =

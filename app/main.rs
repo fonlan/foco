@@ -2062,6 +2062,33 @@ enum ChatMessagePart {
         #[serde(skip_serializing_if = "Option::is_none")]
         interrupted_assistant_metrics: Option<ChatReplyMetrics>,
     },
+    /// A durable, runtime-produced terminal update for a delegated Agent task.
+    AgentTaskLifecycle {
+        lifecycle: ChatAgentTaskLifecycle,
+    },
+}
+
+/// A bounded, user-visible projection of a delegated Agent task's terminal state.
+///
+/// The full result remains on the Agent task transcript. This value intentionally
+/// never participates in provider context assembly; `agent_wait_tasks` owns that
+/// separate model-facing contract.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ChatAgentTaskLifecycle {
+    pub(crate) event_id: String,
+    pub(crate) team_id: String,
+    pub(crate) task_id: String,
+    pub(crate) parent_task_id: String,
+    pub(crate) instance_id: String,
+    pub(crate) status: String,
+    pub(crate) started_at: Option<String>,
+    pub(crate) completed_at: String,
+    pub(crate) duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error_preview: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2095,10 +2122,13 @@ enum StoredChatMessagePart {
         #[serde(skip_serializing_if = "Option::is_none")]
         interrupted_assistant_metrics: Option<ChatReplyMetrics>,
     },
+    AgentTaskLifecycle {
+        lifecycle: ChatAgentTaskLifecycle,
+    },
 }
 
 // ponytail: invalidate all stored assistant parts instead of a one-off SQL repair; add a targeted migration if parts ever get too large.
-const STORED_CHAT_PARTS_VERSION: i64 = 6;
+pub(crate) const STORED_CHAT_PARTS_VERSION: i64 = 7;
 const MEMORY_DREAM_TRANSCRIPT_STEP_KIND: &str = "memory_dream_transcript_step";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2267,6 +2297,10 @@ enum ChatSseEvent {
         instance_id: Option<String>,
         reason: String,
         reveal_panel: bool,
+    },
+    AgentTaskLifecycle {
+        assistant_message_id: String,
+        lifecycle: ChatAgentTaskLifecycle,
     },
     MemoryExtractionComplete {
         assistant_message_id: String,
@@ -8464,6 +8498,7 @@ fn captured_event(event: &ChatSseEvent) -> CapturedAuditEvent {
         ChatSseEvent::TodoGraphRefresh { .. } => "todo_graph_refresh",
         ChatSseEvent::PlanRefresh { .. } => "plan_refresh",
         ChatSseEvent::AgentTeamRefresh { .. } => "agent_team_refresh",
+        ChatSseEvent::AgentTaskLifecycle { .. } => "agent_task_lifecycle",
         ChatSseEvent::MemoryExtractionComplete { .. } => "memory_extraction_complete",
         ChatSseEvent::MemoryResolved { .. } => "memory_resolved",
         ChatSseEvent::Usage { .. } => "usage",
@@ -11857,6 +11892,9 @@ fn assistant_parts_from_metadata(
                 source,
                 interrupted_assistant_metrics,
             }),
+            StoredChatMessagePart::AgentTaskLifecycle { lifecycle } => {
+                Ok(ChatMessagePart::AgentTaskLifecycle { lifecycle })
+            }
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -12775,6 +12813,17 @@ fn materialize_missing_assistant_parts(
                         source,
                         interrupted_assistant_metrics,
                     });
+            }
+            "agent_task_lifecycle" => {
+                if let Some(lifecycle) = value
+                    .get("lifecycle")
+                    .and_then(|lifecycle| serde_json::from_value(lifecycle.clone()).ok())
+                {
+                    parts_by_message
+                        .entry(message_id.to_string())
+                        .or_default()
+                        .push(ChatMessagePart::AgentTaskLifecycle { lifecycle });
+                }
             }
             _ => {}
         }
@@ -13893,6 +13942,7 @@ fn finalized_assistant_message_parts(
                 | "stream_attempt_start"
                 | "stream_reset"
                 | "guidance_applied"
+                | "agent_task_lifecycle"
         ) {
             continue;
         }
@@ -13971,6 +14021,14 @@ fn finalized_assistant_message_parts(
                     source,
                     interrupted_assistant_metrics,
                 });
+            }
+            "agent_task_lifecycle" => {
+                if let Some(lifecycle) = value
+                    .get("lifecycle")
+                    .and_then(|lifecycle| serde_json::from_value(lifecycle.clone()).ok())
+                {
+                    parts.push(ChatMessagePart::AgentTaskLifecycle { lifecycle });
+                }
             }
             "stream_attempt_start" => {
                 stream_attempt_snapshot = Some((
@@ -14123,6 +14181,9 @@ fn stored_chat_message_parts(
                 source,
                 interrupted_assistant_metrics,
             }),
+            ChatMessagePart::AgentTaskLifecycle { lifecycle } => {
+                Ok(StoredChatMessagePart::AgentTaskLifecycle { lifecycle })
+            }
             ChatMessagePart::Attachment { .. } => Err(ApiError::internal(
                 "assistant message history parts must not contain attachments",
             )),

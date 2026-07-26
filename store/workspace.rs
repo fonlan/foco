@@ -10427,6 +10427,59 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    /// Appends a run event under the same immediate transaction that allocates
+    /// its sequence. A stable event id makes asynchronous runtime projections
+    /// idempotent without racing the streaming producer's next event.
+    pub fn append_run_event_if_absent(
+        &mut self,
+        id: &str,
+        chat_id: &str,
+        run_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<Option<i64>, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let already_exists = transaction
+            .query_row(
+                "SELECT 1 FROM run_events WHERE id = ?1",
+                params![id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))?
+            .is_some();
+        if already_exists {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(None);
+        }
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM run_events WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .execute(
+                "INSERT INTO run_events
+                    (id, chat_id, run_id, sequence, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, chat_id, run_id, sequence, event_type, payload_json, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(Some(sequence))
+    }
+
     /// Complete a tool call and append its terminal run event in one durable
     /// operation so recovery never observes a completed card without its SSE event.
     pub fn complete_tool_call_with_result_and_run_event(
@@ -15056,6 +15109,29 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
         let rows = statement
             .query_map(params![team_id.as_str()], agent_task_from_row)
+            .map_err(|source| self.sqlite_error(source))?;
+        collect_rows(rows, &self.database_path)
+    }
+
+    /// Returns terminal delegated tasks. Runtime consumers resolve the root
+    /// coordinator before deciding whether a task belongs to a visible chat.
+    pub fn terminal_delegated_agent_tasks(
+        &self,
+    ) -> Result<Vec<AgentTaskRecord>, WorkspaceDatabaseError> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT id, team_id, owner_instance_id, origin_instance_id, parent_task_id,
+                        sequence, status, input_json, result_json, error_json, created_at,
+                        updated_at, started_at, completed_at
+                 FROM agent_tasks
+                 WHERE parent_task_id IS NOT NULL
+                   AND status IN ('completed', 'failed', 'cancelled')
+                 ORDER BY completed_at, id",
+            )
+            .map_err(|source| self.sqlite_error(source))?;
+        let rows = statement
+            .query_map([], agent_task_from_row)
             .map_err(|source| self.sqlite_error(source))?;
         collect_rows(rows, &self.database_path)
     }

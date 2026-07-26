@@ -35,6 +35,7 @@ use tokio::{
     time,
 };
 
+use super::subscriptions::ChatRunEventFrame;
 use super::{
     ActiveAgentRunIdentity, ActiveChatRunRegistrationResult,
     spawn_code_graph_execution_root_initialization_if_needed,
@@ -235,6 +236,7 @@ async fn run_agent_scheduler(
                     "Agent scheduler lease reconciliation failed"
                 );
             }
+            project_terminal_agent_task_lifecycles(&state);
             match schedule_runnable_tasks(
                 &state,
                 &permits,
@@ -312,6 +314,208 @@ async fn handle_agent_run_join_result(
             recover_abnormal_coordinator_exit(state, &identity, &reason).await;
         }
     }
+}
+
+const AGENT_TASK_LIFECYCLE_PREVIEW_CHARS: usize = 1_024;
+
+/// Projects durable child-task terminal states into their root coordinator's
+/// visible assistant turn. Failure is intentionally isolated from task closure:
+/// a later scheduler scan retries the same deterministic event id.
+fn project_terminal_agent_task_lifecycles(state: &AppState) {
+    let Ok(config) = config_snapshot(state) else {
+        tracing::error!("failed to load configuration for Agent lifecycle projection");
+        return;
+    };
+    for workspace in config.local_workspaces() {
+        let result = (|| -> Result<(), ApiError> {
+            let mut database = open_workspace_database_critical(&workspace.path)?;
+            for task in database
+                .terminal_delegated_agent_tasks()
+                .map_err(ApiError::from_workspace_error)?
+            {
+                project_terminal_agent_task_lifecycle(&mut database, state, workspace, &task)?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::error!(
+                workspace_id = %workspace.id,
+                error = %error.message,
+                error_category = "agent_task_lifecycle_projection_failed",
+                "failed to project terminal Agent task lifecycle"
+            );
+        }
+    }
+}
+
+fn project_terminal_agent_task_lifecycle(
+    database: &mut WorkspaceDatabase,
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    task: &AgentTaskRecord,
+) -> Result<(), ApiError> {
+    let Some(parent_task_id) = task.parent_task_id.as_ref() else {
+        return Ok(());
+    };
+    let mut root = task.clone();
+    let mut seen = HashSet::new();
+    while let Some(parent_id) = root.parent_task_id.as_ref() {
+        if !seen.insert(root.id.clone()) {
+            tracing::warn!(task_id = %task.id, "skipped Agent lifecycle projection for cyclic parent chain");
+            return Ok(());
+        }
+        let Some(parent) = database
+            .agent_task(parent_id)
+            .map_err(ApiError::from_workspace_error)?
+        else {
+            return Ok(());
+        };
+        root = parent;
+    }
+    if root.id == task.id {
+        return Ok(());
+    }
+    let Some(instance) = database
+        .agent_instance(&root.owner_instance_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    if instance.role != AgentRole::Coordinator {
+        return Ok(());
+    }
+    let Ok(input) = serde_json::from_str::<CoordinatorTaskInput>(&root.input_json) else {
+        return Ok(());
+    };
+    let Some(assistant_message_id) = input.visible_assistant_message_id else {
+        return Ok(());
+    };
+    let Some(team) = database
+        .agent_team(&root.team_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(());
+    };
+    let completed_at = task.completed_at.clone().unwrap_or_else(utc_timestamp);
+    let lifecycle = ChatAgentTaskLifecycle {
+        event_id: format!("agent-task-lifecycle:{}:{}", task.id, task.status.as_str()),
+        team_id: task.team_id.to_string(),
+        task_id: task.id.to_string(),
+        parent_task_id: parent_task_id.to_string(),
+        instance_id: task.owner_instance_id.to_string(),
+        status: task.status.as_str().to_string(),
+        started_at: task.started_at.clone(),
+        completed_at: completed_at.clone(),
+        duration_ms: timestamp_delta_ms(task.started_at.as_deref(), Some(&completed_at)),
+        result_preview: lifecycle_preview(task.result_json.as_deref()),
+        error_preview: lifecycle_preview(task.error_json.as_deref()),
+    };
+    let event = ChatSseEvent::AgentTaskLifecycle {
+        assistant_message_id,
+        lifecycle: lifecycle.clone(),
+    };
+    let captured = captured_event(&event);
+    let sequence = database
+        .append_run_event_if_absent(
+            &lifecycle.event_id,
+            &team.chat_id,
+            root.id.as_str(),
+            &captured.event_type,
+            &captured.normalized_event_json,
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    // A durable event may survive a metadata write failure. Replaying this
+    // idempotent materialization on every scan closes that boundary without
+    // rolling back the already-correct task terminal state or duplicating it.
+    let part_materialized = persist_agent_task_lifecycle_part(database, &event, &lifecycle)?;
+    let sequence = match (sequence, part_materialized) {
+        (Some(sequence), _) => Some(sequence),
+        // If the durable event predates a failed metadata write, the retry must
+        // also wake a still-active subscriber after it repairs the assistant
+        // part. This lookup is only on the compensation path.
+        (None, true) => database
+            .run_events_for_run(root.id.as_str())
+            .map_err(ApiError::from_workspace_error)?
+            .into_iter()
+            .find(|event| event.id == lifecycle.event_id)
+            .map(|event| event.sequence),
+        (None, false) => None,
+    };
+    if let Some(sequence) = sequence {
+        state.active_chat_runs.publish_persisted_event(
+            &workspace.id,
+            root.id.as_str(),
+            ChatRunEventFrame {
+                sequence,
+                event_type: captured.event_type,
+                payload_json: captured.normalized_event_json,
+            },
+        )?;
+    }
+    Ok(())
+}
+
+fn lifecycle_preview(json: Option<&str>) -> Option<String> {
+    let value = json.and_then(|json| serde_json::from_str::<Value>(json).ok())?;
+    let text = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| json.as_deref().unwrap_or_default());
+    (!text.trim().is_empty()).then(|| {
+        text.chars()
+            .take(AGENT_TASK_LIFECYCLE_PREVIEW_CHARS)
+            .collect()
+    })
+}
+
+fn persist_agent_task_lifecycle_part(
+    database: &mut WorkspaceDatabase,
+    event: &ChatSseEvent,
+    lifecycle: &ChatAgentTaskLifecycle,
+) -> Result<bool, ApiError> {
+    let ChatSseEvent::AgentTaskLifecycle {
+        assistant_message_id,
+        ..
+    } = event
+    else {
+        return Ok(false);
+    };
+    let Some(message) = database
+        .message(assistant_message_id)
+        .map_err(ApiError::from_workspace_error)?
+    else {
+        return Ok(false);
+    };
+    let mut parts = parse_json_value(&message.metadata_json, "assistant message metadata")?
+        .get("parts")
+        .cloned()
+        .and_then(|parts| serde_json::from_value::<Vec<StoredChatMessagePart>>(parts).ok())
+        .unwrap_or_default();
+    if parts.iter().any(|part| {
+        matches!(part, StoredChatMessagePart::AgentTaskLifecycle { lifecycle: existing } if existing.event_id == lifecycle.event_id)
+    }) {
+        return Ok(false);
+    }
+    parts.push(StoredChatMessagePart::AgentTaskLifecycle {
+        lifecycle: lifecycle.clone(),
+    });
+    let parts = serde_json::to_value(parts).map_err(|source| {
+        ApiError::internal(format!(
+            "failed to serialize Agent lifecycle parts: {source}"
+        ))
+    })?;
+    database
+        .mutate_message_metadata(
+            assistant_message_id,
+            foco_store::workspace::MessageMetadataMutation::SetParts {
+                parts,
+                parts_version: STORED_CHAT_PARTS_VERSION,
+                parts_source: "agent_task_lifecycle".to_string(),
+            },
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    Ok(true)
 }
 
 async fn recover_abnormal_coordinator_exit(

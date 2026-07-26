@@ -484,6 +484,34 @@ impl ActiveChatRunRegistry {
         }))
     }
 
+    /// Publishes a run event that was durably appended by a runtime projection.
+    /// The database remains authoritative; the in-memory cache only wakes active
+    /// SSE subscribers and participates in the normal sequence replay path.
+    pub(crate) fn publish_persisted_event(
+        &self,
+        workspace_id: &str,
+        run_id: &str,
+        event: ChatRunEventFrame,
+    ) -> Result<(), ApiError> {
+        let active_run = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run registry lock is poisoned"))?
+            .get(run_id)
+            .filter(|run| run.workspace_id == workspace_id && !*run.completed_rx.borrow())
+            .cloned();
+        let Some(active_run) = active_run else {
+            return Ok(());
+        };
+        active_run
+            .events
+            .lock()
+            .map_err(|_| ApiError::internal("active chat run event cache lock is poisoned"))?
+            .push(event.clone());
+        let _ = active_run.event_tx.send(event);
+        Ok(())
+    }
+
     pub(crate) fn subscribe(
         &self,
         workspace_id: &str,

@@ -1611,6 +1611,9 @@ fn replay_stored_assistant_parts(
                 )?;
             }
             StoredChatMessagePart::ContextCompression { .. } => {}
+            // Runtime lifecycle cards are deliberately user-visible only. Child
+            // results reach the model through agent_wait_tasks, never transcript replay.
+            StoredChatMessagePart::AgentTaskLifecycle { .. } => {}
             StoredChatMessagePart::UserInterruption {
                 content, source, ..
             } => {
