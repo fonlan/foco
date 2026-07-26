@@ -919,6 +919,30 @@ pub(crate) const WORKSPACE_ROUTE_CONTRACTS: &[WorkspaceRouteContract] = &[
         "Browser skill menus use an explicit main-process handler; remote catalogs are loaded via authenticated skills/discover proxy rather than the generic workspace proxy allowlist."
     ),
     route!(
+        "workspace-skills-manual",
+        "/api/workspaces/{workspace_id}/skills/manual",
+        Post,
+        None,
+        None,
+        MainProcess,
+        MainProcessAuthority,
+        None,
+        "502/503 when the remote sidecar is offline or returns an invalid catalog",
+        "The main process validates the browser request and explicitly proxies the remote skill enablement change to skills/manual."
+    ),
+    route!(
+        "workspace-skills-delete",
+        "/api/workspaces/{workspace_id}/skills/delete",
+        Post,
+        None,
+        None,
+        MainProcess,
+        MainProcessAuthority,
+        None,
+        "502/503 when the remote sidecar is offline or returns an invalid catalog",
+        "The main process validates the browser request and explicitly proxies remote workspace skill deletion to skills/delete."
+    ),
+    route!(
         "scheduled-tasks",
         "/api/workspaces/{workspace_id}/scheduled-tasks/{task_id}",
         Patch,

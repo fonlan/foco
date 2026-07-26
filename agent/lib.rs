@@ -2971,7 +2971,7 @@ mod tests {
 
         assert!(subagents.starts_with("## Subagents"));
         assert!(subagents.contains("Before delegating, give each subagent a focused task"));
-        assert!(subagents.contains("runtime suspends the parent run"));
+        assert!(subagents.contains("the runtime waits for them"));
         assert!(project_spec.starts_with("## Project Spec"));
         assert!(project_spec.contains("A Project Spec is durable workspace context"));
         assert!(memory.starts_with("## Memory"));

@@ -31525,7 +31525,16 @@ mod tests {
         .0;
         assert_eq!(response["ok"], true);
 
-        let cancel = broker_rx.recv().await.expect("cancel envelope");
+        let cancel = timeout(Duration::from_secs(1), async {
+            loop {
+                let envelope = broker_rx.recv().await.expect("broker envelope");
+                if envelope.message_type == "cancel" {
+                    break envelope;
+                }
+            }
+        })
+        .await
+        .expect("cancel envelope timeout");
         assert_eq!(cancel.message_type, "cancel");
         assert_eq!(cancel.id.as_deref(), Some("broker-request-1"));
         assert!(remote_sidecar_active_run_stream(&state, "remote-run-1").is_none());
@@ -35544,11 +35553,41 @@ mod tests {
                 ),
             })
             .expect("insert user");
+        database
+            .insert_message(NewMessage {
+                id: "msg-assistant-proxy",
+                chat_id: "chat-proxy-1",
+                role: "assistant",
+                content: "",
+                sequence: 1,
+                metadata_json: Some("{}"),
+            })
+            .expect("insert assistant placeholder");
         drop(database);
 
         let (sidecar_state, broker_rx) =
             test_sidecar_state(sidecar_workspace.path().to_string_lossy().to_string(), 1);
         let mut sidecar_state = sidecar_state;
+        let mut sidecar_config = remote_test_config(sidecar_workspace.path());
+        sidecar_config
+            .providers
+            .push(foco_store::config::ProviderSettings {
+                id: "provider-1".to_string(),
+                name: "Provider 1".to_string(),
+                kind: foco_providers::OPENAI_RESPONSES_KIND.to_string(),
+                enabled: true,
+                base_url: Some("https://example.invalid/v1".to_string()),
+                api_key: Some("remote-provider-test-key".to_string()),
+                auto_sync_models: false,
+                model_sync_filter_regex: None,
+                request_overrides: Vec::new(),
+                model_redirects: Vec::new(),
+                api_proxy: foco_store::config::ApiProxySettings::default(),
+            });
+        *sidecar_state.runtime_config.lock().expect("runtime config") = Some(
+            build_sidecar_runtime_config_bundle(profile.path(), &sidecar_config, 1)
+                .expect("runtime config bundle"),
+        );
         sidecar_state.workspace_id = "remote".to_string();
         sidecar_state.token = "sidecar-proxy-token".to_string();
         let mut broker_rx =
@@ -35724,6 +35763,10 @@ mod tests {
             .expect("first SSE chunk present")
             .expect("first SSE bytes");
         first_chunk.push_str(std::str::from_utf8(&first).expect("utf8 first chunk"));
+        assert!(
+            !first_chunk.contains("\"type\":\"error\""),
+            "initial proxied SSE must start the remote run, got: {first_chunk}"
+        );
 
         let broker_request_id = timeout(Duration::from_secs(3), partial_sent_rx)
             .await
@@ -46458,11 +46501,17 @@ mod tests {
         *state.runtime_config.lock().expect("runtime config") =
             Some(remote_spec_runtime_bundle(profile.path(), workspace.path()));
 
-        let broker_pending = state.broker_pending.clone();
-        let broker_task = tokio::spawn(async move {
-            let request = next_broker_llm_stream_request(&mut broker_rx).await;
+        wake_remote_sidecar_spec_runner(&state);
+        for attempt in 0..2 {
+            let request = timeout(
+                Duration::from_secs(3),
+                next_broker_llm_stream_request(&mut broker_rx),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for repair request {attempt}"));
             let request_id = request.id.clone().expect("broker request id");
-            // Empty toolCalls: broker did not recover (invalid/prose text). Sidecar must fail.
+            // Empty toolCalls: broker did not recover (invalid/prose text). The
+            // sidecar allows exactly one output-repair request before failing.
             let response = ControlEnvelope {
                 version: 1,
                 message_type: "response".to_string(),
@@ -46477,16 +46526,20 @@ mod tests {
                 }),
                 timestamp: Some(Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)),
             };
-            let tx = broker_pending
+            let tx = state
+                .broker_pending
                 .lock()
                 .await
                 .remove(&request_id)
                 .expect("pending broker receiver");
             tx.send(response).expect("send broker response");
-        });
-
-        wake_remote_sidecar_spec_runner(&state);
-        let failed = wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "failed").await;
+        }
+        let failed = timeout(
+            Duration::from_secs(5),
+            wait_remote_sidecar_spec_job_status(workspace.path(), &job.id, "failed"),
+        )
+        .await
+        .expect("spec job should fail after one output repair");
         assert!(
             failed
                 .error_message
@@ -46495,7 +46548,21 @@ mod tests {
             "empty toolCalls must fail with missing tool-call error, got {:?}",
             failed.error_message
         );
-        broker_task.await.expect("broker task");
+        let unexpected = timeout(Duration::from_millis(250), async {
+            loop {
+                let envelope = broker_rx.recv().await.expect("broker envelope");
+                if envelope.message_type == "request"
+                    && envelope.method.as_deref() == Some("llm.stream")
+                {
+                    return envelope;
+                }
+            }
+        })
+        .await;
+        assert!(
+            unexpected.is_err(),
+            "single-tool repair must not issue a third llm.stream request"
+        );
     }
 
     /// mock provider → broker_llm_stream: streamed text JSON for a single-tool internal
