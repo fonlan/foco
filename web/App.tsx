@@ -264,6 +264,7 @@ import {
   isWorkspaceImageFilePath,
   preloadOptionalMonaco,
   WorkspaceFileEditorPanel,
+  type MonacoEditorViewState,
   type OpenFileTab,
   type WorkspaceFileEditorState,
 } from "./features/files/WorkspaceFileEditorPanel";
@@ -1742,6 +1743,33 @@ export function App() {
     useState<Set<string>>(() => new Set());
   const [openFileTabs, setOpenFileTabs] = useState<OpenFileTab[]>([]);
   const openFileTabsRef = useRef<OpenFileTab[]>([]);
+  // View state is intentionally ephemeral: keeping it in a ref preserves each
+  // active editor's position without rendering App for Monaco scroll updates.
+  const workspaceFileEditorViewStatesRef = useRef<
+    Record<string, MonacoEditorViewState>
+  >({});
+  const getWorkspaceFileEditorViewState = useCallback(
+    (workspaceId: string, path: string) =>
+      workspaceFileEditorViewStatesRef.current[
+        workspaceFileEditorKey(workspaceId, path)
+      ] ?? null,
+    [],
+  );
+  const saveWorkspaceFileEditorViewState = useCallback(
+    (workspaceId: string, path: string, viewState: MonacoEditorViewState) => {
+      const editorKey = workspaceFileEditorKey(workspaceId, path);
+      const isOpen = openFileTabsRef.current.some(
+        (tab) => tab.workspaceId === workspaceId && tab.path === path,
+      );
+
+      if (isOpen) {
+        workspaceFileEditorViewStatesRef.current[editorKey] = viewState;
+      } else {
+        delete workspaceFileEditorViewStatesRef.current[editorKey];
+      }
+    },
+    [],
+  );
   const [openHtmlPreviewTabs, setOpenHtmlPreviewTabs] = useState<
     OpenHtmlPreviewTab[]
   >([]);
@@ -5276,6 +5304,17 @@ export function App() {
       const next = current.filter((tab) =>
         workspaces.some((workspace) => workspace.id === tab.workspaceId),
       );
+      if (next.length !== current.length) {
+        openFileTabsRef.current = next;
+        const openEditorKeys = new Set(
+          next.map((tab) => workspaceFileEditorKey(tab.workspaceId, tab.path)),
+        );
+        for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+          if (!openEditorKeys.has(key)) {
+            delete workspaceFileEditorViewStatesRef.current[key];
+          }
+        }
+      }
       return next.length === current.length ? current : next;
     });
 
@@ -7978,6 +8017,14 @@ export function App() {
 
     openFileTabsRef.current = nextTabs;
     setOpenFileTabs(nextTabs);
+    const openEditorKeys = new Set(
+      nextTabs.map((tab) => workspaceFileEditorKey(tab.workspaceId, tab.path)),
+    );
+    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+      if (!openEditorKeys.has(key)) {
+        delete workspaceFileEditorViewStatesRef.current[key];
+      }
+    }
 
     const selectedFile = activeFile
       ? (nextTabs.find(
@@ -8468,6 +8515,9 @@ export function App() {
     );
     openFileTabsRef.current = nextOpenFileTabs;
     setOpenFileTabs(nextOpenFileTabs);
+    delete workspaceFileEditorViewStatesRef.current[
+      workspaceFileEditorKey(tab.workspaceId, tab.path)
+    ];
     setWorkspaceFileEditors((current) => {
       const next = { ...current };
       delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
@@ -8666,7 +8716,9 @@ export function App() {
       const next = { ...current };
       for (const tab of tabsToClose) {
         if (tab.type === "file") {
-          delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
+          const editorKey = workspaceFileEditorKey(tab.workspaceId, tab.path);
+          delete next[editorKey];
+          delete workspaceFileEditorViewStatesRef.current[editorKey];
         }
       }
       return next;
@@ -9067,18 +9119,33 @@ export function App() {
     newName: string,
   ) {
     const nextPath = workspaceRenamedFilePath(path, newName);
-    setOpenFileTabs((current) =>
-      current.map((tab) => {
-        if (tab.workspaceId !== workspaceId || tab.path !== path) {
-          return tab;
-        }
-        return {
-          ...tab,
-          name: newName,
-          path: nextPath,
-        };
-      }),
-    );
+    const nextOpenFileTabs = openFileTabsRef.current.map((tab) => {
+      if (tab.workspaceId !== workspaceId || tab.path !== path) {
+        return tab;
+      }
+      return {
+        ...tab,
+        name: newName,
+        path: nextPath,
+      };
+    });
+    openFileTabsRef.current = nextOpenFileTabs;
+    setOpenFileTabs(nextOpenFileTabs);
+    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+      const prefix = `${workspaceId}:`;
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const filePath = key.slice(prefix.length);
+      if (
+        filePath === path ||
+        filePath.startsWith(`${path}/`) ||
+        filePath === nextPath ||
+        filePath.startsWith(`${nextPath}/`)
+      ) {
+        delete workspaceFileEditorViewStatesRef.current[key];
+      }
+    }
     setWorkspaceFileEditors((current) => {
       const oldKey = workspaceFileEditorKey(workspaceId, path);
       const newKey = workspaceFileEditorKey(workspaceId, nextPath);
@@ -9126,13 +9193,13 @@ export function App() {
   }
 
   function closeWorkspaceFileTabsForPath(workspaceId: string, path: string) {
-    setOpenFileTabs((current) =>
-      current.filter(
-        (tab) =>
-          tab.workspaceId !== workspaceId ||
-          (tab.path !== path && !tab.path.startsWith(`${path}/`)),
-      ),
+    const nextOpenFileTabs = openFileTabsRef.current.filter(
+      (tab) =>
+        tab.workspaceId !== workspaceId ||
+        (tab.path !== path && !tab.path.startsWith(`${path}/`)),
     );
+    openFileTabsRef.current = nextOpenFileTabs;
+    setOpenFileTabs(nextOpenFileTabs);
     setWorkspaceFileEditors((current) => {
       const next = { ...current };
       for (const key of Object.keys(next)) {
@@ -9147,6 +9214,16 @@ export function App() {
       }
       return next;
     });
+    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+      const prefix = `${workspaceId}:`;
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const filePath = key.slice(prefix.length);
+      if (filePath === path || filePath.startsWith(`${path}/`)) {
+        delete workspaceFileEditorViewStatesRef.current[key];
+      }
+    }
     setOpenHtmlPreviewTabs((current) => {
       const next = current.filter((tab) => {
         if (tab.workspaceId !== workspaceId) {
@@ -14805,7 +14882,9 @@ export function App() {
                       : undefined
                   }
                   onReload={reloadWorkspaceFileEditor}
+                  onRestoreViewState={getWorkspaceFileEditorViewState}
                   onSave={saveWorkspaceFileEditor}
+                  onSaveViewState={saveWorkspaceFileEditorViewState}
                 />
               ) : null}
               {openHtmlPreviewTabs.map((previewTab) => {

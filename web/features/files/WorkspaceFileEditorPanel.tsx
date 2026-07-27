@@ -45,6 +45,8 @@ export type WorkspaceFileEditorState = {
   lastSavedContent: string;
 };
 
+export type MonacoEditorViewState = Monaco.editor.ICodeEditorViewState;
+
 type NetworkInformationLike = {
   saveData?: boolean;
 };
@@ -87,14 +89,25 @@ export function WorkspaceFileEditorPanel({
   onChangeContent,
   onOpenHtmlPreview,
   onReload,
+  onRestoreViewState,
   onSave,
+  onSaveViewState,
 }: {
   editor: WorkspaceFileEditorState | null;
   file: OpenFileTab;
   onChangeContent: (workspaceId: string, path: string, content: string) => void;
   onOpenHtmlPreview?: () => void;
   onReload: (file: OpenFileTab) => Promise<void>;
+  onRestoreViewState: (
+    workspaceId: string,
+    path: string,
+  ) => MonacoEditorViewState | null;
   onSave: (file: OpenFileTab, content: string) => Promise<boolean> | boolean;
+  onSaveViewState: (
+    workspaceId: string,
+    path: string,
+    viewState: MonacoEditorViewState,
+  ) => void;
 }) {
   const isImage = isWorkspaceImageFilePath(file.path);
   const imageUrl = isImage ? workspaceFileBlobUrl(file.workspaceId, file.path) : null;
@@ -133,7 +146,9 @@ export function WorkspaceFileEditorPanel({
             onChange={handleChange}
             onOpenHtmlPreview={onOpenHtmlPreview}
             onReload={handleReload}
+            onRestoreViewState={onRestoreViewState}
             onSave={handleSave}
+            onSaveViewState={onSaveViewState}
             path={editorPath}
             value={editor?.content ?? ""}
             workspaceFilePath={file.path}
@@ -173,7 +188,9 @@ function MonacoFileEditor({
   onChange,
   onOpenHtmlPreview,
   onReload,
+  onRestoreViewState,
   onSave,
+  onSaveViewState,
   path,
   value,
   workspaceFilePath,
@@ -188,7 +205,16 @@ function MonacoFileEditor({
   onChange: (value: string) => void;
   onOpenHtmlPreview?: () => void;
   onReload: () => Promise<void>;
+  onRestoreViewState: (
+    workspaceId: string,
+    path: string,
+  ) => MonacoEditorViewState | null;
   onSave: (value: string) => Promise<boolean> | boolean;
+  onSaveViewState: (
+    workspaceId: string,
+    path: string,
+    viewState: MonacoEditorViewState,
+  ) => void;
   path: string;
   value: string;
   workspaceFilePath: string;
@@ -346,6 +372,10 @@ function MonacoFileEditor({
           theme: "vs",
           wordWrap: wordWrapEnabled ? "on" : "off",
         });
+        const viewState = onRestoreViewState(workspaceId, workspaceFilePath);
+        if (viewState) {
+          editor.restoreViewState(viewState);
+        }
         const changeDisposable = model.onDidChangeContent(() => {
           if (!ignoreModelChangeRef.current) {
             onChange(model.getValue());
@@ -360,6 +390,10 @@ function MonacoFileEditor({
         editorRef.current = editor;
         modelRef.current = model;
         cleanupEditor = () => {
+          const viewState = editor.saveViewState();
+          if (viewState) {
+            onSaveViewState(workspaceId, workspaceFilePath, viewState);
+          }
           changeDisposable.dispose();
           editor.dispose();
           model.dispose();
@@ -377,7 +411,17 @@ function MonacoFileEditor({
       editorRef.current = null;
       modelRef.current = null;
     };
-  }, [language, onChange, onSave, path, previewEnabled]);
+  }, [
+    language,
+    onChange,
+    onRestoreViewState,
+    onSave,
+    onSaveViewState,
+    path,
+    previewEnabled,
+    workspaceFilePath,
+    workspaceId,
+  ]);
 
   useEffect(() => {
     const model = modelRef.current;

@@ -9,27 +9,46 @@ const monacoMock = vi.hoisted(() => {
   const editorDispose = vi.fn();
   const modelDispose = vi.fn();
   const changeDispose = vi.fn();
+  const editors: Array<{
+    addCommand: ReturnType<typeof vi.fn>;
+    dispose: ReturnType<typeof vi.fn>;
+    focus: ReturnType<typeof vi.fn>;
+    getValue: ReturnType<typeof vi.fn>;
+    layout: ReturnType<typeof vi.fn>;
+    restoreViewState: ReturnType<typeof vi.fn>;
+    saveViewState: ReturnType<typeof vi.fn>;
+    trigger: ReturnType<typeof vi.fn>;
+    updateOptions: ReturnType<typeof vi.fn>;
+  }> = [];
   const createModel = vi.fn((value: string) => ({
     dispose: modelDispose,
     getValue: vi.fn(() => value),
     onDidChangeContent: vi.fn(() => ({ dispose: changeDispose })),
     setValue: vi.fn(),
   }));
-  const create = vi.fn(() => ({
-    addCommand: vi.fn(),
-    dispose: editorDispose,
-    focus: vi.fn(),
-    getValue: vi.fn(() => ""),
-    layout: vi.fn(),
-    trigger: vi.fn(),
-    updateOptions: vi.fn(),
-  }));
+  const create = vi.fn(() => {
+    const viewState = { editorIndex: editors.length };
+    const editor = {
+      addCommand: vi.fn(),
+      dispose: editorDispose,
+      focus: vi.fn(),
+      getValue: vi.fn(() => ""),
+      layout: vi.fn(),
+      restoreViewState: vi.fn(),
+      saveViewState: vi.fn(() => viewState),
+      trigger: vi.fn(),
+      updateOptions: vi.fn(),
+    };
+    editors.push(editor);
+    return editor;
+  });
 
   return {
     changeDispose,
     create,
     createModel,
     editorDispose,
+    editors,
     modelDispose,
   };
 });
@@ -61,6 +80,7 @@ const editorState: WorkspaceFileEditorState = {
 describe("WorkspaceFileEditorPanel", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    monacoMock.editors.length = 0;
   });
 
   it("disposes Monaco while markdown preview is active and recreates it for editing", async () => {
@@ -76,7 +96,9 @@ describe("WorkspaceFileEditorPanel", () => {
         }}
         onChangeContent={vi.fn()}
         onReload={vi.fn(async () => undefined)}
+        onRestoreViewState={vi.fn(() => null)}
         onSave={vi.fn(async () => true)}
+        onSaveViewState={vi.fn()}
       />,
     );
 
@@ -112,7 +134,9 @@ describe("WorkspaceFileEditorPanel", () => {
         }}
         onChangeContent={vi.fn()}
         onReload={vi.fn(async () => undefined)}
+        onRestoreViewState={vi.fn(() => null)}
         onSave={onSave}
+        onSaveViewState={vi.fn()}
       />,
     );
 
@@ -154,5 +178,58 @@ describe("WorkspaceFileEditorPanel", () => {
     await user.click(wordWrapButton);
     expect(wordWrapButton).toHaveAttribute("aria-pressed", "true");
     expect(wordWrapButton).toHaveClass("button--tertiary");
+  });
+
+  it("saves and restores view state independently for each file tab", async () => {
+    const viewStates = new Map<string, object>();
+    const onRestoreViewState = vi.fn((workspaceId: string, path: string) =>
+      viewStates.get(`${workspaceId}:${path}`) ?? null,
+    );
+    const onSaveViewState = vi.fn(
+      (workspaceId: string, path: string, viewState: object) => {
+        viewStates.set(`${workspaceId}:${path}`, viewState);
+      },
+    );
+    const props = {
+      editor: editorState,
+      onChangeContent: vi.fn(),
+      onReload: vi.fn(async () => undefined),
+      onRestoreViewState,
+      onSave: vi.fn(async () => true),
+      onSaveViewState,
+    };
+    const file = (path: string) => ({
+      name: path,
+      path,
+      workspaceId: "workspace-1",
+      workspaceLogoUrl: null,
+      workspaceName: "Default",
+    });
+    const { rerender } = render(
+      <WorkspaceFileEditorPanel {...props} file={file("a.ts")} />,
+    );
+
+    await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(1));
+    const firstEditor = monacoMock.editors[0];
+    expect(firstEditor.restoreViewState).not.toHaveBeenCalled();
+
+    rerender(<WorkspaceFileEditorPanel {...props} file={file("b.ts")} />);
+    await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(2));
+    const secondEditor = monacoMock.editors[1];
+    expect(firstEditor.saveViewState).toHaveBeenCalledTimes(1);
+    expect(secondEditor.restoreViewState).not.toHaveBeenCalled();
+
+    rerender(<WorkspaceFileEditorPanel {...props} file={file("a.ts")} />);
+    await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(3));
+    const thirdEditor = monacoMock.editors[2];
+    expect(secondEditor.saveViewState).toHaveBeenCalledTimes(1);
+    expect(thirdEditor.restoreViewState).toHaveBeenCalledWith(
+      firstEditor.saveViewState.mock.results[0]?.value,
+    );
+    expect(onSaveViewState).toHaveBeenCalledWith(
+      "workspace-1",
+      "a.ts",
+      firstEditor.saveViewState.mock.results[0]?.value,
+    );
   });
 });
