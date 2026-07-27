@@ -10070,6 +10070,79 @@ fn active_chat_run_record_event_persists_tools_before_cancelled_history_reload()
     fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
 }
 
+#[test]
+fn active_chat_run_record_event_persists_successful_terminal_tool_observation() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-terminal-tool-observation-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Terminal tool observation")
+        .expect("chat insert");
+    drop(database);
+
+    let registry = ActiveChatRunRegistry::default();
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::ToolCall {
+                assistant_message_id: "assistant-1".to_string(),
+                reasoning_duration_ms: None,
+                tool_call: ChatToolCallSummary {
+                    id: "tool-1".to_string(),
+                    name: "agent_wait_tasks".to_string(),
+                    status: "completed".to_string(),
+                    input: json!({ "taskIds": ["task-1"] }),
+                    output: Some(json!({ "dependencies": [] })),
+                    is_error: false,
+                    started_at: Some("2026-07-27T13:17:15Z".to_string()),
+                    completed_at: Some("2026-07-27T13:17:16Z".to_string()),
+                    live_output: None,
+                },
+            },
+        )
+        .expect("successful terminal tool observation record");
+
+    let database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database reopen");
+    let tool_calls = database
+        .tool_calls_for_chat("chat-1")
+        .expect("tool calls for chat");
+    let tool_call = tool_calls.first().expect("terminal tool call");
+    assert_eq!(tool_call.status, "completed");
+    assert_eq!(
+        tool_call.completed_at.as_deref(),
+        Some("2026-07-27T13:17:16Z")
+    );
+    assert!(
+        !tool_call
+            .result
+            .as_ref()
+            .expect("terminal tool result")
+            .is_error
+    );
+
+    drop(database);
+    registration.finish();
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
 #[tokio::test]
 async fn team_run_id_override_keeps_tool_finalization_idempotent() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-team-tool-run-id-test"));

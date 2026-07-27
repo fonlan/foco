@@ -882,7 +882,8 @@ impl ActiveChatRunRegistration {
                     ApiError::internal(format!("failed to serialize tool input: {source}"))
                 })?;
                 let started_at = tool_call.started_at.clone().unwrap_or_else(utc_timestamp);
-                let terminal_observation = tool_call.is_error && tool_call.output.is_some();
+                let terminal_observation = tool_call.output.is_some()
+                    && matches!(tool_call.status.as_str(), "completed" | "error");
                 let completed_at = terminal_observation.then(|| {
                     tool_call
                         .completed_at
@@ -897,10 +898,10 @@ impl ActiveChatRunRegistration {
                         message_id: Some(&self.assistant_message_id),
                         tool_name: &tool_call.name,
                         input_json: &input_json,
-                        status: if terminal_observation {
-                            "error"
-                        } else {
-                            "running"
+                        status: match tool_call.status.as_str() {
+                            "completed" => "completed",
+                            "error" => "error",
+                            _ => "running",
                         },
                         started_at: &started_at,
                         completed_at: completed_at.as_deref(),
@@ -922,7 +923,7 @@ impl ActiveChatRunRegistration {
                             id: &format!("{}-result", tool_call.id),
                             tool_call_id: &tool_call.id,
                             output_json: &output_json,
-                            is_error: true,
+                            is_error: tool_call.is_error,
                             created_at: completed_at,
                         })
                         .map_err(ApiError::from_workspace_error)?;
