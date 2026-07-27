@@ -142,6 +142,10 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete provider {name}": "Delete provider {name}",
     "Unknown transport": "Unknown",
     "Unknown agent": "Unknown agent",
+    "Subagent result": "Subagent result",
+    "Subagent result: {agent} ({status})":
+      "Subagent result: {agent} ({status})",
+    "No result available": "No result available",
     "{agent} subagent {status}": "{agent} subagent {status}",
     Completed: "Completed",
     Failed: "Failed",
@@ -158,6 +162,9 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
   },
   "zh-CN": {
     "Unknown agent": "未知子代理",
+    "Subagent result": "子代理结果",
+    "Subagent result: {agent} ({status})": "子代理结果：{agent}（{status}）",
+    "No result available": "暂无返回结论",
     "{agent} subagent {status}": "{agent} 子代理{status}",
     Finished: "已结束",
     "Duration unavailable": "耗时未知",

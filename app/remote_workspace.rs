@@ -4773,6 +4773,7 @@ fn project_remote_sidecar_terminal_agent_task_lifecycle(
             task.started_at.as_deref(),
             task.completed_at.as_deref(),
         ),
+        result_json: crate::agent_task_lifecycle_result_json(task.result_json.as_deref()),
         result_preview: remote_agent_task_lifecycle_preview(task.result_json.as_deref()),
         error_preview: remote_agent_task_lifecycle_preview(task.error_json.as_deref()),
     };
@@ -24947,7 +24948,7 @@ async fn remote_sidecar_plans_worktree_cleanup(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use axum::response::{IntoResponse, Sse};
     use foco_agent::AgentPermissions;
@@ -25143,7 +25144,7 @@ mod tests {
                     task_id: &failed_task_id,
                     expected_status: AgentTaskStatus::Running,
                     transition: AgentTaskTransition::Fail,
-                    result_json: None,
+                    result_json: Some(r#"{"kind":"remote failure detail"}"#),
                     error_json: Some(r#"{"message":"remote nested failure"}"#),
                     interruption_reason: None,
                 })
@@ -25154,7 +25155,7 @@ mod tests {
                     task_id: &cancelled_task_id,
                     expected_status: AgentTaskStatus::Queued,
                     transition: AgentTaskTransition::Cancel,
-                    result_json: None,
+                    result_json: Some(r#"{"kind":"remote cancellation detail"}"#),
                     error_json: Some(r#"{"message":"remote cancellation"}"#),
                     interruption_reason: None,
                 })
@@ -25190,6 +25191,23 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["cancelled", "completed", "failed"]),
             "direct, nested, and cancelled remote tasks share the local lifecycle contract"
+        );
+        assert_eq!(
+            live_events
+                .iter()
+                .map(|(_, event)| {
+                    (
+                        event["lifecycle"]["status"].as_str().expect("status"),
+                        event["lifecycle"]["resultJson"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("cancelled", json!({ "kind": "remote cancellation detail" })),
+                ("completed", json!({ "text": "remote completed" })),
+                ("failed", json!({ "kind": "remote failure detail" })),
+            ]),
+            "all terminal remote task statuses preserve valid raw result JSON"
         );
 
         let database =
@@ -25233,6 +25251,23 @@ mod tests {
                 .count(),
             3,
             "remote history transport replays the lifecycle parts emitted on the live stream"
+        );
+        assert_eq!(
+            history_parts
+                .iter()
+                .map(|part| {
+                    (
+                        part["lifecycle"]["status"].as_str().expect("status"),
+                        part["lifecycle"]["resultJson"].clone(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>(),
+            BTreeMap::from([
+                ("cancelled", json!({ "kind": "remote cancellation detail" })),
+                ("completed", json!({ "text": "remote completed" })),
+                ("failed", json!({ "kind": "remote failure detail" })),
+            ]),
+            "remote history preserves the raw lifecycle result JSON from the live stream"
         );
     }
 

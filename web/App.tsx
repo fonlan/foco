@@ -17594,6 +17594,8 @@ function parseChatAgentTaskLifecycle(
   const completedAt = stringField(value, "completedAt", "completed_at");
   const startedAt = optionalNullableStringField(value, "startedAt", "started_at");
   const durationMs = fieldValue(value, "durationMs", "duration_ms");
+  const rawResultJson = fieldValue(value, "resultJson", "result_json");
+  const resultJson = isJsonValue(rawResultJson) ? rawResultJson : null;
   const resultPreview = optionalNullableStringField(
     value,
     "resultPreview",
@@ -17618,6 +17620,7 @@ function parseChatAgentTaskLifecycle(
     eventId, teamId, taskId, parentTaskId, instanceId, status, completedAt,
     startedAt: startedAt ?? null,
     durationMs: typeof durationMs === "number" ? durationMs : null,
+    resultJson,
     resultPreview: resultPreview ?? null,
     errorPreview: errorPreview ?? null,
   };

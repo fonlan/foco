@@ -2086,9 +2086,15 @@ pub(crate) struct ChatAgentTaskLifecycle {
     pub(crate) completed_at: String,
     pub(crate) duration_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) result_json: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) result_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) error_preview: Option<String>,
+}
+
+pub(crate) fn agent_task_lifecycle_result_json(json: Option<&str>) -> Option<Value> {
+    json.and_then(|json| serde_json::from_str(json).ok())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

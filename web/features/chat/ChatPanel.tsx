@@ -1,10 +1,8 @@
 import {
   ArrowUp,
-  Ban,
   Bot,
   Brain,
   CheckCircle2,
-  CircleAlert,
   ChevronDown,
   ChevronRight,
   Copy,
@@ -2135,16 +2133,18 @@ function ReasoningBlock({
 function AgentTaskLifecycleBlock({
   agentName,
   canOpenTranscript,
+  formatJsonValue,
   lifecycle,
   onOpenTranscript,
 }: {
   agentName: string | null;
   canOpenTranscript: boolean;
+  formatJsonValue: (value: JsonValue) => string;
   lifecycle: ChatAgentTaskLifecycle;
   onOpenTranscript?: (instanceId: string) => void;
 }) {
   const { language, t } = useI18n();
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [viewMode, setViewMode] = useState<"compact" | "raw">("compact");
   const status = lifecycle.status;
   const statusLabel =
     status === "completed"
@@ -2154,89 +2154,105 @@ function AgentTaskLifecycleBlock({
         : status === "cancelled"
           ? t("Cancelled")
           : t("Finished");
-  const statusIcon =
-    status === "completed" ? (
-      <CheckCircle2 aria-hidden="true" className="size-4" />
-    ) : status === "failed" ? (
-      <CircleAlert aria-hidden="true" className="size-4" />
-    ) : (
-      <Ban aria-hidden="true" className="size-4" />
-    );
-  const statusTone =
+  const statusClass =
     status === "completed"
-      ? "text-[var(--success)]"
+      ? "bg-[var(--success-soft)] text-[var(--success)]"
       : status === "failed"
-        ? "text-[var(--danger)]"
-        : "text-[var(--muted)]";
+        ? "bg-[var(--danger-soft)] text-[var(--danger)]"
+        : "bg-[var(--surface-secondary)] text-[var(--muted)]";
   const displayName = agentName?.trim() || t("Unknown agent");
   const completedAt = formatLifecycleDateTime(lifecycle.completedAt, language);
   const duration = formatLifecycleDuration(lifecycle.durationMs, language, t);
-  const detail = lifecycle.errorPreview ?? lifecycle.resultPreview ?? null;
+  const conclusion =
+    status === "completed"
+      ? lifecycle.resultPreview ?? lifecycle.errorPreview
+      : lifecycle.errorPreview ?? lifecycle.resultPreview;
+  const displayConclusion = conclusion ?? t("No result available");
+  const resultJson = lifecycle.resultJson;
+  const hasRawResult = resultJson !== null && resultJson !== undefined;
+  const rawResultText = hasRawResult ? formatJsonValue(resultJson) : null;
   const hasTranscript = Boolean(
     lifecycle.instanceId && onOpenTranscript && canOpenTranscript,
   );
-  const toggleLabel = isExpanded ? t("Collapse task details") : t("Expand task details");
+  const toggleLabel = viewMode === "compact" ? t("Raw") : t("Compact");
 
   return (
-    <section
-      aria-live="polite"
-      className="my-2 grid min-w-0 grid-cols-[1.25rem_minmax(0,1fr)] gap-x-2.5 rounded-lg border border-[var(--border)] bg-[var(--surface-2)] px-3 py-2.5 text-sm"
-    >
-      <div className="flex min-h-10 flex-col items-center" aria-hidden="true">
-        <span className={`mt-0.5 ${statusTone}`}>{statusIcon}</span>
-        <span className="mt-1 w-px flex-1 bg-[var(--border)]" />
-      </div>
-      <div className="min-w-0">
-        <div className="flex min-w-0 flex-wrap items-baseline gap-x-2 gap-y-1">
-          <span className="truncate font-medium text-[var(--foreground)]">
-            {t("{agent} subagent {status}", {
-              agent: displayName,
-              status: statusLabel,
-            })}
-          </span>
-          <span className={`shrink-0 text-xs font-medium ${statusTone}`}>
-            {statusLabel}
-          </span>
-          <time
-            className="ml-auto shrink-0 text-xs tabular-nums text-[var(--muted)]"
-            dateTime={lifecycle.completedAt}
-            title={lifecycle.completedAt}
-          >
-            {completedAt}
-          </time>
-        </div>
-        <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--muted)]">
-          <span>{duration}</span>
-          {detail ? (
+    <details aria-live="polite" className="tool-call-block group my-2 min-w-0">
+      <summary
+        aria-label={t("Subagent result: {agent} ({status})", {
+          agent: displayName,
+          status: statusLabel,
+        })}
+        className="tool-call-summary flex cursor-pointer list-none items-center gap-1.5 text-xs font-semibold text-[var(--muted)] marker:hidden"
+      >
+        <Bot
+          aria-hidden="true"
+          className="size-3.5 shrink-0 text-[var(--accent-soft-foreground)]"
+        />
+        <span className="shrink-0">{t("Subagent result")}</span>
+        <span className="min-w-0 shrink-0 truncate">{displayName}</span>
+        <span className="shrink-0 text-[var(--muted)]">·</span>
+        <span
+          className="min-w-0 flex-1 truncate font-medium text-[var(--muted)]"
+          title={displayConclusion}
+        >
+          {displayConclusion}
+        </span>
+        <span
+          className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] leading-4 ${statusClass}`}
+        >
+          {statusLabel}
+        </span>
+      </summary>
+      <div className="mt-2 grid gap-2 text-xs text-[var(--muted)]">
+        <div className="flex min-w-0 items-start justify-between gap-2 text-[11px] text-[var(--muted)]">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+            <time dateTime={lifecycle.completedAt} title={lifecycle.completedAt}>
+              {completedAt}
+            </time>
+            <span>{duration}</span>
+            {hasTranscript ? (
+              <Button
+                className="h-auto min-h-0 p-0 text-[11px] font-semibold text-[var(--muted)] underline-offset-2 hover:underline"
+                onPress={() => onOpenTranscript?.(lifecycle.instanceId)}
+                type="button"
+                variant="ghost"
+              >
+                {t("View full record")}
+              </Button>
+            ) : null}
+          </div>
+          {hasRawResult ? (
             <Button
-              aria-expanded={isExpanded}
               aria-label={toggleLabel}
-              className="h-auto min-h-0 p-0 text-xs font-medium text-[var(--muted)] underline-offset-2 hover:underline"
-              onPress={() => setIsExpanded((current) => !current)}
+              className="h-5 min-h-0 shrink-0 rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-0 text-[11px] leading-4 font-semibold text-[var(--muted)] hover:border-[var(--border)] hover:bg-[var(--surface-secondary)] focus:outline-none focus:ring-2 focus:ring-[color-mix(in_oklab,var(--accent)_28%,transparent)]"
+              onPress={() =>
+                setViewMode(viewMode === "compact" ? "raw" : "compact")
+              }
               type="button"
               variant="ghost"
             >
-              {isExpanded ? t("Hide details") : t("Show details")}
-            </Button>
-          ) : null}
-          {hasTranscript ? (
-            <Button
-              className="h-auto min-h-0 p-0 text-xs font-medium text-[var(--muted)] underline-offset-2 hover:underline"
-              onPress={() => onOpenTranscript?.(lifecycle.instanceId)}
-              type="button"
-              variant="ghost"
-            >
-              {t("View full record")}
+              {toggleLabel}
             </Button>
           ) : null}
         </div>
-        {isExpanded && detail ? (
-          <p className="mt-2 max-h-32 overflow-y-auto whitespace-pre-wrap break-words rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-xs leading-5 text-[var(--muted)]">
-            {detail}
-          </p>
-        ) : null}
+        {viewMode === "raw" && rawResultText ? (
+          <pre
+            className={`${TOOL_CALL_SCROLL_CLASS} max-h-64 overflow-auto whitespace-pre-wrap break-words border-l border-[var(--border)] pl-3 font-mono text-[11px] leading-5`}
+          >
+            {rawResultText}
+          </pre>
+        ) : (
+          <MarkdownContent
+            content={displayConclusion}
+            isError={status === "failed" || status === "cancelled"}
+            isUser={false}
+            renderMode="full"
+            selectedSkillPrefix={selectedSkillPrefix}
+          />
+        )}
       </div>
-    </section>
+    </details>
   );
 }
 
@@ -2324,6 +2340,7 @@ function MessagePartBlockComponent({
   if (part.type === "agentTaskLifecycle") {
     return (
       <AgentTaskLifecycleBlock
+        formatJsonValue={helpers.formatJsonValue}
         lifecycle={part.lifecycle}
         agentName={agentName ?? null}
         canOpenTranscript={canOpenAgentTranscript === true}

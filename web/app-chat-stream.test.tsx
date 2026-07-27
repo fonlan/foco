@@ -5426,7 +5426,7 @@ describe("app-chat-stream verification surfaces", () => {
     });
   });
 
-  it("upserts a terminal subagent timeline block without duplicating replayed events", async () => {
+  it("renders terminal subagent results as tool-call style cards without duplicating replayed events", async () => {
     renderApp();
 
     await userEvent.click(await screen.findByText("Tool run"));
@@ -5444,9 +5444,10 @@ describe("app-chat-stream verification surfaces", () => {
       durationMs: 1_250,
       errorPreview: null,
       eventId: "agent-task-lifecycle:worker-1:completed",
-      instanceId: "agent-instance-worker-1",
+      instanceId: "agent-instance-worker",
       parentTaskId: "agent-task-coordinator-1",
-      resultPreview: "The review is complete.",
+      resultJson: JSON.stringify({ conclusion: "The review is complete." }),
+      resultPreview: "**The review is complete.**\n\n- Coverage is complete.",
       startedAt: "2026-07-26T03:29:58.750Z",
       status: "completed" as const,
       taskId: "agent-task-worker-1",
@@ -5457,6 +5458,7 @@ describe("app-chat-stream verification surfaces", () => {
       errorPreview: "Tool execution failed.",
       eventId: "agent-task-lifecycle:worker-2:failed",
       instanceId: "agent-instance-worker-2",
+      resultJson: null,
       status: "failed" as const,
       taskId: "agent-task-worker-2",
     };
@@ -5465,6 +5467,7 @@ describe("app-chat-stream verification surfaces", () => {
       errorPreview: "Cancelled by the coordinator.",
       eventId: "agent-task-lifecycle:worker-3:cancelled",
       instanceId: "agent-instance-worker-3",
+      resultJson: null,
       status: "cancelled" as const,
       taskId: "agent-task-worker-3",
     };
@@ -5492,31 +5495,75 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
 
+    const completedSummary = await screen.findByLabelText(
+      "Subagent result: Worker (Completed)",
+    );
+    const completedBlock = completedSummary.closest(
+      "details",
+    ) as HTMLDetailsElement | null;
+    expect(completedBlock).not.toBeNull();
+    if (!completedBlock) {
+      throw new Error("Expected completed subagent result card");
+    }
+    expect(completedBlock).toHaveClass("tool-call-block", "group", "min-w-0");
+    expect(completedSummary).toHaveTextContent("Subagent result");
+    expect(completedSummary).toHaveTextContent("Worker");
+    expect(completedSummary).toHaveTextContent("Completed");
     expect(
-      await screen.findByText("Unknown agent subagent Completed"),
+      within(completedBlock).getByText("Duration 1.3 s"),
     ).toBeInTheDocument();
-    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
-    const completedBlock = screen
-      .getByText("Unknown agent subagent Completed")
-      .closest("section");
-    expect(within(completedBlock as HTMLElement).getByText("Duration 1.3 s")).toBeInTheDocument();
-    expect(completedBlock).toHaveClass("grid", "min-w-0");
-    expect(completedBlock).toHaveClass("grid-cols-[1.25rem_minmax(0,1fr)]");
-    const failedBlock = (await screen.findByText("Unknown agent subagent Failed")).closest(
-      "section",
-    ) as HTMLElement | null;
-    expect(failedBlock).not.toBeNull();
     expect(
-      screen.getByText("Unknown agent subagent Cancelled"),
+      within(completedBlock).getByRole("button", { name: "View full record" }),
     ).toBeInTheDocument();
+    expect(completedSummary).toHaveAttribute(
+      "aria-label",
+      "Subagent result: Worker (Completed)",
+    );
+    expect(completedSummary.tagName).toBe("SUMMARY");
+    completedSummary.focus();
+    expect(completedSummary).toHaveFocus();
+    // JSDOM does not synthesize the native click produced by Enter on <summary>.
+    // detail: 0 models that keyboard activation click while retaining the browser's
+    // native <details> toggle behavior under test.
+    fireEvent.click(completedSummary, { detail: 0 });
+    expect(completedBlock.open).toBe(true);
+    const rawButton = within(completedBlock).getByRole("button", {
+      name: "Raw",
+    });
+    expect(rawButton).toHaveClass("h-5", "min-h-0", "py-0", "leading-4");
+    await userEvent.click(rawButton);
+    expect(
+      within(completedBlock).getByText(/"conclusion": "The review is complete\."/),
+    ).toBeInTheDocument();
+    expect(completedBlock.querySelector("pre")).toHaveClass("tool-call-scroll");
     await userEvent.click(
-      within(failedBlock as HTMLElement).getByRole("button", {
-        name: "Expand task details",
-      }),
+      within(completedBlock).getByRole("button", { name: "Compact" }),
     );
     expect(
-      within(failedBlock as HTMLElement).getByText("Tool execution failed."),
+      within(completedBlock).getByText("The review is complete."),
     ).toBeInTheDocument();
+    expect(
+      within(completedBlock).getByText("Coverage is complete."),
+    ).toBeInTheDocument();
+
+    const failedBlock = screen
+      .getByLabelText("Subagent result: Unknown agent (Failed)")
+      .closest("details") as HTMLDetailsElement | null;
+    expect(failedBlock).not.toBeNull();
+    if (!failedBlock) {
+      throw new Error("Expected failed subagent result card");
+    }
+    expect(
+      screen.getByLabelText("Subagent result: Unknown agent (Cancelled)"),
+    ).toBeInTheDocument();
+    await userEvent.click(failedBlock.querySelector("summary") as HTMLElement);
+    expect(failedBlock.open).toBe(true);
+    expect(
+      within(failedBlock).queryByRole("button", { name: "Raw" }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(failedBlock).getAllByText("Tool execution failed.").length,
+    ).toBeGreaterThan(1);
   });
 
   it("preserves a lifecycle block across waiting reattach and resumed output", async () => {
@@ -5759,11 +5806,13 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       within(historyRow as HTMLElement).getByText("Wait Tasks"),
     ).toBeInTheDocument();
+    const lifecycleBlock = within(historyRow as HTMLElement)
+      .getByLabelText("Subagent result: Unknown agent (Completed)")
+      .closest("details");
+    expect(lifecycleBlock).toHaveClass("tool-call-block");
     expect(
-      within(historyRow as HTMLElement).getByText(
-        "Unknown agent subagent Completed",
-      ),
-    ).toBeInTheDocument();
+      within(historyRow as HTMLElement).getAllByText("Nested subagent proof.").length,
+    ).toBeGreaterThan(0);
     // Content may appear in both summary and body nodes inside one bubble.
     expect(
       new Set(
@@ -5852,7 +5901,9 @@ describe("app-chat-stream verification surfaces", () => {
     expect(screen.getByText("Pre-delegate reasoning.")).toBeInTheDocument();
     expect(screen.getByText("Delegate Task")).toBeInTheDocument();
     expect(screen.getByText("Wait Tasks")).toBeInTheDocument();
-    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
+    expect(
+      screen.getAllByLabelText("Subagent result: Unknown agent (Completed)"),
+    ).toHaveLength(1);
 
     await act(async () => {
       enqueueChatStreamEventForRun("request-stream-resumed", {
@@ -5887,7 +5938,9 @@ describe("app-chat-stream verification surfaces", () => {
       ).size,
     ).toBe(1);
     expect(screen.getAllByText("Delegate Task")).toHaveLength(1);
-    expect(screen.getAllByText("Unknown agent subagent Completed")).toHaveLength(1);
+    expect(
+      screen.getAllByLabelText("Subagent result: Unknown agent (Completed)"),
+    ).toHaveLength(1);
 
     await act(async () => {
       appTestState.chatStreamControllers.get("request-stream-resumed")?.close();
@@ -8386,7 +8439,7 @@ describe("app-chat-stream verification surfaces", () => {
       });
     });
     expect(
-      await screen.findByText("Unknown agent subagent Completed"),
+      await screen.findByLabelText("Subagent result: Unknown agent (Completed)"),
     ).toBeInTheDocument();
     expect(
       within(tabList).getByRole("status", { name: "Chat is running" }),

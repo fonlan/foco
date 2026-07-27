@@ -31,6 +31,67 @@ describe("remote start run identity", () => {
   });
 });
 
+describe("Agent task lifecycle result parsing", () => {
+  const lifecycle = {
+    completedAt: "2026-07-26T03:30:00Z",
+    durationMs: 1_250,
+    errorPreview: null,
+    eventId: "agent-task-lifecycle:worker-1:completed",
+    instanceId: "agent-instance-worker-1",
+    parentTaskId: "agent-task-coordinator-1",
+    resultPreview: "Review completed.",
+    startedAt: "2026-07-26T03:29:58.750Z",
+    status: "completed",
+    taskId: "agent-task-worker-1",
+    teamId: "agent-team-1",
+  };
+
+  it("keeps valid raw JSON on streams and safely omits invalid JSON values", () => {
+    const parsed = parseChatStreamEvent({
+      assistantMessageId: "assistant-1",
+      lifecycle: {
+        ...lifecycle,
+        result_json: { findings: ["No issues"], score: 1 },
+      },
+      type: "agent_task_lifecycle",
+    });
+    const invalid = parseChatStreamEvent({
+      assistantMessageId: "assistant-1",
+      lifecycle: { ...lifecycle, resultJson: Symbol("not-json") },
+      type: "agentTaskLifecycle",
+    });
+
+    expect(parsed).toMatchObject({
+      lifecycle: {
+        resultJson: { findings: ["No issues"], score: 1 },
+        resultPreview: "Review completed.",
+      },
+      type: "agentTaskLifecycle",
+    });
+    expect(invalid).toMatchObject({
+      lifecycle: {
+        resultJson: null,
+        resultPreview: "Review completed.",
+      },
+      type: "agentTaskLifecycle",
+    });
+  });
+
+  it("keeps old persisted lifecycle parts without raw JSON readable", () => {
+    const normalized = normalizeChatMessageSummary({
+      ...message("assistant-legacy-lifecycle"),
+      parts: [{ lifecycle, type: "agentTaskLifecycle" }],
+    });
+
+    expect(normalized.parts).toEqual([
+      {
+        lifecycle: { ...lifecycle, resultJson: null },
+        type: "agentTaskLifecycle",
+      },
+    ]);
+  });
+});
+
 describe("live context usage identity", () => {
   const estimate: ContextUsageResponse = {
     assembledMessageTokens: 100,

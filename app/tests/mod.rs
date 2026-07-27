@@ -2,7 +2,7 @@ use super::*;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     convert::Infallible,
 };
 
@@ -14823,13 +14823,13 @@ async fn terminal_delegated_tasks_project_then_resume_the_coordinator_with_a_fre
             (
                 &failed_task_id,
                 foco_agent::AgentTaskTransition::Fail,
-                None,
+                Some(r#"{"kind":"failed result"}"#),
                 Some(r#"{"message":"failed output"}"#),
             ),
             (
                 &cancelled_task_id,
                 foco_agent::AgentTaskTransition::Cancel,
-                None,
+                Some(r#"{"kind":"cancelled result"}"#),
                 Some(r#"{"message":"cancelled output"}"#),
             ),
         ] {
@@ -14894,6 +14894,23 @@ async fn terminal_delegated_tasks_project_then_resume_the_coordinator_with_a_fre
             .map(|event| event["lifecycle"]["status"].as_str().expect("status"))
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["cancelled", "completed", "failed"])
+    );
+    assert_eq!(
+        lifecycle_events
+            .iter()
+            .map(|event| {
+                (
+                    event["lifecycle"]["status"].as_str().expect("status"),
+                    event["lifecycle"]["resultJson"].clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>(),
+        BTreeMap::from([
+            ("cancelled", json!({ "kind": "cancelled result" })),
+            ("completed", json!({ "text": "completed output" })),
+            ("failed", json!({ "kind": "failed result" })),
+        ]),
+        "all terminal task statuses retain valid raw result JSON in lifecycle events"
     );
     assert_eq!(
         events

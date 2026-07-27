@@ -407,6 +407,7 @@ fn project_terminal_agent_task_lifecycle(
         started_at: task.started_at.clone(),
         completed_at: completed_at.clone(),
         duration_ms: timestamp_delta_ms(task.started_at.as_deref(), Some(&completed_at)),
+        result_json: agent_task_lifecycle_result_json(task.result_json.as_deref()),
         result_preview: lifecycle_preview(task.result_json.as_deref()),
         error_preview: lifecycle_preview(task.error_json.as_deref()),
     };

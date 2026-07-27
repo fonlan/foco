@@ -558,6 +558,8 @@ export type ChatAgentTaskLifecycle = {
   startedAt: string | null;
   completedAt: string;
   durationMs: number | null;
+  /** Raw structured result when the terminal task result was valid JSON. */
+  resultJson?: JsonValue | null;
   resultPreview?: string | null;
   errorPreview?: string | null;
 };
