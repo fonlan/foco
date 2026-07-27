@@ -43,7 +43,10 @@ fn main() {
             Ok(n) => {
                 total += n;
                 if total % (batch * 4) == 0 || n < batch {
-                    println!("migrated_rows={total} (+{n}) elapsed={:?}", started.elapsed());
+                    println!(
+                        "migrated_rows={total} (+{n}) elapsed={:?}",
+                        started.elapsed()
+                    );
                 }
             }
             Err(error) => {

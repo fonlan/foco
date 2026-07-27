@@ -1352,19 +1352,19 @@ impl WorkspaceDatabase {
         let mut migrated = 0usize;
         for (id, request_body, response_body) in rows {
             let request_locator = match request_body.as_deref() {
-                Some(body) if !body.trim().is_empty() => Some(self.audit_segments.append_detail(
-                    &self.connection,
-                    LlmAuditDetailKind::Request,
-                    body,
-                ).map_err(segment_error_to_workspace)?),
+                Some(body) if !body.trim().is_empty() => Some(
+                    self.audit_segments
+                        .append_detail(&self.connection, LlmAuditDetailKind::Request, body)
+                        .map_err(segment_error_to_workspace)?,
+                ),
                 _ => None,
             };
             let response_locator = match response_body.as_deref() {
-                Some(body) if !body.trim().is_empty() => Some(self.audit_segments.append_detail(
-                    &self.connection,
-                    LlmAuditDetailKind::Response,
-                    body,
-                ).map_err(segment_error_to_workspace)?),
+                Some(body) if !body.trim().is_empty() => Some(
+                    self.audit_segments
+                        .append_detail(&self.connection, LlmAuditDetailKind::Response, body)
+                        .map_err(segment_error_to_workspace)?,
+                ),
                 _ => None,
             };
             let transport = LlmRequestTransport::from_request_body_json(request_body.as_deref());
@@ -12029,12 +12029,8 @@ impl WorkspaceDatabase {
         outcome: UpdateLlmRequestOutcome<'_>,
     ) -> Result<(), WorkspaceDatabaseError> {
         let cache_ratio = validate_llm_request_outcome(&outcome)?;
-        let response_locator = prepare_outcome_response_locator(
-            &self.audit_segments,
-            &self.connection,
-            id,
-            &outcome,
-        )?;
+        let response_locator =
+            prepare_outcome_response_locator(&self.audit_segments, &self.connection, id, &outcome)?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -12067,12 +12063,8 @@ impl WorkspaceDatabase {
             .iter()
             .map(prepare_llm_request_event)
             .collect::<Result<Vec<_>, _>>()?;
-        let response_locator = prepare_outcome_response_locator(
-            &self.audit_segments,
-            &self.connection,
-            id,
-            &outcome,
-        )?;
+        let response_locator =
+            prepare_outcome_response_locator(&self.audit_segments, &self.connection, id, &outcome)?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection
@@ -12110,12 +12102,8 @@ impl WorkspaceDatabase {
             .iter()
             .map(prepare_llm_request_event)
             .collect::<Result<Vec<_>, _>>()?;
-        let response_locator = prepare_outcome_response_locator(
-            &self.audit_segments,
-            &self.connection,
-            id,
-            &outcome,
-        )?;
+        let response_locator =
+            prepare_outcome_response_locator(&self.audit_segments, &self.connection, id, &outcome)?;
         let database_path = self.database_path.clone();
         let transaction = self
             .connection

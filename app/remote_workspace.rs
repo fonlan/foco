@@ -7561,6 +7561,9 @@ async fn broker_llm_stream(
             return;
         }
     };
+    let temperature = (request_kind == BROKER_DEFAULT_LLM_REQUEST_KIND)
+        .then(|| crate::plan_mode_temperature(payload.get("sessionMode").and_then(Value::as_str)))
+        .flatten();
 
     let mut request = payload
         .get("request")
@@ -7746,7 +7749,10 @@ async fn broker_llm_stream(
                 stream_chat_with_capture_observer_runtime_options(
                     &provider_config,
                     request,
-                    foco_providers::ChatRequestRuntimeOptions { latency_mode },
+                    foco_providers::ChatRequestRuntimeOptions {
+                        latency_mode,
+                        temperature,
+                    },
                     save_details,
                     audit_writer.observer(),
                     broker_openai_resp_ws_session_context(
@@ -7770,7 +7776,10 @@ async fn broker_llm_stream(
             stream_chat_with_capture_observer_runtime_options(
                 &provider_config,
                 request,
-                foco_providers::ChatRequestRuntimeOptions { latency_mode },
+                foco_providers::ChatRequestRuntimeOptions {
+                    latency_mode,
+                    temperature,
+                },
                 save_details,
                 audit_writer.observer(),
                 broker_openai_resp_ws_session_context(
@@ -18794,6 +18803,7 @@ async fn run_remote_sidecar_chat_in_background(ctx: RemoteSidecarChatRunContext)
             "providerId": provider_id,
             "modelId": model_id,
             "latencyMode": latency_mode,
+            "sessionMode": session_mode,
             "request": broker_request,
         });
         let turn_text_start = text.len();

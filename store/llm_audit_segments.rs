@@ -105,29 +105,26 @@ impl LlmAuditSegmentStore {
         utf8_json: &str,
     ) -> Result<LlmAuditDetailLocator, LlmAuditSegmentError> {
         let uncompressed = utf8_json.as_bytes();
-        let uncompressed_len = u32::try_from(uncompressed.len()).map_err(|_| {
-            LlmAuditSegmentError::Corrupt {
+        let uncompressed_len =
+            u32::try_from(uncompressed.len()).map_err(|_| LlmAuditSegmentError::Corrupt {
                 path: self.segments_dir.clone(),
                 message: format!("detail payload too large ({} bytes)", uncompressed.len()),
-            }
-        })?;
+            })?;
         let mut hasher = Sha256::new();
         hasher.update(uncompressed);
         let digest = hasher.finalize();
         let sha256_hex = hex_encode(&digest);
 
-        let compressed = zstd::encode_all(uncompressed, 3).map_err(|source| {
-            LlmAuditSegmentError::Io {
+        let compressed =
+            zstd::encode_all(uncompressed, 3).map_err(|source| LlmAuditSegmentError::Io {
                 path: self.segments_dir.clone(),
                 source: io::Error::new(io::ErrorKind::Other, source),
-            }
-        })?;
-        let compressed_len = u32::try_from(compressed.len()).map_err(|_| {
-            LlmAuditSegmentError::Corrupt {
+            })?;
+        let compressed_len =
+            u32::try_from(compressed.len()).map_err(|_| LlmAuditSegmentError::Corrupt {
                 path: self.segments_dir.clone(),
                 message: format!("compressed detail too large ({} bytes)", compressed.len()),
-            }
-        })?;
+            })?;
 
         let (segment_id, file_name, mut file, start_offset) =
             self.open_active_segment_for_append(connection)?;
@@ -142,10 +139,11 @@ impl LlmAuditSegmentStore {
         record.extend_from_slice(&digest);
         record.extend_from_slice(&compressed);
 
-        file.write_all(&record).map_err(|source| LlmAuditSegmentError::Io {
-            path: self.segment_path(&file_name),
-            source,
-        })?;
+        file.write_all(&record)
+            .map_err(|source| LlmAuditSegmentError::Io {
+                path: self.segment_path(&file_name),
+                source,
+            })?;
         file.sync_all().map_err(|source| LlmAuditSegmentError::Io {
             path: self.segment_path(&file_name),
             source,
@@ -244,12 +242,11 @@ impl LlmAuditSegmentStore {
                 path: path.clone(),
                 source,
             })?;
-        let plain = zstd::decode_all(compressed.as_slice()).map_err(|source| {
-            LlmAuditSegmentError::Io {
+        let plain =
+            zstd::decode_all(compressed.as_slice()).map_err(|source| LlmAuditSegmentError::Io {
                 path: path.clone(),
                 source: io::Error::new(io::ErrorKind::InvalidData, source),
-            }
-        })?;
+            })?;
         if plain.len() != uncompressed_len as usize {
             return Err(LlmAuditSegmentError::Corrupt {
                 path: path.clone(),
@@ -307,12 +304,12 @@ impl LlmAuditSegmentStore {
                         path: path.clone(),
                         source,
                     })?;
-                let len = file
-                    .seek(SeekFrom::End(0))
-                    .map_err(|source| LlmAuditSegmentError::Io {
-                        path: path.clone(),
-                        source,
-                    })?;
+                let len =
+                    file.seek(SeekFrom::End(0))
+                        .map_err(|source| LlmAuditSegmentError::Io {
+                            path: path.clone(),
+                            source,
+                        })?;
                 if len < FILE_HEADER_LEN {
                     return Err(LlmAuditSegmentError::Corrupt {
                         path,
@@ -446,7 +443,8 @@ mod tests {
         let db_path = dir.path().join("meta.sqlite");
         let connection = setup_db(&db_path);
         let store = LlmAuditSegmentStore::open(dir.path()).expect("store");
-        let payload = r#"{"version":1,"format":"provider_request_v1","method":"POST","body":"hello"}"#;
+        let payload =
+            r#"{"version":1,"format":"provider_request_v1","method":"POST","body":"hello"}"#;
         let locator = store
             .append_detail(&connection, LlmAuditDetailKind::Request, payload)
             .expect("append");

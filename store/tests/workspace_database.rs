@@ -13934,16 +13934,38 @@ fn audits_mocked_llm_request_response_and_stream_events() {
                     request_detail_segment_id, response_detail_segment_id, transport
              FROM llm_requests WHERE id = 'request-1'",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .expect("locator row");
-    assert!(stored_request_text.is_none(), "request dump must not stay in SQLite TEXT");
-    assert!(stored_response_text.is_none(), "response dump must not stay in SQLite TEXT");
-    assert!(request_segment_id.is_some(), "request segment locator required");
-    assert!(response_segment_id.is_some(), "response segment locator required");
+    assert!(
+        stored_request_text.is_none(),
+        "request dump must not stay in SQLite TEXT"
+    );
+    assert!(
+        stored_response_text.is_none(),
+        "response dump must not stay in SQLite TEXT"
+    );
+    assert!(
+        request_segment_id.is_some(),
+        "request segment locator required"
+    );
+    assert!(
+        response_segment_id.is_some(),
+        "response segment locator required"
+    );
     assert_eq!(transport, "http");
     let segment_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM llm_audit_segments", [], |row| row.get(0))
+        .query_row("SELECT COUNT(*) FROM llm_audit_segments", [], |row| {
+            row.get(0)
+        })
         .expect("segment count");
     assert!(segment_count >= 1);
     let segment_files = std::fs::read_dir(workspace.path().join(".foco/llm-audit/segments"))

@@ -3820,6 +3820,7 @@ impl PreparedChatContext {
                             turn_request,
                             foco_providers::ChatRequestRuntimeOptions {
                                 latency_mode: self.latency_mode,
+                                temperature: plan_mode_temperature(self.session_mode.as_deref()),
                             },
                             api_audit_save_details(&self.global_config),
                             turn_capture.observer(),
@@ -11224,6 +11225,24 @@ fn collect_git_diff_file_stats(diff_text: &str, stats: &mut GitDiffStatsByFile) 
 struct GitDiffSummary {
     text: String,
     stats: CodeChangeStats,
+}
+
+const PLAN_MODE_TEMPERATURE: f64 = 0.7;
+
+pub(crate) fn plan_mode_temperature(session_mode: Option<&str>) -> Option<f64> {
+    (session_mode == Some("plan")).then_some(PLAN_MODE_TEMPERATURE)
+}
+
+#[cfg(test)]
+#[test]
+fn plan_mode_temperature_returns_override_for_plan_mode() {
+    assert_eq!(plan_mode_temperature(Some("plan")), Some(0.7));
+}
+
+#[cfg(test)]
+#[test]
+fn plan_mode_temperature_preserves_defaults_for_other_modes() {
+    assert_eq!(plan_mode_temperature(None), None);
 }
 
 fn maybe_git_diff_summary_for_session_mode(

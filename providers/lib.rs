@@ -1127,11 +1127,14 @@ pub enum LatencyMode {
 ///
 /// These parameters are intentionally separate from `NeutralChatRequest` so internal one-shot
 /// calls retain the default behavior unless an explicit user chat/agent run opts in.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ChatRequestRuntimeOptions {
     #[serde(default)]
     pub latency_mode: LatencyMode,
+    /// Optional per-request sampling override for user-visible chat runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
 }
 
 /// Return whether this provider route can expose the Fast latency mode for `model_id`.
@@ -2764,7 +2767,13 @@ fn genai_chat_options_with_runtime_options(
     let model_id = upstream_provider_model_id(&request.model_id, &config.model_redirects)?;
     // ponytail: model-id heuristic; add provider metadata if non-Claude ids ever contain "claude".
     let is_claude = model_id.to_ascii_lowercase().contains("claude");
-    let temperature = if is_claude { 1.0 } else { 0.0 };
+    let default_temperature = if is_claude { 1.0 } else { 0.0 };
+    let temperature = runtime_options.temperature.unwrap_or(default_temperature);
+    if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+        return Err(ProviderConfigError::InvalidRequest(format!(
+            "temperature must be a finite value between 0 and 2: {temperature}"
+        )));
+    }
     let mut options = ChatOptions::default()
         .with_temperature(temperature)
         .with_capture_usage(true)
@@ -5016,6 +5025,7 @@ mod tests {
     fn fast_latency_runtime_options_serialize_as_camel_case() {
         let value = serde_json::to_value(ChatRequestRuntimeOptions {
             latency_mode: LatencyMode::Fast,
+            temperature: None,
         })
         .expect("serialize runtime options");
 
@@ -5053,6 +5063,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                temperature: None,
             },
         )
         .expect("Fast should take precedence over service tier override");
@@ -5080,6 +5091,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                temperature: None,
             },
         )
         .expect_err("non-Responses adapters must reject Fast");
@@ -5392,6 +5404,7 @@ mod tests {
             &request,
             &ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                temperature: None,
             },
         )
         .expect("Fast options");
@@ -5432,6 +5445,7 @@ mod tests {
             request,
             ChatRequestRuntimeOptions {
                 latency_mode: LatencyMode::Fast,
+                temperature: None,
             },
             true,
         )
@@ -7279,6 +7293,31 @@ mod tests {
             Some("foco:workspace:chat")
         );
         assert_eq!(options.cache_control, Some(CacheControl::Ephemeral24h));
+    }
+
+    #[test]
+    fn runtime_temperature_override_replaces_model_default() {
+        let request = neutral_request(Vec::new());
+        let config = ProviderConnectionConfig {
+            kind: openai_responses_kind(),
+            base_url: None,
+            api_key: Some("sk-test".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+
+        let options = genai_chat_options_with_runtime_options(
+            &config,
+            &request,
+            &ChatRequestRuntimeOptions {
+                latency_mode: LatencyMode::Standard,
+                temperature: Some(0.7),
+            },
+        )
+        .expect("runtime temperature override should be accepted");
+
+        assert_eq!(options.temperature, Some(0.7));
     }
 
     #[test]
