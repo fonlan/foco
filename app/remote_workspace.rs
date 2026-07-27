@@ -698,14 +698,9 @@ impl RemoteSidecarRuntimeToolState {
         let retry_budget = ContextCompressionRetryBudget::from_configured_retry_count(
             remote_sidecar_llm_request_retry_count(state),
         );
-        let retry_started_at = Instant::now();
         let mut retries_used = 0;
         let (summary, resolved_provider_id, provider_request_id) = loop {
-            let attempt_deadline = ContextCompressionAttemptDeadline::new(
-                retry_budget
-                    .remaining_deadline(retry_started_at.elapsed())
-                    .unwrap_or_default(),
-            );
+            let attempt_deadline = retry_budget.attempt_deadline();
             let outcome = remote_sidecar_run_broker_context_compression_summary_with_deadline(
                 state,
                 Some(run_stream),
@@ -748,7 +743,6 @@ impl RemoteSidecarRuntimeToolState {
                         crate::provider_retry::ProviderRetryClass::NonRetryable,
                         retries_used,
                         retry_budget,
-                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
                         run_stream.is_cancel_requested() || run_stream.is_finished(),
                     );
                     tracing::warn!(
@@ -798,41 +792,17 @@ impl RemoteSidecarRuntimeToolState {
                     retry_class,
                     retry_after,
                 } => {
-                    let mut action = context_compression_failure_action(
+                    let action = context_compression_failure_action(
                         ContextCompressionMode::from(mode),
                         retry_class,
                         retries_used,
                         retry_budget,
-                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
                         run_stream.is_cancel_requested() || run_stream.is_finished(),
                     );
                     let next_retry_ordinal = retries_used.saturating_add(1);
-                    // Do not publish a retry that cannot be scheduled. A deadline can expire
-                    // between the initial policy decision and calculating the bounded backoff;
-                    // re-evaluate with the current remaining budget to produce the proper
-                    // Normal skip or RequiredOverflow terminal event.
                     let retry_delay = matches!(action, ContextCompressionFailureAction::Retry)
-                        .then(|| {
-                            retry_budget.retry_backoff(
-                                retry_class,
-                                retries_used,
-                                retry_started_at.elapsed(),
-                                retry_after,
-                            )
-                        })
+                        .then(|| retry_budget.retry_backoff(retry_class, retries_used, retry_after))
                         .flatten();
-                    if matches!(action, ContextCompressionFailureAction::Retry)
-                        && retry_delay.is_none()
-                    {
-                        action = context_compression_failure_action(
-                            ContextCompressionMode::from(mode),
-                            retry_class,
-                            retries_used,
-                            retry_budget,
-                            retry_budget.remaining_deadline(retry_started_at.elapsed()),
-                            run_stream.is_cancel_requested() || run_stream.is_finished(),
-                        );
-                    }
                     tracing::warn!(
                         workspace_id,
                         chat_id,
@@ -39485,7 +39455,6 @@ mod tests {
                 retry_class,
                 0,
                 budget,
-                Some(Duration::from_secs(1)),
                 false,
             ),
             ContextCompressionFailureAction::Retry

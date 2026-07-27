@@ -8,7 +8,8 @@ pub(crate) use assembly::{
     truncate_workspace_spec_markdown_for_prompt,
 };
 pub(crate) use compression::{
-    ContextUsageInput, DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT, LlmContextCompressionMode,
+    ContextUsageInput, DEFAULT_CONTEXT_COMPRESSION_SYSTEM_PROMPT,
+    DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT, LlmContextCompressionMode,
     active_compression_snapshots, active_llm_checkpoint_snapshot_ids,
     apply_compression_snapshot_to_messages, assistant_parts_checkpoint_replay_start_index,
     build_chunk_merge_checkpoint_messages, build_context_compression_summary_request,

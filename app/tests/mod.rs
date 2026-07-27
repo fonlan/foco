@@ -7672,7 +7672,7 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
     assert!(request.tools.is_empty());
     assert!(request.thinking_level.is_none());
     assert_eq!(request.max_output_tokens, Some(2048));
-    assert_eq!(request.messages.len(), 4);
+    assert_eq!(request.messages.len(), 5);
     assert_eq!(request.messages[0].role, NeutralChatRole::System);
     assert_eq!(
         request.messages[0].content,
@@ -7688,6 +7688,11 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
     );
     assert_eq!(request.messages[3].role, NeutralChatRole::Tool);
     assert!(request.messages[3].content.contains("fn main() {}"));
+    assert_eq!(request.messages[4].role, NeutralChatRole::User);
+    assert_eq!(
+        request.messages[4].content,
+        crate::prompt::DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT
+    );
     assert!(!request.messages.iter().any(|message| {
         message.content.contains("source ")
             || message.content.contains("tool calls: read_file")
@@ -7706,6 +7711,13 @@ fn build_context_compression_summary_request_uses_raw_neutral_messages() {
     assert_eq!(
         custom_request.messages[2].tool_calls[0].arguments,
         tool_call.arguments
+    );
+    assert_eq!(
+        custom_request
+            .messages
+            .last()
+            .map(|message| message.content.as_str()),
+        Some(crate::prompt::DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT)
     );
 }
 

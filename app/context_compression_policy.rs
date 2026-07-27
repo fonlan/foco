@@ -59,17 +59,17 @@ impl ContextCompressionFailureAction {
     }
 }
 
-/// Per-compression retry limits. The total deadline deliberately never exceeds the provider
-/// request deadline, and callers must give each attempt only the remaining duration.
+/// Per-compression retry limits. Each provider retry receives a fresh request deadline; the
+/// retry count remains the bound on the total number of attempts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextCompressionRetryBudget {
     pub(crate) max_retries: u32,
-    pub(crate) total_deadline: Duration,
+    attempt_timeout: Duration,
 }
 
-/// A deadline shared by every provider request that contributes to one compression attempt.
-/// Hierarchical compression can issue more than one request, so applying the timeout per request
-/// would silently exceed the retry budget.
+/// A deadline shared only by the provider requests within one high-level compression attempt.
+/// Hierarchical compression can issue multiple chunk/merge requests inside that attempt, while a
+/// transport retry starts a new attempt with a fresh deadline.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ContextCompressionAttemptDeadline {
     started_at: Instant,
@@ -102,29 +102,25 @@ impl ContextCompressionRetryBudget {
     pub(crate) fn from_configured_retry_count(configured_retry_count: u32) -> Self {
         Self {
             max_retries: configured_retry_count.min(CONTEXT_COMPRESSION_MAX_RETRIES),
-            total_deadline: Duration::from_millis(LLM_REQUEST_TIMEOUT_MS),
+            attempt_timeout: Duration::from_millis(LLM_REQUEST_TIMEOUT_MS),
         }
     }
 
-    pub(crate) fn remaining_deadline(self, elapsed: Duration) -> Option<Duration> {
-        self.total_deadline
-            .checked_sub(elapsed)
-            .filter(|remaining| !remaining.is_zero())
+    pub(crate) fn attempt_deadline(self) -> ContextCompressionAttemptDeadline {
+        ContextCompressionAttemptDeadline::new(self.attempt_timeout)
     }
 
     pub(crate) fn retry_backoff(
         self,
         class: ProviderRetryClass,
         retries_used: u32,
-        elapsed: Duration,
         retry_after: Option<Duration>,
     ) -> Option<Duration> {
-        let remaining = self.remaining_deadline(elapsed)?;
         provider_retry_backoff_for_class_with_retry_after(
             class,
             retries_used.saturating_add(1),
             retry_after,
-            Some(remaining),
+            None,
         )
     }
 }
@@ -137,16 +133,12 @@ pub(crate) fn context_compression_failure_action(
     retry_class: ProviderRetryClass,
     retries_used: u32,
     budget: ContextCompressionRetryBudget,
-    remaining_deadline: Option<Duration>,
     stop_requested: bool,
 ) -> ContextCompressionFailureAction {
     if stop_requested {
         return ContextCompressionFailureAction::Stop;
     }
-    if retry_class.is_retryable()
-        && retries_used < budget.max_retries
-        && remaining_deadline.is_some_and(|remaining| !remaining.is_zero())
-    {
+    if retry_class.is_retryable() && retries_used < budget.max_retries {
         return ContextCompressionFailureAction::Retry;
     }
     match mode {
@@ -172,7 +164,6 @@ mod tests {
                 ProviderRetryClass::TransientServer,
                 budget.max_retries,
                 budget,
-                Some(Duration::from_secs(1)),
                 false,
             ),
             ContextCompressionFailureAction::ContinueWithoutCompression
@@ -188,7 +179,6 @@ mod tests {
                 ProviderRetryClass::TransientServer,
                 budget.max_retries,
                 budget,
-                Some(Duration::from_secs(1)),
                 false,
             ),
             ContextCompressionFailureAction::FailRequiredOverflow
@@ -205,7 +195,6 @@ mod tests {
                 ProviderRetryClass::TransientServer,
                 0,
                 budget,
-                Some(Duration::from_secs(1)),
                 false,
             ),
             ContextCompressionFailureAction::Retry
@@ -216,7 +205,6 @@ mod tests {
                 ProviderRetryClass::NonRetryable,
                 0,
                 budget,
-                Some(Duration::from_secs(1)),
                 false,
             ),
             ContextCompressionFailureAction::ContinueWithoutCompression
@@ -232,7 +220,6 @@ mod tests {
                 ProviderRetryClass::Network,
                 0,
                 budget,
-                Some(Duration::from_secs(30)),
                 true,
             ),
             ContextCompressionFailureAction::Stop
@@ -240,21 +227,12 @@ mod tests {
     }
 
     #[test]
-    fn total_budget_and_backoff_never_exceed_the_provider_deadline() {
+    fn each_retry_receives_a_fresh_provider_request_deadline() {
         let budget = ContextCompressionRetryBudget::from_configured_retry_count(2);
-        assert_eq!(
-            budget.total_deadline,
-            Duration::from_millis(LLM_REQUEST_TIMEOUT_MS)
-        );
-        assert_eq!(budget.remaining_deadline(budget.total_deadline), None);
-        assert_eq!(
-            budget.retry_backoff(
-                ProviderRetryClass::RateLimit,
-                0,
-                budget.total_deadline - Duration::from_millis(10),
-                None,
-            ),
-            Some(Duration::from_millis(10))
-        );
+        let first = budget.attempt_deadline();
+        std::thread::sleep(Duration::from_millis(1));
+        let second = budget.attempt_deadline();
+
+        assert!(second.remaining() > first.remaining());
     }
 }

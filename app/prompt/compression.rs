@@ -546,54 +546,30 @@ async fn ensure_llm_context_compression(
     let retry_budget = ContextCompressionRetryBudget::from_configured_retry_count(
         context.global_config.app.llm_request_retry_count,
     );
-    let retry_started_at = Instant::now();
     let mut retries_used = 0;
     let summary = loop {
-        let attempt_deadline = ContextCompressionAttemptDeadline::new(
-            retry_budget
-                .remaining_deadline(retry_started_at.elapsed())
-                .unwrap_or_default(),
-        );
+        let attempt_deadline = retry_budget.attempt_deadline();
         match llm_context_compression_summary(context, &checkpoint_messages, attempt_deadline).await
         {
             Ok(summary) => break summary,
             Err(error) => {
-                let elapsed = retry_started_at.elapsed();
-                let remaining_deadline = retry_budget.remaining_deadline(elapsed);
-                let mut action = context_compression_failure_action(
+                let action = context_compression_failure_action(
                     ContextCompressionMode::from(mode),
                     error.retry_class,
                     retries_used,
                     retry_budget,
-                    remaining_deadline,
                     *context.app_shutdown_rx.borrow(),
                 );
                 let next_retry_ordinal = retries_used.saturating_add(1);
-                // Decide whether the backoff still fits before emitting `retrying`. The deadline
-                // can expire between the first policy decision and this calculation; in that
-                // case re-evaluate so Normal compression emits its terminal safe degradation
-                // instead of leaving a retrying card and failing the chat.
                 let retry_delay = matches!(action, ContextCompressionFailureAction::Retry)
                     .then(|| {
                         retry_budget.retry_backoff(
                             error.retry_class,
                             retries_used,
-                            retry_started_at.elapsed(),
                             error.retry_after,
                         )
                     })
                     .flatten();
-                if matches!(action, ContextCompressionFailureAction::Retry) && retry_delay.is_none()
-                {
-                    action = context_compression_failure_action(
-                        ContextCompressionMode::from(mode),
-                        error.retry_class,
-                        retries_used,
-                        retry_budget,
-                        retry_budget.remaining_deadline(retry_started_at.elapsed()),
-                        *context.app_shutdown_rx.borrow(),
-                    );
-                }
                 tracing::warn!(
                     workspace_id = %context.workspace_id,
                     chat_id = %context.chat_id,
@@ -934,6 +910,9 @@ Preserve:
 - Critical file paths, identifiers, data, and references
 - Current state and the immediate next actions";
 
+pub(crate) const DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT: &str =
+    "Create the context checkpoint summary now, following the system instructions above.";
+
 /// Effective compression System prompt: non-empty override, else built-in default.
 pub(crate) fn effective_context_compression_system_prompt(settings: &PromptSettings) -> &str {
     settings
@@ -956,6 +935,9 @@ pub(crate) fn compression_request_input_token_budget(
     context_window
         .saturating_sub(reserved_output)
         .saturating_sub(estimate_text_tokens(compression_system_prompt))
+        .saturating_sub(estimate_text_tokens(
+            DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT,
+        ))
         .saturating_sub(LLM_CONTEXT_COMPRESSION_REQUEST_SAFETY_TOKENS)
         .max(1)
 }
@@ -967,7 +949,8 @@ pub(crate) fn checkpoint_messages_estimated_tokens(messages: &[NeutralChatMessag
 
 /// Build the provider request used by local and remote LLM context checkpoint summaries.
 ///
-/// Shape: single System compression prompt + ordered raw checkpoint Neutral messages.
+/// Shape: single System compression prompt + ordered raw checkpoint Neutral messages + a final
+/// User instruction that explicitly requests the checkpoint summary.
 /// No main-request tools, hidden System/Developer prefixes, thinking, or prompt cache settings.
 pub(crate) fn build_context_compression_summary_request(
     model_id: &str,
@@ -985,12 +968,16 @@ pub(crate) fn build_context_compression_summary_request_with_prompt(
     checkpoint_messages: &[NeutralChatMessage],
     compression_system_prompt: &str,
 ) -> NeutralChatRequest {
-    let mut messages = Vec::with_capacity(checkpoint_messages.len().saturating_add(1));
+    let mut messages = Vec::with_capacity(checkpoint_messages.len().saturating_add(2));
     messages.push(neutral_text_message(
         NeutralChatRole::System,
         compression_system_prompt.to_string(),
     ));
     messages.extend(checkpoint_messages.iter().cloned());
+    messages.push(neutral_text_message(
+        NeutralChatRole::User,
+        DEFAULT_CONTEXT_COMPRESSION_USER_PROMPT.to_string(),
+    ));
     NeutralChatRequest {
         model_id: model_id.to_string(),
         messages,
