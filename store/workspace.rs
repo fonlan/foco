@@ -10712,6 +10712,46 @@ impl WorkspaceDatabase {
         Ok(())
     }
 
+    /// Insert a streaming producer event using the next durable sequence for
+    /// `run_id`. Sequence allocation and insert share one `IMMEDIATE`
+    /// transaction so concurrent writers (for example AgentTaskLifecycle
+    /// projection via [`Self::append_run_event_if_absent`]) cannot steal the
+    /// in-memory counter and trip `UNIQUE(run_id, sequence)`.
+    pub fn insert_run_event_appending_sequence(
+        &mut self,
+        chat_id: &str,
+        run_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM run_events WHERE run_id = ?1",
+                params![run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let id = format!("{run_id}-event-{sequence}");
+        transaction
+            .execute(
+                "INSERT INTO run_events
+                    (id, chat_id, run_id, sequence, event_type, payload_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![id, chat_id, run_id, sequence, event_type, payload_json, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(sequence)
+    }
+
     /// Appends a run event under the same immediate transaction that allocates
     /// its sequence. A stable event id makes asynchronous runtime projections
     /// idempotent without racing the streaming producer's next event.
@@ -10884,12 +10924,19 @@ impl WorkspaceDatabase {
     ///
     /// A previously consumed message is an idempotent no-op, preventing a duplicate live
     /// delivery from producing another run event or changing `consumed_at`.
+    /// Persist a live Agent-message guidance event and consume the message.
+    ///
+    /// Returns `Ok(None)` when the message was already consumed (idempotent).
+    /// Returns `Ok(Some(sequence))` with the durable run-event sequence when a
+    /// new event was inserted. Sequence is allocated inside the same
+    /// `IMMEDIATE` transaction as the insert so concurrent lifecycle
+    /// projections cannot collide with a stale producer counter.
     pub fn insert_agent_message_guidance_run_event_and_consume(
         &mut self,
         event: NewRunEvent<'_>,
         message_id: &AgentMessageId,
         source: &str,
-    ) -> Result<bool, WorkspaceDatabaseError> {
+    ) -> Result<Option<i64>, WorkspaceDatabaseError> {
         if event.event_type != "guidance_applied" {
             return Err(WorkspaceDatabaseError::InvalidAgentRuntimeData {
                 message: "agent message consumption requires a guidance_applied run event"
@@ -10939,19 +10986,27 @@ impl WorkspaceDatabase {
             transaction
                 .commit()
                 .map_err(|source| sqlite_error(&database_path, source))?;
-            return Ok(false);
+            return Ok(None);
         }
 
+        let sequence = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence) + 1, 0) FROM run_events WHERE run_id = ?1",
+                params![event.run_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let run_event_id = format!("{}-event-{sequence}", event.run_id);
         transaction
             .execute(
                 "INSERT INTO run_events
                     (id, chat_id, run_id, sequence, event_type, payload_json, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
-                    event.id,
+                    run_event_id,
                     event.chat_id,
                     event.run_id,
-                    event.sequence,
+                    sequence,
                     event.event_type,
                     event.payload_json,
                     now
@@ -10992,7 +11047,7 @@ impl WorkspaceDatabase {
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
-        Ok(true)
+        Ok(Some(sequence))
     }
 
     pub fn run_events_for_run(

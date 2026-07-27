@@ -21107,6 +21107,93 @@ fn active_chat_run_registration_continues_persisted_run_event_sequence() {
 }
 
 #[test]
+fn active_chat_run_record_event_survives_concurrent_lifecycle_sequence_steal() {
+    // Reproduces the post-subagent resume failure: lifecycle projection appends
+    // via MAX(sequence)+1 while the resumed producer still holds a stale
+    // in-memory next_sequence, which used to trip UNIQUE(run_id, sequence).
+    let registry = ActiveChatRunRegistry::default();
+    let workspace_dir = env::temp_dir().join(unique_id("foco-active-run-lifecycle-steal-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        database
+            .insert_chat("chat-1", "Lifecycle sequence steal")
+            .expect("chat insert");
+    }
+
+    let (guidance_tx, _guidance_rx) = mpsc::unbounded_channel();
+    let mut registration = registry
+        .register(
+            "run-1".to_string(),
+            "workspace-1".to_string(),
+            "chat-1".to_string(),
+            "assistant-1".to_string(),
+            1,
+            Vec::new(),
+            true,
+            0,
+            guidance_tx,
+        )
+        .expect("register active run");
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-1".to_string(),
+                delta: "before lifecycle".to_string(),
+                reasoning_duration_ms: None,
+            },
+        )
+        .expect("record producer event at sequence 0");
+
+    // Steal the next sequence the way AgentTaskLifecycle projection does.
+    {
+        let mut database =
+            WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+        let sequence = database
+            .append_run_event_if_absent(
+                "agent-task-lifecycle:child:completed",
+                "chat-1",
+                "run-1",
+                "agent_task_lifecycle",
+                r#"{"type":"agentTaskLifecycle","lifecycle":{"eventId":"agent-task-lifecycle:child:completed","status":"completed"}}"#,
+            )
+            .expect("lifecycle append")
+            .expect("lifecycle should allocate a new sequence");
+        assert_eq!(sequence, 1);
+    }
+
+    registration
+        .record_event(
+            &workspace_dir,
+            "chat-1",
+            &ChatSseEvent::TextDelta {
+                assistant_message_id: "assistant-1".to_string(),
+                delta: "after lifecycle".to_string(),
+                reasoning_duration_ms: None,
+            },
+        )
+        .expect("producer must allocate past the stolen lifecycle sequence");
+
+    let database = WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    let run_events = database
+        .run_events_for_run("run-1")
+        .expect("run events for run");
+    let sequences = run_events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    assert_eq!(sequences, vec![0, 1, 2]);
+    assert_eq!(run_events[1].event_type, "agent_task_lifecycle");
+    assert_eq!(run_events[2].event_type, "text_delta");
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn session_code_changed_files_counts_net_changes_from_session_baseline() {
     let workspace_dir = env::temp_dir().join(unique_id("foco-session-net-code-stats-test"));
     fs::create_dir_all(&workspace_dir).expect("workspace directory");

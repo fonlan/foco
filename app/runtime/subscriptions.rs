@@ -747,64 +747,65 @@ impl ActiveChatRunRegistration {
     ) -> Result<(), ApiError> {
         let captured = captured_event(event);
         let payload_json = captured.normalized_event_json;
-        let event_frame = ChatRunEventFrame {
-            sequence: self.next_sequence,
-            event_type: captured.event_type,
-            payload_json,
-        };
+        let event_type = captured.event_type;
 
-        let persisted = {
-            let mut database = open_workspace_database(workspace_path)?;
-            let run_event_id = format!("{}-event-{}", self.run_id, event_frame.sequence);
-            let persisted = match event {
-                ChatSseEvent::GuidanceApplied { id, source, .. }
-                    if source == crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE =>
-                {
-                    let message_id = AgentMessageId::new(id.clone()).map_err(|source| {
-                        ApiError::internal(format!("invalid Agent message guidance id: {source}"))
-                    })?;
-                    database
-                        .insert_agent_message_guidance_run_event_and_consume(
-                            NewRunEvent {
-                                id: &run_event_id,
-                                chat_id,
-                                run_id: &self.run_id,
-                                sequence: event_frame.sequence,
-                                event_type: &event_frame.event_type,
-                                payload_json: &event_frame.payload_json,
-                            },
-                            &message_id,
-                            crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE,
-                        )
-                        .map_err(ApiError::from_workspace_error)?
-                }
-                _ => {
-                    database
-                        .insert_run_event(NewRunEvent {
-                            id: &run_event_id,
+        // Allocate the durable sequence under the same SQLite writer lock as the
+        // insert. Lifecycle projection and other async appenders also allocate
+        // from MAX(sequence)+1; a stale in-memory counter here is what produced
+        // UNIQUE(run_id, sequence) failures after subagent resume.
+        let mut database = open_workspace_database(workspace_path)?;
+        let sequence = match event {
+            ChatSseEvent::GuidanceApplied { id, source, .. }
+                if source == crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE =>
+            {
+                let message_id = AgentMessageId::new(id.clone()).map_err(|source| {
+                    ApiError::internal(format!("invalid Agent message guidance id: {source}"))
+                })?;
+                // Placeholder id/sequence; the store reallocates both atomically.
+                let placeholder_id = format!("{}-event-pending", self.run_id);
+                match database
+                    .insert_agent_message_guidance_run_event_and_consume(
+                        NewRunEvent {
+                            id: &placeholder_id,
                             chat_id,
                             run_id: &self.run_id,
-                            sequence: event_frame.sequence,
-                            event_type: &event_frame.event_type,
-                            payload_json: &event_frame.payload_json,
-                        })
-                        .map_err(ApiError::from_workspace_error)?;
-                    true
-                }
-            };
-            if persisted && self.primary_chat_output {
-                self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
-                self.persist_tool_state_for_event(&mut database, chat_id, event)?;
-                if matches!(event, ChatSseEvent::ToolCall { .. }) {
-                    self.persist_assistant_draft(&mut database, chat_id)?;
+                            sequence: 0,
+                            event_type: &event_type,
+                            payload_json: &payload_json,
+                        },
+                        &message_id,
+                        crate::runtime::AGENT_MESSAGE_GUIDANCE_SOURCE,
+                    )
+                    .map_err(ApiError::from_workspace_error)?
+                {
+                    Some(sequence) => sequence,
+                    None => return Ok(()),
                 }
             }
-            persisted
+            _ => database
+                .insert_run_event_appending_sequence(
+                    chat_id,
+                    &self.run_id,
+                    &event_type,
+                    &payload_json,
+                )
+                .map_err(ApiError::from_workspace_error)?,
         };
-        if !persisted {
-            return Ok(());
+
+        if self.primary_chat_output {
+            self.persist_assistant_draft_for_event(&mut database, chat_id, event)?;
+            self.persist_tool_state_for_event(&mut database, chat_id, event)?;
+            if matches!(event, ChatSseEvent::ToolCall { .. }) {
+                self.persist_assistant_draft(&mut database, chat_id)?;
+            }
         }
-        self.next_sequence += 1;
+
+        self.next_sequence = sequence + 1;
+        let event_frame = ChatRunEventFrame {
+            sequence,
+            event_type,
+            payload_json,
+        };
 
         self.events
             .lock()

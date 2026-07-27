@@ -21362,7 +21362,7 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
             .is_empty()
     );
 
-    assert!(
+    assert_eq!(
         database
             .insert_agent_message_guidance_run_event_and_consume(
                 NewRunEvent {
@@ -21376,7 +21376,8 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
                 &message_id,
                 "agentMessage",
             )
-            .expect("persist live guidance")
+            .expect("persist live guidance"),
+        Some(0)
     );
     assert!(
         database
@@ -21389,6 +21390,7 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
     let events = database.run_events_for_run("run-guidance").expect("events");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, "run-guidance-event-0");
+    assert_eq!(events[0].sequence, 0);
     let consumed_events = database
         .agent_events_after(&team_id, -1)
         .expect("Agent events")
@@ -21398,8 +21400,8 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
     assert_eq!(consumed_events.len(), 1);
     assert_eq!(consumed_events[0].message_id.as_ref(), Some(&message_id));
 
-    assert!(
-        !database
+    assert_eq!(
+        database
             .insert_agent_message_guidance_run_event_and_consume(
                 NewRunEvent {
                     id: "run-guidance-event-1",
@@ -21412,7 +21414,8 @@ fn agent_message_guidance_consumption_is_atomic_and_idempotent() {
                 &message_id,
                 "agentMessage",
             )
-            .expect("duplicate live guidance is a no-op")
+            .expect("duplicate live guidance is a no-op"),
+        None
     );
     assert_eq!(
         database
