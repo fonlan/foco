@@ -663,6 +663,175 @@ describe("app agents verification surfaces", () => {
       "true",
     );
   });
+
+  it("keeps refreshing through the coordinator queued handoff after a worker completes", async () => {
+    const queuedSnapshot = {
+      ...agentTeamSnapshot,
+      instances: agentTeamSnapshot.instances.map((instance) =>
+        instance.id === "agent-instance-coordinator"
+          ? { ...instance, status: "idle" }
+          : instance,
+      ),
+      tasks: [
+        {
+          ...agentTeamSnapshot.tasks[0]!,
+          completedAt: null,
+          id: "agent-task-root",
+          originInstanceId: null,
+          ownerInstanceId: "agent-instance-coordinator",
+          parentTaskId: null,
+          result: null,
+          startedAt: "2026-06-05T10:00:01Z",
+          status: "queued",
+          updatedAt: "2026-06-05T10:00:06Z",
+        },
+      ],
+      workload: { queuedTasks: 1, runningTasks: 0, waitingTasks: 0 },
+    };
+    const runningSnapshot = {
+      ...queuedSnapshot,
+      instances: queuedSnapshot.instances.map((instance) =>
+        instance.id === "agent-instance-coordinator"
+          ? { ...instance, status: "running" }
+          : instance,
+      ),
+      tasks: queuedSnapshot.tasks.map((task) => ({
+        ...task,
+        status: "running",
+        updatedAt: "2026-06-05T10:00:07Z",
+      })),
+      workload: { queuedTasks: 0, runningTasks: 1, waitingTasks: 0 },
+    };
+    let serveRunningSnapshot = false;
+    let snapshotRequestCount = 0;
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          snapshotRequestCount += 1;
+          return jsonResponse(
+            serveRunningSnapshot ? runningSnapshot : queuedSnapshot,
+          );
+        }
+        return mockFetch(input, init);
+      },
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    expect(
+      await screen.findByLabelText("Agent status idle"),
+    ).toBeInTheDocument();
+
+    const requestsBeforeResume = snapshotRequestCount;
+    serveRunningSnapshot = true;
+
+    await waitFor(
+      () => expect(snapshotRequestCount).toBeGreaterThan(requestsBeforeResume),
+      { timeout: 2500 },
+    );
+    expect(
+      await screen.findByLabelText("Agent status running"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not let a late idle Agent snapshot overwrite a resumed coordinator", async () => {
+    const idleSnapshot = {
+      ...agentTeamSnapshot,
+      instances: agentTeamSnapshot.instances.map((instance) =>
+        instance.id === "agent-instance-coordinator"
+          ? { ...instance, status: "idle" }
+          : instance,
+      ),
+    };
+    const runningSnapshot = {
+      ...idleSnapshot,
+      instances: idleSnapshot.instances.map((instance) =>
+        instance.id === "agent-instance-coordinator"
+          ? { ...instance, status: "running" }
+          : instance,
+      ),
+    };
+    const staleRefresh = deferred<Response>();
+    const resumedRefresh = deferred<Response>();
+    let deferRefreshes = false;
+    let deferredRefreshCount = 0;
+    vi.mocked(fetch).mockImplementation(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.startsWith("http://127.0.0.1")
+          ? new URL(url).pathname
+          : url.split("?")[0];
+        if (path === "/api/workspaces/workspace-1/chats/chat-1/agent-team") {
+          if (!deferRefreshes) {
+            return jsonResponse(idleSnapshot);
+          }
+          deferredRefreshCount += 1;
+          return deferredRefreshCount === 1
+            ? staleRefresh.promise
+            : resumedRefresh.promise;
+        }
+        return mockFetch(input, init);
+      },
+    );
+    renderApp();
+
+    await userEvent.click(await screen.findByText("Tool run"));
+    await userEvent.click(await screen.findByRole("tab", { name: "Agents" }));
+    expect(
+      await screen.findByLabelText("Agent status idle"),
+    ).toBeInTheDocument();
+    await userEvent.type(
+      await screen.findByPlaceholderText(defaultComposerPlaceholder),
+      "delegate then resume",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    await waitFor(() =>
+      expect(appTestState.activeChatStreamController).not.toBeNull(),
+    );
+
+    deferRefreshes = true;
+    await act(async () => {
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        instanceId: "agent-instance-coordinator",
+        reason: "task_resumed",
+        revealPanel: false,
+        teamId: "agent-team-1",
+        type: "agentTeamRefresh",
+        workspaceId: "workspace-1",
+      });
+      enqueueChatStreamEvent({
+        chatId: "chat-1",
+        instanceId: "agent-instance-coordinator",
+        reason: "task_started",
+        revealPanel: false,
+        teamId: "agent-team-1",
+        type: "agentTeamRefresh",
+        workspaceId: "workspace-1",
+      });
+    });
+    await waitFor(() => expect(deferredRefreshCount).toBe(2));
+
+    await act(async () => {
+      resumedRefresh.resolve(jsonResponse(runningSnapshot));
+    });
+    expect(
+      await screen.findByLabelText("Agent status running"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      staleRefresh.resolve(jsonResponse(idleSnapshot));
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("Agent status running")).toBeInTheDocument(),
+    );
+  });
+
   it("shows active remote Agent team errors without white-screening", async () => {
     vi.mocked(fetch).mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();

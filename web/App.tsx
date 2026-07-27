@@ -1213,7 +1213,12 @@ type WorkspaceFileContextMenuState = {
 
 const LIVE_REASONING_DURATION_REFRESH_MS = 1000;
 const LIVE_CONTEXT_USAGE_REFRESH_MS = 5000;
-const AGENT_TEAM_RUNNING_REFRESH_MS = 1000;
+const AGENT_TEAM_UNSETTLED_REFRESH_MS = 1000;
+const UNSETTLED_AGENT_TASK_STATUSES = new Set([
+  "queued",
+  "running",
+  "waiting",
+]);
 /** Latest-page size when opening/switching chats or filling a missing cache. */
 export const CHAT_MESSAGES_INITIAL_PAGE_LIMIT = 60;
 /** Older-history page size when the user loads earlier messages. */
@@ -1867,6 +1872,13 @@ export function App() {
   const agentTeamSnapshotChatKeyRef = useRef<string | null>(null);
   const agentTeamSnapshotCacheRef = useRef(
     new Map<string, AgentTeamSnapshotResponse>(),
+  );
+  const agentTeamSnapshotRequestSequenceRef = useRef(0);
+  const latestAgentTeamSnapshotRequestByChatKeyRef = useRef(
+    new Map<string, number>(),
+  );
+  const loadingAgentTeamSnapshotRequestByChatKeyRef = useRef(
+    new Map<string, number>(),
   );
   const agentTranscriptViewCacheRef = useRef(
     new Map<string, AgentTranscriptViewCacheEntry>(),
@@ -3635,6 +3647,17 @@ export function App() {
       options?: { silent?: boolean },
     ) => {
       const requestedChatKey = chatRunKey(workspaceId, chatId);
+      const requestSequence =
+        agentTeamSnapshotRequestSequenceRef.current + 1;
+      agentTeamSnapshotRequestSequenceRef.current = requestSequence;
+      latestAgentTeamSnapshotRequestByChatKeyRef.current.set(
+        requestedChatKey,
+        requestSequence,
+      );
+      const isLatestAgentTeamRequest = () =>
+        latestAgentTeamSnapshotRequestByChatKeyRef.current.get(
+          requestedChatKey,
+        ) === requestSequence;
       const isCurrentAgentTeamRequest = () =>
         activeChatKeyRef.current === requestedChatKey;
       const silent =
@@ -3642,6 +3665,10 @@ export function App() {
         agentTeamSnapshotChatKeyRef.current === requestedChatKey;
 
       if (!silent) {
+        loadingAgentTeamSnapshotRequestByChatKeyRef.current.set(
+          requestedChatKey,
+          requestSequence,
+        );
         setIsLoadingAgentTeam(true);
       }
       setAgentTeamError(null);
@@ -3650,6 +3677,9 @@ export function App() {
         const data = await requestJson<AgentTeamSnapshotResponse>(
           `/api/workspaces/${encodeURIComponent(workspaceId)}/chats/${encodeURIComponent(chatId)}/agent-team`,
         );
+        if (!isLatestAgentTeamRequest()) {
+          return data;
+        }
         agentTeamSnapshotCacheRef.current.set(requestedChatKey, data);
         if (isCurrentAgentTeamRequest()) {
           agentTeamSnapshotChatKeyRef.current = requestedChatKey;
@@ -3658,7 +3688,7 @@ export function App() {
         return data;
       } catch (requestError) {
         const message = errorMessage(requestError);
-        if (isCurrentAgentTeamRequest()) {
+        if (isLatestAgentTeamRequest() && isCurrentAgentTeamRequest()) {
           if (!silent) {
             agentTeamSnapshotChatKeyRef.current = null;
             setAgentTeamSnapshot(null);
@@ -3669,8 +3699,18 @@ export function App() {
         }
         return null;
       } finally {
-        if (!silent && isCurrentAgentTeamRequest()) {
-          setIsLoadingAgentTeam(false);
+        if (
+          !silent &&
+          loadingAgentTeamSnapshotRequestByChatKeyRef.current.get(
+            requestedChatKey,
+          ) === requestSequence
+        ) {
+          loadingAgentTeamSnapshotRequestByChatKeyRef.current.delete(
+            requestedChatKey,
+          );
+          if (isCurrentAgentTeamRequest()) {
+            setIsLoadingAgentTeam(false);
+          }
         }
       }
     },
@@ -3783,17 +3823,19 @@ export function App() {
     isContextPanelOpen,
   ]);
 
-  const visibleAgentSnapshotHasRunningTask = Boolean(
+  const visibleAgentSnapshotHasUnsettledTask = Boolean(
     visibleAgentSnapshotTarget &&
     agentTeamSnapshot?.team.chatId === visibleAgentSnapshotTarget.chatId &&
-    agentTeamSnapshot.tasks.some((task) => task.status === "running"),
+    agentTeamSnapshot.tasks.some((task) =>
+      UNSETTLED_AGENT_TASK_STATUSES.has(task.status),
+    ),
   );
 
   useEffect(() => {
     if (
       !canUseApp ||
       !visibleAgentSnapshotTarget ||
-      !visibleAgentSnapshotHasRunningTask
+      !visibleAgentSnapshotHasUnsettledTask
     ) {
       return;
     }
@@ -3811,7 +3853,7 @@ export function App() {
             scheduleRefresh();
           }
         });
-      }, AGENT_TEAM_RUNNING_REFRESH_MS);
+      }, AGENT_TEAM_UNSETTLED_REFRESH_MS);
     };
 
     scheduleRefresh();
@@ -3824,7 +3866,7 @@ export function App() {
   }, [
     canUseApp,
     loadAgentTeamSnapshot,
-    visibleAgentSnapshotHasRunningTask,
+    visibleAgentSnapshotHasUnsettledTask,
     visibleAgentSnapshotTarget,
   ]);
 
