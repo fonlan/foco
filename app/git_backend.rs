@@ -1440,6 +1440,29 @@ fn repo_relative_path(
         .map(|path| path.display().to_string().replace('\\', "/"))
 }
 
+fn index_entry_mode_from_worktree(
+    repo: &gix::Repository,
+    repo_path: &str,
+) -> gix::index::entry::Mode {
+    #[cfg(not(unix))]
+    let _ = (repo, repo_path);
+
+    #[cfg(unix)]
+    {
+        let Some(path) = repo.workdir_path(repo_path.as_bytes().as_bstr()) else {
+            return gix::index::entry::Mode::FILE;
+        };
+        let Ok(metadata) = gix::index::fs::Metadata::from_path_no_follow(&path) else {
+            return gix::index::entry::Mode::FILE;
+        };
+        if metadata.is_file() && metadata.is_executable() {
+            return gix::index::entry::Mode::FILE_EXECUTABLE;
+        }
+    }
+
+    gix::index::entry::Mode::FILE
+}
+
 fn replace_index_entry_from_worktree(
     repo: &gix::Repository,
     index: &mut gix::index::File,
@@ -1451,6 +1474,7 @@ fn replace_index_entry_from_worktree(
         index.sort_entries();
         return Ok(());
     };
+    let mode = index_entry_mode_from_worktree(repo, repo_path);
     let id = repo
         .write_blob(bytes)
         .map_err(|source| ApiError::internal(format!("failed to write git blob: {source}")))?
@@ -1459,7 +1483,7 @@ fn replace_index_entry_from_worktree(
         Default::default(),
         id,
         gix::index::entry::Flags::from_stage(gix::index::entry::Stage::Unconflicted),
-        gix::index::entry::Mode::FILE,
+        mode,
         repo_path.as_bytes().as_bstr(),
     );
     index.sort_entries();
@@ -1670,6 +1694,49 @@ fn write_index_drops_stale_cache_tree_extension() {
         index.tree().is_none(),
         "Foco index writes must drop stale cache-tree data before mutating entries"
     );
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn stage_git_file_preserves_regular_file_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+
+    fs::write(workspace_path.join("a-data.txt"), "data\n").expect("non-executable file");
+    let executable_path = workspace_path.join("b-script.sh");
+    fs::write(&executable_path, "#!/bin/sh\n").expect("executable file");
+    fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o755))
+        .expect("set executable permission");
+
+    stage_git_file(workspace_path, "a-data.txt").expect("stage non-executable file");
+    stage_git_file(workspace_path, "b-script.sh").expect("stage executable file");
+
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["ls-files", "--stage"])
+        .output()
+        .expect("read index modes");
+    assert!(
+        output.status.success(),
+        "git ls-files --stage failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let index_output = String::from_utf8(output.stdout).expect("utf-8 index output");
+    let modes = index_output
+        .lines()
+        .map(|line| line.split_whitespace().next().expect("index mode"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(modes, ["100644", "100755"]);
 }
 
 #[cfg(test)]
