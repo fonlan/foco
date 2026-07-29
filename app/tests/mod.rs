@@ -108,11 +108,12 @@ use crate::memory_runtime::scheduler::{
 use crate::memory_runtime::{
     MemoryExtractionEvidenceCandidate, MemoryExtractionTask, MemorySearchToolInput,
     MemoryWriteToolInput, execute_memory_search_tool, execute_memory_write_tool,
-    llm_memory_retrieval_candidates, memory_extraction_existing_memory_candidates,
-    memory_extraction_provider_request, memory_extraction_target_status, memory_prompt_search,
-    memory_prompt_search_terms, memory_retrieval_query_text, neutral_messages_from_record,
-    parse_memory_extraction_output, parse_memory_retrieval_output, resolve_prompt_context_memory,
-    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
+    llm_memory_retrieval_candidates, memory_extraction_evidence_candidates,
+    memory_extraction_existing_memory_candidates, memory_extraction_provider_request,
+    memory_extraction_target_status, memory_prompt_search, memory_prompt_search_terms,
+    memory_retrieval_query_text, neutral_messages_from_record, parse_memory_extraction_output,
+    parse_memory_retrieval_output, resolve_prompt_context_memory, should_queue_memory_extraction,
+    store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 use crate::plan_auto_run::PlanAutoRunScheduler;
 use crate::prompt::{
@@ -25150,6 +25151,97 @@ fn memory_search_tool_respects_scope_and_reports_sources() {
 }
 
 #[test]
+fn memory_extraction_evidence_candidates_exclude_attached_tool_calls_and_results() {
+    let workspace_dir = env::temp_dir().join(unique_id("foco-memory-extract-evidence-test"));
+    fs::create_dir_all(&workspace_dir).expect("workspace directory");
+    let mut database =
+        WorkspaceDatabase::open_or_create(&workspace_dir).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Memory extraction")
+        .expect("chat insert");
+    database
+        .insert_message(NewMessage {
+            id: "user-1",
+            chat_id: "chat-1",
+            role: "user",
+            content: "Remember this preference.",
+            sequence: 0,
+            metadata_json: None,
+        })
+        .expect("user message insert");
+    database
+        .insert_message(NewMessage {
+            id: "assistant-1",
+            chat_id: "chat-1",
+            role: "assistant",
+            content: "I will keep it in mind.",
+            sequence: 1,
+            metadata_json: None,
+        })
+        .expect("assistant message insert");
+    database
+        .insert_tool_call(NewToolCall {
+            id: "tool-call-1",
+            chat_id: "chat-1",
+            run_id: "run-1",
+            message_id: Some("assistant-1"),
+            tool_name: "read_file",
+            input_json: r#"{"path":"secret-input.json"}"#,
+            status: "completed",
+            started_at: "2026-07-29T00:00:00Z",
+            completed_at: Some("2026-07-29T00:00:01Z"),
+        })
+        .expect("tool call insert");
+    database
+        .insert_tool_result(NewToolResult {
+            id: "tool-result-1",
+            tool_call_id: "tool-call-1",
+            output_json: r#"{"content":"secret-output"}"#,
+            is_error: false,
+            created_at: "2026-07-29T00:00:01Z",
+        })
+        .expect("tool result insert");
+
+    let evidence =
+        memory_extraction_evidence_candidates(&database, "chat-1", "user-1", "assistant-1")
+            .expect("memory extraction evidence");
+    let request = memory_extraction_provider_request(
+        "model-1",
+        "workspace-1",
+        "chat-1",
+        "run-1",
+        "provider-1",
+        "en-US",
+        512,
+        &evidence,
+        &[],
+        DEFAULT_MEMORY_EXTRACTION_SYSTEM_PROMPT,
+    )
+    .expect("memory extraction request");
+
+    assert_eq!(
+        evidence
+            .iter()
+            .map(|item| item.evidence_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["user_message", "assistant_message"]
+    );
+    assert!(evidence.iter().all(|item| {
+        matches!(
+            item.source_type,
+            MemorySourceType::ChatMessage | MemorySourceType::AssistantMessage
+        )
+    }));
+    assert!(!request.messages[1].content.contains("tool_call"));
+    assert!(!request.messages[1].content.contains("tool_result"));
+    assert!(!request.messages[1].content.contains("secret-input.json"));
+    assert!(!request.messages[1].content.contains("secret-output"));
+
+    drop(database);
+    fs::remove_dir_all(workspace_dir).expect("remove workspace directory");
+}
+
+#[test]
 fn memory_extraction_request_includes_existing_candidates_and_strict_prompt_rules() {
     let evidence = vec![MemoryExtractionEvidenceCandidate {
         evidence_id: "user_message".to_string(),
@@ -25222,12 +25314,12 @@ fn memory_extraction_request_truncates_large_evidence_content() {
         "x".repeat(MEMORY_EXTRACTION_MAX_EVIDENCE_CONTENT_CHARS + 64)
     );
     let evidence = vec![MemoryExtractionEvidenceCandidate {
-        evidence_id: "tool_result_1".to_string(),
-        source_type: MemorySourceType::ToolResult,
-        source_id: "result-1".to_string(),
-        title: "Tool result read_file".to_string(),
+        evidence_id: "assistant_message".to_string(),
+        source_type: MemorySourceType::AssistantMessage,
+        source_id: "assistant-1".to_string(),
+        title: "Assistant message".to_string(),
         content: large_content,
-        metadata: json!({"toolName":"read_file"}),
+        metadata: json!({"role":"assistant"}),
     }];
 
     let request = memory_extraction_provider_request(

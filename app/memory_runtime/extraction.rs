@@ -395,7 +395,6 @@ pub(crate) async fn run_memory_extraction_job_inner(
         memory_extraction_evidence_candidates(
             &workspace_database,
             &task.chat_id,
-            &task.run_id,
             &task.user_message_id,
             &task.assistant_message_id,
         )?
@@ -488,7 +487,6 @@ pub(crate) async fn run_memory_extraction_job_inner(
 pub(crate) fn memory_extraction_evidence_candidates(
     database: &WorkspaceDatabase,
     chat_id: &str,
-    run_id: &str,
     user_message_id: &str,
     assistant_message_id: &str,
 ) -> Result<Vec<MemoryExtractionEvidenceCandidate>, ApiError> {
@@ -522,54 +520,15 @@ pub(crate) fn memory_extraction_evidence_candidates(
             evidence.push(MemoryExtractionEvidenceCandidate {
                 evidence_id: "assistant_message".to_string(),
                 source_type: MemorySourceType::AssistantMessage,
-                source_id: message.id.clone(),
+                source_id: message.id,
                 title: "Assistant message".to_string(),
-                content: message.content.clone(),
+                content: message.content,
                 metadata: json!({
                     "role": &message.role,
                     "sequence": message.sequence,
                     "createdAt": &message.created_at,
                 }),
             });
-            let tool_calls = database
-                .tool_calls_for_message(&message.id)
-                .map_err(ApiError::from_workspace_error)?;
-            for (index, tool_call) in tool_calls
-                .into_iter()
-                .filter(|tool_call| tool_call.run_id == run_id)
-                .enumerate()
-            {
-                let call_evidence_id = format!("tool_call_{index}");
-                evidence.push(MemoryExtractionEvidenceCandidate {
-                    evidence_id: call_evidence_id,
-                    source_type: MemorySourceType::ToolCall,
-                    source_id: tool_call.id.clone(),
-                    title: format!("Tool call {}", tool_call.tool_name),
-                    content: tool_call.input_json.clone(),
-                    metadata: json!({
-                        "toolName": &tool_call.tool_name,
-                        "status": &tool_call.status,
-                        "startedAt": &tool_call.started_at,
-                        "completedAt": &tool_call.completed_at,
-                    }),
-                });
-
-                if let Some(result) = tool_call.result {
-                    evidence.push(MemoryExtractionEvidenceCandidate {
-                        evidence_id: format!("tool_result_{index}"),
-                        source_type: MemorySourceType::ToolResult,
-                        source_id: result.id,
-                        title: format!("Tool result {}", tool_call.tool_name),
-                        content: result.output_json,
-                        metadata: json!({
-                            "toolCallId": &tool_call.id,
-                            "toolName": &tool_call.tool_name,
-                            "isError": result.is_error,
-                            "createdAt": &result.created_at,
-                        }),
-                    });
-                }
-            }
         }
     }
 

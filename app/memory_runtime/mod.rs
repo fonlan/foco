@@ -8,10 +8,10 @@ mod tools;
 pub(crate) use expiration::{apply_memory_expiration_to_fact, expire_due_memories};
 #[cfg(test)]
 pub(crate) use extraction::{
-    MemoryExtractionEvidenceCandidate, memory_extraction_existing_memory_candidates,
-    memory_extraction_provider_request, memory_extraction_target_status,
-    parse_memory_extraction_output, should_queue_memory_extraction, store_extracted_memory_facts,
-    validate_extracted_memory_facts,
+    MemoryExtractionEvidenceCandidate, memory_extraction_evidence_candidates,
+    memory_extraction_existing_memory_candidates, memory_extraction_provider_request,
+    memory_extraction_target_status, parse_memory_extraction_output,
+    should_queue_memory_extraction, store_extracted_memory_facts, validate_extracted_memory_facts,
 };
 pub(crate) use extraction::{
     MemoryExtractionTask, call_memory_retrieval_provider,
