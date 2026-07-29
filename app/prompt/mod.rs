@@ -36,8 +36,7 @@ pub(crate) use compression::{
 #[allow(unused_imports)]
 pub(crate) use compression::{
     PreparedContextCompressionSnapshot, build_context_compression_snapshot_record,
-    insert_context_compression_snapshot_record, next_context_compression_snapshot_sequence,
-    prepare_context_compression_snapshot,
+    insert_context_compression_snapshot_record, prepare_context_compression_snapshot,
 };
 pub(crate) use environment::environment_context_message;
 #[cfg(all(not(windows), not(target_os = "macos")))]

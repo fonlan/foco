@@ -1469,6 +1469,19 @@ pub struct NewContextCompressionSnapshot<'a> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewContextCompressionSnapshotUnsequenced<'a> {
+    pub id: &'a str,
+    pub chat_id: &'a str,
+    pub run_id: &'a str,
+    pub summary: &'a str,
+    pub source_message_start_sequence: i64,
+    pub source_message_end_sequence: i64,
+    pub original_token_count: i64,
+    pub summary_token_count: i64,
+    pub metadata_json: Option<&'a str>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextCompressionSnapshotRecord {
     pub id: String,
     pub chat_id: String,

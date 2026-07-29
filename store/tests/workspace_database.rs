@@ -32,12 +32,12 @@ use foco_store::{
         NewAgentContextSnapshot, NewAgentEvent, NewAgentInstance, NewAgentMessage, NewAgentTask,
         NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot, NewCodeGraphEdge,
         NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphReference, NewCodeGraphSymbol,
-        NewContextCompressionSnapshot, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan,
-        NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection,
-        NewRunEvent, NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall,
-        NewToolResult, NewWorkspaceSpecJob, PlanListFilter, PlanListOrder, PlanPatch,
-        PlanPhaseAttemptConflictReason, PlanPhaseAttemptTrigger, PlanStepPatch,
-        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+        NewContextCompressionSnapshot, NewContextCompressionSnapshotUnsequenced, NewLlmRequest,
+        NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects,
+        NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
+        NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
+        PlanListOrder, PlanPatch, PlanPhaseAttemptConflictReason, PlanPhaseAttemptTrigger,
+        PlanStepPatch, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
         QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL, RegisterAgentTaskWaitDependencies,
         RemotePreStreamFailureClosureOutcome, RemoteQueuedRunClaimOutcome,
         RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
@@ -11819,6 +11819,55 @@ fn repository_helpers_round_trip_core_records() {
     assert_eq!(snapshots[0].summary, "Earlier conversation summary.");
     assert_eq!(snapshots[0].original_token_count, 120);
     assert_eq!(snapshots[0].summary_token_count, 8);
+}
+
+#[test]
+fn allocates_context_compression_snapshot_sequence_inside_the_write_transaction() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-snapshot-sequence", "Snapshot sequence")
+        .expect("chat insert");
+    drop(database);
+
+    let workspace_path = workspace.path().to_path_buf();
+    let barrier = Arc::new(Barrier::new(2));
+    let workers = (0..2)
+        .map(|index| {
+            let workspace_path = workspace_path.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut database = WorkspaceDatabase::open_or_create_ungated(&workspace_path)
+                    .expect("worker workspace database");
+                let id = format!("snapshot-{index}");
+                let run_id = format!("run-{index}");
+                barrier.wait();
+                database
+                    .insert_context_compression_snapshot_allocating_sequence(
+                        NewContextCompressionSnapshotUnsequenced {
+                            id: &id,
+                            chat_id: "chat-snapshot-sequence",
+                            run_id: &run_id,
+                            summary: "summary",
+                            source_message_start_sequence: 0,
+                            source_message_end_sequence: 0,
+                            original_token_count: 10,
+                            summary_token_count: 2,
+                            metadata_json: None,
+                        },
+                    )
+                    .expect("atomic snapshot insert")
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut allocated_sequences = workers
+        .into_iter()
+        .map(|worker| worker.join().expect("snapshot worker"))
+        .collect::<Vec<_>>();
+    allocated_sequences.sort_unstable();
+
+    assert_eq!(allocated_sequences, vec![0, 1]);
 }
 
 #[test]

@@ -6,7 +6,8 @@ use foco_providers::{
 };
 use foco_store::config::PromptSettings;
 use foco_store::workspace::{
-    ContextCompressionSnapshotRecord, NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
+    ContextCompressionSnapshotRecord, NewContextCompressionSnapshotUnsequenced,
+    NewPlanPhaseDerivedEffects, ToolCallWithResultRecord,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -2085,7 +2086,6 @@ pub(crate) fn prepare_context_compression_snapshot(
     message_source_sequences: &[Option<i64>],
     message_context_sources: &[PromptContextSource],
     active_tool_start_index: usize,
-    compression_snapshots: &[ContextCompressionSnapshotRecord],
     context_budget: &foco_agent::ContextBudget,
     covered_indices: &[usize],
     summary: String,
@@ -2094,12 +2094,12 @@ pub(crate) fn prepare_context_compression_snapshot(
     mut metadata: Value,
 ) -> Result<PreparedContextCompressionSnapshot, ApiError> {
     let snapshot_id = unique_id("ctx");
-    let snapshot_sequence = next_context_snapshot_sequence(compression_snapshots)?;
     let mut snapshot = build_context_compression_snapshot_record(
         snapshot_id,
         chat_id.to_string(),
         run_id.to_string(),
-        snapshot_sequence,
+        // The store owns allocation so concurrent compression runs cannot reuse a stale sequence.
+        0,
         summary.clone(),
         message_source_sequences,
         covered_indices,
@@ -2130,25 +2130,30 @@ pub(crate) fn prepare_context_compression_snapshot(
     })
 }
 
-/// Insert a prepared snapshot into an already-open workspace database.
+/// Persist a prepared snapshot and replace its provisional sequence with the
+/// sequence allocated atomically by the workspace database.
 pub(crate) fn insert_context_compression_snapshot_record(
     database: &mut WorkspaceDatabase,
-    prepared: &PreparedContextCompressionSnapshot,
+    prepared: &mut PreparedContextCompressionSnapshot,
 ) -> Result<(), ApiError> {
-    database
-        .insert_context_compression_snapshot(NewContextCompressionSnapshot {
-            id: &prepared.snapshot.id,
-            chat_id: &prepared.snapshot.chat_id,
-            run_id: &prepared.snapshot.run_id,
-            sequence: prepared.snapshot.sequence,
-            summary: &prepared.summary,
-            source_message_start_sequence: prepared.snapshot.source_message_start_sequence,
-            source_message_end_sequence: prepared.snapshot.source_message_end_sequence,
-            original_token_count: prepared.snapshot.original_token_count,
-            summary_token_count: prepared.snapshot.summary_token_count,
-            metadata_json: Some(&prepared.snapshot.metadata_json),
-        })
-        .map_err(ApiError::from_workspace_error)
+    let sequence = database
+        .insert_context_compression_snapshot_allocating_sequence(
+            NewContextCompressionSnapshotUnsequenced {
+                id: &prepared.snapshot.id,
+                chat_id: &prepared.snapshot.chat_id,
+                run_id: &prepared.snapshot.run_id,
+                summary: &prepared.summary,
+                source_message_start_sequence: prepared.snapshot.source_message_start_sequence,
+                source_message_end_sequence: prepared.snapshot.source_message_end_sequence,
+                original_token_count: prepared.snapshot.original_token_count,
+                summary_token_count: prepared.snapshot.summary_token_count,
+                metadata_json: Some(&prepared.snapshot.metadata_json),
+            },
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    prepared.snapshot.sequence = sequence;
+
+    Ok(())
 }
 
 fn persist_context_compression_snapshot(
@@ -2160,14 +2165,13 @@ fn persist_context_compression_snapshot(
     kind: &str,
     metadata: Value,
 ) -> Result<ContextCompressionSnapshotRecord, ApiError> {
-    let prepared = prepare_context_compression_snapshot(
+    let mut prepared = prepare_context_compression_snapshot(
         &context.chat_id,
         &context.llm_request_id,
         &context.provider_request.messages,
         &context.message_source_sequences,
         &context.message_context_sources,
         context.active_tool_start_index,
-        &context.compression_snapshots,
         &context.context_budget,
         covered_indices,
         summary,
@@ -2178,7 +2182,7 @@ fn persist_context_compression_snapshot(
 
     let mut database = WorkspaceDatabase::open_or_create(&context.workspace_path)
         .map_err(ApiError::from_workspace_error)?;
-    insert_context_compression_snapshot_record(&mut database, &prepared)?;
+    insert_context_compression_snapshot_record(&mut database, &mut prepared)?;
 
     context.provider_request.messages = prepared.replaced.messages;
     context.message_source_sequences = prepared.replaced.message_source_sequences;
@@ -3134,25 +3138,6 @@ fn compressed_active_tool_start_index(
         .is_some_and(|index| *index < active_tool_start_index);
 
     active_tool_start_index - removed_before_active_tool + usize::from(inserted_before_active_tool)
-}
-
-fn next_context_snapshot_sequence(
-    snapshots: &[ContextCompressionSnapshotRecord],
-) -> Result<i64, ApiError> {
-    let last = snapshots
-        .iter()
-        .map(|snapshot| snapshot.sequence)
-        .max()
-        .unwrap_or(-1);
-    last.checked_add(1)
-        .ok_or_else(|| ApiError::internal("context compression snapshot sequence overflowed"))
-}
-
-#[allow(dead_code)]
-pub(crate) fn next_context_compression_snapshot_sequence(
-    snapshots: &[ContextCompressionSnapshotRecord],
-) -> Result<i64, ApiError> {
-    next_context_snapshot_sequence(snapshots)
 }
 
 fn neutral_role_label(role: &NeutralChatRole) -> &'static str {

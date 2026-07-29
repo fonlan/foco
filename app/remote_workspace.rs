@@ -974,14 +974,13 @@ impl RemoteSidecarRuntimeToolState {
             }
             metadata
         };
-        let prepared = match prepare_context_compression_snapshot(
+        let mut prepared = match prepare_context_compression_snapshot(
             chat_id,
             run_id,
             messages,
             &self.message_source_sequences,
             &self.message_context_sources,
             self.active_tool_start_index,
-            &self.compression_snapshots,
             &self.context_budget,
             &covered_indices,
             summary,
@@ -1021,7 +1020,7 @@ impl RemoteSidecarRuntimeToolState {
         if let Err(error) = (|| {
             let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
                 .map_err(ApiError::from_workspace_error)?;
-            insert_context_compression_snapshot_record(&mut database, &prepared)
+            insert_context_compression_snapshot_record(&mut database, &mut prepared)
         })() {
             let failed_event = remote_sidecar_snapshot_persistence_failure_event(
                 events[compression_start_event_index].clone(),

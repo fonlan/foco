@@ -70,14 +70,14 @@ pub use workspace_records::{
     NewAgentTaskDependency, NewAgentTeam, NewChatSpecSnapshot, NewCodeGraphEdge,
     NewCodeGraphFileIndex, NewCodeGraphImport, NewCodeGraphImportResolution,
     NewCodeGraphImportResolutionCandidate, NewCodeGraphReference, NewCodeGraphResolvedCall,
-    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewHookRun, NewLlmRequest,
-    NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase, NewPlanPhaseDerivedEffects, NewPlanStep,
-    NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
-    NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob,
-    PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord, PlanListFilter,
-    PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord, PlanPhaseDerivedEffectsRecord,
-    PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord,
-    PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+    NewCodeGraphSymbol, NewContextCompressionSnapshot, NewContextCompressionSnapshotUnsequenced,
+    NewHookRun, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewPlan, NewPlanPhase,
+    NewPlanPhaseDerivedEffects, NewPlanStep, NewPromptContextInjection, NewRunEvent,
+    NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
+    NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
+    PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
+    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
+    PlanWorktreeAuditRecord, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
     PreStreamFailureMaterialization, PromptContextInjectionRecord, QueueCoordinatorChatMessage,
     RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
     RewriteChatFromUserMessageResult, RunEventRecord, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
@@ -13603,6 +13603,74 @@ impl WorkspaceDatabase {
             .map_err(|source| self.sqlite_error(source))?;
 
         Ok(())
+    }
+
+    /// Allocates and persists the next snapshot sequence for one chat atomically.
+    ///
+    /// Compression runs may prepare from an out-of-date in-memory snapshot list,
+    /// so the sequence must be allocated while holding SQLite's write reservation.
+    pub fn insert_context_compression_snapshot_allocating_sequence(
+        &mut self,
+        snapshot: NewContextCompressionSnapshotUnsequenced<'_>,
+    ) -> Result<i64, WorkspaceDatabaseError> {
+        let metadata_json = snapshot.metadata_json.unwrap_or("{}");
+        let created_at = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let last_sequence: Option<i64> = transaction
+            .query_row(
+                "SELECT MAX(sequence)
+                 FROM context_compression_snapshots
+                 WHERE chat_id = ?1",
+                params![snapshot.chat_id],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let sequence =
+            match last_sequence {
+                Some(sequence) => sequence.checked_add(1).ok_or_else(|| {
+                    WorkspaceDatabaseError::InvalidAuditData {
+                        message: format!(
+                            "context compression snapshot sequence overflowed for chat '{}'",
+                            snapshot.chat_id
+                        ),
+                    }
+                })?,
+                None => 0,
+            };
+
+        transaction
+            .execute(
+                "INSERT INTO context_compression_snapshots
+                    (
+                        id, chat_id, run_id, sequence, summary,
+                        source_message_start_sequence, source_message_end_sequence,
+                        original_token_count, summary_token_count, created_at, metadata_json
+                    )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    snapshot.id,
+                    snapshot.chat_id,
+                    snapshot.run_id,
+                    sequence,
+                    snapshot.summary,
+                    snapshot.source_message_start_sequence,
+                    snapshot.source_message_end_sequence,
+                    snapshot.original_token_count,
+                    snapshot.summary_token_count,
+                    created_at,
+                    metadata_json
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+
+        Ok(sequence)
     }
 
     pub fn context_compression_snapshots_for_chat(
