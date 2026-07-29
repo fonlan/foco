@@ -5565,7 +5565,7 @@ describe("app-chat-stream verification surfaces", () => {
     ).toBeGreaterThan(1);
   });
 
-  it("preserves a lifecycle block across waiting reattach and resumed output", async () => {
+  it("automatically reattaches the same durable run after coordinator waiting resumes", async () => {
     const assistantMessageId = "message-assistant-stream";
     const historyUserMessageId = "message-user-waiting-history";
     const lifecycle = {
@@ -5680,7 +5680,7 @@ describe("app-chat-stream verification surfaces", () => {
                   acceptingGuidance: true,
                   chatId: "chat-1",
                   lastSequence: 12,
-                  runId: "request-stream-resumed",
+                  runId: "request-stream",
                   workspaceId: "workspace-1",
                 }
               : null,
@@ -5689,13 +5689,13 @@ describe("app-chat-stream verification surfaces", () => {
       }
       if (
         path ===
-        "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream"
+        "/api/workspaces/workspace-1/chat/runs/request-stream/stream"
       ) {
         const encoder = new TextEncoder();
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             appTestState.chatStreamControllers.set(
-              "request-stream-resumed",
+              "request-stream",
               controller,
             );
             appTestState.activeChatStreamController = controller;
@@ -5704,7 +5704,7 @@ describe("app-chat-stream verification surfaces", () => {
                 `id: 13\ndata: ${JSON.stringify({
                   assistantMessageId,
                   chatId: "chat-1",
-                  llmRequestId: "request-stream-resumed",
+                  llmRequestId: "request-stream",
                   memoriesUsed: [],
                   type: "start",
                   userMessageId: "message-user-stream",
@@ -5783,6 +5783,7 @@ describe("app-chat-stream verification surfaces", () => {
         assistantMessageId,
         isError: false,
         output: { waiting: true, suspend: true },
+        terminal: false,
         toolCallId: "call-wait-reattach",
         type: "toolResult",
       });
@@ -5821,8 +5822,9 @@ describe("app-chat-stream verification surfaces", () => {
       ).size,
     ).toBe(1);
 
-    // The provider turn ends while the coordinator remains durably waiting; the
-    // next attempt receives a distinct run id for the same assistant turn.
+    // The provider turn ends while the coordinator remains durably waiting. The
+    // scheduler later attaches the next Coordinator attempt to the same durable
+    // Agent task run id, which is the identity exposed by the real backend.
     reattachActiveRun = true;
     appTestState.workspaceResponseWorkspaces = [
       {
@@ -5835,7 +5837,7 @@ describe("app-chat-stream verification surfaces", () => {
                   acceptingGuidance: true,
                   chatId: "chat-1",
                   lastSequence: 12,
-                  runId: "request-stream-resumed",
+                  runId: "request-stream",
                   workspaceId: "workspace-1",
                 },
                 queuedRun: {
@@ -5866,25 +5868,16 @@ describe("app-chat-stream verification surfaces", () => {
       ).not.toBeInTheDocument(),
     );
 
-    // Reopen the chat and take the GET reattach path for that later attempt.
-
-    await userEvent.click(await screen.findByText("Second chat"));
-    expect(await screen.findByText("Second answer.")).toBeInTheDocument();
-    await userEvent.click(
-      screen.getByRole("button", { name: "Refresh workspaces" }),
-    );
-    const workspaceList = await screen.findByRole("navigation", {
-      name: "Workspace list",
-    });
-    await userEvent.click(within(workspaceList).getByText("Tool run"));
-
+    // No tab switch, chat reload, or user-triggered workspace refresh is allowed:
+    // the terminal stream handoff must discover the same durable active run and
+    // begin its GET subscription on its own.
     await waitFor(() => {
       expect(
         fetchMock.mock.calls.some(
           ([url]) =>
             typeof url === "string" &&
             url.includes(
-              "/api/workspaces/workspace-1/chat/runs/request-stream-resumed/stream",
+              "/api/workspaces/workspace-1/chat/runs/request-stream/stream",
             ),
         ),
       ).toBe(true);
@@ -5905,12 +5898,12 @@ describe("app-chat-stream verification surfaces", () => {
     ).toHaveLength(1);
 
     await act(async () => {
-      enqueueChatStreamEventForRun("request-stream-resumed", {
+      enqueueChatStreamEventForRun("request-stream", {
         assistantMessageId,
         lifecycle,
         type: "agentTaskLifecycle",
       });
-      enqueueChatStreamEventForRun("request-stream-resumed", {
+      enqueueChatStreamEventForRun("request-stream", {
         assistantMessageId,
         delta: "Post-wait summary.",
         type: "textDelta",
@@ -5942,7 +5935,7 @@ describe("app-chat-stream verification surfaces", () => {
     ).toHaveLength(1);
 
     await act(async () => {
-      appTestState.chatStreamControllers.get("request-stream-resumed")?.close();
+      appTestState.chatStreamControllers.get("request-stream")?.close();
     });
   });
 
