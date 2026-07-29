@@ -1075,6 +1075,17 @@ type MainTabSummary =
       workspaceLogoUrl: string | null;
     });
 
+type DurableRunTermination = {
+  runId: string;
+};
+
+type ChatStreamHandoff = {
+  chatId: string;
+  lastSequence: number | null;
+  runId: string | null;
+  workspaceId: string;
+};
+
 type MainTabCloseScope = "current" | "others" | "all" | "right" | "left";
 
 type ChatSessionStatusKind =
@@ -2146,10 +2157,17 @@ export function App() {
   const restoredPendingQuestionIdsRef = useRef<Set<string>>(new Set());
   const isCheckingPendingQuestionsRef = useRef(false);
   const activeRunInfoByChatKeyRef = useRef<Record<string, ActiveRunInfo>>({});
-  // A completed run may briefly reappear in a delayed workspace/messages response.
-  // Keep only the terminal identity, not a mirrored running flag, so a different
-  // subsequent run can start normally while the old snapshot stays inert.
-  const terminalRunIdByChatKeyRef = useRef<Map<string, string>>(new Map());
+  // Durable terminal identity only. A streamEnd closes one SSE session, but the
+  // underlying coordinator run may be reattached later with that same run id.
+  const durableRunTerminationByChatKeyRef = useRef<
+    Map<string, DurableRunTermination>
+  >(new Map());
+  const chatStreamHandoffTimersByChatKeyRef = useRef<Map<string, number>>(
+    new Map(),
+  );
+  const chatStreamHandoffsByChatKeyRef = useRef<Map<string, ChatStreamHandoff>>(
+    new Map(),
+  );
   const queuedRunRequestsByChatKeyRef = useRef<
     Record<string, RetryRunRequest[]>
   >({});
@@ -2436,7 +2454,10 @@ export function App() {
         runningChatKeys,
         scheduledChatKey: options.scheduledChatKey,
         scheduledStatus: options.scheduledStatus,
-        terminalRunId: terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
+        terminalRunId:
+          durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId ??
+          chatStreamHandoffsByChatKeyRef.current.get(chatKey)?.runId ??
+          null,
         workspaceActiveRun: options.workspaceActiveRun ?? null,
       });
     },
@@ -3122,6 +3143,11 @@ export function App() {
         session.abortController.abort();
       }
       chatStreamSessionsByChatKeyRef.current.clear();
+      for (const timer of chatStreamHandoffTimersByChatKeyRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      chatStreamHandoffTimersByChatKeyRef.current.clear();
+      chatStreamHandoffsByChatKeyRef.current.clear();
 
       for (const abortController of loadingChatControllersRef.current.values()) {
         abortController.abort();
@@ -3423,6 +3449,7 @@ export function App() {
       );
       workspacesRef.current = baseWorkspaces;
       setWorkspaces(baseWorkspaces);
+      reconcileHandoffsFromWorkspaceSummaries(baseWorkspaces);
       syncOpenChatTabTitlesFromWorkspaces(baseWorkspaces);
       setWorkspaceChatPaging(workspaceChatPagingFromWorkspaces(baseWorkspaces));
       reconcileActiveWorkspaceSelection(baseWorkspaces, data.activeWorkspaceId);
@@ -6809,19 +6836,194 @@ export function App() {
     });
   }
 
+  function clearChatStreamHandoff(chatKey: string) {
+    const timer = chatStreamHandoffTimersByChatKeyRef.current.get(chatKey);
+    if (timer !== undefined) {
+      window.clearTimeout(timer);
+      chatStreamHandoffTimersByChatKeyRef.current.delete(chatKey);
+    }
+    chatStreamHandoffsByChatKeyRef.current.delete(chatKey);
+  }
+
+  function reconcileHandoffsFromWorkspaceSummaries(
+    workspaceSummaries: WorkspaceSummary[],
+  ) {
+    for (const [chatKey, handoff] of chatStreamHandoffsByChatKeyRef.current) {
+      if (
+        chatStreamSessionsByChatKeyRef.current.has(chatKey) ||
+        activeRunAbortByChatKeyRef.current.has(chatKey)
+      ) {
+        continue;
+      }
+      const workspaceChat = workspaceSummaries
+        .find((workspace) => workspace.id === handoff.workspaceId)
+        ?.chats.find((chat) => chat.id === handoff.chatId);
+      const isDurablyWaiting =
+        workspaceChat?.queuedRun?.status === "running" ||
+        workspaceChat?.queuedRun?.status === "queued";
+      const activeRun = normalizeActiveChatRunSummary(workspaceChat?.activeRun);
+      if (isDurablyWaiting && activeRun) {
+        clearChatStreamHandoff(chatKey);
+        void subscribeActiveChatRun(
+          {
+            ...activeRun,
+            lastSequence: handoff.lastSequence ?? activeRun.lastSequence ?? null,
+          },
+          true,
+        );
+        continue;
+      }
+      if (!isDurablyWaiting) {
+        clearChatStreamHandoff(chatKey);
+        finishChatRun(
+          chatKey,
+          handoff.runId,
+          handoff.workspaceId,
+          handoff.chatId,
+        );
+      }
+    }
+  }
+
+  function reconcileChatStreamHandoff(handoff: ChatStreamHandoff) {
+    const chatKey = chatRunKey(handoff.workspaceId, handoff.chatId);
+    clearChatStreamHandoff(chatKey);
+    chatStreamHandoffsByChatKeyRef.current.set(chatKey, handoff);
+
+    const reconcile = async (attempt: number) => {
+      if (chatStreamHandoffsByChatKeyRef.current.get(chatKey) !== handoff) {
+        return;
+      }
+      if (
+        chatStreamSessionsByChatKeyRef.current.has(chatKey) ||
+        activeRunAbortByChatKeyRef.current.has(chatKey)
+      ) {
+        clearChatStreamHandoff(chatKey);
+        return;
+      }
+
+      // Message history is authoritative for events and replay sequence, but a
+      // delayed activeRun alone cannot revive a terminal session. Coordinator
+      // handoff additionally requires its durable queuedRun to remain alive.
+      const messageActiveRun = await loadChatMessages(
+        handoff.workspaceId,
+        handoff.chatId,
+        undefined,
+        { deferActiveRunSubscription: true },
+      );
+      if (chatStreamHandoffsByChatKeyRef.current.get(chatKey) !== handoff) {
+        return;
+      }
+      if (
+        chatStreamSessionsByChatKeyRef.current.has(chatKey) ||
+        activeRunAbortByChatKeyRef.current.has(chatKey)
+      ) {
+        clearChatStreamHandoff(chatKey);
+        return;
+      }
+
+      const workspaceChat = workspacesRef.current
+        .find((workspace) => workspace.id === handoff.workspaceId)
+        ?.chats.find((chat) => chat.id === handoff.chatId);
+      const queuedStatus = workspaceChat?.queuedRun?.status;
+      const isDurablyWaiting =
+        queuedStatus === "running" || queuedStatus === "queued";
+      const workspaceActiveRun = normalizeActiveChatRunSummary(
+        workspaceChat?.activeRun,
+      );
+      const durableTerminalRunId =
+        durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId ?? null;
+      const activeRun = !isTerminalActiveRun(
+        workspaceActiveRun,
+        durableTerminalRunId,
+      )
+        ? (messageActiveRun ?? workspaceActiveRun)
+        : null;
+      if (isDurablyWaiting && activeRun) {
+        const reattachRun = {
+          ...activeRun,
+          lastSequence: handoff.lastSequence ?? activeRun.lastSequence ?? null,
+        };
+        console.debug("[chat-stream] stream handoff reattaching active run", {
+          chatId: handoff.chatId,
+          lastSequence: reattachRun.lastSequence,
+          result: "active-run",
+          runId: reattachRun.runId,
+          workspaceId: handoff.workspaceId,
+        });
+        clearChatStreamHandoff(chatKey);
+        void subscribeActiveChatRun(reattachRun, true);
+        return;
+      }
+
+      if (isDurablyWaiting) {
+        if (attempt >= 20) {
+          console.debug("[chat-stream] stream handoff check budget exhausted", {
+            chatId: handoff.chatId,
+            lastSequence: handoff.lastSequence,
+            result: "waiting-check-exhausted",
+            runId: handoff.runId,
+            workspaceId: handoff.workspaceId,
+          });
+          return;
+        }
+        let timer: number;
+        timer = window.setTimeout(() => {
+          if (chatStreamHandoffTimersByChatKeyRef.current.get(chatKey) !== timer) {
+            return;
+          }
+          chatStreamHandoffTimersByChatKeyRef.current.delete(chatKey);
+          void reconcile(attempt + 1);
+        }, 250);
+        chatStreamHandoffTimersByChatKeyRef.current.set(chatKey, timer);
+        return;
+      }
+
+      console.debug("[chat-stream] stream handoff reached durable terminal state", {
+        chatId: handoff.chatId,
+        lastSequence: handoff.lastSequence,
+        result: "terminal",
+        runId: handoff.runId,
+        workspaceId: handoff.workspaceId,
+      });
+      clearChatStreamHandoff(chatKey);
+      finishChatRun(
+        chatKey,
+        handoff.runId,
+        handoff.workspaceId,
+        handoff.chatId,
+      );
+    };
+
+    let initialTimer: number;
+    initialTimer = window.setTimeout(() => {
+      if (
+        chatStreamHandoffTimersByChatKeyRef.current.get(chatKey) !==
+        initialTimer
+      ) {
+        return;
+      }
+      chatStreamHandoffTimersByChatKeyRef.current.delete(chatKey);
+      void reconcile(0);
+    }, 50);
+    chatStreamHandoffTimersByChatKeyRef.current.set(chatKey, initialTimer);
+  }
+
   function startChatRun(chatKey: string, runId: string | null): boolean {
     if (!runId) {
       return true;
     }
 
-    const terminalRunId = terminalRunIdByChatKeyRef.current.get(chatKey);
+    const terminalRunId =
+      durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId;
     if (terminalRunId === runId) {
       return false;
     }
 
     if (terminalRunId !== undefined) {
-      terminalRunIdByChatKeyRef.current.delete(chatKey);
+      durableRunTerminationByChatKeyRef.current.delete(chatKey);
     }
+    clearChatStreamHandoff(chatKey);
     return true;
   }
 
@@ -6830,14 +7032,16 @@ export function App() {
     runId: string | null,
     workspaceId: string,
     chatId: string | null,
+    options: { durable?: boolean } = {},
   ): boolean {
     const currentRun = activeRunInfoByChatKeyRef.current[chatKey] ?? null;
     if (runId && currentRun?.runId && currentRun.runId !== runId) {
       return false;
     }
 
-    if (runId) {
-      terminalRunIdByChatKeyRef.current.set(chatKey, runId);
+    if (runId && options.durable !== false) {
+      durableRunTerminationByChatKeyRef.current.set(chatKey, { runId });
+      clearChatStreamHandoff(chatKey);
     }
     setChatRunning(chatKey, false);
     setActiveRunInfoForChatKey(chatKey, null);
@@ -7339,6 +7543,7 @@ export function App() {
     workspaceId: string,
     chatId: string,
     expectedStreamSession?: ChatStreamSession,
+    options: { deferActiveRunSubscription?: boolean } = {},
   ) {
     setError(null);
     const chatKey = chatRunKey(workspaceId, chatId);
@@ -7376,7 +7581,7 @@ export function App() {
       const reportedActiveRun = normalizeActiveChatRunSummary(data.activeRun);
       const activeRun = isTerminalActiveRun(
         reportedActiveRun,
-        terminalRunIdByChatKeyRef.current.get(chatKey) ?? null,
+        durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId ?? null,
       )
         ? null
         : reportedActiveRun;
@@ -7522,7 +7727,11 @@ export function App() {
         expectedStreamSession !== undefined &&
         isCurrentChatStreamSession(chatKey, expectedStreamSession) &&
         activeRun?.runId === expectedStreamSession.runId;
-      if (activeRun && !expectedSessionOwnsActiveRun) {
+      if (
+        activeRun &&
+        !expectedSessionOwnsActiveRun &&
+        !options.deferActiveRunSubscription
+      ) {
         void subscribeActiveChatRun(activeRun);
       } else if (!hasLocalActiveRun) {
         setChatRunning(chatKey, false);
@@ -11175,6 +11384,7 @@ export function App() {
     });
     activeRunAbortByChatKeyRef.current.set(chatKey, abortController);
     let shouldReconnect = false;
+    let streamEnded = false;
 
     try {
       const afterSequence = lastProcessedSequence;
@@ -11826,11 +12036,19 @@ export function App() {
             finishLiveReasoningDuration();
             stopLiveReasoningDuration();
             finishStreamingAssistantMessage(currentAssistantMessageId);
+            chatStreamHandoffsByChatKeyRef.current.set(chatKey, {
+              chatId: activeRun.chatId,
+              lastSequence: lastSequenceForState(),
+              runId: activeRun.runId,
+              workspaceId: activeRun.workspaceId,
+            });
+            streamEnded = true;
             finishChatRun(
               chatKey,
               activeRun.runId,
               activeRun.workspaceId,
               activeRun.chatId,
+              { durable: false },
             );
             refreshTerminalContextUsage();
             refreshActiveAgentTeamSnapshot(
@@ -11975,6 +12193,15 @@ export function App() {
             workspaceId: activeRun.workspaceId,
           });
           void subscribeActiveChatRun(activeRunWithCurrentSequence(), true);
+        } else if (streamEnded) {
+          const handoff = {
+            chatId: activeRun.chatId,
+            lastSequence: lastSequenceForState(),
+            runId: activeRun.runId,
+            workspaceId: activeRun.workspaceId,
+          };
+          releaseChatStreamSession(chatKey, session);
+          reconcileChatStreamHandoff(handoff);
         } else {
           finishChatRun(
             chatKey,
@@ -12082,6 +12309,7 @@ export function App() {
     let lastLiveContextUsageRefreshAtMs = Date.now();
     let runSucceeded = false;
     let streamHadError = false;
+    let streamEnded = false;
     let hasGuidanceTurns = false;
     let activeRunId: string | null = null;
     let reconnectAfterEof: ActiveChatRunSummary | null = null;
@@ -13205,11 +13433,21 @@ export function App() {
           finishLiveReasoningDuration();
           stopLiveReasoningDuration();
           finishStreamingAssistantMessage(currentAssistantMessageId);
+          if (requestChatId) {
+            chatStreamHandoffsByChatKeyRef.current.set(currentRunningChatKey, {
+              chatId: requestChatId,
+              lastSequence: session.lastSequence,
+              runId: activeRunId,
+              workspaceId: request.workspaceId,
+            });
+          }
+          streamEnded = true;
           finishChatRun(
             currentRunningChatKey,
             activeRunId,
             request.workspaceId,
             requestChatId,
+            { durable: false },
           );
           refreshTerminalContextUsage();
           if (requestChatId) {
@@ -13333,6 +13571,15 @@ export function App() {
           releaseChatStreamSession(currentRunningChatKey, session);
           setChatRunning(currentRunningChatKey, true);
           void subscribeActiveChatRun(reconnectAfterEof, true);
+        } else if (streamEnded && requestChatId) {
+          const handoff = {
+            chatId: requestChatId,
+            lastSequence: session.lastSequence,
+            runId: activeRunId,
+            workspaceId: request.workspaceId,
+          };
+          releaseChatStreamSession(currentRunningChatKey, session);
+          reconcileChatStreamHandoff(handoff);
         } else {
           refreshTerminalContextUsage();
           finishChatRun(
