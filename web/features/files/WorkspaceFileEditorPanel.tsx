@@ -41,6 +41,7 @@ export type WorkspaceFileEditorState = {
   error: string | null;
   isDirty: boolean;
   isLoading: boolean;
+  isMarkdownPreviewEnabled: boolean;
   isSaving: boolean;
   lastSavedContent: string;
 };
@@ -87,6 +88,7 @@ export function WorkspaceFileEditorPanel({
   editor,
   file,
   onChangeContent,
+  onMarkdownPreviewChange,
   onOpenHtmlPreview,
   onReload,
   onRestoreViewState,
@@ -96,6 +98,11 @@ export function WorkspaceFileEditorPanel({
   editor: WorkspaceFileEditorState | null;
   file: OpenFileTab;
   onChangeContent: (workspaceId: string, path: string, content: string) => void;
+  onMarkdownPreviewChange: (
+    workspaceId: string,
+    path: string,
+    isMarkdownPreviewEnabled: boolean,
+  ) => void;
   onOpenHtmlPreview?: () => void;
   onReload: (file: OpenFileTab) => Promise<void>;
   onRestoreViewState: (
@@ -119,6 +126,15 @@ export function WorkspaceFileEditorPanel({
     (content: string) => onChangeContent(file.workspaceId, file.path, content),
     [file.path, file.workspaceId, onChangeContent],
   );
+  const handleMarkdownPreviewChange = useCallback(
+    (isMarkdownPreviewEnabled: boolean) =>
+      onMarkdownPreviewChange(
+        file.workspaceId,
+        file.path,
+        isMarkdownPreviewEnabled,
+      ),
+    [file.path, file.workspaceId, onMarkdownPreviewChange],
+  );
   const handleReload = useCallback(() => onReload(file), [file, onReload]);
   const handleSave = useCallback(
     (content: string) => onSave(file, content),
@@ -141,9 +157,11 @@ export function WorkspaceFileEditorPanel({
             isDirty={editor?.isDirty ?? false}
             isHtml={isHtml}
             isMarkdown={isMarkdown}
+            isMarkdownPreviewEnabled={editor?.isMarkdownPreviewEnabled ?? false}
             isSaving={editor?.isSaving ?? false}
             language={language}
             onChange={handleChange}
+            onMarkdownPreviewChange={handleMarkdownPreviewChange}
             onOpenHtmlPreview={onOpenHtmlPreview}
             onReload={handleReload}
             onRestoreViewState={onRestoreViewState}
@@ -183,9 +201,11 @@ function MonacoFileEditor({
   isDirty,
   isHtml,
   isMarkdown,
+  isMarkdownPreviewEnabled,
   isSaving,
   language,
   onChange,
+  onMarkdownPreviewChange,
   onOpenHtmlPreview,
   onReload,
   onRestoreViewState,
@@ -200,9 +220,11 @@ function MonacoFileEditor({
   isDirty: boolean;
   isHtml: boolean;
   isMarkdown: boolean;
+  isMarkdownPreviewEnabled: boolean;
   isSaving: boolean;
   language: string;
   onChange: (value: string) => void;
+  onMarkdownPreviewChange: (isMarkdownPreviewEnabled: boolean) => void;
   onOpenHtmlPreview?: () => void;
   onReload: () => Promise<void>;
   onRestoreViewState: (
@@ -226,7 +248,6 @@ function MonacoFileEditor({
   const modelRef = useRef<Monaco.editor.ITextModel | null>(null);
   const ignoreModelChangeRef = useRef(false);
   const valueRef = useRef(value);
-  const [previewEnabled, setPreviewEnabled] = useState(false);
   const [wordWrapEnabled, setWordWrapEnabled] = useState(false);
   const [monacoError, setMonacoError] = useState<string | null>(null);
   const [isReloadConfirmOpen, setIsReloadConfirmOpen] = useState(false);
@@ -239,14 +260,10 @@ function MonacoFileEditor({
   }, [value]);
 
   useEffect(() => {
-    setPreviewEnabled(false);
-  }, [path]);
-
-  useEffect(() => {
-    if (!previewEnabled) {
+    if (!isMarkdownPreviewEnabled) {
       window.setTimeout(() => editorRef.current?.layout(), 0);
     }
-  }, [previewEnabled]);
+  }, [isMarkdownPreviewEnabled]);
 
   const focusEditor = useCallback(() => {
     editorRef.current?.focus();
@@ -335,7 +352,7 @@ function MonacoFileEditor({
   );
 
   useEffect(() => {
-    if (previewEnabled) {
+    if (isMarkdownPreviewEnabled) {
       return undefined;
     }
 
@@ -418,7 +435,7 @@ function MonacoFileEditor({
     onSave,
     onSaveViewState,
     path,
-    previewEnabled,
+    isMarkdownPreviewEnabled,
     workspaceFilePath,
     workspaceId,
   ]);
@@ -457,45 +474,45 @@ function MonacoFileEditor({
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={Scissors}
           label={t("Cut")}
           onClick={() => runEditorCommand("cut")}
         />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={Copy}
           label={t("Copy")}
           onClick={() => runEditorCommand("copy")}
         />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={ClipboardPaste}
           label={t("Paste")}
           onClick={() => runEditorCommand("paste")}
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={Undo2}
           label={t("Undo")}
           onClick={() => runEditorCommand("undo")}
         />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={Redo2}
           label={t("Redo")}
           onClick={() => runEditorCommand("redo")}
         />
         <span className="workspace-file-editor-toolbar-separator" />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={Search}
           label={t("Find")}
           onClick={() => runEditorCommand("find")}
         />
         <EditorToolbarButton
-          disabled={previewEnabled}
+          disabled={isMarkdownPreviewEnabled}
           icon={WrapText}
           isActive={wordWrapEnabled}
           label={t("Word wrap")}
@@ -505,10 +522,12 @@ function MonacoFileEditor({
           <>
             <span className="workspace-file-editor-toolbar-separator" />
             <EditorToolbarButton
-              icon={previewEnabled ? EyeOff : Eye}
-              isActive={previewEnabled}
-              label={previewEnabled ? t("Edit markdown") : t("Preview markdown")}
-              onClick={() => setPreviewEnabled((current) => !current)}
+              icon={isMarkdownPreviewEnabled ? EyeOff : Eye}
+              isActive={isMarkdownPreviewEnabled}
+              label={isMarkdownPreviewEnabled ? t("Edit markdown") : t("Preview markdown")}
+              onClick={() =>
+                onMarkdownPreviewChange(!isMarkdownPreviewEnabled)
+              }
             />
           </>
         ) : null}
@@ -529,12 +548,12 @@ function MonacoFileEditor({
         </div>
       ) : null}
       <div
-        aria-hidden={previewEnabled || undefined}
-        className={`workspace-file-monaco ${previewEnabled ? "workspace-file-monaco-hidden" : ""}`}
+        aria-hidden={isMarkdownPreviewEnabled || undefined}
+        className={`workspace-file-monaco ${isMarkdownPreviewEnabled ? "workspace-file-monaco-hidden" : ""}`}
         onMouseDown={focusEditor}
         ref={containerRef}
       />
-      {isMarkdown && previewEnabled ? (
+      {isMarkdown && isMarkdownPreviewEnabled ? (
         <div className="workspace-file-markdown-preview">
           <MarkdownContent
             allowHtml

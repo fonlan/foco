@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -73,6 +74,7 @@ const editorState: WorkspaceFileEditorState = {
   error: null,
   isDirty: false,
   isLoading: false,
+  isMarkdownPreviewEnabled: false,
   isSaving: false,
   lastSavedContent: "# Notes\n\nHello",
 };
@@ -83,24 +85,35 @@ describe("WorkspaceFileEditorPanel", () => {
     monacoMock.editors.length = 0;
   });
 
-  it("disposes Monaco while markdown preview is active and recreates it for editing", async () => {
-    render(
-      <WorkspaceFileEditorPanel
-        editor={editorState}
-        file={{
-          name: "README.md",
-          path: "README.md",
-          workspaceId: "workspace-1",
-          workspaceLogoUrl: null,
-          workspaceName: "Default",
-        }}
-        onChangeContent={vi.fn()}
-        onReload={vi.fn(async () => undefined)}
-        onRestoreViewState={vi.fn(() => null)}
-        onSave={vi.fn(async () => true)}
-        onSaveViewState={vi.fn()}
-      />,
-    );
+  it("disposes Monaco while controlled markdown preview is active and recreates it for editing", async () => {
+    function ControlledPanel() {
+      const [isMarkdownPreviewEnabled, setIsMarkdownPreviewEnabled] = useState(
+        false,
+      );
+
+      return (
+        <WorkspaceFileEditorPanel
+          editor={{ ...editorState, isMarkdownPreviewEnabled }}
+          file={{
+            name: "README.md",
+            path: "README.md",
+            workspaceId: "workspace-1",
+            workspaceLogoUrl: null,
+            workspaceName: "Default",
+          }}
+          onChangeContent={vi.fn()}
+          onMarkdownPreviewChange={(_, __, isEnabled) =>
+            setIsMarkdownPreviewEnabled(isEnabled)
+          }
+          onReload={vi.fn(async () => undefined)}
+          onRestoreViewState={vi.fn(() => null)}
+          onSave={vi.fn(async () => true)}
+          onSaveViewState={vi.fn()}
+        />
+      );
+    }
+
+    render(<ControlledPanel />);
 
     await waitFor(() => expect(monacoMock.create).toHaveBeenCalledTimes(1));
 
@@ -133,6 +146,7 @@ describe("WorkspaceFileEditorPanel", () => {
           workspaceName: "Default",
         }}
         onChangeContent={vi.fn()}
+        onMarkdownPreviewChange={vi.fn()}
         onReload={vi.fn(async () => undefined)}
         onRestoreViewState={vi.fn(() => null)}
         onSave={onSave}
@@ -193,6 +207,7 @@ describe("WorkspaceFileEditorPanel", () => {
     const props = {
       editor: editorState,
       onChangeContent: vi.fn(),
+      onMarkdownPreviewChange: vi.fn(),
       onReload: vi.fn(async () => undefined),
       onRestoreViewState,
       onSave: vi.fn(async () => true),

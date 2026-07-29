@@ -6584,7 +6584,21 @@ describe("app-panels-stats verification surfaces", () => {
       "flowchart TD\n  A --> B",
     );
 
-    await userEvent.click(editButton);
+    await userEvent.click(await screen.findByText("index.html"));
+    const tabList = screen.getByRole("tablist", { name: "Chat" });
+    await userEvent.click(
+      within(tabList).getByRole("tab", { name: /README\.md/ }),
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "Preview title" }),
+    ).toBeInTheDocument();
+    const restoredEditButton = screen.getByRole("button", {
+      name: "Edit markdown",
+    });
+    expect(restoredEditButton).toHaveAttribute("aria-pressed", "true");
+
+    await userEvent.click(restoredEditButton);
     expect(
       screen.queryByRole("heading", { name: "Preview title" }),
     ).not.toBeInTheDocument();

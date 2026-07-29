@@ -8384,6 +8384,7 @@ export function App() {
         error: null,
         isDirty: false,
         isLoading: true,
+        isMarkdownPreviewEnabled: false,
         isSaving: false,
         lastSavedContent: "",
       },
@@ -8409,6 +8410,8 @@ export function App() {
           error: null,
           isDirty: false,
           isLoading: false,
+          isMarkdownPreviewEnabled:
+            current[editorKey]?.isMarkdownPreviewEnabled ?? false,
           isSaving: false,
           lastSavedContent: response.content,
         },
@@ -8421,6 +8424,8 @@ export function App() {
           error: errorMessage(requestError),
           isDirty: current[editorKey]?.isDirty ?? false,
           isLoading: false,
+          isMarkdownPreviewEnabled:
+            current[editorKey]?.isMarkdownPreviewEnabled ?? false,
           isSaving: false,
           lastSavedContent: current[editorKey]?.lastSavedContent ?? "",
         },
@@ -8488,6 +8493,8 @@ export function App() {
           error: null,
           isDirty: false,
           isLoading: false,
+          isMarkdownPreviewEnabled:
+            current[editorKey]?.isMarkdownPreviewEnabled ?? false,
           isSaving: false,
           lastSavedContent: response.content,
         },
@@ -8527,6 +8534,31 @@ export function App() {
             content,
             isDirty: content !== editor.lastSavedContent,
           },
+        };
+      });
+    },
+    [],
+  );
+
+  const updateWorkspaceFileEditorMarkdownPreview = useCallback(
+    (
+      workspaceId: string,
+      path: string,
+      isMarkdownPreviewEnabled: boolean,
+    ) => {
+      const editorKey = workspaceFileEditorKey(workspaceId, path);
+      setWorkspaceFileEditors((current) => {
+        const editor = current[editorKey];
+        if (
+          !editor ||
+          editor.isMarkdownPreviewEnabled === isMarkdownPreviewEnabled
+        ) {
+          return current;
+        }
+
+        return {
+          ...current,
+          [editorKey]: { ...editor, isMarkdownPreviewEnabled },
         };
       });
     },
@@ -15158,6 +15190,9 @@ export function App() {
                   editor={activeFileEditor}
                   file={activeFileTab}
                   onChangeContent={updateWorkspaceFileEditorContent}
+                  onMarkdownPreviewChange={
+                    updateWorkspaceFileEditorMarkdownPreview
+                  }
                   onOpenHtmlPreview={
                     isHtmlFilePath(activeFileTab.path)
                       ? () => openWorkspaceHtmlPreviewTab(activeFileTab)
