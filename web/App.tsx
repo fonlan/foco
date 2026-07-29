@@ -11778,7 +11778,7 @@ export function App() {
             if (!latestResponseUsage && liveStatisticsUsage) {
               latestResponseUsage = liveStatisticsUsage;
             }
-            refreshRunContextUsage({
+            terminalContextUsageRefreshRequested = refreshRunContextUsage({
               modelId: streamEvent.metrics.modelId,
               providerId: streamEvent.metrics.providerId,
             });
@@ -11791,6 +11791,12 @@ export function App() {
             void loadChatStatistics(activeRun.workspaceId, activeRun.chatId);
             void refreshWorkspaces();
             setChatRunFailed(chatKey, false);
+            // The terminal refresh uses the run's actual provider route. Keep
+            // the composer effect from immediately replacing it with the
+            // current composer route as this run becomes inactive.
+            skipComposerContextUsageRefreshAfterRunByChatKeyRef.current.add(
+              chatKey,
+            );
             finishChatRun(
               chatKey,
               activeRun.runId,
@@ -12193,7 +12199,11 @@ export function App() {
             workspaceId: activeRun.workspaceId,
           });
           void subscribeActiveChatRun(activeRunWithCurrentSequence(), true);
-        } else if (streamEnded) {
+        } else if (
+          streamEnded &&
+          durableRunTerminationByChatKeyRef.current.get(chatKey)?.runId !==
+            activeRun.runId
+        ) {
           const handoff = {
             chatId: activeRun.chatId,
             lastSequence: lastSequenceForState(),
@@ -12202,6 +12212,12 @@ export function App() {
           };
           releaseChatStreamSession(chatKey, session);
           reconcileChatStreamHandoff(handoff);
+        } else if (streamEnded) {
+          // A complete/error event has already established this run as durable
+          // terminal. Its trailing streamEnd only closes the SSE transport; it
+          // must not re-enter handoff reconciliation and reload stale history.
+          releaseChatStreamSession(chatKey, session);
+          clearChatStreamHandoff(chatKey);
         } else {
           finishChatRun(
             chatKey,
@@ -13175,7 +13191,7 @@ export function App() {
           if (!latestResponseUsage && liveStatisticsUsage) {
             latestResponseUsage = liveStatisticsUsage;
           }
-          refreshRunContextUsage({
+          terminalContextUsageRefreshRequested = refreshRunContextUsage({
             modelId: streamEvent.metrics.modelId,
             providerId: streamEvent.metrics.providerId,
           });
@@ -13196,6 +13212,12 @@ export function App() {
           }
           void refreshWorkspaces();
           setChatRunFailed(runMessagesKey, false);
+          // The terminal refresh uses the run's actual provider route. Keep
+          // the composer effect from immediately replacing it with the
+          // current composer route as this run becomes inactive.
+          skipComposerContextUsageRefreshAfterRunByChatKeyRef.current.add(
+            runMessagesKey,
+          );
           setRetryRunRequest(null);
           setPendingQuestion(null);
           setQuestionError(null);
@@ -13522,7 +13544,10 @@ export function App() {
 
       if (ownsSession()) {
         await refreshWorkspaces();
-        runSucceeded = !streamHadError && reconnectAfterEof === null;
+        // streamEnd can suspend a Coordinator for durable handoff; only a
+        // completed stream may advance this chat's queued request locally.
+        runSucceeded =
+          !streamHadError && !streamEnded && reconnectAfterEof === null;
       }
     } catch (requestError) {
       if (!ownsSession()) {
@@ -13571,7 +13596,12 @@ export function App() {
           releaseChatStreamSession(currentRunningChatKey, session);
           setChatRunning(currentRunningChatKey, true);
           void subscribeActiveChatRun(reconnectAfterEof, true);
-        } else if (streamEnded && requestChatId) {
+        } else if (
+          streamEnded &&
+          requestChatId &&
+          durableRunTerminationByChatKeyRef.current.get(currentRunningChatKey)
+            ?.runId !== activeRunId
+        ) {
           const handoff = {
             chatId: requestChatId,
             lastSequence: session.lastSequence,
@@ -13580,6 +13610,12 @@ export function App() {
           };
           releaseChatStreamSession(currentRunningChatKey, session);
           reconcileChatStreamHandoff(handoff);
+        } else if (streamEnded) {
+          // A complete/error event has already established this run as durable
+          // terminal. Its trailing streamEnd only closes the SSE transport; it
+          // must not re-enter handoff reconciliation and reload stale history.
+          releaseChatStreamSession(currentRunningChatKey, session);
+          clearChatStreamHandoff(currentRunningChatKey);
         } else {
           refreshTerminalContextUsage();
           finishChatRun(
