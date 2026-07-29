@@ -106,8 +106,10 @@ describe("WorkspaceFileEditorPanel", () => {
             setIsMarkdownPreviewEnabled(isEnabled)
           }
           onReload={vi.fn(async () => undefined)}
+          onRestoreMarkdownPreviewScrollTop={vi.fn(() => 0)}
           onRestoreViewState={vi.fn(() => null)}
           onSave={vi.fn(async () => true)}
+          onSaveMarkdownPreviewScrollTop={vi.fn()}
           onSaveViewState={vi.fn()}
         />
       );
@@ -148,8 +150,10 @@ describe("WorkspaceFileEditorPanel", () => {
         onChangeContent={vi.fn()}
         onMarkdownPreviewChange={vi.fn()}
         onReload={vi.fn(async () => undefined)}
+        onRestoreMarkdownPreviewScrollTop={vi.fn(() => 0)}
         onRestoreViewState={vi.fn(() => null)}
         onSave={onSave}
+        onSaveMarkdownPreviewScrollTop={vi.fn()}
         onSaveViewState={vi.fn()}
       />,
     );
@@ -209,8 +213,10 @@ describe("WorkspaceFileEditorPanel", () => {
       onChangeContent: vi.fn(),
       onMarkdownPreviewChange: vi.fn(),
       onReload: vi.fn(async () => undefined),
+      onRestoreMarkdownPreviewScrollTop: vi.fn(() => 0),
       onRestoreViewState,
       onSave: vi.fn(async () => true),
+      onSaveMarkdownPreviewScrollTop: vi.fn(),
       onSaveViewState,
     };
     const file = (path: string) => ({
@@ -245,6 +251,75 @@ describe("WorkspaceFileEditorPanel", () => {
       "workspace-1",
       "a.ts",
       firstEditor.saveViewState.mock.results[0]?.value,
+    );
+  });
+
+  it("saves and restores markdown preview scroll positions independently for each file tab", () => {
+    const scrollTops = new Map<string, number>([
+      ["workspace-1:a.md", 0],
+      ["workspace-1:b.md", 180],
+    ]);
+    const onRestoreMarkdownPreviewScrollTop = vi.fn(
+      (workspaceId: string, path: string) =>
+        scrollTops.get(`${workspaceId}:${path}`) ?? 0,
+    );
+    const onSaveMarkdownPreviewScrollTop = vi.fn(
+      (workspaceId: string, path: string, scrollTop: number) => {
+        scrollTops.set(`${workspaceId}:${path}`, scrollTop);
+      },
+    );
+    const props = {
+      editor: { ...editorState, isMarkdownPreviewEnabled: true },
+      onChangeContent: vi.fn(),
+      onMarkdownPreviewChange: vi.fn(),
+      onReload: vi.fn(async () => undefined),
+      onRestoreMarkdownPreviewScrollTop,
+      onRestoreViewState: vi.fn(() => null),
+      onSave: vi.fn(async () => true),
+      onSaveMarkdownPreviewScrollTop,
+      onSaveViewState: vi.fn(),
+    };
+    const file = (path: string) => ({
+      name: path,
+      path,
+      workspaceId: "workspace-1",
+      workspaceLogoUrl: null,
+      workspaceName: "Default",
+    });
+    const { container, rerender } = render(
+      <WorkspaceFileEditorPanel {...props} file={file("a.md")} />,
+    );
+    const preview = () => {
+      const element = container.querySelector<HTMLDivElement>(
+        ".workspace-file-markdown-preview",
+      );
+      if (!element) {
+        throw new Error("Expected markdown preview container");
+      }
+      return element;
+    };
+
+    expect(preview().scrollTop).toBe(0);
+    preview().scrollTop = 75;
+
+    rerender(<WorkspaceFileEditorPanel {...props} file={file("b.md")} />);
+    expect(preview().scrollTop).toBe(180);
+    preview().scrollTop = 0;
+
+    rerender(<WorkspaceFileEditorPanel {...props} file={file("a.md")} />);
+    expect(preview().scrollTop).toBe(75);
+
+    rerender(<WorkspaceFileEditorPanel {...props} file={file("b.md")} />);
+    expect(preview().scrollTop).toBe(0);
+    expect(onSaveMarkdownPreviewScrollTop).toHaveBeenCalledWith(
+      "workspace-1",
+      "a.md",
+      75,
+    );
+    expect(onSaveMarkdownPreviewScrollTop).toHaveBeenCalledWith(
+      "workspace-1",
+      "b.md",
+      0,
     );
   });
 });

@@ -6583,6 +6583,13 @@ describe("app-panels-stats verification surfaces", () => {
       expect.stringMatching(/^foco-mermaid-/),
       "flowchart TD\n  A --> B",
     );
+    const markdownPreview = document.querySelector<HTMLDivElement>(
+      ".workspace-file-markdown-preview",
+    );
+    if (!markdownPreview) {
+      throw new Error("Expected markdown preview container");
+    }
+    markdownPreview.scrollTop = 160;
 
     await userEvent.click(await screen.findByText("index.html"));
     const tabList = screen.getByRole("tablist", { name: "Chat" });
@@ -6597,6 +6604,10 @@ describe("app-panels-stats verification surfaces", () => {
       name: "Edit markdown",
     });
     expect(restoredEditButton).toHaveAttribute("aria-pressed", "true");
+    expect(
+      document.querySelector<HTMLDivElement>(".workspace-file-markdown-preview")
+        ?.scrollTop,
+    ).toBe(160);
 
     await userEvent.click(restoredEditButton);
     expect(

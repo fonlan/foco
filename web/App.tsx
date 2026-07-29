@@ -1759,11 +1759,38 @@ export function App() {
   const workspaceFileEditorViewStatesRef = useRef<
     Record<string, MonacoEditorViewState>
   >({});
+  // Preview scroll positions follow the same ephemeral, per-open-file lifetime
+  // as Monaco view states, without rerendering App for scroll updates.
+  const workspaceMarkdownPreviewScrollTopsRef = useRef<Record<string, number>>(
+    {},
+  );
   const getWorkspaceFileEditorViewState = useCallback(
     (workspaceId: string, path: string) =>
       workspaceFileEditorViewStatesRef.current[
         workspaceFileEditorKey(workspaceId, path)
       ] ?? null,
+    [],
+  );
+  const getWorkspaceMarkdownPreviewScrollTop = useCallback(
+    (workspaceId: string, path: string) =>
+      workspaceMarkdownPreviewScrollTopsRef.current[
+        workspaceFileEditorKey(workspaceId, path)
+      ] ?? 0,
+    [],
+  );
+  const saveWorkspaceMarkdownPreviewScrollTop = useCallback(
+    (workspaceId: string, path: string, scrollTop: number) => {
+      const editorKey = workspaceFileEditorKey(workspaceId, path);
+      const isOpen = openFileTabsRef.current.some(
+        (tab) => tab.workspaceId === workspaceId && tab.path === path,
+      );
+
+      if (isOpen) {
+        workspaceMarkdownPreviewScrollTopsRef.current[editorKey] = scrollTop;
+      } else {
+        delete workspaceMarkdownPreviewScrollTopsRef.current[editorKey];
+      }
+    },
     [],
   );
   const saveWorkspaceFileEditorViewState = useCallback(
@@ -5341,6 +5368,11 @@ export function App() {
             delete workspaceFileEditorViewStatesRef.current[key];
           }
         }
+        for (const key of Object.keys(workspaceMarkdownPreviewScrollTopsRef.current)) {
+          if (!openEditorKeys.has(key)) {
+            delete workspaceMarkdownPreviewScrollTopsRef.current[key];
+          }
+        }
       }
       return next.length === current.length ? current : next;
     });
@@ -8234,6 +8266,11 @@ export function App() {
         delete workspaceFileEditorViewStatesRef.current[key];
       }
     }
+    for (const key of Object.keys(workspaceMarkdownPreviewScrollTopsRef.current)) {
+      if (!openEditorKeys.has(key)) {
+        delete workspaceMarkdownPreviewScrollTopsRef.current[key];
+      }
+    }
 
     const selectedFile = activeFile
       ? (nextTabs.find(
@@ -8759,6 +8796,9 @@ export function App() {
     delete workspaceFileEditorViewStatesRef.current[
       workspaceFileEditorKey(tab.workspaceId, tab.path)
     ];
+    delete workspaceMarkdownPreviewScrollTopsRef.current[
+      workspaceFileEditorKey(tab.workspaceId, tab.path)
+    ];
     setWorkspaceFileEditors((current) => {
       const next = { ...current };
       delete next[workspaceFileEditorKey(tab.workspaceId, tab.path)];
@@ -8960,6 +9000,7 @@ export function App() {
           const editorKey = workspaceFileEditorKey(tab.workspaceId, tab.path);
           delete next[editorKey];
           delete workspaceFileEditorViewStatesRef.current[editorKey];
+          delete workspaceMarkdownPreviewScrollTopsRef.current[editorKey];
         }
       }
       return next;
@@ -9372,19 +9413,27 @@ export function App() {
     });
     openFileTabsRef.current = nextOpenFileTabs;
     setOpenFileTabs(nextOpenFileTabs);
-    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+    const renamedPathMatches = (key: string) => {
       const prefix = `${workspaceId}:`;
       if (!key.startsWith(prefix)) {
-        continue;
+        return false;
       }
       const filePath = key.slice(prefix.length);
-      if (
+      return (
         filePath === path ||
         filePath.startsWith(`${path}/`) ||
         filePath === nextPath ||
         filePath.startsWith(`${nextPath}/`)
-      ) {
+      );
+    };
+    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+      if (renamedPathMatches(key)) {
         delete workspaceFileEditorViewStatesRef.current[key];
+      }
+    }
+    for (const key of Object.keys(workspaceMarkdownPreviewScrollTopsRef.current)) {
+      if (renamedPathMatches(key)) {
+        delete workspaceMarkdownPreviewScrollTopsRef.current[key];
       }
     }
     setWorkspaceFileEditors((current) => {
@@ -9455,14 +9504,22 @@ export function App() {
       }
       return next;
     });
-    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+    const deletedPathMatches = (key: string) => {
       const prefix = `${workspaceId}:`;
       if (!key.startsWith(prefix)) {
-        continue;
+        return false;
       }
       const filePath = key.slice(prefix.length);
-      if (filePath === path || filePath.startsWith(`${path}/`)) {
+      return filePath === path || filePath.startsWith(`${path}/`);
+    };
+    for (const key of Object.keys(workspaceFileEditorViewStatesRef.current)) {
+      if (deletedPathMatches(key)) {
         delete workspaceFileEditorViewStatesRef.current[key];
+      }
+    }
+    for (const key of Object.keys(workspaceMarkdownPreviewScrollTopsRef.current)) {
+      if (deletedPathMatches(key)) {
+        delete workspaceMarkdownPreviewScrollTopsRef.current[key];
       }
     }
     setOpenHtmlPreviewTabs((current) => {
@@ -15199,8 +15256,14 @@ export function App() {
                       : undefined
                   }
                   onReload={reloadWorkspaceFileEditor}
+                  onRestoreMarkdownPreviewScrollTop={
+                    getWorkspaceMarkdownPreviewScrollTop
+                  }
                   onRestoreViewState={getWorkspaceFileEditorViewState}
                   onSave={saveWorkspaceFileEditor}
+                  onSaveMarkdownPreviewScrollTop={
+                    saveWorkspaceMarkdownPreviewScrollTop
+                  }
                   onSaveViewState={saveWorkspaceFileEditorViewState}
                 />
               ) : null}

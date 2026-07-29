@@ -17,6 +17,7 @@ import {
   useCallback,
   useEffect,
   useId,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -91,8 +92,10 @@ export function WorkspaceFileEditorPanel({
   onMarkdownPreviewChange,
   onOpenHtmlPreview,
   onReload,
+  onRestoreMarkdownPreviewScrollTop,
   onRestoreViewState,
   onSave,
+  onSaveMarkdownPreviewScrollTop,
   onSaveViewState,
 }: {
   editor: WorkspaceFileEditorState | null;
@@ -105,11 +108,20 @@ export function WorkspaceFileEditorPanel({
   ) => void;
   onOpenHtmlPreview?: () => void;
   onReload: (file: OpenFileTab) => Promise<void>;
+  onRestoreMarkdownPreviewScrollTop: (
+    workspaceId: string,
+    path: string,
+  ) => number;
   onRestoreViewState: (
     workspaceId: string,
     path: string,
   ) => MonacoEditorViewState | null;
   onSave: (file: OpenFileTab, content: string) => Promise<boolean> | boolean;
+  onSaveMarkdownPreviewScrollTop: (
+    workspaceId: string,
+    path: string,
+    scrollTop: number,
+  ) => void;
   onSaveViewState: (
     workspaceId: string,
     path: string,
@@ -164,8 +176,14 @@ export function WorkspaceFileEditorPanel({
             onMarkdownPreviewChange={handleMarkdownPreviewChange}
             onOpenHtmlPreview={onOpenHtmlPreview}
             onReload={handleReload}
+            onRestoreMarkdownPreviewScrollTop={
+              onRestoreMarkdownPreviewScrollTop
+            }
             onRestoreViewState={onRestoreViewState}
             onSave={handleSave}
+            onSaveMarkdownPreviewScrollTop={
+              onSaveMarkdownPreviewScrollTop
+            }
             onSaveViewState={onSaveViewState}
             path={editorPath}
             value={editor?.content ?? ""}
@@ -208,8 +226,10 @@ function MonacoFileEditor({
   onMarkdownPreviewChange,
   onOpenHtmlPreview,
   onReload,
+  onRestoreMarkdownPreviewScrollTop,
   onRestoreViewState,
   onSave,
+  onSaveMarkdownPreviewScrollTop,
   onSaveViewState,
   path,
   value,
@@ -227,11 +247,20 @@ function MonacoFileEditor({
   onMarkdownPreviewChange: (isMarkdownPreviewEnabled: boolean) => void;
   onOpenHtmlPreview?: () => void;
   onReload: () => Promise<void>;
+  onRestoreMarkdownPreviewScrollTop: (
+    workspaceId: string,
+    path: string,
+  ) => number;
   onRestoreViewState: (
     workspaceId: string,
     path: string,
   ) => MonacoEditorViewState | null;
   onSave: (value: string) => Promise<boolean> | boolean;
+  onSaveMarkdownPreviewScrollTop: (
+    workspaceId: string,
+    path: string,
+    scrollTop: number,
+  ) => void;
   onSaveViewState: (
     workspaceId: string,
     path: string,
@@ -244,6 +273,7 @@ function MonacoFileEditor({
 }) {
   const { t } = useI18n();
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const markdownPreviewRef = useRef<HTMLDivElement | null>(null);
   const editorRef = useRef<Monaco.editor.IStandaloneCodeEditor | null>(null);
   const modelRef = useRef<Monaco.editor.ITextModel | null>(null);
   const ignoreModelChangeRef = useRef(false);
@@ -264,6 +294,37 @@ function MonacoFileEditor({
       window.setTimeout(() => editorRef.current?.layout(), 0);
     }
   }, [isMarkdownPreviewEnabled]);
+
+  useLayoutEffect(() => {
+    if (!isMarkdown || !isMarkdownPreviewEnabled) {
+      return undefined;
+    }
+
+    const preview = markdownPreviewRef.current;
+    if (!preview) {
+      return undefined;
+    }
+
+    preview.scrollTop = onRestoreMarkdownPreviewScrollTop(
+      workspaceId,
+      workspaceFilePath,
+    );
+
+    return () => {
+      onSaveMarkdownPreviewScrollTop(
+        workspaceId,
+        workspaceFilePath,
+        preview.scrollTop,
+      );
+    };
+  }, [
+    isMarkdown,
+    isMarkdownPreviewEnabled,
+    onRestoreMarkdownPreviewScrollTop,
+    onSaveMarkdownPreviewScrollTop,
+    workspaceFilePath,
+    workspaceId,
+  ]);
 
   const focusEditor = useCallback(() => {
     editorRef.current?.focus();
@@ -554,7 +615,7 @@ function MonacoFileEditor({
         ref={containerRef}
       />
       {isMarkdown && isMarkdownPreviewEnabled ? (
-        <div className="workspace-file-markdown-preview">
+        <div className="workspace-file-markdown-preview" ref={markdownPreviewRef}>
           <MarkdownContent
             allowHtml
             content={value}
