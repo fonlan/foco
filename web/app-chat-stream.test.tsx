@@ -1268,11 +1268,10 @@ describe("app-chat-stream verification surfaces", () => {
     renderApp();
     await userEvent.click(await screen.findByText("Tool run"));
 
-    await userEvent.type(
-      screen.getByPlaceholderText(defaultComposerPlaceholder),
-      "Use Fast for this request.",
-    );
+    const composer = screen.getByPlaceholderText(defaultComposerPlaceholder);
+    await userEvent.type(composer, "Use Fast for this request.");
     await userEvent.click(screen.getByRole("button", { name: "Send message" }));
+    expect(composer).toHaveValue("");
     await waitFor(() =>
       expect(appTestState.activeChatStreamController).not.toBeNull(),
     );
@@ -6700,6 +6699,9 @@ describe("app-chat-stream verification surfaces", () => {
     );
     await userEvent.type(otherChatComposer, "Keep this draft");
 
+    // Plan phase transitions start their next implementation through this same
+    // queued-run → runChatMessage path, so retain this unrelated draft while
+    // waiting for the background stream to actually begin.
     const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
       ([url]) =>
         typeof url === "string" &&
