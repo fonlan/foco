@@ -12283,7 +12283,6 @@ export function App() {
         assistantMessage,
       ];
     });
-    setDraftMessage("");
     setChatRunning(currentRunningChatKey, true);
     setActiveRunInfoForChatKey(currentRunningChatKey, {
       acceptingGuidance: false,

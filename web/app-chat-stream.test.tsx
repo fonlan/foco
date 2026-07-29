@@ -6695,6 +6695,10 @@ describe("app-chat-stream verification surfaces", () => {
     expect(
       await screen.findByText("Please inspect README."),
     ).toBeInTheDocument();
+    const otherChatComposer = screen.getByPlaceholderText(
+      defaultComposerPlaceholder,
+    );
+    await userEvent.type(otherChatComposer, "Keep this draft");
 
     const streamCallsBeforeComplete = fetchMock.mock.calls.filter(
       ([url]) =>
@@ -6732,6 +6736,7 @@ describe("app-chat-stream verification surfaces", () => {
       );
       expect(streamCalls).toHaveLength(2);
     });
+    expect(otherChatComposer).toHaveValue("Keep this draft");
 
     const secondStreamCall = fetchMock.mock.calls.filter(
       ([url]) =>
