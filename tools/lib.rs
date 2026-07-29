@@ -2548,12 +2548,12 @@ mod tests {
     }
 
     #[test]
-    fn read_file_rejects_oversized_skill_md() {
+    fn read_file_accepts_skill_md_larger_than_former_64kib_limit() {
         let workspace = tempfile::tempdir().expect("workspace");
         let skill_dir = workspace.path().join(".agents").join("skills").join("huge");
         fs::create_dir_all(&skill_dir).expect("skill dir");
         let header = "---\nname: huge\ndescription: huge\n---\n\n";
-        let body_len = output_budget::SKILL_MD_MAX_BYTES - header.len() + 1;
+        let body_len = 64 * 1024 - header.len() + 1;
         fs::write(
             skill_dir.join("SKILL.md"),
             format!("{header}{}", "x".repeat(body_len)),
@@ -2569,13 +2569,8 @@ mod tests {
                 "endLine": null,
             }),
         );
-        assert!(result.is_error);
-        let message = result.output["error"].as_str().unwrap_or_default();
-        assert!(message.contains("SKILL.md"), "{message}");
-        assert!(
-            message.contains("exceeds") || message.contains("maximum"),
-            "{message}"
-        );
+        assert!(!result.is_error, "{:?}", result.output);
+        assert_eq!(result.output["bytes"], (64 * 1024 + 1) as u64);
     }
 
     #[test]
@@ -2583,13 +2578,12 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace");
         let skill_dir = workspace.path().join(".agents").join("skills").join("mid");
         fs::create_dir_all(&skill_dir).expect("skill dir");
-        // 56 KiB is above the 50 KiB soft tool budget but under the 64 KiB skill hard limit.
+        // 56 KiB is above the 50 KiB soft tool budget.
         let target = 56 * 1024;
         let header = "---\nname: mid\ndescription: mid size\n---\n\n";
         let body_len = target - header.len();
         let content = format!("{header}{}", "m".repeat(body_len));
         assert!(content.len() > output_budget::TOOL_OUTPUT_SOFT_BYTE_LIMIT);
-        assert!(content.len() <= output_budget::SKILL_MD_MAX_BYTES);
         fs::write(skill_dir.join("SKILL.md"), &content).expect("skill");
 
         let result = execute_builtin_tool(

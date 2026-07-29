@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::Read,
     path::{Path, PathBuf},
 };
 
@@ -10,10 +9,10 @@ use foco_store::config::{
     GlobalConfig, SKILL_SCOPE_GLOBAL, SKILL_SCOPE_WORKSPACE, SkillSettings, WorkspaceConfig,
     WorkspaceLocation,
 };
-use foco_tools::output_budget::{
-    SELECTED_SKILLS_MAX_TOTAL_BYTES, SKILL_MD_MAX_BYTES, path_is_skill_md,
-};
+use foco_tools::output_budget::{SELECTED_SKILLS_MAX_TOTAL_BYTES, path_is_skill_md};
 use serde::{Deserialize, Serialize};
+
+const MAX_SKILL_MD_SOURCE_BYTES: u64 = 32 * 1024 * 1024;
 
 use crate::{ApiError, markdown_code_block, neutral_text_message};
 
@@ -756,17 +755,11 @@ fn skill_file_candidates(directory: &Path) -> Result<Vec<PathBuf>, String> {
 
 pub(crate) fn parse_skill_file(path: &Path) -> Result<ParsedSkillFile, String> {
     let content = load_skill_md_document(path)?;
-    let parsed = parse_skill_markdown(path, &content)?;
-    // load already enforces the byte cap; re-check decoded content for safety.
-    if parsed.markdown.len() > SKILL_MD_MAX_BYTES {
-        return Err(skill_md_size_error(path, parsed.markdown.len()));
-    }
-    Ok(parsed)
+    parse_skill_markdown(path, &content)
 }
 
 fn parse_skill_file_frontmatter(path: &Path) -> Result<ParsedSkillFile, String> {
-    // Frontmatter-only callers still require a complete in-budget document so oversized
-    // or truncated files cannot enter discovery routing with partial metadata.
+    // Discovery parses the complete document before retaining only its frontmatter.
     let mut parsed = parse_skill_file(path)?;
     parsed.markdown.clear();
     Ok(parsed)
@@ -777,8 +770,7 @@ fn parse_skill_file_id(path: &Path) -> Result<String, String> {
     parse_skill_markdown_id(path, &content)
 }
 
-/// Strict full-document load for `SKILL.md`: metadata check, then complete UTF-8 read of at
-/// most [`SKILL_MD_MAX_BYTES`]. Never returns a partial body for oversized files.
+/// Strict full-document UTF-8 load for `SKILL.md`. Never returns a partial body.
 pub(crate) fn load_skill_md_document(path: &Path) -> Result<String, String> {
     if !path_is_skill_md(path) {
         return Err(format!(
@@ -798,23 +790,16 @@ pub(crate) fn load_skill_md_document(path: &Path) -> Result<String, String> {
         return Err(format!("skill path is not a file: {}", path.display()));
     }
 
-    let file_bytes = metadata.len();
-    if file_bytes > SKILL_MD_MAX_BYTES as u64 {
-        return Err(skill_md_size_error(path, file_bytes as usize));
+    // Parsing and selected-skill validation need the complete document, but discovery must not
+    // allocate unbounded memory from a workspace-controlled skill file.
+    if metadata.len() > MAX_SKILL_MD_SOURCE_BYTES {
+        return Err(skill_md_source_size_error(path, metadata.len()));
     }
 
-    let mut file = fs::File::open(path)
+    let bytes = fs::read(path)
         .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
-    // Cap the read slightly above the hard limit so a racing grow is still rejected
-    // without unbounded allocation; success still requires complete UTF-8 content.
-    let mut bytes = Vec::new();
-    let mut limited = file.by_ref().take(SKILL_MD_MAX_BYTES as u64 + 1);
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|source| format!("failed to read skill file {}: {}", path.display(), source))?;
-
-    if bytes.len() > SKILL_MD_MAX_BYTES {
-        return Err(skill_md_size_error(path, bytes.len()));
+    if bytes.len() > MAX_SKILL_MD_SOURCE_BYTES as usize {
+        return Err(skill_md_source_size_error(path, bytes.len() as u64));
     }
 
     String::from_utf8(bytes).map_err(|source| {
@@ -826,12 +811,12 @@ pub(crate) fn load_skill_md_document(path: &Path) -> Result<String, String> {
     })
 }
 
-pub(crate) fn skill_md_size_error(path: &Path, actual_bytes: usize) -> String {
+fn skill_md_source_size_error(path: &Path, actual_bytes: u64) -> String {
     format!(
-        "skill file {} exceeds the maximum SKILL.md size ({} bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
+        "skill file {} exceeds the source file safety limit ({} bytes; max {} bytes)",
         path.display(),
         actual_bytes,
-        SKILL_MD_MAX_BYTES
+        MAX_SKILL_MD_SOURCE_BYTES
     )
 }
 
@@ -850,12 +835,6 @@ pub(crate) fn validate_selected_skills_total_budget(
     let mut total: usize = 0;
     for entry in entries {
         let size = entry.content_markdown.len();
-        if size > SKILL_MD_MAX_BYTES {
-            return Err(format!(
-                "selected skill '{}' content exceeds the maximum SKILL.md size ({} bytes; max {} bytes)",
-                entry.prompt.key, size, SKILL_MD_MAX_BYTES
-            ));
-        }
         total = total.saturating_add(size);
         sizes.push((entry.prompt.key.as_str(), size));
     }
@@ -916,9 +895,6 @@ pub(crate) fn parse_skill_markdown(path: &Path, content: &str) -> Result<ParsedS
     validate_skill_id(&id).map_err(|error| format!("skill file {}: {}", path.display(), error))?;
     let description = skill_frontmatter_description(path, &frontmatter)?;
 
-    // Runtime enablement requires documents within SKILL_MD_MAX_BYTES. Structural parse
-    // (e.g. Skill Store install validation) may still inspect larger archives; those
-    // oversized files remain non-enableable because load_skill_md_document / discovery fail.
     Ok(ParsedSkillFile {
         id: id.clone(),
         name: id,
@@ -1316,7 +1292,7 @@ pub(crate) fn available_skills_routing_message(
     Some(neutral_text_message(
         NeutralChatRole::Developer,
         format!(
-            "## Skills\n\nA skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used in this session. Each entry includes a name, description, skill key, scope, and source locator. Treat this list as a routing table for the current user turn. Foco currently exposes filesystem-backed skills; `file` locators are paths on the host filesystem.\n\n### Available Skills\n\n{}\n\n### How to Use Skills\n\n- Discovery: The list above is the skills available in this session (name + description + skill key + scope + source locator). Empty selected `skillIds` or empty Agent task skill ids mean no skill was explicitly preselected for the task; they do not mean the available-skill list is empty. `file` entries live on the host filesystem and must be opened with `read_file` when the skill is selected. Workspace skill paths are usually workspace-relative in practice; global skill paths are usually absolute paths outside the workspace and `read_file` will request explicit user authorization before reading them.\n- Trigger rules: Before starting task work, compare the user's latest request with the available skill names and descriptions. If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list, its `SKILL.md` file can't be read, or the user denies external read access for a global skill, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1. After deciding to use a skill, the main agent must read its `SKILL.md` completely with `read_file` before taking task actions. `startLine` and `endLine` must both be null for `SKILL.md`. Files larger than 64KiB fail at runtime and cannot be reconstructed by stitching line ranges. Referenced resources under `references/`, scripts, and assets stay ordinary files and may use ranged reads.\n  2. When `SKILL.md` references another resource, resolve relative paths against that skill's directory and read only the resources required for the current task.\n  3. If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the relevant files. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent.\n  4. Prefer running or patching provided scripts, templates, or assets from the skill directory instead of retyping large code blocks or recreating assets.\n  5. Reuse provided assets or templates from the skill source whenever they fit the task.\n- Coordination and sequencing: If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them. Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.\n- Context hygiene: Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets. Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked. When variants exist, pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly, state the issue, pick the next-best approach, and continue.",
+            "## Skills\n\nA skill is a set of instructions provided through a `SKILL.md` source. Below is the list of skills that can be used in this session. Each entry includes a name, description, skill key, scope, and source locator. Treat this list as a routing table for the current user turn. Foco currently exposes filesystem-backed skills; `file` locators are paths on the host filesystem.\n\n### Available Skills\n\n{}\n\n### How to Use Skills\n\n- Discovery: The list above is the skills available in this session (name + description + skill key + scope + source locator). Empty selected `skillIds` or empty Agent task skill ids mean no skill was explicitly preselected for the task; they do not mean the available-skill list is empty. `file` entries live on the host filesystem and must be opened with `read_file` when the skill is selected. Workspace skill paths are usually workspace-relative in practice; global skill paths are usually absolute paths outside the workspace and `read_file` will request explicit user authorization before reading them.\n- Trigger rules: Before starting task work, compare the user's latest request with the available skill names and descriptions. If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.\n- Missing/blocked: If a named skill isn't in the list, its `SKILL.md` file can't be read, or the user denies external read access for a global skill, say so briefly and continue with the best fallback.\n- How to use a skill (progressive disclosure):\n  1. After deciding to use a skill, the main agent must read its `SKILL.md` completely with `read_file` before taking task actions. `startLine` and `endLine` must both be null for `SKILL.md`; it cannot be reconstructed from partial ranges. Referenced resources under `references/`, scripts, and assets stay ordinary files and may use ranged reads.\n  2. When `SKILL.md` references another resource, resolve relative paths against that skill's directory and read only the resources required for the current task.\n  3. If `SKILL.md` points to extra folders such as `references/`, use its routing instructions to identify the relevant files. The main agent must read each required instruction or reference file itself before acting on it. Do not delegate reading, summarizing, or interpreting skill instructions to a subagent.\n  4. Prefer running or patching provided scripts, templates, or assets from the skill directory instead of retyping large code blocks or recreating assets.\n  5. Reuse provided assets or templates from the skill source whenever they fit the task.\n- Coordination and sequencing: If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them. Announce which skill(s) you're using and why in one short line. If you skip an obvious skill, say why.\n- Context hygiene: Progressive disclosure applies to selecting relevant files, not partially reading a selected instruction file. Do not load unrelated references, scripts, or assets. Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked. When variants exist, pick only the relevant reference file(s) and note that choice.\n- Safety and fallback: If a skill can't be applied cleanly, state the issue, pick the next-best approach, and continue.",
             entries
         ),
     ))
@@ -1636,64 +1612,65 @@ Body.",
     }
 
     #[test]
-    fn load_skill_md_document_accepts_exact_64kib_boundary() {
+    fn load_skill_md_document_accepts_document_larger_than_former_64kib_limit() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("SKILL.md");
         let header = "---\nname: edge\ndescription: boundary\n---\n\n";
-        let body_len = SKILL_MD_MAX_BYTES - header.len();
+        let former_limit = 64 * 1024;
+        let body_len = former_limit - header.len() + 1;
         let content = format!("{header}{}", "a".repeat(body_len));
-        assert_eq!(content.len(), SKILL_MD_MAX_BYTES);
+        assert_eq!(content.len(), former_limit + 1);
         fs::write(&path, &content).expect("write");
 
-        let loaded = load_skill_md_document(&path).expect("load boundary");
-        assert_eq!(loaded.len(), SKILL_MD_MAX_BYTES);
-        let parsed = parse_skill_file(&path).expect("parse boundary");
+        let loaded = load_skill_md_document(&path).expect("load document");
+        assert_eq!(loaded.len(), former_limit + 1);
+        let parsed = parse_skill_file(&path).expect("parse document");
         assert_eq!(parsed.id, "edge");
-        assert_eq!(parsed.markdown.len(), SKILL_MD_MAX_BYTES);
+        assert_eq!(parsed.markdown.len(), former_limit + 1);
     }
 
     #[test]
-    fn load_skill_md_document_rejects_64kib_plus_one() {
+    fn load_skill_md_document_rejects_document_larger_than_source_safety_limit() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("SKILL.md");
-        let header = "---\nname: huge\ndescription: too large\n---\n\n";
-        let body_len = SKILL_MD_MAX_BYTES - header.len() + 1;
-        let content = format!("{header}{}", "b".repeat(body_len));
-        assert_eq!(content.len(), SKILL_MD_MAX_BYTES + 1);
-        fs::write(&path, &content).expect("write");
+        let file = fs::File::create(&path).expect("create");
+        file.set_len(MAX_SKILL_MD_SOURCE_BYTES + 1)
+            .expect("set sparse size");
 
-        let error = load_skill_md_document(&path).expect_err("oversized");
-        assert!(
-            error.contains("exceeds the maximum SKILL.md size"),
-            "{error}"
-        );
-        assert!(
-            error.contains(&format!("{}", SKILL_MD_MAX_BYTES + 1)),
-            "{error}"
-        );
-        assert!(
-            error.contains(&format!("max {SKILL_MD_MAX_BYTES}")),
-            "{error}"
-        );
-        assert!(!error.contains(&"b".repeat(32)));
+        let error = load_skill_md_document(&path).expect_err("source too large");
+        assert!(error.contains("exceeds the source file safety limit"));
+        assert!(error.contains(&format!("max {MAX_SKILL_MD_SOURCE_BYTES}")));
     }
 
     #[test]
-    fn load_skill_md_document_rejects_utf8_bom_when_on_disk_over_budget() {
+    fn load_skill_md_document_accepts_multibyte_utf8_larger_than_former_64kib_limit() {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("SKILL.md");
+        let content = format!(
+            "---\nname: huge\ndescription: large\n---\n\n{}",
+            "你".repeat(64 * 1024)
+        );
+        assert!(content.len() > 64 * 1024);
+        fs::write(&path, &content).expect("write");
+
+        let parsed = parse_skill_file(&path).expect("parse document");
+        assert_eq!(parsed.id, "huge");
+        assert!(parsed.markdown.contains("你"));
+    }
+
+    #[test]
+    fn load_skill_md_document_accepts_utf8_bom_larger_than_former_64kib_limit() {
         let dir = tempfile::tempdir().expect("dir");
         let path = dir.path().join("SKILL.md");
         let header = "---\nname: bom\ndescription: bom test\n---\n\n";
-        let body_len = SKILL_MD_MAX_BYTES - header.len();
+        let body_len = 64 * 1024 - header.len() + 1;
         let mut content = Vec::from([0xEF, 0xBB, 0xBF]);
         content.extend_from_slice(format!("{header}{}", "c".repeat(body_len)).as_bytes());
-        assert_eq!(content.len(), SKILL_MD_MAX_BYTES + 3);
+        assert!(content.len() > 64 * 1024);
         fs::write(&path, &content).expect("write");
 
-        let error = load_skill_md_document(&path).expect_err("bom+full should fail size");
-        assert!(
-            error.contains("exceeds the maximum SKILL.md size"),
-            "{error}"
-        );
+        let parsed = parse_skill_file(&path).expect("parse document");
+        assert_eq!(parsed.id, "bom");
     }
 
     #[test]
@@ -1702,7 +1679,6 @@ Body.",
         let path = dir.path().join("SKILL.md");
         let body = "你".repeat(100);
         let content = format!("---\nname: multi\ndescription: multibyte\n---\n\n{body}");
-        assert!(content.len() < SKILL_MD_MAX_BYTES);
         fs::write(&path, &content).expect("write");
 
         let parsed = parse_skill_file(&path).expect("parse multi");
@@ -1711,7 +1687,7 @@ Body.",
     }
 
     #[test]
-    fn discovery_marks_oversized_skill_as_error_not_routable() {
+    fn discovery_includes_skill_larger_than_former_64kib_limit() {
         let profile = tempfile::tempdir().expect("profile");
         let skill_dir = profile
             .path()
@@ -1720,28 +1696,17 @@ Body.",
             .join("oversized");
         fs::create_dir_all(&skill_dir).expect("skill dir");
         let path = skill_dir.join("SKILL.md");
-        let header = "---\nname: oversized\ndescription: too big for runtime\n---\n\n";
-        let body_len = SKILL_MD_MAX_BYTES - header.len() + 1;
+        let header = "---\nname: oversized\ndescription: large skill\n---\n\n";
+        let body_len = 64 * 1024 - header.len() + 1;
         fs::write(&path, format!("{header}{}", "z".repeat(body_len))).expect("write");
 
         let discovery = discover_global_skills_for_profile(profile.path());
         assert!(
             discovery
-                .errors
+                .skills
                 .iter()
-                .any(|error| error.message.contains("exceeds the maximum SKILL.md size")),
-            "expected size error in discovery.errors: {}",
-            discovery
-                .errors
-                .iter()
-                .map(|error| format!("{}: {}", error.path, error.message))
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-        assert!(
-            !discovery.skills.iter().any(|skill| skill.id == "oversized"
-                && skill.description.contains("too big for runtime")),
-            "oversized skill must not enter routing as a normal enableable entry: {:?}",
+                .any(|skill| skill.id == "oversized" && skill.description.contains("large skill")),
+            "large skill must enter routing: {:?}",
             discovery.skills
         );
     }
@@ -1783,17 +1748,16 @@ Body.",
 
     #[test]
     fn validate_selected_skills_total_budget_rejects_one_byte_over() {
-        // Three per-file-legal skills whose combined size is exactly 128KiB+1.
+        // Three skills whose combined size is exactly 128KiB+1.
         let sizes = [
-            SKILL_MD_MAX_BYTES,
-            SKILL_MD_MAX_BYTES,
-            SELECTED_SKILLS_MAX_TOTAL_BYTES - 2 * SKILL_MD_MAX_BYTES + 1,
+            64 * 1024,
+            64 * 1024,
+            SELECTED_SKILLS_MAX_TOTAL_BYTES - 2 * 64 * 1024 + 1,
         ];
         assert_eq!(
             sizes.iter().sum::<usize>(),
             SELECTED_SKILLS_MAX_TOTAL_BYTES + 1
         );
-        assert!(sizes.iter().all(|size| *size <= SKILL_MD_MAX_BYTES));
         let keys = ["global:a", "global:b", "global:c"];
         let entries = keys
             .iter()
@@ -1820,7 +1784,7 @@ Body.",
     }
 
     #[test]
-    fn validate_selected_skills_total_budget_rejects_single_skill_over_64kib() {
+    fn validate_selected_skills_total_budget_accepts_single_skill_over_former_64kib_limit() {
         let entries = vec![selected_skill_prompt_entry(
             SkillPromptEntry {
                 key: "global:huge".to_string(),
@@ -1829,15 +1793,13 @@ Body.",
                 scope: "global".to_string(),
                 path: "/tmp/huge/SKILL.md".to_string(),
             },
-            "x".repeat(SKILL_MD_MAX_BYTES + 1),
+            "x".repeat(64 * 1024 + 1),
         )];
-        let error = validate_selected_skills_total_budget(&entries).expect_err("single over");
-        assert!(error.contains("global:huge"), "{error}");
-        assert!(error.contains("maximum SKILL.md size"), "{error}");
+        validate_selected_skills_total_budget(&entries).expect("single skill within total budget");
     }
 
     #[test]
-    fn message_with_selected_skills_rejects_oversized_skill_before_prompt_injection() {
+    fn message_with_selected_skills_accepts_skill_over_former_64kib_limit() {
         let profile = tempfile::tempdir().expect("profile");
         let skill_dir = profile
             .path()
@@ -1845,8 +1807,8 @@ Body.",
             .join("skills")
             .join("oversized");
         fs::create_dir_all(&skill_dir).expect("skill dir");
-        let header = "---\nname: oversized\ndescription: too big\n---\n\n";
-        let body_len = SKILL_MD_MAX_BYTES - header.len() + 1;
+        let header = "---\nname: oversized\ndescription: large\n---\n\n";
+        let body_len = 64 * 1024 - header.len() + 1;
         fs::write(
             skill_dir.join("SKILL.md"),
             format!("{header}{}", "q".repeat(body_len)),
@@ -1855,24 +1817,16 @@ Body.",
 
         let workspace = tempfile::tempdir().expect("workspace");
         let config = GlobalConfig::first_run(workspace.path().to_path_buf());
-        let error = message_with_selected_skills(
+        let message = message_with_selected_skills(
             profile.path(),
             &config,
             "default",
             Some(vec!["global:oversized".to_string()]),
             "user message",
         )
-        .expect_err("must fail before format");
-        assert!(
-            error.message.contains("disabled")
-                || error.message.contains("exceeds")
-                || error.message.contains("not found")
-                || error.message.contains("total content budget")
-                || error.message.contains("maximum SKILL.md"),
-            "{}",
-            error.message
-        );
-        assert!(!error.message.contains(&"q".repeat(16)));
+        .expect("must format selected skill");
+        assert!(message.contains("Skill 1: oversized"));
+        assert!(message.contains(&"q".repeat(16)));
     }
 
     #[test]

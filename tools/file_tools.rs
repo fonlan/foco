@@ -14,7 +14,7 @@ use crate::output_budget::{
     CompleteLinePrefix, CompleteLineTruncateOptions, CompleteLineTruncateOutcome,
     LINE_BOUNDED_LAST_RETURNED_LINE_FIELD, LINE_BOUNDED_NEXT_START_LINE_FIELD,
     LINE_BOUNDED_NOTE_FIELD, LINE_BOUNDED_RETURNED_LINES_FIELD,
-    LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD, LINE_BOUNDED_TRUNCATED_FIELD, SKILL_MD_MAX_BYTES,
+    LINE_BOUNDED_SOFT_BUDGET_EXCEEDED_FIELD, LINE_BOUNDED_TRUNCATED_FIELD,
     TOOL_EXECUTION_PAYLOAD_HARD_BYTE_LIMIT, TOOL_OUTPUT_SOFT_BYTE_LIMIT,
     TOOL_OUTPUT_SOFT_LINE_LIMIT, complete_line_count, complete_line_prefix_note,
     measure_tool_execution, path_is_skill_md, peel_last_complete_line, serialized_json_size,
@@ -76,33 +76,19 @@ fn read_file_inner(
     if is_skill_md {
         if requested_line_range.is_some() {
             return Err(ToolRuntimeError::InvalidArguments(format!(
-                "read_file path '{}' targets SKILL.md, which must be read in full (startLine and endLine must both be null). Oversized skills cannot be reconstructed by stitching line ranges.",
+                "read_file path '{}' targets SKILL.md, which must be read in full (startLine and endLine must both be null).",
                 request.path
-            )));
-        }
-        if metadata.len() > SKILL_MD_MAX_BYTES as u64 {
-            return Err(ToolRuntimeError::InvalidArguments(format!(
-                "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
-                request.path,
-                metadata.len(),
-                SKILL_MD_MAX_BYTES
             )));
         }
     }
 
-    // Ordinary full and ranged reads share the 32 MiB text source protection. Soft output
-    // truncation is applied after decode (complete-line prefixes), not by refusing the source.
-    let max_source_bytes = if is_skill_md {
-        SKILL_MD_MAX_BYTES as u64
-    } else {
-        MAX_RANGED_READ_SOURCE_BYTES
-    };
-
-    if metadata.len() > max_source_bytes {
+    // Full and ranged reads share the 32 MiB text source protection. Soft output truncation is
+    // applied after decode (complete-line prefixes), not by refusing the source.
+    if metadata.len() > MAX_RANGED_READ_SOURCE_BYTES {
         return Err(ToolRuntimeError::FileTooLarge {
             path,
             bytes: metadata.len(),
-            max_bytes: max_source_bytes,
+            max_bytes: MAX_RANGED_READ_SOURCE_BYTES,
         });
     }
 
@@ -110,24 +96,7 @@ fn read_file_inner(
         path: path.clone(),
         source,
     })?;
-    if is_skill_md && bytes.len() > SKILL_MD_MAX_BYTES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
-            request.path,
-            bytes.len(),
-            SKILL_MD_MAX_BYTES
-        )));
-    }
-
     let (content, _) = decode_text_file(&path, &bytes)?;
-    if is_skill_md && content.len() > SKILL_MD_MAX_BYTES {
-        return Err(ToolRuntimeError::InvalidArguments(format!(
-            "read_file path '{}' is a SKILL.md that exceeds the maximum size ({} UTF-8 bytes; max {} bytes). The document must fit entirely under the limit; partial reads are not allowed.",
-            request.path,
-            content.len(),
-            SKILL_MD_MAX_BYTES
-        )));
-    }
 
     let line_range = if let Some(range) = requested_line_range {
         Some(normalize_read_line_range(

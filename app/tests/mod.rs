@@ -3892,24 +3892,17 @@ Use composition over boolean props.
 }
 
 #[test]
-fn parse_skill_file_rejects_oversized_skill_md_with_safe_error() {
+fn parse_skill_file_accepts_skill_md_larger_than_former_64kib_limit() {
     let dir = tempfile::tempdir().expect("dir");
     let path = dir.path().join("SKILL.md");
     let header = "---\nname: huge\ndescription: too large\n---\n\n";
-    let body_len = foco_tools::output_budget::SKILL_MD_MAX_BYTES - header.len() + 1;
+    let body_len = 64 * 1024 - header.len() + 1;
     let body = "z".repeat(body_len);
     fs::write(&path, format!("{header}{body}")).expect("write");
 
-    let error = parse_skill_file(&path).expect_err("oversized skill");
-    assert!(
-        error.contains("exceeds the maximum SKILL.md size"),
-        "{error}"
-    );
-    assert!(error.contains(&format!(
-        "max {}",
-        foco_tools::output_budget::SKILL_MD_MAX_BYTES
-    )));
-    assert!(!error.contains(&"z".repeat(32)));
+    let parsed = parse_skill_file(&path).expect("large skill");
+    assert_eq!(parsed.id, "huge");
+    assert!(parsed.markdown.contains(&"z".repeat(32)));
 }
 
 #[test]

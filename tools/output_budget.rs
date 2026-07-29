@@ -9,8 +9,6 @@ use crate::ToolExecution;
 pub const TOOL_OUTPUT_SOFT_BYTE_LIMIT: usize = 50 * 1024;
 pub const TOOL_OUTPUT_SOFT_LINE_LIMIT: usize = 2_000;
 pub const TOOL_EXECUTION_HARD_BYTE_LIMIT: usize = 128 * 1024;
-/// Single `SKILL.md` hard limit: full document success or explicit failure (no partial load).
-pub const SKILL_MD_MAX_BYTES: usize = 64 * 1024;
 /// Total UTF-8 bytes of deduplicated selected skill bodies for one provider turn.
 pub const SELECTED_SKILLS_MAX_TOTAL_BYTES: usize = 128 * 1024;
 pub const TOOL_TRANSPORT_DYNAMIC_FIELD_BYTE_LIMIT: usize = 512;
@@ -702,13 +700,13 @@ where
     };
 
     // SKILL.md is an integrity-critical instruction document: allow full successful results
-    // through the soft byte/line caps when the file itself is within SKILL_MD_MAX_BYTES.
-    // Hard envelope limits still apply.
+    // through the soft byte/line caps so agents never receive partial instructions. Hard
+    // envelope limits still apply.
     if semantics == ToolOutputSemantics::ReadOnly
         && tool_name == "read_file"
         && !execution.is_error
         && reason != ToolOutputBudgetReason::HardByteLimit
-        && read_file_output_is_skill_md_within_limit(&execution.output)
+        && read_file_output_is_skill_md(&execution.output)
     {
         return BudgetedToolExecution {
             execution,
@@ -951,17 +949,14 @@ pub fn path_is_skill_md(path: &Path) -> bool {
         .is_some_and(|name| name == "SKILL.md")
 }
 
-fn read_file_output_is_skill_md_within_limit(output: &Value) -> bool {
+fn read_file_output_is_skill_md(output: &Value) -> bool {
     let Some(path) = output.get("path").and_then(Value::as_str) else {
         return false;
     };
     if !path_is_skill_md(Path::new(path)) {
         return false;
     }
-    match output.get("bytes").and_then(Value::as_u64) {
-        Some(bytes) => bytes <= SKILL_MD_MAX_BYTES as u64,
-        None => false,
-    }
+    output.get("bytes").and_then(Value::as_u64).is_some()
 }
 
 fn attach_output_preview(output: &mut Value, original_output: &Value) {
