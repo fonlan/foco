@@ -1739,6 +1739,124 @@ fn stage_git_file_preserves_regular_file_modes() {
     assert_eq!(modes, ["100644", "100755"]);
 }
 
+#[cfg(all(test, unix))]
+#[test]
+fn stage_git_file_commits_chmod_only_changes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+
+    fs::write(workspace_path.join("a-data.txt"), "data\n").expect("non-executable file");
+    let executable_path = workspace_path.join("b-script.sh");
+    fs::write(&executable_path, "#!/bin/sh\n").expect("executable file");
+    stage_git_file(workspace_path, "a-data.txt").expect("stage non-executable file");
+    stage_git_file(workspace_path, "b-script.sh").expect("stage executable file");
+    commit_staged_changes(workspace_path, "initial commit".to_owned()).expect("initial commit");
+
+    fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o755))
+        .expect("set executable permission");
+    stage_git_file(workspace_path, "b-script.sh").expect("stage chmod-only change");
+
+    let index_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["ls-files", "--stage"])
+        .output()
+        .expect("read index modes");
+    assert!(
+        index_output.status.success(),
+        "git ls-files --stage failed: {}",
+        String::from_utf8_lossy(&index_output.stderr)
+    );
+    let index_modes = String::from_utf8(index_output.stdout)
+        .expect("utf-8 index output")
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .expect("index mode")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(index_modes, vec!["100644".to_owned(), "100755".to_owned()]);
+
+    let staged_diff = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["diff", "--cached", "--raw", "--", "b-script.sh"])
+        .output()
+        .expect("read staged chmod-only diff");
+    assert!(
+        staged_diff.status.success(),
+        "git diff --cached --raw failed: {}",
+        String::from_utf8_lossy(&staged_diff.stderr)
+    );
+    let staged_diff = String::from_utf8(staged_diff.stdout).expect("utf-8 staged diff");
+    let (header, path) = staged_diff
+        .trim_end()
+        .split_once('\t')
+        .expect("raw diff header and path");
+    let fields = header.split_whitespace().collect::<Vec<_>>();
+    let [old_mode, new_mode, old_blob, new_blob, status] = fields.as_slice() else {
+        panic!("unexpected raw diff header: {header}");
+    };
+    assert_eq!(
+        (*old_mode, *new_mode, old_blob == new_blob, *status, path),
+        (":100644", "100755", true, "M", "b-script.sh"),
+        "chmod-only staging must change only the regular-file mode"
+    );
+
+    commit_staged_changes(workspace_path, "chmod-only commit".to_owned())
+        .expect("commit chmod-only change");
+
+    let tree_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["ls-tree", "-r", "HEAD"])
+        .output()
+        .expect("read committed tree modes");
+    assert!(
+        tree_output.status.success(),
+        "git ls-tree -r HEAD failed: {}",
+        String::from_utf8_lossy(&tree_output.stderr)
+    );
+    let tree_modes = String::from_utf8(tree_output.stdout)
+        .expect("utf-8 tree output")
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .next()
+                .expect("tree mode")
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(tree_modes, vec!["100644".to_owned(), "100755".to_owned()]);
+
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("read worktree status");
+    assert!(
+        status.status.success(),
+        "git status --porcelain failed: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status.stdout.is_empty(),
+        "worktree should be clean after committing chmod-only change: {}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+}
+
 #[cfg(test)]
 #[test]
 fn phase12_agent_worktrees_isolate_delete_and_merge_changes() {
