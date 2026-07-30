@@ -76,19 +76,19 @@ pub use workspace_records::{
     NewScheduledTask, NewScheduledTaskRun, NewTerminalSession, NewToolCall, NewToolResult,
     NewWorkspaceSpecJob, PlanAutoRunCandidateRecord, PlanAutoRunSelection, PlanAutoRunStateRecord,
     PlanListFilter, PlanListOrder, PlanListPage, PlanPatch, PlanPhaseAttemptRecord,
-    PlanPhaseDerivedEffectsRecord, PlanPhaseRecord, PlanRecord, PlanStepPatch, PlanStepRecord,
-    PlanWorktreeAuditRecord, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-    PreStreamFailureMaterialization, PromptContextInjectionRecord, QueueCoordinatorChatMessage,
-    RegisterAgentTaskWaitDependencies, RewriteChatFromUserMessage,
-    RewriteChatFromUserMessageResult, RunEventRecord, STRUCTURED_LLM_BASELINE_REQUEST_KINDS,
-    STRUCTURED_LLM_OUTCOME_MISSING_TOOL, STRUCTURED_LLM_OUTCOME_OTHER,
-    STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR, STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT,
-    STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID, STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID,
-    STRUCTURED_LLM_OUTCOME_SUCCEEDED, STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED,
-    STRUCTURED_LLM_OUTCOME_WRONG_TOOL, STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY,
-    STRUCTURED_LLM_RECOVERY_NONE, STRUCTURED_LLM_RECOVERY_TEXT_JSON,
-    STRUCTURED_LLM_RECOVERY_TOOL_CALL, ScheduledTaskDueRunClaim, ScheduledTaskListFilter,
-    ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
+    PlanPhaseDerivedEffectsRecord, PlanPhaseDispatchBinding, PlanPhaseRecord, PlanRecord,
+    PlanStepPatch, PlanStepRecord, PlanWorktreeAuditRecord, PreStreamChatFailureClosure,
+    PreStreamChatFailureClosureResult, PreStreamFailureMaterialization,
+    PromptContextInjectionRecord, QueueCoordinatorChatMessage, RegisterAgentTaskWaitDependencies,
+    RewriteChatFromUserMessage, RewriteChatFromUserMessageResult, RunEventRecord,
+    STRUCTURED_LLM_BASELINE_REQUEST_KINDS, STRUCTURED_LLM_OUTCOME_MISSING_TOOL,
+    STRUCTURED_LLM_OUTCOME_OTHER, STRUCTURED_LLM_OUTCOME_PROVIDER_ERROR,
+    STRUCTURED_LLM_OUTCOME_PROVIDER_TIMEOUT, STRUCTURED_LLM_OUTCOME_SCHEMA_INVALID,
+    STRUCTURED_LLM_OUTCOME_SEMANTIC_INVALID, STRUCTURED_LLM_OUTCOME_SUCCEEDED,
+    STRUCTURED_LLM_OUTCOME_TEXT_JSON_RECOVERED, STRUCTURED_LLM_OUTCOME_WRONG_TOOL,
+    STRUCTURED_LLM_RECOVERY_CORRECTION_RETRY, STRUCTURED_LLM_RECOVERY_NONE,
+    STRUCTURED_LLM_RECOVERY_TEXT_JSON, STRUCTURED_LLM_RECOVERY_TOOL_CALL, ScheduledTaskDueRunClaim,
+    ScheduledTaskListFilter, ScheduledTaskRecord, ScheduledTaskRunRecord, ScheduledTaskRunUpdate,
     ScheduledTaskStatusCountRecord, ScheduledTaskUpdate, StructuredLlmOutcomeBreakdownRow,
     StructuredLlmOutcomeFilters, StructuredLlmOutcomeKindSummary,
     StructuredLlmRequestClassification, TerminalSessionRecord, TodoGraphFilter, TodoGraphRecord,
@@ -103,13 +103,24 @@ use workspace_schema::{
     MIGRATION_026, MIGRATION_027, MIGRATION_028, MIGRATION_029, MIGRATION_030, MIGRATION_032,
     MIGRATION_033, MIGRATION_034, MIGRATION_035, MIGRATION_036, MIGRATION_037, MIGRATION_038,
     MIGRATION_039, MIGRATION_040, MIGRATION_041, MIGRATION_042, MIGRATION_043, MIGRATION_044,
-    MIGRATION_045, MIGRATION_046, MIGRATION_047, MIGRATION_048, MIGRATION_049, Migration,
+    MIGRATION_045, MIGRATION_046, MIGRATION_047, MIGRATION_048, MIGRATION_049, MIGRATION_050,
+    Migration,
 };
 
 pub const WORKSPACE_FOCO_DIR: &str = ".foco";
 pub const WORKSPACE_DATABASE_FILE: &str = "foco.sqlite";
 pub const WORKSPACE_BACKUP_RETAIN_COUNT: usize = 3;
-pub const WORKSPACE_SCHEMA_VERSION: u32 = 49;
+pub const WORKSPACE_SCHEMA_VERSION: u32 = 50;
+/// One durable reservation policy shared by local and remote Plan dispatch.
+pub const PLAN_PHASE_DISPATCH_RESERVATION: Duration = Duration::from_secs(120);
+
+/// Derives the durable reservation deadline from an injected clock, making the
+/// local and remote dispatch policy both shared and directly testable.
+pub fn plan_phase_dispatch_deadline_at(now: DateTime<Utc>) -> String {
+    (now + chrono::Duration::from_std(PLAN_PHASE_DISPATCH_RESERVATION)
+        .unwrap_or_else(|_| chrono::Duration::seconds(120)))
+    .to_rfc3339_opts(SecondsFormat::Millis, true)
+}
 pub const WORKSPACE_SPEC_DEFAULT_ID: &str = "default";
 pub const WORKSPACE_SPEC_MAX_MARKDOWN_BYTES: usize = 64 * 1024;
 pub const WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON: &str = "stale_revision";
@@ -484,6 +495,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 49,
         sql: MIGRATION_049,
+    },
+    Migration {
+        version: 50,
+        sql: MIGRATION_050,
     },
 ];
 
@@ -2441,7 +2456,7 @@ impl WorkspaceDatabase {
                 params![
                     id,
                     WorkspaceSpecJobStatus::Failed.as_str(),
-                    error_message,
+                    &error_message,
                     completed_at,
                     WorkspaceSpecJobStatus::Running.as_str()
                 ],
@@ -2514,7 +2529,7 @@ impl WorkspaceDatabase {
                 params![
                     id,
                     WorkspaceSpecJobStatus::Failed.as_str(),
-                    error_message,
+                    &error_message,
                     now
                 ],
             )
@@ -3318,6 +3333,7 @@ impl WorkspaceDatabase {
         let model_id = normalized_optional_text(model_id);
         let thinking_level = normalized_optional_text(thinking_level);
         let now = now_timestamp();
+        let dispatch_deadline_at = plan_phase_dispatch_deadline_at(Utc::now());
         let database_path = self.database_path.clone();
         // Validate plan/phase/active-attempt state, allocate sequence, cancel
         // leftover merge attempts, and write the queued attempt in one Immediate
@@ -3467,9 +3483,9 @@ impl WorkspaceDatabase {
                 "INSERT INTO plan_phase_attempts (
                     id, plan_id, phase_id, sequence, trigger, status,
                     provider_id, model_id, thinking_level,
-                    dispatch_owner_incarnation, created_at, updated_at
+                    dispatch_owner_incarnation, dispatch_deadline_at, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?10)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
                 params![
                     attempt_id.as_str(),
                     plan_id,
@@ -3480,6 +3496,7 @@ impl WorkspaceDatabase {
                     model_id,
                     thinking_level,
                     dispatch_owner_incarnation,
+                    dispatch_deadline_at,
                     now
                 ],
             )
@@ -3601,6 +3618,19 @@ impl WorkspaceDatabase {
             }
         }
 
+        let deadline_at = attempt.dispatch_deadline_at.as_deref().ok_or_else(|| {
+            WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                attempt_id: attempt.id.clone(),
+                reason: PlanPhaseAttemptConflictReason::MissingDeadline,
+            }
+        })?;
+        if dispatch_reservation_expired(deadline_at, &now_timestamp())? {
+            return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                attempt_id: attempt.id,
+                reason: PlanPhaseAttemptConflictReason::Expired,
+            });
+        }
+
         let now = now_timestamp();
         let database_path = self.database_path.clone();
         let transaction = self
@@ -3621,14 +3651,17 @@ impl WorkspaceDatabase {
                    AND implementation_chat_id IS NULL
                    AND agent_team_id IS NULL
                    AND agent_task_id IS NULL
-                   AND dispatch_owner_incarnation = ?6",
+                   AND dispatch_owner_incarnation = ?6
+                   AND dispatch_deadline_at = ?7
+                   AND dispatch_deadline_at > ?5",
                 params![
                     attempt.id.as_str(),
                     implementation_chat_id.trim(),
                     agent_team_id.as_str(),
                     agent_task_id.as_str(),
                     now,
-                    dispatch_owner_incarnation
+                    dispatch_owner_incarnation,
+                    deadline_at
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -3848,7 +3881,7 @@ impl WorkspaceDatabase {
         Ok(task_failures > 0)
     }
 
-    fn plan_phase_attempt(
+    pub fn plan_phase_attempt(
         &self,
         attempt_id: &str,
     ) -> Result<Option<PlanPhaseAttemptRecord>, WorkspaceDatabaseError> {
@@ -3858,7 +3891,7 @@ impl WorkspaceDatabase {
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
                         commit_id, error_message, started_at, completed_at,
-                        created_at, updated_at, dispatch_owner_incarnation
+                        created_at, updated_at, dispatch_owner_incarnation, dispatch_deadline_at
                  FROM plan_phase_attempts
                  WHERE id = ?1",
                 params![attempt_id.trim()],
@@ -3879,7 +3912,7 @@ impl WorkspaceDatabase {
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
                         commit_id, error_message, started_at, completed_at,
-                        created_at, updated_at, dispatch_owner_incarnation
+                        created_at, updated_at, dispatch_owner_incarnation, dispatch_deadline_at
                  FROM plan_phase_attempts
                  WHERE phase_id = ?1
                  ORDER BY sequence ASC",
@@ -4562,7 +4595,7 @@ impl WorkspaceDatabase {
                         provider_id, model_id, thinking_level,
                         implementation_chat_id, agent_team_id, agent_task_id,
                         commit_id, error_message, started_at, completed_at,
-                        created_at, updated_at, dispatch_owner_incarnation
+                        created_at, updated_at, dispatch_owner_incarnation, dispatch_deadline_at
                  FROM plan_phase_attempts
                  WHERE agent_task_id = ?1
                  ORDER BY sequence DESC
@@ -5011,6 +5044,7 @@ impl WorkspaceDatabase {
         let current_dispatch_owner_incarnation =
             normalize_required_dispatch_owner(current_dispatch_owner_incarnation)?;
         let error_message = error_message.trim();
+        let now = now_timestamp();
         // Candidate scan is advisory only. Each phase is re-validated and failed
         // inside an Immediate transaction with owner/status predicates so a
         // concurrent begin that inserts a current-owner queued attempt cannot be
@@ -5034,11 +5068,12 @@ impl WorkspaceDatabase {
                              AND attempt.status IN ('queued', 'running')
                              AND attempt.trigger NOT IN ('merge_auto', 'merge_retry')
                              AND attempt.dispatch_owner_incarnation = ?1
+                             AND attempt.dispatch_deadline_at > ?2
                        )",
                 )
                 .map_err(|source| self.sqlite_error(source))?;
             let rows = statement
-                .query_map(params![current_dispatch_owner_incarnation], |row| {
+                .query_map(params![current_dispatch_owner_incarnation, now], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
                 })
                 .map_err(|source| self.sqlite_error(source))?;
@@ -5075,6 +5110,46 @@ impl WorkspaceDatabase {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|source| sqlite_error(&database_path, source))?;
 
+        // Classify from durable reservation evidence rather than a caller's
+        // wording, so local and remote recovery preserve stable failure codes.
+        let dispatch_reason = transaction
+            .query_row(
+                "SELECT dispatch_owner_incarnation, dispatch_deadline_at
+                 FROM plan_phase_attempts
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('queued', 'running')
+                   AND trigger NOT IN ('merge_auto', 'merge_retry')
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL
+                 ORDER BY sequence DESC
+                 LIMIT 1",
+                params![plan_id, phase_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&database_path, source))
+            .map(|attempt| match attempt {
+                Some((Some(owner), Some(deadline)))
+                    if owner == current_dispatch_owner_incarnation =>
+                {
+                    if deadline <= now {
+                        "plan_phase_dispatch_timed_out"
+                    } else {
+                        "runtime_abandoned"
+                    }
+                }
+                Some((Some(_), _)) => "owner_replaced",
+                _ => "runtime_abandoned",
+            })?;
+        let error_message = format!("{dispatch_reason}: {error_message}");
+
         // Fail the phase only while it remains an unbound running orphan without
         // a live current-owner dispatch window. If begin already wrote a
         // current-owner queued attempt, affected-row count is 0 and we skip.
@@ -5104,13 +5179,15 @@ impl WorkspaceDatabase {
                          AND attempt.status IN ('queued', 'running')
                          AND attempt.trigger NOT IN ('merge_auto', 'merge_retry')
                          AND attempt.dispatch_owner_incarnation = ?5
+                         AND attempt.dispatch_deadline_at > ?6
                    )",
                 params![
                     plan_id,
                     phase_id,
                     error_message,
                     now,
-                    current_dispatch_owner_incarnation
+                    current_dispatch_owner_incarnation,
+                    now
                 ],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -5118,9 +5195,8 @@ impl WorkspaceDatabase {
             return Ok(false);
         }
 
-        // Only terminalize attempts that are not owned by the current runtime.
-        // Defense in depth: the phase predicate already required no current-owner
-        // active attempt, so this should only hit legacy/NULL/old owners.
+        // Terminalize only unbound reservations. A current-owner reservation is
+        // eligible here only after its durable deadline has expired.
         transaction
             .execute(
                 "UPDATE plan_phase_attempts
@@ -5131,14 +5207,19 @@ impl WorkspaceDatabase {
                  WHERE plan_id = ?1
                    AND phase_id = ?2
                    AND status IN ('queued', 'running')
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL
                    AND (
                        dispatch_owner_incarnation IS NULL
                        OR dispatch_owner_incarnation != ?5
+                       OR dispatch_deadline_at IS NULL
+                       OR dispatch_deadline_at <= ?4
                    )",
                 params![
                     plan_id,
                     phase_id,
-                    error_message,
+                    &error_message,
                     now,
                     current_dispatch_owner_incarnation
                 ],
@@ -5167,7 +5248,7 @@ impl WorkspaceDatabase {
                      updated_at = ?3
                  WHERE id = ?1
                    AND status NOT IN ('completed', 'cancelled')",
-                params![plan_id, error_message, now],
+                params![plan_id, &error_message, now],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
         if plan_updated != 1 {
@@ -7001,6 +7082,25 @@ impl WorkspaceDatabase {
             WORKSPACE_SPEC_V1_OUTPUT_STRATEGY.validate_markdown_size(snapshot.content_markdown)?;
             workspace_spec_revision_to_i64(snapshot.revision, "spec_revision")?;
         }
+        if let Some(binding) = queued.plan_phase_dispatch_binding.as_ref() {
+            normalize_required_dispatch_owner(binding.dispatch_owner_incarnation)?;
+            if binding.attempt_id.trim().is_empty()
+                || binding.plan_id.trim().is_empty()
+                || binding.phase_id.trim().is_empty()
+                || binding.dispatch_deadline_at.trim().is_empty()
+            {
+                return Err(WorkspaceDatabaseError::InvalidPlan {
+                    message: "Plan phase dispatch binding must include attempt, plan, phase, and deadline"
+                        .to_string(),
+                });
+            }
+            if dispatch_reservation_expired(binding.dispatch_deadline_at, &now_timestamp())? {
+                return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                    attempt_id: binding.attempt_id.trim().to_string(),
+                    reason: PlanPhaseAttemptConflictReason::Expired,
+                });
+            }
+        }
 
         let new_team_snapshot = queued
             .new_team
@@ -7352,6 +7452,76 @@ impl WorkspaceDatabase {
                 params![chat_metadata_json, now, queued.chat_id],
             )
             .map_err(|source| sqlite_error(&database_path, source))?;
+        if let Some(binding) = queued.plan_phase_dispatch_binding.as_ref() {
+            let attempt_updated = transaction
+                .execute(
+                    "UPDATE plan_phase_attempts
+                     SET status = 'running',
+                         implementation_chat_id = ?4,
+                         agent_team_id = ?5,
+                         agent_task_id = ?6,
+                         started_at = COALESCE(started_at, ?7),
+                         updated_at = ?7
+                     WHERE id = ?1
+                       AND plan_id = ?2
+                       AND phase_id = ?3
+                       AND status IN ('queued', 'running')
+                       AND implementation_chat_id IS NULL
+                       AND agent_team_id IS NULL
+                       AND agent_task_id IS NULL
+                       AND dispatch_owner_incarnation = ?8
+                       AND dispatch_deadline_at = ?9
+                       AND dispatch_deadline_at > ?7",
+                    params![
+                        binding.attempt_id.trim(),
+                        binding.plan_id.trim(),
+                        binding.phase_id.trim(),
+                        queued.chat_id,
+                        queued.task.team_id.as_str(),
+                        queued.task.id.as_str(),
+                        now,
+                        binding.dispatch_owner_incarnation.trim(),
+                        binding.dispatch_deadline_at.trim(),
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if attempt_updated != 1 {
+                return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                    attempt_id: binding.attempt_id.trim().to_string(),
+                    reason: PlanPhaseAttemptConflictReason::ConcurrentStateChange,
+                });
+            }
+            let phase_updated = transaction
+                .execute(
+                    "UPDATE plan_phases
+                     SET implementation_chat_id = ?3,
+                         agent_team_id = ?4,
+                         agent_task_id = ?5,
+                         error_message = NULL,
+                         updated_at = ?6
+                     WHERE plan_id = ?1
+                       AND id = ?2
+                       AND status = 'running'
+                       AND implementation_chat_id IS NULL
+                       AND agent_team_id IS NULL
+                       AND agent_task_id IS NULL",
+                    params![
+                        binding.plan_id.trim(),
+                        binding.phase_id.trim(),
+                        queued.chat_id,
+                        queued.task.team_id.as_str(),
+                        queued.task.id.as_str(),
+                        now,
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            if phase_updated != 1 {
+                return Err(WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+                    attempt_id: binding.attempt_id.trim().to_string(),
+                    reason: PlanPhaseAttemptConflictReason::ConcurrentStateChange,
+                });
+            }
+        }
         transaction
             .commit()
             .map_err(|source| sqlite_error(&database_path, source))?;
@@ -20370,6 +20540,8 @@ pub enum WorkspaceDatabaseError {
 pub enum PlanPhaseAttemptConflictReason {
     OwnerMismatch,
     MissingOwner,
+    MissingDeadline,
+    Expired,
     Terminal,
     AlreadyAttached,
     ConcurrentStateChange,
@@ -20380,6 +20552,8 @@ impl fmt::Display for PlanPhaseAttemptConflictReason {
         let reason = match self {
             Self::OwnerMismatch => "dispatch owner mismatch",
             Self::MissingOwner => "missing dispatch owner",
+            Self::MissingDeadline => "missing dispatch deadline",
+            Self::Expired => "plan_phase_dispatch_timed_out",
             Self::Terminal => "attempt is terminal",
             Self::AlreadyAttached => "attempt is already attached",
             Self::ConcurrentStateChange => "concurrent state change",
@@ -20618,6 +20792,7 @@ fn plan_phase_attempt_from_row(
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
         dispatch_owner_incarnation: row.get(18)?,
+        dispatch_deadline_at: row.get(19)?,
     })
 }
 
@@ -20676,6 +20851,23 @@ fn normalized_optional_text(value: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
+}
+
+fn dispatch_reservation_expired(
+    deadline_at: &str,
+    now: &str,
+) -> Result<bool, WorkspaceDatabaseError> {
+    let deadline = DateTime::parse_from_rfc3339(deadline_at).map_err(|source| {
+        WorkspaceDatabaseError::InvalidPlan {
+            message: format!("invalid plan phase dispatch deadline: {source}"),
+        }
+    })?;
+    let now = DateTime::parse_from_rfc3339(now).map_err(|source| {
+        WorkspaceDatabaseError::InvalidPlan {
+            message: format!("invalid plan phase dispatch clock: {source}"),
+        }
+    })?;
+    Ok(deadline <= now)
 }
 
 fn normalize_required_dispatch_owner(value: &str) -> Result<&str, WorkspaceDatabaseError> {

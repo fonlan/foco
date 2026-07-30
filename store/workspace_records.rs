@@ -148,6 +148,18 @@ pub struct QueueCoordinatorChatMessage<'a> {
     pub max_instance_queued: i64,
     pub max_chat_queued: i64,
     pub task_queued_payload_json: &'a str,
+    /// Optional Plan phase reservation that is attached in this transaction.
+    /// Ordinary chat queueing leaves this unset.
+    pub plan_phase_dispatch_binding: Option<PlanPhaseDispatchBinding<'a>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlanPhaseDispatchBinding<'a> {
+    pub attempt_id: &'a str,
+    pub plan_id: &'a str,
+    pub phase_id: &'a str,
+    pub dispatch_owner_incarnation: &'a str,
+    pub dispatch_deadline_at: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -806,6 +818,10 @@ pub struct PlanPhaseAttemptRecord {
     /// protocol stays unchanged. NULL means legacy/previous-runtime ownership.
     #[serde(skip)]
     pub dispatch_owner_incarnation: Option<String>,
+    /// Deadline for the unbound begin→queue transaction reservation. Internal
+    /// only: it is deliberately absent from the public Plan JSON protocol.
+    #[serde(skip)]
+    pub dispatch_deadline_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

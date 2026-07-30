@@ -902,7 +902,10 @@ pub(crate) fn reconcile_agent_attempt_leases(
                     }
                 }
             }
-            if let Some(dispatch_owner_incarnation) = context.plan_dispatch_owner_incarnation() {
+            let dispatch_owner_incarnation = context
+                .plan_dispatch_owner_incarnation()
+                .unwrap_or_else(|| state.plan_dispatch_owner_incarnation());
+            {
                 database
                     .fail_running_plan_phases_for_terminal_agent_tasks(RESTART_INTERRUPTION_REASON)
                     .map_err(ApiError::from_workspace_error)?;

@@ -1646,6 +1646,21 @@ SET transport = CASE
 END;
 "#;
 
+// An unbound Plan phase attempt is only a short-lived reservation while its
+// Coordinator chat/task is being created. Keeping its deadline in SQLite lets
+// both the local runtime and a remote sidecar make the same recovery decision.
+pub(crate) const MIGRATION_050: &str = r#"
+ALTER TABLE plan_phase_attempts
+ADD COLUMN dispatch_deadline_at TEXT;
+
+CREATE INDEX plan_phase_attempts_unbound_dispatch_deadline_idx
+ON plan_phase_attempts (dispatch_deadline_at)
+WHERE status IN ('queued', 'running')
+  AND implementation_chat_id IS NULL
+  AND agent_team_id IS NULL
+  AND agent_task_id IS NULL;
+"#;
+
 #[cfg(test)]
 mod tests {
     use crate::workspace::{NewHookRun, WorkspaceDatabase};

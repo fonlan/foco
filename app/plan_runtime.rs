@@ -31,7 +31,10 @@ use crate::{
         fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
         resolve_agent_worktree_path, shared_workspace_head_commit_id, stage_git_file,
     },
-    http::chat::{QueueChatMessageInput, QueuedChatMessageOrigin, queue_chat_message_internal},
+    http::chat::{
+        PlanPhaseDispatchBinding, QueueChatMessageInput, QueuedChatMessageOrigin,
+        queue_chat_message_internal,
+    },
     plan_merge::{
         PlanMergeFailureKind, classify_plan_merge_failure, plan_merge_prompt,
         plan_phase_source_diff,
@@ -200,7 +203,7 @@ pub(crate) async fn retry_plan_phase(
 ) -> Result<PlanRecord, ApiError> {
     let config = config_snapshot(state)?;
     let workspace = workspace_by_id(&config, workspace_id)?.clone();
-    let (attempt_id, plan, selection) = {
+    let (attempt_id, deadline_at, plan, selection) = {
         let mut database = open_workspace_database(&workspace.path)?;
         let plan = database
             .plan(plan_id)
@@ -257,14 +260,17 @@ pub(crate) async fn retry_plan_phase(
             .ok_or_else(|| {
                 ApiError::internal(format!("plan was not found after retry: {plan_id}"))
             })?;
-        (attempt.id, plan, selection)
+        let deadline_at = attempt.dispatch_deadline_at.clone().ok_or_else(|| {
+            ApiError::internal("new Plan phase attempt did not receive a dispatch deadline")
+        })?;
+        (attempt.id, deadline_at, plan, selection)
     };
     let dispatch_plan = plan.clone();
     match dispatch_plan_phase(
         state,
         &workspace.id,
         dispatch_plan,
-        Some((attempt_id, selection)),
+        Some((attempt_id, deadline_at, selection)),
     )
     .await
     {
@@ -689,6 +695,7 @@ async fn dispatch_plan_merge(
                 plan_id: plan.id.clone(),
                 phase_id: phase.id.clone(),
             },
+            plan_phase_dispatch_binding: None,
         },
     )
     .await;
@@ -863,7 +870,7 @@ async fn dispatch_plan_phase(
     state: &AppState,
     workspace_id: &str,
     plan: PlanRecord,
-    attempt: Option<(String, PlanRunnerModelSelection)>,
+    attempt: Option<(String, String, PlanRunnerModelSelection)>,
 ) -> Result<PlanRecord, ApiError> {
     if plan.status == "implemented" || plan.active_phase_id.is_none() {
         return Ok(plan);
@@ -887,8 +894,10 @@ async fn dispatch_plan_phase(
     }
 
     let config = config_snapshot(state)?;
-    let (attempt_id, selection) = match attempt {
-        Some((attempt_id, selection)) => (Some(attempt_id), selection),
+    let (attempt_id, dispatch_deadline_at, selection) = match attempt {
+        Some((attempt_id, deadline_at, selection)) => {
+            (Some(attempt_id), Some(deadline_at), selection)
+        }
         None => {
             let is_retry = phase.attempts.iter().any(|attempt| {
                 matches!(
@@ -919,7 +928,10 @@ async fn dispatch_plan_phase(
                     state.plan_dispatch_owner_incarnation(),
                 )
                 .map_err(ApiError::from_workspace_error)?;
-            (Some(attempt.id), selection)
+            let deadline_at = attempt.dispatch_deadline_at.clone().ok_or_else(|| {
+                ApiError::internal("new Plan phase attempt did not receive a dispatch deadline")
+            })?;
+            (Some(attempt.id), Some(deadline_at), selection)
         }
     };
     let workspace = workspace_by_id(&config, workspace_id)?;
@@ -955,6 +967,20 @@ async fn dispatch_plan_phase(
                 plan_id: plan.id.clone(),
                 phase_id: phase.id.clone(),
             },
+            plan_phase_dispatch_binding: attempt_id
+                .as_ref()
+                .zip(dispatch_deadline_at.as_ref())
+                .map(
+                    |(attempt_id, dispatch_deadline_at)| PlanPhaseDispatchBinding {
+                        attempt_id: attempt_id.clone(),
+                        plan_id: plan.id.clone(),
+                        phase_id: phase.id.clone(),
+                        dispatch_owner_incarnation: state
+                            .plan_dispatch_owner_incarnation()
+                            .to_string(),
+                        dispatch_deadline_at: dispatch_deadline_at.clone(),
+                    },
+                ),
         },
     )
     .await?;
@@ -969,15 +995,24 @@ async fn dispatch_plan_phase(
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
     let mut database = open_workspace_database(&workspace.path)?;
     let attached = if let Some(attempt_id) = attempt_id.as_deref() {
-        database
-            .attach_plan_phase_attempt_run(
-                attempt_id,
-                &queued.chat_id,
-                team_id,
-                task_id,
-                state.plan_dispatch_owner_incarnation(),
-            )
-            .map_err(ApiError::from_workspace_error)
+        let bound = database
+            .plan_phase_attempt(attempt_id)
+            .map_err(ApiError::from_workspace_error)?
+            .is_some_and(|attempt| {
+                attempt.implementation_chat_id.as_deref() == Some(queued.chat_id.as_str())
+                    && attempt.agent_team_id.as_deref() == Some(team_id.as_str())
+                    && attempt.agent_task_id.as_deref() == Some(task_id.as_str())
+            });
+        if !bound {
+            Err(ApiError::conflict(
+                "Plan phase dispatch binding was not committed",
+            ))
+        } else {
+            database
+                .plan(&plan.id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| ApiError::internal("Plan disappeared after dispatch binding"))
+        }
     } else {
         database
             .attach_plan_phase_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
@@ -2157,6 +2192,7 @@ mod tests {
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:01:00Z".to_string(),
             dispatch_owner_incarnation: None,
+            dispatch_deadline_at: None,
         }
     }
 

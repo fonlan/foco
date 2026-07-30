@@ -505,6 +505,15 @@ pub(crate) struct QueueChatMessageInput {
     pub(crate) coordinator_worktree: Option<AgentWorktreeInfo>,
     pub(crate) correlation_id: Option<String>,
     pub(crate) origin: QueuedChatMessageOrigin,
+    pub(crate) plan_phase_dispatch_binding: Option<PlanPhaseDispatchBinding>,
+}
+
+pub(crate) struct PlanPhaseDispatchBinding {
+    pub(crate) attempt_id: String,
+    pub(crate) plan_id: String,
+    pub(crate) phase_id: String,
+    pub(crate) dispatch_owner_incarnation: String,
+    pub(crate) dispatch_deadline_at: String,
 }
 
 pub(crate) struct QueuedChatMessageArtifacts {
@@ -547,6 +556,7 @@ pub(crate) async fn queue_chat_message(
             coordinator_worktree: None,
             correlation_id: None,
             origin: QueuedChatMessageOrigin::User,
+            plan_phase_dispatch_binding: None,
         },
     )
     .await?;
@@ -783,6 +793,7 @@ pub(crate) async fn queue_chat_message_internal(
         coordinator_worktree,
         correlation_id,
         origin,
+        plan_phase_dispatch_binding,
     } = input;
     let team = if let Some(chat_id) = chat_id.as_deref() {
         let database = open_workspace_database(&workspace.path)?;
@@ -1134,6 +1145,15 @@ pub(crate) async fn queue_chat_message_internal(
             max_instance_queued: AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
             max_chat_queued: AGENT_MAX_QUEUED_TASKS_PER_CHAT,
             task_queued_payload_json: &task_queued_payload_json,
+            plan_phase_dispatch_binding: plan_phase_dispatch_binding.as_ref().map(|binding| {
+                foco_store::workspace::PlanPhaseDispatchBinding {
+                    attempt_id: &binding.attempt_id,
+                    plan_id: &binding.plan_id,
+                    phase_id: &binding.phase_id,
+                    dispatch_owner_incarnation: &binding.dispatch_owner_incarnation,
+                    dispatch_deadline_at: &binding.dispatch_deadline_at,
+                }
+            }),
         },
     );
     if let Err(error) = queued_result {

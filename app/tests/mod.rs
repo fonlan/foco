@@ -15689,6 +15689,7 @@ async fn queue_chat_message_internal_marks_scheduled_origin() {
                 run_id: "scheduled-run-test".to_string(),
                 trigger_reason: "scheduled".to_string(),
             },
+            plan_phase_dispatch_binding: None,
         },
     )
     .await
@@ -15792,6 +15793,7 @@ Only load this when matched.
             coordinator_worktree: None,
             correlation_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::User,
+            plan_phase_dispatch_binding: None,
         },
     )
     .await
@@ -15914,6 +15916,7 @@ async fn queued_plan_chat_recreates_single_skills_table_with_workspace_paths() {
             coordinator_worktree: None,
             correlation_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::User,
+            plan_phase_dispatch_binding: None,
         },
     )
     .await
@@ -16112,6 +16115,7 @@ Only load this when matched.
             coordinator_worktree: None,
             correlation_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::User,
+            plan_phase_dispatch_binding: None,
         },
     )
     .await
@@ -16235,6 +16239,7 @@ async fn queued_chat_deferred_memory_summaries_show_on_assistant_summary() {
             coordinator_worktree: None,
             correlation_id: None,
             origin: crate::http::chat::QueuedChatMessageOrigin::User,
+            plan_phase_dispatch_binding: None,
         },
     )
     .await
@@ -16379,6 +16384,7 @@ async fn queue_plan_phase_reuses_existing_worktree_relative_path() {
                 plan_id: "plan-worktree-reuse-test".to_string(),
                 phase_id: "plan-worktree-reuse-test-phase-2".to_string(),
             },
+            plan_phase_dispatch_binding: None,
         },
     )
     .await

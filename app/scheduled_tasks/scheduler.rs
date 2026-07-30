@@ -705,6 +705,7 @@ fn scheduled_queue_input(
                     run_id: run.id.clone(),
                     trigger_reason: trigger_reason.to_string(),
                 },
+                plan_phase_dispatch_binding: None,
             })
         }
     }

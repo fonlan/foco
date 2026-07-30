@@ -37,18 +37,18 @@ use foco_store::{
         NewPlanStep, NewPromptContextInjection, NewRunEvent, NewScheduledTask, NewScheduledTaskRun,
         NewTerminalSession, NewToolCall, NewToolResult, NewWorkspaceSpecJob, PlanListFilter,
         PlanListOrder, PlanPatch, PlanPhaseAttemptConflictReason, PlanPhaseAttemptTrigger,
-        PlanStepPatch, PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
-        QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL, RegisterAgentTaskWaitDependencies,
-        RemotePreStreamFailureClosureOutcome, RemoteQueuedRunClaimOutcome,
-        RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage, ScheduledTaskDueRunClaim,
-        ScheduledTaskListFilter, ScheduledTaskRunUpdate, ScheduledTaskUpdate, TodoGraphFilter,
-        TodoGraphTask, TodoGraphTaskPatch, UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION,
-        WORKSPACE_SPEC_MAX_MARKDOWN_BYTES, WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON,
-        WORKSPACE_SPEC_V1_OUTPUT_STRATEGY, WorkspaceDatabase, WorkspaceDatabaseError,
-        WorkspaceSpecJobEnqueueDecision, WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy,
-        WorkspaceSpecPromptPlan, WorkspaceSpecSettings, WorkspaceSpecTriggerType,
-        WorkspaceSpecWriteDecision, initialize_workspace_databases,
-        llm_request_audit_count_sql_for_tests,
+        PlanPhaseDispatchBinding, PlanStepPatch, PreStreamChatFailureClosure,
+        PreStreamChatFailureClosureResult, QueueCoordinatorChatMessage, RUNNABLE_AGENT_TASKS_SQL,
+        RegisterAgentTaskWaitDependencies, RemotePreStreamFailureClosureOutcome,
+        RemoteQueuedRunClaimOutcome, RemoteQueuedRunClearOutcome, RewriteChatFromUserMessage,
+        ScheduledTaskDueRunClaim, ScheduledTaskListFilter, ScheduledTaskRunUpdate,
+        ScheduledTaskUpdate, TodoGraphFilter, TodoGraphTask, TodoGraphTaskPatch,
+        UpdateLlmRequestOutcome, WORKSPACE_SCHEMA_VERSION, WORKSPACE_SPEC_MAX_MARKDOWN_BYTES,
+        WORKSPACE_SPEC_STALE_REVISION_SKIP_REASON, WORKSPACE_SPEC_V1_OUTPUT_STRATEGY,
+        WorkspaceDatabase, WorkspaceDatabaseError, WorkspaceSpecJobEnqueueDecision,
+        WorkspaceSpecJobStatus, WorkspaceSpecOutputStrategy, WorkspaceSpecPromptPlan,
+        WorkspaceSpecSettings, WorkspaceSpecTriggerType, WorkspaceSpecWriteDecision,
+        initialize_workspace_databases, llm_request_audit_count_sql_for_tests,
         llm_request_audit_request_kind_breakdown_sql_for_tests,
         llm_request_audit_rows_sql_for_tests, llm_request_audit_summary_sql_for_tests,
         prune_workspace_database_backups, scheduled_task_count_sql_for_tests,
@@ -3425,7 +3425,83 @@ fn running_plan_phase_without_agent_run_reconciliation_marks_failed() {
     assert_eq!(failed.phases[0].steps[0].status, "failed");
     assert_eq!(
         failed.phases[0].error_message.as_deref(),
-        Some("Plan phase start did not create an implementation chat or Agent task"),
+        Some(
+            "runtime_abandoned: Plan phase start did not create an implementation chat or Agent task"
+        ),
+    );
+}
+
+#[test]
+fn expired_current_owner_dispatch_reservation_is_recovered_with_timeout_reason() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "expired-dispatch-reservation", "ready");
+    database
+        .transition_plan("expired-dispatch-reservation", "start")
+        .expect("start Plan phase");
+    database
+        .set_plan_auto_run_enabled(true)
+        .expect("enable Plan auto-run");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "expired-dispatch-reservation",
+            "expired-dispatch-reservation-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("reserve Plan dispatch");
+
+    let connection = Connection::open(database.database_path()).expect("fixture connection");
+    connection
+        .execute(
+            "UPDATE plan_phase_attempts
+             SET dispatch_deadline_at = '2000-01-01T00:00:00.000Z'
+             WHERE id = ?1",
+            params![attempt.id.as_str()],
+        )
+        .expect("expire dispatch reservation");
+    drop(connection);
+
+    let repaired = database
+        .fail_running_plan_phases_without_agent_runs(
+            "Plan phase start did not create an implementation chat or Agent task",
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("recover expired dispatch reservation");
+    assert_eq!(repaired, 1);
+
+    let plan = database
+        .plan("expired-dispatch-reservation")
+        .expect("plan lookup")
+        .expect("plan exists");
+    assert_eq!(plan.status, "failed");
+    assert!(
+        plan.phases[0]
+            .error_message
+            .as_deref()
+            .is_some_and(|error| error.starts_with("plan_phase_dispatch_timed_out:"))
+    );
+    let recovered_attempt = database
+        .plan_phase_attempt(&attempt.id)
+        .expect("attempt lookup")
+        .expect("attempt exists");
+    assert_eq!(recovered_attempt.status, "failed");
+    assert!(
+        recovered_attempt
+            .error_message
+            .as_deref()
+            .is_some_and(|error| error.starts_with("plan_phase_dispatch_timed_out:"))
+    );
+    let auto_run = database.plan_auto_run_state().expect("auto-run state");
+    assert!(auto_run.desired_enabled);
+    assert!(!auto_run.enabled);
+    assert_eq!(
+        auto_run.blocked_reason.as_deref(),
+        Some("waiting_for_retry")
     );
 }
 
@@ -3877,16 +3953,27 @@ fn old_and_null_dispatch_owners_are_recovered_without_attach_race() {
         .expect("recovery scan");
     assert_eq!(repaired, 2);
 
-    for (plan_id, phase_id) in [
-        ("plan-dispatch-owner-old", "plan-dispatch-owner-old-phase"),
-        ("plan-dispatch-owner-null", "plan-dispatch-owner-null-phase"),
+    for (plan_id, phase_id, expected_reason) in [
+        (
+            "plan-dispatch-owner-old",
+            "plan-dispatch-owner-old-phase",
+            "owner_replaced",
+        ),
+        (
+            "plan-dispatch-owner-null",
+            "plan-dispatch-owner-null-phase",
+            "runtime_abandoned",
+        ),
     ] {
+        let expected_error = format!(
+            "{expected_reason}: Plan phase start did not create an implementation chat or Agent task"
+        );
         let failed = database.plan(plan_id).expect("plan").expect("plan");
         assert_eq!(failed.status, "failed");
         assert_eq!(failed.phases[0].status, "failed");
         assert_eq!(
             failed.phases[0].error_message.as_deref(),
-            Some("Plan phase start did not create an implementation chat or Agent task")
+            Some(expected_error.as_str())
         );
         let attempts = database
             .plan_phase_attempts_for_phase(phase_id)
@@ -3895,7 +3982,7 @@ fn old_and_null_dispatch_owners_are_recovered_without_attach_race() {
         assert_eq!(attempts[0].status, "failed");
         assert_eq!(
             attempts[0].error_message.as_deref(),
-            Some("Plan phase start did not create an implementation chat or Agent task")
+            Some(expected_error.as_str())
         );
 
         let (team_id, instance_id) =
@@ -3933,7 +4020,7 @@ fn old_and_null_dispatch_owners_are_recovered_without_attach_race() {
         assert_eq!(after[0].status, "failed");
         assert_eq!(
             after[0].error_message.as_deref(),
-            Some("Plan phase start did not create an implementation chat or Agent task"),
+            Some(expected_error.as_str()),
             "original recovery error must not be overwritten by attach conflict"
         );
     }
@@ -22461,6 +22548,7 @@ fn queue_coordinator_chat_message_rolls_back_chat_and_team_when_task_owner_is_in
             max_instance_queued: 1,
             max_chat_queued: 1,
             task_queued_payload_json: r#"{"userMessageId":"msg-user-atomic-queue"}"#,
+            plan_phase_dispatch_binding: None,
         })
         .expect_err("mismatched owner must fail atomically");
 
@@ -22486,10 +22574,144 @@ fn queue_coordinator_chat_message_rolls_back_chat_and_team_when_task_owner_is_in
 }
 
 #[test]
+fn queue_coordinator_chat_message_rolls_back_when_plan_dispatch_binding_conflicts() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "atomic-binding-conflict", "ready");
+    database
+        .transition_plan("atomic-binding-conflict", "start")
+        .expect("start Plan phase");
+    let dispatch_attempt = database
+        .begin_plan_phase_attempt(
+            "atomic-binding-conflict",
+            "atomic-binding-conflict-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("reserve Plan dispatch");
+    let dispatch_deadline_at = dispatch_attempt
+        .dispatch_deadline_at
+        .as_deref()
+        .expect("new dispatch has deadline");
+    let team_id =
+        AgentTeamId::new("agent-team-atomic-binding-conflict".to_string()).expect("team id");
+    let coordinator_id = AgentInstanceId::new("agent-instance-atomic-binding-conflict".to_string())
+        .expect("instance id");
+    let task_id =
+        AgentTaskId::new("agent-task-atomic-binding-conflict".to_string()).expect("task id");
+    let definition = phase8_agent_definition("atomic-binding-conflict", 1, 1);
+
+    let error = database
+        .queue_coordinator_chat_message(QueueCoordinatorChatMessage {
+            chat_id: "chat-atomic-binding-conflict",
+            new_chat_title: Some("Atomic binding conflict"),
+            new_chat_metadata_json: Some(r#"{"queuedRun":{"status":"queued"}}"#),
+            user_message: NewMessage {
+                id: "msg-user-atomic-binding-conflict",
+                chat_id: "chat-atomic-binding-conflict",
+                role: "user",
+                content: "queue this",
+                sequence: 0,
+                metadata_json: Some("{}"),
+            },
+            chat_queued_run_json: r#"{"status":"queued","userMessageId":"msg-user-atomic-binding-conflict"}"#,
+            chat_spec_snapshot: None,
+            prompt_context_injections: Vec::new(),
+            new_team: Some(NewAgentTeam {
+                id: &team_id,
+                chat_id: "chat-atomic-binding-conflict",
+                coordinator_instance_id: &coordinator_id,
+                coordinator_definition: &definition,
+                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::Shared,
+                coordinator_execution_root_path: None,
+                coordinator_worktree_base_revision: None,
+                coordinator_worktree_branch: None,
+                coordinator_worktree_status: None,
+                max_concurrent_runs: 1,
+            }),
+            task: NewAgentTask {
+                id: &task_id,
+                team_id: &team_id,
+                owner_instance_id: &coordinator_id,
+                origin_instance_id: None,
+                parent_task_id: None,
+                input_json: "{}",
+            },
+            max_team_queued: 1,
+            max_instance_queued: 1,
+            max_chat_queued: 1,
+            task_queued_payload_json: r#"{"userMessageId":"msg-user-atomic-binding-conflict"}"#,
+            plan_phase_dispatch_binding: Some(PlanPhaseDispatchBinding {
+                attempt_id: &dispatch_attempt.id,
+                plan_id: "atomic-binding-conflict",
+                phase_id: "atomic-binding-conflict-phase",
+                dispatch_owner_incarnation: OTHER_DISPATCH_OWNER,
+                dispatch_deadline_at,
+            }),
+        })
+        .expect_err("mismatched dispatch owner must fail atomically");
+
+    assert!(matches!(
+        error,
+        WorkspaceDatabaseError::PlanPhaseAttemptConflict {
+            reason: PlanPhaseAttemptConflictReason::ConcurrentStateChange,
+            ..
+        }
+    ));
+    assert!(
+        database
+            .chat("chat-atomic-binding-conflict")
+            .expect("chat lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .agent_team(&team_id)
+            .expect("team lookup")
+            .is_none()
+    );
+    assert!(
+        database
+            .agent_task(&task_id)
+            .expect("task lookup")
+            .is_none()
+    );
+    let attempt = database
+        .plan_phase_attempt(&dispatch_attempt.id)
+        .expect("attempt lookup")
+        .expect("attempt exists");
+    assert_eq!(attempt.status, "queued");
+    assert!(attempt.implementation_chat_id.is_none());
+}
+
+#[test]
 fn queue_coordinator_chat_message_publishes_task_and_context_together() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
         WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "atomic-publish", "ready");
+    database
+        .transition_plan("atomic-publish", "start")
+        .expect("start Plan phase");
+    let dispatch_attempt = database
+        .begin_plan_phase_attempt(
+            "atomic-publish",
+            "atomic-publish-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("reserve Plan dispatch");
+    let dispatch_deadline_at = dispatch_attempt
+        .dispatch_deadline_at
+        .as_deref()
+        .expect("new dispatch has deadline");
     let team_id = AgentTeamId::new("agent-team-atomic-publish".to_string()).expect("team id");
     let coordinator_id =
         AgentInstanceId::new("agent-instance-atomic-publish".to_string()).expect("instance id");
@@ -22548,6 +22770,13 @@ fn queue_coordinator_chat_message_publishes_task_and_context_together() {
             max_instance_queued: 1,
             max_chat_queued: 1,
             task_queued_payload_json: r#"{"userMessageId":"msg-user-atomic-publish"}"#,
+            plan_phase_dispatch_binding: Some(PlanPhaseDispatchBinding {
+                attempt_id: &dispatch_attempt.id,
+                plan_id: "atomic-publish",
+                phase_id: "atomic-publish-phase",
+                dispatch_owner_incarnation: TEST_DISPATCH_OWNER,
+                dispatch_deadline_at,
+            }),
         })
         .expect("queue Coordinator chat message");
 
@@ -22571,6 +22800,22 @@ fn queue_coordinator_chat_message_publishes_task_and_context_together() {
             .agent_task(&task_id)
             .expect("task lookup")
             .is_some()
+    );
+    let bound_attempt = database
+        .plan_phase_attempt(&dispatch_attempt.id)
+        .expect("Plan attempt lookup")
+        .expect("Plan attempt exists");
+    assert_eq!(
+        bound_attempt.implementation_chat_id.as_deref(),
+        Some("chat-atomic-publish")
+    );
+    assert_eq!(
+        bound_attempt.agent_team_id.as_deref(),
+        Some(team_id.as_str())
+    );
+    assert_eq!(
+        bound_attempt.agent_task_id.as_deref(),
+        Some(task_id.as_str())
     );
     assert_eq!(
         database

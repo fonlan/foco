@@ -60,8 +60,9 @@ use foco_store::{
         LLM_REQUEST_KIND_WORKSPACE_SPEC_UPDATE_COMPACTION, LlmRequestAuditFilters,
         MAIN_CHAT_EXCLUDED_LLM_REQUEST_KINDS, MessageMetadataMutation, NewAgentInstance,
         NewAgentTask, NewAgentTeam, NewLlmRequest, NewLlmRequestEvent, NewMessage, NewRunEvent,
-        NewToolResult, PlanPhaseAttemptTrigger, PreStreamChatFailureClosure,
-        PreStreamChatFailureClosureResult, RemotePreStreamFailureClosureOutcome,
+        NewToolResult, PlanPhaseAttemptTrigger, PlanPhaseDispatchBinding,
+        PreStreamChatFailureClosure, PreStreamChatFailureClosureResult,
+        QueueCoordinatorChatMessage, RemotePreStreamFailureClosureOutcome,
         RewriteChatFromUserMessage, TerminalSessionRecord, TodoGraphFilter,
         UpdateLlmRequestOutcome, WorkspaceDatabase, WorkspaceDatabaseError,
         WorkspaceDatabaseHandle, WorkspaceSpecJobRecord, WorkspaceSpecPromptPlan,
@@ -4632,13 +4633,15 @@ fn reconcile_remote_sidecar_agent_attempt_leases_with_context(
             interrupted += 1;
         }
     }
+    // Runtime scans also reclaim a same-owner reservation after its durable
+    // deadline; a live sidecar must not protect an unbound phase forever.
+    database.fail_running_plan_phases_without_agent_runs(
+        "Plan phase start did not create an implementation chat or Agent task",
+        state.plan_dispatch_owner_incarnation.as_str(),
+    )?;
     if context.is_startup() {
         database.fail_running_plan_phases_for_terminal_agent_tasks(
             "remote sidecar restarted while Agent attempt was active",
-        )?;
-        database.fail_running_plan_phases_without_agent_runs(
-            "Plan phase start did not create an implementation chat or Agent task",
-            state.plan_dispatch_owner_incarnation.as_str(),
         )?;
         database.reconcile_prematurely_completed_plan_phases_with_active_tasks()?;
         database.reconcile_plan_phase_attempts_for_terminal_phases()?;
@@ -24436,13 +24439,26 @@ async fn remote_sidecar_dispatch_plan_phase(
         return Ok(plan);
     }
     let selection = remote_sidecar_plan_runner_selection(state, phase, retry_payload)?;
-    let (attempt_id, prompt) = {
+    let (attempt_id, dispatch_deadline_at, prompt) = {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
-        let attempt_id = match attempt_id {
-            Some(attempt_id) => attempt_id,
+        let (attempt_id, dispatch_deadline_at) = match attempt_id {
+            Some(attempt_id) => {
+                let attempt = database
+                    .plan_phase_attempt(&attempt_id)
+                    .map_err(ApiError::from_workspace_error)?
+                    .ok_or_else(|| {
+                        ApiError::conflict("remote Plan phase dispatch attempt was not found")
+                    })?;
+                let deadline_at = attempt.dispatch_deadline_at.ok_or_else(|| {
+                    ApiError::conflict(
+                        "remote Plan phase dispatch attempt has no reservation deadline",
+                    )
+                })?;
+                (attempt_id, deadline_at)
+            }
             None => {
-                database
+                let attempt = database
                     .begin_plan_phase_attempt(
                         &plan.id,
                         &phase.id,
@@ -24452,43 +24468,23 @@ async fn remote_sidecar_dispatch_plan_phase(
                         selection.thinking_level.as_deref(),
                         state.plan_dispatch_owner_incarnation.as_str(),
                     )
-                    .map_err(ApiError::from_workspace_error)?
-                    .id
+                    .map_err(ApiError::from_workspace_error)?;
+                let deadline_at = attempt.dispatch_deadline_at.clone().ok_or_else(|| {
+                    ApiError::internal(
+                        "new remote Plan phase attempt did not receive a dispatch deadline",
+                    )
+                })?;
+                (attempt.id, deadline_at)
             }
         };
         let prompt = remote_plan_phase_prompt(&database, &plan, phase)
             .map_err(ApiError::from_workspace_error)?;
-        (attempt_id, prompt)
+        (attempt_id, dispatch_deadline_at, prompt)
     };
-    let queued = remote_sidecar_chat_queue(
-        State(state.clone()),
-        Json(json!({
-            "message": prompt,
-            "chatTitleOverride": remote_plan_phase_chat_title(&plan.title, &phase.title),
-            "modelId": selection.model_id,
-            "providerId": selection.provider_id,
-            "thinkingLevel": selection.thinking_level,
-        })),
-    )
-    .await
-    .map_err(|response| {
-        ApiError::internal(format!(
-            "failed to queue remote Plan implementation chat: {response:?}"
-        ))
-    })?
-    .0;
-    let chat_id = remote_required_text(queued.get("chatId"), "chatId").map_err(|response| {
-        ApiError::internal(format!("queued Plan chat is invalid: {response:?}"))
-    })?;
-    let user_message_id = remote_required_text(queued.get("userMessageId"), "userMessageId")
-        .map_err(|response| {
-            ApiError::internal(format!("queued Plan chat is invalid: {response:?}"))
-        })?;
-    let assistant_message_id =
-        remote_required_text(queued.get("assistantMessageId"), "assistantMessageId").map_err(
-            |response| ApiError::internal(format!("queued Plan chat is invalid: {response:?}")),
-        )?;
-
+    let chat_id = unique_id("chat");
+    let chat_title = remote_plan_phase_chat_title(&plan.title, &phase.title);
+    let user_message_id = unique_id("msg-user");
+    let assistant_message_id = unique_id("msg-assistant");
     let team_id = AgentTeamId::new(unique_id("agent-team"))
         .map_err(|error| ApiError::internal(error.to_string()))?;
     let instance_id = AgentInstanceId::new(unique_id("agent-instance-plan"))
@@ -24527,42 +24523,85 @@ async fn remote_sidecar_dispatch_plan_phase(
         "message": prompt,
     })
     .to_string();
+    let chat_queued_run_json = json!({
+        "status": "queued",
+        "userMessageId": user_message_id,
+        "assistantMessageId": assistant_message_id,
+        "assistantSequence": 1,
+        "modelId": selection.model_id,
+        "providerId": selection.provider_id,
+        "thinkingLevel": selection.thinking_level,
+        "latencyMode": foco_providers::LatencyMode::Standard,
+        "skillIds": [],
+        "sessionMode": Value::Null,
+        "content": prompt,
+        "idempotencyKey": format!("plan-phase:{attempt_id}"),
+    })
+    .to_string();
+    let user_metadata_json = json!({
+        "parts": remote_chat_parts(&prompt, None),
+        "queuedRun": serde_json::from_str::<Value>(&chat_queued_run_json).map_err(|source| {
+            ApiError::internal(format!("failed to serialize remote Plan queued run: {source}"))
+        })?,
+    })
+    .to_string();
+    let task_queued_payload_json = json!({
+        "userMessageId": user_message_id,
+    })
+    .to_string();
     let mut attempt_attached = false;
     let dispatched_plan = (|| {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
-        let (team, coordinator) = database
-            .create_agent_team(NewAgentTeam {
-                id: &team_id,
+        database
+            .queue_coordinator_chat_message(QueueCoordinatorChatMessage {
                 chat_id: &chat_id,
-                coordinator_instance_id: &instance_id,
-                coordinator_definition: &selection.definition,
-                coordinator_execution_workspace_mode: AgentExecutionWorkspaceMode::IsolatedWorktree,
-                coordinator_execution_root_path: Some(&worktree_root),
-                coordinator_worktree_base_revision: Some(&worktree.base_revision),
-                coordinator_worktree_branch: Some(&worktree.branch),
-                coordinator_worktree_status: Some("active"),
-                max_concurrent_runs: 1,
+                new_chat_title: Some(&chat_title),
+                new_chat_metadata_json: Some("{}"),
+                user_message: NewMessage {
+                    id: &user_message_id,
+                    chat_id: &chat_id,
+                    role: "user",
+                    content: &prompt,
+                    sequence: 0,
+                    metadata_json: Some(&user_metadata_json),
+                },
+                chat_queued_run_json: &chat_queued_run_json,
+                chat_spec_snapshot: None,
+                prompt_context_injections: Vec::new(),
+                new_team: Some(NewAgentTeam {
+                    id: &team_id,
+                    chat_id: &chat_id,
+                    coordinator_instance_id: &instance_id,
+                    coordinator_definition: &selection.definition,
+                    coordinator_execution_workspace_mode:
+                        AgentExecutionWorkspaceMode::IsolatedWorktree,
+                    coordinator_execution_root_path: Some(&worktree_root),
+                    coordinator_worktree_base_revision: Some(&worktree.base_revision),
+                    coordinator_worktree_branch: Some(&worktree.branch),
+                    coordinator_worktree_status: Some("active"),
+                    max_concurrent_runs: 1,
+                }),
+                task: NewAgentTask {
+                    id: &task_id,
+                    team_id: &team_id,
+                    owner_instance_id: &instance_id,
+                    origin_instance_id: None,
+                    parent_task_id: None,
+                    input_json: &input_json,
+                },
+                max_team_queued: AGENT_MAX_QUEUED_TASKS_PER_TEAM,
+                max_instance_queued: AGENT_MAX_QUEUED_TASKS_PER_INSTANCE,
+                max_chat_queued: AGENT_MAX_QUEUED_TASKS_PER_CHAT,
+                task_queued_payload_json: &task_queued_payload_json,
+                plan_phase_dispatch_binding: Some(PlanPhaseDispatchBinding {
+                    attempt_id: &attempt_id,
+                    plan_id: &plan.id,
+                    phase_id: &phase.id,
+                    dispatch_owner_incarnation: state.plan_dispatch_owner_incarnation.as_str(),
+                    dispatch_deadline_at: &dispatch_deadline_at,
+                }),
             })
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .enqueue_agent_task(NewAgentTask {
-                id: &task_id,
-                team_id: &team.id,
-                owner_instance_id: &coordinator.id,
-                origin_instance_id: None,
-                parent_task_id: None,
-                input_json: &input_json,
-            })
-            .map_err(ApiError::from_workspace_error)?;
-        database
-            .attach_plan_phase_attempt_run(
-                &attempt_id,
-                &chat_id,
-                &team_id,
-                &task_id,
-                state.plan_dispatch_owner_incarnation.as_str(),
-            )
             .map_err(ApiError::from_workspace_error)?;
         attempt_attached = true;
         let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
