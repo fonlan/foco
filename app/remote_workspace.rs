@@ -25,7 +25,7 @@ use axum::{
     routing::{any, delete, get, patch, post, put},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use foco_agent::{
     AgentAttemptId, AgentAttemptStatus, AgentDefinitionId, AgentExecutionWorkspaceMode,
     AgentInstanceId, AgentInstanceStatus, AgentRole, AgentTaskId, AgentTaskStatus,
@@ -194,6 +194,8 @@ use crate::{
 pub(crate) mod route_policy;
 
 const REMOTE_SIDECAR_COMMAND: &str = "--remote-sidecar";
+const REMOTE_PLAN_PHASE_DISPATCH_TIMEOUT_CODE: &str = "plan_phase_dispatch_timed_out";
+const REMOTE_PLAN_PHASE_DISPATCH_FAILED_CODE: &str = "plan_phase_dispatch_failed";
 const SIDECAR_BINARY_NAME: &str = "foco";
 const REMOTE_SIDECAR_BOOTSTRAP_VERSION: u32 = 2;
 const SIDECAR_BUILD_ID_PROTOCOL: &str = "foco-sidecar-v2";
@@ -3366,6 +3368,7 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         token: options.token.clone(),
         plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
             .map_err(|error| std::io::Error::other(error.message))?,
+        plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
         workspace_id: options.workspace_id.clone(),
         workspace_path: options.workspace_path.clone(),
         background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
@@ -3409,6 +3412,9 @@ async fn run_remote_sidecar_server(args: &[String]) -> AppResult<()> {
         interval.tick().await;
         loop {
             interval.tick().await;
+            reconciliation_state
+                .plan_phase_dispatch_registry
+                .cancel_expired();
             if let Err(error) = reconcile_remote_sidecar_agent_attempt_leases_with_context(
                 &reconciliation_state,
                 RemoteSidecarAgentAttemptRecoveryContext::RuntimeScan,
@@ -4891,11 +4897,142 @@ fn remote_plan_queued_run_id_from_message(
     queued_run.get("runId")?.as_str().map(str::to_string)
 }
 
+#[derive(Clone, Default)]
+struct RemotePlanPhaseDispatchRegistry {
+    runs: Arc<Mutex<HashMap<String, RemotePlanPhaseDispatchRunControl>>>,
+}
+
+#[derive(Clone)]
+struct RemotePlanPhaseDispatchRunControl {
+    plan_id: String,
+    deadline_at: String,
+    cancel_tx: watch::Sender<Option<String>>,
+}
+
+struct RemotePlanPhaseDispatchLease {
+    registry: RemotePlanPhaseDispatchRegistry,
+    attempt_id: String,
+    deadline_at: String,
+    cancellation_rx: watch::Receiver<Option<String>>,
+}
+
+impl RemotePlanPhaseDispatchRegistry {
+    fn register(
+        &self,
+        attempt_id: String,
+        plan_id: String,
+        deadline_at: String,
+    ) -> Result<RemotePlanPhaseDispatchLease, ApiError> {
+        let deadline = DateTime::parse_from_rfc3339(&deadline_at)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "remote Plan phase dispatch '{attempt_id}' has invalid deadline: {source}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        if deadline <= Utc::now() {
+            return Err(ApiError::conflict(format!(
+                "remote Plan phase dispatch '{attempt_id}' reservation has already expired"
+            )));
+        }
+        let (cancel_tx, cancellation_rx) = watch::channel(None);
+        let mut runs = self.runs.lock().map_err(|_| {
+            ApiError::internal("remote Plan phase dispatch registry lock was poisoned")
+        })?;
+        if runs.contains_key(&attempt_id) {
+            return Err(ApiError::conflict(format!(
+                "remote Plan phase dispatch '{attempt_id}' is already registered"
+            )));
+        }
+        runs.insert(
+            attempt_id.clone(),
+            RemotePlanPhaseDispatchRunControl {
+                plan_id,
+                deadline_at: deadline_at.clone(),
+                cancel_tx,
+            },
+        );
+        Ok(RemotePlanPhaseDispatchLease {
+            registry: self.clone(),
+            attempt_id,
+            deadline_at,
+            cancellation_rx,
+        })
+    }
+
+    fn cancel_plan(&self, plan_id: &str, reason: &str) {
+        let Ok(runs) = self.runs.lock() else {
+            tracing::error!(
+                plan_id,
+                "remote Plan phase dispatch registry lock was poisoned"
+            );
+            return;
+        };
+        for control in runs.values().filter(|control| control.plan_id == plan_id) {
+            let _ = control.cancel_tx.send(Some(reason.to_string()));
+        }
+    }
+
+    fn cancel_expired(&self) {
+        self.cancel_expired_at(Utc::now());
+    }
+
+    fn cancel_expired_at(&self, now: chrono::DateTime<Utc>) {
+        let Ok(runs) = self.runs.lock() else {
+            tracing::error!("remote Plan phase dispatch registry lock was poisoned");
+            return;
+        };
+        for control in runs.values() {
+            let expired = DateTime::parse_from_rfc3339(&control.deadline_at)
+                .map(|deadline| deadline.with_timezone(&Utc) <= now)
+                .unwrap_or(true);
+            if expired {
+                let _ = control.cancel_tx.send(Some(
+                    "remote Plan phase dispatch reservation timed out".to_string(),
+                ));
+            }
+        }
+    }
+}
+
+impl RemotePlanPhaseDispatchLease {
+    fn ensure_live(&self, stage: &'static str) -> Result<(), ApiError> {
+        if let Some(reason) = self.cancellation_rx.borrow().clone() {
+            return Err(ApiError::conflict(format!(
+                "remote Plan phase dispatch reservation no longer owns stage '{stage}': {reason}"
+            )));
+        }
+        let deadline = DateTime::parse_from_rfc3339(&self.deadline_at)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "remote Plan phase dispatch '{}' has invalid deadline: {source}",
+                    self.attempt_id
+                ))
+            })?
+            .with_timezone(&Utc);
+        if deadline <= Utc::now() {
+            return Err(ApiError::conflict(format!(
+                "remote Plan phase dispatch reservation no longer owns stage '{stage}': deadline expired"
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for RemotePlanPhaseDispatchLease {
+    fn drop(&mut self) {
+        if let Ok(mut runs) = self.registry.runs.lock() {
+            runs.remove(&self.attempt_id);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct RemoteSidecarState {
     token: String,
     /// Owner shared by this sidecar's recovery and Plan dispatch lifecycle.
     plan_dispatch_owner_incarnation: String,
+    plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry,
     last_config_hash: Arc<Mutex<Option<String>>>,
     runtime_config: Arc<Mutex<Option<SidecarRuntimeConfigBundle>>>,
     /// Per canonical execution-root code graph lifecycle (index + watcher).
@@ -24313,6 +24450,135 @@ fn remote_plan_phase_prompt(
     Ok(prompt)
 }
 
+struct RemoteUnboundPlanPhaseDispatchGuard {
+    state: RemoteSidecarState,
+    plan_id: String,
+    phase_id: String,
+    attempt_id: String,
+    deadline_at: String,
+    created_worktree: Option<PathBuf>,
+    active: bool,
+}
+
+impl RemoteUnboundPlanPhaseDispatchGuard {
+    fn new(
+        state: &RemoteSidecarState,
+        plan_id: &str,
+        phase_id: &str,
+        attempt_id: &str,
+        deadline_at: &str,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            plan_id: plan_id.to_string(),
+            phase_id: phase_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            deadline_at: deadline_at.to_string(),
+            created_worktree: None,
+            active: true,
+        }
+    }
+
+    fn track_created_worktree(&mut self, worktree_path: &Path) {
+        self.created_worktree = Some(worktree_path.to_path_buf());
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for RemoteUnboundPlanPhaseDispatchGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let error_code = DateTime::parse_from_rfc3339(&self.deadline_at)
+                .map(|deadline| deadline.with_timezone(&Utc) <= Utc::now())
+                .unwrap_or(true)
+                .then_some(REMOTE_PLAN_PHASE_DISPATCH_TIMEOUT_CODE)
+                .unwrap_or(REMOTE_PLAN_PHASE_DISPATCH_FAILED_CODE);
+            remote_fail_unbound_plan_phase_dispatch(
+                &self.state,
+                &self.plan_id,
+                &self.phase_id,
+                &self.attempt_id,
+                &self.deadline_at,
+                error_code,
+                "remote dispatch ended before session binding",
+            );
+            if let Some(worktree_path) = self.created_worktree.as_deref()
+                && let Err(error) = delete_agent_worktree(
+                    Path::new(&self.state.workspace_path),
+                    worktree_path,
+                    false,
+                )
+            {
+                tracing::warn!(
+                    workspace_id = %self.state.workspace_id,
+                    worktree_path = %worktree_path.display(),
+                    error = %error.message,
+                    "failed to delete remote Plan worktree after unbound dispatch closure"
+                );
+            }
+        }
+    }
+}
+
+fn remote_fail_unbound_plan_phase_dispatch(
+    state: &RemoteSidecarState,
+    plan_id: &str,
+    phase_id: &str,
+    attempt_id: &str,
+    deadline_at: &str,
+    error_code: &str,
+    message: &str,
+) {
+    let result = (|| -> Result<bool, WorkspaceDatabaseError> {
+        let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))?;
+        database.fail_unbound_plan_phase_dispatch_attempt(
+            attempt_id,
+            plan_id,
+            phase_id,
+            state.plan_dispatch_owner_incarnation.as_str(),
+            deadline_at,
+            &format!("{error_code}: {message}"),
+        )
+    })();
+    match result {
+        Ok(true) => tracing::warn!(
+            workspace_id = %state.workspace_id,
+            plan_id,
+            phase_id,
+            attempt_id,
+            owner = %state.plan_dispatch_owner_incarnation,
+            deadline = deadline_at,
+            error_code,
+            "closed unbound remote Plan phase dispatch reservation"
+        ),
+        Ok(false) => tracing::info!(
+            workspace_id = %state.workspace_id,
+            plan_id,
+            phase_id,
+            attempt_id,
+            owner = %state.plan_dispatch_owner_incarnation,
+            deadline = deadline_at,
+            error_code,
+            transition = "preserve_existing_terminal_or_attached_state",
+            "remote Plan phase dispatch closure lost its durable CAS race"
+        ),
+        Err(error) => tracing::error!(
+            workspace_id = %state.workspace_id,
+            plan_id,
+            phase_id,
+            attempt_id,
+            owner = %state.plan_dispatch_owner_incarnation,
+            deadline = deadline_at,
+            error_code,
+            error = %error,
+            "failed to close unbound remote Plan phase dispatch reservation"
+        ),
+    }
+}
+
 fn remote_fail_plan_phase_dispatch(
     state: &RemoteSidecarState,
     plan_id: &str,
@@ -24356,6 +24622,8 @@ fn remote_fail_plan_phase_dispatch(
 
 fn remote_cleanup_unattached_plan_dispatch(
     state: &RemoteSidecarState,
+    chat_id: &str,
+    user_message_id: &str,
     team_id: &AgentTeamId,
     task_id: &AgentTaskId,
     created_worktree: Option<&Path>,
@@ -24365,9 +24633,11 @@ fn remote_cleanup_unattached_plan_dispatch(
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
         database
-            .cancel_queued_agent_task(
+            .cancel_queued_agent_task_and_clear_queued_run(
                 team_id,
                 task_id,
+                chat_id,
+                user_message_id,
                 &json!({
                     "message": dispatch_error.message,
                     "code": "plan_phase_attach_failed",
@@ -24379,6 +24649,8 @@ fn remote_cleanup_unattached_plan_dispatch(
     match cleanup {
         Ok(true) => tracing::info!(
             workspace_id = %state.workspace_id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             transition = "cancel_unattached_queued_task",
@@ -24386,6 +24658,8 @@ fn remote_cleanup_unattached_plan_dispatch(
         ),
         Ok(false) => tracing::warn!(
             workspace_id = %state.workspace_id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             transition = "unattached_task_not_queued",
@@ -24393,6 +24667,8 @@ fn remote_cleanup_unattached_plan_dispatch(
         ),
         Err(error) => tracing::error!(
             workspace_id = %state.workspace_id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             error = %error.message,
@@ -24438,24 +24714,52 @@ async fn remote_sidecar_dispatch_plan_phase(
     if phase.agent_task_id.is_some() {
         return Ok(plan);
     }
-    let selection = remote_sidecar_plan_runner_selection(state, phase, retry_payload)?;
-    let (attempt_id, dispatch_deadline_at, prompt) = {
+    // A retry supplies its durable reservation id. Resolve it before any
+    // fallible preparation so an old runner can only close its own attempt.
+    // In particular, a model-selection error must not use the phase-wide
+    // fallback while a newer retry is briefly unbound.
+    let existing_dispatch_attempt = match attempt_id.as_deref() {
+        Some(attempt_id) => {
+            let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                .map_err(ApiError::from_workspace_error)?;
+            let attempt = database
+                .plan_phase_attempt(attempt_id)
+                .map_err(ApiError::from_workspace_error)?
+                .ok_or_else(|| {
+                    ApiError::conflict("remote Plan phase dispatch attempt was not found")
+                })?;
+            let deadline_at = attempt.dispatch_deadline_at.ok_or_else(|| {
+                ApiError::conflict("remote Plan phase dispatch attempt has no reservation deadline")
+            })?;
+            Some((attempt_id.to_string(), deadline_at))
+        }
+        None => None,
+    };
+    let selection = match remote_sidecar_plan_runner_selection(state, phase, retry_payload) {
+        Ok(selection) => selection,
+        Err(error) => {
+            if let Some((attempt_id, dispatch_deadline_at)) = existing_dispatch_attempt.as_ref() {
+                remote_fail_unbound_plan_phase_dispatch(
+                    state,
+                    &plan.id,
+                    &phase.id,
+                    attempt_id,
+                    dispatch_deadline_at,
+                    REMOTE_PLAN_PHASE_DISPATCH_FAILED_CODE,
+                    &error.message,
+                );
+            } else {
+                remote_fail_plan_phase_dispatch(state, &plan.id, &phase.id, &error.message);
+            }
+            return Err(error);
+        }
+    };
+    let (attempt_id, dispatch_deadline_at) = {
         let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
             .map_err(ApiError::from_workspace_error)?;
-        let (attempt_id, dispatch_deadline_at) = match attempt_id {
-            Some(attempt_id) => {
-                let attempt = database
-                    .plan_phase_attempt(&attempt_id)
-                    .map_err(ApiError::from_workspace_error)?
-                    .ok_or_else(|| {
-                        ApiError::conflict("remote Plan phase dispatch attempt was not found")
-                    })?;
-                let deadline_at = attempt.dispatch_deadline_at.ok_or_else(|| {
-                    ApiError::conflict(
-                        "remote Plan phase dispatch attempt has no reservation deadline",
-                    )
-                })?;
-                (attempt_id, deadline_at)
+        let (attempt_id, dispatch_deadline_at) = match existing_dispatch_attempt.as_ref() {
+            Some((attempt_id, dispatch_deadline_at)) => {
+                (attempt_id.clone(), dispatch_deadline_at.clone())
             }
             None => {
                 let attempt = database
@@ -24477,10 +24781,41 @@ async fn remote_sidecar_dispatch_plan_phase(
                 (attempt.id, deadline_at)
             }
         };
-        let prompt = remote_plan_phase_prompt(&database, &plan, phase)
-            .map_err(ApiError::from_workspace_error)?;
-        (attempt_id, dispatch_deadline_at, prompt)
+        (attempt_id, dispatch_deadline_at)
     };
+    let dispatch_lease = match state.plan_phase_dispatch_registry.register(
+        attempt_id.clone(),
+        plan.id.clone(),
+        dispatch_deadline_at.clone(),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            remote_fail_unbound_plan_phase_dispatch(
+                state,
+                &plan.id,
+                &phase.id,
+                &attempt_id,
+                &dispatch_deadline_at,
+                REMOTE_PLAN_PHASE_DISPATCH_FAILED_CODE,
+                &error.message,
+            );
+            return Err(error);
+        }
+    };
+    let mut reservation_guard = RemoteUnboundPlanPhaseDispatchGuard::new(
+        state,
+        &plan.id,
+        &phase.id,
+        &attempt_id,
+        &dispatch_deadline_at,
+    );
+    dispatch_lease.ensure_live("prompt_creation")?;
+    let prompt = {
+        let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+            .map_err(ApiError::from_workspace_error)?;
+        remote_plan_phase_prompt(&database, &plan, phase).map_err(ApiError::from_workspace_error)?
+    };
+    dispatch_lease.ensure_live("worktree_creation")?;
     let chat_id = unique_id("chat");
     let chat_title = remote_plan_phase_chat_title(&plan.title, &phase.title);
     let user_message_id = unique_id("msg-user");
@@ -24513,6 +24848,10 @@ async fn remote_sidecar_dispatch_plan_phase(
             )
         }
     };
+    if let Some(worktree_path) = created_worktree.as_deref() {
+        reservation_guard.track_created_worktree(worktree_path);
+    }
+    dispatch_lease.ensure_live("queue_transaction")?;
     let worktree_root = agent_worktree_relative_path(&workspace_path, &worktree.root_path)?;
     let input_json = json!({
         "planId": plan.id,
@@ -24604,6 +24943,10 @@ async fn remote_sidecar_dispatch_plan_phase(
             })
             .map_err(ApiError::from_workspace_error)?;
         attempt_attached = true;
+        reservation_guard.disarm();
+        // The reservation protects only the unbound dispatch window. Once the
+        // chat, task, and phase are committed together, its deadline must not
+        // close a now-owned queued run between claim and stream startup.
         let agent_attempt_id = AgentAttemptId::new(unique_id("agent-attempt"))
             .map_err(|error| ApiError::internal(error.to_string()))?;
         database
@@ -24642,12 +24985,13 @@ async fn remote_sidecar_dispatch_plan_phase(
             } else {
                 remote_cleanup_unattached_plan_dispatch(
                     state,
+                    &chat_id,
+                    &user_message_id,
                     &team_id,
                     &task_id,
-                    created_worktree.as_deref(),
+                    None,
                     &error,
                 );
-                remote_fail_plan_phase_dispatch(state, &plan.id, &phase.id, &error.message);
             }
             return Err(error);
         }
@@ -24732,18 +25076,19 @@ async fn remote_sidecar_plans_action(
             .transition_plan(&plan_id, action)
             .map_err(|error| ApiError::from_workspace_error(error).into_response())?
     };
+    if action.trim() == "cancel" {
+        state.plan_phase_dispatch_registry.cancel_plan(
+            &plan.id,
+            "Plan was cancelled before its remote implementation session was prepared",
+        );
+    }
     if !matches!(action.trim(), "start" | "resume") || !remote_plan_requires_initial_dispatch(&plan)
     {
         return Ok(Json(json!({ "plan": plan })));
     }
     match remote_sidecar_dispatch_plan_phase(&state, plan.clone(), None, None).await {
         Ok(plan) => Ok(Json(json!({ "plan": plan }))),
-        Err(error) => {
-            if let Some(phase_id) = plan.active_phase_id.as_deref() {
-                remote_fail_plan_phase_dispatch(&state, &plan.id, phase_id, &error.message);
-            }
-            Err(error.into_response())
-        }
+        Err(error) => Err(error.into_response()),
     }
 }
 
@@ -24819,10 +25164,7 @@ async fn remote_sidecar_plans_phase_retry(
         .await
     {
         Ok(plan) => Ok(Json(json!({ "plan": plan }))),
-        Err(error) => {
-            remote_fail_plan_phase_dispatch(&state, &plan.id, &phase_id, &error.message);
-            Err(error.into_response())
-        }
+        Err(error) => Err(error.into_response()),
     }
 }
 
@@ -24973,6 +25315,51 @@ mod tests {
     use foco_store::config::AgentModelOptions;
 
     use super::*;
+
+    #[test]
+    fn remote_plan_dispatch_registry_cancels_expired_reservation_without_sleeping() {
+        let registry = RemotePlanPhaseDispatchRegistry::default();
+        let deadline = Utc::now() + chrono::Duration::minutes(1);
+        let lease = registry
+            .register(
+                "attempt-1".to_string(),
+                "plan-1".to_string(),
+                deadline.to_rfc3339(),
+            )
+            .expect("register remote reservation");
+
+        registry.cancel_expired_at(deadline + chrono::Duration::seconds(1));
+
+        let error = lease
+            .ensure_live("queue_transaction")
+            .expect_err("expired remote reservation must be cancelled");
+        assert!(error.message.contains("timed out"));
+    }
+
+    #[test]
+    fn remote_plan_dispatch_registry_cancels_only_the_requested_plan() {
+        let registry = RemotePlanPhaseDispatchRegistry::default();
+        let deadline = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        let cancelled = registry
+            .register(
+                "attempt-cancelled".to_string(),
+                "plan-cancelled".to_string(),
+                deadline.clone(),
+            )
+            .expect("register cancelled plan");
+        let unaffected = registry
+            .register(
+                "attempt-unaffected".to_string(),
+                "plan-unaffected".to_string(),
+                deadline,
+            )
+            .expect("register unaffected plan");
+
+        registry.cancel_plan("plan-cancelled", "cancelled by user");
+
+        assert!(cancelled.ensure_live("queue_transaction").is_err());
+        assert!(unaffected.ensure_live("queue_transaction").is_ok());
+    }
 
     #[tokio::test]
     async fn remote_run_subscription_recovers_events_produced_after_broadcast_lag() {
@@ -26399,9 +26786,12 @@ mod tests {
         assert_eq!(plan.status, "failed");
         assert_eq!(plan.phases[0].status, "failed");
         assert_eq!(plan.phases[0].attempts[0].status, "failed");
-        assert_eq!(
-            plan.phases[0].attempts[0].error_message.as_deref(),
-            Some("Plan phase start did not create an implementation chat or Agent task")
+        assert!(
+            plan.phases[0].attempts[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.starts_with("owner_replaced:")),
+            "a previous sidecar owner must preserve the structured replacement reason"
         );
         // Sidecar DB terminal reason is the durable source of truth for main UI snapshots.
         assert!(
@@ -27379,6 +27769,7 @@ mod tests {
                 token: "token".to_string(),
                 plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                     .expect("test plan dispatch owner"),
+                plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
                 last_config_hash: Arc::new(Mutex::new(None)),
                 runtime_config: Arc::new(Mutex::new(None)),
                 code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -31249,6 +31640,7 @@ mod tests {
             token: "token".to_string(),
             plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                 .expect("test plan dispatch owner"),
+            plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -34313,6 +34705,7 @@ mod tests {
             token: "token".to_string(),
             plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                 .expect("test plan dispatch owner"),
+            plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -42192,6 +42585,7 @@ mod tests {
             token: "token".to_string(),
             plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                 .expect("test plan dispatch owner"),
+            plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -42264,6 +42658,7 @@ mod tests {
             token: "token".to_string(),
             plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                 .expect("test plan dispatch owner"),
+            plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
@@ -48623,6 +49018,7 @@ mod tests {
             token: "token".to_string(),
             plan_dispatch_owner_incarnation: crate::new_plan_dispatch_owner_incarnation()
                 .expect("test plan dispatch owner"),
+            plan_phase_dispatch_registry: RemotePlanPhaseDispatchRegistry::default(),
             last_config_hash: Arc::new(Mutex::new(None)),
             runtime_config: Arc::new(Mutex::new(None)),
             code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),
