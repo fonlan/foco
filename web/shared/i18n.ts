@@ -418,6 +418,7 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
     "Delete plan confirmation":
       "确定要删除这个计划吗？这会同时删除它的阶段和步骤。",
     "Open implementation chat": "打开实现会话",
+    "Preparing session": "正在准备会话",
     "Mark complete": "标记完成",
     "Retry phase": "重试阶段",
     "Retry plan phase": "重试计划阶段",

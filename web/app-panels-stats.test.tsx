@@ -856,6 +856,197 @@ describe("app-panels-stats verification surfaces", () => {
     );
   });
 
+  it("distinguishes an unbound dispatch reservation from running and retryable plan phases", async () => {
+    const user = userEvent.setup();
+    const timestamp = "2026-07-30T01:00:00Z";
+    const attempt = (
+      phaseId: string,
+      status: string,
+      overrides: Record<string, unknown> = {},
+    ) => ({
+      agentTaskId: null,
+      agentTeamId: null,
+      commitId: null,
+      completedAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: `attempt-${phaseId}`,
+      implementationChatId: null,
+      modelId: null,
+      phaseId,
+      planId: "plan-dispatch-presentation",
+      providerId: null,
+      sequence: 0,
+      startedAt: null,
+      status,
+      thinkingLevel: null,
+      trigger: "initial",
+      updatedAt: timestamp,
+      ...overrides,
+    });
+    const phase = (
+      id: string,
+      title: string,
+      overrides: Record<string, unknown> = {},
+    ) => ({
+      agentTaskId: null,
+      agentTeamId: null,
+      attempts: [],
+      commitId: null,
+      completedAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id,
+      implementationChatId: null,
+      mergeAttemptCount: 0,
+      planId: "plan-dispatch-presentation",
+      sequence: 0,
+      startedAt: null,
+      status: "running",
+      steps: [],
+      summary: "Plan dispatch presentation coverage.",
+      title,
+      updatedAt: timestamp,
+      ...overrides,
+    });
+    const plan = {
+      activePhaseId: "phase-preparing",
+      completedAt: null,
+      completedByUserAt: null,
+      createdAt: timestamp,
+      errorMessage: null,
+      id: "plan-dispatch-presentation",
+      overview: "Render reservation state without inventing a chat link.",
+      pauseRequestedAt: null,
+      phases: [
+        phase("phase-preparing", "Preparing phase", {
+          attempts: [attempt("phase-preparing", "queued")],
+        }),
+        phase("phase-bound", "Bound phase", {
+          agentTaskId: "agent-task-bound",
+          agentTeamId: "agent-team-bound",
+          attempts: [
+            attempt("phase-bound", "running", {
+              agentTaskId: "agent-task-bound",
+              agentTeamId: "agent-team-bound",
+              implementationChatId: "implementation-chat-bound",
+              startedAt: timestamp,
+            }),
+            attempt("phase-bound-merge", "queued", {
+              id: "attempt-phase-bound-merge",
+              phaseId: "phase-bound",
+              sequence: 1,
+              trigger: "merge_auto",
+            }),
+          ],
+          implementationChatId: "implementation-chat-bound",
+          startedAt: timestamp,
+        }),
+        phase("phase-timed-out", "Timed out phase", {
+          attempts: [
+            attempt("phase-timed-out", "failed", {
+              completedAt: timestamp,
+              errorMessage: "plan_phase_dispatch_timed_out",
+            }),
+          ],
+          errorMessage: "plan_phase_dispatch_timed_out",
+          status: "failed",
+        }),
+        // Legacy plan history did not always include attempt rows. It must keep
+        // rendering the persisted phase status rather than assuming a reservation.
+        phase("phase-legacy", "Legacy phase", { attempts: undefined }),
+        phase("phase-legacy-retry", "Legacy retry phase", {
+          attempts: undefined,
+          status: "failed",
+        }),
+      ],
+      sharedMergeCommitId: null,
+      sortOrder: 0,
+      sourceChatId: "chat-1",
+      status: "running",
+      title: "Plan dispatch presentation",
+      updatedAt: timestamp,
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (
+          new URL(url, "http://127.0.0.1").pathname ===
+          "/api/workspaces/workspace-1/plans"
+        ) {
+          return jsonResponse({
+            page: 1,
+            pageSize: 50,
+            plans: [plan],
+            totalCount: 1,
+            totalPages: 1,
+          });
+        }
+        return mockFetch(input, init);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    renderApp();
+
+    await user.click(await screen.findByRole("tab", { name: "Plan" }));
+    expect(await screen.findByText("Plan dispatch presentation")).toBeInTheDocument();
+
+    const preparingPhase = screen.getByText("Preparing phase").closest("section");
+    const boundPhase = screen.getByText("Bound phase").closest("section");
+    const timedOutPhase = screen.getByText("Timed out phase").closest("section");
+    const legacyPhase = screen.getByText("Legacy phase").closest("section");
+    const legacyRetryPhase = screen
+      .getByText("Legacy retry phase")
+      .closest("section");
+    if (
+      !preparingPhase ||
+      !boundPhase ||
+      !timedOutPhase ||
+      !legacyPhase ||
+      !legacyRetryPhase
+    ) {
+      throw new Error("Expected all plan phase presentation rows");
+    }
+
+    expect(within(preparingPhase).getByText("Preparing session")).toBeInTheDocument();
+    expect(
+      within(preparingPhase).queryByRole("button", {
+        name: "Open implementation chat",
+      }),
+    ).not.toBeInTheDocument();
+    expect(within(boundPhase).getByText("Running")).toBeInTheDocument();
+    expect(
+      within(boundPhase).getByRole("button", {
+        name: "Open implementation chat",
+      }),
+    ).toBeInTheDocument();
+    expect(within(timedOutPhase).getByText("Failed")).toBeInTheDocument();
+    expect(
+      within(timedOutPhase).getByRole("button", { name: "Retry plan phase" }),
+    ).toBeInTheDocument();
+    expect(within(legacyPhase).getByText("Running")).toBeInTheDocument();
+
+    await user.click(within(timedOutPhase).getByText("Timed out phase"));
+    expect(
+      await within(timedOutPhase).findByText("plan_phase_dispatch_timed_out"),
+    ).toBeInTheDocument();
+
+    await user.click(
+      within(legacyRetryPhase).getByRole("button", {
+        name: "Retry phase options",
+      }),
+    );
+    await user.click(
+      await screen.findByRole("menuitem", {
+        name: "Retry with another model…",
+      }),
+    );
+    expect(
+      screen.getByRole("dialog", { name: "Retry with another model" }),
+    ).toBeInTheDocument();
+  });
+
   it("confirms plan deletion and skips the request when cancelled", async () => {
     const user = userEvent.setup();
     const timestamp = "2026-06-28T06:15:00Z";

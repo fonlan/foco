@@ -1176,7 +1176,7 @@ function ContextPlanTab({
                       const canRetryPhase = isRetryablePlanPhase(phase);
                       const retryOperationKey = planPhaseRetryOperationKey(plan.id, phase.id);
                       const isRetrying = operationKey === retryOperationKey;
-                      const implementationChatId = phase.implementationChatId;
+                      const phasePresentation = planPhasePresentation(phase);
 
                       return (
                         <section
@@ -1219,14 +1219,22 @@ function ContextPlanTab({
                               </div>
                             </Button>
                             <div className="flex shrink-0 flex-wrap items-center justify-end gap-1.5">
-                              <span className={planPhaseStatusClass(phase.status)}>
-                                {t(planPhaseStatusLabel(phase.status))}
+                              <span
+                                className={planPhaseStatusClass(
+                                  phasePresentation.status,
+                                )}
+                              >
+                                {t(planPhaseStatusLabel(phasePresentation.status))}
                               </span>
-                              {implementationChatId ? (
+                              {phasePresentation.implementationChatId ? (
                                 <Button
                                   aria-label={t("Open implementation chat")}
                                   className="inline-flex size-7 items-center justify-center rounded-md border border-[var(--border)] bg-[var(--surface)] text-[var(--muted)] shadow-sm hover:border-[var(--accent)] hover:bg-[var(--accent-soft)] hover:text-[var(--accent-soft-foreground)]"
-                                  onPress={() => onOpenPhaseChat(implementationChatId)}
+                                  onPress={() =>
+                                    onOpenPhaseChat(
+                                      phasePresentation.implementationChatId!,
+                                    )
+                                  }
                                   type="button"
                               variant="ghost"
                             >
@@ -1299,11 +1307,11 @@ function ContextPlanTab({
                                   {phase.errorMessage}
                                 </div>
                               ) : null}
-                              {phase.implementationChatId ? (
+                              {phasePresentation.implementationChatId ? (
                                 <div className="flex min-w-0 items-center gap-1.5 text-xs text-[var(--muted)]">
                                   <MessageSquare aria-hidden="true" className="size-3.5 shrink-0" />
                                   <span className="truncate">
-                                    {t("Implementation chat")}: {phase.implementationChatId}
+                                    {t("Implementation chat")}: {phasePresentation.implementationChatId}
                                   </span>
                                 </div>
                               ) : null}
@@ -1568,7 +1576,7 @@ function defaultPlanPhaseRetryModelId(
   phase: PlanPhase,
   models: ConfiguredModelSummary[],
 ) {
-  const lastModelId = [...phase.attempts]
+  const lastModelId = [...(phase.attempts ?? [])]
     .reverse()
     .find((attempt) => attempt.modelId)?.modelId;
   if (lastModelId && models.some((model) => model.id === lastModelId)) {
@@ -3239,6 +3247,34 @@ function isRetryablePlanPhase(phase: PlanPhase) {
   return phase.status === "failed" || phase.status === "cancelled";
 }
 
+function planPhasePresentation(phase: PlanPhase) {
+  const latestImplementationAttempt = (phase.attempts ?? [])
+    .filter(
+      (attempt) =>
+        attempt.trigger !== "merge_auto" && attempt.trigger !== "merge_retry",
+    )
+    .reduce<PlanPhase["attempts"][number] | null>(
+      (latestAttempt, attempt) =>
+        !latestAttempt || attempt.sequence > latestAttempt.sequence
+          ? attempt
+          : latestAttempt,
+      null,
+    );
+  const implementationChatId =
+    latestImplementationAttempt?.implementationChatId?.trim() ||
+    (latestImplementationAttempt ? null : phase.implementationChatId?.trim()) ||
+    null;
+  const isPreparingSession =
+    latestImplementationAttempt?.status === "queued" &&
+    !latestImplementationAttempt.implementationChatId?.trim() &&
+    !latestImplementationAttempt.agentTaskId?.trim();
+
+  return {
+    implementationChatId: isPreparingSession ? null : implementationChatId,
+    status: isPreparingSession ? "preparing_session" : phase.status,
+  };
+}
+
 function isPlanReorderable(plan: Plan) {
   return plan.status === "draft" || plan.status === "ready" || plan.status === "paused" || plan.status === "failed";
 }
@@ -3375,6 +3411,9 @@ function planStatusLabel(status: string) {
 }
 
 function planPhaseStatusLabel(status: string) {
+  if (status === "preparing_session") {
+    return "Preparing session";
+  }
   return planStatusLabel(status);
 }
 
@@ -3394,6 +3433,9 @@ function planStatusClass(status: PlanStatus) {
 
 function planPhaseStatusClass(status: string) {
   const base = "inline-flex shrink-0 rounded-md px-1.5 py-0.5 text-[11px] font-semibold";
+  if (status === "preparing_session") {
+    return `${base} bg-[var(--accent-soft)] text-[var(--accent-soft-foreground)]`;
+  }
   if (status === "completed" || status === "implemented") {
     return `${base} bg-[var(--success-soft)] text-[var(--success-soft-foreground)]`;
   }
