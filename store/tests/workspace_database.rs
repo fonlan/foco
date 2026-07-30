@@ -3506,6 +3506,141 @@ fn expired_current_owner_dispatch_reservation_is_recovered_with_timeout_reason()
 }
 
 #[test]
+fn managed_dispatch_closure_fails_only_the_matching_unbound_reservation() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "managed-dispatch-close", "ready");
+    database
+        .transition_plan("managed-dispatch-close", "start")
+        .expect("start Plan phase");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "managed-dispatch-close",
+            "managed-dispatch-close-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("reserve Plan dispatch");
+    let deadline_at = attempt
+        .dispatch_deadline_at
+        .as_deref()
+        .expect("dispatch deadline");
+
+    let closed = database
+        .fail_unbound_plan_phase_dispatch_attempt(
+            &attempt.id,
+            "managed-dispatch-close",
+            "managed-dispatch-close-phase",
+            TEST_DISPATCH_OWNER,
+            deadline_at,
+            "plan_phase_dispatch_timed_out: managed runner exceeded reservation deadline",
+        )
+        .expect("close matching dispatch reservation");
+    assert!(closed);
+
+    let plan = database
+        .plan("managed-dispatch-close")
+        .expect("plan lookup")
+        .expect("plan exists");
+    assert_eq!(plan.status, "failed");
+    assert_eq!(plan.phases[0].status, "failed");
+    assert_eq!(plan.phases[0].attempts[0].status, "failed");
+    assert_eq!(
+        plan.phases[0].error_message.as_deref(),
+        Some("plan_phase_dispatch_timed_out: managed runner exceeded reservation deadline")
+    );
+
+    let late_close = database
+        .fail_unbound_plan_phase_dispatch_attempt(
+            &attempt.id,
+            "managed-dispatch-close",
+            "managed-dispatch-close-phase",
+            TEST_DISPATCH_OWNER,
+            deadline_at,
+            "plan_phase_dispatch_failed: late runner must not replace timeout",
+        )
+        .expect("late closure is a harmless conflict");
+    assert!(!late_close);
+}
+
+#[test]
+fn managed_dispatch_late_closure_preserves_an_already_bound_attempt() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let mut database =
+        WorkspaceDatabase::open_or_create_ungated(workspace.path()).expect("workspace database");
+    create_auto_run_test_plan(&mut database, "managed-dispatch-bound", "ready");
+    database
+        .transition_plan("managed-dispatch-bound", "start")
+        .expect("start Plan phase");
+    let attempt = database
+        .begin_plan_phase_attempt(
+            "managed-dispatch-bound",
+            "managed-dispatch-bound-phase",
+            PlanPhaseAttemptTrigger::Initial,
+            None,
+            None,
+            None,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("reserve Plan dispatch");
+    let deadline_at = attempt
+        .dispatch_deadline_at
+        .as_deref()
+        .expect("dispatch deadline");
+    let (team_id, instance_id) = create_test_agent_team(
+        &mut database,
+        "chat-managed-dispatch-bound",
+        "managed-bound",
+    );
+    let task_id = AgentTaskId::new("agent-task-managed-dispatch-bound").expect("task id");
+    database
+        .enqueue_agent_task(NewAgentTask {
+            id: &task_id,
+            team_id: &team_id,
+            owner_instance_id: &instance_id,
+            origin_instance_id: None,
+            parent_task_id: None,
+            input_json: "{}",
+        })
+        .expect("enqueue task");
+    database
+        .attach_plan_phase_attempt_run(
+            &attempt.id,
+            "chat-managed-dispatch-bound",
+            &team_id,
+            &task_id,
+            TEST_DISPATCH_OWNER,
+        )
+        .expect("bind attempt");
+
+    let late_close = database
+        .fail_unbound_plan_phase_dispatch_attempt(
+            &attempt.id,
+            "managed-dispatch-bound",
+            "managed-dispatch-bound-phase",
+            TEST_DISPATCH_OWNER,
+            deadline_at,
+            "plan_phase_dispatch_timed_out: late runner must not close bound attempt",
+        )
+        .expect("late bound closure is harmless");
+    assert!(!late_close);
+    let plan = database
+        .plan("managed-dispatch-bound")
+        .expect("plan lookup")
+        .expect("plan exists");
+    assert_eq!(plan.status, "running");
+    assert_eq!(plan.phases[0].attempts[0].status, "running");
+    assert_eq!(
+        plan.phases[0].agent_task_id.as_deref(),
+        Some(task_id.as_str())
+    );
+}
+
+#[test]
 fn current_dispatch_owner_queued_attempt_survives_recovery_and_can_attach() {
     let workspace = tempfile::tempdir().expect("workspace tempdir");
     let mut database =
@@ -22831,6 +22966,33 @@ fn queue_coordinator_chat_message_publishes_task_and_context_together() {
             .expect("prompt context lookup")
             .len(),
         1
+    );
+
+    let claimed_attempt_id =
+        AgentAttemptId::new("agent-attempt-atomic-publish".to_string()).expect("attempt id");
+    database
+        .claim_runnable_agent_task(&team_id, &task_id, &claimed_attempt_id)
+        .expect("claim queued Coordinator task")
+        .expect("Coordinator task should be claimed");
+    assert!(
+        !database
+            .cancel_queued_agent_task_and_clear_queued_run(
+                &team_id,
+                &task_id,
+                "chat-atomic-publish",
+                "msg-user-atomic-publish",
+                r#"{"code":"plan_phase_attach_failed"}"#,
+            )
+            .expect("claimed task must not be cancelled by attach cleanup")
+    );
+    assert!(
+        database
+            .chat("chat-atomic-publish")
+            .expect("chat lookup after rejected cleanup")
+            .expect("chat remains")
+            .metadata_json
+            .contains("queuedRun"),
+        "attach cleanup must not clear a queuedRun after the scheduler claimed its task"
     );
 }
 

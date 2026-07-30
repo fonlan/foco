@@ -21,7 +21,7 @@ use rusqlite::{
     types::Value as SqlValue,
 };
 use serde::de::DeserializeOwned;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::config::WorkspaceConfig;
 use crate::memory::{
@@ -6049,6 +6049,145 @@ impl WorkspaceDatabase {
         error_message: &str,
     ) -> Result<PlanRecord, WorkspaceDatabaseError> {
         self.fail_plan_phase_by_id(plan_id, phase_id, error_message)
+    }
+
+    /// Terminally closes exactly one unbound dispatch reservation. The owner and
+    /// deadline predicates make late local dispatch runners harmless after a
+    /// timeout, cancellation, or retry has already changed durable state.
+    pub fn fail_unbound_plan_phase_dispatch_attempt(
+        &mut self,
+        attempt_id: &str,
+        plan_id: &str,
+        phase_id: &str,
+        dispatch_owner_incarnation: &str,
+        dispatch_deadline_at: &str,
+        error_message: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        let dispatch_owner_incarnation =
+            normalize_required_dispatch_owner(dispatch_owner_incarnation)?;
+        let attempt_id = attempt_id.trim();
+        let plan_id = plan_id.trim();
+        let phase_id = phase_id.trim();
+        let dispatch_deadline_at = dispatch_deadline_at.trim();
+        let error_message = error_message.trim();
+        if attempt_id.is_empty()
+            || plan_id.is_empty()
+            || phase_id.is_empty()
+            || dispatch_deadline_at.is_empty()
+            || error_message.is_empty()
+        {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message:
+                    "unbound Plan phase dispatch closure requires non-empty identity and error"
+                        .to_string(),
+            });
+        }
+
+        let now = now_timestamp();
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let attempt_updated = transaction
+            .execute(
+                "UPDATE plan_phase_attempts
+                 SET status = 'failed',
+                     error_message = ?6,
+                     completed_at = COALESCE(completed_at, ?7),
+                     updated_at = ?7
+                 WHERE id = ?1
+                   AND plan_id = ?2
+                   AND phase_id = ?3
+                   AND status IN ('queued', 'running')
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL
+                   AND dispatch_owner_incarnation = ?4
+                   AND dispatch_deadline_at = ?5",
+                params![
+                    attempt_id,
+                    plan_id,
+                    phase_id,
+                    dispatch_owner_incarnation,
+                    dispatch_deadline_at,
+                    error_message,
+                    now,
+                ],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if attempt_updated != 1 {
+            return Ok(false);
+        }
+
+        let phase_updated = transaction
+            .execute(
+                "UPDATE plan_phases
+                 SET status = 'failed',
+                     error_message = ?3,
+                     completed_at = COALESCE(completed_at, ?4),
+                     updated_at = ?4
+                 WHERE plan_id = ?1
+                   AND id = ?2
+                   AND status = 'running'
+                   AND implementation_chat_id IS NULL
+                   AND agent_team_id IS NULL
+                   AND agent_task_id IS NULL",
+                params![plan_id, phase_id, error_message, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if phase_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "Plan phase dispatch attempt '{attempt_id}' closed without its unbound running phase"
+                ),
+            });
+        }
+        transaction
+            .execute(
+                "UPDATE plan_steps
+                 SET status = 'failed',
+                     checked_at = NULL,
+                     updated_at = ?3
+                 WHERE plan_id = ?1
+                   AND phase_id = ?2
+                   AND status IN ('pending', 'running')",
+                params![plan_id, phase_id, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let plan_updated = transaction
+            .execute(
+                "UPDATE plans
+                 SET status = 'failed',
+                     active_phase_id = NULL,
+                     error_message = ?2,
+                     completed_at = ?3,
+                     completed_by_user_at = NULL,
+                     updated_at = ?3
+                 WHERE id = ?1
+                   AND status NOT IN ('completed', 'cancelled')",
+                params![plan_id, error_message, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        if plan_updated != 1 {
+            return Err(WorkspaceDatabaseError::InvalidPlan {
+                message: format!(
+                    "Plan '{plan_id}' could not transition while closing dispatch attempt '{attempt_id}'"
+                ),
+            });
+        }
+        block_plan_auto_run_transaction(
+            &transaction,
+            &database_path,
+            "waiting_for_retry",
+            plan_id,
+            phase_id,
+            &now,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     fn earliest_incomplete_plan_phase<'a>(
@@ -15921,6 +16060,124 @@ impl WorkspaceDatabase {
             )
             .map(|updated| updated == 1)
             .map_err(|source| self.sqlite_error(source))
+    }
+
+    /// Cancel a still-queued Coordinator task and clear only its matching queued
+    /// turn in the same transaction. A scheduler can otherwise claim the task
+    /// between the two writes, leaving a live run without its durable chat owner.
+    pub fn cancel_queued_agent_task_and_clear_queued_run(
+        &mut self,
+        team_id: &AgentTeamId,
+        task_id: &AgentTaskId,
+        chat_id: &str,
+        user_message_id: &str,
+        error_json: &str,
+    ) -> Result<bool, WorkspaceDatabaseError> {
+        validate_agent_json(error_json, "error_json")?;
+        let database_path = self.database_path.clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        let now = now_timestamp();
+        let cancelled = transaction
+            .execute(
+                "UPDATE agent_tasks
+                 SET status = 'cancelled', error_json = ?3, completed_at = ?4, updated_at = ?4
+                 WHERE team_id = ?1 AND id = ?2 AND status = 'queued'",
+                params![team_id.as_str(), task_id.as_str(), error_json, now],
+            )
+            .map_err(|source| sqlite_error(&database_path, source))?
+            == 1;
+        if !cancelled {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(false);
+        }
+
+        let Some(chat) = chat_from_transaction(&transaction, &database_path, chat_id)? else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(true);
+        };
+        let Some(message) =
+            message_from_transaction(&transaction, &database_path, user_message_id)?
+        else {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(true);
+        };
+        if message.chat_id != chat_id {
+            transaction
+                .commit()
+                .map_err(|source| sqlite_error(&database_path, source))?;
+            return Ok(true);
+        }
+
+        let mut chat_metadata = parse_json_object(&chat.metadata_json, "chat metadata")?;
+        let mut message_metadata =
+            parse_json_object(&message.metadata_json, "user message metadata")?;
+        let task_matches = |queued_run: &Map<String, Value>| {
+            queued_run
+                .get("agentTaskId")
+                .and_then(Value::as_str)
+                .is_none_or(|owner| owner == task_id.as_str())
+        };
+        let clear_chat = chat_metadata
+            .get(QUEUED_CHAT_METADATA_KEY)
+            .and_then(Value::as_object)
+            .is_some_and(|queued_run| {
+                task_matches(queued_run)
+                    && queued_run
+                        .get("userMessageId")
+                        .or_else(|| queued_run.get("user_message_id"))
+                        .and_then(Value::as_str)
+                        == Some(user_message_id)
+            });
+        let clear_message = message_metadata
+            .get(QUEUED_MESSAGE_METADATA_KEY)
+            .and_then(Value::as_object)
+            .is_some_and(task_matches);
+        if clear_chat {
+            chat_metadata.remove(QUEUED_CHAT_METADATA_KEY);
+            transaction
+                .execute(
+                    "UPDATE chats SET metadata_json = ?1 WHERE id = ?2",
+                    params![
+                        serde_json::to_string(&chat_metadata).map_err(|source| {
+                            WorkspaceDatabaseError::InvalidMessageMetadata {
+                                message: format!("chat metadata is invalid JSON: {source}"),
+                            }
+                        })?,
+                        chat_id,
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        if clear_message {
+            message_metadata.remove(QUEUED_MESSAGE_METADATA_KEY);
+            transaction
+                .execute(
+                    "UPDATE messages SET metadata_json = ?1 WHERE id = ?2 AND chat_id = ?3",
+                    params![
+                        serde_json::to_string(&message_metadata).map_err(|source| {
+                            WorkspaceDatabaseError::InvalidMessageMetadata {
+                                message: format!("user message metadata is invalid JSON: {source}"),
+                            }
+                        })?,
+                        user_message_id,
+                        chat_id,
+                    ],
+                )
+                .map_err(|source| sqlite_error(&database_path, source))?;
+        }
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&database_path, source))?;
+        Ok(true)
     }
 
     /// Atomically cancel queued and waiting tasks in a root task's complete subtree.

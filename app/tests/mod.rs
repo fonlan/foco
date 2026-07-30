@@ -38665,6 +38665,7 @@ pub(crate) fn test_app_state(config: GlobalConfig, user_profile_dir: PathBuf) ->
         plan_auto_run_scheduler,
         plan_dispatch_owner_incarnation: new_plan_dispatch_owner_incarnation()
             .expect("test plan dispatch owner"),
+        plan_phase_dispatch_registry: crate::plan_runtime::PlanPhaseDispatchRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         background_command_registry: foco_tools::BackgroundCommandRegistry::default(),
         code_graph_indexes: Arc::new(Mutex::new(CodeGraphIndexState::default())),

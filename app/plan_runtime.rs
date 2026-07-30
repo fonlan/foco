@@ -1,10 +1,11 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use foco_agent::{
     AgentDefinitionId, AgentExecutionWorkspaceMode, AgentInstanceStatus, AgentTaskId,
     AgentTaskStatus, AgentTeamId,
@@ -23,6 +24,7 @@ use foco_store::{
 use serde_json::Value;
 
 use foco_tools::BackgroundCommandRegistry;
+use tokio::{sync::watch, time};
 
 use crate::{
     git_backend::{
@@ -47,6 +49,109 @@ const PLAN_MERGE_CORRELATION_PREFIX: &str = "plan_merge:";
 const DEFAULT_AGENT_DEFINITION_ID: &str = "agent-definition-default";
 // ponytail: fixed char cap keeps phase prompts bounded for now; ceiling is rough prompt sizing, upgrade to token-aware summaries if long plans need it.
 const PREVIOUS_PLAN_PHASE_CONCLUSIONS_MAX_CHARS: usize = 12_000;
+const PLAN_PHASE_DISPATCH_TIMEOUT_CODE: &str = "plan_phase_dispatch_timed_out";
+const PLAN_PHASE_DISPATCH_CANCELLED_CODE: &str = "plan_phase_dispatch_cancelled";
+const PLAN_PHASE_DISPATCH_FAILED_CODE: &str = "plan_phase_dispatch_failed";
+
+#[derive(Clone, Default)]
+pub(crate) struct PlanPhaseDispatchRegistry {
+    runs: Arc<Mutex<HashMap<String, PlanPhaseDispatchRunControl>>>,
+}
+
+#[derive(Clone)]
+struct PlanPhaseDispatchRunControl {
+    plan_id: String,
+    cancel_tx: watch::Sender<Option<PlanPhaseDispatchCancellation>>,
+}
+
+#[derive(Clone, Debug)]
+struct PlanPhaseDispatchCancellation {
+    message: String,
+}
+
+struct PlanPhaseDispatchLease {
+    registry: PlanPhaseDispatchRegistry,
+    attempt_id: String,
+    phase_id: String,
+    owner_incarnation: String,
+    deadline_at: String,
+    deadline: time::Instant,
+    cancellation_rx: watch::Receiver<Option<PlanPhaseDispatchCancellation>>,
+}
+
+impl PlanPhaseDispatchRegistry {
+    fn register(
+        &self,
+        attempt_id: String,
+        plan_id: String,
+        phase_id: String,
+        owner_incarnation: String,
+        deadline_at: String,
+    ) -> Result<PlanPhaseDispatchLease, ApiError> {
+        let parsed_deadline = DateTime::parse_from_rfc3339(&deadline_at)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "Plan phase dispatch '{attempt_id}' has invalid deadline: {source}"
+                ))
+            })?
+            .with_timezone(&Utc);
+        let remaining = parsed_deadline.signed_duration_since(Utc::now());
+        let remaining = remaining.to_std().map_err(|_| {
+            ApiError::conflict(format!(
+                "Plan phase dispatch '{attempt_id}' reservation has already expired"
+            ))
+        })?;
+        let (cancel_tx, cancellation_rx) = watch::channel(None);
+        let mut runs = self
+            .runs
+            .lock()
+            .map_err(|_| ApiError::internal("Plan phase dispatch registry lock was poisoned"))?;
+        if runs.contains_key(&attempt_id) {
+            return Err(ApiError::conflict(format!(
+                "Plan phase dispatch '{attempt_id}' is already registered"
+            )));
+        }
+        runs.insert(
+            attempt_id.clone(),
+            PlanPhaseDispatchRunControl {
+                plan_id: plan_id.clone(),
+                cancel_tx,
+            },
+        );
+        Ok(PlanPhaseDispatchLease {
+            registry: self.clone(),
+            attempt_id,
+            phase_id,
+            owner_incarnation,
+            deadline_at,
+            deadline: time::Instant::now() + remaining,
+            cancellation_rx,
+        })
+    }
+
+    pub(crate) fn cancel_plan(&self, plan_id: &str, reason: &str) {
+        let Ok(runs) = self.runs.lock() else {
+            tracing::error!(
+                plan_id,
+                "Plan phase dispatch registry lock was poisoned during cancellation"
+            );
+            return;
+        };
+        for control in runs.values().filter(|control| control.plan_id == plan_id) {
+            let _ = control.cancel_tx.send(Some(PlanPhaseDispatchCancellation {
+                message: reason.to_string(),
+            }));
+        }
+    }
+}
+
+impl Drop for PlanPhaseDispatchLease {
+    fn drop(&mut self) {
+        if let Ok(mut runs) = self.registry.runs.lock() {
+            runs.remove(&self.attempt_id);
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PlanRunnerModelSelection {
@@ -96,9 +201,16 @@ pub(crate) async fn transition_plan_action(
         let config = config_snapshot(state)?;
         let workspace = workspace_by_id(&config, workspace_id)?;
         let mut database = open_workspace_database(&workspace.path)?;
-        return database
+        let plan = database
             .transition_plan(plan_id, action)
-            .map_err(ApiError::from_workspace_error);
+            .map_err(ApiError::from_workspace_error)?;
+        if action == "cancel" {
+            state.plan_phase_dispatch_registry.cancel_plan(
+                &plan.id,
+                "Plan was cancelled before its implementation session was prepared",
+            );
+        }
+        return Ok(plan);
     }
 
     let config = config_snapshot(state)?;
@@ -129,15 +241,16 @@ pub(crate) async fn transition_plan_action(
     if !plan_requires_initial_dispatch(&plan) {
         return Ok(plan);
     }
-    let _selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
-    let dispatch_plan = plan.clone();
-    match dispatch_plan_phase(state, &workspace.id, dispatch_plan, None).await {
-        Ok(plan) => Ok(plan),
-        Err(error) => {
-            fail_plan_phase_dispatch_error(state, &workspace, &plan, &error)?;
-            Err(error)
-        }
-    }
+    let selection = plan_runner_model_selection(&config, &state.model_metadata_file)?;
+    let (plan, dispatch) = reserve_plan_phase_dispatch(
+        state,
+        &workspace,
+        &plan,
+        selection,
+        PlanPhaseAttemptTrigger::Initial,
+    )?;
+    start_managed_plan_phase_dispatch(state, &workspace, plan.clone(), dispatch)?;
+    Ok(plan)
 }
 
 /// A resumed plan with an active attempt or Agent task already owns its execution slot.
@@ -265,24 +378,14 @@ pub(crate) async fn retry_plan_phase(
         })?;
         (attempt.id, deadline_at, plan, selection)
     };
-    let dispatch_plan = plan.clone();
-    match dispatch_plan_phase(
-        state,
-        &workspace.id,
-        dispatch_plan,
-        Some((attempt_id, deadline_at, selection)),
-    )
-    .await
-    {
-        Ok(plan) => {
-            state.plan_auto_run_scheduler.wake()?;
-            Ok(plan)
-        }
-        Err(error) => {
-            fail_plan_phase_dispatch_error(state, &workspace, &plan, &error)?;
-            Err(error)
-        }
-    }
+    let dispatch = LocalPlanPhaseDispatch {
+        attempt_id,
+        deadline_at,
+        selection,
+    };
+    start_managed_plan_phase_dispatch(state, &workspace, plan.clone(), dispatch)?;
+    state.plan_auto_run_scheduler.wake()?;
+    Ok(plan)
 }
 
 fn plan_phase_attempt_id_for_task(
@@ -780,52 +883,265 @@ async fn continue_plan_if_ready(
     Ok(())
 }
 
+#[derive(Clone)]
+struct LocalPlanPhaseDispatch {
+    attempt_id: String,
+    deadline_at: String,
+    selection: PlanRunnerModelSelection,
+}
+
 fn fail_plan_phase_dispatch_error(
     state: &AppState,
     workspace: &WorkspaceConfig,
     plan: &PlanRecord,
+    dispatch: &LocalPlanPhaseDispatch,
+    error_code: &'static str,
     error: &ApiError,
 ) -> Result<(), ApiError> {
     let Some(phase_id) = plan.active_phase_id.as_deref() else {
         return Ok(());
     };
     let mut database = open_workspace_database(&workspace.path)?;
-    let Some(current_plan) = database
-        .plan(&plan.id)
-        .map_err(ApiError::from_workspace_error)?
-    else {
-        return Ok(());
-    };
-    let Some(current_phase) = current_plan
-        .phases
-        .iter()
-        .find(|phase| phase.id == phase_id)
-    else {
-        return Ok(());
-    };
-    if current_phase.status != "running" || current_phase.agent_task_id.is_some() {
-        let attempt = current_phase.attempts.last();
+    let error_message = format!("{error_code}: {}", error.message);
+    let committed = database
+        .fail_unbound_plan_phase_dispatch_attempt(
+            &dispatch.attempt_id,
+            &plan.id,
+            phase_id,
+            state.plan_dispatch_owner_incarnation(),
+            &dispatch.deadline_at,
+            &error_message,
+        )
+        .map_err(ApiError::from_workspace_error)?;
+    if !committed {
         tracing::info!(
+            workspace_id = %workspace.id,
             plan_id = %plan.id,
             phase_id,
-            attempt_id = ?attempt.map(|attempt| &attempt.id),
+            attempt_id = %dispatch.attempt_id,
             current_owner = %state.plan_dispatch_owner_incarnation(),
-            stored_owner = ?attempt.and_then(|attempt| attempt.dispatch_owner_incarnation.as_deref()),
-            attempt_status = ?attempt.map(|attempt| &attempt.status),
+            deadline = %dispatch.deadline_at,
+            error_code,
             transition = "preserve_existing_terminal_or_attached_state",
             error = %error.message,
             "Plan phase dispatch failure did not overwrite a durable state transition"
         );
-        return Ok(());
     }
-    database
-        .fail_plan_phase_start(&plan.id, phase_id, &error.message)
+    Ok(())
+}
+
+fn reserve_plan_phase_dispatch(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    plan: &PlanRecord,
+    selection: PlanRunnerModelSelection,
+    trigger: PlanPhaseAttemptTrigger,
+) -> Result<(PlanRecord, LocalPlanPhaseDispatch), ApiError> {
+    let phase_id = plan
+        .active_phase_id
+        .as_deref()
+        .ok_or_else(|| ApiError::internal(format!("plan '{}' has no active phase", plan.id)))?;
+    let phase = plan
+        .phases
+        .iter()
+        .find(|phase| phase.id == phase_id)
+        .ok_or_else(|| ApiError::internal("Plan active phase disappeared before dispatch"))?;
+    let mut database = open_workspace_database(&workspace.path)?;
+    let attempt = database
+        .begin_plan_phase_attempt(
+            &plan.id,
+            &phase.id,
+            trigger,
+            Some(selection.provider_id.as_str()),
+            Some(selection.model_id.as_str()),
+            selection.thinking_level.as_deref(),
+            state.plan_dispatch_owner_incarnation(),
+        )
         .map_err(ApiError::from_workspace_error)?;
+    let deadline_at = attempt.dispatch_deadline_at.clone().ok_or_else(|| {
+        ApiError::internal("new Plan phase attempt did not receive a dispatch deadline")
+    })?;
+    let plan = database
+        .plan(&plan.id)
+        .map_err(ApiError::from_workspace_error)?
+        .ok_or_else(|| ApiError::internal("Plan disappeared after dispatch reservation"))?;
+    Ok((
+        plan,
+        LocalPlanPhaseDispatch {
+            attempt_id: attempt.id,
+            deadline_at,
+            selection,
+        },
+    ))
+}
+
+fn ensure_plan_phase_dispatch_reservation_live(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    plan: &PlanRecord,
+    phase_id: &str,
+    dispatch: &LocalPlanPhaseDispatch,
+    stage: &'static str,
+) -> Result<(), ApiError> {
+    let database = open_workspace_database(&workspace.path)?;
+    let attempt = database
+        .plan_phase_attempt(&dispatch.attempt_id)
+        .map_err(ApiError::from_workspace_error)?;
+    let live = attempt.is_some_and(|attempt| {
+        matches!(attempt.status.as_str(), "queued" | "running")
+            && attempt.implementation_chat_id.is_none()
+            && attempt.agent_team_id.is_none()
+            && attempt.agent_task_id.is_none()
+            && attempt.dispatch_owner_incarnation.as_deref()
+                == Some(state.plan_dispatch_owner_incarnation())
+            && attempt.dispatch_deadline_at.as_deref() == Some(dispatch.deadline_at.as_str())
+            && attempt
+                .dispatch_deadline_at
+                .as_deref()
+                .is_some_and(|deadline| {
+                    DateTime::parse_from_rfc3339(deadline)
+                        .map(|deadline| deadline.with_timezone(&Utc) > Utc::now())
+                        .unwrap_or(false)
+                })
+    });
+    if live {
+        tracing::debug!(
+            workspace_id = %workspace.id,
+            plan_id = %plan.id,
+            phase_id,
+            attempt_id = %dispatch.attempt_id,
+            owner = %state.plan_dispatch_owner_incarnation(),
+            deadline = %dispatch.deadline_at,
+            stage,
+            transition = "dispatch_reservation_live",
+            "managed Plan phase dispatch entered pipeline stage"
+        );
+        Ok(())
+    } else {
+        Err(ApiError::conflict(format!(
+            "Plan phase dispatch reservation no longer owns stage '{stage}'"
+        )))
+    }
+}
+
+fn start_managed_plan_phase_dispatch(
+    state: &AppState,
+    workspace: &WorkspaceConfig,
+    plan: PlanRecord,
+    dispatch: LocalPlanPhaseDispatch,
+) -> Result<(), ApiError> {
+    let phase_id = plan
+        .active_phase_id
+        .clone()
+        .ok_or_else(|| ApiError::internal(format!("plan '{}' has no active phase", plan.id)))?;
+    let lease = match state.plan_phase_dispatch_registry.register(
+        dispatch.attempt_id.clone(),
+        plan.id.clone(),
+        phase_id,
+        state.plan_dispatch_owner_incarnation().to_string(),
+        dispatch.deadline_at.clone(),
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            // The reservation is already durable before registration. Close only that
+            // still-unbound reservation so a registry rejection cannot strand a phase.
+            if let Err(closure_error) = fail_plan_phase_dispatch_error(
+                state,
+                workspace,
+                &plan,
+                &dispatch,
+                PLAN_PHASE_DISPATCH_FAILED_CODE,
+                &error,
+            ) {
+                tracing::error!(
+                    workspace_id = %workspace.id,
+                    plan_id = %plan.id,
+                    attempt_id = %dispatch.attempt_id,
+                    owner = %state.plan_dispatch_owner_incarnation(),
+                    deadline = %dispatch.deadline_at,
+                    error_code = PLAN_PHASE_DISPATCH_FAILED_CODE,
+                    transition = "registry_registration_cleanup_failed",
+                    error = %closure_error.message,
+                    "failed to close Plan phase reservation after registry registration failure"
+                );
+            }
+            return Err(error);
+        }
+    };
+    let state = state.clone();
+    let workspace_id = workspace.id.clone();
+    tokio::spawn(async move {
+        let mut cancellation_rx = lease.cancellation_rx.clone();
+        let mut shutdown_rx = state.app_shutdown_rx.clone();
+        let outcome = tokio::select! {
+            result = dispatch_plan_phase(&state, &workspace_id, plan.clone(), &dispatch) => result,
+            _ = time::sleep_until(lease.deadline) => Err(ApiError::internal("Plan phase dispatch reservation timed out")),
+            changed = cancellation_rx.changed() => {
+                let cancellation = changed.ok()
+                    .and_then(|_| cancellation_rx.borrow().clone())
+                    .unwrap_or(PlanPhaseDispatchCancellation {
+                        message: "Plan phase dispatch registry closed".to_string(),
+                    });
+                Err(ApiError::conflict(cancellation.message))
+            }
+            changed = shutdown_rx.changed() => {
+                let message = if changed.is_err() || *shutdown_rx.borrow() {
+                    "Application shutdown interrupted Plan phase dispatch"
+                } else {
+                    "Plan phase dispatch shutdown channel changed"
+                };
+                Err(ApiError::conflict(message))
+            }
+        };
+        if let Err(error) = outcome {
+            let error_code = if time::Instant::now() >= lease.deadline {
+                PLAN_PHASE_DISPATCH_TIMEOUT_CODE
+            } else if cancellation_rx.borrow().is_some() {
+                PLAN_PHASE_DISPATCH_CANCELLED_CODE
+            } else {
+                PLAN_PHASE_DISPATCH_FAILED_CODE
+            };
+            let result = (|| -> Result<(), ApiError> {
+                let config = config_snapshot(&state)?;
+                let workspace = workspace_by_id(&config, &workspace_id)?;
+                fail_plan_phase_dispatch_error(
+                    &state, workspace, &plan, &dispatch, error_code, &error,
+                )
+            })();
+            match result {
+                Ok(()) => tracing::warn!(
+                    workspace_id,
+                    plan_id = %plan.id,
+                    phase_id = %lease.phase_id,
+                    attempt_id = %lease.attempt_id,
+                    owner = %lease.owner_incarnation,
+                    deadline = %lease.deadline_at,
+                    error_code,
+                    transition = "dispatch_terminal_or_preserved",
+                    error = %error.message,
+                    "managed Plan phase dispatch ended before session binding"
+                ),
+                Err(closure_error) => tracing::error!(
+                    workspace_id,
+                    plan_id = %plan.id,
+                    phase_id = %lease.phase_id,
+                    attempt_id = %lease.attempt_id,
+                    owner = %lease.owner_incarnation,
+                    deadline = %lease.deadline_at,
+                    error_code,
+                    error = %closure_error.message,
+                    "failed to close managed Plan phase dispatch"
+                ),
+            }
+        }
+    });
     Ok(())
 }
 
 fn cancel_unattached_plan_phase_task(
     workspace: &WorkspaceConfig,
+    chat_id: &str,
+    user_message_id: &str,
     team_id: &AgentTeamId,
     task_id: &AgentTaskId,
     dispatch_error: &ApiError,
@@ -837,13 +1153,22 @@ fn cancel_unattached_plan_phase_task(
             "code": "plan_phase_attach_failed",
         })
         .to_string();
-        database
-            .cancel_queued_agent_task(team_id, task_id, &error_json)
-            .map_err(ApiError::from_workspace_error)
+        let cancelled = database
+            .cancel_queued_agent_task_and_clear_queued_run(
+                team_id,
+                task_id,
+                chat_id,
+                user_message_id,
+                &error_json,
+            )
+            .map_err(ApiError::from_workspace_error)?;
+        Ok(cancelled)
     })();
     match result {
         Ok(true) => tracing::info!(
             workspace_id = %workspace.id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             transition = "cancel_unattached_queued_task",
@@ -851,6 +1176,8 @@ fn cancel_unattached_plan_phase_task(
         ),
         Ok(false) => tracing::warn!(
             workspace_id = %workspace.id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             transition = "unattached_task_not_queued",
@@ -858,6 +1185,8 @@ fn cancel_unattached_plan_phase_task(
         ),
         Err(error) => tracing::error!(
             workspace_id = %workspace.id,
+            chat_id,
+            user_message_id,
             team_id = %team_id,
             task_id = %task_id,
             error = %error.message,
@@ -870,7 +1199,7 @@ async fn dispatch_plan_phase(
     state: &AppState,
     workspace_id: &str,
     plan: PlanRecord,
-    attempt: Option<(String, String, PlanRunnerModelSelection)>,
+    dispatch: &LocalPlanPhaseDispatch,
 ) -> Result<PlanRecord, ApiError> {
     if plan.status == "implemented" || plan.active_phase_id.is_none() {
         return Ok(plan);
@@ -894,47 +1223,15 @@ async fn dispatch_plan_phase(
     }
 
     let config = config_snapshot(state)?;
-    let (attempt_id, dispatch_deadline_at, selection) = match attempt {
-        Some((attempt_id, deadline_at, selection)) => {
-            (Some(attempt_id), Some(deadline_at), selection)
-        }
-        None => {
-            let is_retry = phase.attempts.iter().any(|attempt| {
-                matches!(
-                    attempt.status.as_str(),
-                    "failed" | "cancelled" | "interrupted"
-                )
-            });
-            let request = PlanPhaseRetryRequest::default();
-            let selection = if is_retry {
-                plan_retry_model_selection(&config, &state.model_metadata_file, phase, &request)?
-            } else {
-                plan_runner_model_selection(&config, &state.model_metadata_file)?
-            };
-            let workspace = workspace_by_id(&config, workspace_id)?;
-            let mut database = open_workspace_database(&workspace.path)?;
-            let attempt = database
-                .begin_plan_phase_attempt(
-                    &plan.id,
-                    &phase.id,
-                    if is_retry {
-                        PlanPhaseAttemptTrigger::Retry
-                    } else {
-                        PlanPhaseAttemptTrigger::Initial
-                    },
-                    Some(selection.provider_id.as_str()),
-                    Some(selection.model_id.as_str()),
-                    selection.thinking_level.as_deref(),
-                    state.plan_dispatch_owner_incarnation(),
-                )
-                .map_err(ApiError::from_workspace_error)?;
-            let deadline_at = attempt.dispatch_deadline_at.clone().ok_or_else(|| {
-                ApiError::internal("new Plan phase attempt did not receive a dispatch deadline")
-            })?;
-            (Some(attempt.id), Some(deadline_at), selection)
-        }
-    };
     let workspace = workspace_by_id(&config, workspace_id)?;
+    ensure_plan_phase_dispatch_reservation_live(
+        state,
+        workspace,
+        &plan,
+        phase_id,
+        dispatch,
+        "prompt_context_memory_spec",
+    )?;
     let (coordinator_worktree, previous_conclusions) = {
         let database = open_workspace_database(&workspace.path)?;
         (
@@ -943,15 +1240,23 @@ async fn dispatch_plan_phase(
                 .map_err(ApiError::from_workspace_error)?,
         )
     };
+    ensure_plan_phase_dispatch_reservation_live(
+        state,
+        workspace,
+        &plan,
+        phase_id,
+        dispatch,
+        "worktree_creation_and_queue_transaction",
+    )?;
     let queued = queue_chat_message_internal(
         state,
         workspace_id,
         QueueChatMessageInput {
             chat_id: None,
             chat_title_override: Some(plan_phase_chat_title(&plan.title, &phase.title)),
-            model_id: selection.model_id,
-            provider_id: Some(selection.provider_id),
-            thinking_level: selection.thinking_level,
+            model_id: dispatch.selection.model_id.clone(),
+            provider_id: Some(dispatch.selection.provider_id.clone()),
+            thinking_level: dispatch.selection.thinking_level.clone(),
             latency_mode: foco_providers::LatencyMode::Standard,
             skill_ids: None,
             session_mode: None,
@@ -967,20 +1272,13 @@ async fn dispatch_plan_phase(
                 plan_id: plan.id.clone(),
                 phase_id: phase.id.clone(),
             },
-            plan_phase_dispatch_binding: attempt_id
-                .as_ref()
-                .zip(dispatch_deadline_at.as_ref())
-                .map(
-                    |(attempt_id, dispatch_deadline_at)| PlanPhaseDispatchBinding {
-                        attempt_id: attempt_id.clone(),
-                        plan_id: plan.id.clone(),
-                        phase_id: phase.id.clone(),
-                        dispatch_owner_incarnation: state
-                            .plan_dispatch_owner_incarnation()
-                            .to_string(),
-                        dispatch_deadline_at: dispatch_deadline_at.clone(),
-                    },
-                ),
+            plan_phase_dispatch_binding: Some(PlanPhaseDispatchBinding {
+                attempt_id: dispatch.attempt_id.clone(),
+                plan_id: plan.id.clone(),
+                phase_id: phase.id.clone(),
+                dispatch_owner_incarnation: state.plan_dispatch_owner_incarnation().to_string(),
+                dispatch_deadline_at: dispatch.deadline_at.clone(),
+            }),
         },
     )
     .await?;
@@ -993,36 +1291,37 @@ async fn dispatch_plan_phase(
         .agent_task_id
         .as_ref()
         .ok_or_else(|| ApiError::internal("plan phase queue did not create an Agent task"))?;
-    let mut database = open_workspace_database(&workspace.path)?;
-    let attached = if let Some(attempt_id) = attempt_id.as_deref() {
-        let bound = database
-            .plan_phase_attempt(attempt_id)
-            .map_err(ApiError::from_workspace_error)?
-            .is_some_and(|attempt| {
-                attempt.implementation_chat_id.as_deref() == Some(queued.chat_id.as_str())
-                    && attempt.agent_team_id.as_deref() == Some(team_id.as_str())
-                    && attempt.agent_task_id.as_deref() == Some(task_id.as_str())
-            });
-        if !bound {
-            Err(ApiError::conflict(
-                "Plan phase dispatch binding was not committed",
-            ))
-        } else {
-            database
-                .plan(&plan.id)
-                .map_err(ApiError::from_workspace_error)?
-                .ok_or_else(|| ApiError::internal("Plan disappeared after dispatch binding"))
-        }
+    let database = open_workspace_database(&workspace.path)?;
+    let bound = database
+        .plan_phase_attempt(&dispatch.attempt_id)
+        .map_err(ApiError::from_workspace_error)?
+        .is_some_and(|attempt| {
+            attempt.implementation_chat_id.as_deref() == Some(queued.chat_id.as_str())
+                && attempt.agent_team_id.as_deref() == Some(team_id.as_str())
+                && attempt.agent_task_id.as_deref() == Some(task_id.as_str())
+        });
+    let attached = if !bound {
+        Err(ApiError::conflict(
+            "Plan phase dispatch binding was not committed",
+        ))
     } else {
         database
-            .attach_plan_phase_run(&plan.id, &phase.id, &queued.chat_id, team_id, task_id)
-            .map_err(ApiError::from_workspace_error)
+            .plan(&plan.id)
+            .map_err(ApiError::from_workspace_error)?
+            .ok_or_else(|| ApiError::internal("Plan disappeared after dispatch binding"))
     };
     let plan = match attached {
         Ok(plan) => plan,
         Err(error) => {
             drop(database);
-            cancel_unattached_plan_phase_task(workspace, team_id, task_id, &error);
+            cancel_unattached_plan_phase_task(
+                workspace,
+                &queued.chat_id,
+                &queued.user_message_id,
+                team_id,
+                task_id,
+                &error,
+            );
             return Err(error);
         }
     };
@@ -1848,6 +2147,47 @@ mod tests {
         },
         workspace::PlanPhaseAttemptRecord,
     };
+
+    #[test]
+    fn plan_phase_dispatch_registry_cancels_only_its_plan_and_removes_dropped_runs() {
+        let registry = PlanPhaseDispatchRegistry::default();
+        let deadline = (Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        let first = registry
+            .register(
+                "attempt-registry-first".to_string(),
+                "plan-registry-first".to_string(),
+                "phase-registry-first".to_string(),
+                "owner-registry".to_string(),
+                deadline.clone(),
+            )
+            .expect("register first dispatch");
+        let second = registry
+            .register(
+                "attempt-registry-second".to_string(),
+                "plan-registry-second".to_string(),
+                "phase-registry-second".to_string(),
+                "owner-registry".to_string(),
+                deadline,
+            )
+            .expect("register second dispatch");
+        let first_rx = first.cancellation_rx.clone();
+        let second_rx = second.cancellation_rx.clone();
+
+        registry.cancel_plan("plan-registry-first", "plan cancelled");
+
+        assert_eq!(
+            first_rx
+                .borrow()
+                .as_ref()
+                .map(|cancellation| cancellation.message.as_str()),
+            Some("plan cancelled")
+        );
+        assert!(second_rx.borrow().is_none());
+        drop(first);
+        assert_eq!(registry.runs.lock().expect("registry lock").len(), 1);
+        drop(second);
+        assert!(registry.runs.lock().expect("registry lock").is_empty());
+    }
 
     #[test]
     fn plan_phase_chat_title_uses_plan_and_phase_titles() {

@@ -430,6 +430,8 @@ pub(crate) struct AppState {
     /// Owner shared by this application's startup reconciliation and every
     /// local Plan phase begin→attach dispatch.
     plan_dispatch_owner_incarnation: String,
+    /// In-memory cancellation ownership for local Plan dispatch reservations.
+    plan_phase_dispatch_registry: crate::plan_runtime::PlanPhaseDispatchRegistry,
     tool_resource_locks: ToolResourceLockRegistry,
     background_command_registry: BackgroundCommandRegistry,
     code_graph_indexes: Arc<Mutex<CodeGraphIndexState>>,
@@ -828,6 +830,7 @@ async fn run_server_until_shutdown(
         scheduled_task_scheduler: scheduled_task_scheduler.clone(),
         plan_auto_run_scheduler: plan_auto_run_scheduler.clone(),
         plan_dispatch_owner_incarnation,
+        plan_phase_dispatch_registry: crate::plan_runtime::PlanPhaseDispatchRegistry::default(),
         tool_resource_locks: ToolResourceLockRegistry::default(),
         background_command_registry: BackgroundCommandRegistry::default(),
         code_graph_indexes: code_graph_indexes.clone(),
