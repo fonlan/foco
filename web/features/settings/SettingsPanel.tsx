@@ -181,6 +181,11 @@ import {
   SettingsTextField,
   Spinner,
 } from "../../shared/ui";
+import {
+  developerForModelMetadata,
+  modelIdForDeveloper,
+  modelsForDeveloper,
+} from "./model-developer-catalog";
 import { useRemoteWorkspaceSkillCatalog } from "./use-remote-workspace-skill-catalog";
 import { WorkspaceIcon } from "../workspaces/WorkspaceIcon";
 import {
@@ -1844,7 +1849,7 @@ export function SettingsPanel({
     }
 
     if (metadataModel) {
-      return [metadataModel.providerId];
+      return [developerForModelMetadata(metadataModel.providerId)];
     }
 
     return providers.map((provider) => provider.id);
@@ -1971,7 +1976,7 @@ export function SettingsPanel({
     const model = isProviderRawModelId ? null : modelMetadataForInput(modelId);
     setSelectedMetadataKey(model?.key ?? "");
     if (model) {
-      setSelectedModelDeveloper(model.providerId);
+      setSelectedModelDeveloper(developerForModelMetadata(model.providerId));
     }
 
     setForm((current) => {
@@ -1997,7 +2002,11 @@ export function SettingsPanel({
   function editConfiguredModel(model: ConfiguredModelSummary) {
     setSelectedMetadataKey(model.metadataKey ?? "");
     const metadataModel = metadata?.models.find((item) => item.key === model.metadataKey);
-    setSelectedModelDeveloper(metadataModel?.providerId ?? "");
+    setSelectedModelDeveloper(
+      metadataModel
+        ? developerForModelMetadata(metadataModel.providerId)
+        : "",
+    );
     setForm({
       displayName: model.displayName,
       enabled: model.enabled,
@@ -14998,27 +15007,6 @@ function modelModalityOptions(
   return values;
 }
 
-function modelsForDeveloper(models: ModelMetadataRecord[], developer: string) {
-  const normalizedDeveloper = normalizeDeveloperToken(developer);
-
-  if (!normalizedDeveloper) {
-    return [];
-  }
-
-  return models.filter((model) =>
-    normalizeDeveloperToken(model.key).startsWith(`${normalizedDeveloper}/`),
-  );
-}
-
-function modelIdForDeveloper(model: ModelMetadataRecord, developer: string) {
-  return stripDeveloperPrefix(
-    normalizeDeveloperToken(model.key).startsWith(`${normalizeDeveloperToken(developer)}/`)
-      ? model.key.slice(developer.length + 1)
-      : model.modelId,
-    developer,
-  );
-}
-
 function loadedProviderModelIds(modelLists: Record<string, ProviderModelListState>) {
   return Object.values(modelLists)
     .filter((modelList) => modelList.status === "ok")
@@ -15028,21 +15016,6 @@ function loadedProviderModelIds(modelLists: Record<string, ProviderModelListStat
 
 function uniqueByValue<T extends { value: string }>(item: T, index: number, values: T[]) {
   return values.findIndex((value) => value.value === item.value) === index;
-}
-
-function stripDeveloperPrefix(modelId: string, developer: string) {
-  const prefix = `${normalizeDeveloperToken(developer)}/`;
-  let value = modelId.trim();
-
-  while (normalizeDeveloperToken(value).startsWith(prefix)) {
-    value = value.slice(prefix.length);
-  }
-
-  return value;
-}
-
-function normalizeDeveloperToken(value: string) {
-  return value.trim().toLowerCase();
 }
 
 function normalizeModalities(modalities: string[]) {
