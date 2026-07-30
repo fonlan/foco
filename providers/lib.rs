@@ -1438,8 +1438,8 @@ pub enum ToolChoiceEnforcement {
 
 /// Return whether this adapter can emit a native forced single-tool selection field.
 ///
-/// Unsupported adapters (Ollama native protocol, Cohere, Bedrock) keep tools + prompt
-/// only; callers must treat that as an explicit degradation, not silent enforcement.
+/// Unsupported adapters (Ollama native protocol, Cohere, DeepSeek, Bedrock) keep tools +
+/// prompt only; callers must treat that as an explicit degradation, not silent enforcement.
 pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool {
     match adapter_kind {
         AdapterKind::OpenAI
@@ -1454,7 +1454,6 @@ pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool 
         | AdapterKind::Moonshot
         | AdapterKind::Nebius
         | AdapterKind::Xai
-        | AdapterKind::DeepSeek
         | AdapterKind::Zai
         | AdapterKind::BigModel
         | AdapterKind::Aliyun
@@ -1467,6 +1466,7 @@ pub fn adapter_supports_required_single_tool(adapter_kind: AdapterKind) -> bool 
         AdapterKind::Ollama
         | AdapterKind::OllamaCloud
         | AdapterKind::Cohere
+        | AdapterKind::DeepSeek
         | AdapterKind::BedrockApi => false,
     }
 }
@@ -7698,6 +7698,10 @@ mod tests {
             ToolChoiceEnforcement::Auto
         );
         assert_eq!(
+            resolve_tool_choice_enforcement(AdapterKind::DeepSeek, &NeutralToolChoice::Auto),
+            ToolChoiceEnforcement::Auto
+        );
+        assert_eq!(
             resolve_tool_choice_enforcement(
                 AdapterKind::OpenAIResp,
                 &NeutralToolChoice::required_single_tool("select_relevant_memory")
@@ -7739,8 +7743,18 @@ mod tests {
             ),
             ToolChoiceEnforcement::UnsupportedDegraded
         );
+        assert_eq!(
+            resolve_tool_choice_enforcement(
+                AdapterKind::DeepSeek,
+                &NeutralToolChoice::required_single_tool("select_relevant_memory")
+            ),
+            ToolChoiceEnforcement::UnsupportedDegraded
+        );
         assert!(!adapter_supports_required_single_tool(
             AdapterKind::OllamaCloud
+        ));
+        assert!(!adapter_supports_required_single_tool(
+            AdapterKind::DeepSeek
         ));
         assert!(adapter_supports_required_single_tool(AdapterKind::OpenAI));
     }
@@ -7889,6 +7903,60 @@ mod tests {
                 "type": "function",
                 "function": { "name": "select_relevant_memory" }
             })
+        );
+        assert_eq!(
+            body_json["tools"][0]["function"]["name"],
+            "select_relevant_memory"
+        );
+
+        while stream.next_event().await.is_some() {}
+        let _ = fixture.await;
+    }
+
+    #[tokio::test]
+    async fn required_single_tool_omits_tool_choice_on_deepseek_chat_wire() {
+        let response = concat!(
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\\n\\n",
+            "data: {\"id\":\"resp-fixture\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\\n\\n",
+            "data: [DONE]\\n\\n"
+        );
+        let (fixture_root, fixture) =
+            spawn_raw_http_fixture("200 OK", "text/event-stream", response).await;
+        let config = ProviderConnectionConfig {
+            kind: parse_provider_kind(DEEPSEEK_KIND).expect("deepseek kind"),
+            base_url: Some(format!("{fixture_root}v1/")),
+            api_key: Some("fixture-api-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        };
+        let mut request = neutral_request(vec![neutral_text_message(
+            NeutralChatRole::User,
+            "use the tool",
+        )]);
+        request.tools.push(NeutralToolDefinition {
+            name: "select_relevant_memory".to_string(),
+            description: "pick memories".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+            strict: true,
+            kind: NeutralToolKind::Function,
+        });
+        request.tool_choice = NeutralToolChoice::required_single_tool("select_relevant_memory");
+
+        let mut stream = stream_chat_with_capture(&config, request, true)
+            .await
+            .expect("open fixture stream");
+        let dump = stream
+            .wire_request_dump()
+            .expect("wire request dump")
+            .as_http()
+            .expect("http request dump")
+            .clone();
+        let body = dump.body.as_deref().expect("request body");
+        let body_json: Value = serde_json::from_str(body).expect("request JSON");
+        assert!(
+            body_json.get("tool_choice").is_none(),
+            "DeepSeek must receive tools + prompt degradation without native tool_choice"
         );
         assert_eq!(
             body_json["tools"][0]["function"]["name"],

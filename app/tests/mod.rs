@@ -37744,6 +37744,141 @@ async fn audited_single_tool_request_recovers_thinking_tool_choice_400_with_auto
 }
 
 #[tokio::test]
+async fn audited_single_tool_request_deepseek_omits_tool_choice_and_preserves_audit_wire() {
+    let workspace = tempfile::tempdir().expect("workspace directory");
+    let provider_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let provider_app = Router::new().route(
+        "/v1/chat/completions",
+        post({
+            let provider_requests = provider_requests.clone();
+            move |body: axum::body::Bytes| {
+                let provider_requests = provider_requests.clone();
+                async move {
+                    provider_requests
+                        .lock()
+                        .expect("provider capture")
+                        .push(serde_json::from_slice(&body).expect("provider request JSON"));
+                    axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(axum::body::Body::from(concat!(
+                            "data: {\"id\":\"deepseek-tool\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-memory\",\"type\":\"function\",\"function\":{\"name\":\"select_relevant_memory\",\"arguments\":\"{\\\"factKeys\\\":[\\\"fact-1\\\"]}\"}}]},\"finish_reason\":null}]}\n\n",
+                            "data: {\"id\":\"deepseek-tool\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+                            "data: [DONE]\n\n"
+                        )))
+                        .expect("build DeepSeek tool-call stream")
+                }
+            }
+        }),
+    );
+    let listener = TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind provider fixture");
+    let provider_address = listener.local_addr().expect("provider fixture address");
+    let provider_task = tokio::spawn(async move {
+        axum::serve(listener, provider_app)
+            .await
+            .expect("serve provider fixture");
+    });
+
+    let mut database =
+        WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    database
+        .insert_chat("chat-1", "Memory retrieval")
+        .expect("insert chat");
+    drop(database);
+
+    let tool = memory_retrieval_tool_definition();
+    let result = audited_provider_tool_request(
+        workspace.path(),
+        "workspace",
+        Some("chat-1"),
+        "provider",
+        &ProviderConnectionConfig {
+            kind: parse_provider_kind(foco_providers::DEEPSEEK_KIND).expect("DeepSeek kind"),
+            base_url: Some(format!("http://{provider_address}/v1")),
+            api_key: Some("test-key".to_string()),
+            proxy_url: None,
+            request_overrides: Vec::new(),
+            model_redirects: Vec::new(),
+        },
+        NeutralChatRequest {
+            model_id: "deepseek-chat".to_string(),
+            messages: vec![neutral_text_message(
+                NeutralChatRole::User,
+                "Select relevant memory.".to_string(),
+            )],
+            tools: vec![tool.clone()],
+            thinking_level: None,
+            max_output_tokens: Some(64),
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+            agent_correlation: None,
+            tool_choice: foco_providers::NeutralToolChoice::required_single_tool(
+                "select_relevant_memory",
+            ),
+        },
+        "memory retrieval",
+        "select_relevant_memory",
+        "memory retrieval",
+        5_000,
+        2,
+        true,
+    )
+    .await
+    .expect("DeepSeek structured tool call should succeed without native enforcement");
+    provider_task.abort();
+    let _ = provider_task.await;
+
+    assert_eq!(result.arguments, json!({ "factKeys": ["fact-1"] }));
+    assert_eq!(result.attempt_index, 1);
+    let provider_requests = provider_requests.lock().expect("provider requests");
+    assert_eq!(provider_requests.len(), 1);
+    assert!(provider_requests[0].get("tool_choice").is_none());
+    assert_eq!(
+        provider_requests[0]["tools"][0]["function"]["name"],
+        tool.name
+    );
+    drop(provider_requests);
+
+    let database = WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
+    let audit_rows = database
+        .llm_request_audit_rows(LlmRequestAuditFilters {
+            request_kind: Some("memory retrieval"),
+            ..LlmRequestAuditFilters::default()
+        })
+        .expect("memory retrieval audit rows");
+    assert_eq!(audit_rows.len(), 1);
+    let audit = database
+        .llm_request(&audit_rows[0].id)
+        .expect("read audit row")
+        .expect("audit row exists");
+    assert_eq!(
+        audit.structured_outcome.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_OUTCOME_SUCCEEDED)
+    );
+    assert_eq!(
+        audit.recovery_source.as_deref(),
+        Some(foco_store::workspace::STRUCTURED_LLM_RECOVERY_TOOL_CALL)
+    );
+    let request_wire: Value = serde_json::from_str(
+        audit
+            .request_body_json
+            .as_deref()
+            .expect("request wire audit"),
+    )
+    .expect("request wire JSON");
+    let request_body: Value = serde_json::from_str(
+        request_wire["body"]
+            .as_str()
+            .expect("request wire body JSON"),
+    )
+    .expect("parse request wire body");
+    assert!(request_body.get("tool_choice").is_none());
+    assert_eq!(request_body["tools"][0]["function"]["name"], tool.name);
+}
+
+#[tokio::test]
 async fn audited_single_tool_request_does_not_repair_an_unrelated_http_400() {
     let workspace = tempfile::tempdir().expect("workspace directory");
     let provider_requests = Arc::new(Mutex::new(Vec::<Value>::new()));
