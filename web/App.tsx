@@ -17763,20 +17763,7 @@ function completedAssistantMessage(
       streamEvent.reasoningDurationMs,
     );
   }
-  const textDelta = missingFinalSuffix(message.content, streamEvent.text);
-  if (textDelta) {
-    parts = appendTextPart(parts, textDelta);
-  } else if (
-    streamEvent.text &&
-    message.content !== streamEvent.text &&
-    !message.content.includes(streamEvent.text)
-  ) {
-    // Complete is authoritative, but don't append a second whole conclusion
-    // behind an incompatible stale draft. Replace the terminal text block so
-    // tool/reasoning blocks retain their timeline position and the UI has one
-    // visible final body.
-    parts = replaceLastTextPart(parts, streamEvent.text);
-  }
+  parts = finalizedTextParts(parts, message.content, streamEvent);
 
   return {
     ...message,
@@ -17803,7 +17790,7 @@ function completedGuidanceAssistantMessage(
   activeReasoningStartedAtMs: number | null,
   completedAtMs: number,
 ): ShellMessage {
-  const parts = (() => {
+  let parts = (() => {
     if (activeReasoningStartedAtMs !== null) {
       const serverParts = finishReasoningPartWithDuration(
         message.parts,
@@ -17823,6 +17810,8 @@ function completedGuidanceAssistantMessage(
     );
   })();
 
+  parts = finalizedTextParts(parts, message.content, streamEvent);
+
   return {
     ...message,
     metrics: streamEvent.metrics,
@@ -17831,6 +17820,50 @@ function completedGuidanceAssistantMessage(
     status: undefined,
     parts: parts.length ? parts : fallbackMessageParts(message),
   };
+}
+
+/**
+ * Complete is the durable authority for the final visible response, but it is
+ * not permission to reorder the conversation. New servers tell us whether the
+ * completion supplies the exact final provider segment. In that case replace
+ * only that text block in place; a tool-only final turn instead receives its
+ * truthful completion fallback after the last structural block. Older payloads
+ * retain the previous suffix-compatible behavior.
+ */
+export function finalizedTextParts(
+  parts: ChatMessagePart[],
+  currentContent: string,
+  streamEvent: Extract<ChatStreamEvent, { type: "complete" }>,
+): ChatMessagePart[] {
+  if (!streamEvent.text) {
+    return parts;
+  }
+  if (streamEvent.finalTextSegment !== undefined) {
+    if (!streamEvent.finalTextSegment) {
+      return parts;
+    }
+    return streamEvent.hasFinalTextSegment
+      ? replaceLastTextPart(parts, streamEvent.finalTextSegment)
+      : appendTextPart(parts, streamEvent.finalTextSegment);
+  }
+  if (streamEvent.hasFinalTextSegment === true) {
+    return replaceLastTextPart(parts, streamEvent.text);
+  }
+  if (streamEvent.hasFinalTextSegment === false) {
+    return appendTextPart(parts, streamEvent.text);
+  }
+
+  const textDelta = missingFinalSuffix(currentContent, streamEvent.text);
+  if (textDelta) {
+    return appendTextPart(parts, textDelta);
+  }
+  if (
+    currentContent !== streamEvent.text &&
+    !currentContent.includes(streamEvent.text)
+  ) {
+    return replaceLastTextPart(parts, streamEvent.text);
+  }
+  return parts;
 }
 
 function assistantMessageWithExtractedMemories(
@@ -20019,6 +20052,16 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       "assistant_message_id",
     );
     const text = stringField(value, "text");
+    const hasFinalTextSegment = fieldValue(
+      value,
+      "hasFinalTextSegment",
+      "has_final_text_segment",
+    );
+    const finalTextSegment = fieldValue(
+      value,
+      "finalTextSegment",
+      "final_text_segment",
+    );
     const reasoning = optionalNullableStringField(value, "reasoning");
     const reasoningDurationMs = optionalNumberField(
       value,
@@ -20036,7 +20079,16 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       fieldValue(value, "memoriesUsed", "memories_used"),
     );
 
-    if (!chatId || !assistantMessageId || text === null) {
+    if (
+      !chatId ||
+      !assistantMessageId ||
+      text === null ||
+      (hasFinalTextSegment !== undefined &&
+        typeof hasFinalTextSegment !== "boolean") ||
+      (finalTextSegment !== undefined &&
+        finalTextSegment !== null &&
+        typeof finalTextSegment !== "string")
+    ) {
       return null;
     }
 
@@ -20056,6 +20108,12 @@ export function parseChatStreamEvent(value: unknown): ChatStreamEvent | null {
       chatId,
       assistantMessageId,
       text,
+      ...(typeof hasFinalTextSegment === "boolean"
+        ? { hasFinalTextSegment }
+        : {}),
+      ...(finalTextSegment === null || typeof finalTextSegment === "string"
+        ? { finalTextSegment }
+        : {}),
       reasoning,
       reasoningDurationMs,
       usage,

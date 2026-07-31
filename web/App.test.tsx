@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
-import { activeRunIdFromStartEvent, chatSessionStatusDotClass, composerContextUsageRefreshAction, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedAgentTaskLifecycleParts, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
-import type { ActiveRunInfo, ChatMessageSummary, ContextUsageResponse, ShellMessage } from "./api/types";
+import { activeRunIdFromStartEvent, chatSessionStatusDotClass, composerContextUsageRefreshAction, contextUsageWithLatestProviderUsage, deriveChatSessionStatus, expandMessagesWithUserInterruptions, finalizedTextParts, isAutomaticGuardSource, isGuidableActiveRun, isPersistedQueuedRunRunning, isSameContinuousLocalActiveRun, isTerminalActiveRun, mergeLoadedMessagesWithStreamingPlaceholders, normalizeChatMessageSummary, overlayStaleLoadedAgentTaskLifecycleParts, overlayStaleLoadedContextCompressionParts, parseChatStreamEvent, planModeEnabledFromMessages, preserveCachedReasoningDurations, trimInactiveChatMessageCaches } from "./App";
+import type { ActiveRunInfo, ChatMessagePart, ChatMessageSummary, ChatStreamEvent, ContextUsageResponse, ShellMessage } from "./api/types";
 import { translate } from "./shared/i18n";
 
 describe("blocked tool-call translations", () => {
@@ -11,6 +11,104 @@ describe("blocked tool-call translations", () => {
       "运行时未执行",
     );
     expect(translate("Input", {}, "zh-CN")).toBe("输入");
+  });
+});
+
+describe("durable Complete final text", () => {
+  const completeEvent = (
+    text: string,
+    hasFinalTextSegment: boolean,
+    finalTextSegment: string | null = text,
+  ): Extract<ChatStreamEvent, { type: "complete" }> => ({
+    assistantMessageId: "assistant-1",
+    chatId: "chat-1",
+    hasFinalTextSegment,
+    finalTextSegment,
+    memoriesUsed: [],
+    metrics: {
+      firstTokenLatencyMs: null,
+      llmRequestIds: [],
+      modelId: "model-1",
+      outputTokens: null,
+      providerId: "provider-1",
+      totalLatencyMs: null,
+    },
+    text,
+    type: "complete",
+  });
+
+  const toolPart: ChatMessagePart = {
+    toolCall: {
+      id: "tool-1",
+      input: {},
+      isError: false,
+      name: "read_file",
+      output: null,
+      status: "completed",
+    },
+    type: "toolCall",
+  };
+
+  it("replaces only the final provider text segment without moving the tool", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Stale draft.", type: "text" },
+    ];
+
+    expect(finalizedTextParts(parts, "Before tool. Stale draft.", completeEvent("Final conclusion.", true))).toEqual([
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Final conclusion.", type: "text" },
+    ]);
+  });
+
+  it("places a tool-only completion fallback after the final tool", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+    ];
+
+    expect(finalizedTextParts(parts, "Before tool. ", completeEvent("Tool calls completed.", false))).toEqual([
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Tool calls completed.", type: "text" },
+    ]);
+  });
+
+  it("uses the explicit final segment instead of duplicating accumulated tool-turn text", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+      { text: "Final conclusion.", type: "text" },
+    ];
+
+    expect(
+      finalizedTextParts(
+        parts,
+        "Before tool. Final conclusion.",
+        completeEvent(
+          "Before tool. Final conclusion.",
+          true,
+          "Final conclusion.",
+        ),
+      ),
+    ).toEqual(parts);
+  });
+
+  it("does not append accumulated text when a final tool turn has no fallback segment", () => {
+    const parts: ChatMessagePart[] = [
+      { text: "Before tool. ", type: "text" },
+      toolPart,
+    ];
+
+    expect(
+      finalizedTextParts(
+        parts,
+        "Before tool. ",
+        completeEvent("Before tool. ", false, null),
+      ),
+    ).toEqual(parts);
   });
 });
 

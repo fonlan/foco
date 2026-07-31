@@ -1238,6 +1238,8 @@ async fn agent_run_executor_preserves_single_agent_sse_sequence() {
             chat_id: "chat-1".to_string(),
             assistant_message_id: "assistant-1".to_string(),
             text: "done".to_string(),
+            has_final_text_segment: true,
+            final_text_segment: Some("done".to_string()),
             reasoning: None,
             reasoning_duration_ms: None,
             usage: None,
@@ -10448,6 +10450,8 @@ fn active_chat_run_registry_rejects_guidance_after_complete_event() {
                 chat_id: "chat-1".to_string(),
                 assistant_message_id: "assistant-1".to_string(),
                 text: "Done.".to_string(),
+                has_final_text_segment: true,
+                final_text_segment: Some("Done.".to_string()),
                 reasoning: None,
                 reasoning_duration_ms: None,
                 usage: None,
@@ -10698,7 +10702,7 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
     )
     .expect("assistant metadata");
     assert!(!metadata_json.contains("large result"));
-    assert!(metadata_json.contains(r#""partsVersion":6"#));
+    assert!(metadata_json.contains(&format!(r#""partsVersion":{}"#, STORED_CHAT_PARTS_VERSION)));
     assert!(metadata_json.contains(r#""partsSource":"live_sse""#));
 
     let parts = assistant_parts_from_metadata(&metadata_json, std::slice::from_ref(&tool_call))
@@ -10709,6 +10713,149 @@ fn finalized_assistant_parts_persist_compact_tool_references_in_stream_order() {
         matches!(&parts[1], ChatMessagePart::ToolCall { tool_call } if tool_call.id == "tool-1")
     );
     assert!(matches!(&parts[2], ChatMessagePart::Text { text } if text == "After."));
+}
+
+#[test]
+fn finalized_assistant_parts_replace_only_the_durable_final_text_segment() {
+    let tool_call = ChatToolCallSummary {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "path": "README.md" }),
+        output: None,
+        is_error: false,
+        started_at: None,
+        completed_at: None,
+        live_output: None,
+    };
+    let events = [
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before. " }),
+        ),
+        (
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Discarded draft." }),
+        ),
+        (
+            "completion",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "hasFinalTextSegment": true,
+                "finalTextSegment": "Final conclusion.",
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-07-31T03:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Before. Final conclusion.",
+        None,
+        std::slice::from_ref(&tool_call),
+        None,
+    )
+    .expect("stored parts");
+
+    assert!(matches!(&parts[0], StoredChatMessagePart::Text { text } if text == "Before. "));
+    assert!(
+        matches!(&parts[1], StoredChatMessagePart::ToolCall { tool_call_id } if tool_call_id == "tool-1")
+    );
+    assert!(
+        matches!(&parts[2], StoredChatMessagePart::Text { text } if text == "Final conclusion.")
+    );
+}
+
+#[test]
+fn finalized_assistant_parts_append_tool_only_completion_after_tools() {
+    let tool_call = ChatToolCallSummary {
+        id: "tool-1".to_string(),
+        name: "read_file".to_string(),
+        status: "completed".to_string(),
+        input: json!({ "path": "README.md" }),
+        output: None,
+        is_error: false,
+        started_at: None,
+        completed_at: None,
+        live_output: None,
+    };
+    let events = [
+        (
+            "text_delta",
+            json!({ "assistantMessageId": "assistant-1", "delta": "Before. " }),
+        ),
+        (
+            "tool_call",
+            json!({ "assistantMessageId": "assistant-1", "toolCall": { "id": "tool-1" } }),
+        ),
+        (
+            "completion",
+            json!({
+                "assistantMessageId": "assistant-1",
+                "hasFinalTextSegment": false,
+                "finalTextSegment": "Tool calls completed.",
+            }),
+        ),
+    ]
+    .into_iter()
+    .map(|(event_type, value)| CapturedAuditEvent {
+        event_at: "2026-07-31T03:00:00Z".to_string(),
+        event_type: event_type.to_string(),
+        normalized_event_json: value.to_string(),
+    })
+    .collect::<Vec<_>>();
+
+    let parts = finalized_assistant_message_parts(
+        "assistant-1",
+        &events,
+        "Tool calls completed.",
+        None,
+        std::slice::from_ref(&tool_call),
+        None,
+    )
+    .expect("stored parts");
+
+    assert!(
+        matches!(&parts[2], StoredChatMessagePart::Text { text } if text == "Tool calls completed.")
+    );
+}
+
+#[test]
+fn completed_text_segment_uses_only_the_last_provider_turn() {
+    assert_eq!(
+        completed_text_segment(
+            "Final conclusion.",
+            "Before tool. Final conclusion.",
+            "Before tool. Final conclusion.",
+        ),
+        Some("Final conclusion.".to_string()),
+    );
+}
+
+#[test]
+fn completed_text_segment_keeps_a_git_summary_with_the_last_provider_turn() {
+    assert_eq!(
+        completed_text_segment(
+            "Final conclusion.  ",
+            "Before tool. Final conclusion.  ",
+            "Before tool. Final conclusion.\n\n### Code changes in this turn\n\n- `app/main.rs`: +1 / -0\n",
+        ),
+        Some(
+            "Final conclusion.\n\n### Code changes in this turn\n\n- `app/main.rs`: +1 / -0\n"
+                .to_string(),
+        ),
+    );
 }
 
 #[test]
@@ -18480,6 +18627,8 @@ fn persist_chat_result_writes_audit_status_code_and_queues_memory_extraction() {
         chat_id: "chat-1".to_string(),
         assistant_message_id: "assistant-1".to_string(),
         text: "Done.".to_string(),
+        has_final_text_segment: true,
+        final_text_segment: Some("Done.".to_string()),
         reasoning: None,
         reasoning_duration_ms: None,
         usage: None,

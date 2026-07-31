@@ -1621,6 +1621,18 @@ const MessageRow = memo(function MessageRow({
                   </span>
                 ) : null}
                 {!isUser &&
+                message.metrics &&
+                message.status !== "streaming" ? (
+                  <span
+                    aria-label={t("Durable completion confirmed")}
+                    className="message-run-badge"
+                    role="status"
+                    title={t("Durable completion confirmed")}
+                  >
+                    {t("Final response")}
+                  </span>
+                ) : null}
+                {!isUser &&
                 message.runBadges?.includes("contextCompressionRule") ? (
                   <span
                     className="message-run-badge"

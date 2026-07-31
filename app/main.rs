@@ -2332,6 +2332,13 @@ enum ChatSseEvent {
         chat_id: String,
         assistant_message_id: String,
         text: String,
+        /// Distinguishes a provider's final text segment from the truthful
+        /// completion fallback used when a final turn only executed tools.
+        has_final_text_segment: bool,
+        /// The actual final provider segment, after any durable completion
+        /// suffix (such as the code-change summary) has been applied. `null`
+        /// means no new visible text part should be added for this completion.
+        final_text_segment: Option<String>,
         reasoning: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_duration_ms: Option<i64>,
@@ -4782,6 +4789,17 @@ impl PreparedChatContext {
                                 );
                                 let assistant_message_text = git_diff_summary_result.text;
                                 self.code_change_stats = git_diff_summary_result.stats;
+                                let has_final_text_segment = !turn_text.trim().is_empty();
+                                let final_text_segment = if has_final_text_segment {
+                                    completed_text_segment(
+                                        &turn_text,
+                                        &assistant_text,
+                                        &assistant_message_text,
+                                    )
+                                } else {
+                                    (assistant_message_text == "Tool calls completed.")
+                                        .then(|| assistant_message_text.clone())
+                                };
                                 let total_latency_ms = elapsed_millis(started_at);
                                 if reasoning_duration_ms.is_none()
                                     && let Some(started_at) = reasoning_started_at.take()
@@ -4804,6 +4822,8 @@ impl PreparedChatContext {
                                     chat_id: self.chat_id.clone(),
                                     assistant_message_id: self.assistant_message_id.clone(),
                                     text: assistant_message_text.clone(),
+                                    has_final_text_segment,
+                                    final_text_segment,
                                     reasoning: non_empty_string(&assistant_reasoning),
                                     reasoning_duration_ms,
                                     usage: final_usage.clone(),
@@ -11115,6 +11135,33 @@ fn assistant_message_text(assistant_text: &str, tool_calls: &[ExecutedToolCall])
         assistant_text.to_string()
     }
 }
+
+/// Builds the one text part that Complete is allowed to reconcile in place.
+/// `assistant_text` spans prior tool turns, so using it directly would repeat
+/// earlier text after the final tool. Git summaries may trim trailing space
+/// before appending their suffix, which is why both exact and trimmed prefixes
+/// are considered here.
+fn completed_text_segment(
+    turn_text: &str,
+    assistant_text: &str,
+    completed_text: &str,
+) -> Option<String> {
+    if turn_text.trim().is_empty() {
+        return None;
+    }
+    if let Some(suffix) = completed_text.strip_prefix(assistant_text) {
+        return Some(format!("{turn_text}{suffix}"));
+    }
+    if let Some(suffix) = completed_text.strip_prefix(assistant_text.trim_end()) {
+        return Some(format!("{}{suffix}", turn_text.trim_end()));
+    }
+
+    // A hook may transform the durable content in a way that has no safe text
+    // prefix. Preserve the streamed final segment rather than duplicating all
+    // accumulated text; history remains authoritative for the transformed body.
+    Some(turn_text.to_string())
+}
+
 fn session_code_change_baseline_for_workspace(
     workspace_path: &Path,
 ) -> SessionCodeChangeBaselineState {
@@ -14142,11 +14189,21 @@ fn finalized_assistant_message_parts(
             },
         );
     }
-    if !assistant_text.is_empty()
+    let completed_final_text_segment = completed_final_text_segment(events, assistant_message_id)?;
+    if let Some(CompletedFinalTextSegment {
+        has_final_text_segment: true,
+        text: Some(text),
+    }) = completed_final_text_segment.as_ref()
+    {
+        replace_last_text_part(&mut parts, text);
+    } else if completed_final_text_segment.is_none()
+        && !assistant_text.is_empty()
         && !parts
             .iter()
             .any(|part| matches!(part, ChatMessagePart::Text { .. }))
     {
+        // Historical Complete events did not identify their final provider
+        // segment, so preserve the old conservative fallback for replay.
         push_text_part(&mut parts, assistant_text);
     }
     for tool_call in tool_calls {
@@ -14156,6 +14213,16 @@ fn finalized_assistant_message_parts(
             &tool_calls_by_id,
             &tool_call.id,
         );
+    }
+    if let Some(CompletedFinalTextSegment {
+        has_final_text_segment: false,
+        text: Some(text),
+    }) = completed_final_text_segment.as_ref()
+    {
+        // A tool-only final provider turn still has a durable user-visible
+        // completion fallback. It belongs after the final tool, not in place
+        // of the earlier text that introduced that tool.
+        push_text_part(&mut parts, text);
     }
     if let Some(failure_message) = failure_message.filter(|message| !message.is_empty())
         && !parts
@@ -14172,6 +14239,44 @@ fn finalized_assistant_message_parts(
     }
 
     stored_chat_message_parts(parts)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CompletedFinalTextSegment {
+    has_final_text_segment: bool,
+    text: Option<String>,
+}
+
+fn completed_final_text_segment(
+    events: &[CapturedAuditEvent],
+    assistant_message_id: &str,
+) -> Result<Option<CompletedFinalTextSegment>, ApiError> {
+    let Some(event) = events.iter().rev().find(|event| {
+        event.event_type == "completion"
+            && event_matches_assistant_message_json(
+                &event.normalized_event_json,
+                assistant_message_id,
+            )
+    }) else {
+        return Ok(None);
+    };
+    let value = parse_json_value(&event.normalized_event_json, "chat completion event")?;
+    let Some(segment) = value
+        .get("finalTextSegment")
+        .or_else(|| value.get("final_text_segment"))
+    else {
+        // Events written before the explicit segment contract retain the
+        // conservative legacy replay path.
+        return Ok(None);
+    };
+    Ok(Some(CompletedFinalTextSegment {
+        has_final_text_segment: value
+            .get("hasFinalTextSegment")
+            .or_else(|| value.get("has_final_text_segment"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        text: segment.as_str().map(ToOwned::to_owned),
+    }))
 }
 
 fn stored_chat_message_parts(
@@ -14246,6 +14351,21 @@ fn push_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
         _ => parts.push(ChatMessagePart::Text {
             text: text.to_string(),
         }),
+    }
+}
+
+fn replace_last_text_part(parts: &mut Vec<ChatMessagePart>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(ChatMessagePart::Text { text: existing }) = parts
+        .iter_mut()
+        .rev()
+        .find(|part| matches!(part, ChatMessagePart::Text { .. }))
+    {
+        *existing = text.to_string();
+    } else {
+        push_text_part(parts, text);
     }
 }
 

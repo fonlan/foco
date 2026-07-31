@@ -16379,6 +16379,8 @@ async fn remote_sidecar_run_broker_llm_turn(
                     chat_id,
                     assistant_message_id,
                     text,
+                    !remaining_text.trim().is_empty(),
+                    (!remaining_text.trim().is_empty()).then_some(remaining_text),
                     (!reasoning.is_empty()).then_some(reasoning.as_str()),
                     usage.clone(),
                     metrics.clone(),
@@ -17786,6 +17788,8 @@ fn remote_chat_completion_event(
     chat_id: &str,
     assistant_message_id: &str,
     text: &str,
+    has_final_text_segment: bool,
+    final_text_segment: Option<&str>,
     reasoning: Option<&str>,
     usage: Value,
     metrics: Value,
@@ -17795,6 +17799,8 @@ fn remote_chat_completion_event(
         "chatId": chat_id,
         "assistantMessageId": assistant_message_id,
         "text": text,
+        "hasFinalTextSegment": has_final_text_segment,
+        "finalTextSegment": final_text_segment,
         "reasoning": reasoning,
         "usage": usage,
         "stopReason": null,
@@ -32259,6 +32265,8 @@ mod tests {
             "chat-1",
             "msg-assistant-1",
             "done",
+            true,
+            Some("done"),
             None,
             json!({
                 "inputTokens": 10,
@@ -32279,6 +32287,8 @@ mod tests {
         assert_eq!(event["type"], "complete");
         assert!(event.get("value").is_none());
         assert_eq!(event["chatId"], "chat-1");
+        assert_eq!(event["hasFinalTextSegment"], true);
+        assert_eq!(event["finalTextSegment"], "done");
         assert_eq!(event["metrics"]["modelId"], "model-1");
         assert_eq!(event["metrics"]["providerId"], "provider-1");
         assert_eq!(event["metrics"]["totalLatencyMs"], 1200);

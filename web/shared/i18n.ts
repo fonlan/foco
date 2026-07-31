@@ -638,6 +638,8 @@ export const TRANSLATIONS: Record<AppLanguageId, Record<string, string>> = {
       "下次发送可能会触发上下文压缩",
     "LLM request failed and reconnected": "大模型请求失败并已重连",
     Reconnected: "已重连",
+    "Final response": "最终回复",
+    "Durable completion confirmed": "已确认最终回复",
     "Rule-based context compression was triggered": "已触发规则上下文压缩",
     "LLM summary context compression was triggered": "已触发大模型摘要压缩",
     "Runtime tool-state compression was triggered": "已触发运行期工具状态压缩",

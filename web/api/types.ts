@@ -819,6 +819,18 @@ export type ChatStreamEvent =
       chatId: string;
       assistantMessageId: string;
       text: string;
+      /**
+       * Whether `text` belongs to a final provider text segment. When false,
+       * `text` is the durable completion fallback for a tool-only final turn.
+       * Missing on older events keeps the legacy best-effort behavior.
+       */
+      hasFinalTextSegment?: boolean;
+      /**
+       * The one final segment that may be reconciled into ordered parts. `null`
+       * means the durable completion changed no visible text part; absent is a
+       * legacy Complete event that requires the old best-effort path.
+       */
+      finalTextSegment?: string | null;
       reasoning?: string | null;
       reasoningDurationMs?: number | null;
       usage?: ChatUsage | null;
