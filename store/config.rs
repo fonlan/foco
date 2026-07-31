@@ -1302,6 +1302,10 @@ fn default_system_prompt_name() -> String {
     DEFAULT_SYSTEM_PROMPT_NAME.to_string()
 }
 
+fn default_developer_role_enabled() -> bool {
+    true
+}
+
 impl Default for WebServerSettings {
     fn default() -> Self {
         Self {
@@ -1352,6 +1356,15 @@ pub struct ModelSettings {
     /// Defaults to disabled so existing global configuration remains Standard.
     #[serde(default, rename = "fastModeEnabled")]
     pub fast_mode_enabled: bool,
+    /// Whether provider requests for this model should preserve the Developer role.
+    ///
+    /// Defaults to enabled so configuration written before this field keeps the
+    /// existing provider request semantics.
+    #[serde(
+        default = "default_developer_role_enabled",
+        rename = "developerRoleEnabled"
+    )]
+    pub developer_role_enabled: bool,
     #[serde(default = "default_system_prompt_name")]
     pub system_prompt_name: String,
     pub metadata_key: Option<String>,
@@ -4611,6 +4624,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: "Missing".to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -4645,6 +4659,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: IMAGE_GENERATION_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5308,6 +5323,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5334,6 +5350,45 @@ mod tests {
             serde_json::from_value(legacy).expect("legacy model settings deserialize");
 
         assert!(!model.fast_mode_enabled);
+    }
+
+    #[test]
+    fn model_settings_without_developer_role_enabled_defaults_to_enabled() {
+        let mut legacy = serde_json::to_value(enabled_memory_model("legacy-model"))
+            .expect("serialize model settings");
+        legacy
+            .as_object_mut()
+            .expect("model settings serialize as an object")
+            .remove("developerRoleEnabled");
+
+        let model: ModelSettings =
+            serde_json::from_value(legacy).expect("legacy model settings deserialize");
+
+        assert!(model.developer_role_enabled);
+    }
+
+    #[test]
+    fn model_settings_round_trip_preserves_disabled_developer_role_and_rejects_unknown_fields() {
+        let mut model = enabled_memory_model("developer-role-model");
+        model.developer_role_enabled = false;
+        let serialized = serde_json::to_value(&model).expect("serialize model settings");
+
+        assert_eq!(serialized["developerRoleEnabled"], false);
+        let restored: ModelSettings =
+            serde_json::from_value(serialized.clone()).expect("deserialize model settings");
+        assert!(!restored.developer_role_enabled);
+
+        let mut with_unknown_field = serialized;
+        with_unknown_field
+            .as_object_mut()
+            .expect("model settings serialize as an object")
+            .insert(
+                "unexpectedDeveloperRoleSetting".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        let error = serde_json::from_value::<ModelSettings>(with_unknown_field)
+            .expect_err("unknown model settings field must be rejected");
+        assert!(error.to_string().contains("unexpectedDeveloperRoleSetting"));
     }
 
     #[test]
@@ -5396,6 +5451,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5424,6 +5480,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5463,6 +5520,7 @@ mod tests {
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,

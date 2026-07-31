@@ -4514,6 +4514,7 @@ fn apply_patch_eligibility_allows_only_native_openai_gpt_routes_after_redirects(
             thinking_level: None,
             web_search_mode: WebSearchMode::Auto,
             fast_mode_enabled: false,
+            developer_role_enabled: true,
             system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
             metadata_key: None,
             metadata_source_url: None,
@@ -5286,6 +5287,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -5303,6 +5305,7 @@ async fn image_agent_uses_text_runner_and_preserves_custom_prompt() {
         thinking_level: Some("low".to_string()),
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -5954,6 +5957,7 @@ async fn concurrent_model_edit_and_route_update_preserve_both_changes() {
                 thinking_level: None,
                 clear_thinking_level: None,
                 web_search_mode: None,
+                developer_role_enabled: None,
                 system_prompt_name: None,
             }),
         )
@@ -6116,6 +6120,7 @@ async fn image_output_model_can_be_saved_without_text_limits() {
             thinking_level: None,
             clear_thinking_level: Some(true),
             web_search_mode: None,
+            developer_role_enabled: None,
             system_prompt_name: Some(DEFAULT_SYSTEM_PROMPT_NAME.to_string()),
         }),
     )
@@ -6131,6 +6136,7 @@ async fn image_output_model_can_be_saved_without_text_limits() {
     assert_eq!(image_model.context_window, None);
     assert_eq!(image_model.max_output_tokens, None);
     assert!(image_model.can_enable);
+    assert!(image_model.developer_role_enabled);
     assert_eq!(image_model.output_modalities, vec!["image"]);
     assert_eq!(image_model.system_prompt_name, DEFAULT_SYSTEM_PROMPT_NAME);
 }
@@ -6140,6 +6146,7 @@ async fn save_manual_model_preserves_web_search_mode_and_rejects_native_on_chat(
     let fixture = prompt_state_fixture(|config| {
         config.providers[0].kind = OPENAI_CHAT_KIND.to_string();
         config.models[0].web_search_mode = WebSearchMode::Function;
+        config.models[0].developer_role_enabled = false;
         config.web_search.enabled = true;
     });
     let state = fixture.state;
@@ -6160,6 +6167,7 @@ async fn save_manual_model_preserves_web_search_mode_and_rejects_native_on_chat(
             thinking_level: None,
             clear_thinking_level: None,
             web_search_mode: None,
+            developer_role_enabled: None,
             system_prompt_name: None,
         }),
     )
@@ -6172,6 +6180,7 @@ async fn save_manual_model_preserves_web_search_mode_and_rejects_native_on_chat(
         .find(|model| model.id == "model")
         .expect("model summary");
     assert_eq!(preserved_model.web_search_mode, WebSearchMode::Function);
+    assert!(!preserved_model.developer_role_enabled);
     assert_eq!(
         state.config.lock().expect("config lock").models[0].web_search_mode,
         WebSearchMode::Function
@@ -6193,6 +6202,7 @@ async fn save_manual_model_preserves_web_search_mode_and_rejects_native_on_chat(
             thinking_level: None,
             clear_thinking_level: None,
             web_search_mode: Some(WebSearchMode::Native),
+            developer_role_enabled: None,
             system_prompt_name: None,
         }),
     )
@@ -6235,6 +6245,7 @@ async fn save_manual_model_native_on_responses_allows_unknown_model_with_warning
             thinking_level: None,
             clear_thinking_level: None,
             web_search_mode: Some(WebSearchMode::Native),
+            developer_role_enabled: Some(false),
             system_prompt_name: None,
         }),
     )
@@ -6247,6 +6258,7 @@ async fn save_manual_model_native_on_responses_allows_unknown_model_with_warning
         .find(|model| model.id == "custom-gateway-model")
         .expect("native model summary");
     assert_eq!(native_model.web_search_mode, WebSearchMode::Native);
+    assert!(!native_model.developer_role_enabled);
     assert!(
         native_model
             .warnings
@@ -14548,6 +14560,7 @@ async fn agent_team_api_enables_and_controls_a_coordinator_snapshot() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27000,6 +27013,7 @@ Search memory before repo work.
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27327,6 +27341,7 @@ async fn prepare_chat_context_continues_without_deferred_memory() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27451,6 +27466,7 @@ async fn chat_stream_starts_when_deferred_memory_fails() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27549,6 +27565,7 @@ Use the existing product UI conventions.
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -27914,6 +27931,7 @@ async fn prepare_prompt_context_hides_memory_tools_when_memory_disabled() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28317,6 +28335,7 @@ async fn prepare_prompt_context_hides_search_text_when_ripgrep_unavailable() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -28905,6 +28924,7 @@ async fn prepare_prompt_context_uses_model_system_prompt() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29015,6 +29035,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29035,6 +29056,7 @@ async fn prompt_cache_key_changes_when_model_system_prompt_changes() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: "Review".to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29588,6 +29610,7 @@ async fn prepare_prompt_context_appends_memory_context_after_current_user() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29813,6 +29836,7 @@ async fn prepare_prompt_context_memory_budget_follows_context_budget_percent() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -29992,6 +30016,7 @@ async fn prepare_prompt_context_injects_existing_todo_graph_for_followup_run() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30274,6 +30299,7 @@ async fn prepare_chat_context_replays_stable_memory_and_dedupes_turn_memory() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30493,6 +30519,7 @@ async fn prepare_prompt_context_retrieves_cjk_memory_without_exact_question_matc
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30977,6 +31004,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -30997,6 +31025,7 @@ async fn chat_statistics_returns_context_usage_timeline_for_compression_snapshot
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -31247,6 +31276,7 @@ async fn chat_statistics_excludes_internal_llm_requests_bound_to_chat() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -31575,6 +31605,7 @@ async fn ai_statistics_list_and_detail_expose_wire_derived_transport() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -32039,6 +32070,7 @@ async fn context_usage_preview_does_not_persist_chat_messages() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -32202,6 +32234,7 @@ async fn context_usage_preview_does_not_call_model_memory_retrieval() {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -34237,6 +34270,7 @@ fn test_model_settings(id: &str) -> ModelSettings {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,
@@ -38588,6 +38622,7 @@ fn prompt_test_config(workspace_dir: PathBuf) -> GlobalConfig {
         thinking_level: None,
         web_search_mode: WebSearchMode::Auto,
         fast_mode_enabled: false,
+        developer_role_enabled: true,
         system_prompt_name: DEFAULT_SYSTEM_PROMPT_NAME.to_string(),
         metadata_key: None,
         metadata_source_url: None,

@@ -1310,6 +1310,8 @@ export type ConfiguredModelSummary = {
   supportsFast?: boolean;
   /** Model-level Fast preference, effective only while the active route supports it. */
   fastModeEnabled?: boolean;
+  /** Whether provider requests preserve the Developer role for this model. */
+  developerRoleEnabled?: boolean;
   supportedThinkingLevels: string[];
   warnings: string[];
 };

@@ -1031,6 +1031,7 @@ pub(crate) fn configured_model_summary(model: &ModelSettings) -> ConfiguredModel
         supports_thinking: false,
         supports_fast: false,
         fast_mode_enabled: false,
+        developer_role_enabled: model.developer_role_enabled,
         supported_thinking_levels: Vec::new(),
         warnings: Vec::new(),
     }

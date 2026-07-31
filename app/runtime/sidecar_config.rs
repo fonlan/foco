@@ -371,6 +371,7 @@ mod tests {
                 thinking_level: None,
                 web_search_mode: foco_providers::WebSearchMode::Native,
                 fast_mode_enabled: false,
+                developer_role_enabled: true,
                 system_prompt_name: "Default".to_string(),
                 metadata_key: None,
                 metadata_source_url: None,

@@ -268,6 +268,9 @@ pub(crate) struct ManualModelRequest {
     /// Optional per-model web search mode. When omitted, preserve the existing value (or `auto`).
     #[serde(default)]
     pub(crate) web_search_mode: Option<WebSearchMode>,
+    /// `None` preserves the configured value for existing models and enables
+    /// Developer-role requests for newly created models.
+    pub(crate) developer_role_enabled: Option<bool>,
     pub(crate) system_prompt_name: Option<String>,
 }
 
@@ -823,6 +826,7 @@ pub(crate) struct ConfiguredModelSummary {
     pub(crate) supports_thinking: bool,
     pub(crate) supports_fast: bool,
     pub(crate) fast_mode_enabled: bool,
+    pub(crate) developer_role_enabled: bool,
     pub(crate) supported_thinking_levels: Vec<String>,
     pub(crate) warnings: Vec<String>,
 }
@@ -3129,6 +3133,10 @@ pub(crate) async fn save_manual_model(
             .map(|model| model.web_search_mode)
             .unwrap_or(WebSearchMode::Auto),
     };
+    let developer_role_enabled = request
+        .developer_role_enabled
+        .or_else(|| existing_model.map(|model| model.developer_role_enabled))
+        .unwrap_or(true);
     let system_prompt_name = match requested_system_prompt_name {
         Some(value) => {
             let value = value.trim().to_string();
@@ -3162,6 +3170,7 @@ pub(crate) async fn save_manual_model(
         thinking_level,
         web_search_mode,
         fast_mode_enabled: existing_model.is_some_and(|model| model.fast_mode_enabled),
+        developer_role_enabled,
         system_prompt_name,
         metadata_key: metadata_key
             .clone()
