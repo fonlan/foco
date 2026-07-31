@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::atomic::AtomicBool,
 };
 
@@ -48,6 +49,17 @@ pub(super) struct AgentWorktreeMergeResult {
     pub(super) base_revision: String,
     pub(super) changed_paths: Vec<String>,
     pub(super) diff_id: String,
+}
+
+/// The deterministic result of integrating a committed Agent worktree into the
+/// shared workspace. Conflict detection happens against temporary Git objects,
+/// so `Conflicted` never leaves merge stages in the shared index or worktree.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum AgentWorktreeCommitMergeOutcome {
+    NoChanges,
+    FastForward { shared_merge_commit_id: String },
+    ThreeWayMerged { shared_merge_commit_id: String },
+    Conflicted { paths: Vec<String> },
 }
 
 #[derive(Clone, Debug)]
@@ -856,6 +868,190 @@ pub(super) fn fast_forward_shared_workspace_to_agent_worktree(
         })?;
 
     Ok(Some(worktree_head.to_string()))
+}
+
+/// Integrates a committed Agent worktree using the recorded base (`B`), the
+/// current shared HEAD (`S`), and the worktree HEAD (`W`).
+///
+/// When `S == B`, this delegates to the existing fast-forward implementation
+/// to preserve its commit identity. Otherwise it asks Git to construct a
+/// three-way tree from exactly `B`, `S`, and `W`; Git only writes temporary
+/// objects while deciding whether the merge conflicts. The shared checkout and
+/// index are updated only after that tree is known to be conflict-free.
+pub(super) fn merge_committed_agent_worktree_into_shared_workspace(
+    workspace_path: &Path,
+    worktree_path: &Path,
+    base_revision: &str,
+) -> Result<AgentWorktreeCommitMergeOutcome, ApiError> {
+    let worktree_path = validate_agent_worktree_path(workspace_path, worktree_path)?;
+    let shared_repo = open_repo(workspace_path)?;
+    let worktree_repo = open_repo(&worktree_path)?;
+    let base_id = gix::ObjectId::from_hex(base_revision.as_bytes()).map_err(|source| {
+        ApiError::bad_request(format!("invalid Agent worktree base revision: {source}"))
+    })?;
+    worktree_repo.find_commit(base_id).map_err(|source| {
+        ApiError::bad_request(format!(
+            "failed to read Agent worktree base commit: {source}"
+        ))
+    })?;
+    let worktree_head = worktree_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("Agent worktree has unborn HEAD: {source}"))
+        })?
+        .detach();
+    let worktree_head_text = worktree_head.to_string();
+    reject_committed_foco_runtime_paths(&worktree_repo, base_revision, &worktree_head_text)?;
+    let shared_head = shared_repo
+        .head_id()
+        .map_err(|source| {
+            ApiError::bad_request(format!("shared workspace has unborn HEAD: {source}"))
+        })?
+        .detach();
+    if !status_entries_for_repo(workspace_path, &shared_repo)?.is_empty() {
+        return Err(ApiError::bad_request(AGENT_WORKTREE_SHARED_DIRTY_MESSAGE));
+    }
+    if !status_entries_for_repo(&worktree_path, &worktree_repo)?.is_empty() {
+        return Err(ApiError::bad_request(
+            "cannot merge Agent worktree with uncommitted changes",
+        ));
+    }
+
+    if worktree_head_text == base_revision {
+        return Ok(AgentWorktreeCommitMergeOutcome::NoChanges);
+    }
+    if shared_head.to_string() == base_revision {
+        let shared_merge_commit_id = fast_forward_shared_workspace_to_agent_worktree(
+            workspace_path,
+            &worktree_path,
+            base_revision,
+        )?
+        .ok_or_else(|| {
+            ApiError::internal("fast-forward unexpectedly had no Agent worktree changes")
+        })?;
+        return Ok(AgentWorktreeCommitMergeOutcome::FastForward {
+            shared_merge_commit_id,
+        });
+    }
+
+    let shared_head_text = shared_head.to_string();
+    let merge_tree = match git_three_way_merge_tree(
+        workspace_path,
+        base_revision,
+        &shared_head_text,
+        &worktree_head_text,
+    )? {
+        GitThreeWayMergeTree::Conflicted { paths } => {
+            return Ok(AgentWorktreeCommitMergeOutcome::Conflicted { paths });
+        }
+        GitThreeWayMergeTree::Merged(tree_id) => tree_id,
+    };
+    let current_branch = shared_repo
+        .head_name()
+        .map_err(|source| ApiError::internal(format!("failed to read git HEAD: {source}")))?
+        .map(|name| name.shorten().to_string())
+        .ok_or_else(|| ApiError::bad_request("cannot merge into detached shared workspace"))?;
+    let mut target_index = shared_repo.index_from_tree(&merge_tree).map_err(|source| {
+        ApiError::internal(format!("failed to build three-way merge index: {source}"))
+    })?;
+
+    remove_tracked_files_missing_from_target(&shared_repo, &target_index)?;
+    checkout_index(&shared_repo, &mut target_index)?;
+    write_index(target_index)?;
+    let shared_merge_commit_id = shared_repo
+        .commit(
+            branch_ref_name(&current_branch).as_str(),
+            "merge: Foco Agent worktree three-way merge",
+            merge_tree,
+            vec![shared_head, worktree_head],
+        )
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to create Agent worktree merge commit: {source}"
+            ))
+        })?
+        .detach()
+        .to_string();
+
+    Ok(AgentWorktreeCommitMergeOutcome::ThreeWayMerged {
+        shared_merge_commit_id,
+    })
+}
+
+enum GitThreeWayMergeTree {
+    Merged(gix::ObjectId),
+    Conflicted { paths: Vec<String> },
+}
+
+fn git_three_way_merge_tree(
+    workspace_path: &Path,
+    base_revision: &str,
+    shared_head: &str,
+    worktree_head: &str,
+) -> Result<GitThreeWayMergeTree, ApiError> {
+    let merge_base = format!("--merge-base={base_revision}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace_path)
+        .args([
+            "merge-tree",
+            "--write-tree",
+            merge_base.as_str(),
+            shared_head,
+            worktree_head,
+        ])
+        .output()
+        .map_err(|source| {
+            ApiError::internal(format!(
+                "failed to run git merge-tree for Agent worktree: {source}"
+            ))
+        })?;
+
+    if output.status.success() {
+        let tree_id = std::str::from_utf8(&output.stdout)
+            .map_err(|source| {
+                ApiError::internal(format!(
+                    "git merge-tree returned non-UTF-8 tree id: {source}"
+                ))
+            })?
+            .lines()
+            .next()
+            .ok_or_else(|| ApiError::internal("git merge-tree did not return a tree id"))?;
+        let tree_id = gix::ObjectId::from_hex(tree_id.as_bytes()).map_err(|source| {
+            ApiError::internal(format!(
+                "git merge-tree returned an invalid tree id: {source}"
+            ))
+        })?;
+        return Ok(GitThreeWayMergeTree::Merged(tree_id));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(GitThreeWayMergeTree::Conflicted {
+            paths: git_merge_tree_conflict_paths(&output.stdout),
+        });
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(ApiError::bad_request(format!(
+        "git merge-tree could not prepare Agent worktree merge: {}",
+        stderr.trim()
+    )))
+}
+
+fn git_merge_tree_conflict_paths(output: &[u8]) -> Vec<String> {
+    let output = String::from_utf8_lossy(output);
+    let mut paths = BTreeSet::new();
+    for line in output.lines() {
+        let Some(path) = line
+            .strip_prefix("CONFLICT ")
+            .and_then(|line| line.rsplit_once(" in "))
+        else {
+            continue;
+        };
+        if !path.1.is_empty() {
+            paths.insert(path.1.to_string());
+        }
+    }
+    paths.into_iter().collect()
 }
 
 pub(super) fn agent_worktree_committed_diff(
@@ -2009,13 +2205,18 @@ fn plan_worktree_fast_forward_merges_committed_phase_history() {
     assert!(source_diff.contains("phase-1.txt"));
     assert!(source_diff.contains("phase-2.txt"));
 
-    let merged = fast_forward_shared_workspace_to_agent_worktree(
+    let merged = merge_committed_agent_worktree_into_shared_workspace(
         workspace_path,
         &worktree.root_path,
         &worktree.base_revision,
     )
     .expect("fast-forward merge");
-    assert_eq!(merged.as_deref(), Some(second_commit.as_str()));
+    assert_eq!(
+        merged,
+        AgentWorktreeCommitMergeOutcome::FastForward {
+            shared_merge_commit_id: second_commit.clone(),
+        }
+    );
     assert_eq!(
         fs::read_to_string(workspace_path.join("phase-1.txt")).expect("phase 1 merged"),
         "phase 1\n"
@@ -2033,6 +2234,205 @@ fn plan_worktree_fast_forward_merges_committed_phase_history() {
     );
     delete_agent_worktree(workspace_path, &worktree.root_path, false).expect("delete worktree");
     assert!(!worktree.root_path.exists());
+}
+
+#[cfg(test)]
+fn create_agent_merge_test_workspace(files: &[(&str, &str)]) -> tempfile::TempDir {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let workspace_path = workspace.path();
+    let repo = gix::init(workspace_path).expect("init repository");
+    let mut index = gix::index::File::from_state(
+        gix::index::State::new(repo.object_hash()),
+        repo.index_path(),
+    );
+    index.write(Default::default()).expect("empty index");
+    fs::write(
+        workspace_path.join(".git").join("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = false\n\tbare = false\n\tlogallrefupdates = true\n[user]\n\tname = Foco Test\n\temail = foco@example.invalid\n",
+    )
+    .expect("test git config");
+    fs::write(workspace_path.join(".gitignore"), ".foco/\n").expect("ignore Foco internals");
+    stage_git_file(workspace_path, ".gitignore").expect("stage ignore file");
+    for (path, contents) in files {
+        fs::write(workspace_path.join(path), contents).expect("base file");
+        stage_git_file(workspace_path, path).expect("stage base file");
+    }
+    commit_staged_changes(workspace_path, "initial".to_string()).expect("initial commit");
+    workspace
+}
+
+#[cfg(test)]
+#[test]
+fn committed_agent_worktree_three_way_merges_disjoint_paths_after_shared_head_advances() {
+    let workspace = create_agent_merge_test_workspace(&[("base.txt", "base\n")]);
+    let workspace_path = workspace.path();
+    let worktree = create_agent_worktree(workspace_path, "agent-instance-three-way-disjoint")
+        .expect("worktree");
+
+    fs::write(workspace_path.join("shared.txt"), "shared\n").expect("shared change");
+    stage_git_file(workspace_path, "shared.txt").expect("stage shared change");
+    let shared_commit =
+        commit_staged_changes(workspace_path, "shared advance".to_string()).expect("shared commit");
+    fs::write(worktree.root_path.join("worktree.txt"), "worktree\n").expect("worktree change");
+    stage_git_file(&worktree.root_path, "worktree.txt").expect("stage worktree change");
+    let worktree_commit = commit_staged_changes(&worktree.root_path, "worktree change".to_string())
+        .expect("worktree commit");
+
+    let outcome = merge_committed_agent_worktree_into_shared_workspace(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect("three-way merge");
+    let AgentWorktreeCommitMergeOutcome::ThreeWayMerged {
+        shared_merge_commit_id,
+    } = outcome
+    else {
+        panic!("expected a successful three-way merge");
+    };
+
+    assert_ne!(shared_merge_commit_id, shared_commit);
+    assert_ne!(shared_merge_commit_id, worktree_commit);
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("shared.txt")).expect("shared file"),
+        "shared\n"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("worktree.txt")).expect("worktree file"),
+        "worktree\n"
+    );
+    assert_eq!(
+        shared_workspace_head_commit_id(workspace_path).expect("shared head"),
+        shared_merge_commit_id
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn committed_agent_worktree_three_way_merges_non_overlapping_hunks_in_one_file() {
+    let workspace = create_agent_merge_test_workspace(&[(
+        "shared.txt",
+        "first\nsecond\nthird\nfourth\nfifth\n",
+    )]);
+    let workspace_path = workspace.path();
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-three-way-hunks").expect("worktree");
+
+    fs::write(
+        workspace_path.join("shared.txt"),
+        "first from shared\nsecond\nthird\nfourth\nfifth\n",
+    )
+    .expect("shared edit");
+    stage_git_file(workspace_path, "shared.txt").expect("stage shared edit");
+    commit_staged_changes(workspace_path, "shared edit".to_string()).expect("shared commit");
+    fs::write(
+        worktree.root_path.join("shared.txt"),
+        "first\nsecond\nthird\nfourth\nfifth from worktree\n",
+    )
+    .expect("worktree edit");
+    stage_git_file(&worktree.root_path, "shared.txt").expect("stage worktree edit");
+    commit_staged_changes(&worktree.root_path, "worktree edit".to_string())
+        .expect("worktree commit");
+
+    let outcome = merge_committed_agent_worktree_into_shared_workspace(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect("three-way merge");
+
+    assert!(matches!(
+        outcome,
+        AgentWorktreeCommitMergeOutcome::ThreeWayMerged { .. }
+    ));
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("shared.txt")).expect("merged file"),
+        "first from shared\nsecond\nthird\nfourth\nfifth from worktree\n"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn committed_agent_worktree_three_way_conflict_leaves_shared_checkout_and_head_unchanged() {
+    let workspace = create_agent_merge_test_workspace(&[("conflict.txt", "base\n")]);
+    let workspace_path = workspace.path();
+    let worktree = create_agent_worktree(workspace_path, "agent-instance-three-way-conflict")
+        .expect("worktree");
+
+    fs::write(workspace_path.join("conflict.txt"), "shared\n").expect("shared edit");
+    stage_git_file(workspace_path, "conflict.txt").expect("stage shared edit");
+    commit_staged_changes(workspace_path, "shared edit".to_string()).expect("shared commit");
+    let shared_head_before = shared_workspace_head_commit_id(workspace_path).expect("shared head");
+    fs::write(worktree.root_path.join("conflict.txt"), "worktree\n").expect("worktree edit");
+    stage_git_file(&worktree.root_path, "conflict.txt").expect("stage worktree edit");
+    commit_staged_changes(&worktree.root_path, "worktree edit".to_string())
+        .expect("worktree commit");
+
+    let outcome = merge_committed_agent_worktree_into_shared_workspace(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect("conflict must be classified");
+
+    let AgentWorktreeCommitMergeOutcome::Conflicted { paths } = outcome else {
+        panic!("expected a classified conflict");
+    };
+    assert_eq!(paths, ["conflict.txt"]);
+    assert_eq!(
+        shared_workspace_head_commit_id(workspace_path).expect("shared head after conflict"),
+        shared_head_before
+    );
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("conflict.txt"))
+            .expect("shared file after conflict"),
+        "shared\n"
+    );
+    assert!(
+        git_diff_response(workspace_path, None)
+            .expect("shared status after conflict")
+            .status
+            .trim()
+            .is_empty(),
+        "conflict detection must not leave a shared index or checkout change"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn committed_agent_worktree_three_way_merges_worktree_file_deletion() {
+    let workspace = create_agent_merge_test_workspace(&[
+        ("delete-me.txt", "delete\n"),
+        ("shared.txt", "base\n"),
+    ]);
+    let workspace_path = workspace.path();
+    let worktree =
+        create_agent_worktree(workspace_path, "agent-instance-three-way-delete").expect("worktree");
+
+    fs::write(workspace_path.join("shared.txt"), "shared\n").expect("shared edit");
+    stage_git_file(workspace_path, "shared.txt").expect("stage shared edit");
+    commit_staged_changes(workspace_path, "shared edit".to_string()).expect("shared commit");
+    fs::remove_file(worktree.root_path.join("delete-me.txt")).expect("delete worktree file");
+    stage_git_file(&worktree.root_path, "delete-me.txt").expect("stage worktree deletion");
+    commit_staged_changes(&worktree.root_path, "worktree delete".to_string())
+        .expect("worktree commit");
+
+    let outcome = merge_committed_agent_worktree_into_shared_workspace(
+        workspace_path,
+        &worktree.root_path,
+        &worktree.base_revision,
+    )
+    .expect("three-way merge");
+
+    assert!(matches!(
+        outcome,
+        AgentWorktreeCommitMergeOutcome::ThreeWayMerged { .. }
+    ));
+    assert!(!workspace_path.join("delete-me.txt").exists());
+    assert_eq!(
+        fs::read_to_string(workspace_path.join("shared.txt")).expect("shared file"),
+        "shared\n"
+    );
 }
 
 #[cfg(test)]
