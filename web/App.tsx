@@ -17336,30 +17336,40 @@ function mergeToolCallUpdate(
   nextToolCall: ChatToolCallSummary,
 ): ChatToolCallSummary {
   const normalizedToolCall = normalizedToolCallSummary(nextToolCall);
-  const keepExistingOutcome =
-    currentToolCall.output !== null && normalizedToolCall.output === null;
+  // A replayed running card may legitimately have no output (for example a
+  // waiting `agent_wait_tasks` result), so output alone cannot establish which
+  // version is newer. Keep terminal state monotonic and use the newer/equally
+  // terminal update only to supplement fields that the earlier version lacked.
+  const currentRank = toolCallStatusRank(currentToolCall.status);
+  const nextRank = toolCallStatusRank(normalizedToolCall.status);
+  const preferred = nextRank >= currentRank
+    ? normalizedToolCall
+    : currentToolCall;
+  const supplementary = preferred === normalizedToolCall
+    ? currentToolCall
+    : normalizedToolCall;
 
   return {
-    ...normalizedToolCall,
-    status: keepExistingOutcome
-      ? currentToolCall.status
-      : normalizedToolCall.status,
-    output: keepExistingOutcome
-      ? currentToolCall.output
-      : normalizedToolCall.output,
-    isError: keepExistingOutcome
-      ? currentToolCall.isError
-      : normalizedToolCall.isError,
-    startedAt: normalizedToolCall.startedAt ?? currentToolCall.startedAt,
-    completedAt: keepExistingOutcome
-      ? currentToolCall.completedAt
-      : (normalizedToolCall.completedAt ?? currentToolCall.completedAt),
+    ...supplementary,
+    ...preferred,
+    status: preferred.status,
+    output: preferred.output ?? supplementary.output,
+    isError: preferred.isError,
+    startedAt: preferred.startedAt ?? supplementary.startedAt,
+    completedAt: preferred.completedAt ?? supplementary.completedAt,
     liveOutput:
-      normalizedToolCall.liveOutput ??
-      (normalizedToolCall.output === null
-        ? currentToolCall.liveOutput
+      preferred.liveOutput ??
+      (preferred.output === null
+        ? supplementary.liveOutput
         : undefined),
   };
+}
+
+function toolCallStatusRank(status: string) {
+  if (status === "completed" || status === "error" || status === "cancelled") {
+    return 2;
+  }
+  return status === "running" ? 1 : 0;
 }
 
 function applyToolResult(
@@ -17924,7 +17934,7 @@ type ChatStreamSession = {
  * single state update. A reconnect can observe both forms briefly; rendering
  * either as independent messages is what produces duplicate assistant bubbles.
  */
-function canonicalizeAssistantMessage(
+export function canonicalizeAssistantMessage(
   current: ShellMessage[],
   canonicalId: string,
   aliases: Iterable<string | null | undefined>,
@@ -17943,23 +17953,15 @@ function canonicalizeAssistantMessage(
     return current;
   }
 
-  const canonical =
-    matching.find((message) => message.id === canonicalId) ?? matching[0];
-  const merged = matching.reduce<ShellMessage>((result, message) => {
-    if (message === canonical) {
-      return result;
-    }
+  // `current` is the only ordering authority available for legacy parts. Keep
+  // its assistant order while folding aliases; starting from the durable id can
+  // otherwise prepend a late Complete before earlier reasoning/tool events.
+  const merged = matching.slice(1).reduce<ShellMessage>((result, message) => {
     const content = mergeAssistantStreamText(result.content, message.content);
     const reasoning = mergeAssistantStreamText(
       result.reasoning ?? "",
       message.reasoning ?? "",
     );
-    const toolCallsById = new Map(
-      result.toolCalls.map((call) => [call.id, call]),
-    );
-    for (const toolCall of message.toolCalls) {
-      toolCallsById.set(toolCall.id, toolCall);
-    }
     return {
       ...result,
       content,
@@ -17971,23 +17973,79 @@ function canonicalizeAssistantMessage(
         result.memoriesUsed.length >= message.memoriesUsed.length
           ? result.memoriesUsed
           : message.memoriesUsed,
-      metrics: result.metrics ?? message.metrics,
+      metrics: message.metrics ?? result.metrics,
       parts: mergeAssistantMessageParts(result.parts, message.parts),
       reasoning: reasoning || null,
-      status:
-        result.status === "streaming" || message.status === "streaming"
-          ? "streaming"
-          : (result.status ?? message.status),
-      toolCalls: Array.from(toolCallsById.values()),
+      status: mergeAssistantMessageStatus(result.status, message.status),
+      toolCalls: mergeAssistantToolCalls(result.toolCalls, message.toolCalls),
     };
-  }, canonical);
-  const canonicalMessage = { ...merged, id: canonicalId };
+  }, matching[0]);
+  // A temporary alias can be remapped to the durable id before its duplicate is
+  // removed. Prefer an explicit terminal version already carrying that id, but
+  // ignore a remapped streaming placeholder and use the monotonic merge then.
+  const durableTerminal = matching.find(
+    (message) => message.id === canonicalId && message.status !== "streaming",
+  );
+  const canonicalMessage = {
+    ...merged,
+    id: canonicalId,
+    status: durableTerminal?.status ?? merged.status,
+  };
   const firstMatchingIndex = current.findIndex((message) =>
     matching.includes(message),
   );
   const next = current.filter((message) => !matching.includes(message));
   next.splice(firstMatchingIndex, 0, canonicalMessage);
   return next;
+}
+
+/** A terminal alias must never be revived by a stale streaming placeholder. */
+function mergeAssistantMessageStatus(
+  current: ShellMessage["status"],
+  next: ShellMessage["status"],
+): ShellMessage["status"] {
+  const rank = (status: ShellMessage["status"]) =>
+    status === "streaming" ? 0 : 1;
+  // Alias order is not an event sequence. Preserve the earlier terminal when
+  // ranks tie instead of allowing a stale alias to replace it arbitrarily.
+  return rank(next) > rank(current) ? next : current;
+}
+
+function mergeAssistantToolCalls(
+  current: ChatToolCallSummary[],
+  next: ChatToolCallSummary[],
+): ChatToolCallSummary[] {
+  const merged = [...current];
+  const indexes = new Map<string, number>();
+  for (const [index, toolCall] of merged.entries()) {
+    const existingIndex = indexes.get(toolCall.id);
+    if (existingIndex === undefined) {
+      indexes.set(toolCall.id, index);
+    } else {
+      merged[existingIndex] = mergeToolCallUpdate(
+        merged[existingIndex],
+        toolCall,
+      );
+    }
+  }
+  // Drop duplicate legacy tool summaries after their first timeline position.
+  const unique = merged.filter((toolCall, index) => indexes.get(toolCall.id) === index);
+  indexes.clear();
+  unique.forEach((toolCall, index) => indexes.set(toolCall.id, index));
+
+  for (const toolCall of next) {
+    const existingIndex = indexes.get(toolCall.id);
+    if (existingIndex === undefined) {
+      indexes.set(toolCall.id, unique.length);
+      unique.push(toolCall);
+    } else {
+      unique[existingIndex] = mergeToolCallUpdate(
+        unique[existingIndex],
+        toolCall,
+      );
+    }
+  }
+  return unique;
 }
 
 function mergeAssistantStreamText(current: string, next: string) {
@@ -18009,39 +18067,236 @@ function mergeAssistantStreamText(current: string, next: string) {
  * Choosing the longer array is unsafe: two aliases can contain equally many,
  * but different, text, reasoning, or tool parts.
  */
-function mergeAssistantMessageParts(
+export function mergeAssistantMessageParts(
   current: ChatMessagePart[],
   next: ChatMessagePart[],
 ): ChatMessagePart[] {
-  if (!current.length) {
-    return next;
-  }
-  if (!next.length) {
-    return current;
-  }
-
-  const currentSignatures = current.map(chatMessagePartSignature);
-  const nextSignatures = next.map(chatMessagePartSignature);
-  const maxOverlap = Math.min(current.length, next.length);
-  for (let overlap = maxOverlap; overlap > 0; overlap -= 1) {
-    const currentOffset = current.length - overlap;
-    let matches = true;
-    for (let index = 0; index < overlap; index += 1) {
-      if (currentSignatures[currentOffset + index] !== nextSignatures[index]) {
-        matches = false;
-        break;
+  const merged: ChatMessagePart[] = [];
+  const stableIndexes = new Map<string, number>();
+  for (const part of current) {
+    const identity = chatMessagePartIdentity(part);
+    const existingIndex = identity ? stableIndexes.get(identity) : undefined;
+    if (existingIndex === undefined) {
+      if (identity) {
+        stableIndexes.set(identity, merged.length);
       }
-    }
-    if (matches) {
-      return [...current, ...next.slice(overlap)];
+      merged.push(part);
+    } else {
+      merged[existingIndex] = mergeAssistantMessagePart(merged[existingIndex], part);
     }
   }
 
-  return [...current, ...next];
+  // Unkeyed text/reasoning has no protocol id in historical records. Align it
+  // only while its type and content prove continuity, and only forward from the
+  // last aligned position. A block that cannot be proven equivalent remains a
+  // distinct timeline event instead of being silently discarded.
+  let nextSearchStart = 0;
+  for (const [nextIndex, part] of next.entries()) {
+    const identity = chatMessagePartIdentity(part);
+    const stableIndex = identity ? stableIndexes.get(identity) : undefined;
+    if (stableIndex !== undefined) {
+      merged[stableIndex] = mergeAssistantMessagePart(merged[stableIndex], part);
+      nextSearchStart = Math.max(nextSearchStart, stableIndex + 1);
+      continue;
+    }
+    if (identity) {
+      stableIndexes.set(identity, merged.length);
+      merged.push(part);
+      nextSearchStart = merged.length;
+      continue;
+    }
+
+    const compatibleIndex = findContinuousMessagePartIndex(
+      merged,
+      part,
+      nextSearchStart,
+      nextLegacyPartSearchEnd(next, nextIndex, stableIndexes, merged.length),
+    );
+    if (compatibleIndex === -1) {
+      merged.push(part);
+    } else {
+      merged[compatibleIndex] = mergeAssistantMessagePart(
+        merged[compatibleIndex],
+        part,
+      );
+      nextSearchStart = compatibleIndex + 1;
+    }
+  }
+  return merged;
 }
 
-function chatMessagePartSignature(part: ChatMessagePart) {
-  return JSON.stringify(part);
+function chatMessagePartIdentity(part: ChatMessagePart): string | null {
+  switch (part.type) {
+    case "toolCall":
+      return `tool:${part.toolCall.id}`;
+    case "contextCompression":
+      if (part.detail.compressionId) {
+        return `compression:${part.detail.compressionId}`;
+      }
+      if (part.detail.snapshotId) {
+        return `compression:snapshot:${part.detail.snapshotId}`;
+      }
+      // Old history may synthesize a generic `kind:pending` id. It is not an
+      // event identity, so treating it as one would discard distinct cards.
+      return part.detail.startedAt
+        ? `compression:legacy:${part.kind}:${part.detail.startedAt}`
+        : null;
+    case "agentTaskLifecycle":
+      return `agent-task:${part.lifecycle.eventId}`;
+    case "userInterruption":
+      return `interruption:${part.id}`;
+    case "attachment":
+      return `attachment:${part.attachment.id}`;
+    default:
+      return null;
+  }
+}
+
+function findContinuousMessagePartIndex(
+  parts: ChatMessagePart[],
+  next: ChatMessagePart,
+  startIndex: number,
+  endIndex: number,
+): number {
+  for (let index = startIndex; index < endIndex; index += 1) {
+    const current = parts[index];
+    if (current && partsHaveContinuousContent(current, next)) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+/**
+ * Legacy text and reasoning lack a protocol id. A later known structure bounds
+ * the only interval in which a compatible segment can be upgraded. Without an
+ * anchor, consider only the expected next timeline position: matching equal
+ * text across a tool or interruption would be speculation, not deduplication.
+ */
+function nextLegacyPartSearchEnd(
+  next: ChatMessagePart[],
+  nextIndex: number,
+  stableIndexes: Map<string, number>,
+  mergedLength: number,
+): number {
+  for (let index = nextIndex + 1; index < next.length; index += 1) {
+    const identity = chatMessagePartIdentity(next[index]);
+    if (identity) {
+      const stableIndex = stableIndexes.get(identity);
+      if (stableIndex !== undefined) {
+        return stableIndex;
+      }
+    }
+  }
+  return Math.min(mergedLength, nextIndex + 1);
+}
+
+function partsHaveContinuousContent(
+  current: ChatMessagePart,
+  next: ChatMessagePart,
+): boolean {
+  const hasContinuousText = (currentText: string, nextText: string) =>
+    currentText === nextText ||
+    currentText.startsWith(nextText) ||
+    nextText.startsWith(currentText);
+  if (current.type === "text" && next.type === "text") {
+    return hasContinuousText(current.text, next.text);
+  }
+  if (current.type === "reasoning" && next.type === "reasoning") {
+    return hasContinuousText(current.text, next.text);
+  }
+  return current.type === "error" && next.type === "error"
+    ? hasContinuousText(current.text, next.text)
+    : false;
+}
+
+function mergeAssistantMessagePart(
+  current: ChatMessagePart,
+  next: ChatMessagePart,
+): ChatMessagePart {
+  if (current.type !== next.type) {
+    return next;
+  }
+  switch (current.type) {
+    case "toolCall": {
+      if (next.type !== "toolCall") {
+        return next;
+      }
+      return {
+        type: "toolCall",
+        toolCall: mergeToolCallUpdate(current.toolCall, next.toolCall),
+      };
+    }
+    case "contextCompression":
+      if (next.type !== "contextCompression") {
+        return next;
+      }
+      return mergeContextCompressionPart(current, next);
+    case "agentTaskLifecycle":
+      if (next.type !== "agentTaskLifecycle") {
+        return next;
+      }
+      return {
+        type: "agentTaskLifecycle",
+        lifecycle: {
+          ...current.lifecycle,
+          ...next.lifecycle,
+          durationMs: next.lifecycle.durationMs ?? current.lifecycle.durationMs,
+          resultJson: next.lifecycle.resultJson ?? current.lifecycle.resultJson,
+          resultPreview:
+            next.lifecycle.resultPreview ?? current.lifecycle.resultPreview,
+          errorPreview: next.lifecycle.errorPreview ?? current.lifecycle.errorPreview,
+        },
+      };
+    case "userInterruption":
+      if (next.type !== "userInterruption") {
+        return next;
+      }
+      return {
+        ...current,
+        ...next,
+        interruptedAssistantMetrics:
+          next.interruptedAssistantMetrics ??
+          current.interruptedAssistantMetrics ??
+          null,
+      };
+    case "attachment":
+      if (next.type !== "attachment") {
+        return next;
+      }
+      return {
+        type: "attachment",
+        attachment: { ...current.attachment, ...next.attachment },
+      };
+    case "reasoning": {
+      if (next.type !== "reasoning") {
+        return next;
+      }
+      const durationMs = next.durationMs ?? current.durationMs;
+      return {
+        type: "reasoning",
+        text: mergeAssistantStreamText(current.text, next.text),
+        ...(durationMs === undefined ? {} : { durationMs }),
+        ...(durationMs === undefined
+          ? {
+              liveDurationMs: Math.max(
+                current.liveDurationMs ?? 0,
+                next.liveDurationMs ?? 0,
+              ),
+              startedAtMs: current.startedAtMs ?? next.startedAtMs,
+            }
+          : {}),
+      };
+    }
+    case "text":
+      return next.type === "text"
+        ? { type: "text", text: mergeAssistantStreamText(current.text, next.text) }
+        : next;
+    case "error":
+      return next.type === "error"
+        ? { type: "error", text: mergeAssistantStreamText(current.text, next.text) }
+        : next;
+  }
 }
 
 function missingFinalSuffix(current: string, next: string) {

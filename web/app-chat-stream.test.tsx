@@ -10,7 +10,17 @@ import {
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { ConfiguredSkillSummary, WorkspaceSummary } from "./api/types";
+import type {
+  ChatMessagePart,
+  ConfiguredSkillSummary,
+  JsonValue,
+  ShellMessage,
+  WorkspaceSummary,
+} from "./api/types";
+import {
+  canonicalizeAssistantMessage,
+  mergeAssistantMessageParts,
+} from "./App";
 import {
   activeMemory,
   aiStatistics,
@@ -153,6 +163,46 @@ function isDisabledControl(el: HTMLElement) {
   );
 }
 
+function toolPart(
+  status: string,
+  output: JsonValue | null = null,
+): ChatMessagePart {
+  return {
+    type: "toolCall",
+    toolCall: {
+      id: "tool-1",
+      input: { path: "README.md" },
+      isError: status === "error",
+      name: "read_file",
+      output,
+      status,
+    },
+  };
+}
+
+function assistantAlias(
+  id: string,
+  parts: ChatMessagePart[],
+  status: ShellMessage["status"],
+): ShellMessage {
+  return {
+    content: "Final conclusion.",
+    createdAt: "2026-07-31T01:00:00Z",
+    extractedMemories: [],
+    id,
+    memoriesUsed: [],
+    metrics: null,
+    parts,
+    reasoning: "Reasoning.",
+    role: "assistant",
+    specUpdates: [],
+    status,
+    toolCalls: parts.flatMap((part) =>
+      part.type === "toolCall" ? [part.toolCall] : [],
+    ),
+  };
+}
+
 describe("app-chat-stream verification surfaces", () => {
   beforeEach(() => {
     resetAppTestEnvironment();
@@ -163,6 +213,283 @@ describe("app-chat-stream verification surfaces", () => {
         ) => void;
       }
     ).__FOCO_TEST_STREAM_AUXILIARY_UPDATE_SCHEDULER__;
+  });
+
+  it("merges ordered parts by stable identity and monotonic version", () => {
+    const current: ChatMessagePart[] = [
+      { type: "reasoning", text: "Inspecting.", startedAtMs: 10, liveDurationMs: 40 },
+      toolPart("running"),
+      {
+        type: "contextCompression",
+        id: "compression-1",
+        kind: "llm",
+        status: "retrying",
+        detail: { compressionId: "compression-1", attemptIndex: 1 },
+      },
+      {
+        type: "agentTaskLifecycle",
+        lifecycle: {
+          completedAt: "2026-07-31T01:00:02Z",
+          durationMs: 20,
+          errorPreview: null,
+          eventId: "lifecycle-1",
+          instanceId: "agent-1",
+          parentTaskId: "parent-1",
+          resultJson: { summary: "partial" },
+          resultPreview: "partial",
+          startedAt: "2026-07-31T01:00:00Z",
+          status: "completed",
+          taskId: "task-1",
+          teamId: "team-1",
+        },
+      },
+      { type: "text", text: "Final" },
+    ];
+    const next: ChatMessagePart[] = [
+      { type: "reasoning", text: "Inspecting.", durationMs: 90 },
+      toolPart("completed", { content: "done" }),
+      {
+        type: "contextCompression",
+        id: "snapshot-1",
+        kind: "llm",
+        status: "completed",
+        detail: {
+          compressionId: "compression-1",
+          completedAt: "2026-07-31T01:00:03Z",
+          summaryTokenCount: 12,
+        },
+      },
+      {
+        type: "agentTaskLifecycle",
+        lifecycle: {
+          completedAt: "2026-07-31T01:00:02Z",
+          durationMs: 20,
+          errorPreview: null,
+          eventId: "lifecycle-1",
+          instanceId: "agent-1",
+          parentTaskId: "parent-1",
+          resultJson: { summary: "complete" },
+          resultPreview: "complete",
+          startedAt: "2026-07-31T01:00:00Z",
+          status: "completed",
+          taskId: "task-1",
+          teamId: "team-1",
+        },
+      },
+      { type: "text", text: "Final conclusion." },
+    ];
+
+    const merged = mergeAssistantMessageParts(current, next);
+
+    expect(merged.map((part) => part.type)).toEqual([
+      "reasoning",
+      "toolCall",
+      "contextCompression",
+      "agentTaskLifecycle",
+      "text",
+    ]);
+    expect(merged[0]).toMatchObject({
+      type: "reasoning",
+      text: "Inspecting.",
+      durationMs: 90,
+    });
+    expect(merged[1]).toMatchObject({
+      type: "toolCall",
+      toolCall: { id: "tool-1", status: "completed", output: { content: "done" } },
+    });
+    expect(merged[2]).toMatchObject({
+      type: "contextCompression",
+      status: "completed",
+      detail: { compressionId: "compression-1", summaryTokenCount: 12 },
+    });
+    expect(merged[3]).toMatchObject({
+      type: "agentTaskLifecycle",
+      lifecycle: { eventId: "lifecycle-1", resultJson: { summary: "complete" } },
+    });
+    expect(merged[4]).toMatchObject({ type: "text", text: "Final conclusion." });
+  });
+
+  it("keeps unproven text blocks in timeline order while alias normalization upgrades known blocks", () => {
+    const localParts: ChatMessagePart[] = [
+      { type: "reasoning", text: "Thinking.", startedAtMs: 10, liveDurationMs: 15 },
+      toolPart("running"),
+      { type: "text", text: "Final conclusion." },
+    ];
+    const durableParts: ChatMessagePart[] = [
+      { type: "reasoning", text: "Thinking.", durationMs: 45 },
+      toolPart("completed", { ok: true }),
+      { type: "text", text: "Final conclusion." },
+    ];
+    const replayedParts: ChatMessagePart[] = [
+      { type: "reasoning", text: "Thinking.", liveDurationMs: 20 },
+      toolPart("running"),
+      { type: "text", text: "Final conclusion." },
+    ];
+    const mergedParts = mergeAssistantMessageParts(
+      [{ type: "text", text: "First segment." }, ...localParts],
+      [{ type: "text", text: "Different segment." }, ...durableParts],
+    );
+    expect(mergedParts.map((part) => part.type)).toEqual([
+      "text",
+      "reasoning",
+      "toolCall",
+      "text",
+      "text",
+    ]);
+    expect(mergedParts.at(-1)).toMatchObject({
+      type: "text",
+      text: "Different segment.",
+    });
+
+    const normalized = canonicalizeAssistantMessage(
+      [
+        assistantAlias("local-placeholder", localParts, "streaming"),
+        assistantAlias("durable-assistant", durableParts, undefined),
+        assistantAlias("reconnect-alias", replayedParts, "streaming"),
+      ],
+      "durable-assistant",
+      ["local-placeholder", "reconnect-alias"],
+    );
+
+    expect(normalized).toHaveLength(1);
+    expect(normalized[0]).toMatchObject({
+      id: "durable-assistant",
+      status: undefined,
+    });
+    expect(normalized[0]?.parts.map((part) => part.type)).toEqual([
+      "reasoning",
+      "toolCall",
+      "text",
+    ]);
+    expect(normalized[0]?.parts[1]).toMatchObject({
+      type: "toolCall",
+      toolCall: { status: "completed", output: { ok: true } },
+    });
+  });
+
+  it("merges legacy unkeyed part variants only when content proves continuity", () => {
+    const cases: Array<{
+      name: string;
+      current: ChatMessagePart[];
+      next: ChatMessagePart[];
+      expected: Array<{ type: ChatMessagePart["type"]; text?: string }>;
+    }> = [
+      {
+        name: "reasoning duration changes do not create a second segment",
+        current: [
+          {
+            type: "reasoning",
+            text: "Inspecting files.",
+            liveDurationMs: 15,
+            startedAtMs: 5,
+          },
+        ],
+        next: [
+          { type: "reasoning", text: "Inspecting files.", durationMs: 80 },
+        ],
+        expected: [{ type: "reasoning", text: "Inspecting files." }],
+      },
+      {
+        name: "a growing text delta upgrades its original position",
+        current: [{ type: "text", text: "Final" }],
+        next: [{ type: "text", text: "Final conclusion." }],
+        expected: [{ type: "text", text: "Final conclusion." }],
+      },
+      {
+        name: "same-length but different legacy text remains visible",
+        current: [{ type: "text", text: "First segment." }],
+        next: [{ type: "text", text: "Other segment." }],
+        expected: [
+          { type: "text", text: "First segment." },
+          { type: "text", text: "Other segment." },
+        ],
+      },
+      {
+        name: "partial overlap preserves an unmatched timeline block",
+        current: [
+          { type: "text", text: "First segment." },
+          { type: "text", text: "Second segment." },
+        ],
+        next: [
+          { type: "text", text: "First segment." },
+          { type: "text", text: "Different segment." },
+        ],
+        expected: [
+          { type: "text", text: "First segment." },
+          { type: "text", text: "Second segment." },
+          { type: "text", text: "Different segment." },
+        ],
+      },
+    ];
+
+    for (const testCase of cases) {
+      expect(
+        mergeAssistantMessageParts(testCase.current, testCase.next).map((part) =>
+          part.type === "text" || part.type === "reasoning"
+            ? { type: part.type, text: part.text }
+            : { type: part.type },
+        ),
+        testCase.name,
+      ).toEqual(testCase.expected);
+    }
+  });
+
+  it("preserves ambiguous legacy blocks and terminal state during stale alias replay", () => {
+    const completedWithNullOutput = toolPart("completed");
+    const staleRunningReplay = toolPart("running");
+    const mergedTool = mergeAssistantMessageParts(
+      [completedWithNullOutput],
+      [staleRunningReplay],
+    );
+    expect(mergedTool).toEqual([
+      expect.objectContaining({
+        type: "toolCall",
+        toolCall: expect.objectContaining({ status: "completed", output: null }),
+      }),
+    ]);
+
+    const pendingCompression: ChatMessagePart = {
+      type: "contextCompression",
+      id: "llm:pending",
+      kind: "llm",
+      status: "started",
+      detail: {},
+    };
+    const repeatedReasoning: ChatMessagePart[] = [
+      { type: "reasoning", text: "Checking state." },
+      toolPart("running"),
+      { type: "reasoning", text: "Checking state." },
+    ];
+    const mergedLegacy = mergeAssistantMessageParts(
+      [pendingCompression, { ...pendingCompression }, ...repeatedReasoning],
+      [{ type: "reasoning", text: "Checking state.", durationMs: 50 }],
+    );
+    expect(
+      mergedLegacy.filter((part) => part.type === "contextCompression"),
+    ).toHaveLength(2);
+    expect(
+      mergedLegacy.filter((part) => part.type === "reasoning"),
+    ).toHaveLength(3);
+
+    const completeWins = canonicalizeAssistantMessage(
+      [
+        assistantAlias("durable", [], undefined),
+        assistantAlias("stale-error-alias", [], "error"),
+      ],
+      "durable",
+      ["stale-error-alias"],
+    );
+    expect(completeWins[0]).toMatchObject({ id: "durable", status: undefined });
+
+    const errorWins = canonicalizeAssistantMessage(
+      [
+        assistantAlias("durable", [], "error"),
+        assistantAlias("stale-complete-alias", [], undefined),
+      ],
+      "durable",
+      ["stale-complete-alias"],
+    );
+    expect(errorWins[0]).toMatchObject({ id: "durable", status: "error" });
   });
 
   it("edits a persisted user message, confirms truncation, and starts one replacement stream", async () => {
