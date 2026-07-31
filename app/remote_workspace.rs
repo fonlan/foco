@@ -96,10 +96,11 @@ use crate::{
     },
     estimate_tool_schema_tokens,
     git_backend::{
-        agent_worktree_relative_path, commit_staged_changes, create_agent_worktree,
-        delete_agent_worktree, discard_git_file, fast_forward_shared_workspace_to_agent_worktree,
-        git_diff_response, git_status_response, shared_workspace_head_commit_id, stage_git_file,
-        unstage_git_file,
+        AgentWorktreeCommitMergeOutcome, agent_worktree_relative_path, commit_staged_changes,
+        create_agent_worktree, delete_agent_worktree, discard_git_file,
+        fast_forward_shared_workspace_to_agent_worktree, git_diff_response, git_status_response,
+        merge_committed_agent_worktree_into_shared_workspace, shared_workspace_head_commit_id,
+        stage_git_file, unstage_git_file,
     },
     hooks::{
         HookExecution, HookNotification, HookRunRequest, HookRuntime, PromptHookError,
@@ -20897,12 +20898,12 @@ async fn remote_sidecar_finalize_plan_worktree(
         return Ok(());
     };
 
-    match fast_forward_shared_workspace_to_agent_worktree(
+    match merge_committed_agent_worktree_into_shared_workspace(
         &workspace_path,
         &worktree.root_path,
         &worktree.base_revision,
     ) {
-        Ok(_) => {
+        Ok(AgentWorktreeCommitMergeOutcome::NoChanges) => {
             let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace_path)?;
             {
                 let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
@@ -20914,6 +20915,88 @@ async fn remote_sidecar_finalize_plan_worktree(
             release_sidecar_plan_worktrees_after_merge(state, &plan.id)?;
             Ok(())
         }
+        Ok(
+            AgentWorktreeCommitMergeOutcome::FastForward {
+                shared_merge_commit_id,
+            }
+            | AgentWorktreeCommitMergeOutcome::ThreeWayMerged {
+                shared_merge_commit_id,
+            },
+        ) => {
+            {
+                let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                    .map_err(ApiError::from_workspace_error)?;
+                database
+                    .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
+                    .map_err(ApiError::from_workspace_error)?;
+            }
+            release_sidecar_plan_worktrees_after_merge(state, &plan.id)?;
+            Ok(())
+        }
+        Ok(AgentWorktreeCommitMergeOutcome::Conflicted { paths }) => {
+            let error = ApiError::bad_request(format!(
+                "deterministic Agent worktree three-way merge conflicted in: {}",
+                paths.join(", ")
+            ));
+            match remote_sidecar_dispatch_plan_merge(state, plan, &worktree, &error, manual_retry)
+                .await
+            {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    // Could not begin a new attempt: either one is already
+                    // active (idempotent no-op) or auto budget is exhausted.
+                    let database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                        .map_err(ApiError::from_workspace_error)?;
+                    let refreshed = database
+                        .plan(&plan.id)
+                        .map_err(ApiError::from_workspace_error)?
+                        .ok_or_else(|| {
+                            ApiError::internal(format!(
+                                "plan was not found after merge dispatch: {}",
+                                plan.id
+                            ))
+                        })?;
+                    let has_active_merge = refreshed
+                        .phases
+                        .iter()
+                        .find(|phase| phase.id == worktree.phase_id)
+                        .map(|phase| {
+                            phase.attempts.iter().any(|attempt| {
+                                matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
+                                    && matches!(attempt.status.as_str(), "queued" | "running")
+                            })
+                        })
+                        .unwrap_or(false);
+                    if has_active_merge || refreshed.status == "running" {
+                        return Ok(());
+                    }
+                    drop(database);
+                    let mut database =
+                        WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                            .map_err(ApiError::from_workspace_error)?;
+                    database
+                        .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
+                        .map_err(ApiError::from_workspace_error)?;
+                    Ok(())
+                }
+                Err(dispatch_error) => {
+                    // Dispatch already terminalized the merge attempt via
+                    // await_plan_merge_retry when a queued attempt existed.
+                    // Ensure plan is still awaiting merge retry.
+                    let mut database =
+                        WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
+                            .map_err(ApiError::from_workspace_error)?;
+                    database
+                        .block_plan_phase_merge(
+                            &plan.id,
+                            &worktree.phase_id,
+                            &dispatch_error.message,
+                        )
+                        .map_err(ApiError::from_workspace_error)?;
+                    Err(dispatch_error)
+                }
+            }
+        }
         Err(error) => match classify_plan_merge_failure(&error) {
             PlanMergeFailureKind::SharedWorkspaceDirty => {
                 let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
@@ -20923,74 +21006,7 @@ async fn remote_sidecar_finalize_plan_worktree(
                     .map_err(ApiError::from_workspace_error)?;
                 Ok(())
             }
-            PlanMergeFailureKind::SharedHeadMismatch => {
-                match remote_sidecar_dispatch_plan_merge(
-                    state,
-                    plan,
-                    &worktree,
-                    &error,
-                    manual_retry,
-                )
-                .await
-                {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        // Could not begin a new attempt: either one is already
-                        // active (idempotent no-op) or auto budget is exhausted.
-                        let database =
-                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                                .map_err(ApiError::from_workspace_error)?;
-                        let refreshed = database
-                            .plan(&plan.id)
-                            .map_err(ApiError::from_workspace_error)?
-                            .ok_or_else(|| {
-                                ApiError::internal(format!(
-                                    "plan was not found after merge dispatch: {}",
-                                    plan.id
-                                ))
-                            })?;
-                        let has_active_merge = refreshed
-                            .phases
-                            .iter()
-                            .find(|phase| phase.id == worktree.phase_id)
-                            .map(|phase| {
-                                phase.attempts.iter().any(|attempt| {
-                                    matches!(attempt.trigger.as_str(), "merge_auto" | "merge_retry")
-                                        && matches!(attempt.status.as_str(), "queued" | "running")
-                                })
-                            })
-                            .unwrap_or(false);
-                        if has_active_merge || refreshed.status == "running" {
-                            return Ok(());
-                        }
-                        drop(database);
-                        let mut database =
-                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                                .map_err(ApiError::from_workspace_error)?;
-                        database
-                            .block_plan_phase_merge(&plan.id, &worktree.phase_id, &error.message)
-                            .map_err(ApiError::from_workspace_error)?;
-                        Ok(())
-                    }
-                    Err(dispatch_error) => {
-                        // Dispatch already terminalized the merge attempt via
-                        // await_plan_merge_retry when a queued attempt existed.
-                        // Ensure plan is still awaiting merge retry.
-                        let mut database =
-                            WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
-                                .map_err(ApiError::from_workspace_error)?;
-                        database
-                            .block_plan_phase_merge(
-                                &plan.id,
-                                &worktree.phase_id,
-                                &dispatch_error.message,
-                            )
-                            .map_err(ApiError::from_workspace_error)?;
-                        Err(dispatch_error)
-                    }
-                }
-            }
-            PlanMergeFailureKind::Other => {
+            PlanMergeFailureKind::SharedHeadMismatch | PlanMergeFailureKind::Other => {
                 let mut database = WorkspaceDatabase::open_or_create(sidecar_workspace_path(state))
                     .map_err(ApiError::from_workspace_error)?;
                 database
@@ -49451,26 +49467,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_finalize_fast_forward_releases_graph_and_worktree() {
+    async fn remote_finalize_three_way_merge_releases_graph_and_worktree() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (plan, source_worktree, _) =
-            setup_remote_plan_merge_fixture(workspace.path(), "fast-forward-cleanup", false);
+            setup_remote_plan_merge_fixture(workspace.path(), "three-way-cleanup", true);
         let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
         prewarm_sidecar_code_graph_execution_root(
             &state,
             &source_worktree.root_path,
-            "test-remote-fast-forward-cleanup",
+            "test-remote-three-way-cleanup",
         );
         wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 1);
 
         remote_sidecar_finalize_plan_worktree(&state, &plan, false)
             .await
-            .expect("fast-forward finalize");
+            .expect("three-way finalize");
 
         wait_for_remote_code_graph_watchers(&state.code_graph_indexes, 0);
         assert!(
             !source_worktree.root_path.exists(),
-            "fast-forward finalization should remove the isolated worktree"
+            "three-way finalization should remove the isolated worktree"
         );
         assert_eq!(
             fs::read_to_string(workspace.path().join("phase-change.txt"))
@@ -49483,7 +49499,14 @@ mod tests {
         let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
         assert!(
             refreshed.shared_merge_commit_id.is_some(),
-            "fast-forward finalization should record the shared merge commit"
+            "three-way finalization should record the shared merge commit"
+        );
+        assert!(
+            refreshed.phases[0]
+                .attempts
+                .iter()
+                .all(|attempt| attempt.trigger != "merge_auto"),
+            "a clean deterministic three-way merge must not queue an LLM merge"
         );
         let team_id = AgentTeamId::new(
             refreshed.phases[0]
@@ -49509,10 +49532,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_finalize_head_mismatch_dispatches_direct_merge_with_source_diff() {
+    async fn remote_finalize_three_way_conflict_dispatches_direct_merge_with_source_diff() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (plan, _source_worktree, _shared_head) =
             setup_remote_plan_merge_fixture(workspace.path(), "direct-dispatch", true);
+        fs::write(
+            workspace.path().join("phase-change.txt"),
+            "shared conflict\n",
+        )
+        .expect("write conflicting shared change");
+        remote_plan_merge_test_git(workspace.path(), &["add", "phase-change.txt"]);
+        remote_plan_merge_test_git(
+            workspace.path(),
+            &["commit", "-m", "conflicting shared change"],
+        );
         let (state, _broker) =
             remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
 
@@ -49579,10 +49612,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_finalize_head_mismatch_dispatches_isolated_merge_from_current_shared_head() {
+    async fn remote_finalize_three_way_conflict_dispatches_isolated_merge_from_current_shared_head()
+    {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (plan, source_worktree, shared_head) =
+        let (plan, source_worktree, _shared_head) =
             setup_remote_plan_merge_fixture(workspace.path(), "isolated-dispatch", true);
+        fs::write(
+            workspace.path().join("phase-change.txt"),
+            "shared conflict\n",
+        )
+        .expect("write conflicting shared change");
+        remote_plan_merge_test_git(workspace.path(), &["add", "phase-change.txt"]);
+        remote_plan_merge_test_git(
+            workspace.path(),
+            &["commit", "-m", "conflicting shared change"],
+        );
         let (state, _broker) = remote_plan_merge_test_state(
             workspace.path(),
             PLAN_MERGE_AUTOMATION_ISOLATED_AUTO_ONCE,
@@ -49649,7 +49693,11 @@ mod tests {
         );
         assert_eq!(
             coordinator.worktree_base_revision.as_deref(),
-            Some(shared_head.as_str())
+            Some(
+                shared_workspace_head_commit_id(workspace.path())
+                    .expect("shared head")
+                    .as_str()
+            )
         );
         assert_eq!(
             task.input_json
@@ -49691,10 +49739,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_finalize_head_mismatch_only_dispatches_one_automatic_merge_attempt() {
+    async fn remote_finalize_three_way_conflict_only_dispatches_one_automatic_merge_attempt() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (plan, _source_worktree, _shared_head) =
             setup_remote_plan_merge_fixture(workspace.path(), "one-attempt", true);
+        fs::write(
+            workspace.path().join("phase-change.txt"),
+            "shared conflict\n",
+        )
+        .expect("write conflicting shared change");
+        remote_plan_merge_test_git(workspace.path(), &["add", "phase-change.txt"]);
+        remote_plan_merge_test_git(
+            workspace.path(),
+            &["commit", "-m", "conflicting shared change"],
+        );
         let (state, _broker) =
             remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
 
@@ -49729,6 +49787,16 @@ mod tests {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
         let (plan, _source_worktree, _shared_head) =
             setup_remote_plan_merge_fixture(workspace.path(), "retry-after-fail", true);
+        fs::write(
+            workspace.path().join("phase-change.txt"),
+            "shared conflict\n",
+        )
+        .expect("write conflicting shared change");
+        remote_plan_merge_test_git(workspace.path(), &["add", "phase-change.txt"]);
+        remote_plan_merge_test_git(
+            workspace.path(),
+            &["commit", "-m", "conflicting shared change"],
+        );
         let (state, _broker) =
             remote_plan_merge_test_state(workspace.path(), PLAN_MERGE_AUTOMATION_DIRECT_AUTO);
 

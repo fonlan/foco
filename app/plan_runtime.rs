@@ -28,10 +28,11 @@ use tokio::{sync::watch, time};
 
 use crate::{
     git_backend::{
-        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AgentWorktreeInfo, agent_instance_worktree_path,
-        commit_staged_changes, delete_agent_worktree,
-        fast_forward_shared_workspace_to_agent_worktree, git_diff_response, merge_agent_worktree,
-        resolve_agent_worktree_path, shared_workspace_head_commit_id, stage_git_file,
+        AGENT_WORKTREE_SHARED_DIRTY_MESSAGE, AgentWorktreeCommitMergeOutcome, AgentWorktreeInfo,
+        agent_instance_worktree_path, commit_staged_changes, delete_agent_worktree,
+        git_diff_response, merge_agent_worktree,
+        merge_committed_agent_worktree_into_shared_workspace, resolve_agent_worktree_path,
+        shared_workspace_head_commit_id, stage_git_file,
     },
     http::chat::{
         PlanPhaseDispatchBinding, QueueChatMessageInput, QueuedChatMessageOrigin,
@@ -296,8 +297,9 @@ pub(crate) async fn retry_plan_merge(
             plan.id
         )));
     }
-    // Manual retry: try direct fast-forward first; only HEAD mismatch dispatches
-    // a merge_retry LLM attempt (never re-runs the last implementation phase).
+    // Manual retry first uses deterministic Git integration. A merge_retry LLM
+    // attempt is reserved for an actual three-way conflict and never re-runs
+    // the implementation phase.
     finalize_plan_worktree(state, &workspace, &plan, true).await?;
     state.plan_auto_run_scheduler.wake()?;
     let database = open_workspace_database(&workspace.path)?;
@@ -1349,12 +1351,12 @@ async fn finalize_plan_worktree(
             plan.id
         ))
     })?;
-    match fast_forward_shared_workspace_to_agent_worktree(
+    match merge_committed_agent_worktree_into_shared_workspace(
         &workspace.path,
         &root_path,
         base_revision,
     ) {
-        Ok(_) => {
+        Ok(AgentWorktreeCommitMergeOutcome::NoChanges) => {
             let shared_merge_commit_id = shared_workspace_head_commit_id(&workspace.path)?;
             let mut database = open_workspace_database(&workspace.path)?;
             database
@@ -1371,28 +1373,47 @@ async fn finalize_plan_worktree(
                 true,
             )
         }
-        Err(error) => {
-            if is_shared_workspace_dirty_merge_error(&error) {
-                let mut database = open_workspace_database(&workspace.path)?;
-                database
-                    .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
-                    .map_err(ApiError::from_workspace_error)?;
-                return Ok(());
+        Ok(
+            AgentWorktreeCommitMergeOutcome::FastForward {
+                shared_merge_commit_id,
             }
-            if is_shared_head_mismatch_merge_error(&error)
-                && dispatch_plan_merge(
-                    state,
-                    workspace,
-                    plan,
-                    &phase,
-                    &instance,
-                    &error,
-                    manual_retry,
-                )
-                .await?
+            | AgentWorktreeCommitMergeOutcome::ThreeWayMerged {
+                shared_merge_commit_id,
+            },
+        ) => {
+            let mut database = open_workspace_database(&workspace.path)?;
+            database
+                .record_plan_shared_merge_commit(&plan.id, &shared_merge_commit_id)
+                .map_err(ApiError::from_workspace_error)?;
+            drop(database);
+            confirm_plan_derived_effects_for_phase(workspace, &plan.id, &phase.id)?;
+            release_confirmed_plan_derived_effects(state, workspace)?;
+            delete_plan_worktrees(
+                &state.background_command_registry,
+                &state.code_graph_indexes,
+                workspace,
+                plan,
+                true,
+            )
+        }
+        Ok(AgentWorktreeCommitMergeOutcome::Conflicted { paths }) => {
+            let error = ApiError::bad_request(format!(
+                "deterministic Agent worktree three-way merge conflicted in: {}",
+                paths.join(", ")
+            ));
+            if dispatch_plan_merge(
+                state,
+                workspace,
+                plan,
+                &phase,
+                &instance,
+                &error,
+                manual_retry,
+            )
+            .await?
             {
                 Ok(())
-            } else if is_shared_head_mismatch_merge_error(&error) {
+            } else {
                 // Could not begin a new attempt. If one is already active, leave
                 // the plan running (idempotent). Otherwise surface await-retry.
                 let database = open_workspace_database(&workspace.path)?;
@@ -1425,25 +1446,29 @@ async fn finalize_plan_worktree(
                     .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
                 Ok(())
-            } else {
-                // Other git/config errors: still keep implementation completed
-                // and allow Retry Merge rather than failing the last phase.
+            }
+        }
+        Err(error) => {
+            if is_shared_workspace_dirty_merge_error(&error) {
                 let mut database = open_workspace_database(&workspace.path)?;
                 database
                     .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
                     .map_err(ApiError::from_workspace_error)?;
-                Ok(())
+                return Ok(());
             }
+            // Git/config/precondition failures keep the implementation completed
+            // and await a manual retry; only a structured conflict can queue LLM.
+            let mut database = open_workspace_database(&workspace.path)?;
+            database
+                .block_plan_phase_merge(&phase.plan_id, &phase.id, &error.message)
+                .map_err(ApiError::from_workspace_error)?;
+            Ok(())
         }
     }
 }
 
 fn is_shared_workspace_dirty_merge_error(error: &ApiError) -> bool {
     classify_plan_merge_failure(error) == PlanMergeFailureKind::SharedWorkspaceDirty
-}
-
-fn is_shared_head_mismatch_merge_error(error: &ApiError) -> bool {
-    classify_plan_merge_failure(error) == PlanMergeFailureKind::SharedHeadMismatch
 }
 
 /// Plan is implemented (or legacy blocked) without a shared merge commit and
@@ -2204,8 +2229,14 @@ mod tests {
             "shared workspace HEAD 'new' {AGENT_WORKTREE_SHARED_HEAD_MISMATCH_MESSAGE} 'base'"
         ));
         assert!(is_shared_workspace_dirty_merge_error(&dirty));
-        assert!(!is_shared_head_mismatch_merge_error(&dirty));
-        assert!(is_shared_head_mismatch_merge_error(&advanced));
+        assert_ne!(
+            classify_plan_merge_failure(&dirty),
+            PlanMergeFailureKind::SharedHeadMismatch
+        );
+        assert_eq!(
+            classify_plan_merge_failure(&advanced),
+            PlanMergeFailureKind::SharedHeadMismatch
+        );
 
         let mut plan = plan_record_for_prompt(phase_record_for_prompt());
         plan.status = "implemented".to_string();
