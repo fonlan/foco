@@ -16763,7 +16763,7 @@ fn unix_process_is_alive(pid: u32) -> bool {
 }
 
 #[tokio::test]
-async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once() {
+async fn retry_merge_after_non_conflicting_shared_head_advance_merges_without_dispatching_llm() {
     let mut fixture = blocked_plan_worktree_fixture("retry-head-advanced").await;
     fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
     fs::write(
@@ -16788,63 +16788,60 @@ async fn retry_merge_after_shared_head_advances_dispatches_isolated_merge_once()
     .await
     .expect("retry merge");
 
-    assert_eq!(retried.status, "running");
-    assert!(retried.shared_merge_commit_id.is_none());
-    assert_eq!(retried.phases[0].merge_attempt_count, 1);
-    // Phase keeps implementation task identity; merge binds on the attempt only.
+    let shared_merge_commit_id = retried
+        .shared_merge_commit_id
+        .as_deref()
+        .expect("three-way merge commit");
+
+    assert_eq!(retried.status, "implemented");
+    assert!(retried.error_message.is_none());
+    assert_ne!(shared_merge_commit_id, advanced_head);
+    assert_ne!(shared_merge_commit_id, fixture.source_commit);
+    assert_eq!(retried.phases[0].merge_attempt_count, 0);
     assert_eq!(
         retried.phases[0].agent_task_id.as_deref(),
         Some(fixture.phase_task_id.as_str())
     );
     assert_eq!(retried.phases[0].status, "completed");
-    let merge_attempt = retried.phases[0]
-        .attempts
-        .iter()
-        .find(|attempt| attempt.trigger == "merge_retry")
-        .expect("manual merge_retry attempt");
-    assert_eq!(merge_attempt.status, "running");
-    assert_eq!(fixture.agent_scheduler_rx.recv().await, Some(()));
+    assert!(
+        retried.phases[0]
+            .attempts
+            .iter()
+            .all(|attempt| attempt.trigger != "merge_retry"),
+        "a clean deterministic three-way merge must not queue an LLM merge"
+    );
 
     let database = WorkspaceDatabase::open_or_create(&fixture.workspace.path).expect("database");
     let source_instance = database
         .agent_instance(&fixture.source_instance_id)
         .expect("source instance lookup")
         .expect("source instance");
-    assert_eq!(source_instance.worktree_status.as_deref(), Some("kept"));
-    assert!(fixture.source_root.exists());
-
-    let merge_team_id = foco_agent::AgentTeamId::new(
-        merge_attempt
-            .agent_team_id
-            .as_deref()
-            .expect("merge team id"),
-    )
-    .expect("merge team id");
-    let merge_team = database
-        .agent_team(&merge_team_id)
-        .expect("merge team lookup")
-        .expect("merge team");
-    let merge_instance = database
-        .agent_instance(&merge_team.coordinator_instance_id)
-        .expect("merge instance lookup")
-        .expect("merge instance");
     assert_eq!(
-        merge_instance.execution_workspace_mode,
-        foco_agent::AgentExecutionWorkspaceMode::IsolatedWorktree
+        source_instance.execution_workspace_mode,
+        foco_agent::AgentExecutionWorkspaceMode::Shared
     );
-    assert_ne!(merge_instance.id, fixture.source_instance_id);
-    assert_eq!(merge_instance.worktree_status.as_deref(), Some("active"));
-    let merge_root = merge_instance
-        .execution_root_path
-        .as_deref()
-        .map(|path| crate::git_backend::resolve_agent_worktree_path(&fixture.workspace.path, path))
-        .expect("merge root");
-    assert!(merge_root.exists());
-    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 2);
+    assert!(source_instance.worktree_status.is_none());
+    assert!(!fixture.source_root.exists());
+    assert_eq!(managed_agent_worktree_count(&fixture.workspace.path), 0);
     assert_eq!(
         crate::git_backend::shared_workspace_head_commit_id(&fixture.workspace.path)
             .expect("shared HEAD"),
-        advanced_head
+        shared_merge_commit_id
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.path.join("phase.txt")).expect("merged phase file"),
+        "phase\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.workspace.path.join("shared-advance.txt"))
+            .expect("retained shared file"),
+        "advance\n"
+    );
+    assert!(
+        timeout(Duration::from_millis(50), fixture.agent_scheduler_rx.recv())
+            .await
+            .is_err(),
+        "clean deterministic merge should not wake an LLM merge Coordinator"
     );
 }
 
@@ -16853,19 +16850,19 @@ async fn retry_merge_after_llm_merge_failure_keeps_phase_completed_and_dispatche
     let mut fixture = blocked_plan_worktree_fixture("retry-after-llm-fail").await;
     fs::remove_file(fixture.workspace.path.join("shared-dirty.txt")).expect("clean dirty file");
     fs::write(
-        fixture.workspace.path.join("shared-advance.txt"),
-        "advance\n",
+        fixture.workspace.path.join("phase.txt"),
+        "shared conflict\n",
     )
-    .expect("advance file");
-    crate::git_backend::stage_git_file(&fixture.workspace.path, "shared-advance.txt")
-        .expect("stage advance");
+    .expect("write conflicting shared phase change");
+    crate::git_backend::stage_git_file(&fixture.workspace.path, "phase.txt")
+        .expect("stage conflicting shared phase change");
     crate::git_backend::commit_staged_changes(
         &fixture.workspace.path,
         "advance shared head".to_string(),
     )
     .expect("advance shared head");
 
-    // First manual retry dispatches LLM merge (HEAD mismatch).
+    // First manual retry dispatches LLM merge only for the true same-path conflict.
     let first = crate::plan_runtime::transition_plan_action(
         &fixture.state,
         &fixture.workspace.id,

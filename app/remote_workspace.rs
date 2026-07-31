@@ -49469,7 +49469,7 @@ mod tests {
     #[tokio::test]
     async fn remote_finalize_three_way_merge_releases_graph_and_worktree() {
         let workspace = tempfile::tempdir().expect("workspace tempdir");
-        let (plan, source_worktree, _) =
+        let (plan, source_worktree, shared_head_before_merge) =
             setup_remote_plan_merge_fixture(workspace.path(), "three-way-cleanup", true);
         let (state, _) = test_sidecar_state(workspace.path().display().to_string(), 0);
         prewarm_sidecar_code_graph_execution_root(
@@ -49497,9 +49497,18 @@ mod tests {
         let database =
             WorkspaceDatabase::open_or_create(workspace.path()).expect("workspace database");
         let refreshed = database.plan(&plan.id).expect("plan lookup").expect("plan");
-        assert!(
-            refreshed.shared_merge_commit_id.is_some(),
-            "three-way finalization should record the shared merge commit"
+        let shared_merge_commit_id = refreshed
+            .shared_merge_commit_id
+            .as_deref()
+            .expect("three-way finalization should record the shared merge commit");
+        let shared_head = shared_workspace_head_commit_id(workspace.path()).expect("shared HEAD");
+        assert_eq!(
+            shared_merge_commit_id, shared_head,
+            "Plan persistence must record the commit that integrated both heads"
+        );
+        assert_ne!(
+            shared_merge_commit_id, shared_head_before_merge,
+            "a divergent shared HEAD must produce a new two-parent merge commit"
         );
         assert!(
             refreshed.phases[0]
