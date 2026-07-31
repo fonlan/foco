@@ -24,7 +24,7 @@ describe("workspace helpers", () => {
   it("keeps chat row helper layout-only", () => {
     expect(workspaceNewChatButtonClass(false)).toContain("workspace-new-chat-button");
     expect(chatItemClass()).toContain("chat-item");
-    expect(chatItemClass()).toContain("text-[11px]");
+    expect(chatItemClass()).toContain("text-[10px]");
     expect(chatItemClass()).not.toContain("text-xs");
     expect(chatItemClass()).not.toContain("chat-item-active");
   });
